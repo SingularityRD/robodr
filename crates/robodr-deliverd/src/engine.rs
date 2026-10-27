@@ -29,18 +29,19 @@
 //! failing version and raises `robot.deliver.rollback_blocked_floor`
 //! (Critical); an operator decides. Rollbacks pass the safety gate too.
 
-use crate::clock::{effective_now, in_window, Clock};
+use crate::clock::{effective_now, in_window, window_time, Clock};
 use crate::config::Config;
 use crate::fault;
 use crate::findings::{rules, Finding, Findings};
 use crate::health;
+use crate::highwater::{self, HighWater};
 use crate::install::{Installer, PrepError};
 use crate::journal::{kinds, Journal};
 use crate::media::{self, Outcome};
 use crate::safety::{self, state_name, Observed};
 use crate::state::{
-    ActiveDeployment, Installed, Item, ItemStatus, LastDeployment, Phase, Stale, State, StateFile,
-    Txn, Ver,
+    ActiveDeployment, Installed, Item, ItemStatus, LastDeployment, Locked, Phase, Stale, State,
+    StateFile, Txn, Ver,
 };
 use crate::store::Store;
 use robodr_events::Severity;
@@ -103,6 +104,13 @@ pub struct Engine {
     anchor: Option<VerifiedTrust>,
     /// Transient import problems already recorded this run.
     reported: BTreeSet<String>,
+    /// Media entry name -> (tree stamp, content digest) of the last pass,
+    /// so an unchanged pack is not hashed again (review L4).
+    media_cache: std::collections::BTreeMap<String, (String, String)>,
+    /// The black-box key, which signs the high-water record.
+    hw_key: Box<dyn robodr_blackbox::Signer>,
+    /// The high-water record as last written or read.
+    hw_written: Option<HighWater>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -121,12 +129,27 @@ fn ver_json(v: &Option<Ver>) -> serde_json::Value {
 }
 
 impl Engine {
-    /// Open the agent: state, store, journal (single-writer lock), anchor.
+    /// Open the agent: state, store, journal (single-writer lock), anchor,
+    /// and the high-water record ([`crate::highwater`], review M1).
+    ///
+    /// | state file | high-water record | journal | result |
+    /// |---|---|---|---|
+    /// | present | valid | any | state raised to the record (if behind) |
+    /// | present | missing / invalid | any | state kept; record rewritten from it |
+    /// | missing | valid | any | floors, deployment sequence, time floor, chain heads restored (High finding) |
+    /// | missing | missing / invalid | has records | **locked** until `reanchor` (High finding) |
+    /// | missing | missing | empty | a freshly enrolled unit |
+    ///
+    /// The `floor_raised` notes still in the journal raise the floors in
+    /// every case.
     pub fn open(cfg: Config, clock: Box<dyn Clock>) -> R<Self> {
         crate::fsx::ensure_dir(&cfg.state_dir, 0o700)
             .map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
         let had_records = Journal::has_records(&cfg.blackbox.dir);
         let journal = Journal::open(&cfg.blackbox.dir, &cfg.unit.id, &cfg.blackbox.key)?;
+        let hw_key = robodr_blackbox::KeyFile::load_secret(&cfg.blackbox.key)
+            .and_then(|k| k.signer())
+            .map_err(|e| format!("black-box key {}: {e}", cfg.blackbox.key.display()))?;
         let signer = match &cfg.findings.finding_key {
             Some(p) => Some(
                 robodr_blackbox::KeyFile::load_secret(p)
@@ -144,7 +167,17 @@ impl Engine {
         );
         let mut file = StateFile::new(&cfg.state_path());
         let recorded = Journal::recorded_floors(&cfg.blackbox.dir);
-        let (mut state, restored) = match file.load()? {
+        let hw = match highwater::load(&cfg.blackbox.dir, hw_key.as_ref()) {
+            Ok(Some(h)) if h.site != cfg.unit.site || h.unit != cfg.unit.id => Err(format!(
+                "high-water record of unit {} at site {}, this is {} at {}",
+                h.unit, h.site, cfg.unit.id, cfg.unit.site
+            )),
+            other => other,
+        };
+        let now = clock.now_s().unwrap_or(0);
+        let mut restored: Option<&str> = None;
+        let mut lock: Option<String> = None;
+        let mut state = match file.load()? {
             Some(s) => {
                 if s.site != cfg.unit.site || s.unit != cfg.unit.id {
                     return Err(EngineError(format!(
@@ -156,18 +189,52 @@ impl Engine {
                         cfg.unit.site
                     )));
                 }
-                (s, None)
+                s
             }
-            None if had_records => (
-                State::new(&cfg.unit.site, &cfg.unit.id),
-                Some("the state file is missing but the delivery journal has records"),
-            ),
-            None => (State::new(&cfg.unit.site, &cfg.unit.id), None),
+            None => {
+                match &hw {
+                    Ok(Some(_)) => {
+                        restored = Some(
+                            "the state file is missing; floors, deployment sequence, time floor \
+                             and chain heads restored from the signed high-water record",
+                        );
+                    }
+                    Ok(None) if !had_records => {}
+                    Ok(None) => {
+                        lock = Some(
+                            "the state file and the high-water record are missing but the \
+                             delivery journal has records: the floors and the deployment \
+                             sequence cannot be restored completely"
+                                .into(),
+                        );
+                    }
+                    Err(e) => {
+                        lock = Some(format!(
+                            "the state file is missing and the high-water record is not usable \
+                             ({e})"
+                        ));
+                    }
+                }
+                State::new(&cfg.unit.site, &cfg.unit.id)
+            }
         };
-        let mut behind = Vec::new();
+        // Legacy (before review L4): name-keyed media entries.
+        state.seen_media.clear();
+        let mut behind: Vec<serde_json::Value> = Vec::new();
+        if let Ok(Some(h)) = &hw {
+            behind.extend(h.raise(&mut state));
+        }
         for (name, f) in &recorded {
             if let Some(old) = state.raise_floor(name, *f) {
-                behind.push(json!({"name": name, "state": old, "black_box": f}));
+                behind.push(json!({"floor": name, "state": old, "black_box": f}));
+            }
+        }
+        if let Some(why) = &lock {
+            if state.locked.is_none() {
+                state.locked = Some(Locked {
+                    since: now,
+                    why: why.clone(),
+                });
             }
         }
         let store = Store::open(&cfg.state_dir)?;
@@ -181,6 +248,9 @@ impl Engine {
             findings,
             anchor: None,
             reported: BTreeSet::new(),
+            media_cache: std::collections::BTreeMap::new(),
+            hw_key,
+            hw_written: None,
         };
         e.load_anchor();
         e.journal.note(
@@ -188,24 +258,100 @@ impl Engine {
             json!({"version": env!("CARGO_PKG_VERSION"), "unit": e.cfg.unit.id,
                    "site": e.cfg.unit.site, "trust_version": e.anchor.as_ref().map(|a| a.file().version)}),
         )?;
-        if restored.is_some() || !behind.is_empty() {
-            let why = restored.unwrap_or("the state file's floors are behind the delivery journal");
-            let r = e
-                .journal
-                .note(kinds::STATE_RESTORED, json!({"why": why, "floors": behind}))?;
+        match &hw {
+            Ok(Some(h)) => e.hw_written = Some(h.clone()),
+            Ok(None) => {}
+            Err(err) => {
+                let r = e.journal.note(
+                    kinds::STATE_RESTORED,
+                    json!({"why": "the high-water record is not usable", "detail": err}),
+                )?;
+                e.finding(
+                    rules::REFUSED,
+                    Severity::High,
+                    format!("highwater_invalid: {err}; it is rewritten from the state"),
+                    Some(r),
+                );
+            }
+        }
+        if let Some(why) = &lock {
+            let r = e.journal.note(
+                kinds::STATE_RESTORED,
+                json!({"why": why, "locked": true, "restored": behind}),
+            )?;
             e.finding(
                 rules::REFUSED,
                 Severity::High,
-                format!("state_restored: {why}; floors taken from the black box"),
+                format!(
+                    "state_lost: {why}; the unit refuses imports and installs until an operator \
+                     re-anchors it (robodr-deliverd reanchor)"
+                ),
+                Some(r),
+            );
+            e.save()?;
+        } else if restored.is_some() || !behind.is_empty() {
+            let why = restored.unwrap_or(
+                "the state file is behind the high-water record or the delivery journal",
+            );
+            let r = e.journal.note(
+                kinds::STATE_RESTORED,
+                json!({"why": why, "restored": behind}),
+            )?;
+            e.finding(
+                rules::REFUSED,
+                Severity::High,
+                format!("state_restored: {why}"),
                 Some(r),
             );
             e.save()?;
         }
-        if !e.file.path().exists() {
+        if !e.file.path().exists() || e.hw_written.is_none() {
             e.save()?;
         }
         e.cleanup();
         Ok(e)
+    }
+
+    /// Operator re-anchoring after a lost state (review M1): accept the
+    /// presented site trust file under the pinned roots and site (as the
+    /// unit's anchor, a rotation of it, or a new anchor when none is
+    /// left), take its signed `issued_at` as a time floor and its site
+    /// floors as they apply at every install, and lift the lock. The
+    /// daemon must be stopped (the journal is single-writer).
+    pub fn reanchor(&mut self, trust: &std::path::Path) -> R<serde_json::Value> {
+        let now = self.sys_now()?;
+        let anchor = self.cfg.anchor_path();
+        let t = if std::fs::symlink_metadata(&anchor).is_ok() {
+            let st = robodr_release::ops::SiteTrust::anchored(
+                trust,
+                &anchor,
+                &self.cfg.trust.roots,
+                &self.cfg.unit.site,
+                now,
+            )
+            .map_err(|e| e.to_string())?;
+            robodr_release::ops::commit_anchor(&st).map_err(|e| e.to_string())?;
+            st.trust
+        } else {
+            robodr_release::ops::init_anchor(
+                trust,
+                &anchor,
+                &self.cfg.trust.roots,
+                &self.cfg.unit.site,
+                now,
+            )
+            .map_err(|e| e.to_string())?
+        };
+        self.load_anchor();
+        let was = self.state.locked.take();
+        self.state.time_floor = self.state.time_floor.max(t.file().issued_at);
+        self.save()?;
+        let v = json!({"trust_version": t.file().version, "trust_digest": t.digest,
+                       "was_locked": was.as_ref().map(|l| l.why.clone()),
+                       "time_floor": self.state.time_floor,
+                       "site_floors": t.file().floors.iter().map(|f| json!({"name": f.name, "min_serial": f.min_serial})).collect::<Vec<_>>()});
+        self.journal.note(kinds::REANCHORED, v.clone())?;
+        Ok(v)
     }
 
     fn load_anchor(&mut self) {
@@ -241,7 +387,14 @@ impl Engine {
         Ok(self.journal.close()?)
     }
 
+    /// Write the state; the high-water record first when the baseline
+    /// moved, so the record is never behind the state file (review M1).
     fn save(&mut self) -> R<()> {
+        let hw = HighWater::of(&self.state);
+        if self.hw_written.as_ref() != Some(&hw) {
+            highwater::store(&self.cfg.blackbox.dir, &hw, self.hw_key.as_ref())?;
+            self.hw_written = Some(hw);
+        }
         Ok(self.file.save(&self.state)?)
     }
 
@@ -314,6 +467,13 @@ impl Engine {
     pub fn tick(&mut self) -> R<TickReport> {
         let mut rep = TickReport::default();
         let sys = self.sys_now()?;
+        if let Some(l) = &self.state.locked {
+            // Fail closed (review M1): nothing is imported, installed or
+            // rolled back until an operator re-anchors the unit.
+            rep.deferred = Some(format!("locked: {} (robodr-deliverd reanchor)", l.why));
+            self.check_stale(sys, &mut rep)?;
+            return Ok(rep);
+        }
         if let Some(t) = self.state.txn.clone() {
             self.resume(t, &mut rep)?;
             return Ok(rep);
@@ -326,18 +486,41 @@ impl Engine {
 
     // ------------------------------------------------------------ media --
 
+    /// The content digest of the pack at `path` (review L4), recomputed
+    /// only when its tree stamp changed since the last pass. `None`: not
+    /// readable now (looked at again next pass).
+    fn pack_key(&mut self, name: &str, path: &std::path::Path) -> Option<String> {
+        let stamp = media::pack_stamp(path)?;
+        if let Some((s, d)) = self.media_cache.get(name) {
+            if *s == stamp {
+                return Some(d.clone());
+            }
+        }
+        // A pack beyond the walk's bounds is keyed by its stamp: the
+        // import refuses its layout anyway.
+        let digest = media::pack_digest(path).unwrap_or_else(|| stamp.clone());
+        if self.media_cache.len() >= 4 * crate::state::MAX_SEEN_MEDIA {
+            self.media_cache.clear();
+        }
+        self.media_cache
+            .insert(name.to_string(), (stamp, digest.clone()));
+        Some(digest)
+    }
+
     fn scan_media(&mut self, sys: u64, rep: &mut TickReport) -> R<()> {
         for (name, path) in media::list_media(&self.cfg.media_dir) {
-            let key = media::media_key(&path).unwrap_or_else(|| "none".into());
-            if self.state.seen_media.get(&name) == Some(&key) {
+            let Some(key) = self.pack_key(&name, &path) else {
+                continue;
+            };
+            if self.state.seen_pack(&key) {
                 continue;
             }
             match media::import(&self.cfg, &self.state, &path, sys) {
                 Ok(Outcome::AlreadyAccepted) => {
-                    self.state.see_media(&name, &key);
+                    self.state.see_pack(&key, &name);
                     self.save()?;
                 }
-                Ok(Outcome::Imported(imp)) => self.accept_pack(&name, *imp, rep)?,
+                Ok(Outcome::Imported(imp)) => self.accept_pack(&name, &key, *imp, rep)?,
                 Err(r) if r.transient => {
                     let k = format!("{name}:{}", r.detail);
                     if self.reported.insert(k) {
@@ -368,7 +551,7 @@ impl Engine {
                         Some(ev),
                     );
                     rep.refused.push(format!("{name}: {r}"));
-                    self.state.see_media(&name, &key);
+                    self.state.see_pack(&key, &name);
                     self.save()?;
                 }
             }
@@ -379,6 +562,7 @@ impl Engine {
     fn accept_pack(
         &mut self,
         media_name: &str,
+        pack_key: &str,
         imp: media::Imported,
         rep: &mut TickReport,
     ) -> R<()> {
@@ -423,7 +607,7 @@ impl Engine {
                 })
                 .collect(),
         });
-        self.state.see_media(media_name, &imp.media_sha);
+        self.state.see_pack(pack_key, media_name);
         if self.state.stale.is_some() && self.eff_now(self.sys_now()?) < d.expires_at {
             self.state.stale = None;
         }
@@ -599,19 +783,16 @@ impl Engine {
             return Ok(());
         }
         // The same serial with other content (a release re-signed into
-        // another manifest) would be "already active" to the installers.
-        if let Some(i) = self.state.installed.get(&it.name) {
-            if i.ver.serial == m.version.serial && i.ver.digest != it.digest {
-                return self.refuse_item(
-                    idx,
-                    "equivocation",
-                    format!(
-                        "serial {} is installed with other content",
-                        m.version.serial
-                    ),
-                    rep,
-                );
-            }
+        // another manifest): refused while a version of that serial is
+        // installed, kept as a rollback target (review M4) or part of a
+        // switch, so a serial always names one content on this unit.
+        if let Some(role) = self.serial_taken(&it.name, m.version.serial, &it.digest) {
+            return self.refuse_item(
+                idx,
+                "equivocation",
+                format!("serial {} is {role} with other content", m.version.serial),
+                rep,
+            );
         }
         // 2. Policy at the moment of use: floors (unit and site),
         // revocations, the unit checks.
@@ -703,10 +884,24 @@ impl Engine {
                 v
             }
         };
-        // 4. The gate.
+        // 3b. The dpkg identity of a deb (review H2).
+        if let Some(d) = &ver.deb {
+            if let Some(why) = self.deb_conflict(&it.name, &it.digest, &pack_dir, &ver, d) {
+                return self.refuse_item(idx, "invalid", why, rep);
+            }
+        }
+        // 4. The gate. A window is judged only on a time nobody local can
+        // set (review L3): with an untrusted clock and no signed time it
+        // stays closed.
         if let Some(w) = &dep.maintenance_window {
-            if !in_window(w, sys) {
-                return self.defer(idx, "maintenance_window".into(), None, rep);
+            match window_time(self.cfg.trust.clock, sys, self.clock.signed_now_s()) {
+                None => {
+                    return self.defer(idx, "maintenance_window:no_trusted_time".into(), None, rep)
+                }
+                Some(t) if !in_window(w, t) => {
+                    return self.defer(idx, "maintenance_window".into(), None, rep)
+                }
+                Some(_) => {}
             }
         }
         let confirm = self.confirm_path(&dep.digest, &it.name);
@@ -788,10 +983,121 @@ impl Engine {
         }
     }
 
+    /// Where serial `serial` of `name` is already on this unit with
+    /// another digest than `digest` (installed, kept, or in the intent).
+    fn serial_taken(&self, name: &str, serial: u64, digest: &str) -> Option<&'static str> {
+        let other = |v: &Ver| v.serial == serial && v.digest != digest;
+        if self
+            .state
+            .installed
+            .get(name)
+            .is_some_and(|i| other(&i.ver))
+        {
+            return Some("installed");
+        }
+        if self
+            .state
+            .kept
+            .get(name)
+            .is_some_and(|k| k.iter().any(other))
+        {
+            return Some("kept as a rollback target");
+        }
+        if self
+            .state
+            .txn
+            .as_ref()
+            .is_some_and(|t| t.name == name && (other(&t.to) || t.from.as_ref().is_some_and(other)))
+        {
+            return Some("being switched");
+        }
+        None
+    }
+
+    /// Why the staged `.deb` `d` of `name` (RPK `digest`, version `ver`)
+    /// may not be installed (review H2), or `None`.
+    fn deb_conflict(
+        &self,
+        name: &str,
+        digest: &str,
+        pack_dir: &std::path::Path,
+        ver: &Ver,
+        d: &crate::state::DebInfo,
+    ) -> Option<String> {
+        // Another RPK name already owns this dpkg package.
+        let owned = |v: &Ver| v.deb.as_ref().is_some_and(|x| x.package == d.package);
+        if let Some(other) = self
+            .state
+            .installed
+            .iter()
+            .find(|(n, i)| n.as_str() != name && owned(&i.ver))
+            .map(|(n, _)| n.clone())
+            .or_else(|| {
+                self.state
+                    .kept
+                    .iter()
+                    .find(|(n, k)| n.as_str() != name && k.iter().any(owned))
+                    .map(|(n, _)| n.clone())
+            })
+        {
+            return Some(format!(
+                "dpkg package {} belongs to RPK {other} on this unit",
+                d.package
+            ));
+        }
+        // Floors apply to the dpkg identity too.
+        let floor = self.state.floor(&d.package);
+        if ver.serial < floor {
+            return Some(format!(
+                "dpkg package {} has the floor {floor}; serial {} is below it",
+                d.package, ver.serial
+            ));
+        }
+        // A higher serial never carries a lower dpkg version.
+        if let Some(i) = self.state.installed.get(name) {
+            if let Some(cur) = i.ver.deb.as_ref().filter(|_| ver.serial > i.ver.serial) {
+                match self.installer().deb_version_lt(&d.version, &cur.version) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Some(format!(
+                            "serial {} carries dpkg version {}, lower than the installed {} \
+                             (serial {})",
+                            ver.serial, d.version, cur.version, i.ver.serial
+                        ))
+                    }
+                    Err(e) => return Some(e),
+                }
+            }
+        }
+        // RoboDR's own packages: only from the designated programme.
+        let touched: Vec<&str> = crate::install::ROBODR_PACKAGES
+            .iter()
+            .copied()
+            .filter(|p| d.package == *p || d.relations.iter().any(|r| r == p))
+            .collect();
+        if !touched.is_empty() {
+            let programme = media::programme_of(pack_dir, digest);
+            let designated = self.cfg.install.robodr_programme.as_deref();
+            if designated.is_none() || programme.as_deref() != designated {
+                return Some(format!(
+                    "the .deb is, conflicts with, breaks, replaces or provides RoboDR's own \
+                     package(s) {} and its bundle's programme ({}) is not the designated RoboDR \
+                     programme ({})",
+                    touched.join(", "),
+                    programme.as_deref().unwrap_or("unknown"),
+                    designated.unwrap_or("none configured")
+                ));
+            }
+        }
+        None
+    }
+
     fn prepared(&self, name: &str, v: &Ver) -> bool {
         match v.kind {
             robodr_pkg::rpk::Kind::Deb => v.deb.is_some() && self.store.has_rpk(&v.digest),
-            k => crate::fsx::is_real_dir(&self.installer().version_dir(k, name, v.serial)),
+            k => {
+                crate::fsx::is_real_dir(&self.installer().version_dir(k, name, v.serial, &v.digest))
+            }
         }
     }
 

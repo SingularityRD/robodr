@@ -4,10 +4,18 @@
 //!
 //! | kind | prepared at | switch | active version |
 //! |---|---|---|---|
-//! | `files` | `<files_root>/<name>/<serial>/` | `<files_root>/<name>/current` symlink swap | the link target |
-//! | `config` | `<config_root>/<name>/<serial>/` | `current` symlink swap | the link target |
-//! | `robodr-rules` | `<state_dir>/rules/<name>/<serial>/` (checked, [`crate::rules`]) | `<rules_active>/<name>` symlink swap, then `rules_reload` | the link target |
+//! | `files` | `<files_root>/<name>/<serial>-<digest>/` | `<files_root>/<name>/current` symlink swap | the link target |
+//! | `config` | `<config_root>/<name>/<serial>-<digest>/` | `current` symlink swap | the link target |
+//! | `robodr-rules` | `<state_dir>/rules/<name>/<serial>-<digest>/` (checked, [`crate::rules`]) | `<rules_active>/<name>` symlink swap, then `rules_reload` | the link target |
 //! | `deb` | `<state_dir>/debs/<digest>/<file>.deb` (inspected with `dpkg-deb`) | `dpkg -i` | `dpkg-query` status and version |
+//!
+//! Version directories are named by serial **and RPK digest** (review M4):
+//! two RPKs with the same serial but other content (a release re-signed
+//! into another manifest) can never share, overwrite or be mistaken for
+//! each other's directory, so a kept rollback target always activates
+//! exactly the content the state records. (The engine also refuses such an
+//! RPK outright while either is installed, kept or in a switch.) A link
+//! written by an earlier version (`current -> <serial>`) is still read.
 //!
 //! Content paths were validated by `robodr-pkg` (relative, no `.`/`..`,
 //! no hidden or option-like component); they are checked again here and
@@ -19,8 +27,24 @@
 //!
 //! A `deb` with maintainer scripts (`preinst`, `postinst`, `prerm`,
 //! `postrm`, `config`) or `triggers` is refused unless the release quorum
-//! set `install.allow_maintainer_scripts`; its `Package` must stay the same
-//! across serials and its `Architecture` must be the unit's or `all`.
+//! set `install.allow_maintainer_scripts`.
+//!
+//! # The dpkg identity of a `deb` RPK (review H2)
+//!
+//! `dpkg --install` acts on the `.deb`'s own `Package`, not on the RPK
+//! name that floors and "one item per package" are keyed on. The RPK
+//! therefore **declares** the dpkg identity in its release-signed manifest:
+//! for kind `deb`, the RPK `name` is the dpkg `Package` and the RPK `arch`
+//! is the dpkg `Architecture` (an RPK for `amd64` or `arm64` may also carry
+//! an `Architecture: all` package; an RPK for `all` only that). A `.deb`
+//! whose control fields say anything else is refused ([`DebInfo`] records
+//! the package, version and relations), so a floor on an RPK name is a floor on that dpkg package and an
+//! RPK under another name cannot carry an older `.deb` of it. The engine
+//! also refuses a `Package` the state already records under another RPK
+//! name, a higher serial carrying a lower dpkg `Version`, and a `.deb`
+//! that is, conflicts with, breaks, replaces or provides one of RoboDR's
+//! own packages ([`ROBODR_PACKAGES`]) unless the RPK came in a bundle of
+//! the designated RoboDR programme (`install.robodr_programme`).
 
 use crate::config::Config;
 use crate::fsx;
@@ -64,10 +88,61 @@ pub fn supported(k: Kind) -> bool {
     )
 }
 
+/// RoboDR's own Debian packages (`packaging/build-deb.sh`). A `deb` RPK
+/// that is one of them, or whose `Conflicts`, `Breaks`, `Replaces` or
+/// `Provides` names one, would remove, replace or impersonate the
+/// software that guards the unit (agentd, the black box, this agent):
+/// refused unless the RPK came in a bundle of the designated RoboDR
+/// programme (`install.robodr_programme`; review H2).
+pub const ROBODR_PACKAGES: [&str; 2] = ["robodr", "robodr-focal"];
+
+/// The `.deb` control fields whose package names are recorded as
+/// relations ([`DebInfo::relations`]).
+pub const RELATION_FIELDS: [&str; 4] = ["Conflicts", "Breaks", "Replaces", "Provides"];
+
+/// Package names of a dpkg relation field value (`a (>= 1), b | c:any`).
+/// `None`: not a relation field dpkg would write.
+pub fn relation_names(v: &str) -> Option<Vec<String>> {
+    let ok = v.len() <= 8192
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" \t\n,|()<>=.+-~:_[]!".contains(&b));
+    if !ok {
+        return None;
+    }
+    let mut out = Vec::new();
+    for alt in v.split([',', '|']) {
+        let name: String = alt
+            .trim()
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '(' | ':' | '['))
+            .collect();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Some(out)
+}
+
 /// Maintainer-script members of a `.deb`'s control area.
 pub const MAINTAINER_SCRIPTS: [&str; 6] = [
     "preinst", "postinst", "prerm", "postrm", "config", "triggers",
 ];
+
+/// The directory name of a version: `<serial>-<digest>` (review M4).
+pub fn version_name(serial: u64, digest: &str) -> String {
+    format!("{serial}-{digest}")
+}
+
+/// Parse a version directory name: `<serial>-<64 hex>`, or a bare
+/// `<serial>` written before review M4 (no digest).
+pub fn parse_version_name(n: &str) -> Option<(u64, Option<String>)> {
+    let canonical = |s: &str| s.parse::<u64>().ok().filter(|v| v.to_string() == s);
+    match n.split_once('-') {
+        Some((s, d)) if robodr_pkg::common::is_hex64(d) => Some((canonical(s)?, Some(d.into()))),
+        Some(_) => None,
+        None => Some((canonical(n)?, None)),
+    }
+}
 
 /// The installers, bound to a configuration and the store.
 #[derive(Debug)]
@@ -86,9 +161,12 @@ impl Installer<'_> {
         }
     }
 
-    /// The prepared version directory of `name` / `serial` (not `deb`).
-    pub fn version_dir(&self, kind: Kind, name: &str, serial: u64) -> PathBuf {
-        self.versions_root(kind).join(name).join(serial.to_string())
+    /// The prepared version directory of `name` at `serial` with RPK
+    /// `digest` (not `deb`): `<root>/<name>/<serial>-<digest>`.
+    pub fn version_dir(&self, kind: Kind, name: &str, serial: u64, digest: &str) -> PathBuf {
+        self.versions_root(kind)
+            .join(name)
+            .join(version_name(serial, digest))
     }
 
     fn link(&self, kind: Kind, name: &str) -> PathBuf {
@@ -124,8 +202,8 @@ impl Installer<'_> {
         let pdir = root.join(&m.name);
         fsx::ensure_dir(&pdir, 0o755)
             .map_err(|e| PrepError::Refused(format!("{}: {e}", pdir.display())))?;
-        let vdir = pdir.join(m.version.serial.to_string());
-        if self.active_serial(m.kind, &m.name).ok().flatten() == Some(m.version.serial) {
+        let vdir = pdir.join(version_name(m.version.serial, &v.digest));
+        if self.is_active(m.kind, &m.name, v) {
             return Ok(());
         }
         fsx::remove_any(&vdir).map_err(|e| io(&vdir, e))?;
@@ -293,11 +371,39 @@ impl Installer<'_> {
         let package = self.deb_field(&deb, "Package")?;
         let version = self.deb_field(&deb, "Version")?;
         let arch = self.deb_field(&deb, "Architecture")?;
+        // The RPK declares the dpkg identity (review H2): its name is the
+        // Package, its arch the Architecture (or the .deb is `all`).
+        if package != m.name {
+            return Err(PrepError::Refused(format!(
+                "the .deb is dpkg package {package}, but a deb RPK's name is its dpkg Package \
+                 ({})",
+                m.name
+            )));
+        }
+        if arch != "all" && arch != m.arch.as_str() {
+            return Err(PrepError::Refused(format!(
+                "the .deb is for {arch}, the RPK declares {}",
+                m.arch.as_str()
+            )));
+        }
         if arch != "all" && arch != self.cfg.unit.arch.as_str() {
             return Err(PrepError::Refused(format!(
                 "the .deb is for {arch}, this unit is {}",
                 self.cfg.unit.arch.as_str()
             )));
+        }
+        let mut relations: Vec<String> = Vec::new();
+        for field in RELATION_FIELDS {
+            for n in self.deb_relation(&deb, field)? {
+                if !relations.contains(&n) {
+                    relations.push(n);
+                }
+            }
+        }
+        if relations.len() > 256 {
+            return Err(PrepError::Refused(
+                "the .deb declares more than 256 relations".into(),
+            ));
         }
         // Maintainer scripts: listed from the control area.
         let ctl = fsx::temp_sibling(&dir.join("control"), "ctl");
@@ -333,8 +439,53 @@ impl Installer<'_> {
                 scripts.join(", ")
             )));
         }
-        v.deb = Some(DebInfo { package, version });
+        v.deb = Some(DebInfo {
+            package,
+            version,
+            relations,
+        });
         Ok(())
+    }
+
+    /// The package names of relation field `field` of `deb` (empty when
+    /// the field is absent).
+    fn deb_relation(&self, deb: &Path, field: &str) -> Result<Vec<String>, PrepError> {
+        let r = self.tool(
+            &[
+                self.cfg.install.dpkg_deb.to_string_lossy().into_owned(),
+                "--field".into(),
+                deb.to_string_lossy().into_owned(),
+                field.into(),
+            ],
+            60,
+        );
+        if !r.success() || r.truncated {
+            return Err(PrepError::Refused(format!(
+                "dpkg-deb --field {field}: {}",
+                r.summary()
+            )));
+        }
+        relation_names(r.output.trim())
+            .ok_or_else(|| PrepError::Refused(format!("dpkg-deb: bad {field} field")))
+    }
+
+    /// `a` is an earlier dpkg version than `b` (`dpkg --compare-versions`).
+    pub fn deb_version_lt(&self, a: &str, b: &str) -> Result<bool, String> {
+        let r = self.tool(
+            &[
+                self.cfg.install.dpkg.to_string_lossy().into_owned(),
+                "--compare-versions".into(),
+                a.into(),
+                "lt".into(),
+                b.into(),
+            ],
+            60,
+        );
+        match r.code {
+            Some(0) if r.success() => Ok(true),
+            Some(1) if r.spawn_error.is_none() && !r.timed_out => Ok(false),
+            _ => Err(format!("dpkg --compare-versions: {}", r.summary())),
+        }
     }
 
     /// Switch to the prepared version `v` of `name`.
@@ -360,7 +511,7 @@ impl Installer<'_> {
                 }
             }
             kind => {
-                let vdir = self.version_dir(kind, name, v.serial);
+                let vdir = self.version_dir(kind, name, v.serial, &v.digest);
                 if !fsx::is_real_dir(&vdir) {
                     return Err(format!("{}: version not prepared", vdir.display()));
                 }
@@ -374,7 +525,7 @@ impl Installer<'_> {
                 let target = match kind {
                     // Absolute: the link lives outside the versions tree.
                     Kind::RobodrRules => vdir,
-                    _ => PathBuf::from(v.serial.to_string()),
+                    _ => PathBuf::from(version_name(v.serial, &v.digest)),
                 };
                 fsx::swap_symlink(&link, &target)
                     .map_err(|e| format!("{}: {e}", link.display()))?;
@@ -410,31 +561,58 @@ impl Installer<'_> {
         Ok(p)
     }
 
-    /// The active serial of a non-`deb` package (from its link).
-    pub fn active_serial(&self, kind: Kind, name: &str) -> Result<Option<u64>, String> {
+    /// The active version of a non-`deb` package (from its link): the
+    /// serial and, unless the link predates review M4, the RPK digest.
+    pub fn active_version(
+        &self,
+        kind: Kind,
+        name: &str,
+    ) -> Result<Option<(u64, Option<String>)>, String> {
         let link = self.link(kind, name);
         let Some(t) = fsx::read_link(&link).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let s = t
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.parse::<u64>().ok())
+        let file = t.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let (s, d) = parse_version_name(file)
             .ok_or_else(|| format!("{}: unexpected link target", link.display()))?;
-        if kind == Kind::RobodrRules && t != self.version_dir(kind, name, s) {
+        if kind == Kind::RobodrRules
+            && t.parent() != Some(self.versions_root(kind).join(name).as_path())
+        {
             return Err(format!(
                 "{}: link points outside the rules versions",
                 link.display()
             ));
         }
-        Ok(Some(s))
+        Ok(Some((s, d)))
+    }
+
+    /// The active serial of a non-`deb` package (from its link).
+    pub fn active_serial(&self, kind: Kind, name: &str) -> Result<Option<u64>, String> {
+        Ok(self.active_version(kind, name)?.map(|(s, _)| s))
+    }
+
+    /// `v` is exactly the active version of `name` (serial and digest).
+    fn is_active(&self, kind: Kind, name: &str, v: &Ver) -> bool {
+        matches!(
+            self.active_version(kind, name),
+            Ok(Some((s, Some(d)))) if s == v.serial && d == v.digest
+        )
     }
 
     /// Which of `known` is active for `name` (recovery). `Ok(None)`: none
     /// of them (absent, or a state none of them explains).
     pub fn active_of(&self, name: &str, kind: Kind, known: &[&Ver]) -> Result<Option<u64>, String> {
         if kind != Kind::Deb {
-            return self.active_serial(kind, name);
+            return Ok(match self.active_version(kind, name)? {
+                None => None,
+                // A link naming a digest is the known version with that
+                // digest, or none of them.
+                Some((s, Some(d))) => known
+                    .iter()
+                    .find(|v| v.serial == s && v.digest == d)
+                    .map(|v| v.serial),
+                Some((s, None)) => Some(s),
+            });
         }
         let Some(pkg) = known
             .iter()
@@ -464,10 +642,10 @@ impl Installer<'_> {
         let p = match v.kind {
             Kind::Deb => self.deb_dir(&v.digest),
             k => {
-                if self.active_serial(k, name).ok().flatten() == Some(v.serial) {
+                if self.is_active(k, name, v) {
                     return Ok(());
                 }
-                self.version_dir(k, name, v.serial)
+                self.version_dir(k, name, v.serial, &v.digest)
             }
         };
         fsx::remove_any(&p).map_err(|e| format!("{}: {e}", p.display()))

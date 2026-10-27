@@ -589,7 +589,9 @@ fn a_config_package_cannot_write_outside_its_root() {
     }
     assert_eq!(
         found,
-        vec![u.cfg.install.config_root.join("nav-config/2/d/b.yaml")]
+        vec![u
+            .version_dir(&u.cfg.install.config_root, "nav-config", 2)
+            .join("d/b.yaml")]
     );
 }
 

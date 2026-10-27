@@ -198,7 +198,9 @@ fn a_downgrade_below_the_floor_is_refused() {
         u.current(&u.cfg.install.files_root, "nav-stack").as_deref(),
         Some("3")
     );
-    assert!(!u.cfg.install.files_root.join("nav-stack/2").exists());
+    assert!(u
+        .version_dirs(&u.cfg.install.files_root, "nav-stack", 2)
+        .is_empty());
     let refused = u.notes_of("robodr.deliver.refused");
     assert!(
         refused.iter().any(|n| n["code"] == "below_floor"),
@@ -240,7 +242,7 @@ fn install_is_deferred_while_moving_slow_and_proceeds_when_idle() {
     }
     // Staged (the version directory exists), never switched.
     let files = &u.cfg.install.files_root;
-    assert!(files.join("nav-stack/1/ok").is_file());
+    assert!(u.version_dir(files, "nav-stack", 1).join("ok").is_file());
     assert_eq!(u.current(files, "nav-stack"), None);
     assert!(u.notes_of("robodr.deliver.activating").is_empty());
     // One deferral note per change of reason, not one per loop.

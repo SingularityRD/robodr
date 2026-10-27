@@ -34,8 +34,9 @@
 //! delivery (14a), OS A/B updates (14c), and the kinds `oci-image`,
 //! `model`, `robodr-profile` and `os-image` (refused as `unsupported`).
 
-// S10: `unsafe` is denied crate-wide; the one item that needs it (FFI to
-// libc's `kill(2)`, which std already links) carries a local
+// S10: `unsafe` is denied crate-wide; the items that need it (FFI to
+// libc, which std already links: `kill(2)` and `prctl` / `setrlimit` in
+// `runner`, the `*at` calls of `fdio`) carry a local
 // `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -60,9 +61,11 @@ pub mod clock;
 pub mod config;
 pub mod engine;
 pub mod fault;
+pub mod fdio;
 pub mod findings;
 pub mod fsx;
 pub mod health;
+pub mod highwater;
 pub mod install;
 pub mod journal;
 pub mod media;

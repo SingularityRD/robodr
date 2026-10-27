@@ -37,8 +37,11 @@
 #   * Findings: robot.deliver.* records in agentd's spool
 #     /var/lib/robodr/spool/agentd (no-replace record names), exported by
 #     the existing exporters. Contract robodr.findings 2.2 on the SOC side.
-#   * Safety state: agentd's /var/lib/robodr/spool/agentd/status.json with
-#     a configured safety_feed; no feed or a stale status reads unknown and
+#   * Safety state: agentd's status socket /run/robodr-agentd/status.sock
+#     (agentd's spool.status_socket), accepted only when SO_PEERCRED says
+#     it is served by robodr-agentd (or root), never from a file the
+#     exporters could write (review H1); with a configured safety_feed. No
+#     socket, another peer, no feed or a stale status reads unknown and
 #     every install waits.
 #   * sd_notify: READY=1 once the state and the black box are open (no
 #     watchdog: one pass may run dpkg or a health probe for minutes).
@@ -51,9 +54,31 @@
 # /etc/robodr-delivered-rules; probes drop to an unprivileged UID
 # (setgid / setgroups / setuid). The capability bounding set below is
 # what those need (and what a release-allowed maintainer script gets).
-# RestrictSUIDSGID= refuses setuid / setgid files: a .deb that ships one
-# fails to install (and rolls back). MemoryDenyWriteExecute= applies to
-# probes and maintainer scripts too (no JIT runtimes there).
+#
+# NOT A BOUNDARY FOR deb CONTENT (review I1): release signers are fully
+# trusted for kind deb, i.e. root-equivalent on the unit. A .deb without
+# maintainer scripts can still install systemd units, cron entries,
+# /etc/dpkg/dpkg.cfg.d hooks or setuid files, and this unit runs as root
+# and can reach PID 1 (systemctl). The options below limit what goes wrong
+# by accident and what a compromised agent does directly; they do not
+# contain release-approved content (docs/SECURE-DELIVERY.md §6.7).
+#
+# Hardening review (review I1), kept unless it breaks an ordinary install:
+#   * RestrictSUIDSGID= is NOT set: dpkg could not create the setuid /
+#     setgid files that ordinary packages ship (a script-less .deb with a
+#     setgid helper failed and rolled back). Release signers decide what a
+#     .deb contains (above).
+#   * SystemCallFilter= no longer denies @resources: probes get their own
+#     rlimits (setrlimit / prlimit64, review L1).
+#   * MemoryDenyWriteExecute= stays: dpkg, dpkg-deb and script-less
+#     installs never need W+X memory. A probe or a release-allowed
+#     maintainer script that runs a JIT (Java, Node.js, LuaJIT) fails and
+#     the release rolls back: give such a check its own service and use
+#     service_active.
+#   * ProtectKernelTunables= stays: script-less installs do not write
+#     /proc/sys or /sys. A release-allowed maintainer script that runs
+#     `sysctl -w` fails; ship a /etc/sysctl.d/*.conf file instead (applied
+#     by systemd-sysctl at boot, or by an operator).
 #
 # Installed disabled. Enable after commissioning and enrolment:
 #   systemctl enable --now robodr-deliverd
@@ -131,15 +156,15 @@ IPAddressDeny=any
 # --- Kernel interfaces / syscalls -------------------------------------------
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 LockPersonality=yes
 RemoveIPC=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 # @privileged stays allowed: chown (dpkg, spool records) and setuid /
-# setgid / setgroups (dropping to the probe user) are in it.
-SystemCallFilter=~@resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+# setgid / setgroups (dropping to the probe user) are in it. @resources
+# stays allowed: setrlimit / prlimit64 set each probe's limits (review L1).
+SystemCallFilter=~@obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
 SystemCallErrorNumber=EPERM
 
 [Install]

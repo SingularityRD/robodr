@@ -14,6 +14,7 @@ usage:
   robodr-deliverd once         --config FILE
   robodr-deliverd check-config --config FILE
   robodr-deliverd init-anchor  --config FILE --trust TRUST.json
+  robodr-deliverd reanchor     --config FILE --trust TRUST.json
   robodr-deliverd status       --config FILE
   robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
   robodr-deliverd --version
@@ -31,6 +32,11 @@ once          one pass (prints what it did as JSON; exit 0, or 1 on error).
 check-config  validate the configuration and exit.
 init-anchor   create the unit's trust anchor from a trust file accepted
               under the pinned roots and site (once, at enrolment).
+reanchor      after a lost state file the agent locks itself (no import,
+              no install) when its signed high-water record is gone too;
+              an operator presents the site's current trust file (the
+              anchor or a newer rotation; a new anchor if none is left)
+              and the lock is lifted. Stop the service first.
 status        print the state (installed versions, floors, deployment).
 confirm       record a local operator's confirmation for an RPK that
               requires one (install.requires_operator_present).
@@ -83,7 +89,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
     };
     let rest: Vec<String> = it.collect();
     let known: &[&str] = match cmd.as_str() {
-        "init-anchor" => &["config", "trust"],
+        "init-anchor" | "reanchor" => &["config", "trust"],
         "confirm" => &["config", "deployment", "package"],
         "run" | "once" | "check-config" | "status" => &["config"],
         other => {
@@ -114,6 +120,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
             Ok(())
         }
         "init-anchor" => init_anchor(&cfg, &a),
+        "reanchor" => reanchor(cfg, &a),
         "status" => status(&cfg),
         "confirm" => confirm(&cfg, &a),
         "once" => once(cfg),
@@ -149,6 +156,15 @@ fn init_anchor(cfg: &Config, a: &Args) -> Result<(), String> {
         "unit_ring": t.ring_of_unit(&cfg.unit.id),
     }));
     Ok(())
+}
+
+fn reanchor(cfg: Config, a: &Args) -> Result<(), String> {
+    let trust = a.req("trust")?.to_string();
+    let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    let v = e.reanchor(Path::new(&trust)).map_err(|e| e.0);
+    let closed = e.close().map_err(|e| e.0);
+    print(v?);
+    closed
 }
 
 fn status(cfg: &Config) -> Result<(), String> {

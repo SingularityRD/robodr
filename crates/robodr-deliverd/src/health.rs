@@ -5,9 +5,9 @@
 //! |---|---|
 //! | `service_active` | `systemctl is-active --quiet -- <unit>` (argv, bounded) |
 //! | `file_present` | the path is a regular file (symlinks followed: `current/...`) |
-//! | `probe` | the argv run without a shell as the probe user's UID, bounded in time and output ([`crate::runner`]) |
+//! | `probe` | the argv run without a shell as the probe user's UID, bounded in time and output, under resource limits, its leftovers killed ([`crate::runner`]) |
 //! | `ros2_node` | not evaluable on the unit in 13b: an RPK declaring it is refused before anything is installed |
-//! | agentd `ok` | `status.json` fresh and `state: ok` (config `health.require_agentd_ok`) |
+//! | agentd `ok` | agentd's status, from agentd itself ([`crate::safety`]), fresh and `state: ok` (config `health.require_agentd_ok`) |
 //!
 //! A check that cannot run (missing program, user that resolves
 //! differently than at staging, escaped process holding the pipe) fails.
@@ -143,12 +143,18 @@ fn probe(cfg: &Config, argv: &[String], user: &str, timeout_s: u32, v: &Ver) -> 
         }
         Err(e) => return (false, e),
     }
-    let r = runner::run(
+    let h = &cfg.health;
+    let r = runner::run_probe(
         argv,
-        Some(RunAs { uid, gid }),
+        RunAs { uid, gid },
         Limits {
             timeout: Duration::from_secs(u64::from(timeout_s)),
-            max_output: cfg.health.max_output_bytes as usize,
+            max_output: h.max_output_bytes as usize,
+        },
+        runner::ProbeLimits {
+            address_space: u64::from(h.probe_max_memory_mb).saturating_mul(1024 * 1024),
+            open_files: u64::from(h.probe_max_open_files),
+            processes: u64::from(h.probe_max_processes),
         },
     );
     (r.success(), r.summary())

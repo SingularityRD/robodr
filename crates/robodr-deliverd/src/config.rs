@@ -30,7 +30,7 @@ pub const CONFIG_FORMAT: &str = "robodr-deliverd-config/1";
 pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
 /// Usernames a probe may never run as, whatever the configuration says:
 /// root and the RoboDR service users (they hold keys and sockets).
-pub const ALWAYS_DENIED_USERS: [&str; 3] = ["root", "robodr", "robodr-exec"];
+pub const ALWAYS_DENIED_USERS: [&str; 4] = ["root", "robodr", "robodr-agentd", "robodr-exec"];
 
 /// Who this unit is (enrolment).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +161,14 @@ pub struct InstallCfg {
     /// targets), 1..=8.
     #[serde(default = "d_keep")]
     pub keep_versions: u32,
+    /// The designated RoboDR programme (a trust-file programme name): only
+    /// a `deb` RPK from a bundle of this programme may be, conflict with,
+    /// break, replace or provide one of RoboDR's own packages
+    /// (`robodr`, `robodr-focal`; review H2). `null` (default): no `deb`
+    /// RPK may touch them; RoboDR itself is then updated outside the
+    /// delivery agent (`install-bundle.sh`).
+    #[serde(default)]
+    pub robodr_programme: Option<String>,
 }
 
 impl Default for InstallCfg {
@@ -177,6 +185,7 @@ impl Default for InstallCfg {
             dpkg_root: None,
             dpkg_timeout_s: d_dpkg_timeout(),
             keep_versions: d_keep(),
+            robodr_programme: None,
         }
     }
 }
@@ -184,8 +193,11 @@ impl Default for InstallCfg {
 fn d_passwd() -> PathBuf {
     "/etc/passwd".into()
 }
+/// Review L2: system accounts (UID < 1000 on Debian / Ubuntu: daemons,
+/// a PLC or safety-gateway user, a database user) are never probe users
+/// by default; a site that wants one lowers `probe_uid_min` explicitly.
 fn d_uid_min() -> u32 {
-    100
+    1000
 }
 fn d_uid_max() -> u32 {
     59_999
@@ -202,6 +214,15 @@ fn d_max_output() -> u32 {
 fn d_service_timeout() -> u32 {
     30
 }
+fn d_probe_memory() -> u32 {
+    1024
+}
+fn d_probe_files() -> u32 {
+    256
+}
+fn d_probe_procs() -> u32 {
+    64
+}
 
 /// Health gate settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +232,8 @@ pub struct HealthCfg {
     #[serde(default = "d_passwd")]
     pub passwd: PathBuf,
     /// Probe UIDs must lie in `probe_uid_min..=probe_uid_max` (min >= 1).
+    /// Default 1000..=59999: regular accounts only, never a system
+    /// account (UID < 1000) nor `nobody` (65534).
     #[serde(default = "d_uid_min")]
     pub probe_uid_min: u32,
     #[serde(default = "d_uid_max")]
@@ -231,6 +254,17 @@ pub struct HealthCfg {
     /// Timeout of `systemctl is-active`, seconds (1..=300).
     #[serde(default = "d_service_timeout")]
     pub service_timeout_s: u32,
+    /// A probe's address space (`RLIMIT_AS`), MiB (16..=65536). Its CPU
+    /// time is limited to its timeout plus one second (review L1).
+    #[serde(default = "d_probe_memory")]
+    pub probe_max_memory_mb: u32,
+    /// A probe's open files (`RLIMIT_NOFILE`), 16..=4096.
+    #[serde(default = "d_probe_files")]
+    pub probe_max_open_files: u32,
+    /// Processes of the probe user (`RLIMIT_NPROC`, counted system-wide
+    /// for that UID), 1..=4096.
+    #[serde(default = "d_probe_procs")]
+    pub probe_max_processes: u32,
 }
 
 impl Default for HealthCfg {
@@ -244,24 +278,42 @@ impl Default for HealthCfg {
             require_agentd_ok: true,
             max_output_bytes: d_max_output(),
             service_timeout_s: d_service_timeout(),
+            probe_max_memory_mb: d_probe_memory(),
+            probe_max_open_files: d_probe_files(),
+            probe_max_processes: d_probe_procs(),
         }
     }
 }
 
 fn d_status() -> PathBuf {
-    "/var/lib/robodr/spool/agentd/status.json".into()
+    "/run/robodr-agentd/status.sock".into()
 }
 fn d_boot_id() -> PathBuf {
     "/proc/sys/kernel/random/boot_id".into()
 }
+fn d_agentd_user() -> String {
+    "robodr-agentd".into()
+}
 
-/// Where the live safety state is read.
+/// Where the live safety state is read, and from whom it is accepted
+/// (review H1, [`crate::safety`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyCfg {
-    /// agentd's `status.json` (its live `safety_feed` view).
+    /// agentd's status: its **status socket** (`spool.status_socket` of
+    /// agentd, default `/run/robodr-agentd/status.sock`), whose peer is
+    /// checked with `SO_PEERCRED`; or a status file, accepted only when
+    /// it and its directory are owned by agentd's user (or root) and
+    /// writable by nobody else.
     #[serde(default = "d_status")]
     pub agentd_status: PathBuf,
+    /// The user agentd runs as (its dedicated system user); with root, the
+    /// only writer the state is accepted from.
+    #[serde(default = "d_agentd_user")]
+    pub agentd_user: String,
+    /// The user database `agentd_user` is resolved in (files only).
+    #[serde(default = "d_passwd")]
+    pub passwd: PathBuf,
     #[serde(default = "d_boot_id")]
     pub boot_id: PathBuf,
 }
@@ -270,6 +322,8 @@ impl Default for SafetyCfg {
     fn default() -> Self {
         Self {
             agentd_status: d_status(),
+            agentd_user: d_agentd_user(),
+            passwd: d_passwd(),
             boot_id: d_boot_id(),
         }
     }
@@ -513,6 +567,7 @@ impl Config {
             ("health.passwd", &h.passwd),
             ("health.systemctl", &h.systemctl),
             ("safety.agentd_status", &self.safety.agentd_status),
+            ("safety.passwd", &self.safety.passwd),
             ("safety.boot_id", &self.safety.boot_id),
             ("blackbox.dir", &self.blackbox.dir),
             ("blackbox.key", &self.blackbox.key),
@@ -555,6 +610,9 @@ impl Config {
         if let Some(a) = &i.rules_validator {
             check_argv("install.rules_validator", a)?;
         }
+        if i.robodr_programme.as_deref().is_some_and(|p| !is_label(p)) {
+            return Err("install.robodr_programme: not a label".into());
+        }
         if !(1..=8).contains(&i.keep_versions) {
             return Err("install.keep_versions: 1..=8".into());
         }
@@ -564,6 +622,10 @@ impl Config {
         if h.probe_uid_min == 0 || h.probe_uid_min > h.probe_uid_max {
             return Err("health: need 1 <= probe_uid_min <= probe_uid_max".into());
         }
+        let au = &self.safety.agentd_user;
+        if au.is_empty() || au.len() > 32 || au.contains(':') || au.contains('\n') {
+            return Err("safety.agentd_user: a user name".into());
+        }
         if h.deny_users.len() > 64 || h.deny_users.iter().any(|n| n.is_empty() || n.len() > 32) {
             return Err("health.deny_users: at most 64 names".into());
         }
@@ -572,6 +634,16 @@ impl Config {
         }
         if !(1..=300).contains(&h.service_timeout_s) {
             return Err("health.service_timeout_s: 1..=300".into());
+        }
+        if !(16..=65536).contains(&h.probe_max_memory_mb)
+            || !(16..=4096).contains(&h.probe_max_open_files)
+            || !(1..=4096).contains(&h.probe_max_processes)
+        {
+            return Err(
+                "health: probe_max_memory_mb 16..=65536, probe_max_open_files 16..=4096, \
+                 probe_max_processes 1..=4096"
+                    .into(),
+            );
         }
         let f = &self.findings;
         if !robodr_ocsf::validate::is_valid_data_source(&f.data_source) {

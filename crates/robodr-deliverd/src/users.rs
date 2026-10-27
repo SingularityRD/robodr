@@ -5,8 +5,9 @@
 //! The pair is recorded with the staged version and resolved again before
 //! every probe run: a name that now resolves differently fails the probe.
 //!
-//! Refused: UID 0 or GID 0, a UID outside the configured range, the
-//! always-denied names (`root`, `robodr`, `robodr-exec`) and the configured
+//! Refused: UID 0 or GID 0, a UID outside the configured range (default
+//! `1000..=59999`: no system account, review L2), the always-denied names
+//! (`root`, `robodr`, `robodr-agentd`, `robodr-exec`) and the configured
 //! ones, a name listed twice in the database (ambiguous), and a database
 //! that is not a plain regular file of bounded size.
 

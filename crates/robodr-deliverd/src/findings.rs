@@ -10,13 +10,26 @@
 //!
 //! agentd numbers its records itself. Both producers therefore claim a
 //! record name with a **no-replace** hard link (`link(2)` fails if the name
-//! exists): this agent writes the record into its own `tmp.deliverd/`
-//! directory inside the spool (same file system), `fsync`s it and links it
-//! to `ready/<seq:020>.json`, moving on to the next number when the name is
-//! taken; agentd does the same since 13b (`robodr_agentd::spool`). Neither
-//! can overwrite the other's record. The record file is owned by the owner
-//! of `ready/` (agentd's user), mode 0640, so the exporters can read and
-//! rename it.
+//! exists), moving on to the next number when the name is taken; agentd
+//! does the same since 13b (`robodr_agentd::spool`). Neither can overwrite
+//! the other's record. The record file is owned by the owner of `ready/`
+//! (agentd's user), mode 0640, so the exporters can read and rename it.
+//!
+//! # Root in a directory another user owns (review M2)
+//!
+//! The spool belongs to agentd's user, who can rename, replace or symlink
+//! anything in it at any moment. This agent (root) therefore never acts on
+//! a path there: it opens the spool and `ready/` as directory descriptors
+//! (`O_NOFOLLOW`), writes the record into an **unnamed** file in `ready/`
+//! (`O_TMPFILE`), `fchown`s and `fsync`s it through its descriptor, and
+//! gives it its name with `linkat` from that descriptor (no-replace). No
+//! name is created, linked or removed through a directory that could have
+//! been swapped, and no temporary name exists for anyone to replace.
+//! Where `O_TMPFILE` is not available the file is created exclusively
+//! (`O_EXCL|O_NOFOLLOW`) under a hidden name in `ready/`, linked from its
+//! descriptor, and that name is unlinked relative to the held `ready/`
+//! descriptor ([`crate::fdio`]). The `tmp.deliverd/` directory of earlier
+//! versions is no longer used.
 //!
 //! `entity_context.profile` of these findings names the **delivery trust
 //! file** they were judged under (`delivery-trust-<version>` and its
@@ -31,9 +44,10 @@ use robodr_ocsf::{
 };
 use robodr_responder::SafetyState;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Rule ids (catalog entries in `robodr-ocsf`, contract 2.2).
@@ -261,10 +275,12 @@ fn record_seq(name: &str) -> Option<u64> {
     stem.parse().ok()
 }
 
-fn scan(dir: &Path) -> io::Result<(u64, u64)> {
+fn scan(dir: &File) -> io::Result<(u64, u64)> {
     let mut max = 0;
     let mut n = 0;
-    for e in fs::read_dir(dir)? {
+    // Listed through the held descriptor (the magic link names exactly
+    // the directory that was opened).
+    for e in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
         let e = e?;
         if let Some(s) = e.file_name().to_str().and_then(record_seq) {
             max = max.max(s);
@@ -272,6 +288,66 @@ fn scan(dir: &Path) -> io::Result<(u64, u64)> {
         }
     }
     Ok((max, n))
+}
+
+/// Test seam of [`spool_write`] (review M2): a hook called on this thread
+/// at each step (`"opened"`: the directories are held; `"written"`: the
+/// record is written and synced, not yet named), so a test can change the
+/// spool under the writer at exactly those points, and a switch that forces
+/// the named-temporary fallback. Unset (and never set) in production.
+#[doc(hidden)]
+pub mod seam {
+    use std::cell::{Cell, RefCell};
+
+    type Hook = Box<dyn FnMut(&str)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static NAMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Install (or clear) the hook on this thread.
+    pub fn set_hook(h: Option<Hook>) {
+        HOOK.with(|x| *x.borrow_mut() = h);
+    }
+
+    /// Force the named-temporary fallback on this thread.
+    pub fn force_named_temp(on: bool) {
+        NAMED.with(|x| x.set(on));
+    }
+
+    pub(crate) fn named_temp() -> bool {
+        NAMED.with(Cell::get)
+    }
+
+    pub(crate) fn hit(step: &str) {
+        HOOK.with(|x| {
+            if let Some(h) = x.borrow_mut().as_mut() {
+                h(step);
+            }
+        });
+    }
+}
+
+/// The record file, unnamed when the kernel and file system allow it.
+fn new_record_file(ready: &File, seq: u64) -> io::Result<(File, Option<String>)> {
+    if !seam::named_temp() {
+        match crate::fdio::tmpfile_in(ready, 0o640) {
+            Ok(f) => return Ok((f, None)),
+            // No O_TMPFILE here (EISDIR: old kernel; EOPNOTSUPP: file
+            // system; EINVAL): fall back to a named temporary.
+            Err(e) if matches!(e.raw_os_error(), Some(21 | 95 | 22)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        ".deliverd-{}-{seq}-{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let f = crate::fdio::create_at(ready, &name, 0o600)?;
+    Ok((f, Some(name)))
 }
 
 /// Write one spool record into `spool/ready/` with a no-replace link (see
@@ -285,22 +361,23 @@ pub fn spool_write(
     value: &str,
 ) -> Result<PathBuf, String> {
     let io_e = |p: &Path, e: io::Error| format!("{}: {e}", p.display());
-    let ready = spool.join("ready");
-    let acked = spool.join("acked");
-    if !crate::fsx::is_real_dir(&ready) || !crate::fsx::is_real_dir(&acked) {
-        return Err(format!(
-            "{}: not an agentd spool (no ready/ and acked/ directories)",
+    let not_spool = |e: io::Error| {
+        format!(
+            "{}: not an agentd spool (no ready/ and acked/ directories): {e}",
             spool.display()
-        ));
-    }
-    let owner = fs::metadata(&ready).map_err(|e| io_e(&ready, e))?;
-    let tmpdir = spool.join("tmp.deliverd");
-    crate::fsx::ensure_dir(&tmpdir, 0o700).map_err(|e| io_e(&tmpdir, e))?;
-    let (rmax, rn) = scan(&ready).map_err(|e| io_e(&ready, e))?;
+        )
+    };
+    let root = crate::fdio::open_dir(spool).map_err(not_spool)?;
+    let ready = crate::fdio::open_dir_at(&root, "ready").map_err(not_spool)?;
+    let acked = crate::fdio::open_dir_at(&root, "acked").map_err(not_spool)?;
+    let ready_path = spool.join("ready");
+    let owner = ready.metadata().map_err(|e| io_e(&ready_path, e))?;
+    seam::hit("opened");
+    let (rmax, rn) = scan(&ready).map_err(|e| io_e(&ready_path, e))?;
     if rn >= max_ready {
         return Err(FULL.into());
     }
-    let (amax, _) = scan(&acked).map_err(|e| io_e(&acked, e))?;
+    let (amax, _) = scan(&acked).map_err(|e| io_e(&spool.join("acked"), e))?;
     let mut seq = rmax.max(amax).saturating_add(1);
     for _ in 0..64 {
         let rec = SpoolRecord {
@@ -314,35 +391,30 @@ pub fn spool_write(
         };
         let bytes = serde_json::to_vec(&rec).map_err(|e| e.to_string())?;
         let name = format!("{seq:020}.json");
-        let tmp = tmpdir.join(format!("{name}.{}", std::process::id()));
-        let _ = fs::remove_file(&tmp);
-        {
-            let mut f: File = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o640)
-                .open(&tmp)
-                .map_err(|e| io_e(&tmp, e))?;
-            f.write_all(&bytes).map_err(|e| io_e(&tmp, e))?;
+        let (mut f, tmp_name) = new_record_file(&ready, seq).map_err(|e| io_e(&ready_path, e))?;
+        let written = (|| -> io::Result<()> {
+            f.write_all(&bytes)?;
             // Owned like the spool's own records, readable by its group.
-            std::os::unix::fs::fchown(&f, Some(owner.uid()), Some(owner.gid()))
-                .map_err(|e| io_e(&tmp, e))?;
-            f.set_permissions(fs::Permissions::from_mode(0o640))
-                .map_err(|e| io_e(&tmp, e))?;
-            f.sync_all().map_err(|e| io_e(&tmp, e))?;
+            std::os::unix::fs::fchown(&f, Some(owner.uid()), Some(owner.gid()))?;
+            f.set_permissions(fs::Permissions::from_mode(0o640))?;
+            f.sync_all()
+        })();
+        seam::hit("written");
+        let linked = written.and_then(|()| crate::fdio::link_fd_at(&f, &ready, &name));
+        if let Some(t) = &tmp_name {
+            // Relative to the held ready/ descriptor: at worst removes
+            // whatever the spool's owner put under that hidden name there.
+            let _ = crate::fdio::unlink_at(&ready, t);
         }
-        let dst = ready.join(&name);
-        let linked = fs::hard_link(&tmp, &dst);
-        let _ = fs::remove_file(&tmp);
         match linked {
             Ok(()) => {
-                crate::fsx::sync_dir(&ready).map_err(|e| io_e(&ready, e))?;
-                return Ok(dst);
+                ready.sync_all().map_err(|e| io_e(&ready_path, e))?;
+                return Ok(ready_path.join(&name));
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 seq = seq.saturating_add(1);
             }
-            Err(e) => return Err(io_e(&dst, e)),
+            Err(e) => return Err(io_e(&ready_path.join(&name), e)),
         }
     }
     Err("spool: no free record name after 64 attempts".into())

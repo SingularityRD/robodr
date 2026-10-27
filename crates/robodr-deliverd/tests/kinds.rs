@@ -260,7 +260,7 @@ fn rules_are_checked_switched_by_link_and_rolled_back_on_a_failed_reload() {
     let link = u.cfg.install.rules_active.join("nav-rules");
     assert_eq!(
         std::fs::read_link(&link).unwrap(),
-        u.cfg.state_dir.join("rules/nav-rules/1")
+        u.version_dir(&u.cfg.state_dir.join("rules"), "nav-rules", 1)
     );
     assert_eq!(
         std::fs::read_to_string(link.join("robodr/nav.toml")).unwrap(),
@@ -286,7 +286,7 @@ fn rules_are_checked_switched_by_link_and_rolled_back_on_a_failed_reload() {
     );
     assert_eq!(
         std::fs::read_link(&link).unwrap(),
-        u.cfg.state_dir.join("rules/nav-rules/1")
+        u.version_dir(&u.cfg.state_dir.join("rules"), "nav-rules", 1)
     );
     let rb = u.notes_of("robodr.deliver.rollback");
     assert!(
@@ -308,7 +308,7 @@ fn rules_are_checked_switched_by_link_and_rolled_back_on_a_failed_reload() {
     );
     assert_eq!(
         std::fs::read_link(&link).unwrap(),
-        u.cfg.state_dir.join("rules/nav-rules/1")
+        u.version_dir(&u.cfg.state_dir.join("rules"), "nav-rules", 1)
     );
 }
 

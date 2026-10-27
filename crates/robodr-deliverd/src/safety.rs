@@ -18,13 +18,41 @@
 //!   nothing about whether the robot is moving now.
 //!
 //! The feed itself goes to `unknown` when its sources go stale, so a dead
-//! PLC gateway defers installs too. Trust: `status.json` is written by the
-//! `robodr` user; whoever controls that user can claim `idle` to agentd's
-//! responder and to this gate alike (documented in OPERATIONS.md).
+//! PLC gateway defers installs too.
+//!
+//! # Only from agentd (review H1)
+//!
+//! The status is taken only from **agentd itself**, never from a file a
+//! network-facing service could write. agentd runs as its own system user
+//! (`robodr-agentd`), distinct from the exporters (`robodr-kafka-publish`,
+//! `robodr-uplink`, `robodr-spool-export` run as `robodr`), and serves its
+//! status on a unix socket (`spool.status_socket`,
+//! `/run/robodr-agentd/status.sock`). [`observe`]:
+//!
+//! * **socket** (the shipped configuration): connects and checks the peer
+//!   with `SO_PEERCRED`: the process that bound and serves it must run as
+//!   `safety.agentd_user` (resolved in `safety.passwd`, files only) or
+//!   root;
+//! * **regular file** (tests, lab setups): opened without following a
+//!   symlink relative to its directory's descriptor; the file and its
+//!   directory must be owned by that user or root and writable by nobody
+//!   else (no group or other write bit), so no other user can have put
+//!   or replaced it;
+//! * anything else, or a check that fails (another uid, unknown agentd
+//!   user and a non-root writer, a group-writable spool), is `unknown`:
+//!   the install is deferred.
+//!
+//! agentd's own safety input (`safety_feed.socket`, the PLC gateway) is
+//! protected the same way on agentd's side: socket mode and group, and an
+//! `SO_PEERCRED` check against the configured feeders
+//! (`robodr_agentd::safety`).
 
 use crate::config::SafetyCfg;
 use robodr_responder::SafetyState;
+use std::io::Read;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
+use std::time::Duration;
 
 /// Largest `status.json` read.
 pub const MAX_STATUS_BYTES: usize = 1024 * 1024;
@@ -118,12 +146,100 @@ pub fn boot_id(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The uids agentd's status is accepted from: root and `agentd_user`.
+pub fn trusted_uids(cfg: &SafetyCfg) -> Vec<u32> {
+    let mut v = vec![0];
+    let db = robodr_release::fsio::read_capped(&cfg.passwd, crate::users::MAX_PASSWD_BYTES)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    if let Some(ids) = db.and_then(|t| crate::users::lookup(&t, &cfg.agentd_user).ok()) {
+        if ids.uid != 0 {
+            v.push(ids.uid);
+        }
+    }
+    v
+}
+
+/// How long a status read may take (connect, read).
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn bounded(mut r: impl Read) -> Result<Vec<u8>, String> {
+    let mut b = Vec::new();
+    r.by_ref()
+        .take(MAX_STATUS_BYTES as u64 + 1)
+        .read_to_end(&mut b)
+        .map_err(|e| format!("agentd status unreadable: {e}"))?;
+    if b.len() > MAX_STATUS_BYTES {
+        return Err("agentd status too large".into());
+    }
+    Ok(b)
+}
+
+fn writer_ok(md: &std::fs::Metadata, trusted: &[u32]) -> bool {
+    trusted.contains(&md.uid()) && md.mode() & 0o022 == 0
+}
+
+/// Read agentd's status bytes from `path` (socket or file), accepted only
+/// from a writer in `trusted` (see the module docs).
+pub fn read_status(path: &Path, trusted: &[u32]) -> Result<Vec<u8>, String> {
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("no agentd status (agentd not running?)".into())
+        }
+        Err(e) => return Err(format!("agentd status unreadable: {e}")),
+    };
+    if md.file_type().is_socket() {
+        let s = std::os::unix::net::UnixStream::connect(path)
+            .map_err(|e| format!("agentd status socket: {e}"))?;
+        s.set_read_timeout(Some(STATUS_TIMEOUT))
+            .map_err(|e| format!("agentd status socket: {e}"))?;
+        let uid = robodr_agentd::host::peer_uid(&s)
+            .map_err(|e| format!("agentd status socket: peer credentials unreadable: {e}"))?;
+        if !trusted.contains(&uid) {
+            return Err(format!(
+                "agentd status socket is served by uid {uid}, not by agentd's user or root \
+                 (accepted: {trusted:?})"
+            ));
+        }
+        return bounded(s);
+    }
+    if !md.file_type().is_file() {
+        return Err("agentd status is neither a socket nor a regular file".into());
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Err("agentd status: bad path".into());
+    };
+    let d = crate::fdio::open_dir(dir).map_err(|e| format!("agentd status directory: {e}"))?;
+    let dmd = d
+        .metadata()
+        .map_err(|e| format!("agentd status directory: {e}"))?;
+    if !writer_ok(&dmd, trusted) {
+        return Err(format!(
+            "agentd status directory {} (uid {}, mode {:o}) can be written by others than \
+             agentd's user or root",
+            dir.display(),
+            dmd.uid(),
+            dmd.mode() & 0o7777
+        ));
+    }
+    let f = crate::fdio::open_read_at(&d, name).map_err(|e| format!("agentd status: {e}"))?;
+    let fmd = f.metadata().map_err(|e| format!("agentd status: {e}"))?;
+    if !fmd.is_file() || !writer_ok(&fmd, trusted) {
+        return Err(format!(
+            "agentd status (uid {}, mode {:o}) was not written by agentd's user or root",
+            fmd.uid(),
+            fmd.mode() & 0o7777
+        ));
+    }
+    bounded(f)
+}
+
 /// Read agentd's status now.
 pub fn observe(cfg: &SafetyCfg) -> Observed {
-    let bytes = match crate::fsx::read_optional(&cfg.agentd_status, MAX_STATUS_BYTES) {
-        Ok(Some(b)) => b,
-        Ok(None) => return Observed::unknown("no agentd status (agentd not running?)"),
-        Err(e) => return Observed::unknown(format!("agentd status unreadable: {e}")),
+    let bytes = match read_status(&cfg.agentd_status, &trusted_uids(cfg)) {
+        Ok(b) => b,
+        Err(why) => return Observed::unknown(why),
     };
     judge(
         &bytes,
@@ -155,6 +271,45 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::status;
     use super::*;
+
+    #[test]
+    fn the_status_is_taken_only_from_agentd_or_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("deliverd-safety-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let me = crate::users::effective_uid().unwrap();
+        let f = d.join("status.json");
+        std::fs::write(&f, b"{}").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_status(&f, &[me]).unwrap(), b"{}");
+        assert!(read_status(&f, &[me + 1]).is_err(), "another owner");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(read_status(&f, &[me]).is_err(), "group-writable file");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(read_status(&f, &[me]).is_err(), "group-writable directory");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let l = d.join("link.json");
+        std::os::unix::fs::symlink(&f, &l).unwrap();
+        assert!(read_status(&l, &[me]).is_err(), "symlink");
+        // A socket: the serving process's uid decides.
+        let sp = d.join("status.sock");
+        let srv = std::os::unix::net::UnixListener::bind(&sp).unwrap();
+        let t = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut c, _) = srv.accept().unwrap();
+                let _ = std::io::Write::write_all(&mut c, b"{\"x\":1}");
+            }
+        });
+        assert_eq!(read_status(&sp, &[me]).unwrap(), b"{\"x\":1}");
+        assert!(read_status(&sp, &[me + 1])
+            .unwrap_err()
+            .contains("served by uid"));
+        t.join().unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn only_idle_and_safe_state_allow_installs() {

@@ -48,8 +48,13 @@ pub const MAX_CHAINS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebInfo {
+    /// The dpkg `Package` (since review H2 always the RPK name).
     pub package: String,
     pub version: String,
+    /// Package names in the `.deb`'s `Conflicts`, `Breaks`, `Replaces`
+    /// and `Provides` (review H2; empty in a state written before it).
+    #[serde(default)]
+    pub relations: Vec<String>,
 }
 
 /// One version of a package that is (or was) installed and is in the
@@ -183,10 +188,44 @@ pub struct State {
     pub deployment: Option<ActiveDeployment>,
     pub txn: Option<Txn>,
     pub stale: Option<Stale>,
-    /// Media entries already handled: entry name -> SHA-256 of its
-    /// `deployment.json` bytes (imported, already accepted or refused), so
-    /// a refusal is reported once, not every loop.
+    /// Before review L4: media entries handled, by entry name and the
+    /// SHA-256 of their `deployment.json`. Still read (a state written by
+    /// an earlier version parses), cleared when the state is opened and
+    /// never written again: [`State::seen_packs`] replaces it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seen_media: BTreeMap<String, String>,
+    /// Media packs already handled (imported, already accepted or
+    /// refused), by **content digest** (`media::pack_digest`), oldest
+    /// first, so a refusal is reported once, not every loop, while a pack
+    /// whose content changed (a corrected copy under the same name) is
+    /// judged again (review L4).
+    #[serde(default)]
+    pub seen_packs: Vec<SeenPack>,
+    /// Set when the state file was lost and could not be restored
+    /// completely (review M1): no pack is imported and nothing is
+    /// installed or rolled back until an operator re-anchors the unit
+    /// (`robodr-deliverd reanchor`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<Locked>,
+}
+
+/// A media pack already handled (see [`State::seen_packs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeenPack {
+    /// `media::pack_digest` of the pack's whole content.
+    pub digest: String,
+    /// The media entry it was seen under (evidence only).
+    pub name: String,
+}
+
+/// Why installs are refused until an operator re-anchors (review M1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Locked {
+    /// Unix seconds (system clock) when the agent locked itself.
+    pub since: u64,
+    pub why: String,
 }
 
 impl State {
@@ -206,6 +245,8 @@ impl State {
             txn: None,
             stale: None,
             seen_media: BTreeMap::new(),
+            seen_packs: Vec::new(),
+            locked: None,
         }
     }
 
@@ -238,14 +279,21 @@ impl State {
         self.chains.sort_by(|a, b| a.programme.cmp(&b.programme));
     }
 
-    /// Remember a handled media entry (bounded: the oldest names go).
-    pub fn see_media(&mut self, name: &str, sha: &str) {
-        self.seen_media.insert(name.to_string(), sha.to_string());
-        while self.seen_media.len() > MAX_SEEN_MEDIA {
-            let Some(k) = self.seen_media.keys().next().cloned() else {
-                break;
-            };
-            self.seen_media.remove(&k);
+    /// Whether a pack with this content digest was handled already.
+    pub fn seen_pack(&self, digest: &str) -> bool {
+        self.seen_packs.iter().any(|p| p.digest == digest)
+    }
+
+    /// Remember a handled pack by its content digest (bounded: the oldest
+    /// go first).
+    pub fn see_pack(&mut self, digest: &str, name: &str) {
+        self.seen_packs.retain(|p| p.digest != digest);
+        self.seen_packs.push(SeenPack {
+            digest: digest.to_string(),
+            name: name.to_string(),
+        });
+        while self.seen_packs.len() > MAX_SEEN_MEDIA {
+            self.seen_packs.remove(0);
         }
     }
 
@@ -261,7 +309,11 @@ impl State {
                 && is_hex64(&v.digest)
                 && v.probe_users.len() <= 16
                 && v.deb.as_ref().is_none_or(|d| {
-                    d.package.len() <= 128 && d.version.len() <= 128 && !d.package.is_empty()
+                    d.package.len() <= 128
+                        && d.version.len() <= 128
+                        && !d.package.is_empty()
+                        && d.relations.len() <= 256
+                        && d.relations.iter().all(|r| !r.is_empty() && r.len() <= 128)
                 })
         };
         if self.floors.len() > MAX_PACKAGES
@@ -269,8 +321,23 @@ impl State {
             || self.kept.len() > MAX_PACKAGES
             || self.chains.len() > MAX_CHAINS
             || self.seen_media.len() > MAX_SEEN_MEDIA
+            || self.seen_packs.len() > MAX_SEEN_MEDIA
         {
             return bad("bounds");
+        }
+        if !self
+            .seen_packs
+            .iter()
+            .all(|p| is_hex64(&p.digest) && is_label(&p.name))
+        {
+            return bad("seen pack");
+        }
+        if self
+            .locked
+            .as_ref()
+            .is_some_and(|l| l.why.is_empty() || l.why.len() > 1024)
+        {
+            return bad("locked");
         }
         if !self.floors.keys().all(|k| is_pkg_name(k)) {
             return bad("floor name");

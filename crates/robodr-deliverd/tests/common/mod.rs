@@ -522,11 +522,39 @@ impl Unit {
         out
     }
 
-    /// The `current` link target serial of a files package.
+    /// The `current` link target serial of a files package (the link
+    /// names `<serial>-<digest>`; this is the serial).
     pub fn current(&self, root: &Path, name: &str) -> Option<String> {
         std::fs::read_link(root.join(name).join("current"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned())
+            .map(|t| t.split('-').next().unwrap_or_default().to_string())
+    }
+
+    /// The version directories of `name` under `root` for `serial`
+    /// (`<serial>-<digest>`; review M4: one per content).
+    pub fn version_dirs(&self, root: &Path, name: &str, serial: u64) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(root.join(name)) else {
+            return Vec::new();
+        };
+        let mut v: Vec<PathBuf> = rd
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{serial}-"))
+            })
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The single version directory of `name` / `serial` under `root`.
+    pub fn version_dir(&self, root: &Path, name: &str, serial: u64) -> PathBuf {
+        let v = self.version_dirs(root, name, serial);
+        assert_eq!(v.len(), 1, "version directories of {name} {serial}: {v:?}");
+        v[0].clone()
     }
 
     /// Black-box notes (payload JSON) of the delivery journal.

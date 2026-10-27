@@ -38,6 +38,7 @@ pub mod kinds {
     pub const STALE: &str = "robodr.deliver.stale";
     pub const STATE_RESTORED: &str = "robodr.deliver.state_restored";
     pub const TRUST_ROTATED: &str = "robodr.deliver.trust_rotated";
+    pub const REANCHORED: &str = "robodr.deliver.reanchored";
 }
 
 /// The open journal.

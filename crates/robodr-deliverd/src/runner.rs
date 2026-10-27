@@ -21,11 +21,31 @@
 //! * The group is signalled before the child is reaped (timeout), or only
 //!   while members of it still hold the pipes (after a normal exit), so
 //!   the group id cannot have been reused by an unrelated process.
+//!
+//! A **probe** (a run as another user) also gets (review L1):
+//!
+//! * **A reaper.** While a probe runs, this process is a child subreaper
+//!   (`PR_SET_CHILD_SUBREAPER`): whatever the probe leaves behind, even a
+//!   process that started its own session and closed every descriptor,
+//!   is re-parented here instead of to init. After the probe exits, every
+//!   such process (child of this process, running as the probe's UID, not
+//!   a run in progress; found through this process's own `children`
+//!   lists, which `ProtectProc=invisible` does not hide) is killed and
+//!   reaped, repeatedly until none is left, and the probe fails
+//!   (`left_processes`). They can be told apart
+//!   safely: a process cannot change its UID without privileges (and the
+//!   unit sets `NoNewPrivileges=`), and a child's pid cannot be reused
+//!   before it is reaped.
+//! * **Resource limits** of its own, set in the child before `execve`
+//!   ([`ProbeLimits`]): CPU seconds (the timeout plus one), address space,
+//!   open files and processes of its UID, so a probe cannot starve the
+//!   agent that shares its unit's `TasksMax=` and `MemoryMax=`.
 
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The environment every command gets (nothing is inherited).
@@ -44,6 +64,28 @@ pub struct Limits {
     pub timeout: Duration,
     /// Bytes of stdout + stderr kept (each stream keeps at most this).
     pub max_output: usize,
+}
+
+/// Resource limits of a probe (`setrlimit(2)` in the child; soft and hard
+/// alike, so the probe cannot raise them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeLimits {
+    /// `RLIMIT_AS`, bytes.
+    pub address_space: u64,
+    /// `RLIMIT_NOFILE`.
+    pub open_files: u64,
+    /// `RLIMIT_NPROC` (processes of the probe's UID, system-wide).
+    pub processes: u64,
+}
+
+impl Default for ProbeLimits {
+    fn default() -> Self {
+        Self {
+            address_space: 1024 * 1024 * 1024,
+            open_files: 256,
+            processes: 64,
+        }
+    }
 }
 
 /// What happened.
@@ -121,9 +163,172 @@ impl RunResult {
 }
 
 const SIGKILL: i32 = 9;
+const PR_SET_CHILD_SUBREAPER: i32 = 36;
+const WNOHANG: i32 = 1;
+const RLIMIT_CPU: i32 = 0;
+const RLIMIT_NPROC: i32 = 6;
+const RLIMIT_NOFILE: i32 = 7;
+const RLIMIT_AS: i32 = 9;
+
+#[repr(C)]
+struct RLimit {
+    cur: std::ffi::c_ulong,
+    max: std::ffi::c_ulong,
+}
 
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn prctl(option: i32, ...) -> i32;
+    fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+/// Children of this process spawned by [`run`] and not yet reaped (never
+/// taken for leftovers by a concurrent run).
+static LIVE: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+/// Probe runs in progress (the subreaper attribute is on while > 0).
+static REAPING: Mutex<usize> = Mutex::new(0);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `PR_SET_CHILD_SUBREAPER` on (`on`) or off for this process.
+// FFI: std has no prctl.
+#[allow(unsafe_code)]
+fn set_subreaper(on: bool) {
+    // SAFETY: prctl(PR_SET_CHILD_SUBREAPER, 0|1) takes integers only and
+    // changes one process attribute; no memory is passed.
+    unsafe {
+        prctl(PR_SET_CHILD_SUBREAPER, std::ffi::c_ulong::from(on));
+    }
+}
+
+fn reaper_acquire() {
+    let mut n = lock(&REAPING);
+    if *n == 0 {
+        set_subreaper(true);
+    }
+    *n += 1;
+}
+
+fn reaper_release() {
+    let mut n = lock(&REAPING);
+    *n = n.saturating_sub(1);
+    if *n == 0 {
+        set_subreaper(false);
+    }
+}
+
+/// The pids of this process's children, from its own
+/// `/proc/<pid>/task/<tid>/children` lists (readable even under
+/// `ProtectProc=invisible`, which hides the probe user's `/proc/<pid>`
+/// from root without `CAP_SYS_PTRACE`). `None`: the kernel has no such
+/// lists (`CONFIG_PROC_CHILDREN`).
+fn children() -> Option<Vec<u32>> {
+    let rd = std::fs::read_dir(format!("/proc/{}/task", std::process::id())).ok()?;
+    let mut any = false;
+    let mut out = Vec::new();
+    for t in rd.flatten() {
+        if let Ok(s) = std::fs::read_to_string(t.path().join("children")) {
+            any = true;
+            out.extend(s.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    any.then_some(out)
+}
+
+/// `(pid, zombie)` of this process's children that run as `uid` and are
+/// not a run in progress: what a probe left behind (re-parented here).
+/// A child whose `/proc` entry this process may not read is another
+/// user's: with `ProtectProc=invisible` that is how the probe user's
+/// processes look to root, and only a probe re-parents processes here.
+fn leftovers(uid: u32) -> Vec<(i32, bool)> {
+    let me = std::process::id();
+    let live = lock(&LIVE).clone();
+    let (cands, listed) = match children() {
+        Some(c) => (c, true),
+        None => (
+            std::fs::read_dir("/proc")
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            false,
+        ),
+    };
+    let mut out = Vec::new();
+    for pid in cands {
+        if live.contains(&pid) || pid == me {
+            continue;
+        }
+        let Ok(p) = i32::try_from(pid) else {
+            continue;
+        };
+        let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            if listed {
+                out.push((p, false));
+            }
+            continue;
+        };
+        let field = |k: &str| {
+            st.lines()
+                .find_map(|l| l.strip_prefix(k))
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string()
+        };
+        let ppid = field("PPid:").parse::<u32>().ok();
+        let ruid = field("Uid:")
+            .split_whitespace()
+            .next()
+            .and_then(|u| u.parse::<u32>().ok());
+        if ppid == Some(me) && ruid == Some(uid) {
+            out.push((p, field("State:").starts_with('Z')));
+        }
+    }
+    out
+}
+
+/// Kill and reap everything a probe running as `uid` left behind; the
+/// number of live processes killed.
+// FFI: std can signal and wait only for the `Child` it spawned.
+#[allow(unsafe_code)]
+fn reap_leftovers(uid: u32) -> usize {
+    let mut killed = 0;
+    for _ in 0..64 {
+        let l = leftovers(uid);
+        if l.is_empty() {
+            break;
+        }
+        for (pid, zombie) in &l {
+            if !zombie && *pid > 1 {
+                // SAFETY: integers only. `pid` is a child of this process
+                // that is not reaped yet, so the pid cannot have been
+                // reused by an unrelated process.
+                unsafe {
+                    kill(*pid, SIGKILL);
+                }
+                killed += 1;
+            }
+        }
+        for (pid, _) in &l {
+            for _ in 0..500 {
+                let mut st: i32 = 0;
+                // SAFETY: `st` is a valid, writable i32 for the call.
+                let r = unsafe { waitpid(*pid, &mut st, WNOHANG) };
+                if r != 0 {
+                    break; // reaped (r == pid) or not our child (-1)
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    killed
 }
 
 /// `SIGKILL` the process group `pgid` (`kill(-pgid, SIGKILL)`).
@@ -165,8 +370,24 @@ fn reader(mut r: impl Read + Send + 'static, max: usize) -> mpsc::Receiver<(Vec<
     rx
 }
 
-/// Run `argv` under `limits`, optionally as `user`.
+/// Run `argv` under `limits`, optionally as `user` (a probe, with
+/// [`ProbeLimits::default`] and the reaper).
 pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
+    match user {
+        Some(u) => run_probe(argv, u, limits, ProbeLimits::default()),
+        None => run_inner(argv, None, limits),
+    }
+}
+
+/// Run `argv` as the probe user `user` with `rl` (see the module docs).
+pub fn run_probe(argv: &[String], user: RunAs, limits: Limits, rl: ProbeLimits) -> RunResult {
+    reaper_acquire();
+    let r = run_inner(argv, Some((user, rl)), limits);
+    reaper_release();
+    r
+}
+
+fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits) -> RunResult {
     let start = Instant::now();
     let mut res = RunResult {
         code: None,
@@ -198,17 +419,25 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    if let Some(u) = user {
+    if let Some((u, rl)) = user {
         cmd.gid(u.gid).uid(u.uid);
+        let cpu = limits.timeout.as_secs().saturating_add(1);
+        set_limits(&mut cmd, cpu, rl);
     }
+    // Registered before it can exit, so no concurrent run takes it for a
+    // leftover.
+    let mut live = lock(&LIVE);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            drop(live);
             res.spawn_error = Some(robodr_pkg::common::trunc(&e.to_string()));
             res.elapsed_ms = start.elapsed().as_millis() as u64;
             return res;
         }
     };
+    live.insert(child.id());
+    drop(live);
     let pgid = child.id();
     let out_rx = child.stdout.take().map(|s| reader(s, limits.max_output));
     let err_rx = child.stderr.take().map(|s| reader(s, limits.max_output));
@@ -226,6 +455,7 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    lock(&LIVE).remove(&pgid);
     if let Some(st) = status {
         res.code = st.code();
         res.signal = st.signal();
@@ -243,6 +473,15 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
     if got.iter().any(Option::is_none) {
         res.left_processes = true;
         kill_group(pgid);
+    }
+    // A probe's leftovers, wherever they went (own session, no pipes):
+    // re-parented here by the subreaper, killed and reaped.
+    if let Some((u, _)) = user {
+        if reap_leftovers(u.uid) > 0 {
+            res.left_processes = true;
+        }
+    }
+    if got.iter().any(Option::is_none) {
         for (g, rx) in got.iter_mut().zip(&rxs) {
             if g.is_none() {
                 *g = rx.recv_timeout(grace).ok();
@@ -266,6 +505,34 @@ pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
     res.output = String::from_utf8_lossy(&kept).into_owned();
     res.elapsed_ms = start.elapsed().as_millis() as u64;
     res
+}
+
+/// Set the probe's limits in the child, after it dropped to the probe user
+/// and before `execve`.
+// FFI: std has no setrlimit; `pre_exec` is unsafe by contract.
+#[allow(unsafe_code)]
+fn set_limits(cmd: &mut Command, cpu_s: u64, rl: ProbeLimits) {
+    let set = [
+        (RLIMIT_CPU, cpu_s),
+        (RLIMIT_AS, rl.address_space),
+        (RLIMIT_NOFILE, rl.open_files),
+        (RLIMIT_NPROC, rl.processes),
+    ];
+    // SAFETY: the closure runs in the forked child before `execve`; it
+    // only calls setrlimit(2) (async-signal-safe) on values computed
+    // before the fork, allocates nothing and takes no lock.
+    unsafe {
+        cmd.pre_exec(move || {
+            for (res, v) in set {
+                let v = std::ffi::c_ulong::try_from(v).unwrap_or(std::ffi::c_ulong::MAX);
+                let l = RLimit { cur: v, max: v };
+                if setrlimit(res, &l) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(test)]

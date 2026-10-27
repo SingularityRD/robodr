@@ -1,6 +1,7 @@
 //! Time sources. Expiry (trust file, deployments, RPKs) is judged on
-//! [`effective_now`]; maintenance windows on the system clock; freshness of
-//! agentd's status on `CLOCK_MONOTONIC` and the boot id.
+//! [`effective_now`]; maintenance windows on [`window_time`] (the system
+//! clock only when it is trusted); freshness of agentd's status on
+//! `CLOCK_MONOTONIC` and the boot id.
 
 use crate::config::ClockTrust;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +15,14 @@ pub trait Clock: Send {
     /// Unix milliseconds (findings' `first_seen` / `last_seen`).
     fn now_ms(&self) -> Result<u64, String> {
         Ok(self.now_s()?.saturating_mul(1000))
+    }
+    /// The current time from a **signed** source (Unix seconds), when the
+    /// unit has one: a time a local attacker cannot set. None here (13b
+    /// has no such source; a TPM- or depot-signed time source plugs in
+    /// here). With `clock: untrusted` it is the only time a maintenance
+    /// window is judged on ([`window_time`]).
+    fn signed_now_s(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -64,6 +73,19 @@ pub fn effective_now(trust: ClockTrust, system: u64, time_floor: u64) -> u64 {
     match trust {
         ClockTrust::Trusted => system.max(time_floor),
         ClockTrust::Untrusted => time_floor,
+    }
+}
+
+/// The time a maintenance window is judged on (review L3): the system
+/// clock when it is trusted; with `clock: untrusted` only a signed current
+/// time ([`Clock::signed_now_s`]). `None`: no trustworthy current time, so
+/// every window stays **closed** (whoever can set the system clock must
+/// not be able to open one). The signed time floor of the state is not a
+/// substitute: it is a time in the past, not "now".
+pub fn window_time(trust: ClockTrust, system: u64, signed: Option<u64>) -> Option<u64> {
+    match trust {
+        ClockTrust::Trusted => Some(system),
+        ClockTrust::Untrusted => signed,
     }
 }
 
@@ -132,6 +154,14 @@ mod tests {
             duration_minutes: 2,
         };
         assert!(in_window(&sun, mon)); // Mon 00:00 follows Sun 23:59
+    }
+
+    #[test]
+    fn an_untrusted_clock_never_opens_a_window() {
+        assert_eq!(window_time(ClockTrust::Trusted, 100, None), Some(100));
+        assert_eq!(window_time(ClockTrust::Untrusted, 100, None), None);
+        assert_eq!(window_time(ClockTrust::Untrusted, 100, Some(7)), Some(7));
+        assert_eq!(SystemClock.signed_now_s(), None);
     }
 
     #[test]

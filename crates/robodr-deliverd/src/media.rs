@@ -190,12 +190,129 @@ pub fn list_media(media_dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// SHA-256 of a pack's `deployment.json` (bounded read), to recognise a
-/// pack already handled without judging it again.
+/// SHA-256 of a pack's `deployment.json` (bounded read).
 pub fn media_key(pack: &Path) -> Option<String> {
     read_capped(&pack.join(DEPLOYMENT_FILE), MAX_DEPLOYMENT_BYTES)
         .ok()
         .map(|b| sha256_hex(&b))
+}
+
+/// Most entries a pack walk ([`pack_stamp`], [`pack_digest`]) looks at.
+pub const MAX_PACK_ENTRIES: usize = 65_536;
+/// Deepest directory level a pack walk descends to (a pack is
+/// `bundles/<b>/<rpk>/chunks/<file>`: 4 levels below the pack).
+pub const MAX_PACK_DEPTH: usize = 8;
+
+/// One entry of a pack walk: relative path and metadata (never followed).
+fn walk(pack: &Path) -> Option<Vec<(String, fs::Metadata)>> {
+    fn go(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        out: &mut Vec<(String, fs::Metadata)>,
+    ) -> Option<()> {
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        for e in fs::read_dir(dir).ok()? {
+            names.push(e.ok()?.file_name());
+            if out.len() + names.len() > MAX_PACK_ENTRIES {
+                return None;
+            }
+        }
+        names.sort();
+        for n in names {
+            let p = dir.join(&n);
+            let md = fs::symlink_metadata(&p).ok()?;
+            let rel = p.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            let is_dir = md.file_type().is_dir();
+            out.push((rel, md));
+            if is_dir && depth < MAX_PACK_DEPTH {
+                go(root, &p, depth + 1, out)?;
+            }
+        }
+        Some(())
+    }
+    let mut out = Vec::new();
+    go(pack, pack, 0, &mut out)?;
+    Some(out)
+}
+
+fn kind_of(md: &fs::Metadata) -> &'static str {
+    let t = md.file_type();
+    if t.is_dir() {
+        "d"
+    } else if t.is_file() {
+        "f"
+    } else if t.is_symlink() {
+        "l"
+    } else {
+        "o"
+    }
+}
+
+/// A cheap fingerprint of a pack's tree (review L4): every entry's
+/// relative path, type, size, inode, `mtime` and `ctime` (nanoseconds),
+/// hashed. Any write to the pack changes it (a write moves `ctime`, which
+/// no unprivileged process can set back), so an unchanged stamp means the
+/// [`pack_digest`] computed for it still holds. `None`: unreadable or
+/// beyond the walk's bounds.
+pub fn pack_stamp(pack: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut h = robodr_blackbox::crypto::Sha256::new();
+    for (rel, md) in walk(pack)? {
+        h.update(
+            format!(
+                "{rel}\0{}\0{}\0{}\0{}.{}\0{}.{}\n",
+                kind_of(&md),
+                md.len(),
+                md.ino(),
+                md.mtime(),
+                md.mtime_nsec(),
+                md.ctime(),
+                md.ctime_nsec()
+            )
+            .as_bytes(),
+        );
+    }
+    Some(robodr_blackbox::crypto::to_hex(&h.finalize()))
+}
+
+/// The **content** digest of a pack (review L4): SHA-256 over every
+/// entry's relative path and type, and the SHA-256 of each regular file's
+/// bytes (a symlink's target for a symlink). The agent remembers packs it
+/// has handled by this digest, not by their directory name, so a
+/// corrected pack copied under the same name is judged again, and the
+/// same pack under another name is not reported twice. `None`: unreadable
+/// or beyond the walk's bounds.
+pub fn pack_digest(pack: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut h = robodr_blackbox::crypto::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    for (rel, md) in walk(pack)? {
+        h.update(format!("{rel}\0{}\0", kind_of(&md)).as_bytes());
+        let p = pack.join(&rel);
+        if md.file_type().is_file() {
+            let mut f = fs::File::open(&p).ok()?;
+            let mut fh = robodr_blackbox::crypto::Sha256::new();
+            let mut n: u64 = 0;
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(k) => {
+                        fh.update(&buf[..k]);
+                        n += k as u64;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return None,
+                }
+            }
+            h.update(format!("{n}\0").as_bytes());
+            h.update(&fh.finalize());
+        } else if md.file_type().is_symlink() {
+            h.update(fs::read_link(&p).ok()?.as_os_str().as_encoded_bytes());
+        }
+        h.update(b"\n");
+    }
+    Some(robodr_blackbox::crypto::to_hex(&h.finalize()))
 }
 
 /// The exact top-level layout: four files and `bundles/` with 1..=16
@@ -452,6 +569,24 @@ pub fn find_rpk(pack_dir: &Path, digest: &str) -> Option<PathBuf> {
             if robodr_pkg::rpk::rpk_digest(&mb) == digest {
                 return Some(d);
             }
+        }
+    }
+    None
+}
+
+/// The programme of the bundle that carries RPK `digest` in an imported
+/// (verified) pack.
+pub fn programme_of(pack_dir: &Path, digest: &str) -> Option<String> {
+    let rd = fs::read_dir(pack_dir.join(BUNDLES_DIR)).ok()?;
+    for e in rd.flatten() {
+        let Ok(b) = read_capped(&e.path().join(BUNDLE_FILE), MAX_BUNDLE_BYTES) else {
+            continue;
+        };
+        let Ok(m) = bundle::parse_bundle(&b) else {
+            continue;
+        };
+        if m.rpks.iter().any(|r| r.digest == digest) {
+            return Some(m.programme);
         }
     }
     None
