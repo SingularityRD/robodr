@@ -41,7 +41,7 @@ use robodr_executor::client::Client;
 use robodr_executor::decision::codes;
 use robodr_executor::engine::{Outcome, Status as ExStatus};
 use robodr_executor::journal::{Event, EventKind};
-use robodr_executor::order::{ExcludedLocator, Locator, Order, Origin, Target};
+use robodr_executor::order::{ExcludedAddress, ExcludedLocator, Locator, Order, Origin, Target};
 use robodr_executor::proto::Key;
 use robodr_executor::soc::SocRequest;
 use robodr_responder::{ActionId, Morphology, ResponseAction, RestrictTarget, SafetyState, Step};
@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::api::{
     AcceptedAction, ActionExecutor, ExecutorOutcome, Meta, QuarantineScope, ScopeExcluded,
+    ScopeExcludedAddress,
 };
 
 fn default_socket() -> PathBuf {
@@ -519,6 +520,16 @@ fn map(o: &Outcome) -> Option<ExecutorOutcome> {
                         reason: x.reason.clone(),
                     })
                     .collect(),
+                addresses: q.addresses.iter().map(ToString::to_string).collect(),
+                excluded_addresses: q
+                    .excluded_addresses
+                    .iter()
+                    .map(|x| ScopeExcludedAddress {
+                        address: x.ip.to_string(),
+                        reason: x.reason.clone(),
+                    })
+                    .collect(),
+                evidence_truncated: q.evidence_truncated,
             }),
             None => ExecutorOutcome::Verified,
         },
@@ -571,6 +582,9 @@ pub fn order_for(a: &AcceptedAction<'_>, own: Morphology, now_ms: u64) -> Order 
                     locators: Vec::new(),
                     guid_only: false,
                     excluded: Vec::new(),
+                    addresses: Vec::new(),
+                    excluded_addresses: Vec::new(),
+                    evidence_truncated: false,
                 },
                 Err(_) => Target::Node { name: g.clone() },
             },
@@ -705,6 +719,9 @@ pub fn orders_for_plan(req: &ExecutionRequest<'_>, own: Morphology, now_ms: u64)
                         locators: Vec::new(),
                         guid_only: false,
                         excluded: Vec::new(),
+                        addresses: Vec::new(),
+                        excluded_addresses: Vec::new(),
+                        evidence_truncated: false,
                     },
                 ),
                 // A source that is not a GUID prefix cannot be quarantined.
@@ -842,6 +859,10 @@ fn locator(sa: SocketAddr) -> Option<Locator> {
 /// Why a vouched locator is not in the order (review R2-6).
 pub const OVER_LIMIT: &str = "over the order's locator limit (16): not acted on";
 pub const NOT_UNICAST: &str = "not a unicast locator (port 0, unspecified or multicast)";
+/// Why a vouched source address is not in the order (review R3-1).
+pub const OVER_LIMIT_ADDRESSES: &str = "over the order's address limit (16): not cut whole";
+pub const NOT_UNICAST_ADDRESS: &str = "not a unicast address (unspecified or multicast)";
+const _: () = assert!(robodr_executor::order::MAX_ADDRESSES == 16);
 const _: () = assert!(robodr_executor::order::MAX_LOCATORS == 16);
 
 /// Fill a participant order's locators when it carries none, with what
@@ -858,9 +879,12 @@ pub fn attach_locators(
         locators,
         guid_only,
         excluded,
+        addresses,
+        excluded_addresses,
+        evidence_truncated,
     } = &mut o.target
     {
-        if locators.is_empty() {
+        if locators.is_empty() && addresses.is_empty() {
             let t = vouch(&guid_prefix.0, book.get(&guid_prefix.0));
             let mut left: Vec<(SocketAddr, &str)> = t.excluded;
             // Review R2-6: what does not fit the order (or is not a unicast
@@ -874,6 +898,28 @@ pub fn attach_locators(
                     None => left.push((sa, NOT_UNICAST)),
                 }
             }
+            // Review R3-1: the observed source addresses, cut whole.
+            let mut left_addr: Vec<(IpAddr, &str)> = t.excluded_addresses;
+            for a in t.addresses {
+                if a.is_unspecified() || a.is_multicast() {
+                    left_addr.push((a, NOT_UNICAST_ADDRESS));
+                } else if addresses.len() < robodr_executor::order::MAX_ADDRESSES {
+                    addresses.push(a);
+                } else {
+                    left_addr.push((a, OVER_LIMIT_ADDRESSES));
+                }
+            }
+            *evidence_truncated = t.evidence_truncated
+                || left_addr.len() > robodr_executor::order::MAX_EXCLUDED_ADDRESSES
+                || left.len() > robodr_executor::order::MAX_EXCLUDED;
+            *excluded_addresses = left_addr
+                .into_iter()
+                .take(robodr_executor::order::MAX_EXCLUDED_ADDRESSES)
+                .map(|(ip, why)| ExcludedAddress {
+                    ip,
+                    reason: why.into(),
+                })
+                .collect();
             *guid_only = t.guid_only;
             *excluded = left
                 .into_iter()
@@ -1055,6 +1101,10 @@ mod tests {
                 port: 7410,
                 reason: "why".into(),
             }],
+            addresses: Vec::new(),
+            excluded_addresses: Vec::new(),
+            evidence_truncated: false,
+            containment: None,
         });
         match map(&o) {
             Some(ExecutorOutcome::VerifiedQuarantine(q)) => {
@@ -1115,6 +1165,9 @@ mod tests {
                 locators: Vec::new(),
                 guid_only: false,
                 excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
             ttl_s: None,
             judged_state: SafetyState::Idle,
@@ -1163,6 +1216,9 @@ mod tests {
                     excluded: vec![("10.0.0.9:7410".parse().unwrap(), "why")],
                     known: true,
                     guid_only: true,
+                    addresses: vec!["10.0.0.7".parse().unwrap(), "239.255.0.1".parse().unwrap()],
+                    excluded_addresses: vec![("10.0.0.9".parse().unwrap(), "seen elsewhere")],
+                    evidence_truncated: true,
                 }
             },
             &book,
@@ -1178,10 +1234,18 @@ mod tests {
             Target::Participant {
                 guid_only,
                 excluded,
+                addresses,
+                excluded_addresses,
+                evidence_truncated,
                 ..
             } => {
                 assert!(guid_only);
                 assert_eq!(excluded[0].reason, "why");
+                // Review R3-1: the addresses go along (multicast left out).
+                assert_eq!(addresses, &vec!["10.0.0.7".parse::<IpAddr>().unwrap()]);
+                assert_eq!(excluded_addresses.len(), 2, "{excluded_addresses:?}");
+                assert_eq!(excluded_addresses[1].reason, NOT_UNICAST_ADDRESS);
+                assert!(evidence_truncated);
             }
             _ => panic!(),
         }

@@ -1090,12 +1090,13 @@ fn review_m7_an_event_input_does_not_bypass_the_binding_tables_refusal() {
 /// what was cut and left out (`state.quarantine`).
 #[test]
 fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
-    // GUID prefix only: every locator is on an address it never sent from.
-    let frames = vec![
-        spdp_from(v4(66), ROGUE, &[v4(68)]),
-        writer_from(v4(66), ROGUE),
-    ];
-    let (v, _) = soc_quarantine(
+    // GUID prefix only: every locator is on an address it never sent from,
+    // and the address it sends from is outside the executor's quarantine
+    // scope (since review R3-1 an in-scope one is cut whole: `partial`,
+    // `review3_r3_1_*`).
+    let out = std::net::Ipv4Addr::new(10, 99, 0, 66);
+    let frames = vec![spdp_from(out, ROGUE, &[v4(68)]), writer_from(out, ROGUE)];
+    let (v, table) = soc_quarantine(
         "rv2-r2-3-guid",
         &frames,
         std::time::Duration::from_millis(10),
@@ -1105,6 +1106,7 @@ fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
     assert_eq!(v["status"], "verified", "{v}");
     assert_eq!(v["in_force"], true, "{v}");
     assert_eq!(v["containment"], "guid_only", "{v}");
+    assert_containment_matches_rules(&v, &table);
     let q = &v["state"]["quarantine"];
     assert_eq!(q["locators"], json!([]), "{v}");
     let ex = q["excluded"].as_array().unwrap_or_else(|| panic!("{v}"));
@@ -1113,12 +1115,22 @@ fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
             && x["reason"].as_str().unwrap().contains("never seen sending")),
         "{v}"
     );
+    assert_eq!(q["addresses"], json!([]), "{v}");
+    let exa = q["excluded_addresses"].as_array().unwrap();
+    assert!(
+        exa.iter().any(|x| x["address"] == "10.99.0.66"
+            && x["reason"]
+                .as_str()
+                .unwrap()
+                .contains("network.quarantine.cidrs")),
+        "{v}"
+    );
     // Full: every announced locator cut.
     let frames = vec![
         spdp_from(v4(66), ROGUE, &[v4(66)]),
         writer_from(v4(66), ROGUE),
     ];
-    let (v, _) = soc_quarantine(
+    let (v, table) = soc_quarantine(
         "rv2-r2-3-full",
         &frames,
         std::time::Duration::from_millis(10),
@@ -1126,6 +1138,7 @@ fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
         ROGUE_HEX,
     );
     assert_eq!(v["containment"], "full", "{v}");
+    assert_containment_matches_rules(&v, &table);
     assert_eq!(
         v["state"]["quarantine"]["locators"],
         json!(["10.0.0.66:7410", "10.0.0.66:7411"]),
@@ -1138,7 +1151,7 @@ fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
         spdp_from(far, ROGUE, &[v4(66), far]),
         writer_from(v4(66), ROGUE),
     ];
-    let (v, _) = soc_quarantine(
+    let (v, table) = soc_quarantine(
         "rv2-r2-3-part",
         &frames,
         std::time::Duration::from_millis(10),
@@ -1146,6 +1159,7 @@ fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
         ROGUE_HEX,
     );
     assert_eq!(v["containment"], "partial", "{v}");
+    assert_containment_matches_rules(&v, &table);
     let ex = v["state"]["quarantine"]["excluded"].as_array().unwrap();
     assert!(ex.iter().any(|x| x["locator"] == "10.99.0.1:7410"), "{v}");
 }
@@ -1165,6 +1179,9 @@ fn review2_r2_6_locators_over_the_order_limit_are_listed_as_left_out() {
             locators: Vec::new(),
             guid_only: false,
             excluded: Vec::new(),
+            addresses: Vec::new(),
+            excluded_addresses: Vec::new(),
+            evidence_truncated: false,
         },
         ttl_s: None,
         judged_state: robodr_responder::SafetyState::Idle,
@@ -1197,6 +1214,7 @@ fn review2_r2_6_locators_over_the_order_limit_are_listed_as_left_out() {
             excluded: Vec::new(),
             known: true,
             guid_only: true,
+            ..Default::default()
         },
         &LocatorBook::default(),
     );
@@ -1211,4 +1229,191 @@ fn review2_r2_6_locators_over_the_order_limit_are_listed_as_left_out() {
     assert_eq!(left, vec![7416, 7417, 7418, 7419], "{excluded:?}");
     assert!(excluded.iter().all(|x| x.reason.contains("limit")));
     out.validate().unwrap();
+}
+
+// --- Third review of the red-team fixes (wt/redfix, R3-1) --------------------
+
+/// What table `inet robodr` (the executor's nftables model) does with one
+/// UDP datagram: `"accept"` or `"drop"`.
+fn model_verdict(
+    table: &str,
+    chain: &str,
+    src: (&str, u16),
+    dst: (&str, u16),
+    payload: &[u8],
+) -> String {
+    use robodr_executor::nftmodel::{verdict_listed, Packet};
+    let objs: Vec<Value> = serde_json::from_str::<Option<Vec<Value>>>(table)
+        .unwrap()
+        .unwrap_or_default();
+    let p = Packet::udp(
+        chain,
+        (src.0.parse().unwrap(), src.1),
+        (dst.0.parse().unwrap(), dst.1),
+        payload,
+    );
+    verdict_listed(&objs, &p).unwrap().to_string()
+}
+
+/// `containment` must match the rules actually written: every address in
+/// `state.quarantine.addresses` drops a datagram from an ephemeral source
+/// port to a DDS port of the robot whatever its RTPS header says; `full`
+/// only when nothing was left out and every cut locator's address is one
+/// of them; `guid_only` only when no address or locator rule exists.
+fn assert_containment_matches_rules(v: &Value, table: &str) {
+    let q = &v["state"]["quarantine"];
+    let addrs: Vec<String> = q["addresses"]
+        .as_array()
+        .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+        .unwrap_or_default();
+    let other = robodr_executor::nftmodel::rtps(DECOY_HEX);
+    for a in &addrs {
+        assert_eq!(
+            model_verdict(table, "input", (a, 52_101), ("10.0.0.1", 7410), &other),
+            "drop",
+            "address {a} is reported cut but its traffic passes: {v}\n{table}"
+        );
+    }
+    let locators: Vec<String> = q["locators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    match v["containment"].as_str().unwrap() {
+        "full" => {
+            assert!(!addrs.is_empty(), "{v}");
+            assert_eq!(q["excluded"], json!([]), "{v}");
+            assert!(
+                q.get("excluded_addresses")
+                    .is_none_or(|x| x.as_array().is_some_and(Vec::is_empty)),
+                "{v}"
+            );
+            for l in &locators {
+                let ip = l.parse::<std::net::SocketAddr>().unwrap().ip().to_string();
+                assert!(addrs.contains(&ip), "locator {l} not covered: {v}");
+            }
+        }
+        "guid_only" => {
+            assert!(addrs.is_empty() && locators.is_empty(), "{v}");
+        }
+        "partial" => {}
+        other => panic!("containment {other}: {v}"),
+    }
+}
+
+/// R3-1: `containment: "full"` meant "every announced locator has a rule",
+/// but the inbound rule matched only `saddr <ip> udp sport <announced
+/// port>`. Fast DDS sends from ephemeral ports, so inbound traffic of a
+/// "fully contained" participant was held back only by the GUID-prefix
+/// drop, which `INFO_SRC` re-attribution evades. The address it sends from
+/// is now cut whole (to the robot's DDS ports, any source port).
+#[test]
+fn review3_r3_1_a_participant_sending_from_an_ephemeral_port_is_dropped() {
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv3-r3-1",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["containment"], "full", "{v}");
+    // RTPS re-attributed to another prefix, from an ephemeral port: dropped.
+    let other = robodr_executor::nftmodel::rtps(DECOY_HEX);
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.1", 7410),
+            &other
+        ),
+        "drop",
+        "{v}\n{table}"
+    );
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.1", 7650),
+            b"x"
+        ),
+        "accept",
+        "only the robot's DDS ports (domain 0: 7400-7649) are cut: {table}"
+    );
+    assert_eq!(
+        model_verdict(
+            &table,
+            "forward",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.20", 7411),
+            b"x"
+        ),
+        "drop",
+        "{table}"
+    );
+    // Another host on the same network: untouched.
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.67", 52_101),
+            ("10.0.0.1", 7410),
+            &other
+        ),
+        "accept",
+        "{table}"
+    );
+    // To the participant's host, any DDS port: dropped.
+    assert_eq!(
+        model_verdict(
+            &table,
+            "output",
+            ("10.0.0.1", 40_000),
+            ("10.0.0.66", 7499),
+            b"x"
+        ),
+        "drop",
+        "{table}"
+    );
+    assert_eq!(
+        v["state"]["quarantine"]["addresses"],
+        json!(["10.0.0.66"]),
+        "{v}"
+    );
+    assert_containment_matches_rules(&v, &table);
+
+    // An observed source address it never announced as a locator is cut
+    // too; the announced-only one is not (left out): `partial`.
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(68)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv3-r3-1-unannounced",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["containment"], "partial", "{v}");
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.1", 7410),
+            &other
+        ),
+        "drop",
+        "{v}\n{table}"
+    );
+    assert_containment_matches_rules(&v, &table);
 }

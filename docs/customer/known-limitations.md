@@ -39,16 +39,22 @@
     robot and not under a real systemd (load the nf_tables modules at boot
     on a minimal kernel).
   - A participant can be quarantined only after agentd has seen it: by
-    the SPDP locators on addresses it was seen sending from, or by its GUID
-    prefix alone when none can be vouched for. RTPS over TCP or shared
-    memory, a sender that changes its GUID prefix, and a rogue on the same
-    host over loopback are not covered. Source addresses are not
-    authenticated: a rogue that forges an unprofiled host's address and
-    announces its exact ip:port can get that ip:port into its own
-    quarantine (never an address of a profiled participant's host or a
-    pinned one). A rogue that announces its locators only on addresses it
-    never sends from is quarantined by GUID prefix only, which it can
-    evade; the SOC's answer then says `containment: "guid_only"`.
+    the addresses it was seen sending from (cut whole on the robot's DDS
+    ports, any source port) and its SPDP locators there, or by its GUID
+    prefix alone when none can be vouched for. Cutting an address cuts
+    every DDS participant on that host, a legitimate one included. RTPS
+    over TCP or shared memory, a sender that changes its GUID prefix, and
+    a rogue on the same host over loopback are not covered. Source
+    addresses are not authenticated: a rogue that forges an unprofiled
+    host's address gets that host into its own quarantine (never this
+    host, an address pinned to or learned for a profiled participant, or
+    a profile identity's address). A rogue on an address a profiled
+    participant was learned at is cut by its own locators only (an
+    attacker that announces a profiled prefix first is learned there; pin
+    the profiled participants to avoid it). The SOC's answer says
+    `containment: "full"` only when every address and locator is cut
+    whole; otherwise `partial`, or `guid_only` for the GUID-prefix drop
+    alone, which the participant can evade.
   - Upgrade the executor before agentd: an older executor drops an order
     with the newer quarantine fields unanswered (the request reads
     `failed`, nothing is applied).

@@ -594,9 +594,12 @@ Rules for Unitree, all enforced in code:
   SPDP locators lie in `network.quarantine.cidrs` and on the robot's DDS
   ports; with none configured every quarantine is refused
   (`locator_out_of_scope`). The SOC's answer says how far an applied
-  quarantine reaches (`containment`: `full`, `partial`, or `guid_only`
+  quarantine reaches (`containment`: `full` only when every source
+  address the participant was seen sending from and every locator it
+  announced is cut whole, any source port; `partial`; or `guid_only`
   when only the GUID-prefix drop is in force, which a sender can evade by
-  re-attributing its traffic or changing its prefix). The scope may not be `/0` or overlap the
+  re-attributing its traffic or changing its prefix). Cutting an address
+  cuts every DDS participant on that host. The scope may not be `/0` or overlap the
   management or uplink networks. On a humanoid the robot network stays a
   `low_level` motion path, so a quarantine never acts there anyway.
 * **Quadrupeds (Go2, B2).**

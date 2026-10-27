@@ -272,24 +272,63 @@ fn r2_4_a_multi_address_critical_spray_does_not_evict_the_rogue() {
 /// (unprofiled) participant on the robot computer uses 7412/7413. A decoy
 /// whose SPDP source is spoofed to the robot computer's address announces
 /// 7410, 7412 and 7413: the ports LEGIT does not announce were handed out.
-/// Every address of a profiled participant's host is protected.
+/// Every port of the robot's own computer is protected: since review R3-6
+/// that is an address no SPDP can claim (this host's, or pinned to a
+/// profiled participant). An address LEGIT was only *learned* at
+/// (first-come, possibly an attacker's) is never cut whole, but the
+/// decoy's own ports there are handed out.
 #[test]
 fn r2_5_a_spoofed_decoy_never_gets_any_port_of_the_profiled_host() {
-    let mut b = Bus::new();
-    assert!(b.spdp(LEGIT_IP, LEGIT, &[LEGIT_IP]).is_empty());
-    let mut ports = Vec::new();
-    for port in [7410u32, 7412, 7413] {
-        ports.push(param(0x0032, &locator_v4(LEGIT_IP, port)));
-    }
-    let mut params = vec![
-        param(0x0015, &[2, 3, 0, 0]),
-        param(0x0016, &[0x01, 0x0f, 0, 0]),
-        param(0x0050, &guid(DECOY, [0, 0, 1, 0xc1])),
-    ];
-    params.extend(ports);
-    let spdp = datagram(DECOY, &[data(ENTITY_SPDP_WRITER, 1, &pl_payload(&params))]);
-    b.send(LEGIT_IP, &spdp);
-    let t = target(&b, &DECOY);
+    let decoy = |b: &mut Bus| {
+        assert!(b.spdp(LEGIT_IP, LEGIT, &[LEGIT_IP]).is_empty());
+        let mut ports = Vec::new();
+        for port in [7410u32, 7412, 7413] {
+            ports.push(param(0x0032, &locator_v4(LEGIT_IP, port)));
+        }
+        let mut params = vec![
+            param(0x0015, &[2, 3, 0, 0]),
+            param(0x0016, &[0x01, 0x0f, 0, 0]),
+            param(0x0050, &guid(DECOY, [0, 0, 1, 0xc1])),
+        ];
+        params.extend(ports);
+        let spdp = datagram(DECOY, &[data(ENTITY_SPDP_WRITER, 1, &pl_payload(&params))]);
+        b.send(LEGIT_IP, &spdp);
+        target(b, &DECOY)
+    };
+    let with = |binding: robodr_ros2_pipeline::BindingOptions| Bus {
+        p: Pipeline::new(
+            robot_profile(true),
+            PipelineOptions {
+                binding,
+                ..PipelineOptions::default()
+            },
+        ),
+        now: Instant::now(),
+    };
+    // This host's address.
+    let mut b = with(robodr_ros2_pipeline::BindingOptions {
+        local_addresses: vec![LEGIT_IP.into()],
+        ..Default::default()
+    });
+    let t = decoy(&mut b);
     assert!(t.locators.is_empty(), "the robot computer's ports: {t:?}");
     assert_eq!(t.excluded.len(), 3, "{t:?}");
+    assert!(t.addresses.is_empty(), "{t:?}");
+    // Pinned to the profiled participant.
+    let mut b = with(robodr_ros2_pipeline::BindingOptions {
+        participant_ips: [(LEGIT, vec![LEGIT_IP.into()])].into_iter().collect(),
+        ..Default::default()
+    });
+    let t = decoy(&mut b);
+    assert!(t.locators.is_empty(), "the robot computer's ports: {t:?}");
+    assert_eq!(t.excluded.len(), 3, "{t:?}");
+    assert!(t.addresses.is_empty(), "{t:?}");
+    // Learned only: LEGIT's own port stays out, the address is never cut
+    // whole, the decoy's other ports are handed out.
+    let mut b = Bus::new();
+    let t = decoy(&mut b);
+    assert_eq!(t.excluded.len(), 1, "{t:?}");
+    assert_eq!(t.locators.len(), 2, "{t:?}");
+    assert!(t.addresses.is_empty(), "{t:?}");
+    assert_eq!(t.excluded_addresses.len(), 1, "{t:?}");
 }

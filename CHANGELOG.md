@@ -12,6 +12,36 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
+  review of the F1 / F3 fixes"); each fixed finding has a regression test
+  that failed before its fix:
+  - R3-1 (high): **`containment: "full"` overstated a quarantine.** The
+    inbound locator rule matched the announced source port only, and Fast
+    DDS sends from ephemeral ports, so a "fully contained" participant was
+    held back inbound only by the evadable GUID-prefix drop. The executor
+    now also cuts the participant's observed source addresses whole (all
+    UDP to and from the robot's DDS ports, any source port, never over
+    loopback, after every exclusion). `full` now means every observed
+    source address and every announced locator is covered by such a drop
+    (contract §6a, one definition in `robodr_executor::decision`); the
+    answer's `state.quarantine` gains `addresses`, `excluded_addresses`
+    and `evidence_truncated`. A quarantine that cuts locators but not the
+    address, and a scope journalled before this change, now read
+    `partial`. Shared-host caveat: cutting an address cuts every DDS
+    participant on that host. **Upgrade `robodr-executor` before
+    `robodr-agentd`** (orders carry new fields). New test helper
+    `robodr_executor::nftmodel` evaluates a rendered or listed table for a
+    packet.
+  - R3-2 (medium): the 128 by-name Critical findings beyond the source
+    table were one shared budget, which one address could spend. Charged
+    per source now (2 per address, 128 addresses per window).
+  - R3-6 (low): an attacker that announced a profiled prefix first had its
+    address treated as the robot's own computer, shielding its rogues'
+    locators. Only pinned addresses and this host's own shield other
+    ports now; a learned profiled address is never cut whole (`partial`).
+  - R3-3, R3-4, R3-5: accepted, documented limits (spoofed decoy on a
+    present unprofiled host; spool reserve for new Critical sources;
+    one-source-per-prefix eviction of an un-named rogue).
 - Second independent review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`,
   "Second review of the F1 / F3 fixes"); every finding has a regression
   test that failed before its fix:

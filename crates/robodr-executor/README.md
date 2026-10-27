@@ -11,7 +11,7 @@ default**: agentd hands it nothing unless `executor.enabled` is `true` in
 | Action | Adapter | Effect | Revert | TTL |
 |---|---|---|---|---|
 | `isolate_network` | nftables | drops all traffic in, out and forwarded, except loopback, the management and uplink allow-list, the robot's control buses (configurable), the motion control path, the robot's DDS discovery (SPDP multicast, IGMP), and what any host needs: DHCP / DHCPv6 client, path MTU discovery (ICMP "fragmentation needed", ICMPv6 "packet too big"), IPv6 neighbour / router discovery and MLD | exact inverse | always (`ttl.default_s` if the request names none) |
-| `quarantine_node` | nftables | drops RTPS whose header carries the participant's GUID prefix (raw payload match), and UDP from and to its SPDP unicast locators (IP and port); never inside the motion control path it may not cut (accepted before any drop). Needs the locators, each provably outside that path | exact inverse | always |
+| `quarantine_node` | nftables | drops RTPS whose header carries the participant's GUID prefix (raw payload match), all UDP from and to the source addresses it was seen sending from on the robot's DDS ports (any source port; review R3-1), and UDP from and to its SPDP unicast locators (IP and port); never inside the motion control path it may not cut (accepted before any drop). Needs addresses or locators, each provably outside that path | exact inverse | always |
 | `record_evidence` | black box (runs inside agentd) | a signed, fsynced `robodr.evidence_mark` note naming the evidence bundle (the request's black-box reference) | not applicable: evidence is never reverted | none |
 | `restrict_motion` | none in v1 | recorded as advisory: the in-path Motion Firewall gateway (`robodr-firewall-gw`) is a separate unit with its own static configuration, and the executor does not drive it, so nothing changes on the robot (request state `recorded_not_executed`) | — | — |
 | `safe_pause`, `request_safe_state`, `rollback_config` | none | refused (`not_executor_action`): these may de-energise the robot or are plan-only | — | — |
@@ -76,6 +76,32 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
      SPDP claims nobody signed; this bounds what a forged one can name to
      a DDS endpoint of a network the site declared quarantinable (GUIDs
      change on restart and can be forged).
+   * **Source addresses** (review R3-1). The order also carries the
+     addresses agentd saw the participant send from (`addresses`). Each
+     one is cut **whole**: `meta iifname != "lo" ip saddr <addr> udp dport
+     <the robot's DDS ports> drop` in `input` / `forward`, and `meta
+     oifname != "lo" ip daddr <addr> udp dport <those ports> drop` in
+     `output` / `forward`, whatever the source port. The DDS ports are
+     `network.quarantine.udp_ports` (default the RTPS port ranges
+     `7400 + 250 d ..= +249` of `network.discovery.domains`), merged and
+     frozen into the action. An address gets the same checks as a locator
+     (not loopback, inside a `network.quarantine.cidrs` entry, outside every
+     management / uplink entry, outside every motion-path entry it may not
+     cut, one address family) and is otherwise **left out**
+     (`quarantine.excluded_addresses`, with the reason). An address and
+     no locator is enough to act on. **Shared host:** cutting an address
+     cuts every DDS participant on that host, including a legitimate,
+     unprofiled process that happens to run there (agentd never hands out
+     this host's own address, an address pinned to another participant, or
+     a profiled participant's host address; the motion control path is
+     accepted before any drop).
+   * **`containment`** (`quarantine.containment` in the state answer; the
+     SOC's `containment`, contract §6a): `full` only when at least one
+     address is cut whole, no announced locator and no observed address
+     was left out or forgotten, and every cut locator lies on a cut
+     address; `guid_only` when no address and no locator is cut (only the
+     GUID-prefix drop); `partial` otherwise. One definition
+     (`decision::containment_of`) serves the executor and agentd.
    * Isolation needs a configured management channel.
    * The TTL must be within `1..=ttl.max_s`.
 2. **Safety re-check immediately before apply.** This is executor rule 4 of
@@ -434,6 +460,16 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   "domains": [0]}`): the SPDP multicast groups and DDS domains whose
   multicast ports (`7400 + 250 d`, `7401 + 250 d`) stay open during an
   isolation. `"multicast_groups": []` keeps none.
+* **Addresses from agentd** (review R3-1). With the locators, agentd
+  attaches the source addresses the prefix was seen sending from (its own
+  SPDP and accepted endpoint announcements; at most 8 remembered, newest
+  kept; `evidence_truncated` when one was forgotten), leaving out loopback,
+  this host's addresses, an address pinned to another prefix, a profiled
+  participant's pinned address, a profile identity's `ips`, and any
+  address a profiled participant was learned at (each with its reason in
+  `excluded_addresses`): an address-wide drop there could cut the robot's
+  own participants. Addresses beyond the order's 16 are listed as left
+  out, never dropped silently.
 * **Locators from agentd.** For a `quarantine_node` order agentd attaches
   the participant's SPDP unicast locators (metatraffic and default, IP and
   port) from the pipeline's binding table (`robodr_ros2_pipeline::binding`,
@@ -441,8 +477,11 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   through a path the binding trusts, also after it left, its lease expired
   or a prefix flood evicted it (kept 24 h), **only on addresses it was seen
   sending from**; never a locator a profiled participant announces, any
-  port on a profiled participant's host address (for a non-profiled
-  target), or an address pinned to another prefix; none for a contested
+  port on this host's address or an address pinned to a profiled
+  participant (for a non-profiled target; review R3-6: an address a
+  profiled participant was only *learned* at, first-come, may be an
+  attacker's, so it no longer shields other ports, but is never cut
+  whole), or an address pinned to another prefix; none for a contested
   or pinned prefix. Another prefix seen at the same address announcing the
   same ip:port does not take it away (review R2-3: the rogue's own second
   prefix is the same host, no spoofing needed). It
@@ -570,19 +609,31 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   * a rogue participant on the same host that talks over loopback with
     another GUID.
 
-  Locator rules assume the participant sends from its unicast locator
-  port (Cyclone DDS does; Fast DDS uses ephemeral send ports, so only the
-  GUID rule and the to-locator rule apply to it).
+  Locator rules match the participant's announced ports only (Cyclone DDS
+  sends from its unicast locator port; Fast DDS uses ephemeral send
+  ports). Since review R3-1 the **address** rules cover any source port:
+  a participant is contained against ephemeral-port senders and `INFO_SRC`
+  re-attribution only where its addresses are cut whole, i.e. with
+  `containment: "full"`. A participant whose address is left out (e.g. on
+  a profiled participant's host) is `partial`: from there only its
+  announced ports and the GUID-prefix drop apply.
 * **Quarantine needs locators** agentd has seen (binding table or
   participant events), or agentd's `guid_only` vouch (a participant it saw
   and that is not one of the robot's own; then by GUID prefix only, which
   `INFO_SRC` re-attribution or a new prefix evades: the state answer's
-  `quarantine` (no locators) lets agentd tell the SOC `containment:
-  "guid_only"`). A rogue that announces its locators only on addresses it
-  never sends from gets exactly that. A
+  `quarantine` (no address, no locator) lets agentd tell the SOC
+  `containment: "guid_only"`). A rogue that announces its locators only
+  on addresses it never sends from has its observed source addresses cut
+  whole (`partial`: the announced ones are left out). A
   participant whose SPDP agentd never saw cannot be quarantined
   (`locators_required`). A `node`-named quarantine is refused
   (`unsupported_target`).
+* **Shared hosts.** An address cut whole cuts every DDS participant on
+  that host, a legitimate unprofiled one included (above). Source
+  addresses are not authenticated: a decoy whose SPDP is spoofed to a
+  present unprofiled host's address gets that address cut when the decoy
+  is quarantined (within `network.quarantine.cidrs`; never this host, a
+  pinned, identity or learned profiled host, or the motion control path).
 * **A quarantine cannot act inside a low-level network** (or inside any
   motion-path entry it may not cut), and none is possible while such an
   entry names only an interface.

@@ -99,6 +99,9 @@ fn generic_example_scopes_quarantine_locators() {
         }],
         guid_only: false,
         excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     for (ip, port, ok) in [
         ("192.168.10.7", 7410, true),
@@ -150,6 +153,9 @@ fn unitree_g1_example_never_cuts_the_balance_loop() {
         }],
         guid_only: false,
         excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     for (a, t) in [
         (ActionId::IsolateNetwork, Target::None),

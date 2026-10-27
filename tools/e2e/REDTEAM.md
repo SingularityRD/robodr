@@ -134,7 +134,7 @@ where useful).
 | # | Sev | Attack | Fix | Regression |
 |---|-----|--------|-----|------------|
 | R2-1 | High | Findings about a profiled / pinned participant were never folded: 750 SEDP announcements "for" the (contested) robot participant with distinct topics from 5 addresses gave a Critical `endpoint_source_mismatch` plus a High `unknown_writer_topic` each; a 400-file spool filled (402 records, 1103 dropped) and the genuine rogue's Critical finding was dropped. | Per (participant, source, rule) and 60 s window the first 4 High / Critical findings pass by name (64 per participant; below High 256 / 1024, so a legitimate participant leaving is never folded); the rest is a Critical aggregate per (source, participant) that names the participant as its subject, never as a sample. The last quarter of the spool's Critical share takes only a source with no record in it yet. Now 93 records, none dropped, the rogue spooled. | `crates/robodr-agentd/tests/redteam_regressions.rs` `review2_r2_1_*`; `src/flood.rs` `protected_findings_are_bounded_and_name_the_participant`; `src/spool.rs` `the_last_part_of_the_critical_share_is_for_new_sources` |
-| R2-2 | High | 128 spoofed SPDPs (about 2 packets/s) filled the per-window source table; 4 more spoofed motion writers seeded the sourceless Critical aggregate; the real rogue's `unauthorized_motion_writer` was folded into it unnamed. | A Critical finding from a source beyond the 128 still passes by name, up to 128 per window (exhausting it takes about 6.4 packets/s sustained); the "many sources" aggregate keeps the latest samples, motion writers first. | `redteam_regressions.rs` `review2_r2_2_*`; `src/flood.rs` `a_full_source_table_does_not_fold_a_new_sources_critical_finding` |
+| R2-2 | High | 128 spoofed SPDPs (about 2 packets/s) filled the per-window source table; 4 more spoofed motion writers seeded the sourceless Critical aggregate; the real rogue's `unauthorized_motion_writer` was folded into it unnamed. | A Critical finding from a source beyond the 128 still passes by name, up to 128 per window (a shared budget, so one address could spend it: R3-2 below charges it per source); the "many sources" aggregate keeps the latest samples, motion writers first. | `redteam_regressions.rs` `review2_r2_2_*`; `src/flood.rs` `a_full_source_table_does_not_fold_a_new_sources_critical_finding` |
 | R2-3 | Medium | IP-level quarantine was optional for the rogue: its own second prefix from its address contested its locators (no spoofing), locators on an address it never sends from, or a re-announce from a second address after its lease (which wiped a SOC-named history); the SOC read `verified` / `in_force: true` while only the GUID-prefix drop was in force. | Same-address claims share the host (both get the ip:port); a prefix ranked High or above keeps its evidence, locators and rank on a re-announce (merged, bounded); the SOC answer carries `containment` (`full` / `partial` / `guid_only` / `unknown`) and `state.quarantine` {`locators`, `excluded`} (contract §6a, journalled). | `crates/robodr-ros2-pipeline/tests/review_redfix.rs` `r2_3a_*`, `r2_3c_*`; `executor_link.rs` `review2_r2_3_*`, `review_h2a_a_self_decoy_*` |
 | R2-4 | Medium | 1100 Critical-ranked prefixes from 10 addresses evicted a departed Critical rogue (`known: false`, `locators_required`). | Global eviction takes the fullest per-source bucket first; a SOC-named entry is never evicted for a lower-ranked one. | `review_redfix.rs` `r2_4_*`; binding `global_eviction_takes_the_fullest_bucket_first` |
 | R2-5 | Low | A decoy spoofing a present profiled host's address got that host's other ports (protection was per ip:port). | For a non-profiled target, no port on a profiled participant's host address is handed out (`PROFILED_HOST`). | `review_redfix.rs` `r2_5_*` |
@@ -152,3 +152,43 @@ quarantined by GUID prefix only (now visible to the SOC as `guid_only`);
 a merged history keeps a moved unknown participant's old address for
 24 h.
 
+
+## Third review of the F1 / F3 fixes
+
+A third review (`db4162f..2fcc131`, static analysis) found one High, two
+Medium and three Low issues. The High, the Medium R3-2 and the Low R3-6
+are fixed, each with a regression test that failed before its fix; R3-3,
+R3-4 and R3-5 are accepted limits (below).
+
+| # | Sev | Attack | Fix | Regression |
+|---|-----|--------|-----|------------|
+| R3-1 | High | `containment: "full"` meant "every announced locator has a rule", but the inbound locator rule matched `saddr <ip> udp sport <announced port>` only. Fast DDS (the ROS 2 default) sends from ephemeral ports, so a "fully contained" participant was held back inbound only by the GUID-prefix drop, which `INFO_SRC` re-attribution evades; an observed source address it never announced was not cut at all. | The executor also cuts the participant's observed source addresses **whole**: all UDP from them to the robot's DDS ports (`network.quarantine.udp_ports`, default the RTPS ranges of the discovery domains) and to them on those ports, any source port, never over loopback, after every exclusion of a locator (scope, management / uplink, motion path, loopback, family) and agentd's (this host, pins, profile identity ips, learned profiled hosts). `full` now means every observed address and every announced locator is covered by such a drop (one definition, `decision::containment_of`; contract §6a); the answer carries `addresses`, `excluded_addresses`, `evidence_truncated`. Shared-host caveat documented. | `crates/robodr-agentd/tests/executor_link.rs` `review3_r3_1_*` (nftables model: a re-attributed datagram from an ephemeral port was accepted); executor `review3_r3_1_addresses_are_cut_whole_*` (`src/nftmodel.rs` evaluator); `tests/netns.rs` `r3_1_a_quarantined_address_is_dropped_from_any_source_port` (real nftables, real UDP) |
+| R3-2 | Medium | The 128 Critical findings by name per window beyond the 128-source table were one shared counter: one untracked address could spend all of them (and put 128 Critical findings into the spool by name), after which a genuine rogue's Critical finding went to the "many sources" aggregate. | Charged per source: at most 2 per untracked address and window, for at most 128 such addresses (a bounded map, cleared per window). Exhausting it takes 128 + 128 distinct (spoofed) addresses, about 384 datagrams a minute (6.4 packets/s). | `src/flood.rs` `one_untracked_source_cannot_exhaust_the_fresh_critical_budget` (one address passed 128 before) |
+| R3-6 | Low | An attacker that announced a profiled prefix first (before the real participant, or after its 24 h evidence lapsed) was learned at its address, which then counted as "the robot's own computer": no port of a rogue there was handed out (`PROFILED_HOST`). | Only addresses an SPDP cannot write shield other ports: pins (`participant_ips`) and this host's addresses. An address a profiled participant was only learned at (and a profile identity's ips) is never cut **whole** (it may be the robot's computer), so a rogue there is quarantined by its own locators and the GUID-prefix drop (`partial`, reason "learned, not commissioned"). R2-5 holds for pinned hosts and this host. | binding `a_first_come_claim_of_a_profiled_prefix_does_not_shield_the_attackers_host`; `review_redfix.rs` `r2_5_*` (now per host kind) |
+
+Accepted limits (documented, not changed):
+
+* **R3-3 (Medium).** A live unprofiled owner no longer contests its
+  ip:port (R2-3), so a decoy whose SPDP source is **spoofed** to a present
+  unprofiled host's address gets that host's ip:port, and since R3-1 the
+  address itself, in its quarantine target: quarantining the decoy cuts
+  that host (only inside `network.quarantine.cidrs`; never this host, a
+  pinned, identity or learned profiled host, or the motion control path).
+  Needs source spoofing; a product decision.
+* **R3-4 (Low).** The last quarter of the spool's Critical share takes any
+  source with no record in it yet: distinct spoofed sources fill it with
+  one record each, and the flood guard lets their Critical findings
+  through by name (8 per counted source, then 2 per address beyond the
+  128 counted per window, R3-2). It matters only without a draining
+  exporter; what does not fit is in the black box.
+* **R3-5 (Low).** With one spoofed source per sprayed prefix every
+  per-source bucket of the binding's quarantine memory holds one entry,
+  and global eviction takes the lowest-ranked, oldest one: once the spray
+  is Critical-ranked, a departed Critical rogue goes first. A SOC-named
+  rogue (`quarantine_node` names it) is never evicted for a lower-ranked
+  entry.
+
+Still open after the third review: the R2 list above, with R3-1's
+consequence that a rogue that announces locators only on addresses it
+never sends from now has its observed addresses cut whole (`partial`),
+not GUID-prefix only.

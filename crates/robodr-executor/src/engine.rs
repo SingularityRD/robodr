@@ -173,6 +173,18 @@ pub struct QuarantineScope {
     pub locators: Vec<crate::order::Locator>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<crate::order::ExcludedLocator>,
+    /// Review R3-1: the source addresses cut whole (to and from the
+    /// robot's DDS ports, any source port).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<std::net::IpAddr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_addresses: Vec<crate::order::ExcludedAddress>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub evidence_truncated: bool,
+    /// [`crate::decision::Containment`] of the rules in force (agentd
+    /// recomputes it from the fields above with the same definition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<crate::decision::Containment>,
 }
 
 fn quarantine_scope(e: &Effect) -> Option<QuarantineScope> {
@@ -180,6 +192,10 @@ fn quarantine_scope(e: &Effect) -> Option<QuarantineScope> {
         Effect::Quarantine(q) => Some(QuarantineScope {
             locators: q.locators.clone(),
             excluded: q.excluded.clone(),
+            addresses: q.addresses.clone(),
+            excluded_addresses: q.excluded_addresses.clone(),
+            evidence_truncated: q.evidence_truncated,
+            containment: Some(q.containment()),
         }),
         _ => None,
     }
@@ -209,11 +225,29 @@ fn quarantine_note(e: &Effect) -> Option<String> {
         return None;
     };
     let mut parts = Vec::new();
-    if q.locators.is_empty() {
+    if q.locators.is_empty() && q.addresses.is_empty() {
         parts.push(format!(
-            "GUID-prefix drop only for participant {} (no locator could be vouched for)",
+            "GUID-prefix drop only for participant {} (no locator or source address could be \
+             vouched for)",
             q.guid_prefix
         ));
+    }
+    if !q.excluded_addresses.is_empty() {
+        parts.push(format!(
+            "source addresses left out (not cut whole): {}",
+            q.excluded_addresses
+                .iter()
+                .map(|x| format!("{} ({})", x.ip, x.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if q.evidence_truncated {
+        parts.push(
+            "agentd forgot some of the participant's observed source addresses: not all of \
+             them are cut"
+                .to_string(),
+        );
     }
     if !q.excluded.is_empty() {
         parts.push(format!(

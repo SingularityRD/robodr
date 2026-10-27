@@ -810,7 +810,23 @@ safely. Nothing here is specific to one product.
       (below High: 256 / 1024); their aggregate is `critical` for the High
       / Critical ones. Never folded: findings that are not about one
       participant, and a Critical finding from a source first seen after
-      128 sources in the window, up to 128 such per window (review R2-2).
+      128 sources in the window, up to 2 per such source and at most 128
+      such sources per window (review R2-2; charged per source since
+      review R3-2, so one address cannot spend the budget).
+    - Accepted limits (reviews R3-3, R3-4, R3-5 of the redfix; a SOC
+      should know them): a spoofed-source spray of about 6.4 packets/s
+      from 256 or more addresses can still fold a genuine rogue's Critical
+      finding into the "many sources" aggregate (named while among the
+      latest samples; always in the robot's black box). Without a
+      draining exporter, distinct spoofed sources can fill the spool's
+      reserve for new Critical sources one record each (R3-4). A spray
+      with one spoofed source per prefix can evict a departed,
+      Critical-ranked rogue from the robot's quarantine memory unless the
+      SOC already named it in a `quarantine_node` (R3-5). A decoy whose
+      discovery is spoofed to another host's address makes a quarantine
+      of the decoy cut that host (R3-3; control-plane contract §6a,
+      shared hosts). Source IPs in findings are adversary-controlled
+      (§9, trust map).
     - The catalog title ("... unknown participants aggregated") predates
       these per-endpoint and protected-participant aggregates; it is frozen
       and mirrored, so it stays (the detail says which rules were folded).

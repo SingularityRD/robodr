@@ -884,6 +884,19 @@ pub struct QuarantineScope {
     /// Announced locators not acted on, and why.
     #[serde(default)]
     pub excluded: Vec<ScopeExcluded>,
+    /// Review R3-1: source addresses the executor cuts whole (all UDP from
+    /// them to the robot's DDS ports and to them on those ports, any
+    /// source port). Absent in journals before this revision (then the
+    /// quarantine cut locators only).
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    /// Observed source addresses not cut whole, and why.
+    #[serde(default)]
+    pub excluded_addresses: Vec<ScopeExcludedAddress>,
+    /// Some observed source address or announced locator was forgotten
+    /// (agentd's per-participant caps): never `full`.
+    #[serde(default)]
+    pub evidence_truncated: bool,
 }
 
 /// One locator a quarantine left out ([`QuarantineScope::excluded`]).
@@ -894,40 +907,79 @@ pub struct ScopeExcluded {
     pub reason: String,
 }
 
+/// One source address a quarantine did not cut whole
+/// ([`QuarantineScope::excluded_addresses`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeExcludedAddress {
+    pub address: String,
+    pub reason: String,
+}
+
 /// Most locators / left-out locators kept in a [`QuarantineScope`].
 pub const MAX_SCOPE_LOCATORS: usize = 16;
 pub const MAX_SCOPE_EXCLUDED: usize = 64;
+/// Most addresses / left-out addresses kept in a [`QuarantineScope`].
+pub const MAX_SCOPE_ADDRESSES: usize = 16;
+pub const MAX_SCOPE_EXCLUDED_ADDRESSES: usize = 32;
 /// Longest reason kept per left-out locator.
 pub const MAX_SCOPE_REASON: usize = 200;
 
 impl QuarantineScope {
-    /// `guid_only` (no locator cut: only RTPS whose header carries the
-    /// prefix is dropped), `partial` (locators cut, some announced ones
-    /// left out) or `full`.
+    /// Contract §6a, with the executor's own definition
+    /// ([`robodr_executor::decision::containment_of`]): `full` when at
+    /// least one address is cut whole, nothing was left out or forgotten,
+    /// and every cut locator lies on a cut address; `guid_only` when
+    /// neither an address nor a locator is cut (only RTPS whose header
+    /// carries the prefix is dropped); `partial` otherwise.
     pub fn containment(&self) -> &'static str {
-        if self.locators.is_empty() {
-            "guid_only"
-        } else if !self.excluded.is_empty() {
-            "partial"
-        } else {
-            "full"
-        }
+        let ip = |s: &str| {
+            s.parse::<std::net::IpAddr>()
+                .ok()
+                .or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+        };
+        let addresses: Vec<std::net::IpAddr> =
+            self.addresses.iter().filter_map(|a| ip(a)).collect();
+        let locators: Vec<std::net::IpAddr> = self.locators.iter().filter_map(|l| ip(l)).collect();
+        // Anything unparseable counts as left out (never `full`).
+        let left_out = !self.excluded.is_empty()
+            || !self.excluded_addresses.is_empty()
+            || self.evidence_truncated
+            || addresses.len() != self.addresses.len()
+            || locators.len() != self.locators.len();
+        robodr_executor::decision::containment_of(&addresses, &locators, left_out).as_str()
     }
 
     /// Within the bounds a stored request keeps (and the journal takes).
+    /// Cutting a list only ever drops cut addresses or locators, or
+    /// left-out entries while others remain: never towards `full`.
     pub fn bounded(mut self) -> Self {
-        self.locators.truncate(MAX_SCOPE_LOCATORS);
+        if self.locators.len() > MAX_SCOPE_LOCATORS {
+            self.locators.truncate(MAX_SCOPE_LOCATORS);
+            self.evidence_truncated = true;
+        }
         self.excluded.truncate(MAX_SCOPE_EXCLUDED);
+        if self.addresses.len() > MAX_SCOPE_ADDRESSES {
+            self.addresses.truncate(MAX_SCOPE_ADDRESSES);
+            self.evidence_truncated = true;
+        }
+        self.excluded_addresses
+            .truncate(MAX_SCOPE_EXCLUDED_ADDRESSES);
         for x in &mut self.excluded {
-            x.reason = x
-                .reason
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(MAX_SCOPE_REASON)
-                .collect();
+            x.reason = clean_reason(&x.reason);
+        }
+        for x in &mut self.excluded_addresses {
+            x.reason = clean_reason(&x.reason);
         }
         self
     }
+}
+
+fn clean_reason(r: &str) -> String {
+    r.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_SCOPE_REASON)
+        .collect()
 }
 
 /// What an executor did with an accepted request.
@@ -3152,6 +3204,9 @@ mod tests {
                     locator: "10.0.0.68:7410".into(),
                     reason: "never seen sending from it".into(),
                 }],
+                addresses: vec!["10.0.0.66".into()],
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             }),
         );
         x.set(
@@ -3186,6 +3241,8 @@ mod tests {
             v2["state"]["quarantine"]["excluded"][0]["locator"],
             "10.0.0.68:7410"
         );
+        // Review R3-1: the addresses cut whole are journalled too.
+        assert_eq!(v2["state"]["quarantine"]["addresses"][0], "10.0.0.66");
         assert_eq!(get(&mut e, &mut h, "x-3").body, v3);
         // A revert: staged (`pending`), then the executor reports it.
         let rv = Call::Revert(
