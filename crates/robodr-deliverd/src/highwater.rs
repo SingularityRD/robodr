@@ -21,14 +21,25 @@
 //! another unit or site, is not used: the agent reports it and treats it
 //! as missing.
 //!
-//! **Honest limit.** Root can delete the file, like the state file. The
-//! agent then fails closed: when the state file is missing and no valid
-//! record is left while the journal shows the unit had a history, it
-//! locks itself (no import, no install, no rollback) until an operator
-//! re-anchors it (`robodr-deliverd reanchor`). A TPM NV counter (14b)
-//! closes the remaining gap.
+//! **Generation and lock (review M-A, M-B).** Every write gives the record
+//! the next `generation` (a counter that only grows), and the agent notes
+//! that generation, the record's digest and its baseline in the delivery
+//! journal (`robodr.deliver.highwater`) right after the write; the state
+//! file carries the generation it was written with. At start a record
+//! whose generation is lower than the journal's or the state file's (an
+//! older copy put back) locks the agent, as does a missing or invalid
+//! record while the state file or the journal exists. The lock itself is
+//! part of the signed record (`locked`), so deleting the state file does
+//! not lift it; only `robodr-deliverd reanchor` does.
+//!
+//! **Honest limit.** Root can delete or replace the files, like the state
+//! file. The agent then fails closed as above whenever the journal still
+//! shows the unit's history. Root deleting the journal **as well** (or
+//! flooding it with notes signed with the black-box key until the
+//! generation notes are evicted, and then putting an older record back)
+//! is not detected: a TPM NV counter (14b) closes that gap.
 
-use crate::state::{LastDeployment, State};
+use crate::state::{LastDeployment, Locked, State};
 use robodr_blackbox::Signer;
 use robodr_pkg::bundle::ChainState;
 use serde::{Deserialize, Serialize};
@@ -55,6 +66,17 @@ pub struct HighWater {
     pub last_deployment: Option<LastDeployment>,
     pub time_floor: u64,
     pub chains: Vec<ChainState>,
+    /// Write counter (review M-B): one more than the previous record's at
+    /// every write. Absent (0) in a record written before it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
+    /// The agent is locked until an operator re-anchors it (review M-A).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<Locked>,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// The file: the document, the signing key id and the signature (hex).
@@ -88,7 +110,24 @@ impl HighWater {
             last_deployment: s.last_deployment.clone(),
             time_floor: s.time_floor,
             chains: s.chains.clone(),
+            generation: 0,
+            locked: s.locked.clone(),
         }
+    }
+
+    /// The same baseline as `o` (everything but the generation).
+    pub fn same_baseline(&self, o: &Self) -> bool {
+        Self {
+            generation: o.generation,
+            ..self.clone()
+        } == *o
+    }
+
+    /// SHA-256 (hex) of the signed bytes of this document.
+    pub fn digest(&self) -> Result<String, String> {
+        let mut h = robodr_blackbox::crypto::Sha256::new();
+        h.update(&message(self)?);
+        Ok(robodr_blackbox::crypto::to_hex(&h.finalize()))
     }
 
     /// Structural checks (the same rules as the state's fields).
@@ -98,6 +137,7 @@ impl HighWater {
         s.last_deployment = self.last_deployment.clone();
         s.time_floor = self.time_floor;
         s.chains = self.chains.clone();
+        s.locked = self.locked.clone();
         if self.format != HIGHWATER_FORMAT {
             return Err("high-water record: bad format".into());
         }

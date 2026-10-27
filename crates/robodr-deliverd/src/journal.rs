@@ -39,6 +39,109 @@ pub mod kinds {
     pub const STATE_RESTORED: &str = "robodr.deliver.state_restored";
     pub const TRUST_ROTATED: &str = "robodr.deliver.trust_rotated";
     pub const REANCHORED: &str = "robodr.deliver.reanchored";
+    /// The high-water record was written (review M-A, M-B): its
+    /// generation, digest and baseline (deployment, chain heads, time
+    /// floor).
+    pub const HIGHWATER: &str = "robodr.deliver.highwater";
+}
+
+/// What the notes still in the journal say about the unit's history
+/// ([`Journal::history`]): the baseline `reanchor` rebuilds (review L-A)
+/// and the generation a high-water record must not be older than (review
+/// M-B).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct History {
+    /// Highest high-water record generation noted.
+    pub hw_generation: u64,
+    /// Highest site trust file version noted (anchor at start, rotation,
+    /// pack import, re-anchoring).
+    pub trust_version: u64,
+    /// The newest accepted deployment noted.
+    pub last_deployment: Option<crate::state::LastDeployment>,
+    /// The newest chain head per programme noted.
+    pub chains: Vec<robodr_pkg::bundle::ChainState>,
+    /// Highest time floor noted.
+    pub time_floor: u64,
+    /// Floors of the `floor_raised` notes.
+    pub floors: std::collections::BTreeMap<String, u64>,
+}
+
+impl History {
+    fn deployment(&mut self, d: crate::state::LastDeployment) {
+        if self.last_deployment.as_ref().is_none_or(|x| x.seq < d.seq) {
+            self.last_deployment = Some(d);
+        }
+    }
+
+    fn chain(&mut self, c: robodr_pkg::bundle::ChainState) {
+        let full = self.chains.len() >= crate::state::MAX_CHAINS;
+        match self.chains.iter_mut().find(|x| x.programme == c.programme) {
+            Some(x) if x.bundle_seq < c.bundle_seq => *x = c,
+            Some(_) => {}
+            None if !full => self.chains.push(c),
+            None => {}
+        }
+    }
+
+    fn note(&mut self, v: &Value) {
+        let u = |k: &str| v[k].as_u64();
+        let kind = v["kind"].as_str().unwrap_or("");
+        match kind {
+            kinds::FLOOR_RAISED => {
+                if let (Some(n), Some(f)) = (v["name"].as_str(), u("to")) {
+                    if robodr_pkg::common::is_pkg_name(n) {
+                        let e = self.floors.entry(n.to_string()).or_insert(0);
+                        *e = (*e).max(f);
+                    }
+                }
+            }
+            kinds::HIGHWATER => {
+                self.hw_generation = self.hw_generation.max(u("generation").unwrap_or(0));
+                self.time_floor = self.time_floor.max(u("time_floor").unwrap_or(0));
+                if let Ok(d) = serde_json::from_value(v["last_deployment"].clone()) {
+                    self.deployment(d);
+                }
+                if let Ok(cs) =
+                    serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(v["chains"].clone())
+                {
+                    for c in cs {
+                        self.chain(c);
+                    }
+                }
+            }
+            kinds::STARTED | kinds::REANCHORED => {
+                self.hw_generation = self.hw_generation.max(u("hw_generation").unwrap_or(0));
+                self.trust_version = self.trust_version.max(u("trust_version").unwrap_or(0));
+            }
+            kinds::TRUST_ROTATED => {
+                self.trust_version = self.trust_version.max(u("version").unwrap_or(0));
+            }
+            kinds::PACK_IMPORTED => {
+                self.trust_version = self.trust_version.max(u("trust_version").unwrap_or(0));
+                if let (Some(seq), Some(digest), Some(expires_at)) = (
+                    u("deployment_seq"),
+                    v["deployment_digest"].as_str(),
+                    u("expires_at"),
+                ) {
+                    if robodr_pkg::common::is_hex64(digest) {
+                        self.deployment(crate::state::LastDeployment {
+                            seq,
+                            digest: digest.to_string(),
+                            expires_at,
+                        });
+                    }
+                }
+                if let Ok(cs) =
+                    serde_json::from_value::<Vec<robodr_pkg::bundle::ChainState>>(v["heads"].clone())
+                {
+                    for c in cs {
+                        self.chain(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The open journal.
@@ -115,30 +218,26 @@ impl Journal {
     /// Floors recorded by `floor_raised` notes still in the journal
     /// (the baseline when the state file is missing or behind).
     pub fn recorded_floors(dir: &Path) -> std::collections::BTreeMap<String, u64> {
-        let mut out = std::collections::BTreeMap::new();
+        Self::history(dir).floors
+    }
+
+    /// What the notes still in the journal in `dir` say ([`History`]).
+    pub fn history(dir: &Path) -> History {
+        let mut h = History::default();
         let Ok(segs) = robodr_blackbox::verify::read_segments(dir) else {
-            return out;
+            return h;
         };
         for seg in segs {
             for item in robodr_blackbox::record::scan_frames(&seg.bytes).items {
                 let robodr_blackbox::record::ScanItem::Record(r) = item else {
                     continue;
                 };
-                let Ok(v) = serde_json::from_slice::<Value>(&r.record.payload) else {
-                    continue;
-                };
-                if v["kind"].as_str() != Some(kinds::FLOOR_RAISED) {
-                    continue;
-                }
-                if let (Some(n), Some(f)) = (v["name"].as_str(), v["to"].as_u64()) {
-                    if robodr_pkg::common::is_pkg_name(n) {
-                        let e = out.entry(n.to_string()).or_insert(0);
-                        *e = (*e).max(f);
-                    }
+                if let Ok(v) = serde_json::from_slice::<Value>(&r.record.payload) {
+                    h.note(&v);
                 }
             }
         }
-        out
+        h
     }
 
     /// Whether the journal directory already holds segments.

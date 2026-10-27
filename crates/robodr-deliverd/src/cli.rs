@@ -14,7 +14,7 @@ usage:
   robodr-deliverd once         --config FILE
   robodr-deliverd check-config --config FILE
   robodr-deliverd init-anchor  --config FILE --trust TRUST.json
-  robodr-deliverd reanchor     --config FILE --trust TRUST.json
+  robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]
   robodr-deliverd status       --config FILE
   robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
   robodr-deliverd --version
@@ -36,7 +36,12 @@ reanchor      after a lost state file the agent locks itself (no import,
               no install) when its signed high-water record is gone too;
               an operator presents the site's current trust file (the
               anchor or a newer rotation; a new anchor if none is left)
-              and the lock is lifted. Stop the service first.
+              and the lock is lifted. Stop the service first. The
+              configured blackbox.key is usually a systemd credential
+              that exists only while the service runs: pass the key file
+              itself with --key (/etc/robodr/keys/agentd-blackbox.key;
+              a regular file of the invoking user, no group or other
+              permissions).
 status        print the state (installed versions, floors, deployment).
 confirm       record a local operator's confirmation for an RPK that
               requires one (install.requires_operator_present).
@@ -89,7 +94,8 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
     };
     let rest: Vec<String> = it.collect();
     let known: &[&str] = match cmd.as_str() {
-        "init-anchor" | "reanchor" => &["config", "trust"],
+        "init-anchor" => &["config", "trust"],
+        "reanchor" => &["config", "trust", "key"],
         "confirm" => &["config", "deployment", "package"],
         "run" | "once" | "check-config" | "status" => &["config"],
         other => {
@@ -158,13 +164,39 @@ fn init_anchor(cfg: &Config, a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn reanchor(cfg: Config, a: &Args) -> Result<(), String> {
+fn reanchor(mut cfg: Config, a: &Args) -> Result<(), String> {
     let trust = a.req("trust")?.to_string();
+    // Review L-B: the black-box key file itself, for a stopped service
+    // whose configured key is a systemd credential.
+    if let Some(k) = a.one("key")? {
+        let p = Path::new(k);
+        check_key_file(p)?;
+        cfg.blackbox.key = p.to_path_buf();
+    }
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
     let v = e.reanchor(Path::new(&trust)).map_err(|e| e.0);
     let closed = e.close().map_err(|e| e.0);
     print(v?);
     closed
+}
+
+/// `--key`: an absolute path to a regular file (not a symlink) owned by
+/// the invoking user with no group or other permission bits.
+fn check_key_file(p: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if !p.is_absolute() {
+        return Err(format!("--key {}: not an absolute path", p.display()));
+    }
+    let md = std::fs::symlink_metadata(p).map_err(|e| format!("--key {}: {e}", p.display()))?;
+    let me = crate::users::effective_uid().ok_or("cannot read the effective uid")?;
+    if !md.file_type().is_file() || md.uid() != me || md.mode() & 0o077 != 0 {
+        return Err(format!(
+            "--key {}: must be a regular file owned by uid {me} with no group or other \
+             permissions",
+            p.display()
+        ));
+    }
+    Ok(())
 }
 
 fn status(cfg: &Config) -> Result<(), String> {

@@ -111,6 +111,9 @@ pub struct Engine {
     hw_key: Box<dyn robodr_blackbox::Signer>,
     /// The high-water record as last written or read.
     hw_written: Option<HighWater>,
+    /// The highest record generation known (record, state, journal): the
+    /// next write takes the one after it (review M-B).
+    hw_gen: u64,
 }
 
 impl std::fmt::Debug for Engine {
@@ -130,22 +133,28 @@ fn ver_json(v: &Option<Ver>) -> serde_json::Value {
 
 impl Engine {
     /// Open the agent: state, store, journal (single-writer lock), anchor,
-    /// and the high-water record ([`crate::highwater`], review M1).
+    /// and the high-water record ([`crate::highwater`], reviews M1, M-A,
+    /// M-B).
     ///
     /// | state file | high-water record | journal | result |
     /// |---|---|---|---|
-    /// | present | valid | any | state raised to the record (if behind) |
-    /// | present | missing / invalid | any | state kept; record rewritten from it |
-    /// | missing | valid | any | floors, deployment sequence, time floor, chain heads restored (High finding) |
-    /// | missing | missing / invalid | has records | **locked** until `reanchor` (High finding) |
+    /// | present | valid, current | any | state raised to the record (if behind) |
+    /// | present | missing / invalid | has records | **locked** until `reanchor` (High finding) |
+    /// | present | missing / invalid | empty | **locked** (an invalid record); a missing one is rewritten |
+    /// | missing | valid, current | any | floors, deployment sequence, time floor, chain heads restored (High finding) |
+    /// | missing | missing / invalid | has records | **locked** |
     /// | missing | missing | empty | a freshly enrolled unit |
+    /// | any | older than the journal's or the state's generation | any | **locked** |
+    /// | any | locked | any | **locked** (the lock is part of the signed record) |
     ///
     /// The `floor_raised` notes still in the journal raise the floors in
-    /// every case.
+    /// every case. A locked start writes a record that is locked too, so
+    /// deleting the state file again does not lift the lock.
     pub fn open(cfg: Config, clock: Box<dyn Clock>) -> R<Self> {
         crate::fsx::ensure_dir(&cfg.state_dir, 0o700)
             .map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
         let had_records = Journal::has_records(&cfg.blackbox.dir);
+        let history = Journal::history(&cfg.blackbox.dir);
         let journal = Journal::open(&cfg.blackbox.dir, &cfg.unit.id, &cfg.blackbox.key)?;
         let hw_key = robodr_blackbox::KeyFile::load_secret(&cfg.blackbox.key)
             .and_then(|k| k.signer())
@@ -166,7 +175,6 @@ impl Engine {
             signer,
         );
         let mut file = StateFile::new(&cfg.state_path());
-        let recorded = Journal::recorded_floors(&cfg.blackbox.dir);
         let hw = match highwater::load(&cfg.blackbox.dir, hw_key.as_ref()) {
             Ok(Some(h)) if h.site != cfg.unit.site || h.unit != cfg.unit.id => Err(format!(
                 "high-water record of unit {} at site {}, this is {} at {}",
@@ -177,7 +185,9 @@ impl Engine {
         let now = clock.now_s().unwrap_or(0);
         let mut restored: Option<&str> = None;
         let mut lock: Option<String> = None;
-        let mut state = match file.load()? {
+        let loaded = file.load()?;
+        let state_present = loaded.is_some();
+        let mut state = match loaded {
             Some(s) => {
                 if s.site != cfg.unit.site || s.unit != cfg.unit.id {
                     return Err(EngineError(format!(
@@ -191,40 +201,72 @@ impl Engine {
                 }
                 s
             }
-            None => {
-                match &hw {
-                    Ok(Some(_)) => {
-                        restored = Some(
-                            "the state file is missing; floors, deployment sequence, time floor \
-                             and chain heads restored from the signed high-water record",
-                        );
-                    }
-                    Ok(None) if !had_records => {}
-                    Ok(None) => {
-                        lock = Some(
-                            "the state file and the high-water record are missing but the \
-                             delivery journal has records: the floors and the deployment \
-                             sequence cannot be restored completely"
-                                .into(),
-                        );
-                    }
-                    Err(e) => {
-                        lock = Some(format!(
-                            "the state file is missing and the high-water record is not usable \
-                             ({e})"
-                        ));
-                    }
-                }
-                State::new(&cfg.unit.site, &cfg.unit.id)
-            }
+            None => State::new(&cfg.unit.site, &cfg.unit.id),
         };
+        let state_gen = state.hw_generation;
+        match &hw {
+            Ok(Some(h)) => {
+                // Review M-B: an older copy of the record put back.
+                let newest = history.hw_generation.max(state_gen);
+                if h.generation < newest {
+                    lock = Some(format!(
+                        "the high-water record is generation {}, older than the generation {} \
+                         the {} recorded: an older copy was put back",
+                        h.generation,
+                        newest,
+                        if history.hw_generation >= state_gen {
+                            "delivery journal"
+                        } else {
+                            "state file"
+                        }
+                    ));
+                } else if let Some(l) = &h.locked {
+                    // Review M-A: the lock is part of the signed record.
+                    lock = Some(l.why.clone());
+                } else if !state_present {
+                    restored = Some(
+                        "the state file is missing; floors, deployment sequence, time floor \
+                         and chain heads restored from the signed high-water record",
+                    );
+                }
+            }
+            Ok(None) if !had_records && !state_present => {}
+            Ok(None) if !had_records => {
+                // A state file with no journal at all: the record is
+                // written from it (a unit set up before the record).
+            }
+            Ok(None) => {
+                lock = Some(if state_present {
+                    "the high-water record is missing while the state file and the delivery \
+                     journal exist: the state file cannot be shown to be current"
+                        .into()
+                } else {
+                    "the state file and the high-water record are missing but the delivery \
+                     journal has records: the floors and the deployment sequence cannot be \
+                     restored completely"
+                        .into()
+                });
+            }
+            Err(e) => {
+                lock = Some(format!(
+                    "the high-water record is not usable ({}); the {} cannot be shown to be \
+                     current",
+                    robodr_pkg::common::trunc(e),
+                    if state_present {
+                        "state file"
+                    } else {
+                        "baseline"
+                    }
+                ));
+            }
+        }
         // Legacy (before review L4): name-keyed media entries.
         state.seen_media.clear();
         let mut behind: Vec<serde_json::Value> = Vec::new();
         if let Ok(Some(h)) = &hw {
             behind.extend(h.raise(&mut state));
         }
-        for (name, f) in &recorded {
+        for (name, f) in &history.floors {
             if let Some(old) = state.raise_floor(name, *f) {
                 behind.push(json!({"floor": name, "state": old, "black_box": f}));
             }
@@ -237,6 +279,10 @@ impl Engine {
                 });
             }
         }
+        let hw_gen = history
+            .hw_generation
+            .max(state_gen)
+            .max(hw.as_ref().ok().and_then(Option::as_ref).map_or(0, |h| h.generation));
         let store = Store::open(&cfg.state_dir)?;
         let mut e = Self {
             cfg,
@@ -251,33 +297,32 @@ impl Engine {
             media_cache: std::collections::BTreeMap::new(),
             hw_key,
             hw_written: None,
+            hw_gen,
         };
         e.load_anchor();
         e.journal.note(
             kinds::STARTED,
             json!({"version": env!("CARGO_PKG_VERSION"), "unit": e.cfg.unit.id,
-                   "site": e.cfg.unit.site, "trust_version": e.anchor.as_ref().map(|a| a.file().version)}),
+                   "site": e.cfg.unit.site, "trust_version": e.anchor.as_ref().map(|a| a.file().version),
+                   "hw_generation": hw.as_ref().ok().and_then(Option::as_ref).map(|h| h.generation)}),
         )?;
         match &hw {
-            Ok(Some(h)) => e.hw_written = Some(h.clone()),
-            Ok(None) => {}
+            Ok(Some(h)) if lock.is_none() => e.hw_written = Some(h.clone()),
+            Ok(_) => {}
             Err(err) => {
-                let r = e.journal.note(
+                e.journal.note(
                     kinds::STATE_RESTORED,
                     json!({"why": "the high-water record is not usable", "detail": err}),
                 )?;
-                e.finding(
-                    rules::REFUSED,
-                    Severity::High,
-                    format!("highwater_invalid: {err}; it is rewritten from the state"),
-                    Some(r),
-                );
             }
         }
         if let Some(why) = &lock {
             let r = e.journal.note(
                 kinds::STATE_RESTORED,
-                json!({"why": why, "locked": true, "restored": behind}),
+                json!({"why": why, "locked": true, "restored": behind,
+                       "hw_generation": hw.as_ref().ok().and_then(Option::as_ref).map(|h| h.generation),
+                       "journal_hw_generation": history.hw_generation,
+                       "state_hw_generation": state_gen}),
             )?;
             e.finding(
                 rules::REFUSED,
@@ -288,6 +333,7 @@ impl Engine {
                 ),
                 Some(r),
             );
+            // The record written now is locked as well (review M-A).
             e.save()?;
         } else if restored.is_some() || !behind.is_empty() {
             let why = restored.unwrap_or(
@@ -318,8 +364,34 @@ impl Engine {
     /// left), take its signed `issued_at` as a time floor and its site
     /// floors as they apply at every install, and lift the lock. The
     /// daemon must be stopped (the journal is single-writer).
+    ///
+    /// Review L-A: the trust file must not be older than the newest
+    /// version the delivery journal has seen, and the anti-replay baseline
+    /// (the newest accepted deployment, the bundle chain heads, the time
+    /// floor) is rebuilt from the journal's notes before the lock is
+    /// lifted; it is only ever raised.
     pub fn reanchor(&mut self, trust: &std::path::Path) -> R<serde_json::Value> {
         let now = self.sys_now()?;
+        let history = Journal::history(&self.cfg.blackbox.dir);
+        let (doc, sig) =
+            robodr_release::ops::read_trust_files(trust).map_err(|e| e.to_string())?;
+        let presented = robodr_pkg::trust::verify_trust_pinned(
+            &doc,
+            &sig,
+            &self.cfg.trust.roots,
+            &self.cfg.unit.site,
+            now,
+        )
+        .map_err(|e| format!("{}: {e}", trust.display()))?;
+        if presented.file().version < history.trust_version {
+            return Err(EngineError(format!(
+                "{}: trust file version {} is older than version {} the delivery journal has \
+                 seen; present the site's current trust file",
+                trust.display(),
+                presented.file().version,
+                history.trust_version
+            )));
+        }
         let anchor = self.cfg.anchor_path();
         let t = if std::fs::symlink_metadata(&anchor).is_ok() {
             let st = robodr_release::ops::SiteTrust::anchored(
@@ -343,12 +415,50 @@ impl Engine {
             .map_err(|e| e.to_string())?
         };
         self.load_anchor();
+        // Rebuild the anti-replay baseline from the journal (only raises).
+        let mut rebuilt = Vec::new();
+        if let Some(l) = &history.last_deployment {
+            if self
+                .state
+                .last_deployment
+                .as_ref()
+                .is_none_or(|x| x.seq < l.seq)
+            {
+                rebuilt.push(json!({"deployment_seq": l.seq}));
+                self.state.last_deployment = Some(l.clone());
+            }
+        }
+        for c in &history.chains {
+            if self
+                .state
+                .chain(&c.programme)
+                .is_none_or(|x| x.bundle_seq < c.bundle_seq)
+            {
+                rebuilt.push(json!({"chain": c.programme, "bundle_seq": c.bundle_seq}));
+                self.state.set_chain(c.clone());
+            }
+        }
+        for (name, f) in &history.floors {
+            if let Some(old) = self.state.raise_floor(name, *f) {
+                rebuilt.push(json!({"floor": name, "state": old, "black_box": f}));
+            }
+        }
+        if history.time_floor > self.state.time_floor {
+            rebuilt.push(json!({"time_floor": history.time_floor}));
+        }
         let was = self.state.locked.take();
-        self.state.time_floor = self.state.time_floor.max(t.file().issued_at);
+        self.state.time_floor = self
+            .state
+            .time_floor
+            .max(t.file().issued_at)
+            .max(history.time_floor);
         self.save()?;
         let v = json!({"trust_version": t.file().version, "trust_digest": t.digest,
                        "was_locked": was.as_ref().map(|l| l.why.clone()),
                        "time_floor": self.state.time_floor,
+                       "rebuilt": rebuilt,
+                       "last_deployment_seq": self.state.last_deployment.as_ref().map(|l| l.seq),
+                       "hw_generation": self.hw_gen,
                        "site_floors": t.file().floors.iter().map(|f| json!({"name": f.name, "min_serial": f.min_serial})).collect::<Vec<_>>()});
         self.journal.note(kinds::REANCHORED, v.clone())?;
         Ok(v)
@@ -389,12 +499,32 @@ impl Engine {
 
     /// Write the state; the high-water record first when the baseline
     /// moved, so the record is never behind the state file (review M1).
+    ///
+    /// Every record write takes the next generation and is noted in the
+    /// journal (`robodr.deliver.highwater`, with the baseline) right after
+    /// it, and the state file carries that generation (review M-B): a crash
+    /// in between leaves a record newer than the note or the state, which
+    /// is accepted; never an older one.
     fn save(&mut self) -> R<()> {
-        let hw = HighWater::of(&self.state);
-        if self.hw_written.as_ref() != Some(&hw) {
+        let mut hw = HighWater::of(&self.state);
+        if !self
+            .hw_written
+            .as_ref()
+            .is_some_and(|w| w.same_baseline(&hw))
+        {
+            hw.generation = self.hw_gen.saturating_add(1);
             highwater::store(&self.cfg.blackbox.dir, &hw, self.hw_key.as_ref())?;
+            self.hw_gen = hw.generation;
+            self.journal.note(
+                kinds::HIGHWATER,
+                json!({"generation": hw.generation, "digest": hw.digest()?,
+                       "locked": hw.locked.is_some(),
+                       "last_deployment": hw.last_deployment, "time_floor": hw.time_floor,
+                       "chains": hw.chains}),
+            )?;
             self.hw_written = Some(hw);
         }
+        self.state.hw_generation = self.hw_gen;
         Ok(self.file.save(&self.state)?)
     }
 
@@ -622,6 +752,7 @@ impl Engine {
                    "ring": imp.ring, "judged_at": imp.now,
                    "signers": imp.deployment.signers.0.iter().map(|(r, f)| format!("{}:{f}", r.as_str())).collect::<Vec<_>>(),
                    "trust_version": imp.trust.trust.file().version,
+                   "expires_at": d.expires_at, "heads": imp.heads,
                    "items": d.items.iter().map(|i| json!({"name": i.name, "serial": i.serial, "digest": i.rpk_digest})).collect::<Vec<_>>(),
                    "bundles": imp.bundles}),
         )?;

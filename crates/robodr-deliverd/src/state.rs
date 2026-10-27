@@ -207,6 +207,14 @@ pub struct State {
     /// (`robodr-deliverd reanchor`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked: Option<Locked>,
+    /// The generation of the high-water record written with this state
+    /// (review M-B; `highwater`). A record older than this locks the agent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hw_generation: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A media pack already handled (see [`State::seen_packs`]).
@@ -247,6 +255,7 @@ impl State {
             seen_media: BTreeMap::new(),
             seen_packs: Vec::new(),
             locked: None,
+            hw_generation: 0,
         }
     }
 
