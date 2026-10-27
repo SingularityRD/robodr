@@ -429,3 +429,131 @@ fn review_l10_a_spool_without_a_critical_reserve_is_refused() {
     };
     assert!(err.contains("spool.max_files"), "{err}");
 }
+
+// --- Second review of the F1 fix (wt/redfix, R2-1, R2-2) --------------------
+
+/// The genuine rogue: SPDP and a `rt/cmd_vel` writer from `ROGUE_IP`.
+fn rogue_frames() -> Vec<Vec<u8>> {
+    vec![
+        spdp_at(ROGUE_IP, ROGUE),
+        frame(
+            ROGUE_IP,
+            ROBOT_IP,
+            7410,
+            &sedp_datagram(ROGUE, "rt/cmd_vel", TWIST),
+        ),
+    ]
+}
+
+fn rogue_named_critical(
+    found: &[(robodr_agentd::SpoolRecord, robodr_ocsf::FindingEnvelope)],
+) -> bool {
+    found.iter().any(|(_, e)| {
+        e.entity_context.rule_id == "robot.ros2.unauthorized_motion_writer"
+            && json_of(e).contains(&ROGUE_IP.to_string())
+    })
+}
+
+/// R2-1: findings about the robot's own (profiled / pinned) participant
+/// were never folded. SEDP announcements "for" the profiled LEGIT with
+/// distinct topics, from 5 addresses, after one SPDP made the prefix
+/// contested: each datagram a Critical `endpoint_source_mismatch` plus a
+/// High `unknown_writer_topic`. 750 datagrams filled a 400-file spool (both
+/// shares) and the genuine rogue's Critical finding was dropped.
+#[test]
+fn review2_r2_1_findings_about_a_protected_prefix_are_bounded() {
+    let mut frames = vec![
+        spdp_at(ROBOT_IP, LEGIT),
+        spdp_at(Ipv4Addr::new(192, 168, 50, 90), LEGIT),
+    ];
+    for i in 0..750u32 {
+        let src = Ipv4Addr::new(192, 168, 52, (i % 5) as u8 + 1);
+        frames.push(frame(
+            src,
+            ROBOT_IP,
+            7410,
+            &sedp_datagram(LEGIT, &format!("rt/x{i:05}"), TWIST),
+        ));
+    }
+    frames.extend(rogue_frames());
+    let (s, log) = run_frames("rv2-r2-1", &frames, 400, serde_json::json!({}));
+    let found = spooled(&s.spool);
+    let r = rules(&found);
+    assert!(
+        rogue_named_critical(&found),
+        "the genuine rogue's Critical finding: {} records, dropped {}\n{log}",
+        found.len(),
+        s_dropped(&s)
+    );
+    assert_eq!(s_dropped(&s), 0, "{r:?}");
+    let about_legit = found
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e.entity_context.rule_id.as_str(),
+                "robot.ros2.endpoint_source_mismatch" | "robot.ros2.unknown_writer_topic"
+            )
+        })
+        .count();
+    // 4 per (participant, source, rule): 5 sources x 2 rules (before: 399).
+    assert!(about_legit <= 40, "{about_legit} one by one: {r:?}");
+    assert!(found.len() <= 120, "{} spool records", found.len());
+    // The rest is in Critical aggregates that name the protected prefix
+    // and their source.
+    let agg: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| {
+            e.entity_context.rule_id == "robot.ros2.discovery_flood"
+                && e.severity == Severity::Critical
+                && e.entity_context.detail.value.contains(LEGIT_HEX)
+        })
+        .collect();
+    assert!(!agg.is_empty(), "{r:?}");
+    for src in 1..=5 {
+        let ip = format!("192.168.52.{src}");
+        assert!(
+            agg.iter()
+                .any(|(_, e)| e.entity_context.detail.value.contains(&ip)),
+            "{ip}: {agg:#?}"
+        );
+    }
+    // Every one of them is still in the black box.
+    assert!(recorded(&s, "robot.ros2.endpoint_source_mismatch") >= 750);
+}
+
+/// R2-2: 128 spoofed sources (one SPDP each) filled the per-window source
+/// table, 4 more spoofed sources seeded the sourceless "many sources"
+/// Critical aggregate, and the real rogue's `unauthorized_motion_writer`
+/// was then folded into it unnamed: no spooled finding named its address
+/// or GUID (133 datagrams a minute).
+#[test]
+fn review2_r2_2_a_saturated_source_table_does_not_hide_a_rogue() {
+    let mut frames = Vec::new();
+    let mut n = 0usize;
+    for i in 0..128u32 {
+        let src = Ipv4Addr::new(10, 60, (i >> 8) as u8, (i & 255) as u8 + 1);
+        frames.push(spdp_at(src, spray_prefix(n)));
+        n += 1;
+    }
+    for i in 0..4u8 {
+        let src = Ipv4Addr::new(10, 61, 0, i + 1);
+        let g = spray_prefix(n);
+        n += 1;
+        frames.push(spdp_at(src, g));
+        frames.push(frame(
+            src,
+            ROBOT_IP,
+            7410,
+            &sedp_datagram(g, "rt/cmd_vel", TWIST),
+        ));
+    }
+    frames.extend(rogue_frames());
+    let (s, log) = run_frames("rv2-r2-2", &frames, 1000, serde_json::json!({}));
+    let found = spooled(&s.spool);
+    assert!(
+        rogue_named_critical(&found),
+        "no spooled motion-writer finding names the rogue: {:?}\n{log}",
+        rules(&found)
+    );
+    assert!(found.iter().any(|(_, e)| json_of(e).contains(ROGUE_HEX)));
+}

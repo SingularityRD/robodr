@@ -41,11 +41,18 @@
 //! other source key) may hold at most 1/[`RESERVE_SOURCES`] of it (at least
 //! one record) until the spool drains below the lesser share again (review
 //! H3): a flood of Critical findings from one address cannot take the
-//! share a later genuine rogue's Critical finding needs; what does not fit
-//! is in the black box only (as always). The reserve is at least one
-//! record (agentd refuses `max_files` below 8). The discovery-flood
-//! aggregation in agentd (`crate::flood`) keeps a GUID spray, Critical
-//! findings included, from filling either share.
+//! share a later genuine rogue's Critical finding needs. The **last**
+//! 1/[`RESERVE_SOURCES`] of the share is kept for sources that hold no
+//! record in it yet (review R2-1, R2-2): three or more flooding sources
+//! cannot fill it, only that many more distinct sources (spoofed ones
+//! included) with one record each can. What does not fit is in the black
+//! box only (as always). The reserve is at least one record (agentd refuses
+//! `max_files` below 8). The discovery-flood aggregation in agentd
+//! (`crate::flood`) bounds what a GUID spray, Critical findings and
+//! findings about the robot's own participants included, puts into either
+//! share (it does not make a spool without an exporter unfillable: a
+//! spoofed-source spray still adds a bounded number of records per
+//! minute).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -390,7 +397,16 @@ impl Spool {
             self.reserve_use.clear();
         } else if class == SpoolClass::Critical {
             let cap = (self.reserve_files() / RESERVE_SOURCES).max(1);
-            if self.reserve_use.get(source).copied().unwrap_or(0) >= cap {
+            let held = self.reserve_use.get(source).copied().unwrap_or(0);
+            // Review R2-1 / R2-2: the last part of the Critical share (as
+            // large as one source's cap) takes only a source that holds
+            // nothing in the share yet, so a handful of flooding sources
+            // cannot fill it.
+            let fresh_files = cap;
+            let fresh_bytes = (self.max_bytes / CRITICAL_RESERVE_DIVISOR / RESERVE_SOURCES).max(1);
+            let in_fresh = self.used_files() + 1 > self.max_files.saturating_sub(fresh_files)
+                || self.used_bytes() + len > self.max_bytes.saturating_sub(fresh_bytes);
+            if held >= cap || (in_fresh && held > 0) {
                 self.stats.dropped_full += 1;
                 self.stats.dropped_reserve_cap += 1;
                 return Err(SpoolError::Full);
@@ -573,6 +589,33 @@ mod tests {
         t.write_from(&rec(2), SpoolClass::Critical, "a").unwrap();
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&d2);
+    }
+
+    /// Review R2-1: five flooding sources used to fill the Critical share
+    /// a quarter each; the last part is kept for a source new to it.
+    #[test]
+    fn the_last_part_of_the_critical_share_is_for_new_sources() {
+        let d = tmp("crit-fresh");
+        let mut s = Spool::open(&d, 1 << 22, 400).unwrap();
+        while s.write_from(&rec(1), SpoolClass::Normal, "src:x").is_ok() {}
+        let mut n = 0;
+        for src in 0..5 {
+            while s
+                .write_from(&rec(2), SpoolClass::Critical, &format!("src:{src}"))
+                .is_ok()
+            {
+                n += 1;
+            }
+        }
+        // Three sources at their cap (12 each), two more records of the
+        // fourth in the general part, then one of the fifth (new to the
+        // share) in the last part.
+        assert_eq!(n, 36 + 2 + 1);
+        for r in 0..10 {
+            s.write_from(&rec(2), SpoolClass::Critical, &format!("src:rogue{r}"))
+                .unwrap();
+        }
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
