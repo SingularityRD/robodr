@@ -213,6 +213,17 @@ pub fn pcap_spaced(frames: &[Vec<u8>], step: Duration) -> Vec<u8> {
     w.into_inner()
 }
 
+/// A classic pcap (Ethernet) of `frames`, each at its own offset from the
+/// start (a replay is judged on these timestamps).
+pub fn pcap_timed(frames: &[(Duration, Vec<u8>)]) -> Vec<u8> {
+    let mut w = PcapWriter::new(Vec::new(), LinkType::ETHERNET, 65535, false).unwrap();
+    for (at, f) in frames {
+        w.write_packet(Duration::new(1_760_000_000, 0) + *at, f, f.len() as u32)
+            .unwrap();
+    }
+    w.into_inner()
+}
+
 /// The lab scenario: a legit participant + `rt/cmd_vel` and `rt/odom`
 /// writers, non-RTPS noise, then a rogue participant beaconing SPDP
 /// `beacons` times and announcing a `rt/cmd_vel` writer (unicast SEDP).

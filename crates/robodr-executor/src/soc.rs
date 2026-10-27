@@ -380,6 +380,11 @@ fn signed_target(action: &str, p: &SignedParams) -> Target {
             Ok(guid_prefix) => Target::Participant {
                 guid_prefix,
                 locators: Vec::new(),
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
             Err(_) => Target::Node { name: g.clone() },
         },

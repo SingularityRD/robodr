@@ -109,6 +109,16 @@ fn source(a: &Args) -> Result<Source, String> {
     }
 }
 
+/// How the uplink authenticates the server, for the start line: plain
+/// `http://` (loopback only) has no CA bundle and no pin (RESULTS D2).
+fn transport_label(tls: bool, pinned: bool) -> &'static str {
+    match (tls, pinned) {
+        (false, _) => "plain HTTP to loopback, no TLS",
+        (true, false) => "CA bundle",
+        (true, true) => "CA bundle + SPKI pin",
+    }
+}
+
 fn opts(a: &Args) -> Result<Opts, String> {
     let url = Endpoint::parse(a.req("url")?)?;
     let ca_bundle = a.one("ca-bundle")?.map(str::to_string);
@@ -335,11 +345,7 @@ fn main() -> ExitCode {
         "robodr-uplink: {} as {} ({})",
         o.url,
         loaded.key_id(),
-        if o.pins.is_empty() {
-            "CA bundle"
-        } else {
-            "CA bundle + SPKI pin"
-        }
+        transport_label(o.url.tls, !o.pins.is_empty())
     );
     let notifier = Notifier::from_env();
     let open = || {
@@ -368,5 +374,20 @@ impl Loaded {
     fn key_id(&self) -> String {
         use robodr_blackbox::Signer;
         self.key.key_id().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transport_label;
+
+    #[test]
+    fn plain_http_is_not_labelled_as_a_ca_bundle() {
+        assert_eq!(
+            transport_label(false, false),
+            "plain HTTP to loopback, no TLS"
+        );
+        assert_eq!(transport_label(true, false), "CA bundle");
+        assert_eq!(transport_label(true, true), "CA bundle + SPKI pin");
     }
 }

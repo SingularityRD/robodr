@@ -393,6 +393,7 @@ fn a_held_action_is_not_reported_in_force() {
         deadline_ms: None,
         duplicate: false,
         note: None,
+        quarantine: None,
     };
     link.put(outcome(ExStatus::Verified));
     let get = |e: &mut Engine, h: &mut FakeHost| e.handle(&Call::Get(id.into()), &meta(), h).body;

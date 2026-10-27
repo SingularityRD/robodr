@@ -108,6 +108,8 @@ pub mod control;
 pub mod daemon;
 /// executor v1 link (robodr-executor process; `executor.enabled`).
 pub mod executor_link;
+/// Discovery-flood aggregation of pipeline findings (red team F1).
+pub mod flood;
 pub mod health;
 pub mod host;
 pub mod input;
@@ -123,4 +125,4 @@ pub use daemon::{
 };
 pub use health::{HealthState, State};
 pub use safety::{SafetyFeed, SafetyReport};
-pub use spool::{Spool, SpoolRecord, SpoolStats};
+pub use spool::{Spool, SpoolClass, SpoolRecord, SpoolStats};

@@ -565,9 +565,10 @@ Rules for Unitree, all enforced in code:
     Isolation keeps it open, and it is accepted before any quarantine
     drop, so no quarantine acts inside the robot network, even on
     traffic that carries the quarantined GUID prefix.
-  * A quarantine of a participant whose SPDP locators lie on it (or that
-    agentd has no locators for) is refused (`motion_path`,
-    `locators_required`).
+  * A quarantine of a participant whose SPDP locators all lie on it (or
+    that agentd has no locators for and does not vouch for) is refused
+    (`motion_path`, `locators_required`); a locator on it next to others
+    outside is left out, never acted on.
   * During an isolation the robot's DDS discovery (SPDP to
     239.255.0.1:7400/7401, IGMP) keeps working, so the motion stack does
     not lose its peers.
@@ -592,7 +593,13 @@ Rules for Unitree, all enforced in code:
 * **Quarantine scope.** A quarantine acts only on participants whose
   SPDP locators lie in `network.quarantine.cidrs` and on the robot's DDS
   ports; with none configured every quarantine is refused
-  (`locator_out_of_scope`). The scope may not be `/0` or overlap the
+  (`locator_out_of_scope`). The SOC's answer says how far an applied
+  quarantine reaches (`containment`: `full` only when every source
+  address the participant was seen sending from and every locator it
+  announced is cut whole, any source port; `partial`; or `guid_only`
+  when only the GUID-prefix drop is in force, which a sender can evade by
+  re-attributing its traffic or changing its prefix). Cutting an address
+  cuts every DDS participant on that host. The scope may not be `/0` or overlap the
   management or uplink networks. On a humanoid the robot network stays a
   `low_level` motion path, so a quarantine never acts there anyway.
 * **Quadrupeds (Go2, B2).**
@@ -620,6 +627,15 @@ in `soc.keys` cannot be read or is one of the robot's own keys: every
 control-plane order is refused until it is fixed), `approval_key_removed`
 (after a reboot, a held action whose approving key is no longer listed is
 not re-armed) and `locator_out_of_scope`.
+
+**Upgrade order: the executor before agentd.** Since the red-team fixes
+an agentd order may carry `guid_only` and `excluded` (contract §6a). An
+older `robodr-executor` does not understand them and drops the order
+unanswered; the request then reads `failed` ("executor unreachable") and
+nothing is applied. Upgrade `robodr-executor` first, then
+`robodr-agentd` (the newer executor also reports how far a quarantine
+reaches, `containment` in the SOC's answer; with an older executor it
+reads `unknown`).
 
 **Upgrading an existing executor configuration:** add `soc.keys` (without
 it every control-plane order is refused, `soc_signature_invalid`) and

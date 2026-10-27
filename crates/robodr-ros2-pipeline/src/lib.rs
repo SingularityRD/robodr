@@ -104,7 +104,7 @@ pub mod socket;
 pub mod source;
 pub mod watch;
 
-pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress};
+pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress, QuarantineTarget, Rank};
 pub use config::{
     BindingConfig, CaptureConfig, CaptureInput, CaptureSettings, Config, Settings, SpdpSettings,
     UnitreeLegacyConfig,

@@ -88,8 +88,10 @@
 //! - No rate limit on *distinct* profile / binding findings: an attacker
 //!   announcing new GUIDs produces up to `max_findings_per_datagram` findings
 //!   per datagram (each a true positive, the dedup set stays bounded).
-//!   Downstream consumers should aggregate. Protocol and capture findings are
-//!   rate limited.
+//!   Downstream consumers should aggregate (robodr-agentd does: its
+//!   discovery-flood guard, red team F1, keyed by the structured
+//!   [`Finding::participant`] each per-participant / per-endpoint finding
+//!   carries). Protocol and capture findings are rate limited.
 //! - Duplicate identity parameters: the RTPS parser keeps the first value
 //!   and records the conflict as an anomaly without the other value. The
 //!   pipeline cannot judge the other topic itself; it raises
@@ -112,12 +114,12 @@ use robodr_events::profile::{Profile, ProfileError};
 use robodr_events::{Deviation, Mode, RobotEvent, Severity};
 use robodr_rtps::{
     hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentEventKind, FragmentReassembler,
-    ReassemblyLimits,
+    GuidPrefix, ReassemblyLimits,
 };
 use serde::Serialize;
 
 use crate::binding::{
-    parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
+    parse_prefix, parse_src_ip, BindingFinding, BindingOptions, BindingStats, BindingTable, Ingress,
 };
 use crate::dedup::DedupSet;
 use crate::identity::{IdentityResolver, IdentityStats, Resolution};
@@ -159,7 +161,9 @@ const MAX_CAPPED_RULES_LISTED: usize = 16;
 
 /// A raw deviation and the source IP it is attributed to, before dedup,
 /// ordering, the per-datagram cap and the rate limit ([`Pipeline::emit`]).
-type Candidate = (Deviation, String);
+/// The third element is the GUID prefix a per-participant / per-endpoint
+/// discovery finding is about ([`Finding::participant`]).
+type Candidate = (Deviation, String, Option<GuidPrefix>);
 
 /// DDSI-RTPS parameter ids whose value decides *what* an announcement is
 /// (topic, type, endpoint / participant identity, instance, liveliness).
@@ -522,6 +526,11 @@ pub struct Finding {
     pub profile_model: String,
     /// [`ProfileStatus::as_str`] at the time.
     pub profile_status: &'static str,
+    /// The GUID prefix a per-participant / per-endpoint discovery finding
+    /// is about (structured, from the parsed announcement; never parsed
+    /// back from the detail text, which carries attacker-chosen names).
+    /// `None` for every other finding.
+    pub participant: Option<GuidPrefix>,
 }
 
 /// Structured data attached to a threat (`Threat::extra` in Pulsar) and the
@@ -868,20 +877,39 @@ impl Pipeline {
             src_ip: src_ip.to_string(),
             profile_model: self.profile.model.clone(),
             profile_status: self.status.as_str(),
+            participant: None,
         }
     }
 
     /// Queue one raw deviation; [`Pipeline::emit`] decides what is reported.
     fn push(&mut self, out: &mut Vec<Candidate>, deviation: Deviation, src_ip: &str) {
+        self.push_for(out, deviation, src_ip, None);
+    }
+
+    /// [`Pipeline::push`] for a finding about participant `p`.
+    fn push_for(
+        &mut self,
+        out: &mut Vec<Candidate>,
+        deviation: Deviation,
+        src_ip: &str,
+        p: Option<GuidPrefix>,
+    ) {
         self.stats.raw_findings += 1;
-        out.push((deviation, src_ip.to_string()));
+        out.push((deviation, src_ip.to_string(), p));
     }
 
     fn push_binding(&mut self, out: &mut Vec<Candidate>, found: Vec<BindingFinding>) {
-        for (dev, ip) in found {
-            self.push(out, dev, &ip);
+        for (dev, ip, p) in found {
+            self.push_for(out, dev, &ip, p);
         }
         self.stats.binding = *self.binding.stats();
+    }
+
+    /// A SOC request names participant `p` (`quarantine_node`): its
+    /// remembered quarantine locators outlast prefixes nobody named
+    /// ([`BindingTable::note_soc_reference`], review M6).
+    pub fn note_soc_reference(&mut self, p: &GuidPrefix) {
+        self.binding.note_soc_reference(p);
     }
 
     /// Turn the candidates of one call (one datagram, tick, finish or
@@ -900,15 +928,21 @@ impl Pipeline {
     /// ordering guarantees that the most severe findings (e.g. a Critical
     /// rogue motion writer) are never the ones crowded out.
     fn emit(&mut self, cands: Vec<Candidate>, now: Instant) -> Vec<Finding> {
-        let mut fresh: Vec<(String, Deviation, String)> = Vec::with_capacity(cands.len());
+        let mut fresh: Vec<(String, Deviation, String, Option<GuidPrefix>)> =
+            Vec::with_capacity(cands.len());
         let mut batch_keys = HashSet::new();
-        for (dev, ip) in cands {
+        for (dev, ip, p) in cands {
+            // A participant that raised a High / Critical finding keeps its
+            // remembered quarantine locators longer (review M6).
+            if let Some(p) = &p {
+                self.binding.note_finding(p, dev.severity);
+            }
             let key = format!("{}|{}", dev.rule, dev.detail);
             if self.seen.contains(&key) || !batch_keys.insert(key.clone()) {
                 self.stats.duplicates += 1;
                 continue;
             }
-            fresh.push((key, dev, ip));
+            fresh.push((key, dev, ip, p));
         }
         fresh.sort_by_key(|c| std::cmp::Reverse(c.1.severity));
         let cap = self
@@ -919,7 +953,7 @@ impl Pipeline {
         let mut capped: BTreeMap<String, u64> = BTreeMap::new();
         let mut capped_max = Severity::Low;
         let mut capped_n = 0u64;
-        for (key, mut dev, ip) in fresh {
+        for (key, mut dev, ip, p) in fresh {
             if out.len() >= cap {
                 capped_n += 1;
                 capped_max = capped_max.max(dev.severity);
@@ -934,7 +968,9 @@ impl Pipeline {
             }
             self.seen.insert(&key);
             self.stats.findings += 1;
-            out.push(self.finding(dev, &ip));
+            let mut f = self.finding(dev, &ip);
+            f.participant = p;
+            out.push(f);
         }
         if capped_n > 0 {
             self.stats.capped += capped_n;
@@ -1049,8 +1085,8 @@ impl Pipeline {
         self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
-        for dev in self.motion.learn(&self.profile, &report) {
-            self.push(&mut out, dev, src_ip);
+        for (dev, p) in self.motion.learn(&self.profile, &report) {
+            self.push_for(&mut out, dev, src_ip, Some(p));
         }
         let ctx = DatagramCtx {
             src_ip,
@@ -1378,10 +1414,11 @@ impl Pipeline {
                         sanitize(&identity),
                         held.join(", ")
                     );
-                    self.push(
+                    self.push_for(
                         out,
                         Deviation::new(rules::IDENTITY_INSTANCES_EXCEEDED, Severity::High, detail),
                         src_ip,
+                        Some(p),
                     );
                 }
                 Resolution::Refreshed | Resolution::NoMatch => {}
@@ -1454,7 +1491,14 @@ impl Pipeline {
         for event in report.to_events(src_ip) {
             self.stats.events += 1;
             if let Some(dev) = self.profile.evaluate(&event) {
-                self.push(out, dev, src_ip);
+                let p = match &event {
+                    RobotEvent::Ros2ParticipantDiscovered(x) => parse_prefix(&x.guid_prefix),
+                    RobotEvent::Ros2WriterDiscovered(x) | RobotEvent::Ros2ReaderDiscovered(x) => {
+                        parse_prefix(&x.guid_prefix)
+                    }
+                    _ => None,
+                };
+                self.push_for(out, dev, src_ip, p);
             }
         }
     }
@@ -1534,10 +1578,11 @@ impl Pipeline {
                 let detail = format!(
                     "profiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"
                 );
-                self.push(
+                self.push_for(
                     out,
                     Deviation::new(rules::PARTICIPANT_REMOVED, Severity::Medium, detail),
                     src_ip,
+                    Some(r.guid_prefix),
                 );
             } else {
                 let sev = if consistent == Some(false) {
@@ -1548,10 +1593,11 @@ impl Pipeline {
                 let detail = format!(
                     "unprofiled participant {guid} announced as {what}{by} from {src_ip}{unbound}"
                 );
-                self.push(
+                self.push_for(
                     out,
                     Deviation::new(rules::DISCOVERY_REMOVAL, sev, detail),
                     src_ip,
+                    Some(r.guid_prefix),
                 );
             }
         }
@@ -1585,10 +1631,11 @@ impl Pipeline {
                 "{kind} {id} of participant {} announced as {what} from {src_ip}{note}",
                 hex12(&r.participant)
             );
-            self.push(
+            self.push_for(
                 out,
                 Deviation::new(rules::DISCOVERY_REMOVAL, sev, detail),
                 src_ip,
+                Some(r.participant),
             );
         }
     }

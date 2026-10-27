@@ -1013,6 +1013,32 @@ impl Agent {
         )
     }
 
+    /// Record a deviation in the black box only, exactly as
+    /// [`Agent::handle_external`] records it (same mode rule, same record
+    /// kind and criticality), but without a response plan, a finding or an
+    /// executor submission. For deviations a caller folds into one
+    /// aggregate finding (agentd's discovery-flood guard): each one stays
+    /// evidence. Returns the record's reference, or why it was not written.
+    pub fn record_deviation(
+        &mut self,
+        now: Timestamp,
+        detector: Detector,
+        dev: &Deviation,
+    ) -> Result<BlackBoxRef, Vec<String>> {
+        self.observe_time(now);
+        let observe = detector == Detector::SelfHealth
+            || dev.is_observe_only()
+            || self.profile.mode() == Mode::Observe;
+        let dev = dev.clone().with_mode(if observe {
+            Mode::Observe
+        } else {
+            Mode::Enforce
+        });
+        let mut errors = Vec::new();
+        self.append("deviation", &mut errors, |r| r.append_deviation(&dev))
+            .ok_or(errors)
+    }
+
     /// Append a free-form JSON note to the black box at `now` (e.g. a
     /// daemon heartbeat). Goes through the same outage handling as every
     /// other append (reopen with backoff, `evidence_recovered` fault).

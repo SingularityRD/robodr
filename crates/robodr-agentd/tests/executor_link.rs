@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::pcap::robot_profile;
+use common::pcap::{
+    frame, robot_profile, sedp_datagram, spdp_datagram, ROGUE, ROGUE_HEX, SPDP_GROUP, TWIST,
+};
 use common::*;
 use robodr_agentd::control::auth::{answer_message, signing_message};
 use robodr_agentd::control::evidence::parse_signature_header;
@@ -787,4 +789,631 @@ fn executor_section_is_strict_and_off_by_default() {
     assert!(s.resolve(&cfg).executor.is_some());
     cfg["executor"]["unknown"] = json!(1);
     assert!(robodr_agentd::load(&s.write_config(&cfg)).is_err());
+}
+
+/// Red team F3 (row R6e): the SOC quarantines the rogue participant after
+/// a GUID spray (R2) pushed it out of the binding table. agentd used to
+/// hand the executor no locators then (`locators_required`); it now hands
+/// it the rogue's own last announced ones, and the quarantine is verified.
+#[test]
+fn a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators() {
+    let s = setup("exec-rt-f3", &robot_profile(true));
+    let safety = s.dir.join("safety.sock");
+    let control = s.dir.join("control.sock");
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let rogue_ip = std::net::Ipv4Addr::new(10, 0, 0, 66);
+    let spray_ip = std::net::Ipv4Addr::new(10, 0, 0, 77);
+    let mut frames = vec![
+        frame(rogue_ip, SPDP_GROUP, 7400, &spdp_datagram(ROGUE, rogue_ip)),
+        frame(
+            rogue_ip,
+            rogue_ip,
+            7410,
+            &sedp_datagram(ROGUE, "rt/cmd_vel", TWIST),
+        ),
+    ];
+    const SPRAY: u32 = 1500;
+    for i in 0..SPRAY {
+        let mut g = [0xd1; 12];
+        g[8..12].copy_from_slice(&i.to_be_bytes());
+        frames.push(frame(
+            spray_ip,
+            SPDP_GROUP,
+            7400,
+            &spdp_datagram(g, spray_ip),
+        ));
+    }
+    let mut cfg = exec_config(&s, &control, None, &safety, &exec_sock);
+    cfg["sensor"]["capture"] = json!({"enabled": true, "pcap_replay": s.pcap(&frames)});
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let _plc = plc_idle(&s, &safety, &control);
+    wait_for(60, "capture replayed", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["datagrams"].as_u64()? >= u64::from(SPRAY) + 2).then_some(())
+    });
+    let st = status(&s.spool).unwrap();
+    assert!(
+        st["pipeline"]["binding"]["evicted"].as_u64().unwrap() > 0,
+        "the spray evicted bindings: {}",
+        st["pipeline"]["binding"]
+    );
+    let ux = Via::Unix(&control);
+    submit(
+        ux,
+        "q-rogue",
+        "quarantine_node",
+        json!({"participant_guid": ROGUE_HEX}),
+        None,
+    );
+    let v = wait_status(ux, "q-rogue", "verified");
+    assert_eq!(v["executed"], true, "{v}");
+    let table = serde_json::to_string(&*model.0.lock().unwrap()).unwrap();
+    assert!(table.contains("10.0.0.66"), "rogue locator rule: {table}");
+    assert!(!table.contains("10.0.0.77"), "never the sprayer's: {table}");
+    finish(stop, h);
+}
+
+// --- Review of the red-team fixes (wt/redfix, H1, H2, M7) -------------------
+// The reviewer's proofs of concept through the real agentd and the real
+// (in-process) executor: the quarantine of a rogue never cuts another
+// participant's address, and the rogue cannot make itself unquarantinable.
+
+const LEGIT_HEX_: &str = common::pcap::LEGIT_HEX;
+const DECOY: [u8; 12] = [0xc7; 12];
+const DECOY_HEX: &str = "c7c7c7c7c7c7c7c7c7c7c7c7";
+
+fn v4(d: u8) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::new(10, 0, 0, d)
+}
+
+/// SPDP for `prefix` sent from `src`, announcing locators on `ips`.
+fn spdp_from(src: std::net::Ipv4Addr, prefix: [u8; 12], ips: &[std::net::Ipv4Addr]) -> Vec<u8> {
+    use common::pcap::{datagram, spdp_sub};
+    frame(
+        src,
+        SPDP_GROUP,
+        7400,
+        &datagram(prefix, &[spdp_sub(prefix, ips)]),
+    )
+}
+
+fn writer_from(src: std::net::Ipv4Addr, prefix: [u8; 12]) -> Vec<u8> {
+    frame(
+        src,
+        v4(10),
+        7410,
+        &sedp_datagram(prefix, "rt/cmd_vel", TWIST),
+    )
+}
+
+/// The request's state once the executor answered (verified / refused /
+/// failed).
+fn wait_final(via: Via<'_>, id: &str) -> Value {
+    wait_for(10, "executor answer", || {
+        let v = get(via, id);
+        matches!(
+            v["status"].as_str(),
+            Some("verified" | "refused" | "failed")
+        )
+        .then_some(v)
+    })
+}
+
+/// Replay `frames` (`step` apart), optionally feed participant `events`
+/// (JSONL), then quarantine `guid` from the SOC. The request's final state
+/// and the nftables model's table (`"null"` when nothing is installed).
+fn soc_quarantine(
+    tag: &str,
+    frames: &[Vec<u8>],
+    step: std::time::Duration,
+    events: &[&str],
+    guid: &str,
+) -> (Value, String) {
+    let s = setup(tag, &robot_profile(true));
+    let safety = s.dir.join("safety.sock");
+    let control = s.dir.join("control.sock");
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let mut cfg = exec_config(&s, &control, None, &safety, &exec_sock);
+    cfg["sensor"]["capture"] = json!({"enabled": true, "pcap_replay": s.pcap_spaced(frames, step)});
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let _plc = plc_idle(&s, &safety, &control);
+    wait_for(30, "capture replayed", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["datagrams"].as_u64()? >= frames.len() as u64).then_some(())
+    });
+    if !events.is_empty() {
+        let mut ev = wait_for(5, "event socket", || {
+            UnixStream::connect(s.dir.join("ev.sock")).ok()
+        });
+        for e in events {
+            writeln!(ev, "{e}").unwrap();
+        }
+        wait_for(10, "participant events", || {
+            (status(&s.spool)?["inputs"][0]["received"].as_u64()? >= events.len() as u64)
+                .then_some(())
+        });
+    }
+    let ux = Via::Unix(&control);
+    submit(
+        ux,
+        "q-review",
+        "quarantine_node",
+        json!({"participant_guid": guid}),
+        None,
+    );
+    let v = wait_final(ux, "q-review");
+    let table = serde_json::to_string(&*model.0.lock().unwrap()).unwrap();
+    finish(stop, h);
+    (v, table)
+}
+
+/// H1 (PoC 2): the profiled participant's lease ran out; one SPDP for its
+/// prefix from the attacker's host, then a decoy announcing the robot
+/// participant's address next to its own. The SOC quarantines the decoy:
+/// the robot participant's address must never be cut.
+#[test]
+fn review_h1_quarantine_of_a_decoy_never_cuts_the_profiled_participant() {
+    let frames = vec![
+        spdp_from(v4(10), common::pcap::LEGIT, &[v4(10)]),
+        spdp_from(v4(66), common::pcap::LEGIT, &[v4(66)]),
+        spdp_from(v4(66), DECOY, &[v4(66), v4(10)]),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h1",
+        &frames,
+        std::time::Duration::from_secs(120),
+        &[],
+        DECOY_HEX,
+    );
+    assert!(
+        !table.contains("\"10.0.0.10\""),
+        "the robot participant's address was cut: {v}\n{table}"
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("\"10.0.0.66\""), "{table}");
+}
+
+/// H2a: a live decoy prefix (from its own address) copies the rogue's
+/// locators. The rogue's quarantine used to be refused
+/// (`locators_required`).
+#[test]
+fn review_h2a_a_decoy_cannot_make_the_rogue_unquarantinable() {
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+        spdp_from(v4(67), DECOY, &[v4(66)]),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h2a",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("\"10.0.0.66\""), "{table}");
+    assert!(!table.contains("\"10.0.0.67\""), "{table}");
+}
+
+/// H2a from the rogue's own address (review R2-3 (a); it was mis-titled
+/// "spoofed": the rogue's second prefix needs no spoofing). Both prefixes
+/// have evidence at the same ip:port; it used to be handed to neither, so
+/// the rogue was quarantined by GUID prefix only. They share the host: the
+/// rogue's address is cut.
+#[test]
+fn review_h2a_a_self_decoy_does_not_reduce_the_quarantine_to_guid_only() {
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+        spdp_from(v4(66), DECOY, &[v4(66)]),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h2a-self",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("robodr quarantine_node"), "{table}");
+    assert!(table.contains("\"10.0.0.66\""), "self-decoy: {table}");
+}
+
+/// H2b: the rogue announces (and sends SPDP from) a locator outside the
+/// quarantine scope and one inside the motion control path, plus a loopback
+/// one. They used to make the executor refuse the whole order; they are
+/// now dropped (with the reason in the answer's note) and the rest, plus
+/// the GUID-prefix drop, is quarantined.
+#[test]
+fn review_h2b_poison_locators_are_dropped_not_a_reason_to_refuse() {
+    let far = std::net::Ipv4Addr::new(10, 99, 0, 1);
+    let motion = std::net::Ipv4Addr::new(192, 168, 123, 5);
+    let lo = std::net::Ipv4Addr::LOCALHOST;
+    let ips = [v4(66), far, motion, lo];
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &ips),
+        spdp_from(far, ROGUE, &ips),
+        spdp_from(motion, ROGUE, &ips),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv-h2b",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert!(table.contains("\"10.0.0.66\""), "{table}");
+    for bad in ["10.99.0.1", "192.168.123.5", "127.0.0.1"] {
+        assert!(!table.contains(&format!("\"{bad}\"")), "{bad}: {table}");
+    }
+}
+
+/// M7: a JSONL participant event used to fill the locators of a prefix the
+/// binding table deliberately gave none (here the profiled prefix,
+/// contested by a second host): the robot participant's quarantine was
+/// executed on whatever the event announced.
+#[test]
+fn review_m7_an_event_input_does_not_bypass_the_binding_tables_refusal() {
+    let frames = vec![
+        spdp_from(v4(10), common::pcap::LEGIT, &[v4(10)]),
+        spdp_from(v4(66), common::pcap::LEGIT, &[v4(66)]),
+    ];
+    let ev = format!(
+        "{{\"kind\":\"ros2_participant_discovered\",\"guid_prefix\":\"{LEGIT_HEX_}\",\
+         \"src_ip\":\"10.0.0.66\",\"locators\":[\"10.0.0.66:7410\",\"10.0.0.10:7410\"]}}"
+    );
+    let (v, table) = soc_quarantine(
+        "rv-m7",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[&ev],
+        LEGIT_HEX_,
+    );
+    assert_eq!(v["status"], "refused", "{v}\n{table}");
+    assert_eq!(v["refusal"]["code"], "locators_required", "{v}");
+    assert_eq!(table, "null");
+}
+
+// --- Second review of the red-team fixes (wt/redfix, R2-3, R2-6) ------------
+
+/// R2-3: the rogue announced its locators only on an address it never
+/// sends from (no spoofing), so the executor installed the RTPS-header
+/// GUID-prefix drop alone (bypassable with INFO_SRC or a new prefix). The
+/// SOC still read `verified` / `in_force: true` with no hint of the scope.
+/// The answer now says how far the quarantine reaches (`containment`) and
+/// what was cut and left out (`state.quarantine`).
+#[test]
+fn review2_r2_3_the_soc_answer_carries_the_quarantine_scope() {
+    // GUID prefix only: every locator is on an address it never sent from,
+    // and the address it sends from is outside the executor's quarantine
+    // scope (since review R3-1 an in-scope one is cut whole: `partial`,
+    // `review3_r3_1_*`).
+    let out = std::net::Ipv4Addr::new(10, 99, 0, 66);
+    let frames = vec![spdp_from(out, ROGUE, &[v4(68)]), writer_from(out, ROGUE)];
+    let (v, table) = soc_quarantine(
+        "rv2-r2-3-guid",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["in_force"], true, "{v}");
+    assert_eq!(v["containment"], "guid_only", "{v}");
+    assert_containment_matches_rules(&v, &table);
+    let q = &v["state"]["quarantine"];
+    assert_eq!(q["locators"], json!([]), "{v}");
+    let ex = q["excluded"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert!(
+        ex.iter().any(|x| x["locator"] == "10.0.0.68:7410"
+            && x["reason"].as_str().unwrap().contains("never seen sending")),
+        "{v}"
+    );
+    assert_eq!(q["addresses"], json!([]), "{v}");
+    let exa = q["excluded_addresses"].as_array().unwrap();
+    assert!(
+        exa.iter().any(|x| x["address"] == "10.99.0.66"
+            && x["reason"]
+                .as_str()
+                .unwrap()
+                .contains("network.quarantine.cidrs")),
+        "{v}"
+    );
+    // Full: every announced locator cut.
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv2-r2-3-full",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["containment"], "full", "{v}");
+    assert_containment_matches_rules(&v, &table);
+    assert_eq!(
+        v["state"]["quarantine"]["locators"],
+        json!(["10.0.0.66:7410", "10.0.0.66:7411"]),
+        "{v}"
+    );
+    // Partial: one announced locator outside the executor's scope.
+    let far = std::net::Ipv4Addr::new(10, 99, 0, 1);
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66), far]),
+        spdp_from(far, ROGUE, &[v4(66), far]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv2-r2-3-part",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["containment"], "partial", "{v}");
+    assert_containment_matches_rules(&v, &table);
+    let ex = v["state"]["quarantine"]["excluded"].as_array().unwrap();
+    assert!(ex.iter().any(|x| x["locator"] == "10.99.0.1:7410"), "{v}");
+}
+
+/// R2-6: agentd cut the binding's locators to the order's limit (16)
+/// silently: the rogue could push its real port out with 16 decoy ports on
+/// its own address, and nothing said why it was not cut.
+#[test]
+fn review2_r2_6_locators_over_the_order_limit_are_listed_as_left_out() {
+    use robodr_agentd::executor_link::{attach_locators, LocatorBook};
+    use robodr_executor::order::{Order, Origin, Target};
+    let o = Order {
+        id: "q".into(),
+        action: robodr_responder::ActionId::QuarantineNode,
+        target: Target::Participant {
+            guid_prefix: ROGUE_HEX.parse().unwrap(),
+            locators: Vec::new(),
+            guid_only: false,
+            excluded: Vec::new(),
+            addresses: Vec::new(),
+            excluded_addresses: Vec::new(),
+            evidence_truncated: false,
+        },
+        ttl_s: None,
+        judged_state: robodr_responder::SafetyState::Idle,
+        context: robodr_responder::OperationalContext {
+            platform: robodr_responder::PlatformFamily::Ugv,
+            morphology: robodr_responder::Morphology::WheeledMobile,
+            phase: robodr_responder::MissionPhase::Transit,
+            connectivity: robodr_responder::Connectivity::Connected,
+            control: robodr_responder::ControlMode::Autonomous,
+            operator_present: true,
+            profile_locked: true,
+        },
+        plan_morphology: robodr_responder::Morphology::WheeledMobile,
+        human_approved: true,
+        replay: false,
+        origin: Origin::Planner {
+            rule: "r".into(),
+            finding_id: None,
+        },
+        issued_ms: 0,
+        soc: None,
+    };
+    let all: Vec<std::net::SocketAddr> = (0..20u16)
+        .map(|i| format!("10.0.0.66:{}", 7400 + i).parse().unwrap())
+        .collect();
+    let out = attach_locators(
+        o,
+        |_, _| robodr_ros2_pipeline::QuarantineTarget {
+            locators: all.clone(),
+            excluded: Vec::new(),
+            known: true,
+            guid_only: true,
+            ..Default::default()
+        },
+        &LocatorBook::default(),
+    );
+    let Target::Participant {
+        locators, excluded, ..
+    } = &out.target
+    else {
+        panic!()
+    };
+    assert_eq!(locators.len(), robodr_executor::order::MAX_LOCATORS);
+    let left: Vec<u16> = excluded.iter().map(|x| x.port).collect();
+    assert_eq!(left, vec![7416, 7417, 7418, 7419], "{excluded:?}");
+    assert!(excluded.iter().all(|x| x.reason.contains("limit")));
+    out.validate().unwrap();
+}
+
+// --- Third review of the red-team fixes (wt/redfix, R3-1) --------------------
+
+/// What table `inet robodr` (the executor's nftables model) does with one
+/// UDP datagram: `"accept"` or `"drop"`.
+fn model_verdict(
+    table: &str,
+    chain: &str,
+    src: (&str, u16),
+    dst: (&str, u16),
+    payload: &[u8],
+) -> String {
+    use robodr_executor::nftmodel::{verdict_listed, Packet};
+    let objs: Vec<Value> = serde_json::from_str::<Option<Vec<Value>>>(table)
+        .unwrap()
+        .unwrap_or_default();
+    let p = Packet::udp(
+        chain,
+        (src.0.parse().unwrap(), src.1),
+        (dst.0.parse().unwrap(), dst.1),
+        payload,
+    );
+    verdict_listed(&objs, &p).unwrap().to_string()
+}
+
+/// `containment` must match the rules actually written: every address in
+/// `state.quarantine.addresses` drops a datagram from an ephemeral source
+/// port to a DDS port of the robot whatever its RTPS header says; `full`
+/// only when nothing was left out and every cut locator's address is one
+/// of them; `guid_only` only when no address or locator rule exists.
+fn assert_containment_matches_rules(v: &Value, table: &str) {
+    let q = &v["state"]["quarantine"];
+    let addrs: Vec<String> = q["addresses"]
+        .as_array()
+        .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+        .unwrap_or_default();
+    let other = robodr_executor::nftmodel::rtps(DECOY_HEX);
+    for a in &addrs {
+        assert_eq!(
+            model_verdict(table, "input", (a, 52_101), ("10.0.0.1", 7410), &other),
+            "drop",
+            "address {a} is reported cut but its traffic passes: {v}\n{table}"
+        );
+    }
+    let locators: Vec<String> = q["locators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    match v["containment"].as_str().unwrap() {
+        "full" => {
+            assert!(!addrs.is_empty(), "{v}");
+            assert_eq!(q["excluded"], json!([]), "{v}");
+            assert!(
+                q.get("excluded_addresses")
+                    .is_none_or(|x| x.as_array().is_some_and(Vec::is_empty)),
+                "{v}"
+            );
+            for l in &locators {
+                let ip = l.parse::<std::net::SocketAddr>().unwrap().ip().to_string();
+                assert!(addrs.contains(&ip), "locator {l} not covered: {v}");
+            }
+        }
+        "guid_only" => {
+            assert!(addrs.is_empty() && locators.is_empty(), "{v}");
+        }
+        "partial" => {}
+        other => panic!("containment {other}: {v}"),
+    }
+}
+
+/// R3-1: `containment: "full"` meant "every announced locator has a rule",
+/// but the inbound rule matched only `saddr <ip> udp sport <announced
+/// port>`. Fast DDS sends from ephemeral ports, so inbound traffic of a
+/// "fully contained" participant was held back only by the GUID-prefix
+/// drop, which `INFO_SRC` re-attribution evades. The address it sends from
+/// is now cut whole (to the robot's DDS ports, any source port).
+#[test]
+fn review3_r3_1_a_participant_sending_from_an_ephemeral_port_is_dropped() {
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(66)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv3-r3-1",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["containment"], "full", "{v}");
+    // RTPS re-attributed to another prefix, from an ephemeral port: dropped.
+    let other = robodr_executor::nftmodel::rtps(DECOY_HEX);
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.1", 7410),
+            &other
+        ),
+        "drop",
+        "{v}\n{table}"
+    );
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.1", 7650),
+            b"x"
+        ),
+        "accept",
+        "only the robot's DDS ports (domain 0: 7400-7649) are cut: {table}"
+    );
+    assert_eq!(
+        model_verdict(
+            &table,
+            "forward",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.20", 7411),
+            b"x"
+        ),
+        "drop",
+        "{table}"
+    );
+    // Another host on the same network: untouched.
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.67", 52_101),
+            ("10.0.0.1", 7410),
+            &other
+        ),
+        "accept",
+        "{table}"
+    );
+    // To the participant's host, any DDS port: dropped.
+    assert_eq!(
+        model_verdict(
+            &table,
+            "output",
+            ("10.0.0.1", 40_000),
+            ("10.0.0.66", 7499),
+            b"x"
+        ),
+        "drop",
+        "{table}"
+    );
+    assert_eq!(
+        v["state"]["quarantine"]["addresses"],
+        json!(["10.0.0.66"]),
+        "{v}"
+    );
+    assert_containment_matches_rules(&v, &table);
+
+    // An observed source address it never announced as a locator is cut
+    // too; the announced-only one is not (left out): `partial`.
+    let frames = vec![
+        spdp_from(v4(66), ROGUE, &[v4(68)]),
+        writer_from(v4(66), ROGUE),
+    ];
+    let (v, table) = soc_quarantine(
+        "rv3-r3-1-unannounced",
+        &frames,
+        std::time::Duration::from_millis(10),
+        &[],
+        ROGUE_HEX,
+    );
+    assert_eq!(v["status"], "verified", "{v}");
+    assert_eq!(v["containment"], "partial", "{v}");
+    assert_eq!(
+        model_verdict(
+            &table,
+            "input",
+            ("10.0.0.66", 52_101),
+            ("10.0.0.1", 7410),
+            &other
+        ),
+        "drop",
+        "{v}\n{table}"
+    );
+    assert_containment_matches_rules(&v, &table);
 }

@@ -44,18 +44,35 @@
 //!     (`needs_approval`);
 //! 11. the target is not on the motion control path (`motion_path`) unless
 //!     the policy lists the target class in `fall_safe_restrict` and the
-//!     entry is not `low_level` (a `low_level` entry is never cut). For a
-//!     quarantine the order must carry the participant's SPDP unicast
-//!     locators (`locators_required`); each must lie provably outside
-//!     every non-cuttable entry: outside its `cidr`; an entry with an
-//!     `interface` and no `cidr` cannot be proven and refuses every
-//!     quarantine (`motion_path`); and each must be in scope
-//!     (`locator_out_of_scope`, review F4: inside a
-//!     `network.quarantine.cidrs` entry, on one of the robot's DDS ports,
-//!     one address family for all). The non-cuttable entries are frozen into
-//!     the quarantine and rendered as accepts **before** its drops, so a
-//!     quarantine cannot act inside a low-level network even when traffic
-//!     there carries the quarantined GUID prefix;
+//!     entry is not `low_level` (a `low_level` entry is never cut): its GUID
+//!     prefix is not a non-cuttable entry's, and no non-cuttable entry
+//!     names an interface without a `cidr` (nothing can be proven outside
+//!     it). A quarantine acts only on locators it can prove lie outside
+//!     every non-cuttable entry (outside its `cidr`) **and** in scope
+//!     (review F4: inside a `network.quarantine.cidrs` entry, on one of the
+//!     robot's DDS ports, not loopback, one address family). Review of the
+//!     F3 fix (H2b): a locator failing either check is **left out** (listed
+//!     in the plan, the `applied` event and the state the executor answers
+//!     agentd: its `note` and `quarantine.excluded`, which agentd passes on
+//!     to the SOC as `state.quarantine` / `containment`, review R2-3;
+//!     nothing rendered for it) instead of refusing the whole order, so one bad
+//!     locator in the rogue's own SPDP cannot make it unquarantinable. Still
+//!     refused: an order whose every locator is on the motion control path
+//!     (`motion_path`: the participant may be on it); an empty
+//!     `network.quarantine.cidrs` (`locator_out_of_scope`); and, unless
+//!     agentd vouched for a GUID-prefix-only quarantine (`guid_only`: the
+//!     participant was seen and is not one of the robot's own), an order
+//!     with no locator left (`locator_out_of_scope` when it had some,
+//!     `locators_required` when it had none). The non-cuttable entries are
+//!     frozen into the quarantine and rendered as accepts **before** its
+//!     drops, so a quarantine (its GUID-prefix drop included) cannot act
+//!     inside a low-level network even when traffic there carries the
+//!     quarantined GUID prefix. Review R3-1: the order's source addresses
+//!     (cut whole, to and from the robot's DDS ports, any source port) get
+//!     the same checks, plus outside every management / uplink entry; a
+//!     left-out one is listed in `quarantine.excluded_addresses`, an
+//!     address is enough to act on (no locator needed), and
+//!     [`Containment`] says what the rendered rules reach;
 //! 12. `isolate_network` needs a configured management channel
 //!     (`no_management_channel`), so isolation can never cut the SOC off;
 //! 13. the TTL is within `1..=ttl.max_s` (`ttl_out_of_range`).
@@ -74,8 +91,8 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 use crate::config::{AllowEntry, ProtectedEntry, Resolved};
-use crate::net::{GuidPrefix, Iface, IpNet};
-use crate::order::{Locator, Order, Target};
+use crate::net::{GuidPrefix, Iface, IpNet, PortRange};
+use crate::order::{ExcludedAddress, ExcludedLocator, Locator, Order, Target};
 
 /// Refusal codes (stable, on the wire).
 pub mod codes {
@@ -226,10 +243,104 @@ pub struct QuarantineSpec {
     pub guid_prefix: GuidPrefix,
     #[serde(default)]
     pub locators: Vec<Locator>,
+    /// Locators of the order left out (by agentd, or here: out of scope,
+    /// loopback, another address family, inside a motion-path entry it
+    /// may not cut), with the reason. Nothing is rendered for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<ExcludedLocator>,
     /// The motion control path entries this quarantine may not cut,
     /// rendered as accepts before any quarantine drop.
     #[serde(default)]
     pub protected: Vec<ProtectedEntry>,
+    /// Review R3-1: source addresses cut whole: every UDP datagram from
+    /// them to one of [`QuarantineSpec::dds_ports`], and to them on one of
+    /// those ports, whatever the source port (absent in journals before
+    /// this revision: locator rules only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<IpAddr>,
+    /// Source addresses of the order left out (by agentd, or here), with
+    /// the reason. Nothing is rendered for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_addresses: Vec<ExcludedAddress>,
+    /// The robot's DDS UDP port ranges the address drops are limited to
+    /// (`network.quarantine.udp_ports`, default the RTPS port ranges of
+    /// the discovery domains), merged, frozen when applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dds_ports: Vec<PortRange>,
+    /// agentd forgot some of the participant's observed source addresses.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub evidence_truncated: bool,
+}
+
+/// How far a quarantine reaches (review R3-1; control-plane contract §6a,
+/// "Quarantine scope"). Serialised `"full"`, `"partial"`, `"guid_only"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Containment {
+    /// Every source address the participant was seen sending from and
+    /// every unicast locator it announced is cut at address level (all
+    /// UDP from the address to the robot's DDS ports and to the address's
+    /// DDS ports, any source port), plus the GUID-prefix drop. Nothing was
+    /// left out and no observed address was forgotten.
+    Full,
+    /// Some address or locator rule is in force, but at least one observed
+    /// source address or announced locator is not covered by an
+    /// address-level drop (left out, forgotten, or only its announced
+    /// ip:port is cut).
+    Partial,
+    /// No address or locator rule: only RTPS whose header carries the
+    /// participant's GUID prefix is dropped (evadable).
+    GuidOnly,
+}
+
+impl Containment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Partial => "partial",
+            Self::GuidOnly => "guid_only",
+        }
+    }
+}
+
+/// The one definition of [`Containment`] (agentd computes its answer with
+/// it too): `addresses` cut whole, `locators` cut by ip:port, `left_out`
+/// any announced locator or observed address left out or forgotten.
+pub fn containment_of(addresses: &[IpAddr], locators: &[IpAddr], left_out: bool) -> Containment {
+    if addresses.is_empty() && locators.is_empty() {
+        Containment::GuidOnly
+    } else if !addresses.is_empty() && !left_out && locators.iter().all(|l| addresses.contains(l)) {
+        Containment::Full
+    } else {
+        Containment::Partial
+    }
+}
+
+impl QuarantineSpec {
+    /// See [`Containment`]: what the rules rendered for this spec reach.
+    pub fn containment(&self) -> Containment {
+        let locs: Vec<IpAddr> = self.locators.iter().map(|l| l.ip).collect();
+        let left_out = !self.excluded.is_empty()
+            || !self.excluded_addresses.is_empty()
+            || self.evidence_truncated
+            // Address drops need the DDS ports they are limited to.
+            || (!self.addresses.is_empty() && self.dds_ports.is_empty());
+        containment_of(&self.addresses, &locs, left_out)
+    }
+}
+
+/// Sorted, overlapping and adjacent ranges merged (nftables lists an
+/// anonymous interval set merged, so the rendering must be too).
+pub fn merge_ranges(mut v: Vec<PortRange>) -> Vec<PortRange> {
+    v.sort();
+    let mut out: Vec<PortRange> = Vec::new();
+    for r in v {
+        match out.last_mut() {
+            Some(l) if u32::from(r.lo) <= u32::from(l.hi) + 1 => l.hi = l.hi.max(r.hi),
+            _ => out.push(r),
+        }
+    }
+    out
 }
 
 /// What an accepted order does.
@@ -279,50 +390,124 @@ fn locator_unproven(e: &ProtectedEntry, l: &Locator) -> Option<String> {
     }
 }
 
-/// Review finding F4: every locator of a quarantine lies in a configured
+/// Review finding F4: a quarantine acts only on locators in a configured
 /// quarantinable network (`network.quarantine.cidrs`), on one of the
-/// robot's DDS ports, and all in one address family. A forged SPDP locator
-/// can then at most name a DDS endpoint of a network the site declared
-/// quarantinable, never an arbitrary UDP service (a DNS server, the SOC's
-/// syslog) that the quarantine's locator drops would blackhole.
+/// robot's DDS ports, never loopback, and all in one address family. A
+/// forged SPDP locator can then at most name a DDS endpoint of a network
+/// the site declared quarantinable, never an arbitrary UDP service (a DNS
+/// server, the SOC's syslog) that the quarantine's locator drops would
+/// blackhole. Review of the F3 fix (H2b): a locator outside that scope is
+/// **left out** (listed with its reason, nothing rendered for it) instead
+/// of refusing the whole order, so one bad locator in the rogue's own SPDP
+/// cannot make it unquarantinable. An empty scope still refuses.
 fn locators_in_scope(
-    q: &QuarantineSpec,
+    q: &mut QuarantineSpec,
     net: &crate::config::NetworkSection,
 ) -> Result<(), Refusal> {
     let scope = &net.quarantine;
-    let refuse = |why: String| {
-        Err(Refusal::new(
-            codes::LOCATOR_OUT_OF_SCOPE,
-            format!("participant {}: {why}; not quarantined", q.guid_prefix),
-        ))
-    };
     if scope.cidrs.is_empty() {
-        return refuse(
-            "network.quarantine.cidrs is empty: the executor cannot tie any SPDP locator to \
-             a quarantinable participant"
-                .into(),
-        );
-    }
-    let v4 = q.locators.first().is_some_and(|l| l.ip.is_ipv4());
-    if q.locators.iter().any(|l| l.ip.is_ipv4() != v4) {
-        return refuse("its locators mix address families".into());
+        return Err(Refusal::new(
+            codes::LOCATOR_OUT_OF_SCOPE,
+            format!(
+                "participant {}: network.quarantine.cidrs is empty: the executor cannot tie any \
+                 SPDP locator to a quarantinable participant; not quarantined",
+                q.guid_prefix
+            ),
+        ));
     }
     let ports = scope.ports(&net.discovery);
-    for l in &q.locators {
-        if !scope.cidrs.iter().any(|c| c.contains(l.ip)) {
-            return refuse(format!(
-                "locator {} is outside every network.quarantine.cidrs entry",
-                l.ip
-            ));
-        }
-        if !ports.iter().any(|r| r.contains(l.port)) {
-            return refuse(format!(
-                "locator port {} is not one of the robot's DDS ports",
-                l.port
-            ));
+    // Review R3-1: an address is cut whole (to and from the robot's DDS
+    // ports), so it must lie in scope, outside every management / uplink
+    // entry (configuration validation already keeps the scope out of them;
+    // this is the second line) and DDS ports must be known.
+    let mut keep_addr = Vec::new();
+    for a in std::mem::take(&mut q.addresses) {
+        let why = if a.is_loopback() {
+            Some("loopback address".to_string())
+        } else if !scope.cidrs.iter().any(|c| c.contains(a)) {
+            Some("outside every network.quarantine.cidrs entry".to_string())
+        } else if net
+            .management
+            .iter()
+            .chain(&net.uplink)
+            .any(|e| e.cidr.as_ref().is_some_and(|c| c.contains(a)))
+        {
+            Some("inside a network.management or network.uplink entry".to_string())
+        } else if ports.is_empty() {
+            Some("no DDS port range is configured (network.quarantine.udp_ports)".to_string())
+        } else {
+            None
+        };
+        match why {
+            Some(reason) => exclude_address(q, a, reason),
+            None => keep_addr.push(a),
         }
     }
+    let mut keep = Vec::new();
+    for l in std::mem::take(&mut q.locators) {
+        let why = if l.ip.is_loopback() {
+            Some("loopback address".to_string())
+        } else if !scope.cidrs.iter().any(|c| c.contains(l.ip)) {
+            Some("outside every network.quarantine.cidrs entry".to_string())
+        } else if !ports.iter().any(|r| r.contains(l.port)) {
+            Some("not one of the robot's DDS ports".to_string())
+        } else {
+            None
+        };
+        match why {
+            Some(reason) => exclude(q, l, reason),
+            None => keep.push(l),
+        }
+    }
+    // One address family: IPv4 if any is left.
+    let v4 = keep.iter().any(|l| l.ip.is_ipv4()) || keep_addr.iter().any(IpAddr::is_ipv4);
+    for l in keep {
+        if l.ip.is_ipv4() == v4 {
+            q.locators.push(l);
+        } else {
+            exclude(
+                q,
+                l,
+                "address family differs from the other locators".into(),
+            );
+        }
+    }
+    for a in keep_addr {
+        if a.is_ipv4() == v4 {
+            q.addresses.push(a);
+        } else {
+            exclude_address(
+                q,
+                a,
+                "address family differs from the other locators".into(),
+            );
+        }
+    }
+    q.dds_ports = if q.addresses.is_empty() {
+        Vec::new()
+    } else {
+        merge_ranges(ports)
+    };
     Ok(())
+}
+
+fn exclude(q: &mut QuarantineSpec, l: Locator, reason: String) {
+    if q.excluded.len() < crate::order::MAX_EXCLUDED * 2 {
+        q.excluded.push(ExcludedLocator {
+            ip: l.ip,
+            port: l.port,
+            reason: format!("executor: {reason}"),
+        });
+    }
+}
+
+fn exclude_address(q: &mut QuarantineSpec, ip: IpAddr, reason: String) {
+    if q.excluded_addresses.len() < crate::order::MAX_EXCLUDED_ADDRESSES * 2 {
+        q.excluded_addresses.push(ExcludedAddress {
+            ip,
+            reason: format!("executor: {reason}"),
+        });
+    }
 }
 
 /// May this protected entry be cut for `target` under `policy`?
@@ -432,17 +617,49 @@ pub fn precheck(
             Target::Participant {
                 guid_prefix,
                 locators,
+                guid_only,
+                excluded,
+                addresses,
+                excluded_addresses,
+                evidence_truncated,
             },
-        ) => Some(QuarantineSpec {
-            guid_prefix: *guid_prefix,
-            locators: {
-                let mut l = locators.clone();
-                l.sort();
-                l.dedup();
-                l
+        ) => Some((
+            QuarantineSpec {
+                guid_prefix: *guid_prefix,
+                locators: {
+                    let mut l = locators.clone();
+                    l.sort();
+                    l.dedup();
+                    l
+                },
+                excluded: excluded
+                    .iter()
+                    .take(crate::order::MAX_EXCLUDED)
+                    .map(|x| ExcludedLocator {
+                        reason: format!("agentd: {}", x.reason),
+                        ..x.clone()
+                    })
+                    .collect(),
+                protected: Vec::new(),
+                addresses: {
+                    let mut a = addresses.clone();
+                    a.sort();
+                    a.dedup();
+                    a
+                },
+                excluded_addresses: excluded_addresses
+                    .iter()
+                    .take(crate::order::MAX_EXCLUDED_ADDRESSES)
+                    .map(|x| ExcludedAddress {
+                        ip: x.ip,
+                        reason: format!("agentd: {}", x.reason),
+                    })
+                    .collect(),
+                dds_ports: Vec::new(),
+                evidence_truncated: *evidence_truncated,
             },
-            protected: Vec::new(),
-        }),
+            *guid_only,
+        )),
         (ActionId::QuarantineNode, Target::Node { .. }) => {
             return Err(Refusal::new(
                 codes::UNSUPPORTED_TARGET,
@@ -517,7 +734,7 @@ pub fn precheck(
     }
     let net = &cfg.config.network;
     let effect = match quarantine {
-        Some(mut q) => {
+        Some((mut q, guid_only)) => {
             let describe = |i: usize, e: &ProtectedEntry| {
                 format!(
                     "network.motion_control_path[{i}]{}{}",
@@ -547,36 +764,125 @@ pub fn precheck(
                     ));
                 }
             }
-            if q.locators.is_empty() {
+            // An entry that names an interface and no address: no locator
+            // (and no GUID-prefix drop) can be proven outside it. (An order
+            // with nothing to act on at all is `locators_required` below.)
+            let anything = !q.locators.is_empty() || !q.addresses.is_empty() || guid_only;
+            for (i, e) in &keep {
+                if e.cidr.is_none() && anything {
+                    let why = match &e.interface {
+                        Some(i) => format!(
+                            "the entry names interface {} and no address: no locator can be \
+                             proven outside it",
+                            i.as_str()
+                        ),
+                        None => "the entry names no address".to_string(),
+                    };
+                    return Err(Refusal::new(
+                        codes::MOTION_PATH,
+                        format!(
+                            "participant {} may be on the motion control path ({}): {why}; \
+                             never quarantined here",
+                            q.guid_prefix,
+                            describe(*i, e)
+                        ),
+                    ));
+                }
+            }
+            // Review of the F3 fix (H2b): a locator inside an entry it may
+            // not cut is left out (never acted on) instead of refusing the
+            // whole order when the participant also has locators outside;
+            // the GUID-prefix drop is rendered after that entry's accepts,
+            // so it cannot act inside it either.
+            let offered = q.locators.len() + q.addresses.len();
+            let mut outside = Vec::new();
+            let mut on_path: Option<String> = None;
+            for l in std::mem::take(&mut q.locators) {
+                match keep.iter().find_map(|(i, e)| {
+                    locator_unproven(e, &l).map(|why| format!("{why} ({})", describe(*i, e)))
+                }) {
+                    Some(why) => {
+                        on_path.get_or_insert_with(|| why.clone());
+                        exclude(&mut q, l, format!("motion control path: {why}"));
+                    }
+                    None => outside.push(l),
+                }
+            }
+            q.locators = outside;
+            // Review R3-1: the same for the addresses cut whole.
+            let mut outside = Vec::new();
+            for a in std::mem::take(&mut q.addresses) {
+                let probe = Locator { ip: a, port: 0 };
+                match keep.iter().find_map(|(i, e)| {
+                    locator_unproven(e, &probe).map(|why| format!("{why} ({})", describe(*i, e)))
+                }) {
+                    Some(why) => {
+                        on_path.get_or_insert_with(|| why.clone());
+                        exclude_address(&mut q, a, format!("motion control path: {why}"));
+                    }
+                    None => outside.push(a),
+                }
+            }
+            q.addresses = outside;
+            // Every locator and address it offered is on the motion control
+            // path: it may be a motion-path participant itself. Refused
+            // (last line).
+            if let (Some(why), 0) = (&on_path, q.locators.len() + q.addresses.len()) {
+                if offered > 0 {
+                    return Err(Refusal::new(
+                        codes::MOTION_PATH,
+                        format!(
+                            "participant {} may be on the motion control path: {why}; never \
+                             quarantined here",
+                            q.guid_prefix
+                        ),
+                    ));
+                }
+            }
+            // F4: the locators come from SPDP (unauthenticated): only those a
+            // quarantine may act on at all are kept.
+            let before_scope = q.locators.len() + q.addresses.len();
+            locators_in_scope(&mut q, net)?;
+            if q.locators.is_empty() && q.addresses.is_empty() && !guid_only {
+                let listed: Vec<String> = q
+                    .excluded
+                    .iter()
+                    .map(|x| format!("{}:{} ({})", x.ip, x.port, x.reason))
+                    .chain(
+                        q.excluded_addresses
+                            .iter()
+                            .map(|x| format!("{} ({})", x.ip, x.reason)),
+                    )
+                    .collect();
+                let left_out = if listed.is_empty() {
+                    String::new()
+                } else {
+                    format!("; left out: {}", listed.join(", "))
+                };
+                let (code, what) = if before_scope > 0 {
+                    (
+                        codes::LOCATOR_OUT_OF_SCOPE,
+                        "none of its locators or source addresses is one a quarantine may act on \
+                         (network.quarantine)",
+                    )
+                } else {
+                    (
+                        codes::LOCATORS_REQUIRED,
+                        "the order carries none of its SPDP unicast locators or source addresses",
+                    )
+                };
                 return Err(Refusal::new(
-                    codes::LOCATORS_REQUIRED,
+                    code,
                     format!(
-                        "the order names participant {} without its SPDP unicast locators: the \
-                         executor quarantines only a participant it can prove is outside the \
-                         motion control path (GUID prefixes change on restart and can be \
-                         forged)",
+                        "participant {}: {what}, and agentd did not vouch for a \
+                         GUID-prefix-only quarantine (the prefix is unknown to it, or one of the \
+                         robot's own: profiled, pinned or contested): the executor quarantines \
+                         only a participant it can prove is outside the motion control path \
+                         (GUID prefixes change on restart and can be forged){left_out}",
                         q.guid_prefix
                     ),
                 ));
             }
-            for (i, e) in &keep {
-                for l in &q.locators {
-                    if let Some(why) = locator_unproven(e, l) {
-                        return Err(Refusal::new(
-                            codes::MOTION_PATH,
-                            format!(
-                                "participant {} may be on the motion control path ({}): {why}; \
-                                 never quarantined here",
-                                q.guid_prefix,
-                                describe(*i, e)
-                            ),
-                        ));
-                    }
-                }
-            }
-            // F4: the locators come from SPDP (unauthenticated): they must
-            // be ones a quarantine may act on at all.
-            locators_in_scope(&q, net)?;
             q.protected = keep.into_iter().map(|(_, e)| e.clone()).collect();
             Effect::Quarantine(q)
         }

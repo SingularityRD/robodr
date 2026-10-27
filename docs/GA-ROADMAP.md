@@ -16,7 +16,7 @@
 |---|---|---|
 | Ne | Robot EDR: ROS 2/DDS grafiği, Motion Firewall, Cyber-Jidoka yanıt planlayıcı, imzalı kara kutu, diyot ihracı | Agentic SOAR/SOC: workflow (Temporal), case yönetimi, agent preset'leri, 100+ entegrasyon, MCP |
 | Dil / yığın | Rust (22 workspace üyesi: 19 saf + 3 Pulsar'a bağlı; `crates/**/*.rs` testler dahil ~240k satır), Pulsar (eBPF) | Python FastAPI + Next.js + Temporal + Postgres + MinIO + Redis (Tracecat çatalı) |
-| Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı**. Kodda (2026-10-26): kontrol düzlemi v2 (mTLS, journal, kanıt API'si; v1 kaldırıldı), executor v1 (varsayılan kapalı), in-path gateway `robodr-firewall-gw`, filo yaşam döngüsünün robot tarafı (`robodr-enroll`), S10 sertleştirmesi, `robodr-uplink`, Unitree desteği | Çalışan platform, `1.0.0` imajları. `claude/robodr-ingest` dalında (henüz `main`'e birleşmedi): RoboDR ingest modülü, `tools.robodr.*`, imza/onay (sign-off, iki kişi), Robot SOC preset'i, Robots UI sayfaları, kontrol düzlemi v2 istemcisi + kanıt, Helm, güvenlik taramaları; filo API'si sürüyor (commit'lenmedi) |
+| Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı**. Kodda (2026-10-26): kontrol düzlemi v2 (mTLS, journal, kanıt API'si; v1 kaldırıldı), executor v1 (varsayılan kapalı), in-path gateway `robodr-firewall-gw`, filo yaşam döngüsünün robot tarafı (`robodr-enroll`), S10 sertleştirmesi, `robodr-uplink`, Unitree desteği | Çalışan platform, `1.0.0` imajları. `claude/robodr-ingest` dalında (henüz `main`'e birleşmedi): RoboDR ingest modülü, `tools.robodr.*`, imza/onay (sign-off, iki kişi), Robot SOC preset'i, Robots UI sayfaları, kontrol düzlemi v2 istemcisi + kanıt, Helm, güvenlik taramaları, filo API'sinin SOC tarafı (filo kaydı tek konteynerde uçtan uca çalıştı, `tools/e2e/RESULTS.md`) |
 | Test | Son kayıtlı toplam: **2196+ test, 0 hata** (§3a, 2026-10-26; S7–S10 birleşmelerinden önce). Birleşmelerden sonra çalışma alanı genelinde yeniden sayılmadı; her parça kendi testleriyle birleşti (network namespace'te gerçek nftables / NFQUEUE, gerçek `dpkg`, libFuzzer 10 hedef × 630 s) | Ortak sözleşme vektörleri gerçek uç noktaya karşı geçiyor (ingest 26 vaka, kontrol düzlemi v2); ingest benchmark'ı 1000 satırlık batch'te p95 ≈ 1,27 s (`gc.freeze`, yüklü 4 vCPU VM, AutoSecOps `09133dc0`). Bu dalın CI koşu sonuçları burada kayıtlı değil |
 | GA'yı en çok engelleyen | Saha doğrulaması yok (gerçek robot, soak, FP oranı); CI GitHub'da hiç koşmadı; release imzalanmadı; Kafka/anchor TLS yok; `restrict_motion`/`safe_pause` adaptörleri yok; executor SOC imzasını kendisi doğrulamıyor | Dal birleşmedi; filo API'si bitmedi; üretim lisans anahtarı yok; robot sayısı kotası yok; uçtan uca (robot ↔ SOC) gerçek ağda hiç çalışmadı |
 
@@ -51,7 +51,7 @@ paketleme (Reed-Solomon), reproducible build + SBOM + minisign release pipeline'
 | R1 | 🟡 **Kısmen çözüldü:** executor v1 geri alınabilir ağ aksiyonlarını yürütüyor (varsayılan kapalı; 0499a47, inceleme 31d1aa4), in-path gateway Unitree hareket kanallarını uyguluyor (a4e0b4b, inceleme e85471c). Kalan: SOC'tan `restrict_motion`, `safe_pause` adaptörleri, ROS 2 `/cmd_vel` / `JointTrajectory` gateway'i, gerçek robotta doğrulama. Eski durum: yanıt **hiçbir şey yürütmüyordu** (responder yalnız plan, agentd `NoopExecutor`, Motion Firewall recording-only, kontrol düzlemi yalnızca `recorded_not_executed`) | `crates/robodr-responder/README.md:160-191`, `crates/robodr-firewall/README.md:194-255`, `docs/contracts/legacy/robot-edr.control-plane.md` §10 |
 | R2 | 🟡 **Kısmen çözüldü:** kontrol düzlemi v2 mTLS (a158536); uplink ve enroll TLS. **Açık:** Kafka istemcisi (TLS/SASL yok) ve anchor receiver düz metin | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
 | R3 | ❌ **Açık.** Saha doğrulaması yok: gerçek robot, RTI Connext, SROS2/DDS-Security, donanım TPM, 72 saat soak, FP oranı ölçümü yok; Zenoh kör; Pulsar kuralları gerçek motora hiç yüklenmedi; pulsard sadece WSL2'de | `README.md` Status, `docs/SPRINTS.md` S1–S4 |
-| R4 | 🟡 **Kısmen çözüldü:** `robodr-fleet` / `robodr-enroll` robot tarafı (1de502d, inceleme 3083030); `install-bundle.sh` gerçek `dpkg` ile test edildi, format kapısı, downgrade ve güvenlik tabanı (3d36c65, ace7fba); AutoSecOps Robots sayfaları (AutoSecOps `05a431e0`). **Açık:** filo API'sinin SOC tarafı, hedef cihazda kurulum provası, staged rollout, çok kiracılık | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
+| R4 | 🟡 **Kısmen çözüldü:** `robodr-fleet` / `robodr-enroll` robot tarafı (1de502d, inceleme 3083030); `install-bundle.sh` gerçek `dpkg` ile test edildi, format kapısı, downgrade ve güvenlik tabanı (3d36c65, ace7fba); AutoSecOps Robots sayfaları (AutoSecOps `05a431e0`); filo API'sinin SOC tarafı dalda (kayıt tek konteynerde uçtan uca, `tools/e2e/RESULTS.md`). **Açık:** SOC tarafının yayımlanması, hedef cihazda kurulum provası, staged rollout, çok kiracılık | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
 | R5 | 🟡 **Kısmen çözüldü:** uplink/finding anahtar rotasyonu ve iptal listesi dağıtımı robot tarafında (`robodr-enroll`). **Açık:** TPM, SOC tarafı, black-box anahtarı rotasyonu hâlâ elle | `crates/robodr-blackbox/README.md:670-704` |
 | R6 | ❌ **Açık.** CI GitHub'da **hiç koşmadı** (org billing); release workflow'u hiç tetiklenmedi; `MINISIGN_SECRET_KEY` yok; `robodr-anchor-receiver` `.deb` zorunlu listesinde değil | `docs/BUILD.md:536-557`, `.github/workflows/release.yml` |
 | R7 | 🟡 **Kısmen çözüldü:** tescilli lisans (24fe84c), hukuki onaylar (ADR-0010), SOC'ta `robot_edr` entitlement'ı (AutoSecOps `9de8854e`). **Açık:** üretim lisans anahtarı, `max_robots` kotası, RoboDR üçüncü taraf bildirimleri. Eski durum: her şey Apache-2.0; lisans anahtarı/aktivasyon, ihracat sınıflandırması ve Pulsar GPL-2.0 incelemesi yoktu | `Cargo.toml:34`, `docs/SECURE-DELIVERY.md` §11 |
@@ -477,10 +477,12 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >   executor crate'ine de uygulandı (2b8ab65). Ek düzeltme 12931f3: saat
 >   geri gidince aksiyon uzamaz; başarısız revert'te istek "kalktı"
 >   okunmaz.
-> - ⏳ M1 (güven sınırı): ele geçirilmiş bir agentd `human_approved`
->   iddia edebilir; sınırları README "Trust boundary" bölümünde. Kontrol
->   düzlemi v2 birleşti, ama SOC imzalı isteğin yürütücüye iletilip orada
->   doğrulanması **hâlâ yapılmadı** (4-2 GAP-23).
+> - ✅ M1 (güven sınırı, 4-2 GAP-23): agentd SOC'un imzalı isteğini
+>   yürütücüye aynen iletiyor; yürütücü onu kendi SOC anahtarları ve kendi
+>   replay deposuyla doğruluyor, eşleşmeyen veya imzasız bir
+>   kontrol-düzlemi emrini reddediyor (fcd58b2, inceleme düzeltmeleri
+>   6f37253; README "Trust boundary"). Kalan: SOC'un iç onay sürecini
+>   (kim onayladı, iki kişi kuralı) robot doğrulayamaz.
 > - ⏳ Q / Kapı 2: tasarım ortağı robotunda kurulum, gerçek robotta
 >   uygula / geri al, 24 saat koşu. Unit henüz gerçek systemd altında
 >   çalıştırılmadı.
@@ -536,9 +538,10 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > testleri, gerçek çekirdekte netns uçtan uca testi, fuzz hedefi
 > `firewall_gw_packet`. **Kalan:** gerçek Go2/G1 ve gerçek sensör
 > kutusunda doğrulama ve gecikme ölçümü; Unitree `rt/lowcmd` QoS'u ve
-> motor kartının akış kaybındaki davranışı (OEM); ROS 2 `/cmd_vel` /
-> `JointTrajectory` gateway'i; loco `SetVelocity`, kol/el SDK
-> kanalları; gateway'e özgü bulgu kuralları (sözleşme 2.2) ve olay
+> motor kartının akış kaybındaki davranışı (OEM); ROS 2
+> `JointTrajectory` gateway'i (loco `SetVelocity`, kol / el SDK ve ROS 2
+> `/cmd_vel` twist kanalları f27e02d ile eklendi, yalnız sentetik
+> çerçevelerle test edildi); gateway'e özgü bulgu kuralları (sözleşme 2.2) ve olay
 > dosyasının agentd'ye beslenmesi; `restrict_motion` kontrol düzlemi
 > adaptörü ve `safe_pause` adaptörleri.
 >
@@ -627,8 +630,11 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >   6c19e73. Birleştirme 332d88f.
 > - 🟡 A/F: AutoSecOps tarafında Robots sayfaları ve robot / anahtar
 >   yönetimi var (dalda, AutoSecOps `05a431e0`); filo API'si
->   (`/robot-edr/v2/fleet/*`, token, rotasyon onayı) **sürüyor, henüz
->   commit'lenmedi**. Gerçek SOC'a karşı hiç çalıştırılmadı.
+>   (`/robot-edr/v2/fleet/*`, token, rotasyon onayı) da dalda
+>   (`claude/robodr-ingest`, yayımlanmadı): filo kaydı (token,
+>   `robodr-enroll`, üç anahtar, imzalı yanıt) tek konteynerde uçtan uca
+>   çalıştı (`tools/e2e/RESULTS.md`). Gerçek ağ üzerinden dağıtılmış bir
+>   SOC'a karşı hiç çalıştırılmadı.
 > - ❌ Kara kutu anahtarı rotasyonu agentd'nin önceki anahtarları
 >   (`open_with_keys`) yüklemesini gerektirir; bugün OPERATIONS 4.3'teki
 >   zincir kapatma yolu.
@@ -884,7 +890,7 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 - [ ] Bulgular connected + air-gapped yollarda imzalı, tekil, doğru severity/alanlarla case olur. *(2026-10-26: iki taraf kodda ve ortak vektörlerle test edildi; `robodr-uplink` → AutoSecOps uçtan uca hiç koşmadı.)*
 - [ ] Kanıt paketi case'ten indirilir ve bağımsız doğrulanır. *(Kodda: kanıt API'si + `verify BUNDLE`, AutoSecOps doğrulayıp saklıyor; gerçek robota karşı denenmedi.)*
 - [ ] `restrict_motion`, `quarantine_node`, `isolate_network`, `record_evidence` gerçek robotta uygulanır, doğrulanır, TTL/elle geri alınır; `safe_pause` OEM-onaylı politikada çalışır. *(Executor v1 son üçünü yalnız network namespace'te yapıyor; `restrict_motion` SOC aksiyonu ve `safe_pause` adaptörleri yok.)*
-- [ ] Hiçbir robot aksiyonu onaysız gönderilemez; iki-kişi kuralı uygulanır. *(AutoSecOps dalında uygulandı; birleşmedi, robot onayı doğrulamıyor.)*
+- [ ] Hiçbir robot aksiyonu onaysız gönderilemez; iki-kişi kuralı uygulanır. *(AutoSecOps dalında uygulandı; birleşmedi. Yürütücü SOC imzalı isteği kendisi doğruluyor (M1), SOC'un iç onay sürecini doğrulayamaz.)*
 - [ ] Robot onboarding, anahtar rotasyonu/iptali, profil kilitleme, güncelleme/geri alma UI'dan yönetilir. *(Robot tarafı hazır; SOC filo API'si ve UI akışı sürüyor.)*
 - [ ] Unitree Go2 EDU ve G1 EDU: tespit + kanıt + ağ tabanlı containment gerçek cihazda doğrulandı (agentless ve EDU ajan modları).
 - [ ] RoboDR tescilli lisansla dağıtılıyor; üçüncü taraf bildirimleri ve eBPF GPL-2.0 kaynak teklifi pakette.
@@ -915,7 +921,7 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 | ~~AutoSecOps1 lisans/menşe~~ | — | — | ✅ Hukuki onay alındı (2026-10-25). Bağımlılık lisans uyumu CI'da `test_third_party_notices.py` ile korunuyor; yeni GPL/AGPL bağımlılık eklenmesi review'da durdurulur |
 | Gerçek robot erişimi gecikir | Orta | Yüksek | S0'da donanım satın alma; Gazebo filo + kiralık AMR yedek |
 | Executor bir robotu güvensiz duruma sokar | Düşük | Kritik | Kodda: yalnız geri alınabilir, TTL'li nftables kuralları; korumalı hareket yolu ve yönetim her zincirde drop'lardan önce; apply'dan hemen önce safety state yeniden kontrol; varsayılan kapalı; insansıda `fall_safe_restrict` dışı hiçbir şey (31d1aa4). Açık: gerçek robotta deneme, saha testinde E-stop'lu ortam |
-| Ele geçirilmiş agentd executor'a sahte "insan onayı" bildirir | Düşük | Yüksek | Executor kendi kurallarını yine uygular (geri alınabilir, TTL'li, korumalı yol asla); SOC imzasının executor'da doğrulanması (GAP-23) yapılana kadar açık risk |
+| Ele geçirilmiş agentd executor'a sahte "insan onayı" bildirir | Düşük | Yüksek | Kapatıldı (GAP-23, executor M1 fcd58b2 / 6f37253): executor SOC imzalı isteği kendi anahtarları ve replay deposuyla doğrular, imzasız veya eşleşmeyen emri reddeder; kendi kuralları da yine geçerli (geri alınabilir, TTL'li, korumalı yol asla) |
 | Firewall gateway gecikmesi kontrol döngüsünü bozar | Orta | Yüksek | Gateway kodda (a4e0b4b); VM'de medyan ek ≈ 20–70 µs; hedef sensör kutusunda p99 ölçüm kapısı (`gw_latency --budget-p99-ns`); önce `mode: observe`; enforce opt-in |
 | Gateway atlatılır (köprü dışı keşif yolu, kuyruk dışı DDS portu, kontrolcü segmentinde IP + MAC sahteciliği) | Orta | Yüksek | Dağıtım kuralları müşteri dokümanında (quick-start 7a, known-limitations); saha ağ incelemesi; `allowed_src_ips` / `allowed_src_macs`; SN bağlama (e85471c). Gerçek robotta doğrulanmadı |
 | Unitree `rt/lowcmd` QoS'u veya motor kartının akış kaybındaki davranışı varsayımdan farklı | Orta | Yüksek | `fail_closed` → robotun kendi komut zaman aşımı; OEM ile teyit; gerçek Go2/G1'de ölçüm (S11) |

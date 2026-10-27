@@ -467,6 +467,22 @@ goes over an HMAC-authenticated unix socket (`socket`, `key_file`):
 - **Safety state.** Immediately before it applies anything, the executor
   asks for the safety state. agentd answers from a cell its main loop
   refreshes every iteration, together with the cell's age.
+- **Quarantine targets.** For `quarantine_node` agentd attaches what the
+  pipeline's binding table vouches for (`robodr_ros2_pipeline::binding`,
+  "Quarantine locators"): the participant's announced unicast locators on
+  addresses it was seen sending from, and (review R3-1) those **source
+  addresses** themselves, which the executor cuts whole (all UDP to and
+  from the robot's DDS ports, any source port: Fast DDS sends from
+  ephemeral ports). Left out, with reasons the SOC sees: loopback, this
+  host's addresses, addresses pinned to another participant, a profiled
+  participant's pinned address, a profile identity's ips, and any address
+  a profiled participant was learned at (review R3-6: such a learned
+  address may be an attacker's first-come claim, so it no longer shields
+  a rogue's own locators there, but it is never cut whole). The SOC's
+  answer says `containment: "full"` only when every observed source
+  address and every announced locator is cut whole (contract §6a).
+  **Shared host:** cutting an address cuts every DDS participant on that
+  host, a legitimate unprofiled one included.
 - **`record_evidence`.** A critical black-box mark (`robodr.evidence_mark`)
   naming the request's evidence.
 - **Events.** The executor's events are recorded as `robodr.executor_event`
@@ -494,6 +510,66 @@ goes over an HMAC-authenticated unix socket (`socket`, `key_file`):
     is not spooled: it is counted, it stays in the black box, and the daemon
     raises a `robot.agent.spool_full` finding. Health findings can use a
     small reserve.
+  - **Critical findings first.** Findings below Critical may fill only
+    7/8 of `max_bytes` and of `max_files`; the last eighth is kept for
+    Critical findings, so a flood of lesser findings never makes a Critical
+    one black-box-only (red team F1). Within that share one source (the
+    finding's `src:<ip>` or other source key) may hold at most a quarter
+    (at least one record) until the spool drains below the lesser share
+    again, so one address flooding Critical findings cannot take the room a
+    later rogue's Critical finding needs (review H3;
+    `spool.dropped_reserve_cap`). The last quarter of the share takes only
+    a source that holds no record in it yet (review R2-1 / R2-2), so a few
+    flooding sources at their quarter each cannot fill it. `max_files`
+    below 8 is refused (there would be no Critical share).
+- **Discovery-flood aggregation** (`src/flood.rs`, red team F1 and the
+  review of its fix, H3 / H4 / L9 / L10). Every pipeline finding about one
+  participant takes part: the pipeline names its GUID prefix as structured
+  data (`Finding::participant`; all per-participant and per-endpoint
+  discovery rules, e.g. `unknown_participant`,
+  `identity_instances_exceeded`, `endpoint_unannounced_participant`,
+  `unknown_writer_topic`, and the Critical `unauthorized_motion_writer`).
+  A finding about one of the robot's own participants (profiled or
+  pinned: an impersonation, a forged dispose, an endpoint "for" it from a
+  foreign host) is never hidden but bounded (review R2-1): 4 High /
+  Critical ones per (participant, source, rule) and 64 per participant
+  per 60 s window are reported one by one (below High: 256 / 1024, so a
+  legitimate participant leaving with many endpoints is not folded); the
+  rest goes to a Critical aggregate per (source, participant) whose text
+  names the participant ("about the robot's own participant ...", never
+  as a sample GUID prefix). Before, 750 SEDP announcements "for" the
+  robot participant from 5 addresses filled a 400-file spool and dropped
+  a genuine rogue's Critical finding; now 93 records, none dropped.
+  Counting is per source IP and per class (Critical / below Critical) in a
+  60 s window: a source's first 8 findings of a class are reported one by
+  one (a source first seen after 32 findings passed in the window: its
+  first one). **Only a source past its own share is folded** into its own
+  `robot.ros2.discovery_flood` finding of that class: **Critical** for the
+  Critical class, else the most severe folded severity (at least Medium),
+  with the count per rule, first and last seen and up to 4 sample GUID
+  prefixes (from the structured prefixes, never parsed from text; the
+  detail is built to fit its 400-character cap), reported at 1, 2, 4, 8,
+  ... folded findings and once more when the source has been quiet for
+  60 s or agentd stops. Its subject is the source IP plus a synthetic node
+  `discovery_flood/<critical|other>/<episode start>`: one SOC case per
+  flood **episode**. A flooding source beyond 32 with their own aggregate,
+  and a below-Critical finding from a source beyond 128 per window (a
+  spoofed-source spray), share one "many sources" aggregate per class
+  that names the **latest** 4 source addresses and GUID prefixes (motion
+  writers kept first). A **Critical** finding from a source beyond 128 is
+  still reported by name (review R2-2: before, 128 spoofed SPDPs, about 2
+  packets/s, pushed a genuine rogue's motion writer into the sourceless
+  aggregate), up to 2 per such source and window, for at most 128 such
+  sources (review R3-2: the budget used to be one counter of 128, which a
+  single address could spend). Exhausting it takes 128 counted sources
+  plus 128 more distinct addresses with a Critical finding each: about
+  384 datagrams a minute (6.4 packets/s) sustained, from 256 (spoofed)
+  addresses. Every folded finding is still recorded
+  in the black box (the same deviation record) and fed to the correlation
+  engine; only its plan, finding and spool record are replaced by the
+  aggregate. `status.json` counts it under `discovery_flood` (`folded`,
+  `reports`, `floods`, `protected_passed`, `protected_folded`,
+  `fresh_critical_passed`).
   - `status.json` is rewritten every tick. It carries `updated_mono_ms`
     (`CLOCK_MONOTONIC`, ms), `boot_id` and `stale_after_ms` (2 x `tick_ms`
     + `lag_ms`). **A consumer must show `unknown`** when `running` is false,
@@ -572,6 +648,8 @@ request.
 | Test | What it shows |
 |---|---|
 | `tests/e2e.rs` | A synthetic pcap (the pipeline's own builders) yields the rogue participant and rogue `cmd_vel` writer findings in the spool, validated, with a black box that verifies against the final seal and evidence links that resolve. Resume across two runs. Unlocked and invalid profiles never enforce. A truncated pcap raises `input_ended`. The agent's rogue-UGV JSONL scenario runs over a unix socket through profile, firewall and monitor. Queue overflow is counted exactly (`received = processed + dropped`). Fuzzed datagrams and event lines do not stop the daemon. |
+| `tests/redteam_regressions.rs` | Red team F1: a 3000-prefix GUID spray from one address replayed through the daemon gives at most a handful of per-GUID findings and one aggregated `robot.ros2.discovery_flood` case (counts, first / last seen, samples), every sprayed announcement stays in the black box, and the genuine rogue's Critical `unauthorized_motion_writer` after the spray is spooled, also when the spool is already full of lesser findings. Review of that fix: 600 sprayed prefixes with a `cmd_vel` writer each (spool of 400) give at most 9 Critical findings one by one plus a Critical aggregate, and a later rogue's Critical finding from another address is spooled (H3); 12 low-rate sources neither hide a later rogue nor a pinned participant's impersonation (H4); a 24-hex-digit topic never becomes a sample GUID and the detail is not cut (L9); two floods are two findings, `max_files` 4 is refused (L10). Second review: 750 SEDP "for" the contested profiled participant from 5 addresses (spool of 400) give at most 40 findings about it one by one plus Critical aggregates naming it and each source, nothing is dropped and the later rogue is spooled (R2-1); 128 spoofed sources plus 4 seeding the Critical "many sources" aggregate no longer hide a rogue's `unauthorized_motion_writer` (R2-2). |
+| `tests/executor_link.rs` (`review_*`) | Review of the F3 fix, through agentd and the in-process executor: a foreign SPDP for the profiled prefix after its lease ran out plus a decoy never gets the robot participant's address cut (H1); a decoy copying the rogue's locators does not make it unquarantinable, nor does the rogue's own second prefix from its address (H2a, R2-3); out-of-scope, motion-path and loopback locators are left out instead of refusing (H2b); a JSONL event cannot fill a contested profiled prefix's locators (M7). Second review (`review2_*`): the SOC's answer carries `containment` (`guid_only` / `full` / `partial`) and `state.quarantine` (R2-3); locators beyond the order's 16 are listed as left out (R2-6). Third review (`review3_*`): a participant sending from an ephemeral port, with RTPS re-attributed to another prefix, is dropped by the executor's rules (nftables model, `robodr_executor::nftmodel`); an observed address it never announced is cut too; `containment` matches the rules actually written (R3-1). |
 | `tests/health.rs` | A silent input reads `unknown` (never `ok`) with an observe-only High finding. Live data turns the state `ok`. Silence again raises a new finding with the same id and a higher count. |
 | `tests/binary.rs` | The real binary: exit code 2 on usage and configuration errors, on a 0644 key file and on an unknown key. SIGTERM and SIGINT give exit 0, a sealed black box that verifies with the spool's `checkpoint.json`, and a stop note. |
 | `tests/motion_live.rs` | A synthetic pcap with SEDP plus CDR `Twist` on `rt/cmd_vel` (0.4 m/s, then 2.5 m/s against a 1.0 m/s envelope) and CDR `Odometry` on `rt/odom`: three motion events reach the agent, exactly one Critical `robot.motion.linear_over_envelope` finding is spooled, the black box holds the decoded command (with its writer GUID) and a firewall verdict with `enforcing: false`, and verifies. A garbage payload on `rt/cmd_vel` yields one Medium `robot.motion.undecodable_sample` and the next good command still flows. `sensor.motion` keys are strict. |
@@ -593,6 +671,41 @@ request.
   pcaps, the agent's demo JSONL. Nothing was exercised with real DDS stacks.
   The live motion path in particular has only decoded hand-built RTPS / CDR
   (no `ros2 topic pub /cmd_vel` capture from a real RMW).
+- **A flood hides findings from the flooding address.** During a
+  discovery flood a genuine participant announced from the flooding
+  address (or, below Critical, from any address beyond 128 in a window) is
+  folded too, its Critical findings past the source's own 8 included: it
+  is in the black box and the correlator, named in the aggregate only if
+  it is among the samples, and gets no response plan of its own (the
+  aggregate does, keyed by its source). Findings about the robot's own
+  (profiled or pinned) participants past their budget are folded into an
+  aggregate that names the participant. A spoofed-source spray of about
+  6.4 packets/s sustained from 256 or more addresses (128 sources, plus
+  an SPDP and a motion writer from each of 128 more, per minute) folds a
+  genuine rogue's Critical finding into the "many sources" aggregate,
+  where it is named only while among the latest samples (review R3-2:
+  one address beyond the 128 passes at most 2 Critical findings by name
+  per window). Source addresses are not
+  authenticated, so a forged flood from a legitimate host's address folds
+  that host's own unprotected discovery findings. Flood state is in
+  memory: after a restart a flood starts a new episode.
+- **Accepted limits of the third red-team-fix review** (R3-3, R3-4, R3-5;
+  `tools/e2e/REDTEAM.md`):
+  - **R3-3:** a decoy whose SPDP source is spoofed to a present
+    unprofiled host's address gets that host's ip:port, and (since R3-1)
+    the address itself, in its quarantine target: quarantining the decoy
+    cuts that host (inside the executor's `network.quarantine.cidrs` only;
+    never this host, a pinned, identity or learned profiled host, or the
+    motion control path). Needs source spoofing.
+  - **R3-4:** the last quarter of the spool's Critical share takes any
+    source with no record in it yet, so distinct spoofed sources fill it
+    one record each. It matters only without a draining exporter; the
+    rest is in the black box.
+  - **R3-5:** with one spoofed source per sprayed prefix, the binding's
+    quarantine memory evicts the lowest-ranked, oldest entry; once the
+    spray is Critical-ranked a departed Critical rogue goes first (then
+    quarantined by nothing: `locators_required`). A rogue the SOC named
+    in a `quarantine_node` is never evicted for a lower-ranked entry.
 - **Motion decode needs SEDP.** A writer announced before the daemon
   started is unknown until it is re-announced; its commands are not decoded
   meanwhile (samples to a known motion reader raise

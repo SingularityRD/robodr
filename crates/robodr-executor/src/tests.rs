@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::config::{ExecutorConfig, Resolved};
 use crate::decision::{codes, precheck, recheck_safety, Current, Effect};
-use crate::engine::{Engine, FixedSafety, Status};
+use crate::engine::{Engine, FixedSafety, Outcome, Status};
 use crate::fault::{self, Point};
 use crate::journal::EventKind;
 use crate::nft::Nft;
@@ -137,6 +137,11 @@ pub fn unsigned(id: &str, action: ActionId, m: Morphology, state: SafetyState) -
                     ip: "10.0.0.7".parse().unwrap(),
                     port: 7410,
                 }],
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
             _ => Target::None,
         },
@@ -185,18 +190,38 @@ impl Tgt {
             Tgt::Outside => Target::Participant {
                 guid_prefix: GUID.parse().unwrap(),
                 locators: vec![loc("10.0.0.7")],
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
             Tgt::InsideBus => Target::Participant {
                 guid_prefix: GUID.parse().unwrap(),
                 locators: vec![loc("192.168.123.50")],
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
             Tgt::ProtectedGuid => Target::Participant {
                 guid_prefix: LOWCMD_GUID.parse().unwrap(),
                 locators: vec![loc("10.0.0.7")],
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
             Tgt::NoLocators => Target::Participant {
                 guid_prefix: GUID.parse().unwrap(),
                 locators: vec![],
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             },
         }
     }
@@ -565,6 +590,11 @@ fn motion_control_path_is_never_cut() {
             ip: "192.168.123.161".parse().unwrap(),
             port: 7411,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     assert_eq!(
         precheck(&o, &wheeled, &c).unwrap_err().code,
@@ -579,6 +609,11 @@ fn motion_control_path_is_never_cut() {
             ip: "192.168.123.161".parse().unwrap(),
             port: 9000,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     assert_eq!(
         precheck(&o, &wheeled, &c).unwrap_err().code,
@@ -591,6 +626,11 @@ fn motion_control_path_is_never_cut() {
             ip: "10.0.0.7".parse().unwrap(),
             port: 7410,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     match precheck(&o, &wheeled, &c).unwrap().effect {
         Effect::Quarantine(q) => assert_eq!(q.protected.len(), 2),
@@ -600,6 +640,11 @@ fn motion_control_path_is_never_cut() {
     o.target = Target::Participant {
         guid_prefix: GUID.parse().unwrap(),
         locators: vec![],
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     assert_eq!(
         precheck(&o, &wheeled, &c).unwrap_err().code,
@@ -617,6 +662,11 @@ fn motion_control_path_is_never_cut() {
     o.target = Target::Participant {
         guid_prefix: LOWCMD_GUID.parse().unwrap(),
         locators: vec![],
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     assert_eq!(
         precheck(&o, &humanoid, &c).unwrap_err().code,
@@ -1096,6 +1146,10 @@ fn l4_reboot_reapply_needs_revalidation_and_a_fresh_safety_check() {
     e.rearm_held(cur(SafetyState::MovingSlow), 2_400);
     assert_eq!(e.status("i1").status, Status::Verified);
     assert_eq!(e.status("q1").status, Status::Verified);
+    // Review R2-3: the state of an applied quarantine says what it cuts.
+    let q = e.status("q1").quarantine.expect("quarantine scope");
+    assert!(!q.locators.is_empty(), "{q:?}");
+    assert!(e.status("i1").quarantine.is_none());
     let listed = crate::nft::read_table(&mut nft.clone()).unwrap();
     assert!(crate::nft::verify(listed.as_deref(), &e.rendered()).is_ok());
     drop(e);
@@ -2219,6 +2273,11 @@ fn f4_quarantine_locators_are_scoped() {
                     port: *port,
                 })
                 .collect(),
+            guid_only: false,
+            excluded: Vec::new(),
+            addresses: Vec::new(),
+            excluded_addresses: Vec::new(),
+            evidence_truncated: false,
         };
         o
     };
@@ -2231,10 +2290,6 @@ fn f4_quarantine_locators_are_scoped() {
             "outside the quarantinable CIDRs",
             vec![("10.20.0.10", 7410)],
         ),
-        (
-            "mixed families",
-            vec![("10.0.0.7", 7410), ("fd00::7", 7410)],
-        ),
     ] {
         let r = precheck(&q(&locs), &p, &scoped);
         assert_eq!(
@@ -2242,6 +2297,31 @@ fn f4_quarantine_locators_are_scoped() {
             Some("locator_out_of_scope"),
             "{what}: {r:?}"
         );
+    }
+    // Review of the F3 fix (H2b): one bad locator next to good ones is left
+    // out (listed, never acted on) instead of refusing the whole order.
+    let r = precheck(
+        &q(&[
+            ("10.0.0.7", 7410),
+            ("fd00::7", 7410),
+            ("10.0.0.7", 53),
+            ("10.20.0.10", 7410),
+            ("127.0.0.1", 7410),
+        ]),
+        &p,
+        &scoped,
+    );
+    match r.map(|x| x.effect) {
+        Ok(Effect::Quarantine(qs)) => {
+            assert_eq!(qs.locators.len(), 1, "{qs:?}");
+            assert_eq!(qs.locators[0].ip.to_string(), "10.0.0.7");
+            assert_eq!(qs.excluded.len(), 4, "{qs:?}");
+            assert!(qs
+                .excluded
+                .iter()
+                .all(|x| x.reason.starts_with("executor: ")));
+        }
+        e => panic!("{e:?}"),
     }
     // No quarantinable network configured: no quarantine at all.
     let r = precheck(&q(&[("10.0.0.7", 7410)]), &p, &with(None));
@@ -2474,4 +2554,380 @@ fn require_approval_for_all_containment_refuses_planner_orders() {
     );
     o.human_approved = true;
     assert!(precheck(&o, &p, &strict).is_ok());
+}
+
+/// Review of the F3 fix (H2): agentd vouches for a GUID-prefix-only
+/// quarantine (`guid_only`) when no locator can be vouched for (a decoy
+/// contested them). The executor then quarantines by the GUID-prefix drop
+/// alone, but every one of its own refusals still applies, and an order
+/// whose every locator lies on the motion control path is still refused.
+#[test]
+fn review_guid_only_quarantine_keeps_every_refusal() {
+    let c = cfg("/tmp/unused");
+    let wheeled = policy(Morphology::WheeledMobile, true, &[]);
+    let target = |g: &str, locs: &[(&str, u16)], guid_only: bool| Target::Participant {
+        guid_prefix: g.parse().unwrap(),
+        locators: locs
+            .iter()
+            .map(|(ip, port)| Locator {
+                ip: ip.parse().unwrap(),
+                port: *port,
+            })
+            .collect(),
+        guid_only,
+        excluded: vec![crate::order::ExcludedLocator {
+            ip: "10.0.0.66".parse().unwrap(),
+            port: 7410,
+            reason: "contested: another live participant was seen at this address".into(),
+        }],
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
+    };
+    let mut o = order(
+        "g1",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    // Vouched, nothing left: the GUID-prefix drop alone.
+    o.target = target(GUID, &[], true);
+    match precheck(&o, &wheeled, &c).unwrap().effect {
+        Effect::Quarantine(q) => {
+            assert!(q.locators.is_empty());
+            assert_eq!(q.excluded.len(), 1);
+            assert!(
+                q.excluded[0].reason.starts_with("agentd: contested"),
+                "{q:?}"
+            );
+            let r = crate::nft::render(&[crate::nft::Active {
+                id: "g1",
+                effect: &Effect::Quarantine(q.clone()),
+            }]);
+            let text = format!("{r:?}");
+            assert!(!text.contains("10.0.0.66"), "{text}");
+        }
+        e => panic!("{e:?}"),
+    }
+    // Not vouched: refused as before.
+    o.target = target(GUID, &[], false);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::LOCATORS_REQUIRED
+    );
+    // Vouched, but every locator on the motion control path: refused.
+    o.target = target(GUID, &[("192.168.123.50", 7410)], true);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // A motion-path locator next to one outside: left out, the rest acted on.
+    o.target = target(GUID, &[("192.168.123.50", 7410), ("10.0.0.7", 7410)], false);
+    match precheck(&o, &wheeled, &c).unwrap().effect {
+        Effect::Quarantine(q) => {
+            assert_eq!(q.locators.len(), 1);
+            assert!(q
+                .excluded
+                .iter()
+                .any(|x| x.reason.contains("motion control path")));
+        }
+        e => panic!("{e:?}"),
+    }
+    // The low-level writer's own prefix: refused, vouched or not.
+    o.target = target(LOWCMD_GUID, &[], true);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // A humanoid: a human must approve, vouched or not.
+    let humanoid = policy(Morphology::Humanoid, true, &[RestrictTarget::Participant]);
+    let mut h = unsigned(
+        "g2",
+        ActionId::QuarantineNode,
+        Morphology::Humanoid,
+        SafetyState::Idle,
+    );
+    h.target = target(GUID, &[], true);
+    h.human_approved = false;
+    assert_eq!(
+        precheck(&h, &humanoid, &c).unwrap_err().code,
+        codes::NEEDS_APPROVAL
+    );
+    // An interface-only motion-path entry: nothing can be proven outside it.
+    let mut v: Value = serde_json::from_str(&config_json("/tmp/unused")).unwrap();
+    v["network"]["motion_control_path"] = json!([{"interface": "eth2"}]);
+    let iface = ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    o.target = target(GUID, &[], true);
+    assert_eq!(
+        precheck(&o, &wheeled, &iface).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // Excluded reasons are bounded text.
+    let mut bad = o.clone();
+    if let Target::Participant { excluded, .. } = &mut bad.target {
+        excluded[0].reason = "line\nbreak".into();
+    }
+    assert!(bad.validate().is_err());
+}
+
+/// Review R2-3 / R2-7: the answer's new `quarantine` field is skipped when
+/// absent, and an answer carrying fields this build does not know still
+/// parses (an older agentd reads a newer executor's answers; the order
+/// itself stays strict, so the executor is upgraded first).
+#[test]
+fn outcomes_stay_readable_across_versions() {
+    let o = Outcome {
+        id: "x".into(),
+        status: Status::Verified,
+        action: None,
+        refusal: None,
+        error: None,
+        applied_ms: None,
+        deadline_ms: None,
+        duplicate: false,
+        note: None,
+        quarantine: None,
+    };
+    let text = serde_json::to_string(&o).unwrap();
+    assert!(!text.contains("quarantine"), "{text}");
+    let newer: Outcome = serde_json::from_str(
+        r#"{"id":"x","status":"verified","quarantine":{"locators":[]},"from_the_future":1}"#,
+    )
+    .unwrap();
+    assert_eq!(newer.quarantine.unwrap().locators.len(), 0);
+}
+
+/// Review R3-1: `containment: "full"` meant "every announced locator has a
+/// rule", but a locator rule matches only traffic **from the announced
+/// port**, and Fast DDS sends from ephemeral ports: inbound traffic was
+/// held back only by the (evadable) GUID-prefix drop. A source address is
+/// now cut whole, to and from the robot's DDS ports, whatever the source
+/// port, after the same exclusions as a locator; `containment` says
+/// exactly what the rendered rules reach.
+#[test]
+fn review3_r3_1_addresses_are_cut_whole_and_containment_matches_the_rules() {
+    use crate::decision::{merge_ranges, Containment};
+    use crate::net::PortRange;
+    use crate::nftmodel::{rtps, verdict_rendered, Packet};
+    use std::net::IpAddr;
+
+    let c = cfg("/tmp/unused");
+    let wheeled = policy(Morphology::WheeledMobile, true, &[]);
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    let target = |locs: &[(&str, u16)], addrs: &[&str], truncated: bool| Target::Participant {
+        guid_prefix: GUID.parse().unwrap(),
+        locators: locs
+            .iter()
+            .map(|(a, port)| Locator {
+                ip: a.parse().unwrap(),
+                port: *port,
+            })
+            .collect(),
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: truncated,
+    };
+    let plan = |t: Target| {
+        let mut o = order(
+            "r3-1",
+            ActionId::QuarantineNode,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        );
+        o.target = t;
+        match precheck(&o, &wheeled, &c).unwrap().effect {
+            Effect::Quarantine(q) => q,
+            e => panic!("{e:?}"),
+        }
+    };
+
+    // Every exclusion of a locator applies to an address too.
+    let q = plan(target(
+        &[("10.0.0.7", 7410)],
+        &[
+            "10.0.0.7",
+            "10.0.0.8",
+            "127.0.0.1",
+            "192.168.123.50",
+            "10.5.0.1",
+            "10.20.0.5",
+            "fd00::7",
+        ],
+        false,
+    ));
+    assert_eq!(q.addresses, vec![ip("10.0.0.7"), ip("10.0.0.8")], "{q:?}");
+    let why = |a: &str| {
+        q.excluded_addresses
+            .iter()
+            .find(|x| x.ip == ip(a))
+            .map(|x| x.reason.clone())
+            .unwrap_or_else(|| panic!("{a} not left out: {q:?}"))
+    };
+    assert!(why("127.0.0.1").contains("loopback"));
+    assert!(why("192.168.123.50").contains("motion control path"));
+    assert!(why("10.5.0.1").contains("network.quarantine.cidrs"));
+    assert!(why("10.20.0.5").contains("network.quarantine.cidrs"));
+    assert!(why("fd00::7").contains("network.quarantine.cidrs"));
+    assert_eq!(q.dds_ports, vec![PortRange::new(7400, 7649).unwrap()]);
+    assert_eq!(q.containment(), Containment::Partial);
+
+    // What the rendered rules do with real-looking packets.
+    let effect = Effect::Quarantine(q.clone());
+    let r = crate::nft::render(&[crate::nft::Active {
+        id: "r3-1",
+        effect: &effect,
+    }]);
+    let robot = ip("10.0.0.1");
+    let other = rtps("0110ffffffffffffffff0000");
+    let v = |p: Packet| verdict_rendered(&r, &p).unwrap();
+    let pkt = |chain: &str, s: (&str, u16), d: (&str, u16), pl: &[u8]| {
+        Packet::udp(chain, (ip(s.0), s.1), (ip(d.0), d.1), pl)
+    };
+    // From an ephemeral port, re-attributed RTPS: dropped.
+    assert_eq!(
+        v(pkt(
+            "input",
+            ("10.0.0.7", 51_234),
+            ("10.0.0.1", 7410),
+            &other
+        )),
+        "drop"
+    );
+    assert_eq!(
+        v(pkt("input", ("10.0.0.8", 40_000), ("10.0.0.1", 7600), b"x")),
+        "drop"
+    );
+    assert_eq!(
+        v(pkt(
+            "forward",
+            ("10.0.0.7", 51_234),
+            ("10.0.0.30", 7401),
+            b"x"
+        )),
+        "drop"
+    );
+    // Only the robot's DDS ports; another host untouched.
+    assert_eq!(
+        v(pkt("input", ("10.0.0.7", 51_234), ("10.0.0.1", 22), b"x")),
+        "accept"
+    );
+    assert_eq!(
+        v(pkt(
+            "input",
+            ("10.0.0.9", 51_234),
+            ("10.0.0.1", 7410),
+            &other
+        )),
+        "accept"
+    );
+    // Never over loopback.
+    assert_eq!(
+        v(pkt("input", ("10.0.0.7", 51_234), ("10.0.0.1", 7410), b"x").on("lo", "")),
+        "accept"
+    );
+    // To the host on a DDS port: dropped; elsewhere: delivered.
+    assert_eq!(
+        v(pkt(
+            "output",
+            ("10.0.0.1", 40_000),
+            ("10.0.0.8", 7499),
+            b"x"
+        )),
+        "drop"
+    );
+    assert_eq!(
+        v(pkt("output", ("10.0.0.1", 40_000), ("10.0.0.8", 53), b"x")),
+        "accept"
+    );
+    // The motion control path is accepted before any drop.
+    assert_eq!(
+        v(pkt(
+            "input",
+            ("192.168.123.50", 51_234),
+            ("10.0.0.1", 7410),
+            b"x"
+        )),
+        "accept"
+    );
+    // The GUID-prefix drop still applies from anywhere.
+    assert_eq!(
+        v(pkt(
+            "input",
+            ("10.0.0.9", 51_234),
+            (&robot.to_string(), 7410),
+            &rtps(GUID)
+        )),
+        "drop"
+    );
+
+    // `full` only when every address and locator is covered.
+    let q = plan(target(&[("10.0.0.7", 7410)], &["10.0.0.7"], false));
+    assert_eq!(q.containment(), Containment::Full);
+    let q = plan(target(&[("10.0.0.7", 7410)], &["10.0.0.7"], true));
+    assert_eq!(q.containment(), Containment::Partial, "forgotten evidence");
+    let q = plan(target(&[("10.0.0.7", 7410)], &[], false));
+    assert_eq!(q.containment(), Containment::Partial, "locator rules only");
+    let q = plan(target(&[("10.0.0.7", 7410)], &["10.0.0.8"], false));
+    assert_eq!(
+        q.containment(),
+        Containment::Partial,
+        "a locator not covered"
+    );
+    // An address alone is enough to act on (no `locators_required`).
+    let q = plan(target(&[], &["10.0.0.8"], false));
+    assert_eq!(q.containment(), Containment::Full);
+    assert!(q.locators.is_empty());
+    // Nothing IP-level left, GUID prefix vouched: `guid_only`.
+    let mut t = target(&[], &["10.5.0.1"], false);
+    if let Target::Participant { guid_only, .. } = &mut t {
+        *guid_only = true;
+    }
+    let q = plan(t);
+    assert_eq!(q.containment(), Containment::GuidOnly);
+    assert_eq!(q.excluded_addresses.len(), 1);
+    // Every address on the motion control path: refused, as for locators.
+    let mut o = order(
+        "r3-1b",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    o.target = target(&[], &["192.168.123.50"], false);
+    assert_eq!(
+        precheck(&o, &wheeled, &c).unwrap_err().code,
+        codes::MOTION_PATH
+    );
+    // A journal entry from before this revision: locator rules only.
+    let old: crate::decision::QuarantineSpec = serde_json::from_value(json!({
+        "guid_prefix": GUID,
+        "locators": [{"ip": "10.0.0.7", "port": 7410}],
+        "protected": []
+    }))
+    .unwrap();
+    assert_eq!(old.containment(), Containment::Partial);
+    // Adjacent domains' ranges are merged (nftables lists them merged).
+    assert_eq!(
+        merge_ranges(vec![
+            PortRange::new(7650, 7899).unwrap(),
+            PortRange::new(7400, 7649).unwrap(),
+            PortRange::new(9000, 9001).unwrap(),
+        ]),
+        vec![
+            PortRange::new(7400, 7899).unwrap(),
+            PortRange::new(9000, 9001).unwrap()
+        ]
+    );
+    // Order limits.
+    let mut bad = o.clone();
+    bad.target = target(&[], &["239.255.0.1"], false);
+    assert!(bad.validate().is_err());
+    let many: Vec<String> = (1..=17).map(|i| format!("10.0.0.{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    bad.target = target(&[], &many, false);
+    assert!(bad.validate().is_err());
 }

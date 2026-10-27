@@ -159,6 +159,46 @@ pub struct Outcome {
     pub duplicate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// What an active quarantine reaches (review R2-3): the locators it
+    /// cuts (empty: the GUID-prefix payload drop alone) and the announced
+    /// ones left out, with the reason. Only on the state of an applied
+    /// `quarantine_node`; an older agentd ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<QuarantineScope>,
+}
+
+/// See [`Outcome::quarantine`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineScope {
+    pub locators: Vec<crate::order::Locator>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<crate::order::ExcludedLocator>,
+    /// Review R3-1: the source addresses cut whole (to and from the
+    /// robot's DDS ports, any source port).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<std::net::IpAddr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_addresses: Vec<crate::order::ExcludedAddress>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub evidence_truncated: bool,
+    /// [`crate::decision::Containment`] of the rules in force (agentd
+    /// recomputes it from the fields above with the same definition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<crate::decision::Containment>,
+}
+
+fn quarantine_scope(e: &Effect) -> Option<QuarantineScope> {
+    match e {
+        Effect::Quarantine(q) => Some(QuarantineScope {
+            locators: q.locators.clone(),
+            excluded: q.excluded.clone(),
+            addresses: q.addresses.clone(),
+            excluded_addresses: q.excluded_addresses.clone(),
+            evidence_truncated: q.evidence_truncated,
+            containment: Some(q.containment()),
+        }),
+        _ => None,
+    }
 }
 
 impl Outcome {
@@ -173,8 +213,53 @@ impl Outcome {
             deadline_ms: None,
             duplicate: false,
             note: None,
+            quarantine: None,
         }
     }
+}
+
+/// What a quarantine left out (review of the F3 fix, H2): the locators not
+/// acted on and why, and whether only the GUID-prefix drop is in force.
+fn quarantine_note(e: &Effect) -> Option<String> {
+    let Effect::Quarantine(q) = e else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    if q.locators.is_empty() && q.addresses.is_empty() {
+        parts.push(format!(
+            "GUID-prefix drop only for participant {} (no locator or source address could be \
+             vouched for)",
+            q.guid_prefix
+        ));
+    }
+    if !q.excluded_addresses.is_empty() {
+        parts.push(format!(
+            "source addresses left out (not cut whole): {}",
+            q.excluded_addresses
+                .iter()
+                .map(|x| format!("{} ({})", x.ip, x.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if q.evidence_truncated {
+        parts.push(
+            "agentd forgot some of the participant's observed source addresses: not all of \
+             them are cut"
+                .to_string(),
+        );
+    }
+    if !q.excluded.is_empty() {
+        parts.push(format!(
+            "locators left out (not acted on): {}",
+            q.excluded
+                .iter()
+                .map(|x| format!("{}:{} ({})", x.ip, x.port, x.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// More of the action's TTL is left than it was ever given: the wall clock
@@ -933,7 +1018,10 @@ impl Engine {
             EventKind::Applied,
             Some(&order.id),
             Some(order.action),
-            format!("installed in table inet robodr, ttl {ttl} s"),
+            match quarantine_note(&planned.effect) {
+                Some(n) => format!("installed in table inet robodr, ttl {ttl} s; {n}"),
+                None => format!("installed in table inet robodr, ttl {ttl} s"),
+            },
         );
         self.state.event(
             now_ms,
@@ -1444,6 +1532,8 @@ impl Engine {
             o.action = Some(en.action);
             o.applied_ms = Some(en.applied_ms);
             o.deadline_ms = Some(en.deadline_ms);
+            o.note = quarantine_note(&en.effect);
+            o.quarantine = quarantine_scope(&en.effect);
             return o;
         }
         if let Some(f) = self.state.finished(id) {

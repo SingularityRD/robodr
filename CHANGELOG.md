@@ -12,6 +12,142 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
+  review of the F1 / F3 fixes"); each fixed finding has a regression test
+  that failed before its fix:
+  - R3-1 (high): **`containment: "full"` overstated a quarantine.** The
+    inbound locator rule matched the announced source port only, and Fast
+    DDS sends from ephemeral ports, so a "fully contained" participant was
+    held back inbound only by the evadable GUID-prefix drop. The executor
+    now also cuts the participant's observed source addresses whole (all
+    UDP to and from the robot's DDS ports, any source port, never over
+    loopback, after every exclusion). `full` now means every observed
+    source address and every announced locator is covered by such a drop
+    (contract §6a, one definition in `robodr_executor::decision`); the
+    answer's `state.quarantine` gains `addresses`, `excluded_addresses`
+    and `evidence_truncated`. A quarantine that cuts locators but not the
+    address, and a scope journalled before this change, now read
+    `partial`. Shared-host caveat: cutting an address cuts every DDS
+    participant on that host. **Upgrade `robodr-executor` before
+    `robodr-agentd`** (orders carry new fields). New test helper
+    `robodr_executor::nftmodel` evaluates a rendered or listed table for a
+    packet.
+  - R3-2 (medium): the 128 by-name Critical findings beyond the source
+    table were one shared budget, which one address could spend. Charged
+    per source now (2 per address, 128 addresses per window).
+  - R3-6 (low): an attacker that announced a profiled prefix first had its
+    address treated as the robot's own computer, shielding its rogues'
+    locators. Only pinned addresses and this host's own shield other
+    ports now; a learned profiled address is never cut whole (`partial`).
+  - R3-3, R3-4, R3-5: accepted, documented limits (spoofed decoy on a
+    present unprofiled host; spool reserve for new Critical sources;
+    one-source-per-prefix eviction of an un-named rogue).
+- Second independent review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`,
+  "Second review of the F1 / F3 fixes"); every finding has a regression
+  test that failed before its fix:
+  - R2-1 (high): findings about the robot's own (profiled / pinned)
+    participants were never folded, so SEDP announcements "for" the robot
+    participant with distinct topics refilled the spool (750 datagrams from
+    5 addresses: a 400-file spool full, the genuine rogue's Critical
+    finding dropped). They are now bounded: 4 High / Critical ones per
+    (participant, source, rule) and 64 per participant per 60 s window by
+    name (below High 256 / 1024), the rest in a Critical
+    `robot.ros2.discovery_flood` that names the participant (subject node
+    `discovery_flood/protected-<class>/<prefix>/<start>`). The last quarter
+    of the spool's Critical share takes only a source new to it.
+  - R2-2 (high): 128 spoofed sources (about 2 packets/s) filled agentd's
+    per-window source table and a genuine rogue's motion writer was folded
+    unnamed. A Critical finding from a source beyond the table still passes
+    by name (128 per window; about 6.4 packets/s sustained to exhaust), and
+    the "many sources" aggregate names the latest samples.
+  - R2-3 (medium): a rogue could reduce its quarantine to the GUID-prefix
+    drop (its own second prefix from its address, a re-announce from a
+    second address after its lease, locators on an address it never sends
+    from), and the SOC still read `verified` / `in_force: true`. Same-address
+    claims now share the host; a prefix ranked High or above keeps (merges)
+    its evidence and rank; **the control-plane answer of a
+    `quarantine_node` carries `containment` (`full` / `partial` /
+    `guid_only` / `unknown`) and `state.quarantine`** (contract §6a, §14;
+    AutoSecOps mirrors it).
+  - R2-4 (medium): 1100 Critical-ranked prefixes from 10 addresses evicted
+    a departed rogue's remembered locators. Global eviction now takes the
+    fullest per-source bucket first; a SOC-named entry is never evicted for
+    a lower-ranked one.
+  - R2-5 / R2-6 (low): a decoy spoofing a present profiled host's address
+    no longer gets that host's other ports; locators beyond an order's 16
+    are listed as left out instead of dropped silently.
+  - R2-7 (low): **upgrade `robodr-executor` before `robodr-agentd`**: an
+    older executor drops quarantine orders carrying `guid_only` /
+    `excluded` unanswered (the request reads `failed`, nothing applied).
+  - R2-8 (low): documentation corrected (the "spoofed" self-decoy, where
+    left-out locators are visible, the contested-prefix lifetime, the
+    source-table numbers).
+- Independent adversarial review of the F1 / F3 fixes below
+  (`tools/e2e/REDTEAM.md`, "Review of the F1 / F3 fixes"); every finding
+  has a regression test replaying the reviewer's proof of concept:
+  - H1 (high): one SPDP for a profiled prefix after its lease ran out, from
+    a foreign host, silently overwrote its remembered locators, and a
+    decoy's quarantine then cut the robot participant. The prefix is now
+    contested with a Critical `participant_source_mismatch`, its locators
+    kept.
+  - H2 (high): a decoy copying the rogue's locators, or one bad locator in
+    the rogue's own SPDP, made every quarantine of it refused. Quarantine
+    locators are now only those on addresses the participant was seen
+    sending from (ties between prefixes broken by that evidence); the
+    executor leaves out-of-scope, loopback, other-family and motion-path
+    locators out (listed with the reason) instead of refusing the order;
+    agentd vouches for a GUID-prefix-only quarantine of a participant it
+    saw that is not one of the robot's own (`guid_only` in the order). The
+    executor still refuses a motion-path GUID, an interface-only motion
+    path, an order whose every locator is on the motion path, and an order
+    with nothing it may act on.
+  - H3 (high): the GUID spray with a `cmd_vel` writer per prefix gave one
+    Critical finding per GUID and filled the Critical spool share. Critical
+    per-participant findings are now aggregated per source too (the first
+    8 one by one, then a Critical `discovery_flood`), and one source may
+    hold at most a quarter of the Critical share.
+  - H4 (high): ~40 packets a minute from a dozen addresses folded every
+    later discovery finding robot-wide into a sourceless aggregate. Only a
+    source past its own share is folded now; a source first seen late
+    still reports its first finding; findings about profiled or pinned
+    participants were never folded (bounded since R2-1 above).
+  - M5 / M6 / M7: an absent legitimate host's address is no longer in a
+    rogue's quarantine set; a rogue that raised a Critical finding (or that
+    a SOC request named) is not evicted by an active-prefix spray (ranked
+    eviction, 128 prefixes per source address); JSONL participant events
+    are used only for prefixes the binding table does not know, through the
+    same filters.
+  - L9 / L10: aggregate sample GUIDs come from the structured prefix (a
+    topic name can no longer forge one) and the detail fits its cap; each
+    flood episode is its own finding (subject node
+    `discovery_flood/<class>/<start>`); `spool.max_files` below 8 is
+    refused.
+- Red team S11-lite (`tools/e2e/REDTEAM.md`), F1 (medium): a GUID spray
+  no longer amplifies into one finding, spool record and SOC case per
+  random prefix. agentd folds the per-participant discovery findings of a
+  flooding source (past 8 per source / 32 in total per 60 s) into one
+  `robot.ros2.discovery_flood` finding (new catalog entry, contract 2.1;
+  subject the source IP, so one case; count per rule, first / last seen,
+  sample GUID prefixes; reported at 1, 2, 4, ... and when the flood ends),
+  while every folded finding stays in the black box and feeds the
+  correlator. Critical findings are never folded, and the spool keeps the
+  last eighth of its bounds for Critical findings so a flood of lesser
+  ones can no longer make a Critical finding black-box-only. 3000 sprayed
+  prefixes: 23 spool records (was one per prefix until the spool filled).
+  Regression: `crates/robodr-agentd/tests/redteam_regressions.rs`.
+- Red team F3: a SOC `quarantine_node` of a rogue that had left (dispose,
+  lease expiry) or been evicted from the binding table by a GUID spray was
+  refused `locators_required`: agentd only passed the locators of a live
+  binding. The binding table now remembers each prefix's own last trusted
+  SPDP unicast locators (1024 prefixes, 24 h; SPDP-only prefixes forgotten
+  first) and agentd hands those over, minus any locator another live or
+  profiled participant (or a pin) claims; contested and pinned prefixes
+  still get none. Regressions:
+  `crates/robodr-ros2-pipeline/tests/redteam_regressions.rs`,
+  `crates/robodr-agentd/tests/executor_link.rs`
+  (`a_rogue_pushed_out_by_a_guid_spray_is_still_quarantined_by_its_own_locators`).
+- `robodr-uplink` no longer labels a plain-HTTP loopback URL "(CA bundle)"
+  (end-to-end results D2).
 - Secure delivery, independent adversarial review of Sprint 13a
   (`docs/SECURE-DELIVERY.md` §3.5 "Review of 13a"); every finding has a
   regression test replaying its attack

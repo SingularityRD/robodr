@@ -612,6 +612,11 @@ fn unsigned(id: &str, action: ActionId, m: Morphology) -> Order {
                     ip: ROGUE.parse().unwrap(),
                     port: 7410,
                 }],
+                guid_only: false,
+                excluded: Vec::new(),
+                addresses: Vec::new(),
+                excluded_addresses: Vec::new(),
+                evidence_truncated: false,
             }
         } else {
             Target::None
@@ -799,6 +804,83 @@ fn quarantine_node_drops_the_participant_by_guid_and_locator_only() {
         3
     );
     assert_eq!(foreign_snapshot(&lab), foreign);
+}
+
+/// Review R3-1 with real nftables: a participant's source address is cut
+/// whole (any source port, to the robot's DDS ports), which is what makes
+/// `containment: "full"` true for a sender using ephemeral ports (Fast
+/// DDS); the read-back verifies the new rule shape (`iifname != "lo"`, a
+/// port range, an anonymous set of merged ranges).
+#[test]
+fn r3_1_a_quarantined_address_is_dropped_from_any_source_port() {
+    let Some(lab) = Lab::new() else { return };
+    let dir = lab.state_dir("r3-1");
+    let mut e = open(&lab, &dir, "boot-1", Morphology::WheeledMobile, 1_000);
+    let before = lab.ruleset();
+    let mut o = order("r3-1", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    if let Target::Participant { addresses, .. } = &mut o.target {
+        *addresses = vec![ROGUE.parse().unwrap()];
+    }
+    let out = submit(&mut e, &o, &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let scope = e.status("r3-1").quarantine.expect("scope");
+    assert_eq!(
+        scope.containment,
+        Some(robodr_executor::decision::Containment::Full),
+        "{scope:?}"
+    );
+    // From an ephemeral port, not RTPS / another prefix: dropped.
+    assert_eq!(
+        lab.peer_to_robot(&format!("{ROGUE}:40000"), 7500, b"not rtps"),
+        0
+    );
+    assert_eq!(
+        lab.peer_to_robot(&format!("{ROGUE}:40001"), 7410, &rtps(OTHER_GUID)),
+        0
+    );
+    // Outside the robot's DDS ports (domain 0: 7400-7649): delivered.
+    assert_eq!(lab.peer_to_robot(&format!("{ROGUE}:40000"), 7650, b"x"), 3);
+    // Another host: delivered.
+    assert_eq!(lab.peer_to_robot(&format!("{OTHER}:40000"), 7500, b"x"), 3);
+    // To the host, any DDS port: dropped.
+    assert_eq!(
+        lab.probe(
+            &lab.robot,
+            &format!("{ROBOT}:0"),
+            &lab.peer,
+            &format!("{ROGUE}:7500"),
+            b"x"
+        ),
+        0
+    );
+    assert_eq!(e.revert("r3-1", "lab", 2_000).status, Status::Reverted);
+    assert_eq!(lab.ruleset(), before);
+    assert_eq!(lab.peer_to_robot(&format!("{ROGUE}:40000"), 7500, b"x"), 3);
+
+    // Several port ranges (adjacent ones merged): an anonymous set, read
+    // back exactly.
+    let dir = lab.state_dir("r3-1-ranges");
+    let cfg = config_with(&dir, |v| {
+        v["network"]["quarantine"]["udp_ports"] = json!([[7400, 7409], [7410, 7420], [7500, 7600]]);
+    });
+    let mut e = Engine::open(
+        cfg,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-1",
+        3_000,
+    )
+    .unwrap();
+    let mut o = order("r3-1r", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    if let Target::Participant { addresses, .. } = &mut o.target {
+        *addresses = vec![ROGUE.parse().unwrap()];
+    }
+    let out = submit(&mut e, &o, &mut idle(), 3_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(lab.peer_to_robot(&format!("{ROGUE}:40000"), 7415, b"x"), 0);
+    assert_eq!(lab.peer_to_robot(&format!("{ROGUE}:40000"), 7550, b"x"), 0);
+    assert_eq!(lab.peer_to_robot(&format!("{ROGUE}:40000"), 7450, b"x"), 3);
+    assert_eq!(e.revert("r3-1r", "lab", 4_000).status, Status::Reverted);
 }
 
 #[test]
@@ -1901,6 +1983,11 @@ fn ipv6_interface_and_example_renderings_read_back_exactly() {
             ip: "fd00:30::7".parse().unwrap(),
             port: 7410,
         }],
+        guid_only: false,
+        excluded: Vec::new(),
+        addresses: Vec::new(),
+        excluded_addresses: Vec::new(),
+        evidence_truncated: false,
     };
     // Interface-only motion path entries cannot be proven: refused.
     assert_eq!(

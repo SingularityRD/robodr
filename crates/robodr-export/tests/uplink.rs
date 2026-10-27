@@ -104,7 +104,8 @@ impl Rig {
             if signed {
                 robodr_ocsf::sign_record(&mut rec, &fk).unwrap();
             }
-            s.write(&Self::output(rec), false).unwrap();
+            s.write(&Self::output(rec), robodr_agentd::SpoolClass::Normal)
+                .unwrap();
         }
     }
 

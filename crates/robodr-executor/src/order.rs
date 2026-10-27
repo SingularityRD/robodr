@@ -15,6 +15,12 @@ use crate::net::{clip, id_ok, GuidPrefix};
 
 /// Most locators per participant target.
 pub const MAX_LOCATORS: usize = 16;
+/// Most left-out locators listed per participant target.
+pub const MAX_EXCLUDED: usize = 32;
+/// Most source addresses per participant target (review R3-1).
+pub const MAX_ADDRESSES: usize = 16;
+/// Most left-out source addresses listed per participant target.
+pub const MAX_EXCLUDED_ADDRESSES: usize = 16;
 /// Longest free-text field of an origin.
 pub const MAX_TEXT: usize = 200;
 
@@ -24,6 +30,23 @@ pub const MAX_TEXT: usize = 200;
 pub struct Locator {
     pub ip: IpAddr,
     pub port: u16,
+}
+
+/// A locator left out of a quarantine, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedLocator {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub reason: String,
+}
+
+/// A source address left out of a quarantine, and why (review R3-1).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedAddress {
+    pub ip: IpAddr,
+    pub reason: String,
 }
 
 /// What an action acts on.
@@ -39,6 +62,35 @@ pub enum Target {
         guid_prefix: GuidPrefix,
         #[serde(default)]
         locators: Vec<Locator>,
+        /// agentd vouches that the participant was seen and is not one of
+        /// the robot's own (profiled, pinned or contested): when no locator
+        /// is left, the executor may quarantine it by its GUID-prefix
+        /// payload drop alone (which matches RTPS sent by that prefix only).
+        /// `false`: no locator left is `locators_required`, as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        guid_only: bool,
+        /// Announced locators agentd left out, and why (evidence only; the
+        /// executor never acts on them).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded: Vec<ExcludedLocator>,
+        /// Review R3-1: the source addresses agentd saw the participant
+        /// send from and vouches for (not loopback, not this host's, not
+        /// pinned to another participant, not a profiled participant's
+        /// host). The executor drops all UDP from them to the robot's DDS
+        /// ports, and to their DDS ports, whatever the source port (a DDS
+        /// stack such as Fast DDS sends from ephemeral ports, which a
+        /// locator rule never matches).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        addresses: Vec<IpAddr>,
+        /// Observed source addresses agentd left out, and why (evidence
+        /// only; the executor never acts on them).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded_addresses: Vec<ExcludedAddress>,
+        /// agentd forgot some of the addresses the participant was seen
+        /// sending from (more than it keeps per participant): the
+        /// quarantine can never be `full`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        evidence_truncated: bool,
     },
     /// A ROS 2 node by name (not resolvable by executor v1: refused).
     Node { name: String },
@@ -99,6 +151,10 @@ pub struct Order {
     pub soc: Option<Box<crate::soc::SocRequest>>,
 }
 
+fn is_broadcast(a: IpAddr) -> bool {
+    matches!(a, IpAddr::V4(v) if v.is_broadcast())
+}
+
 fn text_ok(s: &str) -> bool {
     s.chars().count() <= MAX_TEXT && !s.chars().any(char::is_control)
 }
@@ -115,9 +171,45 @@ impl Order {
         }
         match &self.target {
             Target::None => {}
-            Target::Participant { locators, .. } => {
+            Target::Participant {
+                locators,
+                excluded,
+                addresses,
+                excluded_addresses,
+                ..
+            } => {
+                if addresses.len() > MAX_ADDRESSES
+                    || excluded_addresses.len() > MAX_EXCLUDED_ADDRESSES
+                    || excluded_addresses
+                        .iter()
+                        .any(|x| x.reason.is_empty() || !text_ok(&x.reason))
+                {
+                    return Err(format!(
+                        "more than {MAX_ADDRESSES} addresses or {MAX_EXCLUDED_ADDRESSES} excluded \
+                         addresses, or a reason empty, too long or with control characters"
+                    ));
+                }
+                if let Some(a) = addresses
+                    .iter()
+                    .find(|a| a.is_unspecified() || a.is_multicast() || is_broadcast(**a))
+                {
+                    return Err(format!(
+                        "address {a} is not a unicast address (quarantine would match unrelated \
+                         traffic)"
+                    ));
+                }
                 if locators.len() > MAX_LOCATORS {
                     return Err(format!("more than {MAX_LOCATORS} locators"));
+                }
+                if excluded.len() > MAX_EXCLUDED
+                    || excluded
+                        .iter()
+                        .any(|x| x.reason.is_empty() || !text_ok(&x.reason))
+                {
+                    return Err(format!(
+                        "more than {MAX_EXCLUDED} excluded locators, or a reason empty, too long \
+                         or with control characters"
+                    ));
                 }
                 for l in locators {
                     if l.port == 0 {

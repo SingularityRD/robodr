@@ -343,6 +343,8 @@ whether the action is **being enforced on the robot now**: `true` only for
 `false` for every other status. `executed` stays "it took effect at some
 point" (`true` for `reverted` too). `state.executor_state: "held"` appears
 only on a `verified` request whose action the executor holds (§6a).
+`containment` (top level) and `state.quarantine` say how far a
+`quarantine_node` reaches (§6a, "Quarantine scope"); `in_force` does not.
 
 | `status` | Meaning | Terminal |
 | --- | --- | --- |
@@ -400,8 +402,21 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   * `isolate_network` and `quarantine_node` (by `participant_guid`) can
     reach `verified`. agentd hands a `quarantine_node` order the
     participant's SPDP unicast locators it has seen (from the pipeline's
-    binding table, else from `ros2_participant_discovered` events); without
-    them the executor refuses it (`locators_required`).
+    binding table: the prefix's own last trusted announcement, also after
+    the participant left or was evicted, for 24 h, only on addresses it
+    was seen sending from, minus any locator a profiled participant
+    announces, any port on a profiled participant's host (for another
+    prefix) and any pinned address, none for a contested or pinned prefix;
+    from `ros2_participant_discovered` events
+    only for a prefix the binding table does not know, through the same
+    filters). With no locator left, agentd vouches for a GUID-prefix-only
+    quarantine of a participant it saw that is not one of the robot's own
+    (profiled, pinned, contested); otherwise the executor refuses it
+    (`locators_required`). The executor leaves out (never refuses for) a
+    locator outside its quarantine scope or on the motion control path,
+    and refuses an order whose every locator is on the motion control path
+    (`motion_path`). How far a verified quarantine reaches is in the
+    answer (below, "Quarantine scope").
   * `record_evidence` becomes `verified` once a signed
     `robodr.evidence_mark` note naming the request's evidence is in the
     black box. It is never reverted.
@@ -470,12 +485,85 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * **TTL.** Every executed action has a TTL: the request's `ttl_seconds`,
   or the executor's `ttl.default_s` when the request names none. The
   executor lifts the action at `expires_at_ms` without further requests.
+* **Quarantine scope** (review R2-3 of the red-team fixes; R3-1). A
+  `quarantine_node` is enforced as three kinds of drop:
+
+  1. **address drops** (review R3-1): every UDP datagram from a source
+     address the participant was seen sending from to one of the robot's
+     DDS ports, and every UDP datagram to that address on one of those
+     ports, **whatever the source port** (not over loopback). The DDS
+     ports are the executor's `network.quarantine.udp_ports`, default the
+     RTPS port ranges `7400 + 250 d ..= 7400 + 250 d + 249` of its
+     discovery domains (domain 0: 7400-7649);
+  2. **locator drops**: UDP from an announced unicast locator's ip **and
+     port**, and to that ip:port. A DDS stack that sends from ephemeral
+     ports (Fast DDS, the ROS 2 default) is not matched inbound by these;
+  3. the **GUID-prefix drop**: RTPS whose header carries the
+     participant's GUID prefix, from anywhere. Alone it is weak: a sender
+     can re-attribute its submessages with `INFO_SRC` or restart under a
+     new prefix.
+
+  An address or locator is cut only after every exclusion (not loopback,
+  not the robot's own host as agentd knows it: this host, a pinned
+  address, a profile identity's address, an address a profiled
+  participant was seen at; not on the motion control path; inside the
+  executor's `network.quarantine.cidrs`; outside the management / uplink
+  entries; one address family). **Shared hosts:** an address drop cuts
+  every DDS participant on that host, including a legitimate process that
+  is not in the profile; source addresses are not authenticated, so a
+  decoy whose SPDP is spoofed to such a host's address gets it cut when
+  the decoy is quarantined. So every answer of a `quarantine_node` request
+  says what is cut:
+
+  | Field | Where | Present | Value |
+  | --- | --- | --- | --- |
+  | `containment` | top level, next to `in_force` | on a `quarantine_node` request whose `status` is `verified` or `applied` (held or not); absent otherwise | `"full"`, `"partial"`, `"guid_only"` (definition below); `"unknown"`: the executor did not report the scope (an executor older than revision R2-3) |
+  | `state.quarantine` | `state` | once the executor reported the scope (kept after a revert; journalled, survives a restart) | object, below |
+  | `state.quarantine.addresses` | | always in the object (may be empty; empty in a scope journalled before revision R3-1) | array (0..=16) of IP address strings: the source addresses cut whole (address drops, above) |
+  | `state.quarantine.excluded_addresses` | | always in the object (may be empty) | array (0..=32) of `{"address": "ip", "reason": string}` (reason as for `excluded`): observed source addresses agentd or the executor did **not** cut whole, e.g. "address a profiled participant was learned at (not commissioned): never cut whole; pin it (participant_ips) or commission the identity's ips", "this host's own address (the computer RoboDR runs on)", "executor: outside every network.quarantine.cidrs entry" |
+  | `state.quarantine.evidence_truncated` | | always in the object | `true` when agentd forgot an observed source address or announced locator of the participant (it keeps 8 addresses and 32 locators per participant) or a list above was cut to its bound |
+  | `state.quarantine.locators` | | always in the object | array (0..=16) of `"ip:port"` strings (IPv6 as `"[addr]:port"`): the UDP endpoints the executor cuts |
+  | `state.quarantine.excluded` | | always in the object (may be empty) | array (0..=64) of `{"locator": "ip:port", "reason": string}` (reason ≤ 200 characters, no control characters, tainted text: display only): announced locators agentd or the executor left out, e.g. "the participant was never seen sending from this address (announced only)", "address of a profiled participant's host (the robot's own computer)", "over the order's locator limit (16): not acted on", "outside every network.quarantine.cidrs entry" |
+
+  **`containment`** is derived from `state.quarantine` (one definition,
+  `robodr_executor::decision::containment_of`, used by the executor and
+  agentd):
+
+  * `"full"`: **every** source address the participant was seen sending
+    from and **every** unicast locator it announced is covered by an
+    address drop, plus the GUID-prefix drop. Precisely: `addresses` is
+    not empty, `excluded_addresses` and `excluded` are empty,
+    `evidence_truncated` is `false`, and the address of every entry of
+    `locators` is in `addresses`.
+  * `"guid_only"`: `addresses` and `locators` are both empty: only the
+    GUID-prefix drop is in force (not IP-contained).
+  * `"partial"`: anything else: some address or locator drop is in force,
+    but at least one observed address or announced locator is not covered
+    by an address drop (left out, forgotten, or only its announced ip:port
+    is cut, which a sender using ephemeral ports evades inbound).
+
+  A scope journalled before revision R3-1 (no `addresses`) reads
+  `partial` when it cut locators: those rules matched the announced ports
+  only. The fields are additive: a client that ignores them keeps
+  working, and answers without them (any other action, any other status,
+  an older agentd) are unchanged. The fields are inside the signed body
+  (§2).
 * **Client requirements.** Report "in force" exactly when `in_force` is
   `true` (a `verified` request the executor does not hold); a `verified`
   request with `in_force: false` and `state.executor_state: "held"` is
-  "held after a reboot, not enforced" (keep polling GET). Treat `refused`
-  and `failed` as "not applied" and show `refusal.code`, `refusal.reason`
-  and `state.error`. Poll GET for a `pending` request.
+  "held after a reboot, not enforced" (keep polling GET). For a
+  `quarantine_node` in force, show the containment: `full` as contained
+  (and list `state.quarantine.addresses`: an address drop cuts every DDS
+  participant on that host); `partial` as "partially contained" with the
+  left-out addresses and locators and their reasons (from a left-out
+  address the participant still reaches the robot from any port it did
+  not announce, and by `INFO_SRC` re-attribution); `guid_only` as
+  "partially contained: GUID-prefix drop only, not IP-contained" (the
+  participant can evade it; consider `isolate_network` or on-site
+  action); `unknown` as "in force, scope not reported". Never show
+  `guid_only`, `partial` or `unknown` as fully contained. Treat
+  `refused` and `failed` as "not applied" and show `refusal.code`,
+  `refusal.reason` and `state.error`. Poll GET for a `pending` request.
 * **Evidence.** Each executor event (`applied`, `verified`, `refused`,
   `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
   `removed_externally`, `reconciled`, `journal_reset`, `held`, `rearmed`,
@@ -656,8 +744,16 @@ of §2 (the latest second at which expired pairs were dropped). An agentd
 older than this revision reads a `clock` entry as damage and fences once.
 
 **Executor states** (executor v1, §6a) are one entry each,
-`{"t":"executor","request_id":...,"status":...,"error":...,"refusal":...}`,
-appended (fsync) before the new state is answered. They are the executor's
+`{"t":"executor","request_id":...,"status":...,"error":...,"refusal":...}`
+plus, for a verified quarantine whose scope the executor reported,
+`"quarantine": {"locators": [...], "excluded": [...], "addresses": [...],
+"excluded_addresses": [...], "evidence_truncated": false}` (§6a; the last
+three since revision R3-1, read as empty / `false` when absent; absent
+otherwise, and in the `stored` snapshot likewise), appended (fsync) before
+the new state is answered. An agentd older than that revision (R2-3, or
+R3-1 for the three newer fields) reads such an entry as damage and
+rebuilds from the black box (§9, "After damage"; the scope is then asked
+from the executor again on resync). They are the executor's
 word, not a decision of agentd (the executor and agentd's
 `robodr.executor_event` notes are their evidence), so they have no
 begin / commit pair. An entry for a request whose decision is still
@@ -688,7 +784,15 @@ What a SOC integration must do to use this API correctly:
   report it as not applied, never as success, and never poll it. Report an
   action as in force only when the answer says `"in_force": true`
   (`verified` and not held, §6a); `verified` with `in_force: false` and
-  `state.executor_state: "held"` is "held, not enforced".
+  `state.executor_state: "held"` is "held, not enforced". A
+  `quarantine_node` in force is fully contained only with
+  `"containment": "full"`: every source address the participant was seen
+  sending from and every locator it announced is cut whole (any source
+  port, to and from the robot's DDS ports), plus the GUID-prefix drop
+  (§6a, "Quarantine scope"). Show `partial` and `guid_only` as partially
+  contained, never as contained; show `state.quarantine.addresses` with
+  `full` too (an address drop also cuts any other DDS process on that
+  host).
 * **Retries.** On 503 `busy` or a lost answer, resubmit with the same
   `request_id` and body and a fresh nonce (§7); never a new `request_id`
   for the same intent unless the first answer was a final `failed`.
@@ -934,8 +1038,9 @@ another robot), 13 (signed in the removed v1 domain); all 401
   `isolate_network`, `quarantine_node` (participant GUID) and
   `record_evidence` only, re-checks the safety state at apply time and
   reports `pending` / `verified` / `reverted`. A participant is
-  quarantined only once agentd has seen its SPDP unicast locators
-  (`locators_required` before that). A `pending` request whose
+  quarantined only once agentd has seen it: by its SPDP unicast locators,
+  or by its GUID prefix alone when none can be vouched for and it is not
+  one of the robot's own (`locators_required` otherwise). A `pending` request whose
   order was staged but not yet sent when agentd stopped stays `pending`
   (the order is dropped, never sent late); the SOC resubmits under a new
   `request_id`.
@@ -1050,3 +1155,66 @@ it applies only with `executor.enabled` (§6a). What a SOC client sees:
   (§5): use a new `request_id`.
 * `require_approval_for_all_containment` (site option): planner orders are
   refused, SOC requests unaffected.
+
+### Revision: quarantine scope (red-team fix review R2-3, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`); it applies only
+with `executor.enabled` (§6a). What a SOC client sees:
+
+* **New top-level answer field `containment`** (string: `"full"`,
+  `"partial"`, `"guid_only"` or `"unknown"`) on every answer of a
+  `quarantine_node` request whose `status` is `verified` or `applied`
+  (submit, GET, revert answers; also while held). Before this revision a
+  quarantine that cut no locator (the participant announced its locators
+  only on addresses it never sends from, or every locator was left out)
+  read `verified` / `in_force: true` like a full one.
+* **New `state.quarantine`** object `{"locators": ["ip:port", ...],
+  "excluded": [{"locator": "ip:port", "reason": "..."}]}` once the
+  executor reported the scope (§6a table: at most 16 locators, 64
+  left-out entries, reasons ≤ 200 characters).
+* `in_force`, `status`, `executed` and every other field keep their
+  meaning; vectors (§12) are unchanged (none is a verified quarantine).
+* Client requirement (§6a, §10): show `guid_only` as "partially
+  contained: GUID-prefix drop only, not IP-contained", `partial` as
+  "partially contained" with the left-out locators, `unknown` as "scope
+  not reported"; only `full` is contained.
+* Robot side: the executor's state answer to agentd carries
+  `quarantine: {locators, excluded}` (`robodr_executor::engine::Outcome`;
+  an older agentd ignores it). agentd lists locators beyond the order's 16
+  in `excluded` ("over the order's locator limit (16): not acted on")
+  instead of dropping them silently (review R2-6).
+* **Upgrade order** (review R2-7): upgrade `robodr-executor` **before**
+  `robodr-agentd`. An order carrying `guid_only` or `excluded` (since the
+  previous redfix revision) is not understood by an older executor, which
+  drops the message unanswered (its order format is strict); agentd then
+  answers the request `failed` ("executor unreachable") and nothing is
+  applied. agentd does not retry such an order in the older format: an
+  unanswered order cannot be told apart from an executor that applied it
+  and lost the answer, and resending a changed order under the same
+  `request_id` could be answered `id_conflict` for an action in force.
+
+### Revision: address-level quarantine (red-team fix review R3-1, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`); with
+`executor.enabled` only.
+
+* **`containment: "full"` changed meaning.** It meant "every announced
+  locator has a rule", but a locator rule matches only traffic **from the
+  announced port**, and Fast DDS (the ROS 2 default) sends from ephemeral
+  ports, so such a participant was held back inbound only by the
+  evadable GUID-prefix drop. A quarantine now also cuts the source
+  addresses the participant was seen sending from, whole (any source
+  port, to and from the robot's DDS ports), and `full` means every
+  observed source address and every announced locator is covered by such
+  an address drop (§6a definition). A quarantine that cut the same
+  locators as before but cannot cut the address now reads `partial`; a
+  scope journalled before this revision reads `partial` too.
+* **New in `state.quarantine`:** `addresses`, `excluded_addresses`
+  (`{"address", "reason"}`), `evidence_truncated` (§6a table).
+* **Shared-host caveat** (§6a): an address drop cuts every DDS
+  participant on that host, a legitimate unprofiled process included.
+* Robot side: the order to the executor carries `addresses`,
+  `excluded_addresses` and `evidence_truncated`; the executor's state
+  answer carries them back with `containment`. **Upgrade the executor
+  first** (as for R2-7): an older executor does not understand an order
+  with these fields, and agentd answers the request `failed`.

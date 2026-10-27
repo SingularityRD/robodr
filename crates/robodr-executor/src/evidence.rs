@@ -46,6 +46,7 @@ pub fn record(order: &Order, refs: &[String], sink: &mut dyn EvidenceSink, now_m
         deadline_ms: None,
         duplicate: false,
         note: None,
+        quarantine: None,
     };
     let refuse = |code: &'static str, why: String| Refusal::new(code, why);
     let check = if let Err(e) = order.validate() {

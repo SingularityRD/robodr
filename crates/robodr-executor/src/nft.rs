@@ -28,6 +28,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ use serde_json::{json, Value};
 
 use crate::config::{AllowEntry, ProtectedEntry};
 use crate::decision::{DiscoverySpec, Effect, IsolationSpec, QuarantineSpec};
-use crate::net::{GuidPrefix, Iface, IpNet, Proto};
+use crate::net::{GuidPrefix, Iface, IpNet, PortRange, Proto};
 use crate::order::Locator;
 
 pub const FAMILY: &str = "inet";
@@ -447,8 +448,38 @@ fn locator_rule(l: &Locator, dir: Dir) -> Vec<Value> {
     )
 }
 
+/// Review R3-1: every UDP datagram from `ip` (`In`) to one of the robot's
+/// DDS ports, or to `ip` (`Out`) on one of them, whatever its source port,
+/// except over loopback (the quarantined host is never this one). Fast DDS
+/// and other stacks send from ephemeral ports, which [`locator_rule`]
+/// never matches.
+fn address_rule(ip: IpAddr, ports: &[PortRange], dir: Dir) -> Vec<Value> {
+    let net = IpNet::host(ip);
+    let (addr, ifkey) = ends(dir);
+    let ports = one_or_set(ports.iter().map(|r| port_value(r.lo, r.hi)).collect());
+    verdict(
+        vec![
+            json!({"match": {"op": "!=", "left": {"meta": {"key": ifkey}}, "right": "lo"}}),
+            m(addr_field(&net, addr), addr_value(&net)),
+            m(
+                json!({"payload": {"protocol": "udp", "field": "dport"}}),
+                ports,
+            ),
+        ],
+        "drop",
+        true,
+    )
+}
+
 fn quarantine_rules(q: &QuarantineSpec, chain: &str) -> Vec<Vec<Value>> {
     let mut out = vec![verdict(guid_exprs(&q.guid_prefix), "drop", true)];
+    if !q.dds_ports.is_empty() {
+        for a in &q.addresses {
+            for &dir in dirs(chain) {
+                out.push(address_rule(*a, &q.dds_ports, dir));
+            }
+        }
+    }
     for l in &q.locators {
         for &dir in dirs(chain) {
             out.push(locator_rule(l, dir));
@@ -965,7 +996,12 @@ mod tests {
                 ip: "10.0.0.7".parse().unwrap(),
                 port: 7410,
             }],
+            excluded: vec![],
             protected: vec![],
+            addresses: vec![],
+            excluded_addresses: vec![],
+            dds_ports: vec![],
+            evidence_truncated: false,
         })
     }
 

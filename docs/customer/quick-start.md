@@ -3,9 +3,8 @@
 > **Pre-release draft (refreshed 2026-10-26).** RoboDR is alpha software
 > (`0.1.0-alpha`). No signed release has been published yet, and nothing
 > has run on a customer robot. The SOC side of the connected path (the
-> AutoSecOps ingest module, control-plane client and robot pages) exists
-> on an unreleased AutoSecOps development branch; its fleet API is not
-> finished.
+> AutoSecOps ingest module, control-plane client, robot pages and fleet
+> API) exists on an unreleased AutoSecOps development branch.
 > This page gives the order of steps. The authoritative procedures are in
 > [`docs/OPERATIONS.md`](../OPERATIONS.md), and for Unitree robots in
 > [`docs/UNITREE.md`](../UNITREE.md). Check what your build supports in
@@ -145,8 +144,9 @@ Enable **exactly one** spool consumer. The units conflict.
 - **AutoSecOps** receives findings at `POST /api/robot-edr/v2/ingest`
   ([`docs/contracts/robodr.ingest-api.md`](../contracts/robodr.ingest-api.md)).
   Register each robot and its keys in the workspace. The module is on an
-  unreleased AutoSecOps branch and has not yet been run against
-  `robodr-uplink`.
+  unreleased AutoSecOps branch; `robodr-uplink` has run against it end to
+  end in one container (`tools/e2e/RESULTS.md`), not across a real
+  network.
 - **Enrollment** (optional): `robodr-enroll` registers the unit's keys
   with the SOC using a single-use token
   ([OPERATIONS section 8.6](../OPERATIONS.md)). The AutoSecOps side is not

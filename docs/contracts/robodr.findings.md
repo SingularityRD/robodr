@@ -771,6 +771,66 @@ safely. Nothing here is specific to one product.
     (an RTPS-looking datagram on a configured legacy port) and
     `robot.motion.command_type_mismatch` (a changed, unknown or feedback type
     announced on a profiled command channel).
+  - Also added while 2.1.0 was unreleased (same caveat):
+    `robot.ros2.discovery_flood` (agentd's aggregate of the per-participant
+    and per-endpoint discovery findings of one flooding source and class).
+    Catalog entry (title, description, technique T0848, data source
+    `ros2_dds_discovery`) as first published; consumers that mirror the
+    catalog (e.g. AutoSecOps' validator) need the entry, or they reject
+    these findings for a title mismatch. Rule semantics (final for 2.1.0,
+    after the review of the F1 fix):
+    - **Severity**: `critical` for the aggregate of a source's Critical
+      findings (e.g. sprayed `unauthorized_motion_writer`), else the most
+      severe folded severity, at least `medium`. A source's Critical and
+      lesser findings are two separate aggregates.
+    - **Subject**: `src_ip` = the flooding source (absent for the "many
+      sources" aggregate) and `node` = a synthetic, sensor-authored name
+      `discovery_flood/<critical|other>/<episode start, RFC 3339 UTC ms>`,
+      or `discovery_flood/protected-<critical|other>/<24 hex GUID
+      prefix>/<episode start>` for findings about one of the robot's own
+      participants (it is not a ROS node). Every report of one flood
+      episode therefore has one `finding_id` (one case, updated with
+      `count` / `last_seen_time`), and a flood after the previous one
+      ended (a full 60 s quiet) has a new `finding_id`.
+    - **Detail** (tainted, at most 400 characters, never cut mid-text):
+      the folded count per rule, first and last seen, up to 4 sample GUID
+      prefixes taken from the parsed announcements (never from text), and
+      for the "many sources" aggregate up to 4 sample source addresses
+      (the **latest** ones, and the latest sample prefixes, motion writers
+      kept first: "latest sample sources: ...", "latest sample GUID
+      prefixes: ..."). An aggregate of findings about one of the robot's
+      own (profiled or pinned) participants names that participant as its
+      subject ("about the robot's own participant <prefix> (profiled or
+      pinned)") and lists **no** sample GUID prefixes: a SOC must not take
+      that prefix as a quarantine target from this finding (it is the
+      impersonated one).
+    - Findings about a profiled or pinned participant (review R2-1 of the
+      redfix) are folded only past 4 High / Critical ones per
+      (participant, source, rule) and 60 s window, or 64 per participant
+      (below High: 256 / 1024); their aggregate is `critical` for the High
+      / Critical ones. Never folded: findings that are not about one
+      participant, and a Critical finding from a source first seen after
+      128 sources in the window, up to 2 per such source and at most 128
+      such sources per window (review R2-2; charged per source since
+      review R3-2, so one address cannot spend the budget).
+    - Accepted limits (reviews R3-3, R3-4, R3-5 of the redfix; a SOC
+      should know them): a spoofed-source spray of about 6.4 packets/s
+      from 256 or more addresses can still fold a genuine rogue's Critical
+      finding into the "many sources" aggregate (named while among the
+      latest samples; always in the robot's black box). Without a
+      draining exporter, distinct spoofed sources can fill the spool's
+      reserve for new Critical sources one record each (R3-4). A spray
+      with one spoofed source per prefix can evict a departed,
+      Critical-ranked rogue from the robot's quarantine memory unless the
+      SOC already named it in a `quarantine_node` (R3-5). A decoy whose
+      discovery is spoofed to another host's address makes a quarantine
+      of the decoy cut that host (R3-3; control-plane contract §6a,
+      shared hosts). Source IPs in findings are adversary-controlled
+      (§9, trust map).
+    - The catalog title ("... unknown participants aggregated") predates
+      these per-endpoint and protected-participant aggregates; it is frozen
+      and mirrored, so it stays (the detail says which rules were folded).
+    - No new field.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.1.0`;
     `contract_version` parts at most 9 digits and `ocsf.metadata.log_name`
     not `.` / `..` (as the validator always required).

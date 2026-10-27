@@ -6,8 +6,8 @@
 //!   (reference: `git show c64744d:crates/robodr-ocsf/src/builder.rs`; 2.0
 //!   did not change the catalog);
 //! * 2.1: + the low-level joint-frame firewall ids, the robot API /
-//!   control-handover motion ids, the Unitree legacy UDP sender ids and
-//!   the motion command type id.
+//!   control-handover motion ids, the Unitree legacy UDP sender ids, the
+//!   motion command type id and the discovery-flood aggregate.
 
 mod common;
 
@@ -23,6 +23,7 @@ const IDS_2_1: &[&str] = &[
     "robot.unitree.legacy_sender_mac_mismatch",
     "robot.unitree.legacy_port_rtps",
     "robot.motion.command_type_mismatch",
+    "robot.ros2.discovery_flood",
     "robot.firewall.joint_position_out_of_envelope",
     "robot.firewall.joint_velocity_out_of_envelope",
     "robot.firewall.joint_torque_out_of_envelope",
