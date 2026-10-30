@@ -2742,19 +2742,28 @@ a robot or with device-mapper.
 
 ### 12.1 Provision the unit's TPM (once, as root)
 
-1. Set the **owner authorization** (and the lockout authorization) to
+1. Set the **owner authorization** and the **lockout authorization** to
    secrets that are **not stored on the unit** (kept by the site security
-   officer). Without them anyone with root could undefine the policy
-   floor and revive revoked policies:
+   officer). Required: `provision` refuses a TPM where either is empty,
+   and `policy commit` refuses then too, because with an empty owner
+   authorization anyone with root could undefine and redefine the policy
+   floor and revive every revoked policy:
    `tpm2_changeauth -c o file:-` and `tpm2_changeauth -c l file:-` (each
-   reads the new value on stdin). On a unit that already has one, use it.
-2. `robodr-seal provision --owner-auth-file /root/owner.auth` (a file
-   only root can read; delete it afterwards): defines the erase-epoch
+   reads the new value on stdin; on a TPM that already has one, add
+   `-p file:<old>`). `robodr-seal status` shows `owner_auth_set`,
+   `lockout_auth_set` and a warning when either is missing.
+2. `robodr-seal provision --owner-auth-file /root/owner.auth` (required;
+   a regular file only root can read, not a symlink; delete it
+   afterwards): defines the erase-epoch
    counter (`0x01500040`), the policy-floor bit field (`0x01500041`) and
    the persistent SRK (`0x81000001`); idempotent; an index that exists
    with other attributes is an error, never redefined. Other handles:
    `--epoch-nv`, `--floor-nv`, `--srk` (then the same in every command and
    in the agent's configuration).
+3. TPM session files (they hold session keys) go to `/run/robodr-seal`
+   (`--work-dir`, `seal.tpm.work_dir`), which must be on tmpfs: every
+   TPM command refuses a work directory on a disk. Directories a killed
+   command left behind are removed by the next one.
 
 ### 12.2 Keys of the programme office and the site
 
@@ -2779,7 +2788,12 @@ a robot or with device-mapper.
 3. On the unit: `robodr-seal policy install --seal-dir ... --policy
    policy-v1.json`, then **`robodr-seal policy commit --seal-dir ...`**:
    it first unseals a probe key under the installed policy and only then
-   revokes every older version in the TPM.
+   revokes every older version in the TPM. The floor has 64 versions
+   (0..=63). Version 63 can never be revoked, so `policy sign --version
+   63` needs `--last-version`; the boot-chain update after it needs a new
+   enrolment: `erase`, undefine and redefine the floor with the owner
+   authorization (`tpm2_nvundefine 0x01500041 -C o -P file:-`, then
+   `provision`), enrol again (a new seal directory), re-deliver.
 4. Runtime volume: `robodr-seal volume format --seal-dir ... --device
    /dev/<partition>` (a random key, stored only wrapped to the UWK), then
    at every boot, before `robodr-deliverd` starts:
@@ -2797,6 +2811,9 @@ a robot or with device-mapper.
    "seal": {
      "seal_dir": "/var/lib/robodr-seal",
      "runtime_root": "/run/robodr-sealed",
+     "device": "/dev/disk/by-partlabel/robodr-sealed",
+     "mapper_name": "robodr-sealed",
+     "stop_units": ["robot-planner.service"],
      "tpm": {"tcti": "device:/dev/tpmrm0"}
    }
    ```
@@ -2804,21 +2821,15 @@ a robot or with device-mapper.
    `volume_check` defaults to `dm_crypt` (the runtime root must be a
    mounted dm-crypt mapping, otherwise sealed items and models wait);
    `unchecked` exists for tests and labs only, never in production.
-6. The shipped `robodr-deliverd.service` has `PrivateDevices=yes`, which
-   hides the TPM. Until the package ships it (13c did not change the
-   units), add a drop-in
-   `/etc/systemd/system/robodr-deliverd.service.d/40-seal.conf`:
-
-   ```ini
-   [Service]
-   PrivateDevices=no
-   DevicePolicy=closed
-   DeviceAllow=/dev/tpmrm0 rw
-   ```
-
-   and `systemctl daemon-reload`. The `robodr-seal` binary is not in the
-   package yet either: install it from the build next to the agent
-   (`/usr/sbin/robodr-seal`).
+   `device` (a stable path to the LUKS2 partition), `mapper_name` and
+   `stop_units` (the services that run delivered software from the
+   volume) are what erase acts on (§12.6); `device` is required on a unit
+   without a TPM. `tpm.work_dir` defaults to `/run/robodr-seal`.
+6. The package's `robodr-deliverd.service` reaches the TPM through
+   `DeviceAllow=/dev/tpmrm0 rw` under `DevicePolicy=closed` (no
+   `PrivateDevices=`, which would hide it); remove a `40-seal.conf`
+   drop-in made for an earlier build. `robodr-seal` is in the package
+   (`/usr/sbin`).
 
 **Authorised OS / firmware updates** change the PCRs: ship the new
 signed policy (next version) with the update, install it before the
@@ -2849,24 +2860,48 @@ it. Do not commit before that boot: the old policy is what still works.
    distribution's `clevis-luks` unlockers) and mount as above.
 2. With the volume open: `robodr-seal enroll-fallback --seal-dir ...
    --unit ... --platform ... --key /run/robodr-sealed/.robodr-seal/uwk.key`
-   (the UWK lives inside the volume). Configure `seal` without `tpm`.
+   (the UWK lives inside the volume; a key directory that is not on a
+   dm-crypt mapping is refused). Configure `seal` without `tpm` and with
+   `device` (required: erasing such a unit is wiping that device's
+   keyslots).
 3. Limits (§7.8): a disk image taken before an erase can be unlocked by
    anyone who reaches the Tang server; on site, the fallback protects
-   nothing against someone who can use the site network.
+   nothing against someone who can use the site network. Tang keeps no
+   per-unit state, so a single unit cannot be "retired" at the server.
+   After a unit is lost with its disk intact, rotate the server's keys:
+   `/usr/libexec/tangd-rotate-keys -d <keydir>` on the Tang server,
+   `clevis luks regen -d DEV -s SLOT` on every remaining unit (while the old keys still answer), then
+   delete the old (now hidden, `.`-prefixed) keys from the key database.
 
 ### 12.6 Crypto-erase
 
 `robodr-deliverd erase --config /etc/robodr/deliverd.json --trigger
 operator [--device /dev/<partition>]` (stop the service first; `--key`
-as for `reanchor`): increments the TPM's erase epoch, so every key sealed
-to the unit is dead at once (fallback: destroys the UWK file); with
-`--device` it also wipes the volume's keyslots. Findings
-`robot.seal.erased` (Critical; with `--trigger tamper` also
-`robot.seal.tamper`). It is final: recovery is re-enrolment (a new seal
+as for `reanchor`; `--device` overrides `seal.device`):
+
+1. **The erase itself.** With a TPM: the erase epoch is incremented, so
+   every key sealed to the unit is dead at once; the UWK blobs and the
+   volume wrap are deleted, and with a device its keyslots are wiped.
+   Without a TPM: the device's LUKS2 keyslots are wiped (required; with
+   no device nothing is erased and the command fails), and the UWK file
+   is destroyed if the volume is open (if not, the report says it was
+   not destroyed: it stays inside the volume, which can no longer be
+   opened).
+2. **The open runtime volume.** `seal.stop_units` are stopped, the
+   runtime root is unmounted and `seal.mapper_name` closed; when it is
+   busy it is suspended instead (the kernel wipes the volume key and
+   blocks I/O). Plaintext already in memory survives until power-off:
+   power the unit off when that matters. Without `mapper_name` the volume
+   stays open and the finding says so.
+
+The JSON report lists `destroyed` and `incomplete`; `robot.seal.erased`
+(Critical; with `--trigger tamper` also `robot.seal.tamper`) says the
+same in words. It is final: recovery is re-enrolment (a new seal
 directory) and re-delivery. Erase is not yet triggered automatically
 (tamper input, attestation failures, lease): that is
-`robodr-responder`'s, Sprint 14b. `robodr-seal erase` does the same
-without the agent's journal and findings.
+`robodr-responder`'s, Sprint 14b. `robodr-seal erase` (`--device`,
+`--mapper`, `--mount`, `--stop-unit`) does the same without the agent's
+journal and findings.
 
 ### 12.7 Findings and what to do
 
@@ -2875,4 +2910,4 @@ without the agent's journal and findings.
 | `robot.seal.unseal_failed` (`policy_refused`) | the TPM refused: boot measurements differ from every non-revoked signed policy, or the authority's signature | expected after an update without its policy; otherwise treat the unit as tampered (`Deviation`) |
 | `robot.seal.unseal_failed` (`erased`) | the unit's keys were erased | re-enrol and re-deliver, if the unit is trusted again |
 | `robot.deliver.refused` (`unauthentic_key`) | a wrap in the deployment is not this unit's (another unit's, tampered) | check the depot's re-wrapping |
-| `robot.seal.erased`, `robot.seal.tamper` | crypto-erase ran (trigger in the detail) | investigate the trigger |
+| `robot.seal.erased`, `robot.seal.tamper` | crypto-erase ran (trigger, what was destroyed and the volume's state in the detail) | investigate the trigger; if the volume is "STILL OPEN", power the unit off |

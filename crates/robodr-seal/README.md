@@ -7,14 +7,15 @@ an adversary holds.
 
 ```
 robodr-seal keygen depot|policy --out FILE
-robodr-seal policy sign --key FILE --platform P --version N --pcr I=HEX... --out FILE
-robodr-seal provision TPM [--owner-auth-file FILE]
+robodr-seal policy sign --key FILE --platform P --version N --pcr I=HEX... [--last-version] --out FILE
+robodr-seal provision --owner-auth-file FILE TPM     # refused unless owner + lockout auth are set
 robodr-seal enroll --seal-dir DIR --unit U --platform P --policy-authority FILE.pub TPM
-robodr-seal enroll-fallback --seal-dir DIR --unit U --platform P --key FILE
+robodr-seal enroll-fallback --seal-dir DIR --unit U --platform P --key FILE [--unchecked-key-location]
 robodr-seal policy install|commit --seal-dir DIR [--policy FILE] TPM
 robodr-seal rewrap --depot-key FILE --rpk RPK_DIR --unit-record UNIT.json
 robodr-seal volume format|open|format-tang|open-tang|close ...
-robodr-seal erase --seal-dir DIR --trigger T [--device DEV] [TPM]
+robodr-seal erase --seal-dir DIR --trigger T [--device DEV] [--mapper NAME] [--mount DIR]
+                  [--stop-unit UNIT]... [TPM]           # --device required without a TPM
 robodr-seal status --seal-dir DIR [TPM]
 ```
 
@@ -26,7 +27,8 @@ robodr-seal status --seal-dir DIR [TPM]
 | `wrap` | X25519 / P-256 ECDH key wraps bound to recipient and purpose |
 | `policy` | the signed PCR policy, TPM policy digests computed offline (checked against swtpm) |
 | `tpm` | `tpm2-tools` driver: provisioning, the TPM-resident UWK, unwrap in an encrypted policy session, policy floor, erase epoch |
-| `luks` | LUKS2 runtime volume (`cryptsetup`), Clevis/Tang fallback |
+| `luks` | LUKS2 runtime volume (`cryptsetup`), Clevis/Tang fallback, the volume's lockdown at erase |
+| `mounts` | mountinfo: TPM work directories on tmpfs only, the fallback key and plaintext on dm-crypt |
 | `unit` | the seal directory: enrol, unwrap, policy install / commit, volume key, erase |
 | `rpk` | seal at release, re-wrap at the depot, open on the unit |
 
@@ -39,4 +41,6 @@ fallback test runs against a real Tang server; with `ROBODR_SEAL_DM=1`
 (root, loop devices, device-mapper) the runtime volume is opened and
 mounted for real. `tests/exit_criteria.rs` holds the four exit criteria
 of §10, `tests/adversarial.rs` the attacks, `tests/cli.rs` the binary,
-`tests/fuzz_smoke.rs` the `seal_*` fuzz harnesses.
+`tests/fuzz_smoke.rs` the `seal_*` fuzz harnesses, `tests/review_13c.rs`
+the regressions of the adversarial review. TPM tests put their work
+directories under `/dev/shm` (tmpfs).

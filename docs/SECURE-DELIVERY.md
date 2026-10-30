@@ -902,6 +902,21 @@ Erase is final for that unit's delivered payloads; recovery is re-enrolment
 and re-delivery from the depot. This is RoboDR's own crypto-erase; it does not
 replace the platform's physical zeroization (§0).
 
+**What erase destroys, and what it does not (13c).** Its essential step is the
+epoch increment on a TPM unit and, without a TPM, the wipe of the runtime
+volume's LUKS2 keyslots (§7.7: the device is required; an erase without it
+reports nothing as erased). Nothing is reported as erased unless that step
+happened, and the report and `robot.seal.erased` list exactly what was
+destroyed. Erase destroys **keys**, not plaintext: a runtime volume that is
+open at that moment still serves its plaintext through its mount, and the
+kernel still holds its volume key. Erase therefore also stops the configured
+services, unmounts the runtime root and closes the mapping, or, when it is
+busy, suspends it (`cryptsetup luksSuspend`: the kernel wipes the volume key
+and blocks all I/O). Pages already in memory (page cache, the services'
+memory) survive until power-off; what could not be closed is said in the
+finding. A unit that must not keep plaintext in memory after erase must also
+power off.
+
 Nothing executes a response today: `robodr-responder` performs no I/O and
 executes nothing (`crates/robodr-responder/src/lib.rs`), the only exit for
 plans is the `Executor` seam in `robodr-agent`
@@ -928,8 +943,14 @@ requires for units without a hardware root of trust:
   the unit can recover its key only while it can talk to the site's Tang
   server; the server never learns the key).
 - Optionally combined with an operator passphrase (Clevis `sss` threshold).
-- Crypto-erase deletes the local key material and asks the depot to retire
-  the unit's binding; it cannot defeat a disk image taken before the erase.
+- Crypto-erase wipes the runtime volume's LUKS2 keyslots (which hold the
+  Tang binding) and destroys the UWK file if the volume is open. **Tang is
+  stateless**: it keeps no per-unit binding, so there is nothing to retire
+  for one unit, and a disk image taken before the erase can still be
+  unlocked by anyone who reaches the Tang server. The only remedy is to
+  rotate the Tang server's keys (`tangd-rotate-keys -d <keydir>`, rebind every other
+  unit with `clevis luks regen`, then delete the old keys), which affects
+  every unit bound to that server (OPERATIONS §12.5).
 
 Claims for this mode are in the last column of §7.8.
 
@@ -940,9 +961,9 @@ Claims for this mode are in the last column of §7.8.
 | T5: storage imaged, unit absent | Sealed payloads, models and configs unreadable; keys never on disk. | Unreadable while the attacker cannot reach the site's Tang server. |
 | T5: whole unit, booted with modified software | Cannot unseal (PCR policy). Unsealed parts boot and report `Deviation`. | Unprotected if the attacker can reach the Tang server, otherwise unreadable. |
 | T5: whole unit, booted unmodified, off site | Unseals until the lease expires (if §7.5 on), then cannot. Without lease: unseals; protection then rests on §7.4 lockdown. | Cannot unlock off site. |
-| T6: captured running, locked | Plaintext exists in the runtime volume and memory; protection rests on no-login images, lockdown, and erase triggers. **Not claimed** against a determined lab. | Same, weaker. |
-| T7: cold boot / DMA / decap / TPM fault injection | **Not claimed.** Mitigations: IOMMU on, encrypted swap, TPM parameter encryption on TPM sessions (defeats passive sniffing of a discrete TPM's bus), short lease. | Not claimed. |
-| Other units, future releases | A captured unit holds only its own wraps; content keys of RPKs never assigned to it, and of future releases, are not on it. Erase or revoke the unit at the depot and it receives nothing more. | Same. |
+| T6: captured running, locked | Plaintext exists in the runtime volume and memory; protection rests on no-login images, lockdown, and erase triggers. Erase closes (or suspends) the open runtime volume (§7.6) but does not clear memory. **Not claimed** against a determined lab. | Same, weaker. |
+| T7: cold boot / DMA / decap / TPM fault injection | **Not claimed.** Mitigations: IOMMU on, encrypted swap, TPM parameter encryption on TPM sessions (defeats passive sniffing of a discrete TPM's bus), TPM session files (with session keys) only on tmpfs, short lease. | Not claimed. |
+| Other units, future releases | A captured unit also carries other units' wraps (a signed deployment lists every targeted unit's `wrapped_keys` and travels whole in the media pack), but each wrap opens only with its own unit's UWK. Content keys of RPKs never wrapped to this unit, and of future releases, cannot be recovered from it. Erase or revoke the unit at the depot and it receives nothing more. | Same. |
 | Integrity (A, B) | Unaffected by capture: a captured unit cannot sign releases or deployments. Its unit key is revoked at the depot. | Same. |
 
 ### 7.9 Decisions taken in Sprint 13c
@@ -964,7 +985,10 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
    Paths, modes and sizes stay visible in the signed manifest. A sealed
    file's `sha256` member is a **keyed** digest (HMAC under a key derived
    from `CK`): the plaintext SHA-256 would let anyone confirm a guessed
-   low-entropy file (a config) from the manifest alone.
+   low-entropy file (a config) from the manifest alone. Two files of one
+   RPK with equal plaintext have equal keyed digests (the key is per RPK),
+   so the manifest shows which sealed files are identical; across RPKs the
+   digests are unrelated.
 3. **Chunks** (§7.2): `nonce (24) || ciphertext || tag (16)`,
    XChaCha20-Poly1305 under `HKDF-SHA256(CK, salt = seal_id,
    "robodr-seal/chunk-key/v1")`. §7.2 says "nonce derived from the chunk
@@ -1001,7 +1025,11 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
    UWK from the unit's enrolment record; the deployment's
    `wrapped_keys` lists `{unit, rpk_digest, wrap}` (sorted, an item of
    the deployment, a targeted unit unless groups are targeted). A unit
-   keeps only its own entries (`store/wraps/<digest>`).
+   keeps only its own entries in its store (`store/wraps/<digest>`); the
+   imported deployment, with every unit's entries, stays in its state.
+   `rewrap` wraps to whatever UWK the enrolment record names: until the
+   record is certified by the TPM's endorsement key (14a, item 12), the
+   depot must receive records over a trusted channel.
 
 **TPM**
 
@@ -1012,7 +1040,11 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
    H(platform)) AND PolicyNV(erase epoch == E)`. Unwrapping runs in a
    salted policy session with parameter encryption (the shared secret does
    not cross a discrete TPM's bus in clear) and the secret comes back on a
-   pipe, never in a file.
+   pipe, never in a file. The tools' object and session contexts (a
+   session context holds the session key) go to a per-operation directory
+   under `/run/robodr-seal` (`work_dir`), which must be tmpfs (checked from
+   mountinfo), never the persistent seal directory; directories left by a
+   killed process are swept by the next operation.
 9. **Signed PCR policy** (§7.4): `robodr-seal-policy/1`, ECDSA P-256 by
    the **policy authority** over `TPM2_PolicyAuthorize`'s `aHash`; the
    approved policy is `PolicyPCR(sha256 PCRs = signed values) AND
@@ -1031,8 +1063,16 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
     version, and only after the policy in force has unsealed on this
     boot (a probe unwrap), so a wrong policy never revokes the right one.
     Bits are never cleared; undefining the index needs the owner
-    authorization, which provisioning sets and does not keep on the unit
-    (OPERATIONS §12.1). A counter was not used: its first value is the
+    authorization. `robodr-seal provision` therefore refuses a TPM whose
+    owner or lockout authorization is empty (`TPM_PT_PERMANENT`), and
+    `policy commit` refuses then too: with an empty owner authorization root
+    on the unit can undefine and redefine the floor, which clears every
+    revocation (review H1). The site sets both authorizations and does not
+    keep them on the unit (OPERATIONS §12.1). **Exhaustion:** 64 versions
+    (0..=63); version 63 can never be revoked (there is no higher bit), so
+    signing it needs `--last-version`, and the boot-chain update after it
+    needs a new enrolment: erase (the old UWK dies with the epoch), undefine
+    and redefine the floor with the owner authorization, enrol again. A counter was not used: its first value is the
     TPM's highest counter value ever, which a signing station cannot know.
 11. **Erase epoch** (§7.6): a `TPM_NT_COUNTER` index; erase is one
     increment (measured: a few TPM round trips with swtpm). A counter
@@ -1058,9 +1098,12 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
     random key, `clevis luks bind` to the site's Tang server (thumbprint
     pinned), then the random key's keyslot killed, so the volume key is
     never stored on the unit. The X25519 UWK is a file inside the volume.
-    Erase destroys that file and, with `--device`, wipes every LUKS2
-    keyslot (`cryptsetup erase`), which also defeats a later Tang
-    recovery of that header.
+    `enroll-fallback` refuses a key directory that is not on a dm-crypt
+    mapping. Erase wipes every LUKS2 keyslot (`cryptsetup erase`; the
+    device is required, `seal.device`: that wipe is the erase, and it also
+    defeats a later Tang recovery of that header) and destroys the UWK file
+    when the volume is open; a UWK file that is not present is reported as
+    not destroyed.
 15. **On the unit** (`robodr-deliverd`, `seal` configuration): a sealed
     RPK and every `model` are installed only under
     `<runtime_root>/<files|model|config>/`, which must be a mounted
@@ -1073,8 +1116,11 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
     (PCRs, floor, signature) or the unit was erased; a wrap that does not
     authenticate is a delivery refusal (`robot.deliver.refused`,
     `unauthentic_key`). `robodr-deliverd erase --trigger T` reports
-    `robot.seal.erased` (Critical), preceded by `robot.seal.tamper`
-    (Critical) for the trigger `tamper`. `robot.seal.lease_expired` is
+    `robot.seal.erased` (Critical; its text lists what was destroyed and
+    whether the runtime volume was closed, suspended or is still open),
+    preceded by `robot.seal.tamper` (Critical) for the trigger `tamper`.
+    Erase also stops `seal.stop_units`, unmounts the runtime root and
+    closes `seal.mapper_name` (§7.6). `robot.seal.lease_expired` is
     catalogued for 14b.
 
 ---
@@ -1443,6 +1489,32 @@ smoke runs; no libFuzzer campaign yet, `fuzz/README.md`).
 
 Found and fixed while testing: bundle listings capped chunk files at
 4 MiB, so a full sealed chunk (4 MiB + 40) could not be bundled.
+
+**Adversarial review of 13c (2026-10-30)**, each fix with a regression
+test that failed before it (`robodr-seal/tests/review_13c.rs` unless
+noted):
+
+* H1 (high): with an empty TPM owner authorization root could undefine and
+  redefine the policy floor and revive a revoked policy. `provision`
+  refuses unless the owner and lockout authorizations are set, `policy
+  commit` refuses while they are empty, `status` warns (§7.9 item 10).
+* H2 (high): a unit without a TPM whose runtime volume was closed was
+  reported as erased while nothing was destroyed. Its erase is now the
+  keyslot wipe (device required), and the report lists exactly what was
+  destroyed (§7.9 item 14).
+* M1 (medium): erase left the open runtime volume readable. It now stops
+  the configured services, unmounts and closes the volume, or suspends it
+  (§7.6; `src/luks.rs`, scripted, not on device-mapper).
+* M2 (medium): TPM session contexts were written under the persistent seal
+  directory and survived a kill. Now tmpfs only, swept (§7.9 item 8).
+* L1: `enroll-fallback` refuses a key directory that is not on dm-crypt.
+  L2: a successful epoch increment with a failed read-back counts as the
+  erase (`src/unit.rs`). L3: the fallback key and the owner-auth file are
+  opened with `O_NOFOLLOW` and checked on the descriptor (a race; tested
+  for the symlink case only).
+* Documented: Tang is stateless (§7.7), equal plaintexts in one RPK share
+  their keyed digest (§7.9 item 2), other units' wraps are on a captured
+  unit (§7.8), floor exhaustion at version 63 (§7.9 item 10).
 
 **Gated, not run here:** the dm-crypt path end to end
 (`plaintext_only_inside_the_mounted_runtime_volume_dm`,

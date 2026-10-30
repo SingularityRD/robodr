@@ -451,8 +451,12 @@ unlock without Tang; plus policy and epoch rollback, wrong-unit and
 tampered wraps, chunk reordering / truncation / swaps, nonce reuse. Not
 done: the dm-crypt open path (no device-mapper in the test container;
 gated test), a hardware TPM, EK / AK certification (14a), erase triggers
-and lease (14b), a libFuzzer campaign of the two new targets, packaging
-of `robodr-seal` and the TPM device access of `robodr-deliverd.service`.
+and lease (14b), a libFuzzer campaign of the two new targets. An
+adversarial review of 13c (two high, two medium, three low findings:
+floor rollback without a TPM owner authorization, a fallback erase that
+destroyed nothing, an open volume left readable, session contexts on
+disk) is fixed with regression tests; `robodr-seal` is packaged and the
+agent's unit reaches the TPM.
 
 ---
 

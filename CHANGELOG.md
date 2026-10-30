@@ -12,6 +12,36 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Adversarial review of Sprint 13c (sealing; `docs/SECURE-DELIVERY.md` §10
+  "Adversarial review of 13c"); each fix has a regression test that failed
+  before it (`crates/robodr-seal/tests/review_13c.rs`):
+  - H1 (high): **a revoked PCR policy worked again on a TPM with an empty
+    owner authorization**: root could undefine and redefine the policy
+    floor. `robodr-seal provision` now refuses unless the owner and lockout
+    authorizations are set (`--owner-auth-file` is required), `policy
+    commit` refuses while they are empty, `status` warns. **Units
+    provisioned with an earlier build:** set both authorizations
+    (OPERATIONS §12.1) before the next `policy commit`.
+  - H2 (high): **erasing a unit without a TPM could report success while
+    destroying nothing** (UWK file absent because the runtime volume was
+    closed). The erase of such a unit is now the LUKS2 keyslot wipe; the
+    device is required (`seal.device`, required in `deliverd.json` without
+    a TPM; `--device`), and the report and `robot.seal.erased` list exactly
+    what was destroyed.
+  - M1 (medium): erase now stops `seal.stop_units`, unmounts the runtime
+    root and closes `seal.mapper_name`, or suspends it when busy; it used
+    to leave an open volume readable.
+  - M2 (medium): TPM session contexts (session keys) are written only under
+    a tmpfs work directory (`/run/robodr-seal`, checked; `--work-dir`,
+    `seal.tpm.work_dir`), never the seal directory, and leftovers of killed
+    commands are swept.
+  - L1: `enroll-fallback` refuses a key directory that is not on dm-crypt.
+    L2: a successful epoch increment with a failed read-back counts as the
+    erase. L3: the fallback key and the owner-auth file are opened with
+    `O_NOFOLLOW`.
+  - `robodr-deliverd.service` reached no TPM (`PrivateDevices=yes`): now
+    `DevicePolicy=closed` with `DeviceAllow=/dev/tpmrm0 rw`.
+
 - Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
   review of the F1 / F3 fixes"); each fixed finding has a regression test
   that failed before its fix:
@@ -512,9 +542,8 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     `hmac`, `x25519-dalek`, `p256`.
   - Tested against swtpm 0.7.3 / tpm2-tools 5.6 (`ROBODR_SWTPM=1`), a real
     Tang server (`ROBODR_TANG=1`) and `cryptsetup` on image files; the
-    dm-crypt open path is gated (`ROBODR_SEAL_DM=1`) and was not run. Not
-    yet packaged: the `robodr-seal` binary and TPM device access for
-    `robodr-deliverd.service` (a drop-in, OPERATIONS §12.3).
+    dm-crypt open path is gated (`ROBODR_SEAL_DM=1`) and was not run.
+    `robodr-seal` is packaged (`/usr/sbin`, both variants).
 - Secure delivery, Sprint 13b (unit agent, local; `docs/SECURE-DELIVERY.md`
   §4.2, §6, §10 "13b status"):
   - `robodr-deliverd` (new crate and daemon, `/usr/sbin`, unit

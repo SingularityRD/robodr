@@ -245,11 +245,20 @@ Consumed by the install.
 Crypto-erase the unit's sealing keys (needs the
 .B seal
 section): the TPM's erase epoch moves on, so every key sealed to the unit
-is dead (without a TPM the UWK file is destroyed);
-.B \-\-device
-also wipes the runtime volume's LUKS2 keyslots. Reports
+is dead; without a TPM the runtime volume's LUKS2 keyslots are wiped
+.RB ( seal.device
+or
+.BR \-\-device ,
+required). With a TPM a device's keyslots are wiped too. Then
+.B seal.stop_units
+are stopped,
+.I runtime_root
+is unmounted and
+.B seal.mapper_name
+closed, or suspended when busy. Reports
 .B robot.seal.erased
-(Critical), preceded by
+(Critical; its text lists what was destroyed and the volume's state),
+preceded by
 .B robot.seal.tamper
 for the trigger
 .BR tamper .
@@ -263,7 +272,13 @@ With the optional
 section
 .RB ( seal_dir ", " runtime_root ", " volume_check
 .RB "(" dm_crypt ", default, or " unchecked " for tests only), " tpm
-.RB "(" tcti ", " tools_dir ", " srk ", " epoch_nv ", " floor_nv ", " timeout_ms "); absent for a unit without a TPM)"
+.RB "(" tcti ", " tools_dir ", " srk ", " epoch_nv ", " floor_nv ", " timeout_ms ", " work_dir " (tmpfs)); absent for a unit without a TPM),"
+.B device
+(the LUKS2 partition; required without a TPM),
+.B mapper_name
+and
+.B stop_units
+(what erase closes and stops)
 the agent installs sealed
 .BR files ,
 .B model
@@ -283,9 +298,9 @@ written. A TPM refusal or an erased unit is
 (High); a wrap that is not this unit's is
 .B robot.deliver.refused
 .RB ( unauthentic_key ).
-The shipped unit's
-.B PrivateDevices=yes
-hides the TPM: see OPERATIONS.md section 12.
+The shipped unit reaches only
+.I /dev/tpmrm0
+.RB ( DevicePolicy=closed ", " DeviceAllow= ).
 .SH CONFIGURATION
 .I /etc/robodr/deliverd.json
 .RB ( robodr\-deliverd\-config/1 ,

@@ -38,13 +38,17 @@
 //!   signed policy (an older, possibly vulnerable boot chain) is therefore
 //!   refused by the TPM after the unit committed a newer one. A signed
 //!   PCR policy alone (`PolicyAuthorize` without the floor) would be valid
-//!   forever. Undefining the index (which would clear the bits) needs owner
-//!   authorization: provisioning sets one that is not kept on the unit
-//!   (`docs/OPERATIONS.md`).
+//!   forever. Undefining the index (which would clear the bits) needs the
+//!   owner authorization, so this holds only while one is set: the site
+//!   sets the owner and lockout authorizations to secrets it does not keep
+//!   on the unit, and `Tpm::provision` and `Unit::commit_policy` refuse a
+//!   TPM where either is empty (`docs/OPERATIONS.md` §12.1). Version 63
+//!   can never be revoked (no higher bit): after it, a new enrolment.
 //!
 //! Neither NV index has a policy or a password: anyone on the unit may
 //! increment the epoch or set floor bits, which only destroys (that is
-//! what erase is). Nobody can undo either.
+//! what erase is). Without the owner authorization nobody can undo
+//! either; with it, the floor can be cleared, the epoch never lowered.
 //!
 //! # Document (`robodr-seal-policy/1`)
 //!
