@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.singularityrd.com/robodr/findings/2.3.0",
-  "title": "RoboDR robodr.findings message (contract 2.3.0; also validates 2.0.x, 2.1.x and 2.2.x)",
+  "$id": "https://schemas.singularityrd.com/robodr/findings/2.4.0",
+  "title": "RoboDR robodr.findings message (contract 2.4.0; also validates 2.0.x, 2.1.x, 2.2.x and 2.3.x)",
   "description": "One findings message (Kafka value on the configured topic, default robodr.findings; one NDJSON line on other transports): vendor-neutral envelope + OCSF 1.1 Detection Finding (class_uid 2004). data_source (default robodr) and ocsf.metadata.log_name (the topic, default robodr.findings) are deployment labels. Contract 1.x messages (robot-edr.findings) are described by legacy/robot-edr-finding.schema.json. Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robodr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer. A finding may carry a detached Ed25519 signature in the Kafka header robodr-finding-sig (NOT in this value); its header value is described by $defs/FindingSignatureHeader and is signed over the exact bytes of this value (robodr.findings.md section 2a).",
   "type": "object",
   "additionalProperties": false,

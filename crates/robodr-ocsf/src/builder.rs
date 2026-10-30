@@ -196,6 +196,8 @@ pub const CATALOG_2_1_MINOR: u64 = 1;
 pub const CATALOG_2_2_MINOR: u64 = 2;
 /// Contract 2.x minor that added [`catalog_2_3`]'s entries.
 pub const CATALOG_2_3_MINOR: u64 = 3;
+/// Contract 2.x minor that added [`catalog_2_4`]'s entries.
+pub const CATALOG_2_4_MINOR: u64 = 4;
 
 /// The trusted rule catalog of the current contract
 /// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
@@ -207,6 +209,7 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         .or_else(|| catalog_2_1(rule))
         .or_else(|| catalog_2_2(rule))
         .or_else(|| catalog_2_3(rule))
+        .or_else(|| catalog_2_4(rule))
         .unwrap_or(GENERIC)
 }
 
@@ -220,6 +223,7 @@ pub fn rule_known(rule: &str) -> bool {
         .or_else(|| catalog_2_1(rule))
         .or_else(|| catalog_2_2(rule))
         .or_else(|| catalog_2_3(rule))
+        .or_else(|| catalog_2_4(rule))
         .is_some()
 }
 
@@ -234,7 +238,8 @@ pub fn rule_known(rule: &str) -> bool {
 /// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
 /// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
 /// | 2.2 | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
-/// | 2.3+ | base + 1.3 + 2.1 + 2.2 + 2.3 ([`catalog_2_3`]) |
+/// | 2.3 | base + 1.3 + 2.1 + 2.2 + 2.3 ([`catalog_2_3`]) |
+/// | 2.4+ | base + 1.3 + 2.1 + 2.2 + 2.3 + 2.4 ([`catalog_2_4`]) |
 ///
 /// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
@@ -250,11 +255,14 @@ pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_2_MINOR);
     let with_2_3 =
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_3_MINOR);
+    let with_2_4 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_4_MINOR);
     catalog_1_0(rule)
         .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
         .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
         .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
         .or_else(|| with_2_3.then(|| catalog_2_3(rule)).flatten())
+        .or_else(|| with_2_4.then(|| catalog_2_4(rule)).flatten())
         .unwrap_or(GENERIC)
 }
 
@@ -1058,6 +1066,38 @@ fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
             "The unit's delivery agent saw a release bundle that skips bundles it never received, or two different bundles with the same sequence number, or one that does not follow the accepted bundle.",
             DELIVERY,
             &[],
+        ),
+        _ => return None,
+    })
+}
+
+/// Entries added in contract **2.4**: agentd's state integrity and the
+/// executor's failed reverts and journal resets (data source
+/// `robodr_agent`, no techniques). Not in 2.3 or earlier: an older
+/// validator applies the generic entry to these ids, and so does a 2.4
+/// validator to an older message ([`rule_info_for_contract`]).
+fn catalog_2_4(rule: &str) -> Option<RuleInfo> {
+    const AGENT: &str = "robodr_agent";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: AGENT,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.agent.control_plane_state_untrusted" => e(
+            "Control-plane state failed its integrity check",
+            "At start the control plane's sealed request journal or replay store was damaged, edited, sealed under another key, or older than the head the black box recorded for it. The robot failed safe: the damaged copy was quarantined, requests were reconciled with the black box and the replay store was fenced; nothing was reset silently.",
+        ),
+        "robot.agent.executor_revert_failed" => e(
+            "Containment action could not be reverted",
+            "The robot's executor could not revert a containment action: its transaction or read-back failed, so the action's rules may still be in force after its time limit or revert request. The executor retries every tick; the detail names the action, request, time limit and error.",
+        ),
+        "robot.agent.executor_journal_reset" => e(
+            "Executor journal untrusted and reset",
+            "The robot's executor found its journal unreadable or failing its seal and started empty: every action it held was lifted and its history lost. It refuses new orders until an operator re-arms it.",
         ),
         _ => return None,
     })

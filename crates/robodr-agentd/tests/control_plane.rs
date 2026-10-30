@@ -295,6 +295,12 @@ fn write_finding_key(dir: &Path) -> PathBuf {
 
 /// A private state directory (0700).
 fn state_dir(s: &Setup) -> PathBuf {
+    state_dir_for_key(s, &s.key)
+}
+
+/// [`state_dir`] for a daemon whose black-box key is `bb_key` (the state
+/// is sealed under a key derived from it).
+fn state_dir_for_key(s: &Setup, bb_key: &Path) -> PathBuf {
     let d = s.dir.join("cp-state");
     std::fs::create_dir_all(&d).unwrap();
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -311,6 +317,8 @@ fn state_dir(s: &Setup) -> PathBuf {
             30,
             robodr_agentd::control::auth::MAX_NONCES,
             ago,
+            // Sealed under the key agentd derives from this black-box key.
+            &robodr_agentd::control::journal::Sealing::from_blackbox_key_file(bb_key).unwrap(),
         )
         .unwrap(),
     );
@@ -964,7 +972,7 @@ fn evidence_export_end_to_end() {
     cfg["blackbox"].as_object_mut().unwrap().remove("key_id");
     cfg["control_plane"] = json!({
         "unix_socket": control,
-        "state_dir": state_dir(&s),
+        "state_dir": state_dir_for_key(&s, &bb_key),
         "soc_keys": [soc_pub],
         "rate_per_minute": 600,
         "burst": 100,

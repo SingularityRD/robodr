@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Contract | `robodr.findings`, version **2.3.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Contract | `robodr.findings`, version **2.4.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
 | Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings, and since 2.3 its `robot.seal.*` findings, into the same spool; since 2.3 the in-path gateway `robodr-firewall-gw` reports its `robot.gateway.*` findings through agentd's `gateway_feed` socket), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
-| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`; it also describes 2.0.x, 2.1.x and 2.2.x messages, whose only difference is the rule catalog the validator applies, §3) |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.4.0`; it also describes 2.0.x, 2.1.x, 2.2.x and 2.3.x messages, whose only difference is the rule catalog the validator applies, §3) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 | Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
@@ -71,7 +71,7 @@ each one against the robot's current safety state and may refuse it.
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | the value's own `contract_version` (`2.3.0` from this producer; a forwarded or replayed 2.0, 2.1 or 2.2 message keeps its version) |
+| `robodr-contract-version` | the value's own `contract_version` (`2.4.0` from this producer; a forwarded or replayed 2.0 – 2.3 message keeps its version) |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -86,7 +86,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "2.3.0",
+  "contract_version": "2.4.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robodr",
@@ -423,7 +423,8 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
   | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
-  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c), and the Unitree WebRTC entries `robot.unitree.webrtc_*`, data source `ros2_motion_commands`, no techniques (§3d), and the depot entries `robot.depot.import_refused` (High), `robot.depot.enrolment_refused` (High), `robot.depot.unit_enrolled` (Low), `robot.depot.rollout_halted` (High), `robot.depot.locked` (Critical) and `robot.seal.erase_deferred` (Medium), data source `robodr_delivery`, no techniques (§3e) |
+  | 2.4 and later | everything of 2.3, unchanged + the 2.4 agentd entries `robot.agent.control_plane_state_untrusted` (High / Critical), `robot.agent.executor_revert_failed` (High), `robot.agent.executor_journal_reset` (High), data source `robodr_agent`, no techniques (§3f) |
+  | 2.3 | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c), and the Unitree WebRTC entries `robot.unitree.webrtc_*`, data source `ros2_motion_commands`, no techniques (§3d), and the depot entries `robot.depot.import_refused` (High), `robot.depot.enrolment_refused` (High), `robot.depot.unit_enrolled` (Low), `robot.depot.rollout_halted` (High), `robot.depot.locked` (Critical) and `robot.seal.erase_deferred` (Medium), data source `robodr_delivery`, no techniques (§3e) |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -630,6 +631,35 @@ per reason, while a sealed item waits for a site lease. The executed erase
 reports `robot.seal.tamper` and `robot.seal.erased` as in §3c, with
 `robot.seal.erase_deferred` between them when the robot was moving.
 
+## 3f. Rule catalog 2.4: control-plane state and executor (`robot.agent.*`)
+
+The 2.4 addition (`catalog_2_4` in `robodr-ocsf`), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.4.x (or later 2.x); a 2.3 validator, and a 2.4
+validator given a 2.3 message, apply the generic entry. Data source
+`robodr_agent` (`finding_info.data_sources` exactly `["robodr_agent"]`),
+no techniques, producer `robodr-agentd` (self-health, observe-only: these
+never feed a response).
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | High (damaged, edited, another key); Critical (rolled back against the black box's signed head, or an unsealed v1 file after sealing started) |
+| `robot.agent.executor_revert_failed` | Containment action could not be reverted | High |
+| `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | High |
+
+Catalog sentences (`finding_info.desc`):
+
+* `robot.agent.control_plane_state_untrusted`: At start the control plane's sealed request journal or replay store was damaged, edited, sealed under another key, or older than the head the black box recorded for it. The robot failed safe: the damaged copy was quarantined, requests were reconciled with the black box and the replay store was fenced; nothing was reset silently.
+* `robot.agent.executor_revert_failed`: The robot's executor could not revert a containment action: its transaction or read-back failed, so the action's rules may still be in force after its time limit or revert request. The executor retries every tick; the detail names the action, request, time limit and error.
+* `robot.agent.executor_journal_reset`: The robot's executor found its journal unreadable or failing its seal and started empty: every action it held was lifted and its history lost. It refuses new orders until an operator re-arms it.
+
+`robot.agent.control_plane_state_untrusted` is raised once per agentd start;
+`robot.agent.executor_revert_failed` once per request until a revert of it
+succeeds (the executor reports every retry as a black-box note); the
+detail of each names what failed. Each is also in the black box (the
+finding record, and the `robodr.executor_event` or
+`robodr.control_plane_start` note).
+
 ## 4. Ordering and partitioning
 
 * Partition = `toPositive(murmur2(utf8(robot_id))) % partitions` — Kafka's
@@ -659,15 +689,17 @@ reports `robot.seal.tamper` and `robot.seal.erased` as in §3c, with
   parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
-* **2.0 vs 2.1 vs 2.2 vs 2.3.** 2.1, 2.2 and 2.3 only added rule-catalog
-  entries (§3; 2.2 also the data source `robodr_delivery` they use). A 2.3
-  validator accepts 2.0, 2.1 and 2.2 messages with their own catalogs; an older
+* **2.0 vs 2.1 vs 2.2 vs 2.3 vs 2.4.** 2.1, 2.2, 2.3 and 2.4 only added
+  rule-catalog entries (§3; 2.2 also the data source `robodr_delivery` they
+  use). A 2.4 validator accepts 2.0 – 2.3 messages with their own catalogs; an older
   validator accepts a newer message for every rule both catalogs share and
   rejects one for a rule only the newer minor catalogues (title / data
   source differ): upgrade consumers (and both sides of a diode) before
   producers. Sites that run `robodr-deliverd` need 2.2 validators on the
   SOC side before its findings are exported, and 2.3 validators once it
-  installs sealed RPKs (`robot.seal.*`).
+  installs sealed RPKs (`robot.seal.*`). An agentd that emits 2.4
+  (`robot.agent.control_plane_state_untrusted`, `executor_revert_failed`,
+  `executor_journal_reset`) needs 2.4 validators on the SOC side.
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -956,6 +988,14 @@ safely. Nothing here is specific to one product.
       eval inputs.
 
 ## 10. Changelog
+
+* **2.4.0** — rule-catalog entries only (minor): agentd's sealed
+  control-plane state and the executor (GA-ROADMAP S5):
+  - New entries (data source `robodr_agent`, already in the schema's
+    enums): `robot.agent.control_plane_state_untrusted`,
+    `robot.agent.executor_revert_failed`,
+    `robot.agent.executor_journal_reset` (§3f), emitted by `robodr-agentd`.
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.4.0`.
 
 <!-- 2.3 gateway block (merge with other 2.3 entries, e.g. robot.seal.*). -->
 * **2.3.0** — rule-catalog entries only (minor), Sprint 8:

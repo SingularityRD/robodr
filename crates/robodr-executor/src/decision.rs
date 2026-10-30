@@ -119,6 +119,9 @@ pub mod codes {
     /// The operator removed table `inet robodr`: nothing is executed until
     /// `robodr-executor rearm`.
     pub const OPERATOR_DISABLED: &str = "operator_disabled";
+    /// The executor's journal was unreadable or failed its seal and was
+    /// reset: nothing is executed until `robodr-executor rearm` (gap 1).
+    pub const JOURNAL_RESET: &str = "journal_reset";
     /// The configuration or response policy could not be re-read.
     pub const CONFIG_UNAVAILABLE: &str = "config_unavailable";
     // --- Trust boundary (M1, `crate::soc`) ---------------------------------
@@ -167,7 +170,7 @@ pub mod codes {
     pub const BEHAVIOUR_UNSUPPORTED: &str = "behaviour_unsupported";
 
     /// Every code, for mapping a wire string back to a static one.
-    pub const ALL: [&str; 35] = [
+    pub const ALL: [&str; 36] = [
         INVALID_ORDER,
         REPLAY,
         NOT_EXECUTOR_ACTION,
@@ -188,6 +191,7 @@ pub mod codes {
         EVIDENCE_ELSEWHERE,
         LOCATORS_REQUIRED,
         OPERATOR_DISABLED,
+        JOURNAL_RESET,
         CONFIG_UNAVAILABLE,
         SOC_SIGNATURE_INVALID,
         SOC_REQUEST_STALE,

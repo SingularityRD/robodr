@@ -24,6 +24,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use robodr_responder::{ActionId, ResponsePolicy};
 use serde::{Deserialize, Serialize};
@@ -344,6 +345,9 @@ impl Engine {
     /// Any error deletes table `inet robodr` before it is returned: a start
     /// that fails never leaves rules without the process that enforces
     /// their TTL.
+    ///
+    /// The state files are **unsealed** here (executor v1 format, for tests
+    /// and tools); the daemon opens them with [`Engine::open_sealed`].
     pub fn open(
         cfg: Resolved,
         policy: ResponsePolicy,
@@ -351,13 +355,45 @@ impl Engine {
         boot_id: &str,
         now: impl Into<Now>,
     ) -> Result<Self, String> {
-        let now = now.into();
-        let journal = Journal::new(&cfg.config.state_dir);
-        let soc_replay = crate::soc::ReplayStore::open(
+        Self::open_with(cfg, policy, nft, boot_id, now.into(), None)
+    }
+
+    /// [`Engine::open`] with the journal and the SOC replay store sealed
+    /// under `seal` (gap 1, [`crate::journal::seal`]; the key is derived
+    /// from the link key, [`crate::proto::Key::state_seal_key`]). A journal
+    /// whose seal does not verify, or an unsealed v1 journal, is handled
+    /// like an unreadable one (table deleted, `journal_reset` event, High)
+    /// and every order is refused until `robodr-executor rearm`; a replay
+    /// store that fails its seal is fenced.
+    pub fn open_sealed(
+        cfg: Resolved,
+        policy: ResponsePolicy,
+        nft: Box<dyn Nft + Send>,
+        boot_id: &str,
+        now: impl Into<Now>,
+        seal: Arc<robodr_blackbox::StateSealKey>,
+    ) -> Result<Self, String> {
+        Self::open_with(cfg, policy, nft, boot_id, now.into(), Some(seal))
+    }
+
+    fn open_with(
+        cfg: Resolved,
+        policy: ResponsePolicy,
+        nft: Box<dyn Nft + Send>,
+        boot_id: &str,
+        now: Now,
+        seal: Option<Arc<robodr_blackbox::StateSealKey>>,
+    ) -> Result<Self, String> {
+        let journal = match &seal {
+            None => Journal::new(&cfg.config.state_dir),
+            Some(k) => Journal::sealed(&cfg.config.state_dir, k.clone()),
+        };
+        let soc_replay = crate::soc::ReplayStore::open_sealed(
             &cfg.config.state_dir,
             now.wall_ms / 1000,
             cfg.config.soc.max_clock_skew_s,
             journal.path().exists(),
+            seal,
         );
         let mut e = Engine {
             state: State::empty(boot_id),
@@ -426,6 +462,24 @@ impl Engine {
                     format!(
                         "HIGH: the journal was unreadable ({why}): table inet robodr deleted, \
                          every action reverted, history lost, starting empty"
+                    ),
+                );
+            }
+            Loaded::Untrusted(why) => {
+                // Gap 1: never believed, never silently reset. Fail towards
+                // doing nothing on the robot (as for an unreadable journal)
+                // and refuse every order until the operator re-arms.
+                nft::delete_table(self.nft.as_mut())?;
+                self.state.journal_reset_ms = Some(now.wall_ms);
+                self.state.event(
+                    now.wall_ms,
+                    EventKind::JournalReset,
+                    None,
+                    None,
+                    format!(
+                        "HIGH: {why}: not trusted; table inet robodr deleted, every action \
+                         reverted, history lost, starting empty; orders are refused until \
+                         `robodr-executor rearm`"
                     ),
                 );
             }
@@ -900,6 +954,21 @@ impl Engine {
                 now_ms,
             );
         }
+        if self.state.journal_reset_ms.is_some() {
+            // Gap 1: the journal could not be trusted (unreadable, edited,
+            // another key, unsealed) and was reset; nothing new is
+            // executed until the operator has looked (`rearm`).
+            return self.refuse(
+                order,
+                &digest,
+                Refusal::new(
+                    codes::JOURNAL_RESET,
+                    "the executor's journal was unreadable or failed its seal and was reset: \
+                     nothing is executed until `robodr-executor rearm`",
+                ),
+                now_ms,
+            );
+        }
         if let Err(r) = self.reload_config() {
             return self.refuse(order, &digest, r, now_ms);
         }
@@ -1299,7 +1368,10 @@ impl Engine {
                 Some(order.action),
                 format!(
                     "rolling back the failed apply did not verify ({e}); the periodic \
-                         check retries"
+                         check retries (ttl {})",
+                    order
+                        .ttl_s
+                        .map_or_else(|| "default".to_string(), |t| format!("{t}s"))
                 ),
             );
         }
@@ -1473,7 +1545,11 @@ impl Engine {
                     EventKind::RevertFailed,
                     Some(id),
                     Some(en.action),
-                    format!("{reason}: revert did not verify ({e}); retried every tick"),
+                    format!(
+                        "{reason}: revert did not verify ({e}); retried every tick (ttl {}s, \
+                         deadline {} ms)",
+                        en.ttl_s, en.deadline_ms
+                    ),
                 );
                 let _ = self.save();
                 let mut o = self.status(id);

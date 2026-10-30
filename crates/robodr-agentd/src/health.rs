@@ -25,6 +25,9 @@
 //! | black box failing (evidence lost) | [`rules::EVIDENCE_DEGRADED`] | High | once per outage |
 //! | black box quarantined evidence at open | [`rules::EVIDENCE_QUARANTINED`] | the recorder's (High / Critical) | once per recorder open (daemon) |
 //! | black box found its tail cut at open | [`rules::EVIDENCE_TRUNCATED`] | Critical | once per recorder open (daemon) |
+//! | control-plane state damaged / edited / other key, or rolled back | [`rules::CONTROL_PLANE_STATE_UNTRUSTED`] | High / Critical | once per start (daemon) |
+//! | executor revert failed (rules may still be in force) | [`rules::EXECUTOR_REVERT_FAILED`] | High | once per request until it reverts (daemon) |
+//! | executor journal unreadable or unsealed, executor started empty | [`rules::EXECUTOR_JOURNAL_RESET`] | High | per executor event (daemon) |
 //!
 //! The daemon hands these to `Agent::handle_external` as
 //! `Detector::SelfHealth`, which stamps them observe-only: a health problem
@@ -60,6 +63,18 @@ pub mod rules {
     /// Authenticated control-plane requests refused as invalid (unknown
     /// action, a parameter the class does not take, an override).
     pub const CONTROL_PLANE_INVALID: &str = "robot.agent.control_plane_invalid";
+    /// The control plane's sealed state (request journal, replay store)
+    /// failed its integrity check at start: damaged, edited, sealed under
+    /// another key (High) or rolled back against the black box's signed
+    /// head (Critical). Contract 2.4.
+    pub const CONTROL_PLANE_STATE_UNTRUSTED: &str = "robot.agent.control_plane_state_untrusted";
+    /// robodr-executor could not revert an action (its rules may still be
+    /// in force). High. Contract 2.4.
+    pub const EXECUTOR_REVERT_FAILED: &str = "robot.agent.executor_revert_failed";
+    /// robodr-executor found its journal unreadable or failing its seal
+    /// and started empty (what was in force was lifted). High. Contract
+    /// 2.4.
+    pub const EXECUTOR_JOURNAL_RESET: &str = "robot.agent.executor_journal_reset";
 }
 
 /// Thresholds (milliseconds).

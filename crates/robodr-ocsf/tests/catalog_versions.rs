@@ -181,16 +181,56 @@ fn a_2_2_message_validates_with_its_own_catalog() {
 }
 
 #[test]
-fn current_contract_is_2_3() {
-    assert_eq!(CONTRACT_VERSION, "2.3.0");
+fn current_contract_is_2_4() {
+    assert_eq!(CONTRACT_VERSION, "2.4.0");
     let schema: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/contracts/robodr-finding.schema.json"
     ))
     .unwrap();
     assert_eq!(
         schema["$id"],
-        "https://schemas.singularityrd.com/robodr/findings/2.3.0"
+        "https://schemas.singularityrd.com/robodr/findings/2.4.0"
     );
+}
+
+/// The 2.4 entries (gap 1 / S5: agentd's state integrity, the executor's
+/// failed reverts and journal resets).
+const IDS_2_4: &[&str] = &[
+    "robot.agent.control_plane_state_untrusted",
+    "robot.agent.executor_revert_failed",
+    "robot.agent.executor_journal_reset",
+];
+
+#[test]
+fn entries_added_in_2_4_are_not_in_2_3_or_earlier() {
+    let g = generic();
+    for id in IDS_2_4 {
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert_eq!(full.data_source, "robodr_agent", "{id}");
+        assert!(full.techniques.is_empty(), "{id}");
+        for v in ["1.3.0", "2.0.0", "2.2.0", "2.3.0", "2.3.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.4.0", "2.4.1", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        // A 2.4 finding validates; relabelled as 2.3 it does not (its
+        // catalog constants are the 2.4 ones).
+        let v24 = build(id);
+        robodr_ocsf::parse_and_validate(&v24).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let down = v24.replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.3.0\"",
+        );
+        assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
+    }
+    for id in IDS_2_3_GATEWAY {
+        assert_eq!(
+            rule_info_for_contract(id, "2.4.0"),
+            rule_info_for_contract(id, "2.3.0")
+        );
+    }
 }
 
 #[test]

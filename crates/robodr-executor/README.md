@@ -271,7 +271,25 @@ Writes to `journal.json` are atomic and write-ahead. At start
 | `active`, deadline ahead, same boot, table present | re-applied and verified (no change) |
 | `active`, deadline ahead, **new boot** | **held**: re-validated against the current configuration and policy (the precheck of its stored order; refused → reverted), not installed. It is re-applied only when agentd's next event poll supplies a fresh, known safety state that is not engaged; it expires at its deadline like any action |
 | `active`, same boot, **table missing** | operator emergency disable: dropped, not re-applied, orders refused until `rearm` |
-| journal unreadable | table deleted, start empty: event `journal_reset` (detail `HIGH: ...`) and the status flag `journal_reset_ms` until `rearm` |
+| journal unreadable | table deleted, start empty: event `journal_reset` (detail `HIGH: ...`) and the status flag `journal_reset_ms` until `rearm`; every order is refused (`journal_reset`) until then |
+| journal **fails its seal** (edited, truncated, another key) or is an unsealed v1 file not upgraded with `seal-journal` | not believed: handled exactly like an unreadable journal (above); agentd reports `robot.agent.executor_journal_reset` (High) |
+
+**Sealed state (gap 1).** The daemon (`Engine::open_sealed`) writes
+`journal.json` as `robodr-executor-journal/v2 <key id> <tag>` followed by
+the JSON, and `soc_nonces.json` likewise (`robodr-executor-soc-nonces/v2`;
+a store failing its seal fences). The tag is HMAC-SHA256 under a
+`robodr_blackbox::StateSealKey` derived from the link key (`key_file`,
+purpose `executor/state/v1`): someone who can write the state directory
+but does not hold the link key cannot edit either file unnoticed. The
+seal does **not** detect an older sealed copy put back (no external
+anchor; agentd's own journals are anchored in its black box). Upgrading
+from an unsealed release: `robodr-executor seal-journal` once, executor
+stopped (`docs/OPERATIONS.md` 6.5). `Engine::open` (no key) keeps the
+unsealed v1 format for tests and tools.
+
+A failed revert (`revert_failed`, retried every tick; the detail names the
+TTL and deadline) is reported by agentd as `robot.agent.executor_revert_failed`
+(High) once per request until a revert of it succeeds.
 
 **Clock.** Within a boot, expiry is decided on CLOCK_BOOTTIME
 (`/proc/uptime`): NTP or an operator stepping the wall clock changes

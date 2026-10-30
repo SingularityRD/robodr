@@ -18,6 +18,13 @@ use robodr_responder::{
 };
 use serde_json::{json, Value};
 
+/// The sealing of a replay store in a test directory (gap 1).
+fn seal() -> robodr_agentd::control::journal::Sealing {
+    robodr_agentd::control::journal::Sealing::new(
+        robodr_agentd::control::journal::Sealing::derive_key(&[0x42; 32]).unwrap(),
+    )
+}
+
 fn tmp(tag: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let d = std::env::temp_dir().join(format!(
@@ -212,14 +219,14 @@ fn nonce_journal_tail_damage_fences_the_store() {
     use robodr_agentd::control::auth::{AuthFailure, ReplayGuard, MAX_NONCES, NONCE_JOURNAL};
     let dir = tmp("nonces");
     let now = 1_800_000_000;
-    drop(ReplayGuard::persistent(&dir, 30, MAX_NONCES, now - 3600).unwrap());
-    let (mut g, _) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now).unwrap();
+    drop(ReplayGuard::persistent(&dir, 30, MAX_NONCES, now - 3600, &seal()).unwrap());
+    let (mut g, _) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now, &seal()).unwrap();
     for n in 0..3 {
         g.check("soc-1", &format!("nonce-{n}"), now, now).unwrap();
     }
     drop(g);
     corrupt_last_lines(&dir.join(NONCE_JOURNAL), 2);
-    let (mut g, load) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now + 1).unwrap();
+    let (mut g, load) = ReplayGuard::persistent(&dir, 30, MAX_NONCES, now + 1, &seal()).unwrap();
     assert!(load.damaged >= 2, "{load:?}");
     assert!(load.fence.is_some(), "{load:?}");
     for n in 0..3 {
@@ -290,7 +297,7 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
     let t = 1_800_000_000u64;
     // (b) + (a): a created journal fences up to now + skew.
     let dir = tmp("fence-created");
-    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t).unwrap();
+    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t, &seal()).unwrap();
     assert!(load.created);
     assert_eq!(load.fence, Some(t + skew), "{load:?}");
     assert_eq!(
@@ -306,23 +313,23 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
     let mid = text.iter().position(|b| *b == b'\n').unwrap() + 70;
     text[mid] ^= 1;
     std::fs::write(&p, &text).unwrap();
-    let (_, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t + 2).unwrap();
+    let (_, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t + 2, &seal()).unwrap();
     assert_eq!(load.fence, Some(t + 2 + skew), "{load:?}");
     let _ = std::fs::remove_dir_all(&dir);
 
     // (c) across a restart: a nonce accepted at t, dropped (expired) while
     // the clock read t + 100, replayed after the clock went back to t.
     let dir = tmp("fence-clock");
-    let (g, _) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t - 3600).unwrap();
+    let (g, _) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t - 3600, &seal()).unwrap();
     drop(g);
-    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t).unwrap();
+    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t, &seal()).unwrap();
     assert_eq!(load.fence, None, "{load:?}");
     g.check("soc-1", "n-1", t, t).unwrap();
     drop(g);
-    let (g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t + 100).unwrap();
+    let (g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t + 100, &seal()).unwrap();
     assert_eq!((load.expired, load.fence), (1, None), "{load:?}");
     drop(g);
-    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t).unwrap();
+    let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t, &seal()).unwrap();
     assert_eq!(load.fence, Some(t + 100 + skew), "{load:?}");
     assert_eq!(
         g.check("soc-1", "n-1", t, t),
@@ -335,9 +342,9 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
     // (c) while running: pairs dropped (cache full) while the clock read
     // t + 100, then the clock steps back to t.
     let dir = tmp("fence-run");
-    let (g, _) = ReplayGuard::persistent(&dir, skew, 2, t - 3600).unwrap();
+    let (g, _) = ReplayGuard::persistent(&dir, skew, 2, t - 3600, &seal()).unwrap();
     drop(g);
-    let (mut g, _) = ReplayGuard::persistent(&dir, skew, 2, t).unwrap();
+    let (mut g, _) = ReplayGuard::persistent(&dir, skew, 2, t, &seal()).unwrap();
     g.check("soc-1", "n-a", t, t).unwrap();
     g.check("soc-1", "n-b", t, t).unwrap();
     g.check("soc-1", "n-c", t + 100, t + 100).unwrap();
@@ -349,9 +356,9 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
     assert_eq!(g.fence(), Some(t + 100 + skew));
     // A step back with nothing dropped since is harmless (no fence).
     let dir2 = tmp("fence-run2");
-    let (g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t - 3600).unwrap();
+    let (g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t - 3600, &seal()).unwrap();
     drop(g);
-    let (mut g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t + 1).unwrap();
+    let (mut g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t + 1, &seal()).unwrap();
     g.check("soc-1", "n-x", t + 1, t + 1).unwrap();
     assert_eq!(g.check("soc-1", "n-y", t, t), Ok(()));
     assert_eq!(g.fence(), None);

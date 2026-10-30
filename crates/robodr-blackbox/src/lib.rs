@@ -92,6 +92,7 @@ pub mod record;
 pub mod remote_anchor;
 pub mod sign;
 pub mod sign_ed25519;
+pub mod state_seal;
 pub mod store;
 pub mod time;
 pub mod tls;
@@ -104,6 +105,7 @@ pub use record::{ChainIdentity, Hash, Record, RecordKind};
 pub use remote_anchor::{AnchorReceiver, RemoteAnchorConfig, RemoteHeadAnchor, RemoteMark};
 pub use sign::{HmacSha256Key, Signer, Verifier};
 pub use sign_ed25519::{Ed25519SigningKey, Ed25519VerifyingKey};
+pub use state_seal::StateSealKey;
 pub use store::{
     AnchoredHead, AppendOutcome, EntryKind, Error, FileHeadAnchor, FsyncPolicy, HeadAnchor,
     MemoryHeadAnchor, OpenIncident, Recorder, RecorderConfig, Refusal, RetentionMode,
