@@ -98,7 +98,9 @@ fn read_capped(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if out.len() < MAX_OUTPUT {
-                        out.extend_from_slice(&buf[..n.min(MAX_OUTPUT - out.len())]);
+                        out.extend_from_slice(
+                            buf.get(..n.min(MAX_OUTPUT - out.len())).unwrap_or_default(),
+                        );
                     }
                 }
             }
@@ -759,8 +761,8 @@ pub fn transaction(r: &Rendered) -> Value {
                 let mut obj = json!({
                     "family": FAMILY, "table": TABLE, "chain": chain, "expr": rule.expr
                 });
-                if let Some(c) = &rule.comment {
-                    obj["comment"] = json!(c);
+                if let (Some(c), Some(o)) = (&rule.comment, obj.as_object_mut()) {
+                    o.insert("comment".into(), json!(c));
                 }
                 cmds.push(json!({"add": {"rule": obj}}));
             }

@@ -161,8 +161,8 @@ fn gateway_apply(m: &MotionSection, spec: &MotionSpec) -> Result<String, String>
         ("max_joint_speed", r.max_joint_speed),
         ("factor", r.factor),
     ] {
-        if let Some(x) = x {
-            v[k] = x.into();
+        if let (Some(x), Some(o)) = (x, v.as_object_mut()) {
+            o.insert(k.into(), x.into());
         }
     }
     let p = &g.restriction_path;

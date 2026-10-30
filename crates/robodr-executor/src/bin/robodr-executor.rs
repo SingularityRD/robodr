@@ -32,11 +32,12 @@
 // S10 (R9): release builds use `panic = "abort"`, so any panic kills the
 // executor (systemd restarts it and its ExecStopPost removes the table;
 // docs/OPERATIONS.md, "Crashes and restarts"). Non-test code has no
-// unwrap / expect / panic!-family call; slice indexing and arithmetic are
-// left to review.
+// unwrap / expect / panic!-family call and no unchecked indexing;
+// arithmetic is left to review.
 #![cfg_attr(
     not(test),
     deny(
+        clippy::indexing_slicing,
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,

@@ -364,13 +364,13 @@ fn pct_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
+    while let Some(&c) = b.get(i) {
+        if c == b'%' {
             let h = s.get(i + 1..i + 3)?;
             out.push(u8::from_str_radix(h, 16).ok()?);
             i += 3;
         } else {
-            out.push(b[i]);
+            out.push(c);
             i += 1;
         }
     }
@@ -994,8 +994,8 @@ pub mod testing {
             "source": "soc-test",
             "authority": "request",
         });
-        if let Some(t) = order.ttl_s {
-            v["ttl_seconds"] = t.into();
+        if let (Some(t), Some(o)) = (order.ttl_s, v.as_object_mut()) {
+            o.insert("ttl_seconds".into(), t.into());
         }
         v.to_string()
     }

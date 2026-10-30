@@ -208,8 +208,9 @@ fn left(l: &Value, p: &Packet) -> Result<Option<V>, String> {
         let t = p.transport();
         let o = usize::try_from(off / 8).unwrap_or(usize::MAX);
         return Ok(t
-            .get(o..o.saturating_add(4))
-            .map(|b| V::Num(u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))));
+            .get(o..)
+            .and_then(|b| b.first_chunk())
+            .map(|b| V::Num(u64::from(u32::from_be_bytes(*b)))));
     }
     let proto = pl.get("protocol").and_then(Value::as_str).unwrap_or("");
     let field = pl.get("field").and_then(Value::as_str).unwrap_or("");

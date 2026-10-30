@@ -474,8 +474,7 @@ impl MotionSection {
                 .restrict_motion
                 .iter()
                 .any(|k| !matches!(k, AdapterKind::Gateway | AdapterKind::UnitreeSport))
-            || (self.restrict_motion.len() == 2
-                && self.restrict_motion[0] == self.restrict_motion[1])
+            || matches!(self.restrict_motion.as_slice(), [a, b] if a == b)
         {
             return Err(
                 "motion.restrict_motion: at most gateway and unitree_sport, once each".into(),
