@@ -199,6 +199,7 @@ const IDS_2_4: &[&str] = &[
     "robot.agent.control_plane_state_untrusted",
     "robot.agent.executor_revert_failed",
     "robot.agent.executor_journal_reset",
+    "robot.agent.executor_pause_overridden",
 ];
 
 #[test]

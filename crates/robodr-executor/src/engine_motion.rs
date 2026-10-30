@@ -572,4 +572,92 @@ impl Engine {
             }
         }
     }
+
+    /// The safe_pause latch (sales-readiness T42): every
+    /// `motion.safe_pause_latch_s` each pause in force is re-asserted
+    /// through its adapter ([`crate::motion::MotionPorts::latch`]). What
+    /// someone did to move the robot while paused is an `overridden`
+    /// event with a `HIGH:` detail (agentd: a High finding); a platform
+    /// that cannot be read is a `drift` event, once per change of the
+    /// error. The interval is counted from the end of the previous run, so
+    /// a peer that does not answer cannot keep the engine busy.
+    pub(super) fn motion_latch(&mut self, now: Now) {
+        let now_ms = now.wall_ms;
+        let m = self.motion_cfg();
+        let mono = now.boot_ms.unwrap_or(now_ms);
+        let every = m.safe_pause_latch_s.saturating_mul(1000);
+        if mono.abs_diff(self.last_latch_boot_ms) < every {
+            return;
+        }
+        let pauses: Vec<(String, ActionId, MotionSpec)> = self
+            .state
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Active)
+            .filter_map(|e| match &e.effect {
+                Effect::Motion(s) if s.lift_needs_people() => {
+                    Some((e.id.clone(), e.action, s.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        self.latch_errors
+            .retain(|id, _| pauses.iter().any(|(p, _, _)| p == id));
+        if pauses.is_empty() {
+            self.last_latch_boot_ms = mono;
+            return;
+        }
+        let started = std::time::Instant::now();
+        for (id, action, spec) in pauses {
+            match self.motion.latch(&m, &spec) {
+                Ok(crate::motion::Latch::Held(_)) => {
+                    if self.latch_errors.remove(&id).is_some() {
+                        self.state.event(
+                            now_ms,
+                            EventKind::Verified,
+                            Some(&id),
+                            Some(action),
+                            "safe_pause latch: the platform answers again and is paused",
+                        );
+                        let _ = self.save();
+                    }
+                }
+                Ok(crate::motion::Latch::Overridden(what)) => {
+                    self.latch_errors.remove(&id);
+                    self.state.event(
+                        now_ms,
+                        EventKind::Overridden,
+                        Some(&id),
+                        Some(action),
+                        format!(
+                            "HIGH: the robot was set moving while safe_pause {id} is in force: \
+                             {what}; the pause stays in force until the SOC's two-person signed \
+                             revert"
+                        ),
+                    );
+                    let _ = self.save();
+                }
+                Err(e) => {
+                    if self.latch_errors.get(&id) != Some(&e) {
+                        self.state.event(
+                            now_ms,
+                            EventKind::Drift,
+                            Some(&id),
+                            Some(action),
+                            format!(
+                                "safe_pause latch could not read the platform ({e}): a goal or \
+                                 mode change made meanwhile is not cancelled; retried every \
+                                 {} s",
+                                m.safe_pause_latch_s
+                            ),
+                        );
+                        let _ = self.save();
+                        self.latch_errors.insert(id, e);
+                    }
+                }
+            }
+        }
+        let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_latch_boot_ms = mono.saturating_add(took);
+    }
 }

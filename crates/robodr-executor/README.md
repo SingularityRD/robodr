@@ -189,9 +189,9 @@ the gateway refuses every `SpeedLevel` while its restriction is in force
 Without the gateway, the level is advisory. A restriction limits commands
 decided after it is applied; a joint trajectory the controller already
 accepted keeps executing at its accepted speeds (use `safe_pause`).
-| `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel` | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
+| `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel`; **latched** (below) | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
 | | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch, **only** on the SOC's two-person signed revert with the safety state re-checked (never at TTL, restart or emergency disable) |
-| | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
+| | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode; **latched** (below) | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
 | `request_safe_state` | `px4` (hold, or RTL when the policy's `safe_state` is `return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
 | `rollback_config` | `rollback` (`config: program`) | the site's OEM-validated program, `--verify` afterwards | not reversible: `applied`; `config: profile` is refused (`not_executor_action`: the profile's anti-rollback chain) |
 
@@ -239,6 +239,33 @@ expiry, a revert, restart reconciliation (expired, interrupted or
 reverting entries), an operator's emergency disable and a failed re-arm
 after a reboot call the adapter's undo; a failed undo leaves the action
 `reverting` and is retried every tick.
+
+**The pause latch** (sales-readiness T42). Cancelling the goals and
+setting hold once is not enough: a new goal or a mode change by someone
+else would set the robot moving again. While a `safe_pause` is in force
+the executor re-asserts it every `motion.safe_pause_latch_s` (1..=60,
+default 2; counted from the end of the previous run, so a peer that does
+not answer cannot keep the engine busy):
+
+* `nav2`: `CancelGoal` (every goal) on each action server again. A goal
+  found cancelling was sent while paused: event `overridden` with detail
+  `HIGH: ...` (agentd: finding `robot.agent.executor_pause_overridden`,
+  High), followed by a zero-twist burst.
+* `px4`: the vehicle's `HEARTBEAT` mode is read back (the executor sends
+  a GCS heartbeat, nothing else). Any mode but AUTO.LOITER (a mission
+  resumed, offboard, RTL, land, orbit) is `overridden` and hold is set
+  again. A pilot's **manual** mode (MANUAL, ALTCTL, POSCTL, ACRO,
+  STABILIZED, RATTITUDE) is reported `overridden` too but **left to the
+  pilot**: the latch never takes the sticks away from a human.
+* `ros2_control`: not observed (the controller manager keeps the switch;
+  a later switch by someone else is not detected).
+
+A platform that cannot be read (no answer, a refused cancel) is one
+`drift` event per change of the error (and `verified` once it answers
+again); meanwhile a goal or a mode change is not undone. What the latch
+does not see: velocity commands published straight to `cmd_vel` (teleop,
+a rogue node) without a Nav2 goal, and a goal sent and finished within one
+interval. Keep the gateway's restriction in the path for those.
 
 **A `safe_pause` is never lifted automatically** (ADR-0006; review
 finding 1): its undo may set the robot moving (ros2_control re-activates
@@ -807,9 +834,10 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   header travels in the inline QoS; `rmw: cyclonedds` only), ACKNACK
   processing (the reliable writer re-sends until the reply arrives),
   DATA_FRAG of our own samples (requests are small), MAVLink signing
-  (signed frames are refused). Nav2 and PX4 pauses are not latches: a new
-  goal or a mode change by someone else moves the robot again (combine
-  with the gateway's restriction). Unitree `SpeedLevel` is reverted to 0,
+  (signed frames are refused). Nav2 and PX4 pauses are latched every
+  `safe_pause_latch_s` (above), not continuously: a goal or a mode change
+  moves the robot for up to that interval, and raw `cmd_vel` is not seen
+  (combine with the gateway's restriction). Unitree `SpeedLevel` is reverted to 0,
   not to the level before. The rollback adapter runs the site's program
   with the executor's privileges (systemd drop-in).
 * **Not run on a robot or under systemd.** The unit passes

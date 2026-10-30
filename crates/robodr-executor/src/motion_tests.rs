@@ -1983,3 +1983,210 @@ fn review_11_revert_all_and_abandon_undo_motion_actions() {
     assert_eq!(s.entries.len(), 1);
     assert_eq!(s.entries[0].phase, crate::journal::Phase::Active);
 }
+
+// ------------------------------------- sales-readiness T42: the pause latch
+
+fn overridden(e: &Engine) -> Vec<String> {
+    e.state()
+        .events
+        .iter()
+        .filter(|ev| ev.kind == crate::journal::EventKind::Overridden)
+        .map(|ev| ev.detail.clone())
+        .collect()
+}
+
+/// T42: a Nav2 pause was not a latch: a goal sent after the cancel set the
+/// robot moving again unnoticed. Now every `safe_pause_latch_s` every goal
+/// is cancelled again; a goal found is reported `overridden` (HIGH) and
+/// zero twists follow. A peer that stops answering is one `drift` event,
+/// not one per run.
+#[test]
+fn t42_nav2_pause_is_latched_and_an_override_is_reported() {
+    // Goals the simulated Nav2 holds; a cancel cancels them all.
+    let goals = Arc::new(Mutex::new(1u32));
+    let answering = Arc::new(AtomicBool::new(true));
+    let (g2, a2) = (goals.clone(), answering.clone());
+    let (_sim, port, seen, _) = sim_ros2(move |topic, p| {
+        if !a2.load(Ordering::SeqCst) {
+            return None;
+        }
+        if topic.starts_with("rq/") && topic.ends_with("/_action/cancel_goalRequest") {
+            let n = std::mem::take(&mut *g2.lock().unwrap());
+            return service_reply(p, |e| {
+                e.u8(0); // ERROR_NONE
+                e.u32(n);
+                for i in 0..n {
+                    for b in 0..16u8 {
+                        e.u8(b ^ i as u8);
+                    }
+                    e.i32(1);
+                    e.u32(0);
+                }
+            });
+        }
+        None
+    });
+    let twists = |seen: &Seen| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == "rt/cmd_vel")
+            .count()
+    };
+    let d = tmpdir("t42-nav2");
+    let motion = json!({"safe_pause": "nav2", "safe_pause_latch_s": 2,
+        "nav2": {"oem_validated": true, "ros2": ros2_peer(port),
+                 "actions": ["/navigate_to_pose"], "zero_twists": 3,
+                 "zero_twist_interval_ms": 10}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        t0,
+    );
+    let o = signed(
+        "lp1",
+        ActionId::SafePause,
+        Morphology::WheeledMobile,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(twists(&seen), 3);
+    // Before the interval: nothing is sent.
+    e.tick(late(1_000));
+    assert_eq!(twists(&seen), 3);
+    // Nobody moved it: re-cancelled, nothing found, no event.
+    e.tick(late(2_100));
+    assert!(overridden(&e).is_empty());
+    assert_eq!(twists(&seen), 3);
+    // Someone sends a navigation goal while paused.
+    *goals.lock().unwrap() = 2;
+    e.tick(late(10_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "{ov:?}");
+    assert!(ov[0].starts_with("HIGH:"), "{ov:?}");
+    assert!(ov[0].contains("2 navigation goal(s)"), "{ov:?}");
+    assert_eq!(
+        *goals.lock().unwrap(),
+        0,
+        "the new goals were not cancelled"
+    );
+    assert_eq!(twists(&seen), 6, "no zero twists after the override");
+    assert_eq!(e.status("lp1").status, Status::Verified);
+    // The peer stops answering: one drift event per change, not per run.
+    answering.store(false, Ordering::SeqCst);
+    let drifts = |e: &Engine| {
+        e.state()
+            .events
+            .iter()
+            .filter(|ev| ev.kind == crate::journal::EventKind::Drift)
+            .count()
+    };
+    e.tick(late(20_000));
+    e.tick(late(30_000));
+    assert_eq!(drifts(&e), 1);
+    answering.store(true, Ordering::SeqCst);
+    e.tick(late(40_000));
+    assert_eq!(overridden(&e).len(), 1);
+    assert_eq!(e.status("lp1").status, Status::Verified);
+}
+
+/// T42: a PX4 hold was not a latch: a mode change (a mission resumed,
+/// offboard) moved the vehicle again unnoticed. Now its mode is read back
+/// every `safe_pause_latch_s`; another mode is reported `overridden`
+/// (HIGH) and hold is set again, but a pilot's manual mode is reported and
+/// left to the pilot.
+#[test]
+fn t42_px4_hold_is_latched_but_a_pilot_keeps_manual_control() {
+    let (_sim, addr, mode) = sim_px4(true);
+    let d = tmpdir("t42-px4");
+    let motion = json!({"safe_pause": "px4",
+        "px4": {"oem_validated": true, "address": addr.to_string(), "bind": "127.0.0.1:0",
+                "timeout_ms": 3000}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Drone, Morphology::Aerial),
+        t0,
+    );
+    let o = signed(
+        "lh1",
+        ActionId::SafePause,
+        Morphology::Aerial,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::MovingSlow,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::MovingSlow), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let hold = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, mav::PX4_SUB_AUTO_LOITER);
+    assert_eq!(*mode.lock().unwrap(), hold);
+    e.tick(late(2_100));
+    assert!(overridden(&e).is_empty());
+    // A ground station resumes the mission while paused.
+    *mode.lock().unwrap() = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, 4);
+    e.tick(late(5_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "{ov:?}");
+    assert!(
+        ov[0].starts_with("HIGH:") && ov[0].contains("AUTO.MISSION"),
+        "{ov:?}"
+    );
+    assert_eq!(*mode.lock().unwrap(), hold, "hold was not set again");
+    // Offboard (a companion computer steering it): set back to hold too.
+    *mode.lock().unwrap() = mav::px4_custom_mode(6, 0);
+    e.tick(late(8_000));
+    assert_eq!(overridden(&e).len(), 2);
+    assert_eq!(*mode.lock().unwrap(), hold);
+    // A pilot takes manual control (POSCTL): reported, never taken away.
+    let posctl = mav::px4_custom_mode(3, 0);
+    *mode.lock().unwrap() = posctl;
+    e.tick(late(11_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 3, "{ov:?}");
+    assert!(
+        ov[2].contains("POSCTL") && ov[2].contains("left to the pilot"),
+        "{ov:?}"
+    );
+    assert_eq!(
+        *mode.lock().unwrap(),
+        posctl,
+        "the latch took control from the pilot"
+    );
+    assert_eq!(e.status("lh1").status, Status::Verified);
+}
+
+#[test]
+fn t42_latch_interval_is_validated() {
+    let d = tmpdir("t42-cfg");
+    for bad in [0, 61] {
+        let mut v: Value =
+            serde_json::from_str(&crate::tests::config_json(d.to_str().unwrap())).unwrap();
+        v["motion"] = json!({"safe_pause_latch_s": bad});
+        let r = crate::ExecutorConfig::parse(&v.to_string()).and_then(|c| c.validate());
+        assert!(r.is_err(), "safe_pause_latch_s {bad} accepted");
+    }
+    assert!(mav::px4_is_manual(mav::px4_custom_mode(1, 0)));
+    assert!(mav::px4_is_manual(mav::px4_custom_mode(3, 2)));
+    assert!(
+        !mav::px4_is_manual(mav::px4_custom_mode(3, 1)),
+        "ORBIT is commanded"
+    );
+    assert!(!mav::px4_is_manual(mav::px4_custom_mode(6, 0)));
+    assert!(!mav::px4_is_manual(mav::px4_custom_mode(4, 4)));
+}

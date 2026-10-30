@@ -629,9 +629,11 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * **Evidence.** Each executor event (`applied`, `verified`, `refused`,
   `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
   `removed_externally`, `reconciled`, `journal_reset`, `held`, `rearmed`,
-  `journal_error`) is a `robodr.executor_event` note. `revert_failed`,
-  `drift`, `removed_externally` and `journal_reset` are critical
-  (fsynced). `status.json` carries `executor` counters.
+  `journal_error`, `overridden`) is a `robodr.executor_event` note.
+  `revert_failed`, `drift`, `removed_externally`, `journal_reset` and
+  `overridden` (the robot was set moving while a `safe_pause` was in
+  force; also the High finding `robot.agent.executor_pause_overridden`)
+  are critical (fsynced). `status.json` carries `executor` counters.
 * **Executor journal anchor.** Every events answer of the executor carries
   its journal head (a random `epoch` replaced by every reset, and
   `next_seq`); agentd records it as a critical

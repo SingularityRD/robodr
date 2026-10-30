@@ -1099,6 +1099,10 @@ fn catalog_2_4(rule: &str) -> Option<RuleInfo> {
             "Executor journal untrusted and reset",
             "The robot's executor found its journal unreadable or failing its seal and started empty: every action it held was lifted and its history lost. It refuses new orders until an operator re-arms it.",
         ),
+        "robot.agent.executor_pause_overridden" => e(
+            "Robot set moving while paused",
+            "While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found.",
+        ),
         _ => return None,
     })
 }

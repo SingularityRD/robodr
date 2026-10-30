@@ -252,6 +252,11 @@ pub enum EventKind {
     Rearmed,
     /// A journal write failed (disk full, I/O error); retried.
     JournalError,
+    /// Someone set the robot moving again while a `safe_pause` was in
+    /// force (a navigation goal, a flight-mode change; sales-readiness
+    /// T42): the latch cancelled it / set hold again (detail: what it
+    /// found). agentd reports it as High.
+    Overridden,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

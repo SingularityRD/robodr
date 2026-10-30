@@ -175,6 +175,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // robodr-agentd executor link (failed revert, executor journal reset)
     "robot.agent.executor_revert_failed",
     "robot.agent.executor_journal_reset",
+    "robot.agent.executor_pause_overridden",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",

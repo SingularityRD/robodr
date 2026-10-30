@@ -9,9 +9,9 @@
 //! |---|---|---|---|
 //! | `restrict_motion` | `gateway` | restriction file for `robodr-firewall-gw` (caps / factor, expiry = TTL), read back from the gateway's status | file removed, read back; the gateway also lifts it at its expiry on its own |
 //! | | `unitree_sport` | sport `SpeedLevel(level)` request (`rt/api/sport/request`), reply code 0; held by the gateway (it refuses `SpeedLevel` while restricted: list `unitree_sport` first), advisory without it | `SpeedLevel(0)` (the SDK default: not necessarily the level before) |
-//! | `safe_pause` | `nav2` | `CancelGoal` (zero id: every goal) on each action server, then a burst of zero `Twist` on `cmd_vel` | **nothing to undo**: goals are not restored, the operator re-issues the mission (documented) |
+//! | `safe_pause` | `nav2` | `CancelGoal` (zero id: every goal) on each action server, then a burst of zero `Twist` on `cmd_vel`; **latched**: every `safe_pause_latch_s` every goal is cancelled again, and a goal found (sent while paused) is reported `overridden` (High) and followed by a zero-twist burst | **nothing to undo**: goals are not restored, the operator re-issues the mission (documented) |
 //! | | `ros2_control` | `SwitchController` STRICT: deactivate the motion controllers, activate the hold controllers | the inverse switch, only on the SOC's two-person signed revert with the safety state re-checked (never automatically: [`MotionSpec::lift_needs_people`]) |
-//! | | `px4` | MAVLink `DO_SET_MODE` AUTO.LOITER (hold), ack + heartbeat read back | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
+//! | | `px4` | MAVLink `DO_SET_MODE` AUTO.LOITER (hold), ack + heartbeat read back; **latched**: every `safe_pause_latch_s` the heartbeat's mode is read back, and any other mode is reported `overridden` (High) and set back to hold | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
 //! | `request_safe_state` | `px4` (hold / RTL per the policy's `safe_state`), `nav2`, `ros2_control` | as above | not reversible (an operator restores the robot) |
 //! | `rollback_config` | `rollback` (`config: program` only) | the site's OEM-validated rollback program, `--verify` afterwards | not reversible |
 //!
@@ -380,6 +380,9 @@ pub struct RollbackAdapter {
 fn default_pause_ttl() -> u64 {
     3600
 }
+fn default_latch_s() -> u64 {
+    2
+}
 
 /// `motion` in executor.json (absent: no motion action is executed; each
 /// is refused `no_adapter`).
@@ -403,6 +406,13 @@ pub struct MotionSection {
     /// (ADR-0006; review finding 1).
     #[serde(default = "default_pause_ttl")]
     pub safe_pause_ttl_s: u64,
+    /// How often a `safe_pause` in force is re-asserted (s, 1..=60,
+    /// default 2; sales-readiness T42, [`MotionPorts::latch`]): `nav2`
+    /// cancels every goal again and `px4` reads the vehicle's mode back
+    /// and sets hold again; a goal or a mode change someone made while
+    /// paused is reported (`overridden`, High).
+    #[serde(default = "default_latch_s")]
+    pub safe_pause_latch_s: u64,
     /// The robot's motion envelope (the profile's, as the gateway applies
     /// it): the base an absolute `restrict_motion` cap is converted to a
     /// factor against on a robot that balances (review finding 3).
@@ -431,6 +441,7 @@ impl Default for MotionSection {
             request_safe_state: None,
             rollback_config: None,
             safe_pause_ttl_s: default_pause_ttl(),
+            safe_pause_latch_s: default_latch_s(),
             envelope: None,
             gateway: None,
             unitree_sport: None,
@@ -543,6 +554,9 @@ impl MotionSection {
         }
         if self.safe_pause_ttl_s == 0 || self.safe_pause_ttl_s > max_ttl_s {
             return Err("motion.safe_pause_ttl_s must be 1..=ttl.max_s".into());
+        }
+        if !(1..=60).contains(&self.safe_pause_latch_s) {
+            return Err("motion.safe_pause_latch_s must be 1..=60".into());
         }
         if let Some(e) = &self.envelope {
             let ok = |v: Option<f64>| v.is_none_or(|x| x.is_finite() && x > 0.0);
@@ -1143,6 +1157,27 @@ pub trait MotionPorts {
     fn revert(&mut self, m: &MotionSection, spec: &MotionSpec) -> Result<String, String>;
     /// Periodic read-back of an applied, reversible action.
     fn verify(&mut self, m: &MotionSection, spec: &MotionSpec) -> Result<(), String>;
+    /// Re-assert a `safe_pause` in force (sales-readiness T42; every
+    /// `motion.safe_pause_latch_s`): [`Latch::Overridden`] when someone
+    /// moved the robot again while paused (the pause is then applied
+    /// again by the adapter), `Err` when the platform could not be read.
+    /// Default: nothing to re-assert.
+    fn latch(&mut self, m: &MotionSection, spec: &MotionSpec) -> Result<Latch, String> {
+        let _ = (m, spec);
+        Ok(Latch::Held(String::new()))
+    }
+}
+
+/// What re-asserting a pause found ([`MotionPorts::latch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Latch {
+    /// Still paused (or nothing the adapter can observe); the note says
+    /// what was checked.
+    Held(String),
+    /// Someone set the robot moving while paused (a new navigation goal,
+    /// a flight-mode change): the adapter cancelled it / set hold again;
+    /// the note says what it found.
+    Overridden(String),
 }
 
 /// The real adapters.
@@ -1158,5 +1193,8 @@ impl MotionPorts for SystemPorts {
     }
     fn verify(&mut self, m: &MotionSection, spec: &MotionSpec) -> Result<(), String> {
         adapters::verify(m, spec)
+    }
+    fn latch(&mut self, m: &MotionSection, spec: &MotionSpec) -> Result<Latch, String> {
+        adapters::latch(m, spec)
     }
 }

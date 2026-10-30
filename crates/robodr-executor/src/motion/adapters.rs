@@ -292,7 +292,16 @@ fn reply_body(payload: &[u8]) -> Result<Dec<'_>, String> {
 
 fn nav2_pause(m: &MotionSection) -> Result<String, String> {
     let n = m.nav2.as_ref().ok_or_else(|| missing(AdapterKind::Nav2))?;
+    let (mut notes, _) = nav2_cancel_all(n)?;
+    notes.push(nav2_zero_twists(n)?);
+    Ok(notes.join("; "))
+}
+
+/// `CancelGoal` (every goal) on each action server: the notes and how
+/// many goals were cancelling in all.
+fn nav2_cancel_all(n: &super::Nav2Adapter) -> Result<(Vec<String>, u64), String> {
     let mut notes = Vec::new();
+    let mut total: u64 = 0;
     for a in &n.actions {
         let (client, seq) = correlation();
         let req = cdr::cancel_all_goals(client, seq);
@@ -312,7 +321,13 @@ fn nav2_pause(m: &MotionSection) -> Result<String, String> {
             return Err(format!("{a}: cancel_goal answered return_code {code}"));
         }
         notes.push(format!("{a}: {count} goal(s) cancelling (code {code})"));
+        total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     }
+    Ok((notes, total))
+}
+
+/// A burst of zero `Twist` on `cmd_vel`.
+fn nav2_zero_twists(n: &super::Nav2Adapter) -> Result<String, String> {
     let mut part =
         Participant::open(n.ros2.peer()?, n.ros2.prefix()?).map_err(|e| format!("socket: {e}"))?;
     let topic = format!("rt{}", n.cmd_vel_topic);
@@ -325,11 +340,76 @@ fn nav2_pause(m: &MotionSection) -> Result<String, String> {
         part.publish(tw, sn, &z).map_err(|e| format!("send: {e}"))?;
         std::thread::sleep(Duration::from_millis(n.zero_twist_interval_ms));
     }
-    notes.push(format!(
+    Ok(format!(
         "{} zero twist(s) on {}",
         n.zero_twists, n.cmd_vel_topic
-    ));
-    Ok(notes.join("; "))
+    ))
+}
+
+/// Re-assert a `safe_pause` in force (sales-readiness T42, see
+/// [`super::MotionPorts::latch`]). `nav2`: every goal is cancelled again;
+/// any goal that was cancelling was sent while paused (the first cancel
+/// left none in a cancelable state): overridden, and a zero-twist burst
+/// follows. `px4`: the heartbeat's mode is read back; any mode but hold is
+/// overridden and hold is set again, except a pilot's manual mode, which
+/// is reported but never taken away from the pilot. `ros2_control`: not
+/// observed (a controller switch is state the controller manager keeps).
+pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, String> {
+    use super::Latch;
+    if spec.action != ActionId::SafePause {
+        return Ok(Latch::Held(String::new()));
+    }
+    let mut held = Vec::new();
+    let mut overridden = Vec::new();
+    for k in &spec.adapters {
+        match k {
+            AdapterKind::Nav2 => {
+                let n = m.nav2.as_ref().ok_or_else(|| missing(*k))?;
+                let (notes, total) = nav2_cancel_all(n).map_err(|e| format!("nav2: {e}"))?;
+                if total == 0 {
+                    held.push("nav2: no goal".to_string());
+                } else {
+                    let tw = nav2_zero_twists(n).map_err(|e| format!("nav2: {e}"))?;
+                    overridden.push(format!(
+                        "nav2: {total} navigation goal(s) sent while paused were cancelled ({}); \
+                         {tw}",
+                        notes.join("; ")
+                    ));
+                }
+            }
+            AdapterKind::Px4 => {
+                let p = m.px4.as_ref().ok_or_else(|| missing(*k))?;
+                let mode = px4_read_mode(p).map_err(|e| format!("px4: {e}"))?;
+                let hold = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, mav::PX4_SUB_AUTO_LOITER);
+                if mode == hold {
+                    held.push("px4: in hold".to_string());
+                } else if mav::px4_is_manual(mode) {
+                    overridden.push(format!(
+                        "px4: a pilot switched to manual mode {} while paused: left to the pilot \
+                         (a manual mode is never taken away)",
+                        mav::px4_mode_name(mode)
+                    ));
+                } else {
+                    let again = px4_mode(m, spec).map_err(|e| {
+                        format!(
+                            "px4: mode {} while paused; setting hold again failed: {e}",
+                            mav::px4_mode_name(mode)
+                        )
+                    })?;
+                    overridden.push(format!(
+                        "px4: mode changed to {} while paused; hold set again: {again}",
+                        mav::px4_mode_name(mode)
+                    ));
+                }
+            }
+            other => held.push(format!("{}: not observed", other.as_str())),
+        }
+    }
+    if overridden.is_empty() {
+        Ok(Latch::Held(held.join("; ")))
+    } else {
+        Ok(Latch::Overridden(overridden.join("; ")))
+    }
 }
 
 fn switch(
@@ -511,6 +591,67 @@ fn px4_mode(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
                     }
                     acked = true;
                 }
+            }
+        }
+    }
+}
+
+/// The vehicle's `custom_mode` from its heartbeat (a GCS heartbeat is sent
+/// so the autopilot streams to this address; nothing is commanded).
+fn px4_read_mode(p: &super::Px4Adapter) -> Result<u32, String> {
+    let sock = UdpSocket::bind(p.bind).map_err(|e| format!("bind {}: {e}", p.bind))?;
+    let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
+    let gcs = Heartbeat {
+        custom_mode: 0,
+        mav_type: 6,  // MAV_TYPE_GCS
+        autopilot: 8, // MAV_AUTOPILOT_INVALID
+        base_mode: 0,
+        system_status: 4,
+    };
+    let mut seq: u8 = 0;
+    let mut buf = [0u8; 2048];
+    let mut next_send = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("no heartbeat from the autopilot before the deadline".into());
+        }
+        if now >= next_send {
+            seq = seq.wrapping_add(1);
+            let f = mav::encode(
+                seq,
+                p.system_id,
+                p.component_id,
+                mav::MSG_HEARTBEAT,
+                &gcs.payload(),
+            )
+            .ok_or("MAVLink encode")?;
+            sock.send_to(&f, p.address)
+                .map_err(|e| format!("send: {e}"))?;
+            next_send = now + Duration::from_millis(500);
+        }
+        let _ = sock.set_read_timeout(Some(
+            deadline
+                .min(next_send)
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        ));
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if from != std::net::SocketAddr::V4(p.address) {
+            continue;
+        }
+        let Ok(frames) = mav::decode_all(buf.get(..n).unwrap_or_default()) else {
+            continue;
+        };
+        for f in frames {
+            if f.sysid != p.target_system || f.compid != p.target_component {
+                continue;
+            }
+            if let Some(hb) = Heartbeat::parse(&f) {
+                return Ok(hb.custom_mode);
             }
         }
     }

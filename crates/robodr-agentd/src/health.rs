@@ -28,6 +28,7 @@
 //! | control-plane state damaged / edited / other key, or rolled back | [`rules::CONTROL_PLANE_STATE_UNTRUSTED`] | High / Critical | once per start (daemon) |
 //! | executor revert failed (rules may still be in force) | [`rules::EXECUTOR_REVERT_FAILED`] | High | once per request until it reverts (daemon) |
 //! | executor journal unreadable or unsealed, executor started empty | [`rules::EXECUTOR_JOURNAL_RESET`] | High | per executor event (daemon) |
+//! | robot set moving while a safe_pause is in force (latch re-applied it) | [`rules::EXECUTOR_PAUSE_OVERRIDDEN`] | High | per executor event (daemon) |
 //!
 //! The daemon hands these to `Agent::handle_external` as
 //! `Detector::SelfHealth`, which stamps them observe-only: a health problem
@@ -75,6 +76,10 @@ pub mod rules {
     /// and started empty (what was in force was lifted). High. Contract
     /// 2.4.
     pub const EXECUTOR_JOURNAL_RESET: &str = "robot.agent.executor_journal_reset";
+    /// robodr-executor's safe_pause latch found the robot set moving again
+    /// while paused (a navigation goal, a flight-mode change) and paused it
+    /// again (sales-readiness T42). High. Contract 2.4.
+    pub const EXECUTOR_PAUSE_OVERRIDDEN: &str = "robot.agent.executor_pause_overridden";
 }
 
 /// Thresholds (milliseconds).

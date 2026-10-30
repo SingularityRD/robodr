@@ -22,7 +22,7 @@
 //!   precheck of its stored order) and held until agentd supplies a fresh,
 //!   known safety state that is not engaged ([`Engine::rearm_held`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -313,6 +313,10 @@ pub struct Engine {
     soc_replay: crate::soc::ReplayStore,
     /// The platform adapters of motion actions (Sprint 8).
     motion: Box<dyn crate::motion::MotionPorts + Send>,
+    /// When the safe_pause latch last ran (monotonic ms; T42).
+    last_latch_boot_ms: u64,
+    /// The last latch error per pause (one event per change).
+    latch_errors: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -423,6 +427,8 @@ impl Engine {
             journal_errors: 0,
             soc_replay,
             motion: Box::new(crate::motion::SystemPorts),
+            last_latch_boot_ms: now.boot_ms.unwrap_or(now.wall_ms),
+            latch_errors: BTreeMap::new(),
         };
         if let Some(why) = e.soc_replay.fenced_because.clone() {
             e.state.event(
@@ -1834,6 +1840,7 @@ impl Engine {
             );
             self.revert(&id, "TTL expired: automatic revert", now);
         }
+        self.motion_latch(now);
         let every = self.cfg.config.verify_interval_s.saturating_mul(1000);
         let mono = now.boot_ms.unwrap_or(now_ms);
         if mono.abs_diff(self.last_verify_boot_ms) >= every {

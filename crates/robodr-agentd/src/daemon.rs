@@ -3088,6 +3088,7 @@ impl Daemon<'_> {
                     | robodr_executor::journal::EventKind::Drift
                     | robodr_executor::journal::EventKind::RemovedExternally
                     | robodr_executor::journal::EventKind::JournalReset
+                    | robodr_executor::journal::EventKind::Overridden
             );
             let now = self.clock.now();
             if self
@@ -3166,6 +3167,10 @@ impl Daemon<'_> {
                     ),
                 )
             }
+            EventKind::Overridden => match pause_overridden(ev) {
+                Some(d) => d,
+                None => return,
+            },
             EventKind::JournalReset => robodr_events::Deviation::new(
                 health_rules::EXECUTOR_JOURNAL_RESET,
                 robodr_events::Severity::High,
@@ -3179,6 +3184,57 @@ impl Daemon<'_> {
             _ => return,
         };
         self.self_health("agentd:executor", dev);
+    }
+}
+
+/// Sales-readiness T42: the executor's safe_pause latch found the robot set
+/// moving again while paused (a navigation goal, a flight-mode change) and
+/// paused it again: a High finding per event, naming the request and what
+/// was found.
+fn pause_overridden(ev: &robodr_executor::journal::Event) -> Option<robodr_events::Deviation> {
+    if ev.kind != robodr_executor::journal::EventKind::Overridden {
+        return None;
+    }
+    Some(robodr_events::Deviation::new(
+        health_rules::EXECUTOR_PAUSE_OVERRIDDEN,
+        robodr_events::Severity::High,
+        format!(
+            "robodr-executor found the robot set moving while safe_pause {} is in force and \
+             paused it again: {}",
+            sanitize(ev.id.as_deref().unwrap_or("-")),
+            sanitize(&ev.detail)
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod pause_overridden_tests {
+    use robodr_executor::journal::{Event, EventKind};
+
+    /// T42: an `overridden` executor event is a High finding; other kinds
+    /// are not this one.
+    #[test]
+    fn an_overridden_pause_is_a_high_finding() {
+        let ev: Event = serde_json::from_value(serde_json::json!({
+            "seq": 7, "at_ms": 1, "kind": "overridden", "id": "p-1",
+            "action": "safe_pause",
+            "detail": "HIGH: nav2: 1 navigation goal(s) sent while paused were cancelled"
+        }))
+        .unwrap();
+        let d = super::pause_overridden(&ev).unwrap();
+        assert_eq!(d.rule, "robot.agent.executor_pause_overridden");
+        assert_eq!(d.severity, robodr_events::Severity::High);
+        assert!(
+            d.detail.contains("p-1") && d.detail.contains("navigation goal"),
+            "{d:?}"
+        );
+        assert!(
+            robodr_ocsf::builder::rule_known(&d.rule),
+            "no catalog entry"
+        );
+        let mut other = ev.clone();
+        other.kind = EventKind::Drift;
+        assert!(super::pause_overridden(&other).is_none());
     }
 }
 

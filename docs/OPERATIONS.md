@@ -2089,7 +2089,12 @@ restart, an emergency disable, a failed apply or re-arm leave it paused
 too. It is lifted only by the SOC's signed revert with two approvers, and
 only when agentd's safety state at that moment is known, fresh, not
 engaged and one the adapter allows (otherwise the revert is refused and
-the pause stays). Lifting a pause **releases** it and never resumes a
+the pause stays). While paused, the executor re-asserts the pause every
+`motion.safe_pause_latch_s` (default 2 s): Nav2 goals sent meanwhile are
+cancelled and a PX4 mode change is set back to hold (a pilot's manual
+mode is left to the pilot); each is a High finding
+`robot.agent.executor_pause_overridden` (find out who moved the robot).
+Lifting a pause **releases** it and never resumes a
 mission (Nav2 goals are not restored, PX4 stays in hold);
 `request_safe_state` and `rollback_config` answer `applied` and are not
 reversible. A pause or safe state is refused while `moving_fast` unless
