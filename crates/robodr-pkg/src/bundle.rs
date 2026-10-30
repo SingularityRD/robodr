@@ -302,7 +302,7 @@ impl BundleManifest {
         self.files
             .binary_search_by(|f| f.path.as_str().cmp(path))
             .ok()
-            .map(|i| &self.files[i])
+            .and_then(|i| self.files.get(i))
     }
 
     /// Files of one RPK directory, by path relative to it.
