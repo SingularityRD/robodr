@@ -16,7 +16,8 @@
 //! gateway's service user, may connect; the daemon's own uid too). A line
 //! is parsed strictly ([`parse_gateway_line`]): unknown keys, another
 //! format, a rule outside `robot.gateway.*` / `robot.firewall.*` (the
-//! gateway cannot speak for any other detector), or oversized fields are
+//! gateway cannot speak for any other detector) or not in the findings
+//! catalog (`robodr_ocsf::builder::rule_known`), or oversized fields are
 //! malformed and dropped (counted by the input). The detail is kept as the
 //! gateway wrote it (sanitized when logged; tainted in the finding).
 
@@ -80,8 +81,11 @@ impl GatewayLine {
 }
 
 fn rule_ok(r: &str) -> bool {
-    (r.starts_with("robot.gateway.")
-        || r.starts_with("robot.firewall.")
+    // Only ids of the findings catalog: a line naming `robot.firewall.` or
+    // a made-up id in the two namespaces would otherwise become a finding
+    // with the generic catalog entry (red team 2026-10-30, G3).
+    ((r.starts_with("robot.gateway.") || r.starts_with("robot.firewall."))
+        && robodr_ocsf::builder::rule_known(r)
         // The gateway's WebRTC monitor: exactly its own ids.
         || robodr_ros2_pipeline::webrtc::rules::ALL
             .iter()
@@ -166,5 +170,45 @@ mod tests {
         ] {
             assert!(parse_gateway_line(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// Red team 2026-10-30 (gateway feed spoofing, G3): a line naming
+    /// `robot.firewall.` (nothing after the prefix) was accepted and became
+    /// a finding with that rule id and the generic catalog entry; so was any
+    /// made-up id inside the two namespaces. Only catalogued ids pass now.
+    #[test]
+    fn only_catalogued_gateway_and_firewall_ids_are_accepted() {
+        let line = |r: &str| {
+            format!(
+                r#"{{"format":"robodr-gateway-finding/v1","rule":"{r}","severity":"high","detail":"x","mode":"enforce","channel":"/x","count":1}}"#
+            )
+        };
+        // Joined at run time: the catalog drift test of robodr-ocsf scans
+        // the sources for rule id literals.
+        let id = |parts: &[&str]| parts.join(".");
+        for bad in [
+            id(&["robot", "firewall", ""]),
+            id(&["robot", "gateway", ""]),
+            id(&["robot", "firewall", "", "rejected_stale"]),
+            id(&["robot", "firewall", "made_up_rule"]),
+            id(&["robot", "gateway", "trajectory_rejected", "x"]),
+            id(&["robot", "gateway", "anything"]),
+        ] {
+            assert!(parse_gateway_line(&line(&bad)).is_err(), "{bad} accepted");
+        }
+        // Every id the gateway and its firewall emit stays accepted (a
+        // drift guard: an id added there must be catalogued too).
+        for (id, _) in robodr_firewall_gw::findings::rules::ALL {
+            assert!(parse_gateway_line(&line(id)).is_ok(), "{id}");
+        }
+        let src = include_str!("../../robodr-firewall/src/events.rs");
+        let mut n = 0;
+        for part in src.split('"').skip(1).step_by(2) {
+            if part.starts_with("robot.firewall.") && part.len() > "robot.firewall.".len() {
+                assert!(parse_gateway_line(&line(part)).is_ok(), "{part}");
+                n += 1;
+            }
+        }
+        assert!(n >= 25, "firewall rule ids found in events.rs: {n}");
     }
 }

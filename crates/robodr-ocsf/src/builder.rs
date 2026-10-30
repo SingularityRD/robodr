@@ -210,6 +210,19 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         .unwrap_or(GENERIC)
 }
 
+/// Whether `rule` has an entry in the current contract's catalog (not the
+/// generic fallback of [`rule_info`]). For rule ids that arrive from
+/// outside the detection core (agentd's gateway feed), where an unknown id
+/// must be refused rather than reported with the generic entry.
+pub fn rule_known(rule: &str) -> bool {
+    catalog_1_0(rule)
+        .or_else(|| catalog_1_3(rule))
+        .or_else(|| catalog_2_1(rule))
+        .or_else(|| catalog_2_2(rule))
+        .or_else(|| catalog_2_3(rule))
+        .is_some()
+}
+
 /// The catalog as a validator for a message of `contract_version` must
 /// apply it: entries added in a later contract minor than the message's are
 /// not used (its producer built such a finding with the generic entry, and
