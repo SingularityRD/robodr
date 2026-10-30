@@ -80,11 +80,15 @@ under the new key after a `KeyRotation` record signed by the old one. The
 daemon then runs with the new key in `blackbox.key_file` and the retired
 key's **public** file in `blackbox.previous_keys`; those keys authenticate
 the records signed before the rotation at every open and reopen of the
-black box, the TPM anchor sidecar written before it, and the
-accepted-profile records the profile anti-rollback reads. Each previous key
-must have another id than the current key, a `device_id` binding must name
-`robot.id`, an Ed25519 secret is refused (the `.pub` suffices) and an HMAC
-key needs `allow_hmac`. Without the key that signed a retained record the
+black box and the accepted-profile records the profile anti-rollback
+reads, **only up to the `KeyRotation` that retired them** (a leaked
+retired key cannot add records, marks or profile notes after it). The
+export cursor and the TPM anchor sidecar must be signed by the current key
+(`rotate --tpm-sidecar` re-signs the sidecar). Each previous key must have
+another id than the current key, a `device_id` binding must name
+`robot.id`, an Ed25519 secret is refused (the `.pub` suffices), an HMAC
+key needs `allow_hmac`, and the file must be owned by root (or the
+daemon's user) and not group/world-writable. Without the key that signed a retained record the
 daemon refuses to start (fail closed) and names `blackbox.previous_keys`;
 once the old segments have rotated out, the entry can be removed.
 

@@ -11,7 +11,8 @@
 //!                            [--signing-key ID] [--allow-hmac] [--allow-mixed-algorithms]
 //!                            [--strict] [--json]
 //! robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
-//!                            [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+//!                            [--previous-keys FILE]... [--tpm-sidecar FILE]
+//!                            [--boot-id ID] [--reason TEXT]
 //!                            [--allow-hmac]
 //! robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 //! robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
@@ -70,6 +71,13 @@
 //!   `blackbox.previous_keys` += the old `.pub`); verifiers need both
 //!   public keys (`verify --keyring old.pub --keyring new.pub`). Re-running
 //!   it after a successful rotation reports "already rotated" (exit 0).
+//!   `--previous-keys` files get robodr-agentd's `blackbox.previous_keys`
+//!   checks (public files only, bound to `--device` if bound, owned by
+//!   root or this user and not group/world-writable). The old key's
+//!   export cursor, checkpoint and head mark are re-signed under the new
+//!   key (a retired key vouches only for positions up to its rotation);
+//!   `--tpm-sidecar FILE` (the TPM anchor's `sidecar`) re-signs the TPM
+//!   anchor sidecar too, which is otherwise refused until the next mark.
 //!   `--boot-id` defaults to this boot's id; `--reason` is recorded.
 //! - `inspect` lists frames (seq, kind, flags, time, payload) without
 //!   checking any signature: it is a viewer, not a verdict.
@@ -123,7 +131,8 @@ const USAGE: &str = "usage:
                              [--signing-key ID] [--allow-hmac] [--allow-mixed-algorithms]
                              [--strict] [--json]
   robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
-                             [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+                             [--previous-keys FILE]... [--tpm-sidecar FILE]
+                             [--boot-id ID] [--reason TEXT]
                              [--allow-hmac]
   robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
   robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
@@ -487,6 +496,7 @@ fn rotate(raw: &[String]) -> Result<(), Fail> {
             "previous-keys",
             "boot-id",
             "reason",
+            "tpm-sidecar",
         ],
         &["allow-hmac"],
     )?;
@@ -532,23 +542,37 @@ fn rotate(raw: &[String]) -> Result<(), Fail> {
     if prev_files.len() > MAX_PREVIOUS_KEY_FILES {
         return Err(format!("at most {MAX_PREVIOUS_KEY_FILES} --previous-keys files").into());
     }
-    let mut prev = Vec::new();
-    for f in prev_files {
-        let keys =
-            robodr_blackbox::keys::load_key_files(Path::new(f)).map_err(|e| format!("{f}: {e}"))?;
-        for k in &keys {
-            hmac_gate(k, f, allow_hmac)?;
-        }
-        prev.extend(keys);
+    // The checks robodr-agentd applies to blackbox.previous_keys: public
+    // files only (no ed25519 secret), bound to this device if bound at all,
+    // trust-anchor owner/mode, HMAC only with --allow-hmac, neither the
+    // current nor the new key.
+    let prev_paths: Vec<&Path> = prev_files.iter().map(Path::new).collect();
+    let mut warnings = Vec::new();
+    let prev = robodr_blackbox::keys::load_previous_keys(
+        "--previous-keys",
+        &prev_paths,
+        &device,
+        &[
+            (
+                old.key_id.as_str(),
+                "the --old-key (the key the log is signed with now)",
+            ),
+            (
+                new.key_id.as_str(),
+                "the new key id: a retired key id is never reused",
+            ),
+        ],
+        allow_hmac,
+        &mut warnings,
+    )?;
+    for w in warnings {
+        eprintln!("robodr-blackbox: warning: {w}");
     }
-    let prev = robodr_blackbox::PreviousKeys::from_key_files(&prev, allow_hmac)
-        .map_err(|e| format!("--previous-keys: {e}"))?;
-    if prev.key_ids().contains(&new.key_id.as_str()) {
-        return Err(format!(
-            "--previous-keys holds the new key id {:?}: a retired key id is never reused",
-            new.key_id
-        )
-        .into());
+    let tpm_sidecar = a.one("tpm-sidecar")?.map(PathBuf::from);
+    if let Some(p) = &tpm_sidecar {
+        if !p.is_absolute() {
+            return Err(format!("--tpm-sidecar {}: must be an absolute path", p.display()).into());
+        }
     }
     let boot_id = match a.one("boot-id")? {
         Some(b) => b.to_string(),
@@ -576,8 +600,10 @@ fn rotate(raw: &[String]) -> Result<(), Fail> {
         Err(robodr_blackbox::Error::KeyMismatch { log_key_id, .. })
             if log_key_id == format!("{}/{}", new.algorithm, new.key_id) =>
         {
+            // A re-run after a crash between the rotation and the sidecar.
+            resign_tpm_sidecar(tpm_sidecar.as_deref(), &old, &new, &old_p, &new_p)?;
             eprintln!(
-                "robodr-blackbox: {}: already rotated to {} (nothing written)",
+                "robodr-blackbox: {}: already rotated to {} (nothing written to the log)",
                 dir.display(),
                 new.key_id
             );
@@ -605,6 +631,7 @@ fn rotate(raw: &[String]) -> Result<(), Fail> {
         .map_err(|e| format!("{}: rotation failed: {e}", dir.display()))?;
     r.close()
         .map_err(|e| format!("{}: closing after the rotation: {e}", dir.display()))?;
+    resign_tpm_sidecar(tpm_sidecar.as_deref(), &old, &new, &old_p, &new_p)?;
     eprintln!(
         "robodr-blackbox: {}: rotated {} -> {} (seal seq {}); the writer now needs the new key \
          and {}'s public key as a previous key (robodr-agentd: blackbox.previous_keys); \
@@ -616,6 +643,35 @@ fn rotate(raw: &[String]) -> Result<(), Fail> {
         old.key_id
     );
     println!("{}", new.key_id);
+    Ok(())
+}
+
+/// `rotate --tpm-sidecar`: re-sign the TPM anchor's sidecar under the new
+/// key (a sidecar under a retired key is never trusted).
+fn resign_tpm_sidecar(
+    path: Option<&Path>,
+    old: &KeyFile,
+    new: &KeyFile,
+    old_p: &str,
+    new_p: &str,
+) -> Result<(), Fail> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let o = old.signer().map_err(|e| format!("{old_p}: {e}"))?;
+    let n = new.signer().map_err(|e| format!("{new_p}: {e}"))?;
+    match robodr_blackbox::tpm_anchor::resign_sidecar(path, &*o, &*n) {
+        Ok(true) => eprintln!(
+            "robodr-blackbox: {}: TPM anchor sidecar signed by {}",
+            path.display(),
+            new.key_id
+        ),
+        Ok(false) => eprintln!(
+            "robodr-blackbox: {}: no TPM anchor sidecar (nothing to re-sign)",
+            path.display()
+        ),
+        Err(e) => return Err(format!("--tpm-sidecar {}: {e}", path.display()).into()),
+    }
     Ok(())
 }
 

@@ -509,6 +509,11 @@ pub struct SegmentStartPayload {
     /// rotation record was dropped. Omitted when equal to the chain key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<KeyRef>,
+    /// [`key_fingerprint`](crate::sign::key_fingerprint) of `signing_key`'s
+    /// public key (payload v2; absent in older logs and for keys without a
+    /// public half). A verifier that knows the key checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_fingerprint: Option<String>,
 }
 
 /// A signing key by id and algorithm.
@@ -662,12 +667,21 @@ pub struct TruncationPayload {
     pub severity: Severity,
 }
 
-/// Payload of [`RecordKind::KeyRotation`] (signed by the old key).
+/// Payload of [`RecordKind::KeyRotation`] (signed by the old key, which
+/// must be `from`).
+///
+/// Version 1 named the new key by id and algorithm only; version 2 adds
+/// `to_fingerprint`, the SHA-256 of the new key's public key
+/// ([`crate::sign::key_fingerprint`]), so the rotation commits to one key,
+/// not to whatever key later carries that id. Absent: a v1 record (still
+/// accepted) or a target without a public half (HMAC).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRotationPayload {
     pub from: KeyRef,
     pub to: KeyRef,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_fingerprint: Option<String>,
 }
 
 /// Why a segment was deleted.

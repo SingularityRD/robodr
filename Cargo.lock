@@ -2534,6 +2534,7 @@ dependencies = [
  "robodr-responder",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -2559,6 +2560,7 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

@@ -272,6 +272,18 @@ signs with the new key and authenticates the older records with the
 retired key's **public** file listed in `blackbox.previous_keys`. This is
 also how an HMAC unit moves to Ed25519.
 
+A retired key vouches **only for what it signed up to its rotation**:
+records after the `KeyRotation` must be signed by the key the chain names
+for them (the rotation must be signed by its `from` key, and since v2 it
+names the new key's public-key fingerprint); `head.json`,
+`checkpoint.json` and a recovery pin signed by a retired key count only for
+positions at or before that rotation; the export cursor and the TPM anchor
+sidecar must be signed by the current key (`rotate` re-signs the cursor,
+checkpoint and head mark, and with `--tpm-sidecar` the sidecar); a
+segment may never switch back to an earlier key (`KeySwitchRefused`). So
+whoever holds a leaked retired key cannot add or hide records after the
+rotation.
+
 1. Export all pending evidence (section 8) and confirm on the far side that
    the last bundle verified.
 2. Generate the new key (4.2) with a **new key id**, next to the old one:
@@ -290,14 +302,17 @@ also how an HMAC unit moves to Ed25519.
        --device <robot.id> \
        --old-key /etc/robodr/keys/agentd-blackbox.key \
        --new-key /etc/robodr/keys/agentd-blackbox-$new.key \
-       --reason "scheduled rotation"
+       --reason "scheduled rotation" \
+       --tpm-sidecar /var/lib/robodr/anchor/blackbox-tpm-sidecar.json  # TPM head anchor only
    # add --previous-keys <each earlier retired .pub> if the log still holds
    # records of keys retired before; add --allow-hmac when the old key is HMAC
    ```
 
    It refuses a log that is open (agentd still running), the wrong old key,
    an HMAC new key, a reused key id, and a log holding records no given key
-   authenticates. Re-running it after success prints "already rotated".
+   authenticates. `--previous-keys` gets the same checks as agentd's
+   `blackbox.previous_keys` (below). Re-running it after success prints
+   "already rotated" (and re-signs a `--tpm-sidecar` it did not get to).
 4. Retire the old key and install the new one:
 
    ```sh
@@ -333,13 +348,19 @@ also how an HMAC unit moves to Ed25519.
    box.
    `robodr-agentd --check-config` validates the list: absolute paths, at most
    16, public files (an Ed25519 secret is refused), ids distinct and not the
-   current key's, a device binding must name `robot.id`.
+   current key's, a device binding must name `robot.id`, and each file owned
+   by root (or agentd's user) and not group/world-writable (`chmod 0644`
+   as above; the same rule applies to every `--keyring` / keyring file a
+   verifier loads: whoever can write it decides what verifies).
 5. Copy the new `.pub` to the verifiers (fleet console, SOC evidence store)
    on vetted media; verifiers keep the old `.pub` too. With a **remote head
    anchor** (`head_anchor.kind remote`), replace the unit's public key on
    the anchor receiver before the next step (its marks are signed with the
-   current key); a TPM anchor's sidecar written under the old key is
-   accepted through `previous_keys` and rewritten at the next mark.
+   current key). A TPM anchor's sidecar is re-signed by `rotate
+   --tpm-sidecar` (step 3); one still signed by the old key is **refused**
+   (it names no position the rotation could bound): the first start then
+   logs the anchor as unreadable ("signed by a retired key") and the next
+   mark rewrites it under the new key.
 6. `sudo systemctl start robodr-agentd` and check the journal: no black-box
    error, and `robodr-blackbox verify /var/lib/robodr/blackbox/agentd
    --keyring <old>.key.pub --keyring /etc/robodr/keys/agentd-blackbox.key.pub`

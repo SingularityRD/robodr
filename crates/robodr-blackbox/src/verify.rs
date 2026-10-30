@@ -338,6 +338,14 @@ pub enum FindingKind {
         seq: u64,
         key_id: String,
     },
+    /// The evidence (a v2 `KeyRotation` or `SegmentStart`) names the
+    /// public-key fingerprint of the signing key, and the verifier's key of
+    /// that id has another one: a different key under the same id (a
+    /// swapped public key file, or a key forged under the rotated-to id).
+    KeyFingerprintMismatch {
+        seq: u64,
+        key_id: String,
+    },
     Empty,
 }
 
@@ -552,6 +560,11 @@ impl fmt::Display for FindingKind {
                 "records from {seq} are signed by {key_id}, named only by a segment start \
                  (no rotation record retained, key not bound to the device)"
             ),
+            KeyFingerprintMismatch { seq, key_id } => write!(
+                f,
+                "record {seq}: the verifier's key {key_id} is not the key the chain names \
+                 (public-key fingerprint differs)"
+            ),
             Empty => write!(f, "no records"),
         }
     }
@@ -720,7 +733,12 @@ enum Trust {
 
 struct KeyState {
     key: Option<KeyRef>,
+    /// Public-key fingerprint the evidence names for `key` (v2 records).
+    fp: Option<String>,
     trust: Trust,
+    /// Keys this chain was signed with before `key`, in evidence order: a
+    /// `SegmentStart` may never switch back to one of them.
+    earlier: Vec<KeyRef>,
 }
 
 fn key_of(id: &ChainIdentity) -> KeyRef {
@@ -852,11 +870,20 @@ pub fn verify_segments(
             .or_insert_with(|| match &opts.signing_key {
                 Some(k) if opts.expected_chain_id.is_none_or(|c| c == chain) => KeyState {
                     key: Some(k.clone()),
+                    fp: None,
                     trust: Trust::Proven,
+                    // The chain's first key is older than any later one.
+                    earlier: chain_identity
+                        .map(key_of)
+                        .filter(|c| c != k)
+                        .into_iter()
+                        .collect(),
                 },
                 _ => KeyState {
                     key: chain_identity.map(key_of),
+                    fp: None,
                     trust: Trust::Initial,
+                    earlier: Vec::new(),
                 },
             });
         if recorded_key_id.is_none() {
@@ -865,15 +892,26 @@ pub fn verify_segments(
         // A Genesis / SegmentStart names the key of what follows.
         if let Some(id) = identity_of(r).filter(|i| i.chain_id() == chain) {
             let chain_key = key_of(&id);
-            let named = match r.kind {
-                RecordKind::SegmentStart => r
-                    .payload_json::<SegmentStartPayload>()
-                    .and_then(|p| p.signing_key)
-                    .unwrap_or_else(|| chain_key.clone()),
-                _ => chain_key.clone(),
+            let (named, named_fp) = match r.kind {
+                RecordKind::SegmentStart => match r.payload_json::<SegmentStartPayload>() {
+                    Some(SegmentStartPayload {
+                        signing_key: Some(k),
+                        signing_key_fingerprint,
+                        ..
+                    }) => (k, signing_key_fingerprint),
+                    _ => (chain_key.clone(), None),
+                },
+                _ => (chain_key.clone(), None),
             };
+            // Switching back to a key this chain already left (or to the
+            // chain's first key once another one signs) is never a
+            // rotation: whoever holds a retired key could otherwise make
+            // it current again once the rotation record is pruned.
+            let backwards = st.key.as_ref().is_some_and(|cur| {
+                *cur != named && (st.earlier.contains(&named) || named == chain_key)
+            });
             if st.key.as_ref() != Some(&named) {
-                if st.trust == Trust::Proven && st.key.is_some() {
+                if (st.trust == Trust::Proven && st.key.is_some()) || backwards {
                     key_findings.push((
                         pos,
                         chain,
@@ -893,8 +931,14 @@ pub fn verify_segments(
                     } else {
                         Trust::Unproven
                     };
+                    if let Some(old) = st.key.take() {
+                        st.earlier.push(old);
+                    }
                     st.key = Some(named);
+                    st.fp = named_fp;
                 }
+            } else if named_fp.is_some() {
+                st.fp = named_fp;
             }
             if r.kind == RecordKind::Genesis && st.key.as_ref() == Some(&chain_key) {
                 st.trust = Trust::Proven;
@@ -905,6 +949,24 @@ pub fn verify_segments(
             Some(k) => verifier.verify_key(&k.key_id, &k.algorithm, &msg, &r.sig),
             None => verifier.verify(&msg, &r.sig),
         };
+        if let (true, Some(k), Some(fp)) = (ok, &st.key, &st.fp) {
+            if verifier
+                .key_fingerprint(&k.key_id)
+                .is_some_and(|have| have != *fp)
+            {
+                ok = false;
+                if reported_keys.insert((chain, k.key_id.clone(), 2)) {
+                    key_findings.push((
+                        pos,
+                        chain,
+                        FindingKind::KeyFingerprintMismatch {
+                            seq: r.seq,
+                            key_id: k.key_id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
         if let (true, Some(k)) = (ok, &st.key) {
             let chain_device = chain_identity.map(|i| i.device_id.as_str());
             match (verifier.key_device(&k.key_id), chain_device) {
@@ -946,7 +1008,9 @@ pub fn verify_segments(
         if ok && r.kind == RecordKind::KeyRotation {
             if let Some(p) = r.payload_json::<KeyRotationPayload>() {
                 if st.key.as_ref() == Some(&p.from) {
+                    st.earlier.push(p.from);
                     st.key = Some(p.to);
+                    st.fp = p.to_fingerprint;
                     if st.trust == Trust::Initial {
                         st.trust = Trust::Proven;
                     }

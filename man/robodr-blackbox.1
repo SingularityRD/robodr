@@ -45,6 +45,8 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .I ID
 .RB [ \-\-previous\-keys
 .IR FILE ]...
+.RB [ \-\-tpm\-sidecar
+.IR FILE ]
 .RB [ \-\-boot\-id
 .IR ID ]
 .RB [ \-\-reason
@@ -168,6 +170,17 @@ HMAC) needs
 Re\-running after a successful rotation reports
 .I already rotated
 and exits 0.
+.B \-\-previous\-keys
+files get the checks of robodr\-agentd's
+.IR blackbox.previous_keys :
+public files only, bound to
+.B \-\-device
+if bound, owned by root or this user and not group/world\-writable.
+The export cursor, checkpoint and head mark are re\-signed under the new key
+(a retired key vouches only for positions up to its rotation);
+.B \-\-tpm\-sidecar
+re\-signs the TPM head anchor's sidecar too (a sidecar under a retired key
+is refused).
 .B \-\-reason
 is recorded;
 .B \-\-boot\-id

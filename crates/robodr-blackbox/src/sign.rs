@@ -34,6 +34,14 @@ pub const MAX_KEY_ID_LEN: usize = 128;
 
 const KEY_ID_DOMAIN: &[u8] = b"robodr-blackbox/key-id/v1\0";
 
+/// Fingerprint of a public key: lowercase hex SHA-256 of its encoding (for
+/// Ed25519, the 32-byte `A`). A `KeyRotation` (v2) and a `SegmentStart`
+/// name the new key by id **and** fingerprint, so the evidence commits to
+/// one key rather than to whatever key carries that id.
+pub fn key_fingerprint(public: &[u8]) -> String {
+    to_hex(&sha256(public))
+}
+
 /// A signing backend failed (e.g. TPM unavailable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignError(pub String);
@@ -69,6 +77,11 @@ pub trait Signer: Send {
     /// own state files before it chains onto them.
     fn verify_own(&self, message: &[u8], signature: &[u8]) -> Option<bool> {
         let _ = (message, signature);
+        None
+    }
+    /// [`key_fingerprint`] of this key's public half, if it has one the
+    /// backend can name (`None`: symmetric, or unknown).
+    fn public_fingerprint(&self) -> Option<String> {
         None
     }
 }
@@ -110,6 +123,14 @@ pub trait Verifier {
     /// default is [`Verifier::verify`].
     fn verify_any(&self, message: &[u8], signature: &[u8]) -> bool {
         self.verify(message, signature)
+    }
+    /// [`key_fingerprint`] of the public key this verifier holds for
+    /// `key_id`, if it has one (`None`: unknown id, symmetric key, or a
+    /// backend that cannot name it; evidence that names a fingerprint is
+    /// then checked by signature only).
+    fn key_fingerprint(&self, key_id: &str) -> Option<String> {
+        let _ = key_id;
+        None
     }
 }
 

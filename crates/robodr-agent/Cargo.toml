@@ -14,6 +14,7 @@ description = "RoboDR decision chain (offline): event -> deviation -> response p
 robodr-events = { workspace = true }
 robodr-responder = { workspace = true }
 robodr-blackbox = { workspace = true }
+zeroize = { workspace = true }
 robodr-ocsf = { workspace = true }
 robodr-motion = { workspace = true }
 robodr-firewall = { workspace = true }

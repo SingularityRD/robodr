@@ -35,7 +35,13 @@
 //! A record counts only if its hash matches its fields and its signature
 //! verifies under the daemon's current key (`Signer::verify_own`) or one
 //! of its configured retired keys (`blackbox.previous_keys`, after an
-//! in-place key rotation): a forger without a key cannot plant one. Records
+//! in-place key rotation): a forger without a key cannot plant one. A
+//! retired key counts only for records at or before the `KeyRotation`
+//! that retired it (a rotation record signed by that key, naming it as
+//! `from`; the earliest one found): a retired key is usually retired
+//! because it leaked, and its holder must not be able to plant a record
+//! (e.g. an operator rollback) after the rotation. A retired key whose
+//! rotation record is not retained vouches for nothing. Records
 //! signed by a key the daemon does not know are skipped and counted; so
 //! are frames that do not parse. Chain linkage is checked where it is available
 //! (consecutive hash-valid records in file order: sequence numbers must
@@ -62,7 +68,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use robodr_blackbox::record::{scan_frames, signing_message, Hash, ScanItem};
+use robodr_blackbox::record::{scan_frames, signing_message, Hash, KeyRotationPayload, ScanItem};
 use robodr_blackbox::store::list_segments;
 use robodr_blackbox::{PreviousKeys, RecordKind, Signer, Verifier};
 use robodr_commission::trust::{accepted_from_note, AcceptedState, RollbackDecision};
@@ -134,6 +140,26 @@ pub fn latest_accepted(
         Err(e) => return Err(format!("{}: {e}", dir.display())),
     };
     let mut seen: Vec<Seen> = Vec::new();
+    // Notes verified only by a retired key: (note, key id).
+    let mut retired_seen: Vec<(Seen, String)> = Vec::new();
+    // Earliest authenticated rotation away from each retired key.
+    let mut retired_at: Vec<(String, u64)> = Vec::new();
+    let retired_entries: Vec<(String, String)> = previous
+        .map(|p| {
+            p.entries()
+                .into_iter()
+                .map(|(id, alg, _)| (id.to_string(), alg.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The retired key (of `previous`) that signed `msg`, if any.
+    let retired_signer = |msg: &[u8], sig: &[u8]| -> Option<String> {
+        let p = previous?;
+        retired_entries
+            .iter()
+            .find(|(id, alg)| p.verify_key(id, alg, msg, sig))
+            .map(|(id, _)| id.clone())
+    };
     let mut prev: Option<(u64, Hash)> = None;
     for (_, path) in &segments {
         let bytes = match read_capped(path) {
@@ -157,6 +183,18 @@ pub fn latest_accepted(
                 }
                 prev = Some((rec.seq, rec.hash));
             }
+            if hash_ok && rec.kind == RecordKind::KeyRotation {
+                if let Some(p) = rec.payload_json::<KeyRotationPayload>() {
+                    let msg = signing_message(&rec.hash);
+                    if retired_signer(&msg, &rec.sig).as_deref() == Some(p.from.key_id.as_str()) {
+                        match retired_at.iter_mut().find(|(k, _)| *k == p.from.key_id) {
+                            Some((_, s0)) => *s0 = (*s0).min(rec.seq),
+                            None => retired_at.push((p.from.key_id, rec.seq)),
+                        }
+                    }
+                }
+                continue;
+            }
             if rec.kind != RecordKind::Note {
                 continue;
             }
@@ -164,20 +202,30 @@ pub fn latest_accepted(
                 continue;
             };
             let msg = signing_message(&rec.hash);
-            let authentic = hash_ok
-                && (signer.verify_own(&msg, &rec.sig) == Some(true)
-                    || previous.is_some_and(|p| p.verify_any(&msg, &rec.sig)));
-            if !authentic {
-                scan.unverified += 1;
-                continue;
-            }
-            seen.push(Seen {
+            let s = Seen {
                 seq: rec.seq,
                 hash: rec.hash,
                 state,
                 operator_rollback: decision_of(&rec.payload)
                     .is_some_and(|d| d == format!("{:?}", RollbackDecision::OperatorRollback)),
-            });
+            };
+            if !hash_ok {
+                scan.unverified += 1;
+            } else if signer.verify_own(&msg, &rec.sig) == Some(true) {
+                seen.push(s);
+            } else if let Some(k) = retired_signer(&msg, &rec.sig) {
+                retired_seen.push((s, k));
+            } else {
+                scan.unverified += 1;
+            }
+        }
+    }
+    // A retired key vouches only up to the rotation that retired it.
+    for (s, k) in retired_seen {
+        if retired_at.iter().any(|(id, at)| *id == k && s.seq <= *at) {
+            seen.push(s);
+        } else {
+            scan.unverified += 1;
         }
     }
     // Authenticated order; the same record twice (a replayed copy) counts
@@ -362,16 +410,18 @@ mod tests {
         let s = latest_accepted(&d, &other, None).unwrap();
         assert_eq!(s.latest, None);
         assert_eq!(s.unverified, 4);
-        // After a rotation to `other`, the retired key (public half only)
-        // in `blackbox.previous_keys` keeps the old records as witnesses.
+        // A key in `blackbox.previous_keys` counts only up to the rotation
+        // record that retired it; this log holds none, so it vouches for
+        // nothing (see `retired_key_note_after_the_rotation_is_not_trusted`
+        // for a real rotation).
         let old_pub = robodr_blackbox::KeyFile::ed25519_from_seed(&[5; 32], Some("bb"))
             .unwrap()
             .to_public()
             .unwrap();
         let prev = PreviousKeys::from_key_files(&[old_pub], false).unwrap();
         let s = latest_accepted(&d, &other, Some(&prev)).unwrap();
-        assert_eq!(s.latest, Some(st(2)));
-        assert_eq!(s.unverified, 0);
+        assert_eq!(s.latest, None);
+        assert_eq!(s.unverified, 4);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -501,5 +551,58 @@ mod tests {
         assert!(s.linkage_breaks > 0);
         let _ = std::fs::remove_dir_all(&live);
         let _ = std::fs::remove_dir_all(&old);
+    }
+
+    /// Key rotation: the retired key's holder (it was rotated away from
+    /// because it leaked) appends an "operator rollback" note after the
+    /// rotation. It must not lower the baseline: a retired key vouches only
+    /// for records up to the rotation that retired it.
+    #[test]
+    fn retired_key_note_after_the_rotation_is_not_trusted() {
+        let d = tmpdir("retired-after-rotation");
+        let new_key = || Ed25519SigningKey::from_seed("bb-2", &[6; 32]).unwrap();
+        let mut r = Recorder::open(
+            RecorderConfig::new(&d, "ugv-007", "boot"),
+            Box::new(key()),
+            Box::new(SteppingClock::new(1, 1_000, TimeSource::Rtc)),
+        )
+        .unwrap();
+        r.append_note(&note(5, RollbackDecision::Upgrade), false)
+            .unwrap();
+        r.rotate_key(Box::new(new_key()), None, "leaked").unwrap();
+        r.append_note(&hb(5), false).unwrap();
+        r.close().unwrap();
+        let old = robodr_blackbox::KeyFile::ed25519_from_seed(&[5; 32], Some("bb")).unwrap();
+        let prev = PreviousKeys::from_key_files(&[old], false).unwrap();
+        let s = latest_accepted(&d, &new_key(), Some(&prev)).unwrap();
+        assert_eq!(s.latest, Some(st(5)));
+        assert_eq!(s.unverified, 0);
+
+        // Forge: a k1-signed rollback to version 1, chained after the head.
+        let (_, seg) = list_segments(&d).unwrap().pop().unwrap();
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let last = scan_frames(&bytes)
+            .items
+            .into_iter()
+            .filter_map(|it| match it {
+                ScanItem::Record(sr) => Some(sr.record),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        let mut f = last.clone();
+        f.seq = last.seq + 1;
+        f.kind = RecordKind::Note;
+        f.payload = serde_json::to_vec(&note(1, RollbackDecision::OperatorRollback)).unwrap();
+        f.prev_hash = last.hash;
+        f.hash = f.compute_hash();
+        f.sig = key().sign(&signing_message(&f.hash)).unwrap();
+        bytes.extend_from_slice(&f.encode_frame());
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let s = latest_accepted(&d, &new_key(), Some(&prev)).unwrap();
+        assert_eq!(s.latest, Some(st(5)), "a retired key lowered the baseline");
+        assert_eq!(s.unverified, 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
