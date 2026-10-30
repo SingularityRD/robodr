@@ -393,7 +393,7 @@ pub fn open(
         wrong_key: loaded.wrong_key,
         upgraded_from_v1: loaded.upgraded_from_v1,
         legacy_refused: loaded.legacy_refused,
-        anchor: loaded.anchor,
+        anchor: sealing.qualify(loaded.anchor),
         ..Restored::default()
     };
     let mut store: HashMap<String, Stored> = HashMap::new();
@@ -523,6 +523,17 @@ pub struct Rebuilt {
     /// Request ids whose note did not convert back (their resubmission is
     /// refused: their state is unknown).
     pub unreadable: Vec<String>,
+    /// Journal entries dropped because no authentic black-box note backs
+    /// them (review of gap 1, finding 4: a forged or planted entry); their
+    /// ids are refused like unreadable ones.
+    pub dropped: Vec<String>,
+}
+
+/// The request digest a request note records, and the note's reference.
+fn note_digest(n: &super::evidence::RequestNote) -> Option<String> {
+    let request: ActionRequest =
+        serde_json::from_value(n.note.get("request").cloned().unwrap_or_default()).ok()?;
+    Some(request.digest())
 }
 
 /// A request note back to a [`Stored`] (its decision-time state; the
@@ -554,8 +565,41 @@ fn stored_from_note(n: &super::evidence::RequestNote) -> Option<Stored> {
 /// signed `robodr.control_plane_request` note exists but that the journal
 /// lost, and every revert record its `robodr.control_plane_revert` note
 /// proves. `notes` oldest first; the newest `max` requests are kept.
+///
+/// Review of gap 1, finding 4: the journal's own entries are checked too.
+/// When it may hold entries nobody decided (an unsealed v1 journal that was
+/// adopted, a rolled-back copy, lines failing their seal), an entry is kept
+/// only when an authentic request note with the same request (digest) and
+/// the same evidence reference backs it; the others are dropped and their
+/// ids refused ([`Rebuilt::dropped`]). An adopted v1 journal is not trusted
+/// for anything beyond that: its entries take the state their note records
+/// (the executor's later word comes from the executor's resync) and a revert
+/// counts only with its revert note.
 pub fn rebuild(r: &mut Restored, notes: &[super::evidence::RequestNote], max: usize) -> Rebuilt {
     let mut out = Rebuilt::default();
+    let check =
+        r.upgraded_from_v1 || r.forged > 0 || matches!(r.anchor, AnchorCheck::RolledBack(_));
+    if check {
+        let notes_only = r.upgraded_from_v1;
+        let mut kept = Vec::new();
+        for s in std::mem::take(&mut r.stored) {
+            let backing = notes.iter().find(|n| {
+                n.note.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("robodr.control_plane_request")
+                    && n.evidence == s.evidence
+                    && note_digest(n).as_deref() == Some(s.digest.as_str())
+            });
+            match backing {
+                None => out.dropped.push(s.request.request_id.clone()),
+                Some(n) if notes_only => match stored_from_note(n) {
+                    Some(fresh) => kept.push(fresh),
+                    None => out.dropped.push(s.request.request_id.clone()),
+                },
+                Some(_) => kept.push(s),
+            }
+        }
+        r.stored = kept;
+    }
     let journalled: std::collections::HashSet<String> = r
         .stored
         .iter()
@@ -621,6 +665,10 @@ pub fn rebuild(r: &mut Restored, notes: &[super::evidence::RequestNote], max: us
             _ => {}
         }
     }
+    // A dropped entry whose request the black box does record was restored
+    // from its note above: only ids without any note stay refused.
+    out.dropped
+        .retain(|id| !r.stored.iter().any(|s| s.request.request_id == *id));
     r.stored.sort_by_key(|s| s.received_ms);
     if r.stored.len() > max {
         let cut = r.stored.len() - max;
@@ -744,6 +792,87 @@ impl RequestJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req(id: &str) -> ActionRequest {
+        serde_json::from_value(serde_json::json!({
+            "request_id": id, "action": "record_evidence", "parameters": {},
+            "ttl_seconds": null, "reason": "r", "requested_by": "analyst", "source": "soc"
+        }))
+        .unwrap()
+    }
+
+    fn note_for(r: &ActionRequest, evidence: &str) -> super::super::evidence::RequestNote {
+        super::super::evidence::RequestNote {
+            note: serde_json::json!({
+                "kind": "robodr.control_plane_request", "robot_id": "ugv-007",
+                "request": r, "auth": {"key_id": "soc:1"}, "status": "recorded_not_executed",
+                "refusal": null, "safety_state": SafetyState::Idle, "plan": null,
+                "error": null, "executor": "recording"
+            }),
+            evidence: evidence.into(),
+            wall_ms: 5,
+        }
+    }
+
+    /// Review of gap 1, finding 4: rebuilding an untrusted journal (an
+    /// adopted v1 file) keeps only entries an authentic note backs; a
+    /// planted entry is dropped and its id refused, a backed one takes the
+    /// state its note records (not the file's claim).
+    #[test]
+    fn rebuild_drops_entries_no_note_backs() {
+        let legit = req("r-legit");
+        let mut claimed = stored_from_note(&note_for(&legit, "bb://e1")).unwrap();
+        claimed.status = Status::Reverted;
+        let forged = stored_from_note(&note_for(&req("r-forged"), "bb://e9")).unwrap();
+        let other_evidence = stored_from_note(&note_for(&req("r-moved"), "bb://e7")).unwrap();
+        let mut r = Restored {
+            stored: vec![claimed, forged, other_evidence],
+            upgraded_from_v1: true,
+            ..Restored::default()
+        };
+        let notes = vec![
+            note_for(&legit, "bb://e1"),
+            // r-moved's authentic note names another record.
+            note_for(&req("r-moved"), "bb://e8"),
+        ];
+        let rb = rebuild(&mut r, &notes, 16);
+        let ids: Vec<&str> = r
+            .stored
+            .iter()
+            .map(|s| s.request.request_id.as_str())
+            .collect();
+        assert_eq!(ids, ["r-legit", "r-moved"], "{ids:?}");
+        assert_eq!(rb.dropped, ["r-forged"]);
+        let legit = r
+            .stored
+            .iter()
+            .find(|s| s.request.request_id == "r-legit")
+            .unwrap();
+        assert_eq!(
+            legit.status,
+            Status::RecordedNotExecuted,
+            "the note's state, not the file's"
+        );
+        let moved = r
+            .stored
+            .iter()
+            .find(|s| s.request.request_id == "r-moved")
+            .unwrap();
+        assert_eq!(
+            moved.evidence, "bb://e8",
+            "restored from its authentic note"
+        );
+        // A sealed journal that is merely unanchored (a crash) is not
+        // second-guessed entry by entry.
+        let mut r = Restored {
+            stored: vec![stored_from_note(&note_for(&req("r-x"), "bb://ex")).unwrap()],
+            anchor: AnchorCheck::Unanchored("crash".into()),
+            ..Restored::default()
+        };
+        let rb = rebuild(&mut r, &[], 16);
+        assert!(rb.dropped.is_empty());
+        assert_eq!(r.stored.len(), 1);
+    }
 
     /// Every refusal code the executor can answer (including the review's
     /// `locators_required`, `operator_disabled`, `config_unavailable`)

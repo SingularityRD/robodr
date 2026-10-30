@@ -28,15 +28,17 @@
 //! one-time upgrade of v1 journals ([`super::journal::Sealing::adopt_legacy`]):
 //! once sealing has started, an unsealed journal is a downgrade.
 
-use std::io;
+use std::io::{self, Write};
+use std::path::Path;
 
 use robodr_blackbox::record::{scan_frames, signing_message, RecordKind, ScanItem};
-use robodr_blackbox::Signer;
+use robodr_blackbox::{Signer, StateSealKey};
 use robodr_events::Severity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::evidence::SegmentSource;
+use super::fsutil;
 use super::journal::{Anchor, AnchorCheck, Head, Sealing};
 use super::StateStatus;
 
@@ -63,10 +65,23 @@ pub struct Found {
     pub seen: usize,
     /// Of those, notes whose record hash or signature did not verify.
     pub unverified: usize,
+    /// `segment_dropped` records in the black box (a cyclic store deleted
+    /// its oldest segments): a missing head note may have aged out.
+    pub segments_dropped: usize,
 }
 
 impl Found {
-    /// The sealing the control plane opens its journals with.
+    /// Review of gap 1, finding 3: no authentic head note, but the black
+    /// box dropped segments: the newest head may have aged out, so the
+    /// journals cannot be taken as they are.
+    pub fn anchor_lost(&self) -> bool {
+        self.heads.is_none() && self.segments_dropped > 0
+    }
+
+    /// The sealing the control plane opens its journals with. A v1 journal
+    /// is adopted only while the black box never saw a head note and holds
+    /// no sign of having lost one; the caller also refuses it once the
+    /// state directory's sealed marker exists ([`sealed_marker_present`]).
     pub fn sealing(&self, key: std::sync::Arc<robodr_blackbox::StateSealKey>) -> Sealing {
         let anchor = |h: Option<&Head>| {
             h.map(|head| Anchor {
@@ -80,8 +95,175 @@ impl Found {
             requests: anchor(heads.and_then(|h| h.requests.as_ref())),
             nonces: anchor(heads.and_then(|h| h.nonces.as_ref())),
             adopt_legacy: self.seen == 0,
+            anchor_lost: self.anchor_lost(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Markers in the state directory (review of gap 1, findings 3 and 5)
+// ---------------------------------------------------------------------------
+
+/// Written once the journals have been opened sealed: from then on a v1
+/// journal is never adopted, even if the black box no longer holds a head
+/// note (finding 3).
+pub const SEALED_MARKER: &str = "sealed.marker";
+/// Requests the control plane could not reconcile with the black box
+/// (finding 5): lost request ids and, when the black box could not be read,
+/// the reason every new id is refused. Kept until a start reconciles.
+pub const UNRECONCILED_MARKER: &str = "unreconciled";
+const SEALED_MARKER_FORMAT: &str = "robodr-cp-sealed/v1";
+const UNRECONCILED_FORMAT: &str = "robodr-cp-unreconciled/v1";
+/// Lost request ids kept in the marker.
+pub const MAX_UNRECONCILED_IDS: usize = 4096;
+
+fn seal_file(key: &StateSealKey, format: &str, json: &[u8]) -> Vec<u8> {
+    let tag = key.tag(format, &[key.key_id().as_bytes(), json]);
+    let mut out = format!(
+        "{format} {} {}\n",
+        key.key_id(),
+        robodr_blackbox::crypto::to_hex(&tag)
+    )
+    .into_bytes();
+    out.extend_from_slice(json);
+    out
+}
+
+fn unseal_file<'a>(key: &StateSealKey, format: &str, bytes: &'a [u8]) -> Result<&'a [u8], String> {
+    let nl = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or("no seal line")?;
+    let (line, json) = (
+        bytes.get(..nl).ok_or("no seal line")?,
+        bytes.get(nl + 1..).ok_or("no seal line")?,
+    );
+    let line = std::str::from_utf8(line).map_err(|_| "the seal line is not UTF-8")?;
+    let mut p = line.split(' ');
+    let (Some(f), Some(id), Some(tag), None) = (p.next(), p.next(), p.next(), p.next()) else {
+        return Err("malformed seal line".into());
+    };
+    if f != format || id != key.key_id() {
+        return Err(format!(
+            "sealed as {} under {} (expected {format} under {})",
+            robodr_ros2_pipeline::sanitize(f),
+            robodr_ros2_pipeline::sanitize(id),
+            key.key_id()
+        ));
+    }
+    let ok = robodr_blackbox::crypto::from_hex(tag)
+        .is_some_and(|t| key.check(format, &[key.key_id().as_bytes(), json], &t));
+    if ok {
+        Ok(json)
+    } else {
+        Err("the seal does not verify".into())
+    }
+}
+
+/// Atomically replace `dir/name` (random temporary name, created
+/// exclusively, no symlink followed, fsynced, directory fsynced).
+fn write_private(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp-{}", fsutil::random_hex16()?));
+    let res = (|| -> io::Result<()> {
+        let mut f = fsutil::create_new_private(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, dir.join(name))?;
+        fsutil::sync_dir(dir)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Whether the sealed marker exists (any content: whoever removed sealing
+/// would have to remove it too, and a damaged one still says sealing
+/// happened).
+pub fn sealed_marker_present(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(SEALED_MARKER)).is_ok()
+}
+
+/// The sealing the control plane opens the journals in `dir` with: the
+/// black box's heads ([`Found::sealing`]), and no v1 adoption once the
+/// sealed marker exists. Returns it and whether the marker was there.
+pub fn sealing_for(
+    dir: &Path,
+    found: &Found,
+    key: std::sync::Arc<StateSealKey>,
+) -> (Sealing, bool) {
+    let mut s = found.sealing(key);
+    let marker = sealed_marker_present(dir);
+    if marker {
+        s.adopt_legacy = false;
+    }
+    (s, marker)
+}
+
+/// Write the sealed marker (idempotent).
+pub fn write_sealed_marker(dir: &Path, key: &StateSealKey) -> io::Result<()> {
+    if sealed_marker_present(dir) {
+        return Ok(());
+    }
+    let json = serde_json::json!({"format": super::journal::FORMAT, "key_id": key.key_id()});
+    write_private(
+        dir,
+        SEALED_MARKER,
+        &seal_file(key, SEALED_MARKER_FORMAT, json.to_string().as_bytes()),
+    )
+}
+
+/// What the unreconciled marker holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unreconciled {
+    /// Request ids whose state is unknown: their resubmission is refused.
+    pub lost_ids: Vec<String>,
+    /// Every new request id is refused (the black box could not be read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refuse_new: Option<String>,
+}
+
+/// The unreconciled marker: `Ok(None)` when there is none, `Err` when one
+/// exists but cannot be read or fails its seal (the caller reconciles and
+/// refuses as if it held everything).
+pub fn read_unreconciled(dir: &Path, key: &StateSealKey) -> Result<Option<Unreconciled>, String> {
+    let p = dir.join(UNRECONCILED_MARKER);
+    let bytes = match fsutil::read_capped_nofollow(&p, 1 << 20) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", p.display())),
+    };
+    let json = unseal_file(key, UNRECONCILED_FORMAT, &bytes)
+        .map_err(|e| format!("{}: {e}", p.display()))?;
+    serde_json::from_slice(json)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// Persist `u` (or remove the marker when it holds nothing).
+pub fn write_unreconciled(dir: &Path, key: &StateSealKey, u: &Unreconciled) -> io::Result<()> {
+    if u.lost_ids.is_empty() && u.refuse_new.is_none() {
+        return match std::fs::remove_file(dir.join(UNRECONCILED_MARKER)) {
+            Ok(()) => fsutil::sync_dir(dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+    }
+    let mut u = u.clone();
+    u.lost_ids.sort();
+    u.lost_ids.dedup();
+    if u.lost_ids.len() > MAX_UNRECONCILED_IDS {
+        let cut = u.lost_ids.len() - MAX_UNRECONCILED_IDS;
+        u.lost_ids.drain(..cut);
+    }
+    let json = serde_json::to_vec(&u).map_err(io::Error::other)?;
+    write_private(
+        dir,
+        UNRECONCILED_MARKER,
+        &seal_file(key, UNRECONCILED_FORMAT, &json),
+    )
 }
 
 /// The newest authentic head note of `robot_id` in the black box (see the
@@ -98,6 +280,10 @@ pub fn latest(src: &dyn SegmentSource, robot_id: &str, signer: &dyn Signer) -> i
                 continue;
             };
             let rec = r.record;
+            if rec.kind == RecordKind::SegmentDropped {
+                found.segments_dropped += 1;
+                continue;
+            }
             if rec.kind != RecordKind::Note
                 || !rec.payload.windows(needle.len()).any(|w| w == needle)
             {
@@ -125,6 +311,87 @@ pub fn latest(src: &dyn SegmentSource, robot_id: &str, signer: &dyn Signer) -> i
         }
     }
     Ok(found)
+}
+
+/// Kind of the executor's journal head note (review of gap 1, findings 1
+/// and 2): `{"kind":"robodr.executor_journal_head","robot_id":..,
+/// "reason":..,"epoch":"<32 hex>","next_seq":<n>}`, recorded by agentd when
+/// the executor's epoch changes and on heartbeats when the head moved or
+/// the black box started a new segment.
+pub const EXECUTOR_HEAD_NOTE: &str = "robodr.executor_journal_head";
+
+/// The newest authentic executor journal head note of `robot_id` (and how
+/// many such notes did not verify).
+pub fn latest_executor_head(
+    src: &dyn SegmentSource,
+    robot_id: &str,
+    signer: &dyn Signer,
+) -> io::Result<(Option<robodr_executor::journal::JournalHead>, usize)> {
+    let mut newest = None;
+    let mut unverified = 0;
+    let needle = EXECUTOR_HEAD_NOTE.as_bytes();
+    for idx in src.list()? {
+        let Some(bytes) = src.read(idx)? else {
+            continue;
+        };
+        for item in scan_frames(&bytes).items {
+            let ScanItem::Record(r) = item else {
+                continue;
+            };
+            let rec = r.record;
+            if rec.kind != RecordKind::Note
+                || !rec.payload.windows(needle.len()).any(|w| w == needle)
+            {
+                continue;
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(&rec.payload) else {
+                continue;
+            };
+            if v.get("kind").and_then(Value::as_str) != Some(EXECUTOR_HEAD_NOTE)
+                || v.get("robot_id").and_then(Value::as_str) != Some(robot_id)
+            {
+                continue;
+            }
+            let head = serde_json::from_value::<robodr_executor::journal::JournalHead>(
+                serde_json::json!({"epoch": v.get("epoch"), "next_seq": v.get("next_seq")}),
+            )
+            .ok();
+            match (super::evidence::authentic(&rec, signer), head) {
+                (true, Some(h)) => newest = Some(h),
+                _ => unverified += 1,
+            }
+        }
+    }
+    Ok((newest, unverified))
+}
+
+/// The executor journal head note.
+pub fn executor_head_note(
+    robot_id: &str,
+    reason: &str,
+    head: &robodr_executor::journal::JournalHead,
+) -> Value {
+    serde_json::json!({
+        "kind": EXECUTOR_HEAD_NOTE,
+        "robot_id": robot_id,
+        "reason": reason,
+        "epoch": head.epoch,
+        "next_seq": head.next_seq,
+    })
+}
+
+/// Whether a head note is due on a heartbeat (review of gap 1, finding 3):
+/// when the head changed, or when the black box's newest record (the
+/// heartbeat just written) is in another segment than the last head note.
+/// A cyclic black box drops its oldest segments; re-recording on every
+/// segment change keeps a head note in the newest segments, so it is never
+/// aged out while agentd runs.
+pub fn head_note_due(
+    changed: bool,
+    note_segment: Option<u64>,
+    current_segment: Option<u64>,
+) -> bool {
+    changed || (current_segment.is_some() && note_segment != current_segment)
 }
 
 /// The head note (see the module).
@@ -182,6 +449,25 @@ pub fn integrity_alarm(st: &StateStatus) -> Option<(Severity, String)> {
         why.push(format!(
             "the request journal had {} damaged line(s), {} of them failing their seal",
             st.journal_damaged, st.journal_forged
+        ));
+    }
+    if st.notes_rejected > 0 {
+        why.push(format!(
+            "{} black-box note(s) of the control plane failed their hash or signature check \
+             and were ignored",
+            st.notes_rejected
+        ));
+    }
+    if st.dropped_unbacked > 0 {
+        why.push(format!(
+            "{} request journal entr(ies) had no authentic black-box note and were dropped \
+             (their ids are refused)",
+            st.dropped_unbacked
+        ));
+    }
+    if let Some(e) = &st.unreconciled_unreadable {
+        why.push(format!(
+            "the unreconciled-requests marker could not be trusted ({e})"
         ));
     }
     if st.replay.damaged > 0 {
@@ -265,6 +551,125 @@ mod tests {
             ..StateStatus::default()
         };
         assert_eq!(integrity_alarm(&st).unwrap().0, Severity::Critical);
+        // Review of gap 1: rejected notes and dropped entries are reported.
+        let st = StateStatus {
+            notes_rejected: 2,
+            dropped_unbacked: 1,
+            ..StateStatus::default()
+        };
+        let (sev, d) = integrity_alarm(&st).unwrap();
+        assert_eq!(sev, Severity::High);
+        assert!(
+            d.contains("2 black-box note(s)") && d.contains("1 request journal"),
+            "{d}"
+        );
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("robodr-cp-anchor-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn v1_requests_journal(dir: &Path) {
+        let json = serde_json::to_vec(&serde_json::json!(
+            {"t": "header", "format": crate::control::journal::LEGACY_FORMAT, "kind": "requests"}
+        ))
+        .unwrap();
+        let mut l =
+            robodr_blackbox::crypto::to_hex(&robodr_blackbox::crypto::sha256(&json)).into_bytes();
+        l.push(b' ');
+        l.extend_from_slice(&json);
+        l.push(b'\n');
+        std::fs::write(dir.join(crate::control::state::REQUEST_JOURNAL), l).unwrap();
+    }
+
+    /// Review of gap 1, finding 3: a v1 journal is adopted only before the
+    /// journals were ever sealed. Once the sealed marker exists it is a
+    /// downgrade, even when the black box holds no head note any more (a
+    /// cyclic store aged them out).
+    #[test]
+    fn v1_is_never_adopted_once_sealing_happened() {
+        let key = crate::control::journal::tests::key();
+        let d = tmp("v1-marker");
+        v1_requests_journal(&d);
+        let none = Found::default();
+        let (s, marker) = sealing_for(&d, &none, key.clone());
+        assert!(!marker && s.adopt_legacy, "first sealed start: the upgrade");
+        let (_, r) = crate::control::state::open(&d, 16, &s).unwrap();
+        assert!(r.upgraded_from_v1);
+        write_sealed_marker(&d, &key).unwrap();
+        // The v1 file put back; the black box knows of no head.
+        v1_requests_journal(&d);
+        let (s, marker) = sealing_for(&d, &none, key.clone());
+        assert!(marker && !s.adopt_legacy);
+        let (_, r) = crate::control::state::open(&d, 16, &s).unwrap();
+        assert!(r.legacy_refused && !r.upgraded_from_v1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review of gap 1, finding 3: no head note but dropped segments: the
+    /// journals are not taken as they are (Unanchored: fence and
+    /// reconciliation).
+    #[test]
+    fn a_head_note_aged_out_of_the_black_box_is_not_no_anchor() {
+        let key = crate::control::journal::tests::key();
+        let d = tmp("aged-out");
+        let aged = Found {
+            segments_dropped: 3,
+            ..Found::default()
+        };
+        assert!(aged.anchor_lost());
+        let (s, _) = sealing_for(&d, &aged, key.clone());
+        let (_, r) = crate::control::state::open(&d, 16, &s).unwrap();
+        assert!(
+            matches!(r.anchor, AnchorCheck::Unanchored(_)),
+            "{:?}",
+            r.anchor
+        );
+        assert!(r.untrusted());
+        let (_, load) =
+            crate::control::auth::ReplayGuard::persistent(&d, 30, 64, 1_000, &s).unwrap();
+        assert!(matches!(load.anchor, AnchorCheck::Unanchored(_)));
+        assert!(load.fence.is_some(), "the replay store is fenced");
+        // A fresh black box (nothing dropped) is a first sealed start.
+        let (s, _) = sealing_for(&d, &Found::default(), key);
+        assert!(!s.anchor_lost);
+        // Heads are re-recorded on a segment change even when unchanged.
+        assert!(!head_note_due(false, Some(4), Some(4)));
+        assert!(head_note_due(false, Some(4), Some(5)));
+        assert!(head_note_due(true, Some(4), Some(4)));
+        assert!(!head_note_due(false, Some(4), None));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review of gap 1, finding 5: the unreconciled-requests marker is
+    /// sealed, survives a restart, and is removed once nothing is left.
+    #[test]
+    fn the_unreconciled_marker_is_sealed_and_kept_until_reconciled() {
+        let key = crate::control::journal::tests::key();
+        let d = tmp("unreconciled");
+        assert_eq!(read_unreconciled(&d, &key).unwrap(), None);
+        let u = Unreconciled {
+            lost_ids: vec!["r-2".into(), "r-1".into()],
+            refuse_new: Some("black box unreadable".into()),
+        };
+        write_unreconciled(&d, &key, &u).unwrap();
+        let back = read_unreconciled(&d, &key).unwrap().unwrap();
+        assert_eq!(back.lost_ids, ["r-1", "r-2"]);
+        assert_eq!(back.refuse_new, u.refuse_new);
+        // Edited: not believed.
+        let p = d.join(UNRECONCILED_MARKER);
+        let text = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, text.replace("r-1", "r-9")).unwrap();
+        assert!(read_unreconciled(&d, &key)
+            .unwrap_err()
+            .contains("does not verify"));
+        // Nothing left: removed.
+        write_unreconciled(&d, &key, &Unreconciled::default()).unwrap();
+        assert!(!p.exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -285,6 +690,7 @@ mod tests {
             clean: true,
             seen: 3,
             unverified: 1,
+            segments_dropped: 0,
         };
         let s = f.sealing(key);
         assert!(!s.adopt_legacy, "sealing has started");

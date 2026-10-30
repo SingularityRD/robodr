@@ -313,6 +313,9 @@ Writes to `journal.json` are atomic and write-ahead. At start
 | `active`, same boot, **table missing** | operator emergency disable: dropped, not re-applied, orders refused until `rearm` |
 | journal unreadable | table deleted, start empty: event `journal_reset` (detail `HIGH: ...`) and the status flag `journal_reset_ms` until `rearm`; every order is refused (`journal_reset`) until then |
 | journal **fails its seal** (edited, truncated, another key) or is an unsealed v1 file not upgraded with `seal-journal` | not believed: handled exactly like an unreadable journal (above); agentd reports `robot.agent.executor_journal_reset` (High) |
+| sealed journal **missing** and no `first-start` marker | deleted, not a first start: table deleted, SOC replay store fenced, `journal_reset`, orders refused until `rearm` |
+| `active`, same boot, table present but **without this action's rules** | an older journal copy was put back: re-validated and **held** (re-armed only with a fresh safety state), never re-installed blindly |
+| agentd's anchor (sent with every `events`) is **ahead** of the journal, or of another epoch that is not the journal's predecessor | an older copy put back: every action lifted, table deleted, SOC store fenced, new epoch, `journal_reset`, orders refused until `rearm` |
 
 **Sealed state (gap 1).** The daemon (`Engine::open_sealed`) writes
 `journal.json` as `robodr-executor-journal/v2 <key id> <tag>` followed by
@@ -321,11 +324,23 @@ a store failing its seal fences). The tag is HMAC-SHA256 under a
 `robodr_blackbox::StateSealKey` derived from the link key (`key_file`,
 purpose `executor/state/v1`): someone who can write the state directory
 but does not hold the link key cannot edit either file unnoticed. The
-seal does **not** detect an older sealed copy put back (no external
-anchor; agentd's own journals are anchored in its black box). Upgrading
-from an unsealed release: `robodr-executor seal-journal` once, executor
-stopped (`docs/OPERATIONS.md` 6.5). `Engine::open` (no key) keeps the
-unsealed v1 format for tests and tools.
+seal alone does not detect an older sealed copy put back; the **anchor**
+does: the journal has a random `epoch` (replaced by every reset, the old
+one kept as `prev_epoch`), every `event_list` answer carries the head
+(`epoch`, `next_seq`), agentd records it in its black box and sends the
+newest one back with every `events` request (`Engine::check_anchor`). An
+anchor of this process's own answers is never behind; one from an earlier
+run is compared with the journal as loaded (the events of this start's
+reconciliation do not count). A missing sealed journal is a reset unless
+the `first-start` marker (created by the package on first install) exists.
+State files are written through a random temporary name (exclusive
+create, `O_NOFOLLOW`). Upgrading from an unsealed release:
+`robodr-executor seal-journal` once, executor stopped
+(`docs/OPERATIONS.md` 6.5); refused once the journal was ever written
+sealed (`sealed` marker), and the adopted actions are held at the next
+start. `stop-cleanup` reads and marks the sealed journal and undoes motion
+actions (a failed undo stays `reverting`); so does `revert-all`.
+`Engine::open` (no key) keeps the unsealed v1 format for tests and tools.
 
 A failed revert (`revert_failed`, retried every tick; the detail names the
 TTL and deadline) is reported by agentd as `robot.agent.executor_revert_failed`

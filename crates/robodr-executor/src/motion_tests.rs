@@ -1808,3 +1808,178 @@ fn review_finding_8_rollback_program_must_be_protected() {
         "{ran}"
     );
 }
+
+// ------------------------------------- review of the sealed journal (11)
+
+/// Motion ports whose undo fails.
+#[derive(Clone, Default)]
+struct FailUndo(Arc<Mutex<Vec<String>>>);
+
+impl crate::motion::MotionPorts for FailUndo {
+    fn apply(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        s: &crate::motion::MotionSpec,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().push(format!("apply {}", s.id));
+        Ok("ok".into())
+    }
+    fn revert(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        s: &crate::motion::MotionSpec,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().push(format!("revert {}", s.id));
+        Err("controller manager unreachable".into())
+    }
+    fn verify(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        _s: &crate::motion::MotionSpec,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn gw_motion(d: &std::path::Path) -> Value {
+    json!({"restrict_motion": ["gateway"],
+        "gateway": {"oem_validated": true, "restriction_path": d.join("restriction.json"),
+                    "status_path": d.join("status.json"), "verify_timeout_ms": 2000}})
+}
+
+/// An engine with a gateway restriction (or, `pause`, a safe_pause) in
+/// force, on the given motion ports.
+fn motion_in_force(
+    d: &std::path::Path,
+    id: &str,
+    pause: bool,
+    ports: Box<dyn crate::motion::MotionPorts + Send>,
+) -> Engine {
+    let (motion, p, o) = if pause {
+        (
+            r2c_motion(9),
+            policy(PlatformFamily::Arm, Morphology::Arm),
+            signed(
+                id,
+                ActionId::SafePause,
+                Morphology::Arm,
+                Target::None,
+                None,
+                &["alice", "bob"],
+                SafetyState::Idle,
+            ),
+        )
+    } else {
+        (
+            gw_motion(d),
+            policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+            signed(
+                id,
+                ActionId::RestrictMotion,
+                Morphology::WheeledMobile,
+                restrict(0.3),
+                Some(600),
+                &[],
+                SafetyState::Idle,
+            ),
+        )
+    };
+    let mut e = engine(d, motion, p, now()).with_motion_ports(ports);
+    let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    e
+}
+
+fn journal_of(d: &std::path::Path) -> crate::journal::State {
+    match crate::journal::Journal::new(d).load() {
+        crate::journal::Loaded::State(s) => s,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Review finding 11: `revert-all` and `stop-cleanup` undo motion actions
+/// through their adapters (a gateway restriction is not lifted by deleting
+/// the nft table); an undo that fails leaves the action `reverting`, never
+/// reported reverted. A safe_pause is never lifted by either (ADR-0006).
+#[test]
+fn review_11_revert_all_and_abandon_undo_motion_actions() {
+    // revert-all, undo succeeds.
+    let d = tmpdir("rv11-ra");
+    let rec = Rec::default();
+    let mut e = motion_in_force(&d, "rm-ra", false, Box::new(rec.clone()));
+    assert_eq!(e.revert_all("operator", now()).unwrap(), 1);
+    assert!(rec.0.lock().unwrap().contains(&"revert rm-ra".to_string()));
+    assert_eq!(e.status("rm-ra").status, Status::Reverted);
+    // revert-all, undo fails: still reverting.
+    let d = tmpdir("rv11-ra-fail");
+    let fail = FailUndo::default();
+    let mut e = motion_in_force(&d, "rm-raf", false, Box::new(fail.clone()));
+    assert!(e.revert_all("operator", now()).is_err());
+    assert!(fail
+        .0
+        .lock()
+        .unwrap()
+        .contains(&"revert rm-raf".to_string()));
+    assert_eq!(e.status("rm-raf").status, Status::Reverting);
+    // revert-all leaves a pause in force.
+    let d = tmpdir("rv11-ra-pause");
+    let rec = Rec::default();
+    let mut e = motion_in_force(&d, "p-ra", true, Box::new(rec.clone()));
+    assert!(e.revert_all("operator", now()).is_err());
+    assert!(!rec
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|x| x.starts_with("revert")));
+    assert_eq!(e.status("p-ra").status, Status::Verified);
+    // stop-cleanup (abandon), undo succeeds.
+    let d = tmpdir("rv11-ab");
+    drop(motion_in_force(
+        &d,
+        "rm-ab",
+        false,
+        Box::new(Rec::default()),
+    ));
+    let c = config(&d, gw_motion(&d));
+    let mut nft = FakeNft::default();
+    let mut rec = Rec::default();
+    let n =
+        crate::engine::abandon(Some(&c), &mut nft, "stopped", wall_ms(), None, &mut rec).unwrap();
+    assert_eq!(n, 1);
+    assert!(rec.0.lock().unwrap().contains(&"revert rm-ab".to_string()));
+    let s = journal_of(&d);
+    assert!(s.entries.is_empty());
+    assert_eq!(
+        s.finished("rm-ab").map(|f| f.result),
+        Some(crate::journal::Final::Reverted)
+    );
+    // stop-cleanup, undo fails: kept `reverting` for the next start.
+    let d = tmpdir("rv11-ab-fail");
+    drop(motion_in_force(
+        &d,
+        "rm-abf",
+        false,
+        Box::new(Rec::default()),
+    ));
+    let c = config(&d, gw_motion(&d));
+    let mut fail = FailUndo::default();
+    let n =
+        crate::engine::abandon(Some(&c), &mut nft, "stopped", wall_ms(), None, &mut fail).unwrap();
+    assert_eq!(n, 0);
+    let s = journal_of(&d);
+    assert_eq!(s.entries.len(), 1);
+    assert_eq!(s.entries[0].phase, crate::journal::Phase::Reverting);
+    // stop-cleanup leaves a pause in force (and journalled).
+    let d = tmpdir("rv11-ab-pause");
+    drop(motion_in_force(&d, "p-ab", true, Box::new(Rec::default())));
+    let c = config(&d, r2c_motion(9));
+    let mut rec = Rec::default();
+    let n =
+        crate::engine::abandon(Some(&c), &mut nft, "stopped", wall_ms(), None, &mut rec).unwrap();
+    assert_eq!(n, 0);
+    assert!(rec.0.lock().unwrap().is_empty());
+    let s = journal_of(&d);
+    assert_eq!(s.entries.len(), 1);
+    assert_eq!(s.entries[0].phase, crate::journal::Phase::Active);
+}

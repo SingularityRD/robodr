@@ -10,7 +10,7 @@ use std::time::Duration;
 use robodr_responder::SafetyState;
 
 use crate::engine::Outcome;
-use crate::journal::Event;
+use crate::journal::{Event, JournalHead};
 use crate::order::Order;
 use crate::proto::{self, Key, Msg};
 
@@ -187,10 +187,30 @@ impl Client {
         since: u64,
         safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
     ) -> Result<Vec<Event>, String> {
+        self.events_anchored(since, None, safety).map(|(e, _)| e)
+    }
+
+    /// [`Client::events_with_safety`] sending the journal head agentd
+    /// anchored (`anchor`, review of gap 1) and returning the executor's
+    /// current head with the events (`None` from an executor that does not
+    /// report one).
+    pub fn events_anchored(
+        &self,
+        since: u64,
+        anchor: Option<&JournalHead>,
+        safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
+    ) -> Result<(Vec<Event>, Option<JournalHead>), String> {
         let mut c = self.connect()?;
-        let n = self.send(&mut c, "", &Msg::Events { since })?;
+        let n = self.send(
+            &mut c,
+            "",
+            &Msg::Events {
+                since,
+                anchor: anchor.cloned(),
+            },
+        )?;
         match self.answer_confirm(&mut c, &n, "rearm", safety)?.msg {
-            Msg::EventList { events } => Ok(events),
+            Msg::EventList { events, head } => Ok((events, head)),
             _ => Err("unexpected executor answer".into()),
         }
     }

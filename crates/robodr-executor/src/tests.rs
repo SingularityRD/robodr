@@ -1393,6 +1393,20 @@ fn sealed_engine(
     now: u64,
     key: &std::sync::Arc<robodr_blackbox::StateSealKey>,
 ) -> Engine {
+    if !dir.join(crate::journal::FILE).exists() {
+        // A first start, as the package prepares it (review finding 2).
+        std::fs::write(dir.join(crate::journal::INIT_MARKER), "").unwrap();
+    }
+    sealed_engine_as_is(dir, nft, now, key)
+}
+
+/// [`sealed_engine`] without preparing anything.
+fn sealed_engine_as_is(
+    dir: &std::path::Path,
+    nft: &FakeNft,
+    now: u64,
+    key: &std::sync::Arc<robodr_blackbox::StateSealKey>,
+) -> Engine {
     Engine::open_sealed(
         cfg(dir.to_str().unwrap()),
         policy(Morphology::WheeledMobile, true, &[]),
@@ -1511,17 +1525,270 @@ fn gap1_a_sealed_journal_that_fails_its_seal_is_not_believed() {
         reset_reason(&e)
     );
     drop(e);
-    // The documented one-time upgrade keeps the v1 state.
+    // Review finding 7: once the journal has been written sealed, putting
+    // an unsealed file back is not an upgrade.
+    std::fs::write(d.join("journal.json"), &v1).unwrap();
+    let j = Journal::sealed(&d, key.clone());
+    let err = j.seal_legacy().unwrap_err();
+    assert!(err.contains("not an upgrade"), "{err}");
+    // The documented one-time upgrade (before the sealed executor ever ran)
+    // keeps the v1 state, but not as installed: held for re-validation.
+    let d = tmpdir("seal-v1-upgrade");
     std::fs::write(d.join("journal.json"), &v1).unwrap();
     nft.0.lock().unwrap().table = None;
     let j = Journal::sealed(&d, key.clone());
     let m = j.seal_legacy().unwrap();
     assert!(m.contains("1 active action"), "{m}");
-    assert!(j.seal_legacy().unwrap_err().contains("sealed already"));
+    assert!(j.seal_legacy().unwrap_err().contains("not an upgrade"));
     match j.load() {
-        Loaded::State(s) => assert_eq!(s.entries.len(), 1),
+        Loaded::State(s) => {
+            assert_eq!(s.entries.len(), 1);
+            assert!(s.boot_id.is_empty(), "adopted as of no boot");
+        }
         other => panic!("{other:?}"),
     }
+    let e = sealed_engine(&d, &nft, 2_000, &key);
+    assert_eq!(e.status("v1").status, Status::Held, "re-validated, held");
+    assert!(nft.0.lock().unwrap().table.is_none(), "not re-installed");
+}
+
+/// Review findings 1/2: the journal's epoch and head; an older sealed copy
+/// put back (same boot) is not re-installed blindly, and agentd's anchor
+/// resets it.
+#[test]
+fn review_an_older_sealed_copy_is_caught() {
+    let key = seal_key(7);
+    let nft = FakeNft::default();
+    let iso = |id: &str| {
+        order(
+            id,
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        )
+    };
+    let d = tmpdir("rv-old-copy");
+    let mut e = sealed_engine(&d, &nft, 1_000, &key);
+    assert!(
+        !d.join(crate::journal::INIT_MARKER).exists(),
+        "the first-start marker is consumed"
+    );
+    assert!(d.join(crate::journal::SEALED_MARKER).exists());
+    assert_eq!(
+        e.submit(&iso("i1"), &mut idle(), 1_000).status,
+        Status::Verified
+    );
+    let old = std::fs::read(d.join("journal.json")).unwrap();
+    let anchored = e.state().head();
+    assert_eq!(anchored.epoch.len(), 32);
+    e.revert("i1", "done", 1_100);
+    assert_eq!(e.status("i1").status, Status::Reverted);
+    drop(e);
+    // The table is gone now (i1 reverted); something else keeps it alive
+    // so the copy is not taken for an emergency disable.
+    let mut e = sealed_engine(&d, &nft, 1_150, &key);
+    let q1 = order(
+        "q1",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&q1, &mut idle(), 1_150).status, Status::Verified);
+    // What agentd saw last (its anchor).
+    let anchored_after = e.state().head();
+    assert_eq!(anchored_after.epoch, anchored.epoch);
+    assert!(anchored_after.next_seq > anchored.next_seq);
+    drop(e);
+    // The older copy (i1 active) put back, same boot.
+    std::fs::write(d.join("journal.json"), &old).unwrap();
+    let mut e = sealed_engine(&d, &nft, 1_200, &key);
+    assert_eq!(
+        e.status("i1").status,
+        Status::Held,
+        "an active entry missing from the live table is re-validated and held, not re-installed"
+    );
+    let table = format!("{:?}", nft.0.lock().unwrap().table);
+    assert!(
+        !table.contains(&crate::nft::tag("i1")),
+        "i1 re-installed: {table}"
+    );
+    // agentd's anchor (the newest head it saw) unmasks the copy.
+    assert!(e.check_anchor(&anchored_after, 1_300));
+    assert!(e.state().journal_reset_ms.is_some());
+    assert!(e.state().entries.is_empty());
+    assert_eq!(
+        e.state().prev_epoch.as_deref(),
+        Some(anchored.epoch.as_str())
+    );
+    assert_ne!(e.state().epoch, anchored.epoch);
+    assert!(reset_reason(&e).contains("behind agentd's anchored head"));
+    let o = e.submit(&iso("i2"), &mut idle(), 1_400);
+    assert_eq!(o.refusal.unwrap().code, codes::JOURNAL_RESET);
+    // The old epoch is the new one's predecessor: no second reset.
+    assert!(!e.check_anchor(&anchored_after, 1_500));
+    // A foreign epoch with actions in force resets; a reset nobody saw
+    // yet that holds nothing is adopted.
+    let foreign = crate::journal::JournalHead {
+        epoch: "ab".repeat(16),
+        next_seq: 1,
+    };
+    assert!(!e.check_anchor(&foreign, 1_600), "empty reset: adopted");
+    e.rearm("checked", 1_700).unwrap();
+    // The reset fenced the SOC replay store: requests signed before it are
+    // refused, a fresh one is executed.
+    let stale = e.submit(&iso("i3"), &mut idle(), 1_800);
+    assert_eq!(stale.refusal.unwrap().code, codes::SOC_REQUEST_STALE);
+    let i4 = sign_at(
+        unsigned(
+            "i4",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        40,
+    );
+    assert_eq!(e.submit(&i4, &mut idle(), 40_000).status, Status::Verified);
+    let other = crate::journal::JournalHead {
+        epoch: "cd".repeat(16),
+        next_seq: 1,
+    };
+    assert!(e.check_anchor(&other, 40_100));
+    assert_eq!(e.status("i4").status, Status::Reverted);
+}
+
+/// Review findings 1/2: the anchor never resets a journal that is merely
+/// ahead of it (this run's answers, a restart, an executor without a
+/// first-start journal yet).
+#[test]
+fn review_the_anchor_leaves_a_current_journal_alone() {
+    let key = seal_key(7);
+    let nft = FakeNft::default();
+    let d = tmpdir("rv-anchor-ok");
+    let mut e = sealed_engine(&d, &nft, 1_000, &key);
+    let o = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let h0 = e.answer_head();
+    assert!(!e.check_anchor(&h0, 1_000));
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    let h1 = e.answer_head();
+    assert!(!e.check_anchor(&h1, 1_100));
+    drop(e);
+    let mut e = sealed_engine(&d, &nft, 2_000, &key);
+    assert!(e.state().next_seq > h1.next_seq, "the restart added events");
+    assert!(!e.check_anchor(&h1, 2_000));
+    assert_eq!(e.status("i1").status, Status::Verified);
+    assert!(e.state().journal_reset_ms.is_none());
+}
+
+/// Review finding 2: deleting the sealed journal (and the replay store) is
+/// not a first start: without the first-start marker it is a reset, the
+/// SOC replay store is fenced and orders are refused until `rearm`.
+#[test]
+fn review_a_deleted_journal_is_a_reset_not_a_first_start() {
+    let key = seal_key(7);
+    let nft = FakeNft::default();
+    let d = tmpdir("rv-deleted");
+    let mut e = sealed_engine(&d, &nft, 1_000, &key);
+    let o = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    // The operator's emergency disable, then the state files deleted.
+    nft.0.lock().unwrap().table = None;
+    e.periodic_verify(1_100);
+    assert!(e.state().operator_disabled);
+    drop(e);
+    std::fs::remove_file(d.join("journal.json")).unwrap();
+    std::fs::remove_file(d.join(crate::soc::NONCE_FILE)).unwrap();
+    let mut e = sealed_engine_as_is(&d, &nft, 2_000, &key);
+    assert!(e.state().journal_reset_ms.is_some(), "not a first start");
+    assert!(reset_reason(&e).contains("first-start marker"));
+    let o = order(
+        "i2",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut idle(), 2_100);
+    assert_eq!(out.refusal.unwrap().code, codes::JOURNAL_RESET);
+    drop(e);
+    let s = crate::soc::ReplayStore::open_sealed(&d, 2_005, 30, true, Some(key.clone()));
+    assert_eq!(s.fence_s(), Some(32), "replay store fenced (now + skew)");
+}
+
+/// Review finding 8: the state files are written through a fresh temporary
+/// file with a random name: a planted file or symlink at the old fixed
+/// temporary name is never written through.
+#[test]
+fn review_writes_never_follow_a_planted_temp_file() {
+    let d = tmpdir("rv-tmp");
+    let victim = d.join("victim");
+    std::fs::write(&victim, "untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, d.join("journal.json.tmp")).unwrap();
+    std::os::unix::fs::symlink(&victim, d.join(format!("{}.tmp", crate::soc::NONCE_FILE))).unwrap();
+    let nft = FakeNft::default();
+    let mut e = sealed_engine(&d, &nft, 1_000, &seal_key(7));
+    let o = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    let left = std::fs::read_dir(&d)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|x| x.file_name().to_string_lossy().contains(".tmp-"))
+        .count();
+    assert_eq!(left, 0, "no temporary file left behind");
+}
+
+/// Review finding 10: `stop-cleanup` reads the sealed journal with the
+/// seal key, so its actions are marked reverted (not left `active` for the
+/// next start to read as an emergency disable).
+#[test]
+fn review_abandon_marks_a_sealed_journal() {
+    let key = seal_key(7);
+    let nft = FakeNft::default();
+    let d = tmpdir("rv-abandon");
+    let mut e = sealed_engine(&d, &nft, 1_000, &key);
+    let o = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    assert_eq!(e.submit(&o, &mut idle(), 1_000).status, Status::Verified);
+    drop(e);
+    let c = cfg(d.to_str().unwrap());
+    let mut n = nft.clone();
+    let mut ports = crate::motion::SystemPorts;
+    let k = crate::engine::abandon(
+        Some(&c),
+        &mut n,
+        "stopped",
+        2_000,
+        Some(key.clone()),
+        &mut ports,
+    )
+    .unwrap();
+    assert_eq!(k, 1);
+    assert!(nft.0.lock().unwrap().table.is_none());
+    let e = sealed_engine(&d, &nft, 3_000, &key);
+    assert_eq!(e.status("i1").status, Status::Reverted);
+    assert!(
+        !e.state().operator_disabled,
+        "not taken for an emergency disable"
+    );
+    assert!(e.state().journal_reset_ms.is_none());
 }
 
 /// Gap 1: the executor's SOC replay store is sealed too; a store that

@@ -1581,3 +1581,64 @@ fn review3_r3_1_a_participant_sending_from_an_ephemeral_port_is_dropped() {
     );
     assert_containment_matches_rules(&v, &table);
 }
+
+/// Review of gap 1, finding 1: after the executor's journal is reset (its
+/// event sequence starts again at 1), agentd still sees the new events,
+/// the `journal_reset` among them, and raises the epoch change: it does not
+/// keep waiting for sequence numbers above the old ones.
+#[test]
+fn review_gap1_f1_agentd_follows_an_executor_journal_reset() {
+    let s = setup("exec-epoch", &robot_profile(true));
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    // A journal with a few events, so the sequence is well above 1.
+    let state = s.dir.join("executor-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut st = robodr_executor::journal::State::empty("test-boot");
+    for i in 0..5 {
+        st.event(
+            1_000 + i,
+            robodr_executor::journal::EventKind::Reconciled,
+            None,
+            None,
+            "earlier run",
+        );
+    }
+    robodr_executor::journal::Journal::new(&state)
+        .save(&st)
+        .unwrap();
+    let exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let spec = robodr_agentd::executor_link::ExecutorSpec {
+        socket: exec_sock.clone(),
+        key: Key::from_bytes(EXEC_KEY),
+        planner_orders: false,
+        timeout: std::time::Duration::from_secs(5),
+    };
+    let link = robodr_agentd::executor_link::ExecutorLink::start(
+        &spec,
+        robodr_agentd::executor_link::SafetyCell::default(),
+    )
+    .unwrap();
+    let first = wait_for(10, "the executor's events", || {
+        let evs = link.take_events();
+        (evs.len() >= 5).then_some(evs)
+    });
+    assert!(first.iter().all(|e| e.seq >= 1));
+    let before = wait_for(5, "a journal head", || link.journal_head());
+    // The executor restarts on an unreadable journal: reset, sequence
+    // restarted, a new epoch.
+    drop(exec);
+    std::fs::write(s.dir.join("executor-state/journal.json"), b"garbage").unwrap();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let evs = wait_for(15, "the journal_reset event after the reset", || {
+        let evs = link.take_events();
+        evs.iter()
+            .any(|e| e.kind == robodr_executor::journal::EventKind::JournalReset)
+            .then_some(evs)
+    });
+    assert!(evs.iter().all(|e| e.seq < before.next_seq), "{evs:?}");
+    let alarms = link.take_head_alarms();
+    assert_eq!(alarms.len(), 1, "{alarms:?}");
+    assert!(alarms[0].1.contains("epoch changed"), "{}", alarms[0].1);
+    assert_ne!(link.journal_head().unwrap().epoch, before.epoch);
+}

@@ -70,9 +70,9 @@
 //! make the executor's own rules refuse.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use robodr_blackbox::crypto::{from_hex, sha256, to_hex};
@@ -895,6 +895,14 @@ impl ReplayStore {
         }
     }
 
+    /// Fence every request signed up to `now_s + skew_s` (the executor's
+    /// journal was reset: whatever the store holds may be as old as the
+    /// journal that was lost) and persist the fence.
+    pub fn fence_now(&mut self, now_s: u64, skew_s: u64, why: String) {
+        self.fence(now_s.saturating_add(skew_s), why);
+        let _ = self.save();
+    }
+
     fn fence(&mut self, now_s: u64, why: String) {
         self.fence_s = Some(self.fence_s.map_or(now_s, |f| f.max(now_s)));
         self.fenced_because = Some(why);
@@ -936,21 +944,8 @@ impl ReplayStore {
             None => json,
             Some(k) => crate::journal::seal(k, NONCE_SEALED_FORMAT, &json),
         };
-        let tmp = self.dir.join(format!("{NONCE_FILE}.tmp"));
-        let res = (|| -> std::io::Result<()> {
-            let mut fh = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            fh.write_all(&data)?;
-            fh.sync_all()?;
-            drop(fh);
-            std::fs::rename(&tmp, self.path())?;
-            File::open(&self.dir)?.sync_all()
-        })();
-        res.map_err(|e| format!("{}: {e}", self.path().display()))
+        crate::journal::write_atomic(&self.dir, NONCE_FILE, &data)
+            .map_err(|e| format!("{}: {e}", self.path().display()))
     }
 
     /// Check the fence and the pair, and make the pair durable before `Ok`.

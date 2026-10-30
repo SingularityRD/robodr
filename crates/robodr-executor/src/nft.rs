@@ -958,6 +958,26 @@ pub fn verify(listed: Option<&[Value]>, want: &Rendered) -> Result<(), String> {
     Ok(())
 }
 
+/// The comment the rules of action `id` carry in the table (`None`: the
+/// effect renders no rule).
+pub fn entry_comment(id: &str, effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::Quarantine(_) => Some(format!("robodr quarantine_node {}", tag(id))),
+        Effect::Isolate(_) => Some(format!("robodr isolate_network {}", tag(id))),
+        _ => None,
+    }
+}
+
+/// The comments of every rule in a listing.
+pub fn rule_comments(listed: &[Value]) -> std::collections::BTreeSet<String> {
+    listed
+        .iter()
+        .filter_map(|o| o.get("rule"))
+        .filter_map(|r| r.get("comment").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Packet / byte counters of every drop rule, summed per comment (for
 /// status and evidence).
 pub fn drop_counters(listed: &[Value]) -> BTreeMap<String, (u64, u64)> {

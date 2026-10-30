@@ -1622,14 +1622,40 @@ pub struct Service {
 // Decision notes (journal reconciliation at start)
 // ---------------------------------------------------------------------------
 
+/// Whether a black-box record is authentic: its hash matches its content
+/// and its signature verifies under the black-box key (`signer.verify_own`,
+/// the check [`super::anchor::latest`] applies to head notes). A note that
+/// fails it is never believed (review finding 6).
+pub fn authentic(
+    rec: &robodr_blackbox::record::Record,
+    signer: &dyn robodr_blackbox::Signer,
+) -> bool {
+    rec.compute_hash() == rec.hash
+        && signer.verify_own(
+            &robodr_blackbox::record::signing_message(&rec.hash),
+            &rec.sig,
+        ) == Some(true)
+}
+
+/// Notes found in the black box, and how many candidate notes were
+/// rejected because their hash or signature did not verify.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotesFound<T> {
+    pub found: T,
+    pub rejected: usize,
+}
+
 /// Find the black-box notes that carry one of `ids` as `decision_id`; their
 /// evidence references (`robodr-blackbox://<robot>/<segment>/<seq>?sha256=`).
+/// Only authentic notes count ([`authentic`]); the others are counted in
+/// `rejected`.
 pub fn find_decision_notes(
     src: &dyn SegmentSource,
     robot_id: &str,
     ids: &[String],
-) -> io::Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
+    signer: &dyn robodr_blackbox::Signer,
+) -> io::Result<NotesFound<BTreeMap<String, String>>> {
+    let mut out = NotesFound::default();
     if ids.is_empty() {
         return Ok(out);
     }
@@ -1656,7 +1682,11 @@ pub fn find_decision_notes(
                 continue;
             };
             if v.get("decision_id").and_then(Value::as_str) == Some(id.as_str()) {
-                out.insert(
+                if !authentic(&rec, signer) {
+                    out.rejected += 1;
+                    continue;
+                }
+                out.found.insert(
                     id.clone(),
                     RecordRef {
                         segment: idx,
@@ -1684,9 +1714,14 @@ pub struct RequestNote {
 }
 
 /// Every `robodr.control_plane_request` and `robodr.control_plane_revert`
-/// note of `robot_id` in the black box, oldest first.
-pub fn find_request_notes(src: &dyn SegmentSource, robot_id: &str) -> io::Result<Vec<RequestNote>> {
-    let mut out = Vec::new();
+/// note of `robot_id` in the black box, oldest first. Only authentic notes
+/// count ([`authentic`]); the others are counted in `rejected`.
+pub fn find_request_notes(
+    src: &dyn SegmentSource,
+    robot_id: &str,
+    signer: &dyn robodr_blackbox::Signer,
+) -> io::Result<NotesFound<Vec<RequestNote>>> {
+    let mut out: NotesFound<Vec<RequestNote>> = NotesFound::default();
     for idx in src.list()? {
         let Some(bytes) = src.read(idx)? else {
             continue;
@@ -1715,7 +1750,11 @@ pub fn find_request_notes(src: &dyn SegmentSource, robot_id: &str) -> io::Result
             {
                 continue;
             }
-            out.push(RequestNote {
+            if !authentic(&rec, signer) {
+                out.rejected += 1;
+                continue;
+            }
+            out.found.push(RequestNote {
                 note: v,
                 evidence: RecordRef {
                     segment: idx,
@@ -2289,12 +2328,11 @@ mod tests {
             .unwrap();
         notes(&mut r, 30, 30);
         drop(r);
-        let found = find_decision_notes(
-            &DirSource(d.clone()),
-            ROBOT,
-            &["deadbeef00112233deadbeef00112233".into(), "00".repeat(16)],
-        )
-        .unwrap();
+        let ids = ["deadbeef00112233deadbeef00112233".into(), "00".repeat(16)];
+        let all = find_decision_notes(&DirSource(d.clone()), ROBOT, &ids, key("bb-1", 1).as_ref())
+            .unwrap();
+        assert_eq!(all.rejected, 0);
+        let found = all.found;
         assert_eq!(found.len(), 1);
         let uri = &found["deadbeef00112233deadbeef00112233"];
         let robodr_blackbox::store::AppendOutcome::Recorded { seq, hash } = out else {
@@ -2311,6 +2349,37 @@ mod tests {
             }
             .uri(ROBOT)
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review of gap 1, finding 6: a decision or request note whose
+    /// signature does not verify under the black-box key (another key, or
+    /// a forged record) is not believed; it is counted.
+    #[test]
+    fn notes_that_do_not_verify_are_rejected_and_counted() {
+        let d = tmp("notes-forged");
+        let mut r = recorder(&d, 64);
+        r.append_note(
+            &serde_json::json!({"kind": "robodr.control_plane_request", "robot_id": ROBOT,
+                "decision_id": "deadbeef00112233deadbeef00112233"}),
+            true,
+        )
+        .unwrap();
+        drop(r);
+        let src = DirSource(d.clone());
+        let ids = ["deadbeef00112233deadbeef00112233".to_string()];
+        let other = key("bb-9", 9);
+        let dn = find_decision_notes(&src, ROBOT, &ids, other.as_ref()).unwrap();
+        assert!(
+            dn.found.is_empty(),
+            "a note under another key settled a decision"
+        );
+        assert_eq!(dn.rejected, 1);
+        let rn = find_request_notes(&src, ROBOT, other.as_ref()).unwrap();
+        assert!(rn.found.is_empty());
+        assert_eq!(rn.rejected, 1);
+        let ok = find_request_notes(&src, ROBOT, key("bb-1", 1).as_ref()).unwrap();
+        assert_eq!((ok.found.len(), ok.rejected), (1, 0));
         let _ = std::fs::remove_dir_all(&d);
     }
 

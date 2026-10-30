@@ -463,7 +463,9 @@ fn fatal_start(cfg: Option<&Resolved>, why: &str) {
         "executor start failed ({}): table inet robodr deleted, every action reverted",
         why.chars().take(200).collect::<String>()
     );
-    match engine::abandon(cfg, &mut nft, &why, proto::wall_ms()) {
+    let seal = cfg.and_then(seal_key_of);
+    let mut ports = robodr_executor::motion::SystemPorts;
+    match engine::abandon(cfg, &mut nft, &why, proto::wall_ms(), seal, &mut ports) {
         Ok(n) => eprintln!("robodr-executor: {why} ({n} journalled)"),
         Err(e) => eprintln!("robodr-executor: deleting table inet robodr failed: {e}"),
     }
@@ -500,7 +502,16 @@ fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
                 .collect()
         }
     );
-    match engine::abandon(cfg.as_ref(), &mut nft, &why, proto::wall_ms()) {
+    let seal = cfg.as_ref().and_then(seal_key_of);
+    let mut ports = robodr_executor::motion::SystemPorts;
+    match engine::abandon(
+        cfg.as_ref(),
+        &mut nft,
+        &why,
+        proto::wall_ms(),
+        seal,
+        &mut ports,
+    ) {
         Ok(n) => {
             eprintln!("robodr-executor: {why} ({n} action(s))");
             ExitCode::SUCCESS
@@ -508,6 +519,19 @@ fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
         Err(e) => {
             eprintln!("robodr-executor: stop-cleanup: deleting table inet robodr failed: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+/// The state-seal key (review finding 10: `stop-cleanup` reads and marks
+/// the sealed journal). `None` when the link key cannot be loaded: the
+/// journal is then left alone (the table is deleted all the same).
+fn seal_key_of(cfg: &Resolved) -> Option<std::sync::Arc<robodr_blackbox::StateSealKey>> {
+    match Key::load(&cfg.config.key_file).and_then(|k| k.state_seal_key()) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!("robodr-executor: {e}: the journal is not marked");
+            None
         }
     }
 }

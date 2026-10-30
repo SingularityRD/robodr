@@ -203,8 +203,13 @@ pub fn handle(
                 bad_id(&id)
             }),
         },
-        Msg::Events { since } => {
+        Msg::Events { since, anchor } => {
             let mut g = lock(engine);
+            if let Some(a) = &anchor {
+                // Review of gap 1: an older journal put back is caught by
+                // the head agentd anchored in its black box.
+                g.check_anchor(a, Now::system());
+            }
             if g.has_held() {
                 // Actions held after a reboot: re-armed only with the
                 // safety state now.
@@ -221,6 +226,7 @@ pub fn handle(
             }
             Msg::EventList {
                 events: g.events_since(since, proto::MAX_EVENTS_PER_ANSWER),
+                head: Some(g.answer_head()),
             }
         }
         Msg::Ping => {

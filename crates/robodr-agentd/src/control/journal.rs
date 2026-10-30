@@ -181,6 +181,11 @@ pub struct Sealing {
     pub requests: Option<Anchor>,
     pub nonces: Option<Anchor>,
     pub adopt_legacy: bool,
+    /// The black box holds no head note but has dropped segments (a cyclic
+    /// store aged it out, or it was cut): "no anchor" cannot be told from
+    /// "anchor lost", so a journal without one is [`AnchorCheck::Unanchored`]
+    /// (fence, reconciliation), never taken as it is.
+    pub anchor_lost: bool,
 }
 
 impl Sealing {
@@ -192,6 +197,21 @@ impl Sealing {
             requests: None,
             nonces: None,
             adopt_legacy: false,
+            anchor_lost: false,
+        }
+    }
+
+    /// The comparison with the black box as the callers act on it: with
+    /// the anchor lost ([`Sealing::anchor_lost`]), `NoAnchor` is
+    /// `Unanchored`.
+    pub fn qualify(&self, a: AnchorCheck) -> AnchorCheck {
+        match a {
+            AnchorCheck::NoAnchor if self.anchor_lost => AnchorCheck::Unanchored(
+                "the black box holds no head note but dropped segments: the newest head may \
+                 have aged out"
+                    .into(),
+            ),
+            a => a,
         }
     }
 
@@ -352,6 +372,33 @@ struct Scan {
     good_end: u64,
 }
 
+/// Skip to the end of the current line without buffering it: the bytes
+/// consumed and whether a newline ended it (`false`: end of file).
+fn skip_line(r: &mut impl BufRead) -> io::Result<(u64, bool)> {
+    let mut n: u64 = 0;
+    loop {
+        let (used, done) = {
+            let buf = match r.fill_buf() {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if buf.is_empty() {
+                return Ok((n, false));
+            }
+            match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            }
+        };
+        r.consume(used);
+        n += used as u64;
+        if done {
+            return Ok((n, true));
+        }
+    }
+}
+
 /// One pass: the good lines, how many bad lines precede a good one
 /// (damage) and where the last good line ends (the torn tail starts).
 fn scan(file: File, parse: &mut dyn FnMut(&[u8]) -> Line) -> io::Result<(Scan, bool)> {
@@ -380,11 +427,11 @@ fn scan(file: File, parse: &mut dyn FnMut(&[u8]) -> Line) -> io::Result<(Scan, b
         offset += n as u64;
         if buf.last() != Some(&b'\n') {
             if n > MAX_LINE {
-                // An over-long line: skip to its end; bad either way.
-                let mut rest = Vec::new();
-                let m = r.read_until(b'\n', &mut rest)?;
-                offset += m as u64;
-                if rest.last() == Some(&b'\n') {
+                // An over-long line: skip to its end in bounded chunks
+                // (review finding 9: never buffer it whole); bad either way.
+                let (m, terminated) = skip_line(&mut r)?;
+                offset += m;
+                if terminated {
                     pending_bad += 1;
                     // Keep the chain going: the next line names this one's
                     // tag, which is lost; it fails as an edit would.
@@ -685,9 +732,11 @@ impl Journal {
             let qdir = dir.join("quarantine");
             fsutil::create_dir_private(&qdir)?;
             let q = qdir.join(format!("{name}.{}.damaged", unix_ms()));
-            let bytes = fsutil::read_capped_nofollow(&path, MAX_FILE_BYTES)?;
+            // Streamed (review finding 9): a journal up to MAX_FILE_BYTES is
+            // never held in memory.
+            let src = fsutil::open_read_nofollow(&path)?;
             let mut f = fsutil::create_new_private(&q)?;
-            f.write_all(&bytes)?;
+            io::copy(&mut src.take(MAX_FILE_BYTES), &mut f)?;
             f.sync_all()?;
             fsutil::sync_dir(&qdir)?;
             loaded.quarantined = Some(q);
@@ -1503,6 +1552,72 @@ pub(crate) mod tests {
         l.extend_from_slice(&json);
         l.push(b'\n');
         l
+    }
+
+    /// Review of gap 1, finding 9: an over-long line is skipped in bounded
+    /// chunks (never buffered whole), and a damaged journal is copied to
+    /// the quarantine as it is (streamed).
+    #[test]
+    fn over_long_lines_are_skipped_without_buffering_them() {
+        struct Chunks {
+            left: u64,
+            buf: [u8; 4096],
+            biggest: usize,
+        }
+        impl Read for Chunks {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = (out.len() as u64).min(self.left) as usize;
+                out[..n].fill(b'a');
+                self.left -= n as u64;
+                Ok(n)
+            }
+        }
+        impl BufRead for Chunks {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                let n = (self.buf.len() as u64).min(self.left) as usize;
+                self.biggest = self.biggest.max(n);
+                self.buf[..n].fill(b'a');
+                if n > 0 && self.left == n as u64 {
+                    self.buf[n - 1] = b'\n';
+                }
+                Ok(&self.buf[..n])
+            }
+            fn consume(&mut self, n: usize) {
+                self.left -= n as u64;
+            }
+        }
+        // 64 MiB on one line.
+        let mut r = Chunks {
+            left: 64 << 20,
+            buf: [0; 4096],
+            biggest: 0,
+        };
+        assert_eq!(skip_line(&mut r).unwrap(), (64 << 20, true));
+        assert!(r.biggest <= 4096);
+        let mut r = Chunks {
+            left: 0,
+            buf: [0; 4096],
+            biggest: 0,
+        };
+        assert_eq!(skip_line(&mut r).unwrap(), (0, false));
+        // End to end: an over-long line followed by a good one is damage,
+        // and the quarantined copy is byte for byte the original.
+        let d = tmp("overlong");
+        let (j, _) = open(&d);
+        drop(j);
+        let p = d.join("t.journal");
+        let mut lines = file_lines(&p);
+        let mut long = vec![b'x'; MAX_LINE * 3];
+        long.push(b'\n');
+        lines.insert(1, long);
+        lines.push(sealed_line(&"00".repeat(32), &e(1)));
+        write_lines(&p, &lines);
+        let original = std::fs::read(&p).unwrap();
+        let (_, l) = open(&d);
+        assert!(l.damaged >= 1);
+        let q = l.quarantined.unwrap();
+        assert_eq!(std::fs::read(q).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The one-time upgrade: a v1 journal is adopted and rewritten sealed
