@@ -113,6 +113,7 @@ fn older_minor_uses_the_older_catalog() {
         // Every 2.x has the full catalog, whatever its minor.
         assert_eq!(rule_info_for_contract(id, "2.0.0"), rule_info(id));
         assert_eq!(rule_info_for_contract(id, "2.2.0"), rule_info(id));
+        assert_eq!(rule_info_for_contract(id, "2.3.0"), rule_info(id));
         // Malformed versions get the current (strictest) catalog.
         assert_eq!(rule_info_for_contract(id, "x"), rule_info(id));
     }

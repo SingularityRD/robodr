@@ -194,6 +194,8 @@ pub const CATALOG_1_3_MINOR: u64 = 3;
 pub const CATALOG_2_1_MINOR: u64 = 1;
 /// Contract 2.x minor that added [`catalog_2_2`]'s entries.
 pub const CATALOG_2_2_MINOR: u64 = 2;
+/// Contract 2.x minor that added [`catalog_2_3`]'s entries.
+pub const CATALOG_2_3_MINOR: u64 = 3;
 
 /// The trusted rule catalog of the current contract
 /// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
@@ -204,6 +206,7 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         .or_else(|| catalog_1_3(rule))
         .or_else(|| catalog_2_1(rule))
         .or_else(|| catalog_2_2(rule))
+        .or_else(|| catalog_2_3(rule))
         .unwrap_or(GENERIC)
 }
 
@@ -217,7 +220,8 @@ pub fn rule_info(rule: &str) -> RuleInfo {
 /// | 1.0 - 1.2 | base ([`catalog_1_0`]) |
 /// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
 /// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
-/// | 2.2+ | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+/// | 2.2 | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+/// | 2.3+ | base + 1.3 + 2.1 + 2.2 + 2.3 ([`catalog_2_3`]) |
 ///
 /// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
@@ -231,10 +235,13 @@ pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_1_MINOR);
     let with_2_2 =
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_2_MINOR);
+    let with_2_3 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_3_MINOR);
     catalog_1_0(rule)
         .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
         .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
         .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
+        .or_else(|| with_2_3.then(|| catalog_2_3(rule)).flatten())
         .unwrap_or(GENERIC)
 }
 
@@ -1042,6 +1049,57 @@ fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
         _ => return None,
     })
 }
+
+/// Entries added in contract **2.3**. Each feature that adds entries in
+/// this minor keeps its own block below (one function per block), so
+/// additions merge without touching each other.
+fn catalog_2_3(rule: &str) -> Option<RuleInfo> {
+    catalog_2_3_seal(rule)
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: sealing (captured-unit software protection,
+// `docs/SECURE-DELIVERY.md` §7 and §9, Sprint 13c; robodr-seal through
+// robodr-deliverd), data source `robodr_delivery`.
+// ---------------------------------------------------------------------------
+
+/// The `robot.seal.*` ids of `docs/SECURE-DELIVERY.md` §9. Not in 2.2 or
+/// earlier: a 2.2 validator applies the generic entry to these ids, and so
+/// does a 2.3 validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_seal(rule: &str) -> Option<RuleInfo> {
+    const DELIVERY: &str = "robodr_delivery";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: DELIVERY,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.seal.unseal_failed" => e(
+            "Unit could not unseal delivered software",
+            "The unit's TPM refused to release the key of a sealed (encrypted) delivered package: the boot measurements do not match the signed PCR policy, the policy was revoked, or the unit's sealing keys were crypto-erased. The package stays unreadable on the unit; RoboDR detection keeps running.",
+        ),
+        "robot.seal.lease_expired" => e(
+            "Site lease expired",
+            "The unit's site lease for unsealing delivered software expired: sealed packages become unavailable after its next reboot until a fresh lease is issued.",
+        ),
+        "robot.seal.erased" => e(
+            "Crypto-erase of delivered software executed",
+            "The unit's sealing keys were cryptographically erased (the TPM erase epoch moved on, or the fallback key and volume keyslots were destroyed), with the trigger named in the finding. Every sealed package on the unit is permanently unreadable; recovery is re-enrolment and re-delivery.",
+        ),
+        "robot.seal.tamper" => e(
+            "Enclosure tamper or erase trigger fired",
+            "An enclosure tamper input or another crypto-erase trigger fired on the unit; a crypto-erase of its sealing keys follows.",
+        ),
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// End of the contract 2.3 sealing block.
+// ---------------------------------------------------------------------------
 
 /// The contract 1.0 - 1.2 catalog.
 fn catalog_1_0(rule: &str) -> Option<RuleInfo> {
