@@ -79,9 +79,9 @@ fn apply_one(m: &MotionSection, spec: &MotionSpec, k: AdapterKind) -> Result<Str
         AdapterKind::Gateway => gateway_apply(m, spec),
         AdapterKind::UnitreeSport => {
             let u = m.unitree_sport.as_ref().ok_or_else(|| missing(k))?;
-            unitree_speed_level(u, spec, u.speed_level)
+            unitree_speed_level(u, u.speed_level)
         }
-        AdapterKind::Nav2 => nav2_pause(m, spec),
+        AdapterKind::Nav2 => nav2_pause(m),
         AdapterKind::Ros2Control => {
             let c = m.ros2_control.as_ref().ok_or_else(|| missing(k))?;
             switch(c, &c.activate, &c.deactivate)
@@ -96,7 +96,7 @@ fn revert_one(m: &MotionSection, spec: &MotionSpec, k: AdapterKind) -> Result<St
         AdapterKind::Gateway => gateway_revert(m, spec),
         AdapterKind::UnitreeSport => {
             let u = m.unitree_sport.as_ref().ok_or_else(|| missing(k))?;
-            unitree_speed_level(u, spec, 0)
+            unitree_speed_level(u, 0)
         }
         AdapterKind::Nav2 => Ok(
             "nothing to undo: cancelled navigation goals are not restored; \
@@ -228,11 +228,13 @@ fn gateway_revert(m: &MotionSection, spec: &MotionSpec) -> Result<String, String
 
 // ----------------------------------------------------------------- ROS 2
 
-/// A 64-bit id from a string (FNV-1a; Unitree request ids, client ids).
-fn id64(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+/// Fresh correlation ids for one service call (review F10): a random
+/// client id and a random sequence number above 1, so a reply cannot be
+/// precomputed from the request, the controllers or the order id.
+fn correlation() -> (u64, i64) {
+    let client = rtps::random_u64() | 1;
+    let seq = ((rtps::random_u64() >> 2) | 2) as i64;
+    (client, seq)
 }
 
 /// A service call with the `rmw_cyclonedds` request header: the reply
@@ -258,15 +260,26 @@ fn call_service(
     };
     send(&mut part).map_err(|e| format!("send: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
+    let peer = p.peer_prefix()?;
     part.wait(
         deadline,
         Duration::from_millis(p.resend_ms),
         send,
         |r: &Received| {
+            from_peer(peer, r)?;
             let mut d = Dec::open(&r.payload).ok()?;
             (d.u64().ok()? == client && d.i64().ok()? == seq).then(|| r.payload.clone())
         },
     )
+}
+
+/// With `peer_participant_prefix` configured, only a sample of one of the
+/// peer's own writers is an answer (review F10).
+fn from_peer(peer: Option<[u8; 12]>, r: &Received) -> Option<()> {
+    match peer {
+        Some(p) if r.writer[..12] != p => None,
+        _ => Some(()),
+    }
 }
 
 /// Skip the request header of a reply.
@@ -277,12 +290,11 @@ fn reply_body(payload: &[u8]) -> Result<Dec<'_>, String> {
     Ok(d)
 }
 
-fn nav2_pause(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
+fn nav2_pause(m: &MotionSection) -> Result<String, String> {
     let n = m.nav2.as_ref().ok_or_else(|| missing(AdapterKind::Nav2))?;
-    let client = id64(&spec.id);
     let mut notes = Vec::new();
-    for (i, a) in n.actions.iter().enumerate() {
-        let seq = i as i64 + 1;
+    for a in &n.actions {
+        let (client, seq) = correlation();
         let req = cdr::cancel_all_goals(client, seq);
         let rep = call_service(
             &n.ros2,
@@ -325,8 +337,7 @@ fn switch(
     activate: &[String],
     deactivate: &[String],
 ) -> Result<String, String> {
-    let client = id64(&format!("{activate:?}{deactivate:?}"));
-    let seq = 1;
+    let (client, seq) = correlation();
     let req = cdr::switch_controller(
         client,
         seq,
@@ -354,13 +365,9 @@ fn switch(
     ))
 }
 
-fn unitree_speed_level(
-    u: &super::UnitreeAdapter,
-    spec: &MotionSpec,
-    level: i32,
-) -> Result<String, String> {
+fn unitree_speed_level(u: &super::UnitreeAdapter, level: i32) -> Result<String, String> {
     const SPEED_LEVEL: i64 = 1015;
-    let id = (id64(&format!("{}:{level}", spec.id)) >> 1) as i64;
+    let id = (rtps::random_u64() >> 1) as i64;
     let req = cdr::unitree_request(id, SPEED_LEVEL, &format!("{{\"data\":{level}}}"));
     let mut part =
         Participant::open(u.ros2.peer()?, u.ros2.prefix()?).map_err(|e| format!("socket: {e}"))?;
@@ -374,11 +381,13 @@ fn unitree_speed_level(
     };
     send(&mut part).map_err(|e| format!("send: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(u.ros2.timeout_ms);
+    let peer = u.ros2.peer_prefix()?;
     let code = part.wait(
         deadline,
         Duration::from_millis(u.ros2.resend_ms),
         send,
         |r: &Received| {
+            from_peer(peer, r)?;
             let (rid, api, code) = cdr::unitree_response(&r.payload).ok()?;
             (rid == id && api == SPEED_LEVEL).then_some(code)
         },
@@ -491,9 +500,11 @@ fn px4_mode(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
                 }
             }
             if let Some((c, result, ts, tc)) = mav::parse_command_ack(&f) {
-                // The target fields are an extension: an autopilot that does not
-                // fill them sends zeros.
-                let to_us = (ts, tc) == (p.system_id, p.component_id) || (ts, tc) == (0, 0);
+                // The target fields are an extension (PX4 fills them). Review
+                // F10: only an ack naming our own system / component is ours;
+                // zero targets (an autopilot that does not fill them, or a
+                // forger's broadcast) never confirm, the call fails closed.
+                let to_us = (ts, tc) == (p.system_id, p.component_id);
                 if c == mav::MAV_CMD_DO_SET_MODE && to_us {
                     if result != mav::MAV_RESULT_ACCEPTED {
                         return Err(format!("DO_SET_MODE refused (MAV_RESULT {result})"));
@@ -538,25 +549,20 @@ fn rollback(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
         .as_ref()
         .ok_or_else(|| missing(AdapterKind::Rollback))?;
     let v = spec.request.to_version.as_deref().ok_or("no to_version")?;
+    // Planned only when it matches the version grammar (never a leading
+    // `-`); passed as one `--to-version=<v>` argument either way.
+    if !super::version_ok(v) {
+        return Err(format!("to_version {v:?} is not a version"));
+    }
+    let to = format!("--to-version={v}");
     let t = Duration::from_millis(r.timeout_ms);
     run(
         &r.program,
-        &[
-            "--config",
-            "program",
-            "--to-version",
-            v,
-            "--request-id",
-            &spec.id,
-        ],
+        &["--config", "program", &to, "--request-id", &spec.id],
         t,
     )?;
-    run(
-        &r.program,
-        &["--verify", "--config", "program", "--to-version", v],
-        t,
-    )
-    .map_err(|e| format!("rolled back but --verify failed: {e}"))?;
+    run(&r.program, &["--verify", "--config", "program", &to], t)
+        .map_err(|e| format!("rolled back but --verify failed: {e}"))?;
     Ok(format!(
         "program rolled back to {v} and verified by the site program"
     ))

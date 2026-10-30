@@ -75,6 +75,16 @@ pub fn random_prefix() -> [u8; 12] {
     p
 }
 
+/// A random 64-bit value (`/dev/urandom` through [`random_prefix`]): the
+/// correlation ids of service calls and SDK requests (review F10: an id
+/// derived from the request is one a forger can compute).
+pub fn random_u64() -> u64 {
+    let r = random_prefix();
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&r[..8]);
+    u64::from_le_bytes(b)
+}
+
 /// A user entity id with a fresh random key (`kind` 0x03: writer without
 /// key, 0x04: reader without key). Each call announces new endpoints, so
 /// a participant with a fixed prefix never reuses a writer GUID (whose

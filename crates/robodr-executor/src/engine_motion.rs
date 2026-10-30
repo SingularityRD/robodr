@@ -318,6 +318,32 @@ impl Engine {
 
     /// After a reboot: apply the motion entries just re-armed (their nft
     /// part, if any, is already installed). A failure reverts the entry.
+    /// Review F7: a held motion action is re-armed only in a safety state
+    /// its adapters allow ([`crate::motion::MotionSpec::allowed`], the
+    /// same gate as a fresh submit); `Some(why)` keeps it held.
+    pub(super) fn motion_rearm_blocked(
+        &self,
+        effect: &Effect,
+        s: robodr_responder::SafetyState,
+    ) -> Option<String> {
+        let Effect::Motion(spec) = effect else {
+            return None;
+        };
+        (!spec.allowed(&self.motion_cfg(), s)).then(|| {
+            format!(
+                "{}: the {} adapter(s) do not allow {} in safety state {}",
+                codes::SAFETY_STATE_NOT_ALLOWED,
+                spec.adapters
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                spec.action.as_str(),
+                crate::motion::state_name(s)
+            )
+        })
+    }
+
     pub(super) fn motion_rearmed(&mut self, armed: &[String], now_ms: u64) {
         let m = self.motion_cfg();
         for id in armed {

@@ -174,6 +174,15 @@ morphology, safety system not engaged, state known).
 |---|---|---|---|
 | `restrict_motion` | `gateway` | restriction file for `robodr-firewall-gw` (`motion.gateway.restriction_path`, expiry = TTL); the gateway's status must report its id within `verify_timeout_ms` | file removed, read back; the gateway also lifts it at its expiry on its own |
 | | `unitree_sport` | sport `SpeedLevel(speed_level)` (`rt/api/sport/request`, `unitree_api` `Request_`), the `Response_` with the same identity and code 0 | `SpeedLevel(0)` (the SDK's default level: **not** necessarily the level before; documented) |
+
+`SpeedLevel` is a firmware speed range, not a cap: on its own anyone on
+the bus can set another level. With the gateway in the path, list
+`restrict_motion: ["unitree_sport", "gateway"]` (that order is enforced):
+the gateway refuses every `SpeedLevel` while its restriction is in force
+(it applies after the level is set and is lifted before it is reset).
+Without the gateway, the level is advisory. A restriction limits commands
+decided after it is applied; a joint trajectory the controller already
+accepted keeps executing at its accepted speeds (use `safe_pause`).
 | `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel` | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
 | | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch |
 | | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
@@ -185,7 +194,9 @@ for the morphology (`fall_hazard`: a pause / safe state on a humanoid,
 a rollback on a robot that balances); **two people** for `safe_pause`,
 `request_safe_state` and `rollback_config` — the SOC-signed body's
 `approved_by` names at least two different people, neither the requester
-(`approval_missing`; checked when the executor authenticates the order;
+(names `[A-Za-z0-9._%+@-]{1,100}`, compared case-insensitively, the
+requester's too; a name outside that grammar refuses the order:
+`approval_missing`; checked when the executor authenticates the order;
 the on-robot planner can never order them; a revert of a `safe_pause`
 needs two too); an adapter configured (`no_adapter`) and validated
 (`adapter_not_validated`); the safety state one the adapter allows
@@ -210,7 +221,8 @@ reconciliation (expired, interrupted or reverting entries), an operator's
 emergency disable and a failed re-arm after a reboot call the adapter's
 undo; a failed undo leaves the action `reverting` and is retried every
 tick. After a reboot a held motion action is re-applied only when re-armed
-(fresh safety state). The periodic read-back re-writes a restriction the
+(fresh safety state, and one its adapters allow: a `safe_pause` held while
+the robot moves fast stays held until it does not). The periodic read-back re-writes a restriction the
 gateway no longer reports. Non-reversible actions are journalled as an
 event before the adapter is called and finish `applied` or `failed`.
 
@@ -218,7 +230,18 @@ The ROS 2 adapters' participant uses `ros2.participant_prefix` (24 hex
 digits) when set, so commissioning can profile the executor's host on the
 robot's bus; otherwise a fresh random prefix per call, which agentd's
 sensor reports as an unknown participant. Each call announces fresh
-writer / reader entities (no reused sequence numbers).
+writer / reader entities (no reused sequence numbers). Correlation ids
+(service client id and sequence number, Unitree request id) are random per
+call, and with `ros2.peer_participant_prefix` (the robot participant's 24
+hex digits, recommended) only the peer's own writers can answer: a forged
+reply then needs both the peer's prefix and the id from the request on
+the wire. Source ports are not checked (Fast DDS sends from an ephemeral
+socket). PX4: only a `COMMAND_ACK` naming the executor's own
+`system_id` / `component_id` counts (an autopilot that leaves the target
+fields zero is not confirmed: the call fails), and the mode is confirmed
+by the vehicle's `HEARTBEAT`. The rollback program receives the version
+as one `--to-version=<v>` argument; a version starting with `-` is
+refused (`invalid_order`).
 
 Protocols (implemented here, std only): a minimal RTPS 2.3 participant
 (`src/motion/rtps.rs`: SPDP / SEDP announcements to one configured peer,

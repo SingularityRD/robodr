@@ -263,7 +263,7 @@ their wire names (`robot_<name>`); it sends the plain name here.
 | `record_evidence` | `robot_record_evidence` | none | not allowed | not applicable: evidence is never reverted (a revert answers `not_reversible`) | `record` | single | executed; accepted in every safety state and in observe mode |
 | `safe_pause` | `robot_safe_pause` | none | not allowed | yes | `safe_pause` | two-person | platform adapter only (OEM-validated policy and adapter, executor `motion` section, §6a); never on a humanoid |
 | `request_safe_state` | `robot_request_safe_state` | none | not allowed | no (an operator restarts) | `request_safe_state` | two-person | plan only by default; executed through an OEM-validated adapter when the executor has a `motion` section (§6a); never on a humanoid |
-| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only by default; `config: program` executed through the site's OEM-validated rollback adapter when the executor has a `motion` section (§6a); never on a humanoid or quadruped (a controller restart) |
+| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`, not starting with `-`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only by default; `config: program` executed through the site's OEM-validated rollback adapter when the executor has a `motion` section (§6a); never on a humanoid or quadruped (a controller restart) |
 
 No action is ever autonomous: the SOC sends one only after the approval
 above. The "GA" column is the catalog's plan for the first executing
@@ -272,11 +272,20 @@ release; in this release nothing is executed (§5).
 `authority` must be `"request"`. `reason` ≤ 500 characters (may be empty),
 `requested_by` 1..=100 characters, neither with control characters;
 `source` `[a-z0-9_-]{1,32}`. Optional `approved_by`: the SOC-side approvers,
-an array of at most 4 names of 1..=100 characters without control
-characters (since Sprint 8; §6a, "Motion adapters": the executor carries
-out `safe_pause`, `request_safe_state` and `rollback_config` only when it
-names at least two different people, neither the requester). No field can
-carry a motion command, a force or an override.
+an array of at most 4 names, each `[A-Za-z0-9._%+@-]{1,100}` (user names
+and email-like identifiers such as `alice.smith+ops@soc.example`; white
+space, quotes, non-ASCII, invisible and combining characters are
+refused `invalid_field`) (since Sprint 8; §6a, "Motion adapters": the
+executor carries out `safe_pause`, `request_safe_state` and
+`rollback_config` only when it names at least two different people,
+neither the requester). Names are compared **ASCII case-insensitively**
+(`Alice@SOC` and `alice@soc` are one person), the requester's trimmed
+`requested_by` too. The names are **asserted by the SOC**: the executor
+verifies one signature, the SOC key's, over the whole body; it cannot
+tell whether two named people actually approved. The two-person rule is
+therefore as strong as the SOC's own approval workflow and the custody of
+its signing key (one compromised SOC key can name any two people). No
+field can carry a motion command, a force or an override.
 
 Body errors are answered with an HTTP error (§7) and recorded
 (`robodr.control_plane_rejected`), never judged: `unknown_action`,
@@ -1239,7 +1248,8 @@ Additive, no version change (`robodr-control-plane/v2`). What a SOC
 integration must change (exactly):
 
 * **Request body** (§4): new optional `approved_by` (array, at most 4
-  names of 1..=100 characters, no control characters). Send the
+  names, each `[A-Za-z0-9._%+@-]{1,100}`, compared case-insensitively;
+  asserted by the SOC key, §4). Send the
   approvers of the platform sign-off there. For `safe_pause`,
   `request_safe_state` and `rollback_config` it must name at least two
   different people, neither `requested_by`, or the executor refuses

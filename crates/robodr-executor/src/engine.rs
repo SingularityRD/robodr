@@ -1117,6 +1117,7 @@ impl Engine {
         if !self.has_held() {
             return;
         }
+        let state_now = current.as_ref().ok().map(|c| c.state);
         if let Err(r) = decision::recheck_rearm(current, self.cfg.config.max_safety_age_ms) {
             let why = format!("{}: {}", r.code, r.reason);
             if self.last_hold_reason.as_deref() != Some(why.as_str()) {
@@ -1145,7 +1146,12 @@ impl Engine {
             .cloned()
             .collect();
         let mut armed = Vec::new();
+        let mut waiting = Vec::new();
         for en in held {
+            if let Some(why) = state_now.and_then(|s| self.motion_rearm_blocked(&en.effect, s)) {
+                waiting.push(format!("{}: {why}", en.id));
+                continue;
+            }
             let check = match &reload {
                 Some(r) => Err(r.clone()),
                 None => self.revalidate(&en),
@@ -1181,6 +1187,14 @@ impl Engine {
                         why,
                     );
                 }
+            }
+        }
+        if !waiting.is_empty() {
+            let why = format!("held actions not re-armed: {}", waiting.join("; "));
+            if self.last_hold_reason.as_deref() != Some(why.as_str()) {
+                self.state
+                    .event(now_ms, EventKind::Held, None, None, why.clone());
+                self.last_hold_reason = Some(why);
             }
         }
         if armed.is_empty() {

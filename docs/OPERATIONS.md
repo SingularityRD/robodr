@@ -1673,7 +1673,13 @@ To enable:
    owned by `robodr-exec`, group `robodr`, mode `0750`.
 5. SOC side: `safe_pause`, `request_safe_state` and `rollback_config` need
    `approved_by` with two people in the signed request (and in a revert of
-   a `safe_pause`).
+   a `safe_pause`): names `[A-Za-z0-9._%+@-]{1,100}`, compared
+   case-insensitively. The executor trusts the SOC key for who approved:
+   enforce the two-person rule in the SOC's workflow too.
+6. Set `ros2.peer_participant_prefix` to the robot participant's GUID
+   prefix (from the commissioning capture) so only its replies count. With
+   both `unitree_sport` and `gateway` for `restrict_motion`, list
+   `unitree_sport` first (enforced).
 
 What to expect: `restrict_motion` and `safe_pause` answer `verified` and
 are lifted at their TTL (`motion.safe_pause_ttl_s` for a pause) or by
@@ -1816,7 +1822,14 @@ while the chain is flushed.
 * `restrict_motion`: with `restriction_path`, `status.json` `restriction`
   is the restriction in force (`null`: none) and `restriction_error` why a
   file was ignored. Removing the file lifts it at the next housekeeping
-  tick; it also lapses at its own expiry.
+  tick; it also lapses at its own expiry. The file must be a regular
+  file, not group- or world-writable, owned by root or the directory's
+  owner (a symlink or FIFO is refused without blocking). While it is in
+  force the gateway refuses the sport `SpeedLevel`. A trajectory the
+  controller accepted before the restriction keeps its speeds: pause it.
+* Trajectories: a non-zero `header.stamp` is zeroed (status
+  `trajectory_stamp_zeroed`); the segments between points are checked as
+  the controller's default spline interpolation executes them.
 
 ## 7. Upgrade and rollback
 

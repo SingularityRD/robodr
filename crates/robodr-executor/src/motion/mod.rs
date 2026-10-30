@@ -8,7 +8,7 @@
 //! | Action | Adapters | Apply | Revert |
 //! |---|---|---|---|
 //! | `restrict_motion` | `gateway` | restriction file for `robodr-firewall-gw` (caps / factor, expiry = TTL), read back from the gateway's status | file removed, read back; the gateway also lifts it at its expiry on its own |
-//! | | `unitree_sport` | sport `SpeedLevel(level)` request (`rt/api/sport/request`), reply code 0 | `SpeedLevel(0)` (the SDK default: not necessarily the level before) |
+//! | | `unitree_sport` | sport `SpeedLevel(level)` request (`rt/api/sport/request`), reply code 0; held by the gateway (it refuses `SpeedLevel` while restricted: list `unitree_sport` first), advisory without it | `SpeedLevel(0)` (the SDK default: not necessarily the level before) |
 //! | `safe_pause` | `nav2` | `CancelGoal` (zero id: every goal) on each action server, then a burst of zero `Twist` on `cmd_vel` | **nothing to undo**: goals are not restored, the operator re-issues the mission (documented) |
 //! | | `ros2_control` | `SwitchController` STRICT: deactivate the motion controllers, activate the hold controllers | the inverse switch |
 //! | | `px4` | MAVLink `DO_SET_MODE` AUTO.LOITER (hold), ack + heartbeat read back | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
@@ -26,7 +26,15 @@
 //! carry out (`behaviour_unsupported`), the restriction's parameters
 //! (`invalid_order`, `fall_hazard` below `min_motion_factor` on a robot
 //! that balances). The engine re-checks the adapter's allowed states with
-//! the safety state **at the moment of apply**.
+//! the safety state **at the moment of apply**, and again when it re-arms
+//! a held action after a reboot (review F7: otherwise it stays held).
+//!
+//! Approver names ([`approver_name_ok`]) are `[A-Za-z0-9._%+@-]{1,100}`,
+//! compared ASCII case-insensitively; they are asserted by the SOC key
+//! that signed the body. A restriction limits commands decided after it;
+//! a trajectory the controller already accepted is not reached by it
+//! (`safe_pause` stops it). Correlation ids are random per call and
+//! replies can be pinned to the peer's participant prefix (review F10).
 //!
 //! The protocols are implemented here ([`rtps`] + [`cdr`]: ROS 2 topics,
 //! services and the Unitree SDK request / response over RTPS; [`mavlink`]:
@@ -122,6 +130,11 @@ pub struct Ros2Peer {
     /// call (which the sensor then reports as an unknown participant).
     #[serde(default)]
     pub participant_prefix: Option<String>,
+    /// The peer's own GUID prefix (24 hex digits; review F10): when set,
+    /// only samples of the peer's writers are answers, so a forged reply
+    /// needs the peer's prefix as well as the random correlation id.
+    #[serde(default)]
+    pub peer_participant_prefix: Option<String>,
     /// Deadline of one call (ms, 100..=30000).
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -139,6 +152,17 @@ impl Ros2Peer {
         let p: crate::net::GuidPrefix = h
             .parse()
             .map_err(|_| "participant_prefix must be 24 hex digits".to_string())?;
+        Ok(Some(p.0))
+    }
+
+    /// The configured peer participant prefix.
+    pub fn peer_prefix(&self) -> Result<Option<[u8; 12]>, String> {
+        let Some(h) = &self.peer_participant_prefix else {
+            return Ok(None);
+        };
+        let p: crate::net::GuidPrefix = h
+            .parse()
+            .map_err(|_| "peer_participant_prefix must be 24 hex digits".to_string())?;
         Ok(Some(p.0))
     }
 
@@ -160,6 +184,7 @@ impl Ros2Peer {
         }
         self.peer().map_err(|e| format!("{at}.ros2: {e}"))?;
         self.prefix().map_err(|e| format!("{at}.ros2: {e}"))?;
+        self.peer_prefix().map_err(|e| format!("{at}.ros2: {e}"))?;
         if !(100..=30_000).contains(&self.timeout_ms)
             || self.resend_ms < 20
             || self.resend_ms > self.timeout_ms
@@ -342,8 +367,8 @@ pub struct RollbackAdapter {
     #[serde(default)]
     pub oem_validated: bool,
     /// The site's rollback program (absolute; run without a shell as
-    /// `program --config program --to-version <v> --request-id <id>`, then
-    /// `program --verify --config program --to-version <v>`; exit 0 =
+    /// `program --config program --to-version=<v> --request-id <id>`, then
+    /// `program --verify --config program --to-version=<v>`; exit 0 =
     /// done). It must switch to an already staged version (each run within
     /// `timeout_ms`): the whole action has [`MOTION_BUDGET_MS`].
     pub program: PathBuf,
@@ -454,6 +479,16 @@ impl MotionSection {
         {
             return Err(
                 "motion.restrict_motion: at most gateway and unitree_sport, once each".into(),
+            );
+        }
+        // The gateway refuses SpeedLevel while its restriction is in force
+        // (its review F8): the speed level is set before the restriction
+        // and reset after it is lifted (revert runs in reverse order).
+        if self.restrict_motion == [AdapterKind::Gateway, AdapterKind::UnitreeSport] {
+            return Err(
+                "motion.restrict_motion: list unitree_sport before gateway (the gateway refuses \
+                 SpeedLevel while its restriction is in force)"
+                    .into(),
             );
         }
         for (what, k) in [
@@ -733,17 +768,54 @@ pub fn two_person_ok(order: &Order) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// A rollback `to_version`: `[A-Za-z0-9._-]{1,64}`, not starting with `-`
+/// (it would reach the site program as an option).
+pub fn version_ok(v: &str) -> bool {
+    (1..=64).contains(&v.len())
+        && !v.starts_with('-')
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+}
+
+/// Longest approver name (the control plane's `requested_by` limit).
+pub const MAX_APPROVER_CHARS: usize = 100;
+
+/// An approver name: 1..=[`MAX_APPROVER_CHARS`] ASCII characters from
+/// `[A-Za-z0-9._%+@-]` (user names and email-like identifiers), compared
+/// case-insensitively. Anything else (white space, quotes, non-ASCII,
+/// invisible characters, combining marks) is not a name: it cannot be
+/// told apart from another spelling of the same person.
+pub fn approver_name_ok(s: &str) -> bool {
+    (1..=MAX_APPROVER_CHARS).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_%+@".contains(&b))
+}
+
 /// The SOC-signed body's `approved_by` names at least two different
-/// people, neither the requester (`approval_missing` otherwise).
+/// people, neither the requester (`approval_missing` otherwise). Review
+/// F6: every name must match [`approver_name_ok`] (else the order is
+/// refused), and names are compared ASCII case-insensitively, with the
+/// requester's (trimmed) too, so one person spelled twice is one person.
 pub fn approvers_ok(
     action: ActionId,
     requested_by: &str,
     approved_by: &[String],
 ) -> Result<(), Refusal> {
-    let mut distinct: Vec<&str> = Vec::new();
+    if let Some(bad) = approved_by.iter().find(|a| !approver_name_ok(a)) {
+        return Err(refuse(
+            codes::APPROVAL_MISSING,
+            format!(
+                "approved_by name {:?} is not 1..={MAX_APPROVER_CHARS} characters of \
+                 [A-Za-z0-9._%+@-]",
+                bad.chars().take(MAX_APPROVER_CHARS).collect::<String>()
+            ),
+        ));
+    }
+    let requester = requested_by.trim().to_ascii_lowercase();
+    let mut distinct: Vec<String> = Vec::new();
     for a in approved_by {
-        let a = a.trim();
-        if a.is_empty() || a == requested_by.trim() || distinct.contains(&a) {
+        let a = a.to_ascii_lowercase();
+        if a == requester || distinct.contains(&a) {
             continue;
         }
         distinct.push(a);
@@ -753,8 +825,8 @@ pub fn approvers_ok(
             codes::APPROVAL_MISSING,
             format!(
                 "{} is a two-person action: the SOC-signed request must name at least two \
-                 approvers (approved_by), different people and neither the requester; it names \
-                 {} usable",
+                 approvers (approved_by), different people and neither the requester \
+                 (compared case-insensitively); it names {} usable",
                 action.as_str(),
                 distinct.len()
             ),
@@ -870,10 +942,11 @@ pub fn plan(
                              content as a new version with robodr-commission instead)",
                         ));
                     }
-                    if req.to_version.is_none() {
+                    if !req.to_version.as_deref().is_some_and(version_ok) {
                         return Err(refuse(
                             codes::INVALID_ORDER,
-                            "rollback_config needs to_version",
+                            "rollback_config needs to_version matching [A-Za-z0-9._-]{1,64} \
+                             and not starting with '-'",
                         ));
                     }
                     (m.rollback_config, None)

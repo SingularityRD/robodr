@@ -674,6 +674,11 @@ fn ros2_control_switch_and_its_inverse() {
 /// A simulated PX4: heartbeats in its current mode every 50 ms; a
 /// `DO_SET_MODE` is acknowledged (or refused) and switches the mode.
 fn sim_px4(accept: bool) -> (Sim, SocketAddr, Arc<Mutex<u32>>) {
+    sim_px4_with(accept, None)
+}
+
+/// [`sim_px4`] whose `COMMAND_ACK` names `ack_to` instead of the sender.
+fn sim_px4_with(accept: bool, ack_to: Option<(u8, u8)>) -> (Sim, SocketAddr, Arc<Mutex<u32>>) {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
@@ -697,7 +702,8 @@ fn sim_px4(accept: bool) -> (Sim, SocketAddr, Arc<Mutex<u32>>) {
                             *m2.lock().unwrap() = mav::px4_custom_mode(p[1] as u8, p[2] as u8);
                         }
                         seq = seq.wrapping_add(1);
-                        let ack = mav::command_ack(cmd, if ok { 0 } else { 2 }, f.sysid, f.compid);
+                        let (ts, tc) = ack_to.unwrap_or((f.sysid, f.compid));
+                        let ack = mav::command_ack(cmd, if ok { 0 } else { 2 }, ts, tc);
                         let fr = mav::encode(seq, 1, 1, mav::MSG_COMMAND_ACK, &ack).unwrap();
                         let _ = sock.send_to(&fr, from);
                     }
@@ -979,12 +985,26 @@ fn motion_configuration_is_strict() {
         crate::ExecutorConfig::parse(&v.to_string()).and_then(crate::ExecutorConfig::validate)
     };
     assert!(base(json!({"safe_pause": "nav2", "nav2": {"ros2": peer}})).is_ok());
+    if let Err(e) = base(json!({"restrict_motion": ["unitree_sport", "gateway"],
+        "gateway": {"restriction_path": "/r", "status_path": "/s", "verify_timeout_ms": 1000},
+        "unitree_sport": {"ros2": {"peer_ip": "10.0.0.2", "local_ip": "10.0.0.1",
+                                   "timeout_ms": 1000}}}))
+    {
+        panic!("{e}");
+    }
     for bad in [
         json!({"restrict_motion": ["nav2"], "nav2": {"ros2": peer}}),
         json!({"safe_pause": "gateway"}),
         json!({"safe_pause": "nav2"}),
         json!({"restrict_motion": ["gateway", "gateway"],
                "gateway": {"restriction_path": "/r", "status_path": "/s"}}),
+        json!({"restrict_motion": ["gateway", "unitree_sport"],
+               "gateway": {"restriction_path": "/r", "status_path": "/s",
+                           "verify_timeout_ms": 1000},
+               "unitree_sport": {"ros2": {"peer_ip": "10.0.0.2", "local_ip": "10.0.0.1",
+                                          "timeout_ms": 1000}}}),
+        json!({"nav2": {"ros2": {"peer_ip": "10.0.0.2", "local_ip": "10.0.0.1",
+               "peer_participant_prefix": "0102"}}}),
         json!({"gateway": {"restriction_path": "r", "status_path": "/s"}}),
         json!({"nav2": {"ros2": peer, "bogus": 1}}),
         json!({"nav2": {"ros2": {"peer_ip": "224.0.0.1", "local_ip": "10.0.0.1"}}}),
@@ -1036,4 +1056,309 @@ fn a_motion_target_crosses_the_agentd_protocol_unchanged() {
         ..Default::default()
     });
     assert!(nan.validate().is_err());
+}
+
+// ------------------------------------------- review of the motion branch
+
+/// Motion ports that only record (the engine's gates are under test).
+#[derive(Clone, Default)]
+struct Rec(Arc<Mutex<Vec<String>>>);
+
+impl crate::motion::MotionPorts for Rec {
+    fn apply(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        s: &crate::motion::MotionSpec,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().push(format!("apply {}", s.id));
+        Ok("ok".into())
+    }
+    fn revert(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        s: &crate::motion::MotionSpec,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().push(format!("revert {}", s.id));
+        Ok("ok".into())
+    }
+    fn verify(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        _s: &crate::motion::MotionSpec,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn r2c_motion(port: u16) -> Value {
+    json!({"safe_pause": "ros2_control",
+        "ros2_control": {"oem_validated": true, "ros2": ros2_peer(port),
+                         "deactivate": ["joint_trajectory_controller"],
+                         "activate": ["hold_controller"]}})
+}
+
+/// F6: one person spelled in another case, or with an invisible
+/// character, is not a second approver; email-like identifiers are names.
+#[test]
+fn review_f6_approvers_are_compared_normalised() {
+    use crate::motion::approvers_ok;
+    let r = "analyst@soc";
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let pause = ActionId::SafePause;
+    assert!(approvers_ok(pause, r, &s(&["Analyst@soc", "ANALYST@SOC"])).is_err());
+    assert!(approvers_ok(pause, r, &s(&["alice@soc", "ALICE@soc"])).is_err());
+    assert!(approvers_ok(
+        pause,
+        r,
+        &s(&["analyst@soc\u{200b}", "analyst@soc\u{feff}"])
+    )
+    .is_err());
+    assert!(approvers_ok(pause, r, &s(&["alice\u{200b}", "bob"])).is_err());
+    assert!(approvers_ok(pause, r, &s(&["alice", "bob\u{0301}"])).is_err());
+    assert!(approvers_ok(pause, "Alice", &s(&["alice", "bob"])).is_err());
+    assert!(approvers_ok(pause, r, &s(&["alice.smith+ops@soc.example", "bob_o'neil"])).is_err());
+    assert!(approvers_ok(pause, r, &s(&["alice.smith+ops@soc.example", "bob-2@soc"])).is_ok());
+    assert!(approvers_ok(pause, r, &s(&["a", "b"])).is_ok());
+    // End to end: the pause is refused, nothing applied.
+    let d = tmpdir("rv-f6");
+    let rec = Rec::default();
+    let mut e = engine(
+        &d,
+        r2c_motion(9),
+        policy(PlatformFamily::Arm, Morphology::Arm),
+        now(),
+    )
+    .with_motion_ports(Box::new(rec.clone()));
+    let o = signed(
+        "p-f6",
+        ActionId::SafePause,
+        Morphology::Arm,
+        Target::None,
+        None,
+        &["Analyst@soc", "ANALYST@SOC"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+    assert_eq!(code(&out), codes::APPROVAL_MISSING, "{out:?}");
+    assert!(rec.0.lock().unwrap().is_empty());
+}
+
+/// F7: a safe_pause held across a reboot is not re-applied while the
+/// robot moves fast (the adapter's allowed states); it stays held and is
+/// re-armed once the state allows it.
+#[test]
+fn review_f7_rearm_checks_the_allowed_states() {
+    let d = tmpdir("rv-f7");
+    let p = policy(PlatformFamily::Arm, Morphology::Arm);
+    {
+        let mut e = Engine::open(
+            config(&d, r2c_motion(9)),
+            p.clone(),
+            Box::new(FakeNft::default()),
+            "b1",
+            now(),
+        )
+        .unwrap()
+        .with_motion_ports(Box::new(Rec::default()));
+        let o = signed(
+            "p-f7",
+            ActionId::SafePause,
+            Morphology::Arm,
+            Target::None,
+            None,
+            &["alice", "bob"],
+            SafetyState::Idle,
+        );
+        let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+        assert_eq!(out.status, Status::Verified, "{out:?}");
+    }
+    let rec = Rec::default();
+    let mut e = Engine::open(
+        config(&d, r2c_motion(9)),
+        p,
+        Box::new(FakeNft::default()),
+        "b2",
+        now(),
+    )
+    .unwrap()
+    .with_motion_ports(Box::new(rec.clone()));
+    assert_eq!(e.status("p-f7").status, Status::Held);
+    let fast = Current {
+        state: SafetyState::MovingFast,
+        age_ms: 5,
+    };
+    e.rearm_held(Ok(fast), now());
+    assert!(
+        rec.0.lock().unwrap().is_empty(),
+        "applied while moving fast"
+    );
+    assert_eq!(e.status("p-f7").status, Status::Held);
+    let idle = Current {
+        state: SafetyState::Idle,
+        age_ms: 5,
+    };
+    e.rearm_held(Ok(idle), now());
+    assert_eq!(rec.0.lock().unwrap().as_slice(), ["apply p-f7"]);
+    assert_eq!(e.status("p-f7").status, Status::Verified);
+}
+
+/// F10: service calls carry random correlation ids (not derived from the
+/// request or the controllers), and with `peer_participant_prefix` only
+/// the peer's own writers can answer.
+#[test]
+fn review_f10_service_replies_are_hard_to_forge() {
+    let headers = Arc::new(Mutex::new(Vec::<(u64, i64)>::new()));
+    let h2 = headers.clone();
+    let (_sim, port, _, _) = sim_ros2(move |topic, p| {
+        if topic != "rq/controller_manager/switch_controllerRequest" {
+            return None;
+        }
+        let mut d = cdr::Dec::open(p).ok()?;
+        h2.lock().unwrap().push((d.u64().ok()?, d.i64().ok()?));
+        service_reply(p, |e| e.bool(true))
+    });
+    let pol = policy(PlatformFamily::Arm, Morphology::Arm);
+    let pause = |id: &str| {
+        signed(
+            id,
+            ActionId::SafePause,
+            Morphology::Arm,
+            Target::None,
+            None,
+            &["alice", "bob"],
+            SafetyState::Idle,
+        )
+    };
+    // The sim answers from prefix 09..09.
+    let mut m = r2c_motion(port);
+    m["ros2_control"]["ros2"]["peer_participant_prefix"] = json!("090909090909090909090909");
+    let d = tmpdir("rv-f10a");
+    let mut e = engine(&d, m.clone(), pol.clone(), now());
+    let out = e.submit(&pause("c1"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let out = e.revert_request(
+        "c1",
+        "done",
+        Some(&revert_req("c1", &["alice", "bob"])),
+        now(),
+    );
+    assert_eq!(out.status, Status::Reverted, "{out:?}");
+    drop(e);
+    let d = tmpdir("rv-f10b");
+    let mut e = engine(&d, m.clone(), pol.clone(), now());
+    let out = e.submit(&pause("c1"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    {
+        let h = headers.lock().unwrap();
+        assert!(h.len() >= 3, "{h:?}");
+        let mut distinct: Vec<(u64, i64)> = h.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // Same request, same controllers, same id: still fresh ids.
+        assert_eq!(distinct.len(), h.len(), "{h:?}");
+        assert!(h.iter().all(|&(_, s)| s > 1), "{h:?}");
+    }
+    drop(e);
+    // A reply from any other participant is not the peer's.
+    m["ros2_control"]["ros2"]["peer_participant_prefix"] = json!("080808080808080808080808");
+    let d = tmpdir("rv-f10c");
+    let mut e = engine(&d, m, pol, now());
+    let out = e.submit(&pause("c2"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Failed, "{out:?}");
+}
+
+/// F10: a PX4 `COMMAND_ACK` must name our own system / component; the
+/// zero targets (not addressed to anyone) are not ours.
+#[test]
+fn review_f10_px4_ack_must_be_addressed_to_us() {
+    let (_sim, addr, _) = sim_px4_with(true, Some((0, 0)));
+    let d = tmpdir("rv-px4");
+    let motion = json!({"safe_pause": "px4",
+        "px4": {"oem_validated": true, "address": addr.to_string(), "bind": "127.0.0.1:0",
+                "timeout_ms": 1500}});
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Drone, Morphology::Aerial),
+        now(),
+    );
+    let o = signed(
+        "h1",
+        ActionId::SafePause,
+        Morphology::Aerial,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Failed, "{out:?}");
+}
+
+/// Minor: a `to_version` starting with `-` would reach the rollback
+/// program as an option; it is refused, and the version is passed as
+/// `--to-version=<v>`.
+#[test]
+fn review_rollback_version_is_never_an_option() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("rv-rb");
+    let log = d.join("argv.log");
+    let prog = d.join("rollback.sh");
+    std::fs::write(
+        &prog,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let motion = json!({"rollback_config": "rollback",
+        "rollback": {"oem_validated": true, "program": prog}});
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        now(),
+    );
+    let rb = |v: &str| {
+        Target::Motion(MotionRequest {
+            config: Some("program".into()),
+            to_version: Some(v.into()),
+            ..Default::default()
+        })
+    };
+    for (id, v) in [
+        ("rb1", "-rf"),
+        ("rb2", "--help"),
+        ("rb3", "1.2 3"),
+        ("rb4", "a/b"),
+    ] {
+        let o = signed(
+            id,
+            ActionId::RollbackConfig,
+            Morphology::WheeledMobile,
+            rb(v),
+            None,
+            &["a", "b"],
+            SafetyState::Idle,
+        );
+        let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+        assert_eq!(code(&out), codes::INVALID_ORDER, "{v}: {out:?}");
+    }
+    assert!(!log.exists());
+    let o = signed(
+        "rb5",
+        ActionId::RollbackConfig,
+        Morphology::WheeledMobile,
+        rb("1.2.0"),
+        None,
+        &["a", "b"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Applied, "{out:?}");
+    let argv = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        argv,
+        "--config program --to-version=1.2.0 --request-id rb5\n\
+         --verify --config program --to-version=1.2.0\n"
+    );
 }

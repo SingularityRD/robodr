@@ -136,8 +136,10 @@ struct RawRevert {
 /// Most approvers a body may name.
 pub const MAX_APPROVERS: usize = 4;
 
-/// `approved_by`: at most [`MAX_APPROVERS`] names, each like
-/// `requested_by` (1..=100 characters, no control characters).
+/// `approved_by`: at most [`MAX_APPROVERS`] names, each 1..=100 ASCII
+/// characters of `[A-Za-z0-9._%+@-]` (user names, email-like ids; the
+/// executor's grammar, `robodr_executor::motion::approver_name_ok`, which
+/// compares them case-insensitively).
 fn approvers(v: Option<Vec<String>>) -> Result<Vec<String>, ApiError> {
     let v = v.unwrap_or_default();
     if v.len() > MAX_APPROVERS {
@@ -147,7 +149,16 @@ fn approvers(v: Option<Vec<String>>) -> Result<Vec<String>, ApiError> {
         ));
     }
     v.iter()
-        .map(|a| text("approved_by", a, MAX_REQUESTED_BY_CHARS, true))
+        .map(|a| {
+            if robodr_executor::motion::approver_name_ok(a) {
+                Ok(a.clone())
+            } else {
+                Err(bad(
+                    "invalid_field",
+                    "approved_by: each name 1..=100 characters of [A-Za-z0-9._%+@-]",
+                ))
+            }
+        })
         .collect()
 }
 
@@ -412,10 +423,10 @@ pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
             }
             params.config = Some(kind);
             if let Some(v) = p.to_version {
-                if !name_ok(&v, 64) {
+                if !robodr_executor::motion::version_ok(&v) {
                     return Err(bad(
                         "invalid_parameter",
-                        "to_version must match [A-Za-z0-9._-]{1,64}",
+                        "to_version must match [A-Za-z0-9._-]{1,64}, not starting with '-'",
                     ));
                 }
                 params.to_version = Some(v);
@@ -2064,6 +2075,45 @@ mod tests {
         let mut v: Value = serde_json::from_slice(&body("safe_pause", json!({}), None)).unwrap();
         v.as_object_mut().unwrap().remove("parameters");
         assert!(parse_submit(&serde_json::to_vec(&v).unwrap()).is_ok());
+    }
+
+    /// Review F6 / minor: approver names follow the executor's grammar
+    /// (email-like ids pass; white space, invisible or combining
+    /// characters do not) and a version never starts with `-`.
+    #[test]
+    fn approver_names_and_versions_are_strict() {
+        let with = |approvers: Value| {
+            let mut v: Value =
+                serde_json::from_slice(&body("safe_pause", json!({}), None)).unwrap();
+            v["approved_by"] = approvers;
+            serde_json::to_vec(&v).unwrap()
+        };
+        assert!(parse_submit(&with(json!(["alice.smith+ops@soc.example", "bob-2"]))).is_ok());
+        for bad in [
+            "bob\u{200b}",
+            "bob smith",
+            "bob\u{0301}",
+            "",
+            "b\u{f6}b",
+            "o'neil",
+        ] {
+            assert_eq!(
+                code(parse_submit(&with(json!(["alice", bad])))),
+                "invalid_field",
+                "{bad:?}"
+            );
+        }
+        for v in ["-rf", "--help", "-"] {
+            assert_eq!(
+                code(parse_submit(&body(
+                    "rollback_config",
+                    json!({"config": "program", "to_version": v}),
+                    None
+                ))),
+                "invalid_parameter",
+                "{v}"
+            );
+        }
     }
 
     #[test]
