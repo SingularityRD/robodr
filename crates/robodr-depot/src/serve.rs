@@ -11,6 +11,7 @@
 //! (client confusion), and a report must be signed by the same unit's
 //! identity key as the TLS client.
 
+use crate::config::Config;
 use crate::depot::Depot;
 use crate::{err, DepotError};
 use robodr_pkg::wire::{self, PackListing, Request, StreamFile, PACK_STREAM_FORMAT};
@@ -19,15 +20,15 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The clock the server judges reports and leases on.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// The server's TLS configuration from the depot's state directory.
-pub fn server_config(d: &Depot) -> Result<Arc<rustls::ServerConfig>, DepotError> {
-    let t = d.cfg.state_dir.join("tls");
+pub fn server_config(cfg: &Config) -> Result<Arc<rustls::ServerConfig>, DepotError> {
+    let t = cfg.state_dir.join("tls");
     robodr_blackbox::tls::load_server(&robodr_blackbox::tls::ServerTlsFiles {
         cert_chain: t.join("server.pem"),
         key_file: t.join("server.key"),
@@ -36,32 +37,26 @@ pub fn server_config(d: &Depot) -> Result<Arc<rustls::ServerConfig>, DepotError>
     .map_err(err)
 }
 
-/// Serve until `stop` is set (checked between connections; the listener
-/// should be non-blocking or have a short accept timeout for a prompt
-/// stop).
+/// Serve until `stop` is set (checked between connections). Each request
+/// opens the depot under its lock ([`crate::lock`]) and closes it again,
+/// so operators' commands run between requests.
 pub fn serve(
-    depot: Arc<Mutex<Depot>>,
+    cfg: Config,
     listener: TcpListener,
     stop: Arc<AtomicBool>,
     clock: Clock,
 ) -> Result<(), DepotError> {
-    let (tls, max, deadline) = {
-        let d = depot.lock().map_err(|_| err("depot lock poisoned"))?;
-        let s = d
-            .cfg
-            .serve
-            .clone()
-            .ok_or_else(|| err("no serve configuration"))?;
-        (
-            server_config(&d)?,
-            s.max_connections,
-            Duration::from_secs(s.deadline_s),
-        )
-    };
+    let s = cfg
+        .serve
+        .clone()
+        .ok_or_else(|| err("no serve configuration"))?;
+    let tls = server_config(&cfg)?;
+    let (max, deadline) = (s.max_connections, Duration::from_secs(s.deadline_s));
     listener
         .set_nonblocking(true)
         .map_err(|e| err(e.to_string()))?;
     let live = Arc::new(AtomicUsize::new(0));
+    let cfg = Arc::new(cfg);
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((sock, _)) => {
@@ -70,10 +65,10 @@ pub fn serve(
                     continue;
                 }
                 let _ = sock.set_nonblocking(false);
-                let (d, t, l, c) = (depot.clone(), tls.clone(), live.clone(), clock.clone());
+                let (c, t, l, k) = (cfg.clone(), tls.clone(), live.clone(), clock.clone());
                 l.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(move || {
-                    let _ = handle(sock, t, &d, deadline, &c);
+                    let _ = handle(sock, t, &c, deadline, &k);
                     l.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -100,7 +95,7 @@ fn error_body(e: &str) -> Vec<u8> {
 pub fn handle(
     sock: TcpStream,
     tls: Arc<rustls::ServerConfig>,
-    depot: &Mutex<Depot>,
+    cfg: &Config,
     deadline: Duration,
     clock: &Clock,
 ) -> Result<(), DepotError> {
@@ -122,10 +117,8 @@ pub fn handle(
         .transpose()
         .map_err(err)?
         .ok_or_else(|| err("no client certificate"))?;
-    let unit = {
-        let d = depot.lock().map_err(|_| err("depot lock poisoned"))?;
-        d.unit_of_spki(&spki)
-    };
+    let open = || Depot::open(cfg.clone(), clock());
+    let unit = open()?.unit_of_spki(&spki);
     // Read the header block (bounded).
     let mut head = Vec::new();
     let mut b = [0u8; 1];
@@ -156,10 +149,7 @@ pub fn handle(
     };
     match req {
         Request::Pack => {
-            let files = {
-                let d = depot.lock().map_err(|_| err("depot lock poisoned"))?;
-                d.pack_files(&unit)
-            };
+            let files = open().and_then(|d| d.pack_files(&unit));
             let files = match files {
                 Ok(f) => f,
                 Err(e) => {
@@ -172,10 +162,7 @@ pub fn handle(
         Request::Report(n) => {
             let mut body = vec![0u8; n];
             s.read_exact(&mut body).map_err(|e| err(e.to_string()))?;
-            let r = {
-                let mut d = depot.lock().map_err(|_| err("depot lock poisoned"))?;
-                d.accept_report(Some(&unit), &body, clock())
-            };
+            let r = open().and_then(|mut d| d.accept_report(Some(&unit), &body, clock()));
             match r {
                 Ok(lease) => {
                     let b = serde_json::to_vec(&serde_json::json!({ "lease": lease }))

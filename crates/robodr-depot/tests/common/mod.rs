@@ -703,26 +703,29 @@ pub fn enrol(site: &Site, d: &mut Depot, u: &UnitH) {
     d.enrol_export(&u.id, &u.dir.join("depot")).unwrap();
 }
 
-/// A depot served on 127.0.0.1 in a thread; stopped on drop.
+/// A depot served on 127.0.0.1 in a thread; stopped on drop. Each
+/// request (and each [`Served::with`]) opens the depot under its lock.
 pub struct Served {
-    pub depot: std::sync::Arc<std::sync::Mutex<Depot>>,
+    pub cfg: DepotConfig,
     pub port: u16,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     th: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Served {
+    /// Serve the depot `d` was opened from (`d` is closed first).
     pub fn start(d: Depot) -> Self {
+        let cfg = d.cfg.clone();
+        drop(d);
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        let depot = std::sync::Arc::new(std::sync::Mutex::new(d));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (d2, s2) = (depot.clone(), stop.clone());
+        let (c2, s2) = (cfg.clone(), stop.clone());
         let th = std::thread::spawn(move || {
-            robodr_depot::serve::serve(d2, l, s2, std::sync::Arc::new(now)).unwrap();
+            robodr_depot::serve::serve(c2, l, s2, std::sync::Arc::new(now)).unwrap();
         });
         Self {
-            depot,
+            cfg,
             port,
             stop,
             th: Some(th),
@@ -730,7 +733,8 @@ impl Served {
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut Depot) -> R) -> R {
-        f(&mut self.depot.lock().unwrap())
+        let mut d = Depot::open(self.cfg.clone(), now()).unwrap();
+        f(&mut d)
     }
 }
 

@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 pub const ENROLMENT_SIG_DOMAIN: &[u8] = b"robodr-depot/enrolment/v1\0";
 /// Domain of operator decisions (resume, abort, revoke, reanchor).
 pub const DECISION_SIG_DOMAIN: &[u8] = b"robodr-depot/decision/v1\0";
+/// How long an operation waits for the depot's lock.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Most units in one stage.
 pub const MAX_STAGE_UNITS: usize = 4096;
 
@@ -120,6 +122,8 @@ pub struct Depot {
     ca: PolicyKey,
     authority: [u8; 65],
     findings: Option<robodr_deliverd::findings::Findings>,
+    /// The single-writer lock ([`crate::lock`]), held while open.
+    _lock: std::fs::File,
 }
 
 impl std::fmt::Debug for Depot {
@@ -244,8 +248,9 @@ impl Depot {
                 0o644,
             )?;
         }
+        let _lock = crate::lock::lock(&cfg.state_dir.join("depot.lock"), LOCK_WAIT)?;
         let store = anchor_store(cfg)?;
-        let mut db = store.open(&cfg.site)?;
+        let (mut db, _) = store.open(&cfg.site)?;
         if db.generation != 0 {
             return Err(err("a depot database exists already"));
         }
@@ -256,10 +261,11 @@ impl Depot {
     /// Open the depot at `now`: trust anchor (the anchor itself as the
     /// presented file), database (judged against the anchor), keys.
     pub fn open(cfg: Config, now: u64) -> Result<Self, DepotError> {
+        let lock = crate::lock::lock(&cfg.state_dir.join("depot.lock"), LOCK_WAIT)?;
         let a = cfg.anchor_path();
         let site = SiteTrust::anchored(&a, &a, &cfg.roots, &cfg.site, now).map_err(fail)?;
         let store = anchor_store(&cfg)?;
-        let db = store.open(&cfg.site)?;
+        let (db, fresh_lock) = store.open(&cfg.site)?;
         let kf = robodr_blackbox::KeyFile::load_secret(&cfg.keys.signing).map_err(fail)?;
         let signing_public = kf
             .public_key()
@@ -293,6 +299,7 @@ impl Depot {
             ca,
             authority,
             findings,
+            _lock: lock,
         };
         // The depot key must be the trust file's depot key; the wrap key
         // one the trust file lists (when it lists any).
@@ -310,7 +317,11 @@ impl Depot {
                 "the depot wrapping key is not listed in the site trust file",
             ));
         }
-        if let Some(why) = d.db.locked.clone() {
+        if fresh_lock {
+            // The lock is kept in the database (it moves the anchor on), so
+            // it is reported once and lifted only by `reanchor`.
+            let why = d.db.locked.clone().unwrap_or_default();
+            d.save()?;
             d.finding(
                 rules::LOCKED,
                 Severity::Critical,

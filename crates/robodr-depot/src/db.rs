@@ -274,8 +274,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DepotError> {
 
 impl Store {
     /// Load (or create) the database and judge it against the anchor. A
-    /// database the anchor refuses is returned **locked**.
-    pub fn open(&self, site: &str) -> Result<Db, DepotError> {
+    /// database the anchor refuses is returned **locked**; the flag says
+    /// whether the lock is new (not yet in the file).
+    pub fn open(&self, site: &str) -> Result<(Db, bool), DepotError> {
         let mut db = match std::fs::read(&self.path) {
             Ok(b) => {
                 if b.len() > MAX_DB_BYTES {
@@ -291,6 +292,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Db::new(site),
             Err(e) => return Err(err(format!("{}: {e}", self.path.display()))),
         };
+        let was_locked = db.locked.is_some();
         if let Some(a) = &self.anchor {
             use robodr_seal::nvcounter::{judge, Verdict};
             let c = a.tpm.counter(a.index).map_err(|e| err(e.to_string()))?;
@@ -310,7 +312,8 @@ impl Store {
                 Verdict::Locked(why) => db.locked = Some(why),
             }
         }
-        Ok(db)
+        let fresh_lock = !was_locked && db.locked.is_some();
+        Ok((db, fresh_lock))
     }
 
     /// Save the next generation (anchored: `nv = T + 1`, then increment).

@@ -126,9 +126,9 @@ fn dispatch(args: Vec<String>) -> Result<(), Cmd> {
         }
         "serve" => {
             parse(rest, &[])?;
-            let d = Depot::open(cfg, now)?;
-            let listen = d
-                .cfg
+            // Opened once to check the keys, the trust and the database.
+            drop(Depot::open(cfg.clone(), now)?);
+            let listen = cfg
                 .serve
                 .as_ref()
                 .map(|s| s.listen.clone())
@@ -138,12 +138,7 @@ fn dispatch(args: Vec<String>) -> Result<(), Cmd> {
             eprintln!("robodr-depot: serving on {listen}");
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let clock: crate::serve::Clock = std::sync::Arc::new(|| crate::now().unwrap_or(0));
-            crate::serve::serve(
-                std::sync::Arc::new(std::sync::Mutex::new(d)),
-                l,
-                stop,
-                clock,
-            )?;
+            crate::serve::serve(cfg, l, stop, clock)?;
             Ok(())
         }
         _ => {

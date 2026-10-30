@@ -30,8 +30,10 @@
 //! Findings (`robot.depot.*`, contract 2.3) go into the site agentd's
 //! spool with `robodr-deliverd`'s writer.
 
-// S10: no unsafe code at all in this crate.
-#![forbid(unsafe_code)]
+// S10: `unsafe` is denied crate-wide; the one FFI call (`flock(2)`, in
+// `lock`) is allowed locally with a `SAFETY` comment.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 // S10 (R9): release builds use `panic = "abort"`; non-test code has no
 // unwrap / expect / panic!-family call.
 #![cfg_attr(
@@ -51,6 +53,7 @@ pub mod config;
 pub mod db;
 pub mod depot;
 pub mod entry;
+pub mod lock;
 pub mod serve;
 pub mod x509;
 
