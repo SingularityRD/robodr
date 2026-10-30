@@ -58,8 +58,12 @@ pub mod attr {
 pub const UWK_ATTRS: u32 = attr::RESIDENT | attr::DECRYPT | attr::NO_DA;
 /// Exact attributes of the unit identity key (`tpm::UIK_ATTRIBUTES`).
 pub const UIK_ATTRS: u32 = attr::RESIDENT | attr::USER_WITH_AUTH | attr::SIGN | attr::NO_DA;
-/// Attributes an AK must have.
-pub const AK_REQUIRED: u32 = attr::RESIDENT | attr::RESTRICTED | attr::SIGN;
+/// Exact attributes of an AK (`tpm2_createak`'s template:
+/// `fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign`).
+/// Exact, like [`UWK_ATTRS`] and [`UIK_ATTRS`]: an AK with
+/// `adminWithPolicy` (or any other extra bit) is refused, so no policy can
+/// administer (certify with, duplicate the authorisation of) the key.
+pub const AK_ATTRS: u32 = attr::RESIDENT | attr::USER_WITH_AUTH | attr::RESTRICTED | attr::SIGN;
 
 /// Largest structure read.
 pub const MAX_STRUCT: usize = 4096;
@@ -358,14 +362,26 @@ pub fn verify_p256(public: &[u8; 65], msg: &[u8], der: &[u8]) -> Result<(), Seal
         .map_err(|_| unauthentic("signature does not verify"))
 }
 
-/// Check that `ak` is usable as an attestation key: resident, restricted,
-/// signing only, ECDSA P-256 with SHA-256, no decrypt.
+/// Check that `ak` is usable as an attestation key: exactly the AK
+/// template ([`AK_ATTRS`]: resident, restricted, signing only, no
+/// `adminWithPolicy`, no decrypt), an **empty** authPolicy (no policy can
+/// authorise its use besides its own auth value), no symmetric
+/// algorithm, ECDSA P-256 with SHA-256.
 pub fn check_ak(ak: &Public) -> Result<[u8; 65], SealError> {
-    if ak.attributes & AK_REQUIRED != AK_REQUIRED || ak.attributes & attr::DECRYPT != 0 {
+    if ak.attributes != AK_ATTRS {
         return Err(unauthentic(format!(
-            "AK attributes 0x{:08x}: not a restricted signing key created in the TPM",
+            "AK attributes 0x{:08x}, expected exactly 0x{AK_ATTRS:08x} (a restricted signing \
+             key created in the TPM, no adminWithPolicy)",
             ak.attributes
         )));
+    }
+    if !ak.auth_policy.is_empty() {
+        return Err(unauthentic(
+            "AK has an authPolicy: an AK must not be usable through a policy",
+        ));
+    }
+    if ak.symmetric != TPM_ALG_NULL {
+        return Err(invalid("AK must not have a symmetric algorithm"));
     }
     if ak.scheme != TPM_ALG_ECDSA || ak.scheme_hash != TPM_ALG_SHA256 {
         return Err(invalid("AK must be ECDSA with SHA-256"));
@@ -522,5 +538,49 @@ mod tests {
         let mut att2 = att.clone();
         att2[20] ^= 1;
         assert!(verify_certified(&pk, &uwk, UWK_ATTRS, &att2, &der).is_err());
+    }
+
+    /// An ECC P-256 `TPMT_PUBLIC` with `attrs` and `policy`, ECDSA/SHA-256.
+    fn ak_area(attrs: u32, policy: &[u8], pk: &[u8; 65]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&TPM_ALG_ECC.to_be_bytes());
+        b.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        b.extend_from_slice(&attrs.to_be_bytes());
+        b.extend_from_slice(&(policy.len() as u16).to_be_bytes());
+        b.extend_from_slice(policy);
+        b.extend_from_slice(&TPM_ALG_NULL.to_be_bytes());
+        b.extend_from_slice(&TPM_ALG_ECDSA.to_be_bytes());
+        b.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+        b.extend_from_slice(&TPM_ECC_NIST_P256.to_be_bytes());
+        b.extend_from_slice(&TPM_ALG_NULL.to_be_bytes());
+        for c in [&pk[1..33], &pk[33..]] {
+            b.extend_from_slice(&32u16.to_be_bytes());
+            b.extend_from_slice(c);
+        }
+        b
+    }
+
+    /// Review finding (LOW): the AK check was a superset check that let
+    /// `adminWithPolicy` (and any other extra bit) through and ignored the
+    /// authPolicy. It is now the exact template, like the UWK and UIK.
+    #[test]
+    fn the_ak_must_be_exactly_the_ak_template() {
+        let k = crate::wrap::p256_random().unwrap();
+        let pk = crate::wrap::p256_public_bytes(&k.public_key());
+        let ok = parse_tpmt_public(&ak_area(AK_ATTRS, &[], &pk)).unwrap();
+        assert_eq!(check_ak(&ok).unwrap(), pk);
+        for attrs in [
+            AK_ATTRS | attr::ADMIN_WITH_POLICY,
+            AK_ATTRS | attr::NO_DA,
+            AK_ATTRS | attr::DECRYPT,
+            AK_ATTRS & !attr::RESTRICTED,
+            AK_ATTRS & !attr::FIXED_TPM,
+        ] {
+            let p = parse_tpmt_public(&ak_area(attrs, &[], &pk)).unwrap();
+            assert!(check_ak(&p).is_err(), "attributes 0x{attrs:08x} accepted");
+        }
+        // A policy-usable AK (a non-empty authPolicy).
+        let p = parse_tpmt_public(&ak_area(AK_ATTRS, &[0x5a; 32], &pk)).unwrap();
+        assert!(check_ak(&p).is_err(), "an AK with an authPolicy accepted");
     }
 }

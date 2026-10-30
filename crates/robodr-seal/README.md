@@ -32,6 +32,14 @@ robodr-seal status --seal-dir DIR [TPM]
 | `unit` | the seal directory: enrol, unwrap, policy install / commit, volume key, erase |
 | `rpk` | seal at release, re-wrap at the depot, open on the unit |
 
+The AK, UWK and UIK public areas are checked against their **exact**
+templates (14b review): an AK must be `fixedtpm|fixedparent|
+sensitivedataorigin|userwithauth|restricted|sign` with an empty authPolicy
+(`attest::AK_ATTRS`, `check_ak`); `adminWithPolicy`, `noDA` or any other
+extra bit is refused. `Unit::erase` with `EraseTarget::defer_lockdown`
+destroys the keys only and leaves the runtime volume's lockdown to the
+caller (`robodr-deliverd` runs it when the safety state allows).
+
 ## Tests
 
 `cargo test -p robodr-seal` runs the pure tests always. With

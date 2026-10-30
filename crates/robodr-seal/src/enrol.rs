@@ -215,6 +215,11 @@ pub struct Checked {
     /// The PCR values the quote covered (they match the signed policy).
     pub pcrs: Vec<(u8, [u8; 32])>,
     pub policy_version: Option<u32>,
+    /// The TPM's time `(reset count, clock)` in the enrolment quote (fresh:
+    /// it carries the depot's nonce; signed by the AK). The depot accepts
+    /// only later reports from this enrolment on (no replay of reports the
+    /// unit signed before it).
+    pub tpm_time: Option<(u32, u64)>,
 }
 
 /// Verify everything in a request that needs no TPM and no CA: see the
@@ -245,6 +250,7 @@ pub fn verify_request(r: &EnrolRequest, x: &Expect<'_>) -> Result<Checked, SealE
             identity,
             pcrs: Vec::new(),
             policy_version: None,
+            tpm_time: None,
         });
     };
     let rec = r
@@ -340,7 +346,7 @@ pub fn verify_request(r: &EnrolRequest, x: &Expect<'_>) -> Result<Checked, SealE
         .collect::<Result<_, SealError>>()?;
     let qa = hexb(&t.quote.attest, 1024, "quote")?;
     let qs = hexb(&t.quote.sig, 80, "quote")?;
-    attest::verify_quote(&ak, &qa, &qs, x.nonce, &pcrs)?;
+    let quoted = attest::verify_quote(&ak, &qa, &qs, x.nonce, &pcrs)?;
     let want = pol.pcrs.clone();
     if pcrs != want {
         return Err(SealError::new(
@@ -360,5 +366,6 @@ pub fn verify_request(r: &EnrolRequest, x: &Expect<'_>) -> Result<Checked, SealE
         identity,
         pcrs,
         policy_version: Some(pol.doc.version),
+        tpm_time: Some((quoted.reset_count, quoted.clock)),
     })
 }

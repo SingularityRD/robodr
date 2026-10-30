@@ -114,8 +114,19 @@ directory. Run `verify` afterwards.
 * Only `public` RPKs are built; sealing is Sprint 13c.
 * `--now` defaults to the system clock of the verifying host; a clock
   before 1970 is an error. Trust file expiry is judged on that clock.
-* The anchor's two files are replaced signature first, then document; a
-  crash in between leaves a pair that fails to load (refused, restore
-  from the last accepted trust file), never an older anchor.
+* The anchor's authoritative record is `ANCHOR.json.chain`
+  (`robodr-trust-anchor/1`): the anchored trust file and its signature,
+  with the accepted rotations that lead to it from a file whose roots are
+  exactly the pinned ones. It is committed with one rename, so a crash
+  leaves the old anchor or the new one, never a torn pair; `ANCHOR.json`
+  and `ANCHOR.json.sig` are a mirror of its last entry (for readers of
+  the plain file, e.g. a depot's media packs), rewritten from it when they
+  differ. A **root-set rotation** (signed by the old and the new root
+  quorum) therefore keeps the anchor verifying under the pins the site
+  was configured with; operators may later pin the new roots. Older
+  rotations are compacted away; more than 16 root-set changes since the
+  pinned roots are refused at commit (pin the current roots). An anchor
+  without the record (before this) loads from the pair and gets the
+  record at its next commit.
 * `-h` / `--help` only as the whole command line; anywhere else it is a
   usage error (exit 2).

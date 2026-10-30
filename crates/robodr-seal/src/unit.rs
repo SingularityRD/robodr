@@ -209,6 +209,11 @@ pub struct EraseTarget<'a> {
     pub mount: Option<&'a Path>,
     /// Units that use the runtime volume: stopped first.
     pub stop_units: &'a [String],
+    /// Destroy the keys only: the lockdown of the open runtime volume
+    /// (`stop_units`, `mount`, `mapper`) is left to the caller, which runs
+    /// it later ([`Luks::lockdown`]) when its safety state allows stopping
+    /// services (`robodr-responder`'s erase plan). Noted in `incomplete`.
+    pub defer_lockdown: bool,
 }
 
 /// Where [`Unit::enroll_fallback`] may write the UWK.
@@ -943,7 +948,15 @@ impl Unit {
                 }
             }
         }
-        if target.mapper.is_some() || target.mount.is_some() || !target.stop_units.is_empty() {
+        if target.defer_lockdown {
+            rep.incomplete.push(
+                "the runtime volume lockdown (stop services, unmount, close) is deferred until \
+                 the safety state allows it: until then its plaintext stays readable through \
+                 the open mapping"
+                    .into(),
+            );
+        } else if target.mapper.is_some() || target.mount.is_some() || !target.stop_units.is_empty()
+        {
             let l = luks.lockdown(target.stop_units, target.mount, target.mapper);
             if target.mapper.is_some() && !l.volume_locked() {
                 rep.incomplete.push(

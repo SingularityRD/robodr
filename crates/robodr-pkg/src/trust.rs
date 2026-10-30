@@ -932,6 +932,17 @@ pub fn verify_trust_update(
     Ok(v)
 }
 
+/// As [`verify_trust_update`] without the expiry check: only for replaying
+/// a verifier's own chain of accepted rotations (its anchor's root-set
+/// history), each of which was fresh when it was accepted.
+pub fn verify_trust_successor(
+    prev: &VerifiedTrust,
+    doc: &[u8],
+    sigset: &[u8],
+) -> Result<VerifiedTrust, Refusal> {
+    verify_trust_update_at_any_time(prev, doc, sigset)
+}
+
 fn verify_trust_update_at_any_time(
     prev: &VerifiedTrust,
     doc: &[u8],

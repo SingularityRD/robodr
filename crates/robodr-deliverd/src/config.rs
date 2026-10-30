@@ -628,6 +628,15 @@ pub struct EraseCfg {
     pub feeder_uids: Vec<u32>,
     #[serde(default)]
     pub feeder_gids: Vec<u32>,
+    /// Longest a crypto-erase's lockdown (stop services, close the runtime
+    /// volume) may wait for a safe state after the keys were destroyed
+    /// before it escalates to a High `robot.seal.erase_deferred` (seconds).
+    #[serde(default = "d_max_lockdown_deferral_s")]
+    pub max_lockdown_deferral_s: u64,
+}
+
+fn d_max_lockdown_deferral_s() -> u64 {
+    robodr_responder::erase::DEFAULT_MAX_LOCKDOWN_DEFERRAL_S
 }
 
 fn d_pack_digest_max_mb() -> u64 {

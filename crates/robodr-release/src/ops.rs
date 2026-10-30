@@ -84,6 +84,21 @@ pub fn load_trust(
 /// is refused everywhere (`verify rpk`, `verify bundle`, `verify
 /// deployment`, `repair`, `import`, `build bundle`, `sign`). The anchor
 /// moves forward only by [`commit_anchor`] of such a rotation.
+///
+/// **Root-set rotations** (review finding, MED): the anchor's
+/// authoritative record is `FILE.chain` ([`anchor_chain_path`],
+/// `robodr-trust-anchor/1`), one file holding the anchored trust file and
+/// its signature together with the accepted rotations that lead to it
+/// from a file whose roots are exactly the configured pins. A rotation
+/// that replaces the roots therefore keeps verifying under the pins the
+/// verifier was configured with (the pins advance with the accepted
+/// rotation), and operators may later pin the new roots instead. The
+/// record is committed with a single rename, so a crash cannot leave a
+/// torn document/signature pair; `FILE` and `FILE.sig` are a mirror of
+/// its last entry for readers of the plain trust file (a depot's media
+/// packs), rewritten from it whenever they differ. An anchor without the
+/// record (before this change) is loaded from `FILE` / `FILE.sig` under
+/// the pins, as before, and gets the record at its next commit.
 #[derive(Debug, Clone)]
 pub struct SiteTrust {
     /// The accepted trust file (anchor or rotation of it).
@@ -98,6 +113,11 @@ pub struct Anchor {
     pub path: PathBuf,
     /// The anchor file as accepted (pins and site; not its expiry).
     pub trust: VerifiedTrust,
+    /// The anchor's chain (`(document, signature)`, oldest first; the
+    /// last entry is the anchor).
+    chain: AnchorChain,
+    pins: Vec<String>,
+    site: String,
     /// Bytes of the presented trust file and signature (written by
     /// [`commit_anchor`] when newer than the anchor).
     doc: Vec<u8>,
@@ -111,10 +131,155 @@ impl std::ops::Deref for SiteTrust {
     }
 }
 
+/// One accepted trust file of an anchor: `(document, signature set)`.
+type ChainLink = (Vec<u8>, Vec<u8>);
+/// An anchor's accepted trust files, oldest first.
+type AnchorChain = Vec<ChainLink>;
+
+/// `format` of an anchor record.
+pub const ANCHOR_FORMAT: &str = "robodr-trust-anchor/1";
+/// Most entries an anchor record keeps (root-set changes since the pins).
+pub const MAX_ANCHOR_CHAIN: usize = 16;
+
+/// The anchor record of the anchor at `anchor` (`FILE.chain`).
+pub fn anchor_chain_path(anchor: &Path) -> PathBuf {
+    let mut s = anchor.as_os_str().to_owned();
+    s.push(".chain");
+    PathBuf::from(s)
+}
+
+/// Whether anything of an anchor exists at `anchor` (record or mirror).
+pub fn anchor_exists(anchor: &Path) -> bool {
+    [
+        anchor.to_path_buf(),
+        sig_path(anchor),
+        anchor_chain_path(anchor),
+    ]
+    .iter()
+    .any(|p| fs::symlink_metadata(p).is_ok())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnchorRecord {
+    format: String,
+    /// Oldest first; the last entry is the anchor.
+    chain: Vec<AnchorLink>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnchorLink {
+    /// The trust file's bytes (JSON text).
+    trust: String,
+    /// Its signature set's bytes (JSON text).
+    sig: String,
+}
+
+fn anchor_refusal(msg: impl Into<String>) -> Fail {
+    Fail::Refused(Refusal::new(Code::Invalid, msg.into()).context("trust anchor"))
+}
+
+/// Verify a chain: it starts at the **last** entry whose roots are
+/// exactly `pins` (for `site`), and each later entry is an accepted
+/// rotation of the one before it (expiry not checked: each was fresh when
+/// it was accepted). Returns the start index and the verified entries
+/// from there.
+fn verify_chain(
+    chain: &[ChainLink],
+    pins: &[String],
+    site: &str,
+) -> Result<(usize, Vec<VerifiedTrust>), Fail> {
+    let mut first_err: Option<Refusal> = None;
+    let mut base = None;
+    for (i, (d, s)) in chain.iter().enumerate().rev() {
+        match verify_trust_anchor(d, s, pins, site) {
+            Ok(v) => {
+                base = Some((i, v));
+                break;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    let Some((start, v)) = base else {
+        return Err(Fail::Refused(
+            first_err
+                .unwrap_or_else(|| Refusal::new(Code::Invalid, "empty anchor record"))
+                .context("trust anchor"),
+        ));
+    };
+    let mut out = vec![v];
+    for (d, s) in chain.iter().skip(start + 1) {
+        let prev = out.last().ok_or_else(|| anchor_refusal("empty chain"))?;
+        let next = trust::verify_trust_successor(prev, d, s)
+            .map_err(|r| Fail::Refused(r.context("trust anchor rotation")))?;
+        out.push(next);
+    }
+    Ok((start, out))
+}
+
+/// A loaded anchor: what it accepted and the chain that proves it.
+struct LoadedAnchor {
+    trust: VerifiedTrust,
+    chain: AnchorChain,
+}
+
+/// Load the anchor at `anchor` under `pins` and `site` (record first,
+/// the legacy `FILE` / `FILE.sig` pair otherwise). A mirror that differs
+/// from the record (a crash between its writes) is rewritten from it.
+fn load_anchor(anchor: &Path, pins: &[String], site: &str) -> Result<LoadedAnchor, Fail> {
+    let cp = anchor_chain_path(anchor);
+    if fs::symlink_metadata(&cp).is_err() {
+        let (doc, sig) = read_trust_files(anchor).map_err(|e| prefix(e, "trust anchor"))?;
+        let trust = verify_trust_anchor(&doc, &sig, pins, site)
+            .map_err(|r| Fail::Refused(r.context("trust anchor")))?;
+        return Ok(LoadedAnchor {
+            trust,
+            chain: vec![(doc, sig)],
+        });
+    }
+    let max = MAX_ANCHOR_CHAIN * 2 * (MAX_TRUST_BYTES + MAX_SIGSET_BYTES) + 4096;
+    let b = read_capped(&cp, max).map_err(|e| prefix(e, "trust anchor"))?;
+    let rec: AnchorRecord =
+        serde_json::from_slice(&b).map_err(|e| anchor_refusal(format!("record: {e}")))?;
+    if rec.format != ANCHOR_FORMAT || rec.chain.is_empty() || rec.chain.len() > MAX_ANCHOR_CHAIN {
+        return Err(anchor_refusal("record: format or chain length"));
+    }
+    let chain: AnchorChain = rec
+        .chain
+        .into_iter()
+        .map(|l| (l.trust.into_bytes(), l.sig.into_bytes()))
+        .collect();
+    let (_, verified) = verify_chain(&chain, pins, site)?;
+    let trust = verified
+        .last()
+        .cloned()
+        .ok_or_else(|| anchor_refusal("empty chain"))?;
+    if let Some((d, s)) = chain.last() {
+        let same = read_trust_files(anchor).is_ok_and(|(md, ms)| &md == d && &ms == s);
+        if !same {
+            // Best effort: the record is authoritative.
+            let _ = write_replace(&sig_path(anchor), s);
+            let _ = write_replace(anchor, d);
+        }
+    }
+    Ok(LoadedAnchor { trust, chain })
+}
+
+/// The trust file the anchor at `anchor` holds, accepted under `pins`
+/// and `site` (directly, or through its recorded root-set rotations).
+/// Not checked for expiry.
+pub fn read_anchor(anchor: &Path, pins: &[String], site: &str) -> Result<VerifiedTrust, Fail> {
+    Ok(load_anchor(anchor, pins, site)?.trust)
+}
+
 impl SiteTrust {
     /// Accept `presented` as the site's anchor at `anchor` or a rotation
     /// of it. The anchor must exist (create it with [`init_anchor`]) and
-    /// satisfy the pinned roots and site.
+    /// satisfy the pinned roots and site (directly or through the
+    /// rotations it recorded).
     pub fn anchored(
         presented: &Path,
         anchor: &Path,
@@ -122,22 +287,52 @@ impl SiteTrust {
         site: &str,
         now: u64,
     ) -> Result<Self, Fail> {
-        if fs::symlink_metadata(anchor).is_err() {
+        if !anchor_exists(anchor) {
             return Err(Fail::Io(format!(
                 "{}: no trust anchor; create it once with `verify trust --init-anchor`",
                 anchor.display()
             )));
         }
-        let (adoc, asig) = read_trust_files(anchor).map_err(|e| prefix(e, "trust anchor"))?;
-        let a = verify_trust_anchor(&adoc, &asig, pins, site)
-            .map_err(|r| Fail::Refused(r.context("trust anchor")))?;
+        let la = load_anchor(anchor, pins, site)?;
         let (doc, sig) = read_trust_files(presented)?;
-        let trust = verify_trust_update(&a, &doc, &sig, now)?;
+        let trust = verify_trust_update(&la.trust, &doc, &sig, now)?;
         Ok(Self {
             trust,
             anchor: Some(Anchor {
                 path: anchor.to_path_buf(),
-                trust: a,
+                trust: la.trust,
+                chain: la.chain,
+                pins: pins.to_vec(),
+                site: site.into(),
+                doc,
+                sig,
+            }),
+        })
+    }
+
+    /// The anchor itself as the presented file (unexpired at `now`).
+    pub fn current(anchor: &Path, pins: &[String], site: &str, now: u64) -> Result<Self, Fail> {
+        if !anchor_exists(anchor) {
+            return Err(Fail::Io(format!(
+                "{}: no trust anchor; create it once with `verify trust --init-anchor`",
+                anchor.display()
+            )));
+        }
+        let la = load_anchor(anchor, pins, site)?;
+        la.trust.check_fresh(now)?;
+        let (doc, sig) = la
+            .chain
+            .last()
+            .cloned()
+            .ok_or_else(|| anchor_refusal("empty chain"))?;
+        Ok(Self {
+            trust: la.trust.clone(),
+            anchor: Some(Anchor {
+                path: anchor.to_path_buf(),
+                trust: la.trust,
+                chain: la.chain,
+                pins: pins.to_vec(),
+                site: site.into(),
                 doc,
                 sig,
             }),
@@ -166,6 +361,50 @@ impl SiteTrust {
     }
 }
 
+fn record_bytes(chain: &[ChainLink]) -> Result<Vec<u8>, Fail> {
+    let mut links = Vec::with_capacity(chain.len());
+    for (d, s) in chain {
+        links.push(AnchorLink {
+            trust: String::from_utf8(d.clone())
+                .map_err(|_| anchor_refusal("trust file is not UTF-8"))?,
+            sig: String::from_utf8(s.clone())
+                .map_err(|_| anchor_refusal("signature set is not UTF-8"))?,
+        });
+    }
+    serde_json::to_vec(&AnchorRecord {
+        format: ANCHOR_FORMAT.into(),
+        chain: links,
+    })
+    .map_err(|e| Fail::Io(e.to_string()))
+}
+
+/// The shortest chain to keep: from the last entry the pins accept, and
+/// without every middle entry its neighbours do not need (the entry
+/// after it verifies as a rotation of the one before it).
+fn compact_chain(mut chain: AnchorChain, pins: &[String], site: &str) -> Result<AnchorChain, Fail> {
+    let (start, mut verified) = verify_chain(&chain, pins, site)?;
+    chain.drain(..start);
+    let mut i = 1;
+    while i + 1 < chain.len() {
+        let (Some(prev), Some((d, s))) = (verified.get(i - 1), chain.get(i + 1)) else {
+            break;
+        };
+        if trust::verify_trust_successor(prev, d, s).is_ok() {
+            chain.remove(i);
+            verified.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    if chain.len() > MAX_ANCHOR_CHAIN {
+        return Err(anchor_refusal(format!(
+            "more than {MAX_ANCHOR_CHAIN} root-set changes since the pinned roots: pin the \
+             current roots"
+        )));
+    }
+    Ok(chain)
+}
+
 /// Create the site's trust anchor from a trust file accepted under the
 /// pinned roots and site (the one-time enrolment step). Refuses to
 /// overwrite an existing anchor.
@@ -178,7 +417,11 @@ pub fn init_anchor(
 ) -> Result<VerifiedTrust, Fail> {
     let (doc, sig) = read_trust_files(presented)?;
     let t = verify_trust_pinned(&doc, &sig, pins, site, now)?;
-    for p in [anchor.to_path_buf(), sig_path(anchor)] {
+    for p in [
+        anchor.to_path_buf(),
+        sig_path(anchor),
+        anchor_chain_path(anchor),
+    ] {
         if fs::symlink_metadata(&p).is_ok() {
             return Err(Fail::Io(format!(
                 "{}: already exists; an anchor is advanced with --commit, never re-created",
@@ -186,15 +429,19 @@ pub fn init_anchor(
             )));
         }
     }
+    let rec = record_bytes(&[(doc.clone(), sig.clone())])?;
+    write_new(&anchor_chain_path(anchor), &rec)?;
     write_new(&sig_path(anchor), &sig)?;
     write_new(anchor, &doc)?;
     Ok(t)
 }
 
 /// Advance the anchor to the presented file when it is a newer, accepted
-/// rotation (no-op otherwise). The signature is written first: a crash
-/// between the two renames leaves a pair that fails to load (refused,
-/// never trusted), not an older anchor.
+/// rotation (no-op otherwise). The record (`FILE.chain`, with the
+/// rotation appended) is replaced by one rename: that is the commit; a
+/// crash before it leaves the old anchor, after it the new one. The
+/// mirror (`FILE.sig`, then `FILE`) follows, and is repaired from the
+/// record by the next load if a crash interrupted it.
 pub fn commit_anchor(st: &SiteTrust) -> Result<bool, Fail> {
     let Some(a) = &st.anchor else {
         return Ok(false);
@@ -202,6 +449,11 @@ pub fn commit_anchor(st: &SiteTrust) -> Result<bool, Fail> {
     if !st.is_rotation() {
         return Ok(false);
     }
+    let mut chain = a.chain.clone();
+    chain.push((a.doc.clone(), a.sig.clone()));
+    let chain = compact_chain(chain, &a.pins, &a.site)?;
+    let rec = record_bytes(&chain)?;
+    write_replace(&anchor_chain_path(&a.path), &rec)?;
     write_replace(&sig_path(&a.path), &a.sig)?;
     write_replace(&a.path, &a.doc)?;
     Ok(true)

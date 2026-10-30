@@ -144,6 +144,25 @@ journal and the record with the old key, archives the journal as
 `<blackbox.dir>.archived-g<N>` and starts a new journal and record under
 the new key carrying the whole baseline.
 
+**Trust anchor (14b review).** A missing trust anchor, or one that does
+not verify under the pinned roots (directly or through the root-set
+rotations its record holds, `robodr-release` README), locks imports,
+transaction resumes and installs (one High `robot.deliver.refused`,
+`trust_anchor`) until it loads again (`init-anchor` / `reanchor`): the
+site's revocations, floors and trust expiry are never skipped. `reanchor`
+with an anchor present accepts the anchor or a rotation of it.
+
+**Crypto-erase (14b; 14b review).** A trigger from the platform's socket
+(`erase.trigger_socket`) or an approved person destroys the keys at once
+in **every** safety state (the TPM epoch increment and UWK blobs; without
+a TPM the keyslot wipe): it touches no actuator. Only the lockdown of the
+open runtime volume (`seal.stop_units`, unmount, close `seal.mapper_name`)
+waits for `idle`, `safe_state_active` or `estop_active`
+(`robot.seal.erase_deferred`, Medium once per state; High once after
+`erase.max_lockdown_deferral_s`, default 600). Until the whole erase is
+done the agent imports, stores wraps, unwraps and installs nothing. TPM
+units' reports carry the AK's time attestation also after an erase.
+
 ## Modules
 
 | Module | What |

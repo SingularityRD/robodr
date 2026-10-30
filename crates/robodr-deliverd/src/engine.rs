@@ -47,13 +47,16 @@ use crate::store::Store;
 use robodr_events::Severity;
 use robodr_ocsf::BlackBoxRef;
 use robodr_pkg::rpk::Manifest;
-use robodr_pkg::trust::{verify_trust_anchor, VerifiedTrust};
+use robodr_pkg::trust::VerifiedTrust;
 use robodr_responder::SafetyState;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// What one tick did (tests, `once`, logs).
+/// `reported` key of the missing-anchor lock (one finding per episode).
+const ANCHOR_LOCK: &str = "anchor:locked";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
     pub imported: Vec<String>,
@@ -122,6 +125,8 @@ pub struct Engine {
     sealing: Option<crate::sealing::Sealing>,
     /// Sprint 14b: the TPM NV counter anchoring the high-water record.
     nv: Option<(robodr_seal::tpm::Tpm, u32)>,
+    /// The LUKS front end erase uses (`None`: the system's tools).
+    luks: Option<std::sync::Arc<robodr_seal::luks::Luks>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -360,6 +365,7 @@ impl Engine {
             hw_written: None,
             hw_gen,
             nv,
+            luks: None,
         };
         e.load_anchor();
         e.journal.note(
@@ -442,45 +448,62 @@ impl Engine {
     pub fn reanchor(&mut self, trust: &std::path::Path) -> R<serde_json::Value> {
         let now = self.sys_now()?;
         let history = Journal::history(&self.cfg.blackbox.dir, self.hw_key.as_ref());
-        let (doc, sig) = robodr_release::ops::read_trust_files(trust).map_err(|e| e.to_string())?;
-        let presented = robodr_pkg::trust::verify_trust_pinned(
-            &doc,
-            &sig,
-            &self.cfg.trust.roots,
-            &self.cfg.unit.site,
-            now,
-        )
-        .map_err(|e| format!("{}: {e}", trust.display()))?;
-        if presented.file().version < history.trust_version {
+        let anchor = self.cfg.anchor_path();
+        // With an anchor: the presented file must be it or an accepted
+        // rotation of it (also across a root-set rotation the anchor
+        // recorded); without one: accepted under the pinned roots.
+        let (st, pinned_version) = if robodr_release::ops::anchor_exists(&anchor) {
+            (
+                Some(
+                    robodr_release::ops::SiteTrust::anchored(
+                        trust,
+                        &anchor,
+                        &self.cfg.trust.roots,
+                        &self.cfg.unit.site,
+                        now,
+                    )
+                    .map_err(|e| format!("{}: {e}", trust.display()))?,
+                ),
+                0,
+            )
+        } else {
+            let (doc, sig) =
+                robodr_release::ops::read_trust_files(trust).map_err(|e| e.to_string())?;
+            robodr_pkg::trust::verify_trust_pinned(
+                &doc,
+                &sig,
+                &self.cfg.trust.roots,
+                &self.cfg.unit.site,
+                now,
+            )
+            .map_err(|e| format!("{}: {e}", trust.display()))
+            .map(|v| (None, v.file().version))?
+        };
+        let presented_version = st
+            .as_ref()
+            .map_or(pinned_version, |s| s.trust.file().version);
+        if presented_version < history.trust_version {
             return Err(EngineError(format!(
                 "{}: trust file version {} is older than version {} the delivery journal has \
                  seen; present the site's current trust file",
                 trust.display(),
-                presented.file().version,
+                presented_version,
                 history.trust_version
             )));
         }
-        let anchor = self.cfg.anchor_path();
-        let t = if std::fs::symlink_metadata(&anchor).is_ok() {
-            let st = robodr_release::ops::SiteTrust::anchored(
+        let t = match st {
+            Some(st) => {
+                robodr_release::ops::commit_anchor(&st).map_err(|e| e.to_string())?;
+                st.trust
+            }
+            None => robodr_release::ops::init_anchor(
                 trust,
                 &anchor,
                 &self.cfg.trust.roots,
                 &self.cfg.unit.site,
                 now,
             )
-            .map_err(|e| e.to_string())?;
-            robodr_release::ops::commit_anchor(&st).map_err(|e| e.to_string())?;
-            st.trust
-        } else {
-            robodr_release::ops::init_anchor(
-                trust,
-                &anchor,
-                &self.cfg.trust.roots,
-                &self.cfg.unit.site,
-                now,
-            )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?,
         };
         self.load_anchor();
         // Rebuild the anti-replay baseline from the journal (only raises).
@@ -532,17 +555,17 @@ impl Engine {
         Ok(v)
     }
 
+    /// Load the trust anchor (through the root-set rotations it recorded,
+    /// `robodr_release::ops::read_anchor`). `None` when it is missing or
+    /// does not verify: the unit is then locked for imports and installs
+    /// ([`Engine::tick`], a High finding) until it loads again.
     fn load_anchor(&mut self) {
-        let a = self.cfg.anchor_path();
-        let sig = robodr_release::ops::sig_path(&a);
-        let doc = robodr_release::fsio::read_capped(&a, robodr_pkg::trust::MAX_TRUST_BYTES);
-        let s = robodr_release::fsio::read_capped(&sig, robodr_pkg::sig::MAX_SIGSET_BYTES);
-        self.anchor = match (doc, s) {
-            (Ok(d), Ok(s)) => {
-                verify_trust_anchor(&d, &s, &self.cfg.trust.roots, &self.cfg.unit.site).ok()
-            }
-            _ => None,
-        };
+        self.anchor = robodr_release::ops::read_anchor(
+            &self.cfg.anchor_path(),
+            &self.cfg.trust.roots,
+            &self.cfg.unit.site,
+        )
+        .ok();
     }
 
     /// The state (read only).
@@ -706,9 +729,18 @@ impl Engine {
     pub fn tick(&mut self) -> R<TickReport> {
         let mut rep = TickReport::default();
         let sys = self.sys_now()?;
-        // Sprint 14b: a deferred crypto-erase runs first, locked or not.
+        // Sprint 14b: a pending crypto-erase runs first, locked or not.
+        // Until all of it is done (the keys at once; the lockdown when the
+        // safety state allows) nothing is imported, stored, unwrapped or
+        // installed: no plaintext is produced under keys slated for
+        // destruction, nor written into a volume about to be closed.
         if self.state.erase_pending.is_some() {
             self.erase_pending(sys, &mut rep)?;
+            if self.state.erase_pending.is_some() {
+                rep.deferred
+                    .get_or_insert_with(|| "crypto-erase pending".into());
+                return Ok(rep);
+            }
         }
         if let Some(l) = &self.state.locked {
             // Fail closed (review M1): nothing is imported, installed or
@@ -717,6 +749,38 @@ impl Engine {
             self.check_stale(sys, &mut rep)?;
             return Ok(rep);
         }
+        // Review finding (MED): a missing or unverifiable trust anchor
+        // used to skip the site's revocations, floors and trust expiry at
+        // install. It is a locked state now: nothing is imported, resumed
+        // or installed until the anchor loads again (High finding once).
+        if self.anchor.is_none() {
+            self.load_anchor();
+        }
+        if self.anchor.is_none() {
+            let why = "the site trust anchor is missing or does not verify under the pinned \
+                       roots";
+            rep.deferred = Some(format!(
+                "locked: {why} (robodr-deliverd init-anchor or reanchor)"
+            ));
+            if self.reported.insert(ANCHOR_LOCK.into()) {
+                let ev = self.journal.note(
+                    kinds::REFUSED,
+                    json!({"stage": "trust_anchor", "detail": why,
+                           "anchor": self.cfg.anchor_path()}),
+                )?;
+                self.finding(
+                    rules::REFUSED,
+                    Severity::High,
+                    format!(
+                        "trust_anchor: {why}; the unit refuses imports and installs until it is \
+                         restored"
+                    ),
+                    Some(ev),
+                );
+            }
+            return Ok(rep);
+        }
+        self.reported.remove(ANCHOR_LOCK);
         if let Some(t) = self.state.txn.clone() {
             self.resume(t, &mut rep)?;
             return Ok(rep);
@@ -824,6 +888,7 @@ impl Engine {
         imp: media::Imported,
         rep: &mut TickReport,
     ) -> R<()> {
+        self.erase_guard()?;
         if robodr_release::ops::commit_anchor(&imp.trust).map_err(|e| e.to_string())? {
             let a = &imp.trust.trust;
             self.journal.note(
@@ -1102,15 +1167,44 @@ impl Engine {
     /// Noted in the journal; `robot.seal.erased` (Critical) says exactly
     /// what was destroyed and what was not, and `robot.seal.tamper`
     /// (Critical) comes first when the trigger is a tamper input. An erase
-    /// whose essential step failed reports nothing as erased. Executing an
-    /// erase is not gated here: the trigger's planner (an operator now,
-    /// `robodr-responder` from 14b) decides when.
+    /// whose essential step failed reports nothing as erased. This is the
+    /// operator's direct erase (`robodr-deliverd erase`), not gated here;
+    /// triggers go through [`Engine::erase_trigger`] and the responder's
+    /// plan.
     pub fn erase(
         &mut self,
         trigger: &str,
         device: Option<&std::path::Path>,
     ) -> R<serde_json::Value> {
-        self.erase_with(trigger, device, true)
+        self.erase_with(trigger, device, true, false)
+    }
+
+    /// The LUKS front end erase uses ([`Engine::set_luks`], or the
+    /// system's `cryptsetup` / `systemctl` / `umount`).
+    fn luks(&self) -> std::sync::Arc<robodr_seal::luks::Luks> {
+        self.luks
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(robodr_seal::luks::Luks::system()))
+    }
+
+    /// Replace the LUKS front end (`cryptsetup`, `systemctl`, `umount`
+    /// runner) erase uses: labs and tests without device-mapper.
+    pub fn set_luks(&mut self, luks: robodr_seal::luks::Luks) {
+        self.luks = Some(std::sync::Arc::new(luks));
+    }
+
+    /// The runtime root, if it is a mount point now.
+    fn runtime_mount(s: &crate::sealing::Sealing) -> Option<&std::path::Path> {
+        robodr_seal::mounts::is_mount_point(&s.cfg.runtime_root)
+            .then_some(s.cfg.runtime_root.as_path())
+    }
+
+    /// Whether erase has a lockdown to do at all (services to stop, a
+    /// mapping to close, a mounted runtime root).
+    fn lockdown_configured(s: &crate::sealing::Sealing) -> bool {
+        s.cfg.mapper_name.is_some()
+            || !s.cfg.stop_units.is_empty()
+            || Self::runtime_mount(s).is_some()
     }
 
     fn erase_with(
@@ -1118,6 +1212,7 @@ impl Engine {
         trigger: &str,
         device: Option<&std::path::Path>,
         announce: bool,
+        defer_lockdown: bool,
     ) -> R<serde_json::Value> {
         let s = self
             .sealing
@@ -1135,18 +1230,16 @@ impl Engine {
             );
         }
         let unit = s.unit().map_err(|e| EngineError(e.to_string()))?;
-        let luks = robodr_seal::luks::Luks::system();
         let device = device.or(s.cfg.device.as_deref());
-        let mount = robodr_seal::mounts::is_mount_point(&s.cfg.runtime_root)
-            .then_some(s.cfg.runtime_root.as_path());
         let target = robodr_seal::unit::EraseTarget {
             device,
             mapper: s.cfg.mapper_name.as_deref(),
-            mount,
+            mount: Self::runtime_mount(&s),
             stop_units: &s.cfg.stop_units,
+            defer_lockdown,
         };
         let rep = unit
-            .erase(trigger, &luks, &target)
+            .erase(trigger, &self.luks(), &target)
             .map_err(|e| EngineError(format!("erase failed: {e}")))?;
         let v = serde_json::to_value(&rep).map_err(|e| EngineError(e.to_string()))?;
         let ev = self.journal.note(kinds::ERASED, v.clone())?;
@@ -1163,10 +1256,14 @@ impl Engine {
 
     /// An authenticated erase trigger (the platform's trigger socket,
     /// [`crate::erasex`], or an operator): recorded and planned by the
-    /// responder ([`robodr_responder::erase`]); executed now when the
-    /// live safety state allows it, otherwise kept pending (also across a
-    /// restart) and executed by a later tick. `approvers`: distinct people
-    /// who approved (0 for a platform input). Returns what happened.
+    /// responder ([`robodr_responder::erase`]). The keys are destroyed now
+    /// in every safety state (no actuator is involved); the lockdown of
+    /// the runtime volume (stop services, unmount, close) runs now when
+    /// the live safety state allows it, otherwise it stays pending (also
+    /// across a restart) and a later tick runs it. While anything of the
+    /// erase is pending the agent imports, stores and unwraps nothing.
+    /// `approvers`: distinct people who approved (0 for a platform input).
+    /// Returns what happened.
     pub fn erase_trigger(
         &mut self,
         trigger: robodr_responder::erase::EraseTrigger,
@@ -1205,6 +1302,8 @@ impl Engine {
                 since: sys,
                 deferrals: 0,
                 last_state: String::new(),
+                keys_destroyed: None,
+                escalated: false,
             });
             self.save()?;
         }
@@ -1212,14 +1311,32 @@ impl Engine {
         self.erase_pending(sys, &mut rep)?;
         Ok(match &self.state.erase_pending {
             None => "erased".into(),
-            Some(p) => format!("deferred ({})", p.last_state),
+            Some(p) if p.keys_destroyed.is_some() => {
+                format!("keys destroyed; lockdown deferred ({})", p.last_state)
+            }
+            Some(p) => format!("pending ({})", p.last_state),
         })
     }
 
-    /// Run a pending erase if the responder's plan says so in the live
-    /// safety state, re-read immediately before acting (executor rule 4).
+    /// Refuse while a crypto-erase is pending (imports, wrap stores,
+    /// unwraps): nothing new is decrypted under keys slated for
+    /// destruction, nor written into the volume about to be closed.
+    fn erase_guard(&self) -> R<()> {
+        match &self.state.erase_pending {
+            None => Ok(()),
+            Some(p) => Err(EngineError(format!(
+                "a crypto-erase ({}) is pending: nothing is imported, stored or unwrapped",
+                p.trigger
+            ))),
+        }
+    }
+
+    /// Run a pending erase: the keys at once, in every safety state; the
+    /// lockdown if the responder's plan says so in the live safety state,
+    /// re-read immediately before acting (executor rule 4). A lockdown
+    /// deferred past `erase.max_lockdown_deferral_s` escalates once (High).
     fn erase_pending(&mut self, sys: u64, rep: &mut TickReport) -> R<()> {
-        use robodr_responder::erase::{plan_erase, EraseDecision, EraseTrigger};
+        use robodr_responder::erase::{lockdown_overdue, plan_erase, EraseDecision, EraseTrigger};
         let Some(p) = self.state.erase_pending.clone() else {
             return Ok(());
         };
@@ -1227,57 +1344,125 @@ impl Engine {
             self.state.erase_pending = None;
             return self.save();
         };
+        let Some(s) = self.sealing.clone() else {
+            rep.deferred = Some("erase pending: no seal configuration".into());
+            return Ok(());
+        };
         // The pending erase was approved when it was recorded.
         let approvers = if trigger.needs_two_persons() { 2 } else { 0 };
         let seen = safety::observe(&self.cfg.safety);
         let plan = plan_erase(trigger, seen.state, approvers);
-        if let EraseDecision::Defer { until } = &plan.decision {
-            let st = state_name(seen.state).to_string();
-            if p.last_state != st {
-                let ev = self.journal.note(
-                    kinds::ERASE_DEFERRED,
-                    json!({"trigger": p.trigger, "state": st, "until": until,
-                           "why_unknown": seen.why, "since": p.since}),
-                )?;
-                self.finding_in(
-                    rules::SEAL_ERASE_DEFERRED,
-                    Severity::Medium,
-                    format!(
-                        "erase_deferred: crypto-erase ({}) deferred in safety state {st}: it runs \
-                         as soon as the state is {until}",
-                        p.trigger
-                    ),
-                    Some(ev),
-                    seen.state,
-                );
-                if let Some(x) = self.state.erase_pending.as_mut() {
-                    x.last_state = st.clone();
-                    x.deferrals = x.deferrals.saturating_add(1);
-                }
-                self.save()?;
+        let st = state_name(seen.state).to_string();
+        let lockdown_now = plan.decision == EraseDecision::Execute;
+        // 1. The keys: no actuator involved, in every safety state.
+        if p.keys_destroyed.is_none() {
+            self.journal.note(
+                kinds::ERASE_INTENT,
+                json!({"trigger": p.trigger, "state": st, "since": p.since, "at": sys,
+                       "lockdown": if lockdown_now { "now" } else { "deferred" }}),
+            )?;
+            let v = self.erase_with(&p.trigger, None, false, !lockdown_now)?;
+            // Read back: the epoch moved on (TPM), or the keyslots are gone.
+            let destroyed = v["destroyed"].as_array().map_or(0, Vec::len);
+            if destroyed == 0 {
+                rep.deferred = Some("erase: nothing destroyed; tried again".into());
+                return Err(EngineError("erase destroyed nothing".into()));
             }
-            rep.deferred = Some(format!("erase deferred: {st}"));
-            return Ok(());
+            if lockdown_now || !Self::lockdown_configured(&s) {
+                self.state.erase_pending = None;
+                return self.save();
+            }
+            if let Some(x) = self.state.erase_pending.as_mut() {
+                x.keys_destroyed = Some(sys);
+            }
+            self.save()?;
+        } else if lockdown_now {
+            // 2. The deferred lockdown. Executor rule 4: the state again,
+            // immediately before acting.
+            let again = safety::observe(&self.cfg.safety);
+            if again.state != seen.state {
+                rep.deferred =
+                    Some("erase lockdown: the safety state changed; judged again".into());
+                return Ok(());
+            }
+            self.journal.note(
+                kinds::ERASE_INTENT,
+                json!({"trigger": p.trigger, "state": state_name(again.state), "since": p.since,
+                       "at": sys, "lockdown": "now"}),
+            )?;
+            let l = self.luks().lockdown(
+                &s.cfg.stop_units,
+                Self::runtime_mount(&s),
+                s.cfg.mapper_name.as_deref(),
+            );
+            self.journal.note(
+                kinds::ERASE_LOCKDOWN,
+                json!({"trigger": p.trigger, "lockdown": l, "keys_destroyed": p.keys_destroyed,
+                       "volume_locked": l.volume_locked()}),
+            )?;
+            self.state.erase_pending = None;
+            return self.save();
         }
-        // Executor rule 4: the state again, immediately before acting.
-        let again = safety::observe(&self.cfg.safety);
-        if again.state != seen.state {
-            rep.deferred = Some("erase: the safety state changed; judged again".into());
-            return Ok(());
+        // 3. The lockdown waits: noted once per state, escalated once.
+        let until = match &plan.decision {
+            EraseDecision::DestroyKeysDeferLockdown { until } => until.clone(),
+            _ => String::new(),
+        };
+        let p = self.state.erase_pending.clone().unwrap_or(p);
+        if p.last_state != st {
+            let ev = self.journal.note(
+                kinds::ERASE_DEFERRED,
+                json!({"trigger": p.trigger, "state": st, "until": until,
+                       "why_unknown": seen.why, "since": p.since,
+                       "keys_destroyed": p.keys_destroyed}),
+            )?;
+            self.finding_in(
+                rules::SEAL_ERASE_DEFERRED,
+                Severity::Medium,
+                format!(
+                    "erase_deferred: crypto-erase ({}): keys destroyed; the lockdown of the \
+                     runtime volume (stop services, unmount, close) is deferred in safety state \
+                     {st}: it runs as soon as the state is {until}",
+                    p.trigger
+                ),
+                Some(ev),
+                seen.state,
+            );
+            if let Some(x) = self.state.erase_pending.as_mut() {
+                x.last_state = st.clone();
+                x.deferrals = x.deferrals.saturating_add(1);
+            }
+            self.save()?;
         }
-        self.journal.note(
-            kinds::ERASE_INTENT,
-            json!({"trigger": p.trigger, "state": state_name(again.state), "since": p.since,
-                   "at": sys}),
-        )?;
-        let v = self.erase_with(&p.trigger, None, false)?;
-        // Read back: the epoch moved on (TPM), or the keyslots are gone.
-        let destroyed = v["destroyed"].as_array().map_or(0, Vec::len);
-        if destroyed == 0 {
-            return Err(EngineError("erase destroyed nothing".into()));
+        let max = self.cfg.erase.as_ref().map_or(
+            robodr_responder::erase::DEFAULT_MAX_LOCKDOWN_DEFERRAL_S,
+            |e| e.max_lockdown_deferral_s,
+        );
+        let waited = sys.saturating_sub(p.keys_destroyed.unwrap_or(sys));
+        if !p.escalated && lockdown_overdue(waited, max) {
+            let ev = self.journal.note(
+                kinds::ERASE_DEFERRED,
+                json!({"trigger": p.trigger, "state": st, "until": until, "overdue": true,
+                       "waited_s": waited, "max_s": max}),
+            )?;
+            self.finding_in(
+                rules::SEAL_ERASE_DEFERRED,
+                Severity::High,
+                format!(
+                    "erase_deferred: crypto-erase ({}): the runtime volume lockdown has waited \
+                     {waited} s (cap {max} s) in safety state {st}; the keys are destroyed but \
+                     the open volume's plaintext stays readable until the robot is {until}",
+                    p.trigger
+                ),
+                Some(ev),
+                seen.state,
+            );
+            if let Some(x) = self.state.erase_pending.as_mut() {
+                x.escalated = true;
+            }
+            self.save()?;
         }
-        self.state.erase_pending = None;
-        self.save()?;
+        rep.deferred = Some(format!("erase lockdown deferred: {st}"));
         Ok(())
     }
 
@@ -1356,8 +1541,10 @@ impl Engine {
             time: None,
         };
         // TPM units: the TPM's own attestation of its time, for this
-        // report (the depot bases leases on it; 14b review).
-        if u.record().mode == robodr_seal::unit::Mode::Tpm && !r.erased {
+        // report (the depot bases leases on it; 14b review). Also after an
+        // erase: the AK is intact, and the depot accepts no TPM unit's
+        // report, erased or not, without it.
+        if u.record().mode == robodr_seal::unit::Mode::Tpm {
             let d = r.time_digest().map_err(|e| EngineError(e.to_string()))?;
             r.time = Some(u.time_attest(&d).map_err(|e| EngineError(e.to_string()))?);
         }
@@ -1395,6 +1582,7 @@ impl Engine {
     }
 
     fn item(&mut self, idx: usize, sys: u64, rep: &mut TickReport) -> R<()> {
+        self.erase_guard()?;
         let Some(dep) = self.state.deployment.clone() else {
             return Ok(());
         };
@@ -1443,24 +1631,30 @@ impl Engine {
             );
         }
         // 2. Policy at the moment of use: floors (unit and site),
-        // revocations, the unit checks.
-        if let Some(a) = &self.anchor {
-            if a.is_rpk_revoked(&it.digest) || a.is_serial_revoked(&m.name, m.version.serial) {
-                return self.refuse_item(
-                    idx,
-                    "revoked_rpk",
-                    "revoked by the site trust file".into(),
-                    rep,
-                );
-            }
-            if m.version.serial < a.floor(&m.name) {
-                return self.refuse_item(
-                    idx,
-                    "below_floor",
-                    format!("below the site floor {}", a.floor(&m.name)),
-                    rep,
-                );
-            }
+        // revocations, the unit checks. Never without the anchor (the
+        // tick is locked then; this is the backstop).
+        let Some(a) = self.anchor.as_ref() else {
+            return Err(EngineError(
+                "no verified trust anchor: the site's revocations and floors cannot be checked"
+                    .into(),
+            ));
+        };
+        let floor = a.floor(&m.name);
+        if a.is_rpk_revoked(&it.digest) || a.is_serial_revoked(&m.name, m.version.serial) {
+            return self.refuse_item(
+                idx,
+                "revoked_rpk",
+                "revoked by the site trust file".into(),
+                rep,
+            );
+        }
+        if m.version.serial < floor {
+            return self.refuse_item(
+                idx,
+                "below_floor",
+                format!("below the site floor {floor}"),
+                rep,
+            );
         }
         let others: Vec<(String, u64)> = dep
             .items
