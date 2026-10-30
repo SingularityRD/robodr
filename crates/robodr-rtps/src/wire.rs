@@ -191,15 +191,15 @@ impl<'a> Iterator for ParameterList<'a> {
                 self.misaligned = true;
             }
             let end = start + plen;
-            if end > self.buf.len() {
+            let Some(value) = self.buf.get(start..end) else {
                 self.end = PlEnd::Malformed;
                 return None;
-            }
+            };
             self.pos = end;
             if pid == PID_PAD {
                 continue;
             }
-            return Some((pid, &self.buf[start..end]));
+            return Some((pid, value));
         }
     }
 }
@@ -230,10 +230,7 @@ pub(crate) fn cdr_string(value: &[u8], le: bool) -> Option<String> {
 pub(crate) fn cdr_string_lenient(value: &[u8], le: bool) -> Option<(String, bool)> {
     read_u32(value, 0, le)?;
     let rest = value.get(4..)?;
-    let text = match rest.iter().position(|&b| b == 0) {
-        Some(n) => &rest[..n],
-        None => rest,
-    };
+    let text = rest.split(|&b| b == 0).next().unwrap_or(rest);
     let text = std::str::from_utf8(text).ok()?;
     let canonical = cdr_string(value, le).as_deref() == Some(text);
     Some((text.to_owned(), canonical))
@@ -317,11 +314,11 @@ impl fmt::Display for Locator {
 
 /// Lower-case hex of any byte slice, no separators.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push(DIGITS[(b >> 4) as usize] as char);
-        s.push(DIGITS[(b & 0x0f) as usize] as char);
+        // Both nibbles are < 16, so `from_digit` never falls back.
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
     }
     s
 }

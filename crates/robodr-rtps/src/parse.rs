@@ -330,11 +330,12 @@ impl EndpointInfo {
         }
         if self.source != GUIDPREFIX_UNKNOWN {
             let sender = hex(&self.source);
-            for i in 0..out.len() {
-                if out[i].guid_prefix != sender {
+            let readings = out.clone();
+            for o in readings {
+                if o.guid_prefix != sender {
                     let e = Endpoint {
                         guid_prefix: sender.clone(),
-                        ..out[i].clone()
+                        ..o
                     };
                     if !out.contains(&e) {
                         out.push(e);
@@ -569,9 +570,12 @@ impl DatagramReport {
                 parts.push((prefix, Vec::new()));
                 (parts.len() - 1, HashSet::new())
             });
+            let Some((_, part)) = parts.get_mut(*i) else {
+                return;
+            };
             for l in locs {
                 if seen.insert(l.clone()) {
-                    parts[*i].1.push(l);
+                    part.push(l);
                 }
             }
         };
@@ -710,7 +714,9 @@ impl Report {
             // Keep the first values and always the latest one.
             self.anomaly(Anomaly::TooManyParameterValues(pid));
             m.last = MAX_PARAMETER_VALUES - 1;
-            m.vals[m.last] = v;
+            if let Some(slot) = m.vals.get_mut(m.last) {
+                *slot = v;
+            }
         }
     }
 
@@ -1227,16 +1233,20 @@ impl Report {
                 .map(|j| (0, j, 0)),
         );
         combos.extend((1..types.len()).filter(|&k| k != y_last).map(|k| (0, 0, k)));
-        let reading = |(i, j, k): (usize, usize, usize)| EndpointAlternate {
-            guid: owners[i].0,
-            participant: owners[i].1,
-            topic: topics[j].clone(),
-            type_name: types[k].clone(),
+        let reading = |(i, j, k): (usize, usize, usize)| {
+            let &(guid, participant) = owners.get(i)?;
+            Some(EndpointAlternate {
+                guid,
+                participant,
+                topic: topics.get(j)?.clone(),
+                type_name: types.get(k)?.clone(),
+            })
         };
-        let first = reading((0, 0, 0));
+        let Some(first) = reading((0, 0, 0)) else {
+            return;
+        };
         let mut alternates: Vec<EndpointAlternate> = Vec::new();
-        for c in combos {
-            let a = reading(c);
+        for a in combos.into_iter().filter_map(reading) {
             if a != first && !alternates.contains(&a) {
                 alternates.push(a);
             }
@@ -1289,7 +1299,7 @@ pub(crate) fn parse(
         ));
     }
     let mut source = header.guid_prefix;
-    let mut buf = &datagram[RTPS_HEADER_LEN..];
+    let mut buf = datagram.get(RTPS_HEADER_LEN..)?;
     while !buf.is_empty() {
         let (Some(&id), Some(&flags)) = (buf.first(), buf.get(1)) else {
             r.anomaly(Anomaly::TruncatedSubmessage);
@@ -1307,7 +1317,7 @@ pub(crate) fn parse(
         } else {
             len as usize
         };
-        let Some(body) = buf.get(4..4 + body_len) else {
+        let Some((body, rest)) = buf.get(4..).and_then(|b| b.split_at_checked(body_len)) else {
             r.anomaly(Anomaly::TruncatedSubmessage);
             break;
         };
@@ -1346,7 +1356,7 @@ pub(crate) fn parse(
             SUBMSG_VENDOR_FIRST..=0xff => r.stats.vendor_specific += 1,
             _ => r.stats.unknown += 1,
         }
-        buf = &buf[4 + body_len..];
+        buf = rest;
     }
     Some(r)
 }

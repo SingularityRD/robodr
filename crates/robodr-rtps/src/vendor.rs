@@ -63,7 +63,7 @@ pub fn vendor_info(id: [u8; 2]) -> Option<&'static VendorInfo> {
     KNOWN_VENDORS
         .binary_search_by_key(&id, |v| v.id)
         .ok()
-        .map(|i| &KNOWN_VENDORS[i])
+        .and_then(|i| KNOWN_VENDORS.get(i))
 }
 
 /// The vendor's name, if the id is in the table.
