@@ -63,7 +63,9 @@ rocky9)
     ROBODR_CLANG_APT_PACKAGE="clang"
     # An RPM version-release here (dnf install clang-<this>).
     ROBODR_CLANG_APT_VERSION="21.1.8-2.el9"
-    ROBODR_CLANG_APT_ALSO="clang-libs llvm-libs"
+    # llvm / lld too: the eBPF toolchain step installs them from the same
+    # AppStream, and they must not move the shared LLVM libraries.
+    ROBODR_CLANG_APT_ALSO="clang-libs llvm-libs llvm lld lld-libs"
     ROBODR_GCC_VERSION="11.5.0"
     ROBODR_BINUTILS_VERSION="2.35.2"
     ;;
@@ -114,6 +116,30 @@ robodr_pin_cc() {
         fi
     fi
     export "$var=$cc"
+}
+
+# robodr_pkg_version PKG: installed version (dpkg) or version-release (rpm).
+robodr_pkg_version() {
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true
+    else
+        rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null || true
+    fi
+}
+
+# robodr_check_pinned_packages WHO: the driver and every package of
+# ROBODR_CLANG_APT_ALSO are installed at the pinned version (re-checked by
+# the release build after the other toolchain steps ran). 1 + message if not.
+robodr_check_pinned_packages() {
+    local p v ok=0
+    for p in "$ROBODR_CLANG_APT_PACKAGE" ${ROBODR_CLANG_APT_ALSO:-}; do
+        v="$(robodr_pkg_version "$p")"
+        if [[ "$v" != "$ROBODR_CLANG_APT_VERSION" ]]; then
+            echo "$1: FAIL: $p ${v:-(not installed)}, pinned $ROBODR_CLANG_APT_VERSION ($(robodr_build_userland))" >&2
+            ok=1
+        fi
+    done
+    return "$ok"
 }
 
 # robodr_toolchain_report: the versions that went into a build.

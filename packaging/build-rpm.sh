@@ -116,6 +116,9 @@ while IFS= read -r p; do
         esac
     elif [[ "$conffiles" == *" $path "* ]]; then
         echo "%config(noreplace) %attr($mode,root,root) $path" >>"$files"
+    elif [[ "$path" == /usr/share/doc/robodr/copyright || "$path" == /usr/share/doc/robodr/licenses/* ]]; then
+        # %license, not %doc: installed even with tsflags=nodocs.
+        echo "%license %attr($mode,root,root) $path" >>"$files"
     elif [[ -L "$payload$path" ]]; then
         echo "$path" >>"$files"
     else

@@ -384,7 +384,10 @@ def read_tar(data: bytes) -> tuple[dict[str, Entry], dict[str, bytes]]:
     contents: dict[str, bytes] = {}
     with tarfile.open(fileobj=io.BytesIO(data)) as tf:
         for ti in tf.getmembers():
-            p = "/" + ti.name.lstrip("./").rstrip("/") if ti.name not in (".", "./") else "/"
+            # removeprefix, not lstrip: ".hidden" keeps its dot.
+            if ti.name in (".", "./", "/"):
+                continue
+            p = "/" + ti.name.removeprefix("./").removeprefix("/").rstrip("/")
             if p == "/":
                 continue
             if ti.isdir():
@@ -400,6 +403,48 @@ def read_tar(data: bytes) -> tuple[dict[str, Entry], dict[str, bytes]]:
                 kind, digest = "?", ""
             entries[p] = Entry(kind, ti.mode & 0o7777, ti.uname or str(ti.uid), ti.gname or str(ti.gid), digest)
     return entries, contents
+
+
+def deb_conffiles(path: Path) -> set[str]:
+    """The .deb's conffiles (DEBIAN/conffiles)."""
+    r = subprocess.run(["dpkg-deb", "-I", str(path), "conffiles"], capture_output=True, text=True)
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()} if r.returncode == 0 else set()
+
+
+def rpm_fileflags(path: Path) -> dict[str, str]:
+    """path -> rpm file flags letters (c config, n noreplace, d doc, l license)."""
+    out = subprocess.run(
+        ["rpm", "-qp", "--qf", "[%{FILEFLAGS:fflags}\\t%{FILENAMES}\\n]", str(path)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    flags = {}
+    for line in out.splitlines():
+        if "\t" in line:
+            f, p = line.split("\t", 1)
+            flags[p] = f
+    return flags
+
+
+LICENSE_FILES = ("/usr/share/doc/robodr/copyright", "/usr/share/doc/robodr/licenses/*")
+
+
+def check_rpm_flags(label: str, flags: dict[str, str], conffiles: set[str] | None) -> list[str]:
+    """%license on the licence files (tsflags=nodocs must not drop them),
+    %config(noreplace) exactly on the .deb's conffiles."""
+    errs = []
+    for p, f in sorted(flags.items()):
+        if any(fnmatch(p, g) for g in LICENSE_FILES) and "l" not in f:
+            errs.append(f"{label}: {p} is not %license (flags {f!r}): dnf --nodocs would drop it")
+    config = {p for p, f in flags.items() if "c" in f}
+    for p in sorted(config):
+        if "n" not in flags[p]:
+            errs.append(f"{label}: {p} is %config without noreplace")
+    if conffiles is not None:
+        for p in sorted(conffiles - config):
+            errs.append(f"{label}: deb conffile {p} is not %config in the RPM")
+        for p in sorted(config - conffiles):
+            errs.append(f"{label}: %config {p} is not a conffile of the .deb")
+    return errs
 
 
 def read_rpm(path: Path) -> tuple[dict[str, Entry], dict[str, bytes], str, str]:
@@ -519,16 +564,20 @@ def rpm_owned(entries: dict[str, Entry]) -> dict[str, Entry]:
 def package_checks(debs: list[Path], rpms: list[Path], root: Path) -> list[str]:
     errs: list[str] = []
     loaded = []
+    conffiles: dict[str, set[str]] = {}
     for path in debs:
         entries, contents, name, arch = read_deb(path)
         loaded.append(("deb", name, arch, entries, path))
         errs += check_package(path.name, name, entries, contents, root)
+        if name == STD:
+            conffiles[arch] = deb_conffiles(path)
     for path in rpms:
         entries, contents, name, arch = read_rpm(path)
         if name != STD:
             errs.append(f"{path.name}: package {name}, only {STD} has an RPM")
         loaded.append(("rpm", name, arch, entries, path))
         errs += check_package(path.name, STD, entries, contents, root)
+        errs += check_rpm_flags(path.name, rpm_fileflags(path), conffiles.get(arch))
     for kind, name, arch, entries, path in loaded:
         if kind == "rpm":
             for k2, n2, a2, e2, p2 in loaded:
@@ -542,6 +591,15 @@ def package_checks(debs: list[Path], rpms: list[Path], root: Path) -> list[str]:
 
 
 # -------------------------------------------------------------- self-test --
+
+
+def _tar_with(name: str) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        ti = tarfile.TarInfo(name)
+        ti.size = 0
+        tf.addfile(ti, io.BytesIO(b""))
+    return buf.getvalue()
 
 
 def self_test() -> int:
@@ -619,7 +677,17 @@ def self_test() -> int:
     expect("drop-in widens bounding only", check_noroot_caps(
         "u", [nr + "AmbientCapabilities=CAP_BPF CAP_PERFMON\n", "[Service]\nCapabilityBoundingSet=CAP_SYS_ADMIN\n"]), False)
     expect("no noroot: not required", check_noroot_caps("u", ["[Service]\nCapabilityBoundingSet=CAP_BPF\n"]), True)
-    total = 27
+    lic = {"/usr/share/doc/robodr/copyright": "l", "/usr/share/doc/robodr/licenses/MIT": "l",
+           "/usr/share/doc/robodr/README.md": "d", "/etc/robodr/pulsar.toml": "cn"}
+    expect("rpm flags ok", check_rpm_flags("r", lic, {"/etc/robodr/pulsar.toml"}), True)
+    expect("licence as %doc", check_rpm_flags("r", {**lic, "/usr/share/doc/robodr/copyright": "d"}, None), False)
+    expect("config without noreplace", check_rpm_flags("r", {**lic, "/etc/robodr/pulsar.toml": "c"}, None), False)
+    expect("conffile not %config", check_rpm_flags("r", {**lic, "/etc/robodr/pulsar.toml": ""}, {"/etc/robodr/pulsar.toml"}), False)
+    hidden, _ = read_tar(_tar_with("./.hidden") )
+    root_only, _ = read_tar(_tar_with("."))
+    expect("archive root skipped", [] if not root_only else [str(root_only)], True)
+    expect("hidden name keeps its dot", [] if "/.hidden" in hidden else [str(hidden)], True)
+    total = 33
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

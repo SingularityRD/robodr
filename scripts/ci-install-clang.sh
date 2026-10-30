@@ -20,19 +20,7 @@ pkgs=("$ROBODR_CLANG_APT_PACKAGE")
 read -r -a also <<<"${ROBODR_CLANG_APT_ALSO:-}"
 pkgs+=("${also[@]}")
 
-if command -v dpkg-query >/dev/null 2>&1; then
-    pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true; }
-else
-    # RPM userland (rocky9): ROBODR_CLANG_APT_VERSION is a version-release.
-    pkg_version() { rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null || true; }
-fi
-
-pinned_ok() {
-    local p
-    for p in "${pkgs[@]}"; do
-        [[ "$(pkg_version "$p")" == "$ROBODR_CLANG_APT_VERSION" ]] || return 1
-    done
-}
+pinned_ok() { robodr_check_pinned_packages ci-install-clang 2>/dev/null; }
 
 if ! pinned_ok; then
     spec=()
@@ -52,13 +40,7 @@ fi
 if command -v apt-mark >/dev/null 2>&1; then
     "${as_root[@]}" apt-mark hold "${pkgs[@]}" >/dev/null
 fi
-for p in "${pkgs[@]}"; do
-    installed="$(pkg_version "$p")"
-    if [[ "$installed" != "$ROBODR_CLANG_APT_VERSION" ]]; then
-        echo "ci-install-clang: FAIL: $p ${installed:-(none)} installed, pinned $ROBODR_CLANG_APT_VERSION ($(robodr_build_userland))" >&2
-        exit 1
-    fi
-done
+robodr_check_pinned_packages ci-install-clang || exit 1
 if ! robodr_clang_ok "$ROBODR_CLANG"; then
     echo "ci-install-clang: FAIL: $ROBODR_CLANG --version: $("$ROBODR_CLANG" --version | head -n1)" >&2
     exit 1

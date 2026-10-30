@@ -58,6 +58,12 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   sets umask 022 and the mode explicitly.
 - The `.deb`'s `prerm` did not stop `robodr-deliverd` on removal.
 - `scripts/deb-install-smoke.sh` used `cp --update=none` (coreutils >= 9.3).
+- Removal left services enabled, so a reinstall started them at the next
+  boot before commissioning: RPM erase now disables them, deb purge
+  removes their `.wants` / `.requires` links (masks and drop-ins stay).
+- `robodr-pulsard.service` set `SecureBits=noroot-locked` without
+  `AmbientCapabilities=`, so the daemon would have run without any
+  capability (no `CAP_BPF`): the ambient set now equals the bounding set.
 - The pinned clang of ring now also pins the LLVM libraries that hold its
   code generator (`libllvm*`, `libclang-cpp*`, ...), not only the driver.
 

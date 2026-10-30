@@ -29,6 +29,9 @@ export RUSTFLAGS="--remap-path-prefix=$PWD=/build/robodr --remap-path-prefix=${C
 . scripts/c-toolchain.sh
 host="$(rustc -vV | sed -n 's/^host: //p')"
 robodr_pin_cc "$host" release
+# The packages too, after every toolchain step (an eBPF toolchain install
+# must not have moved the LLVM libraries the pinned clang runs on).
+robodr_check_pinned_packages release
 robodr_toolchain_report >&2
 # Word lists exported by ci-setup.sh.
 read -r -a excludes <<<"${PURE_EXCLUDES:-}"

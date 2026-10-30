@@ -15,6 +15,18 @@ purge)
     # (re-validates) actions of the old one.
     rm -f /var/lib/robodr/executor/journal.json /var/lib/robodr/executor/journal.json.tmp
     rmdir /var/lib/robodr/executor 2>/dev/null || true
+    # Purge forgets what the operator enabled (the deb counterpart of
+    # deb-systemd-helper purge; the unit files are already gone, so
+    # systemctl disable cannot be used): the .wants/.requires links of
+    # RoboDR's own units. Masks and drop-ins under /etc/systemd/system are
+    # the operator's and stay. A later install then starts nothing.
+    for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
+        robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
+        robodr-executor.service robodr-firewall-gw.service robodr-firewall-gw-rules.service \
+        robodr-deliverd.service; do
+        find -P /etc/systemd/system -mindepth 2 -maxdepth 2 -type l \
+            \( -path "*.wants/$u" -o -path "*.requires/$u" \) -exec rm -f -- {} + 2>/dev/null || true
+    done
     if [ -d /var/lib/robodr ] || [ -d /etc/robodr ]; then
         echo "robodr: purge keeps /var/lib/robodr (evidence) and /etc/robodr (keys, profile)."
         echo "robodr: export and archive them first; see OPERATIONS.md, 'Decommissioning'."

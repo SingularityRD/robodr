@@ -6,7 +6,7 @@
 #
 #   robodr .deb   Depends: libc6 (>= X) with X <= 2.35 (Ubuntu 22.04 /
 #                 JetPack 6; Debian 12 has 2.36)
-#   robodr .rpm   every generated libc.so.6(GLIBC_X) requirement X <= 2.34
+#   robodr .rpm   every generated <lib>(GLIBC_X) requirement X <= 2.34
 #                 (RHEL / Rocky / Alma 9)
 #   robodr-focal  no libc6 dependency at all (static)
 # Also prints the dependency line, for the build log.
@@ -41,7 +41,8 @@ case "$f" in
 *.rpm)
     reqs="$(rpm -qp --requires "$f")"
     printf '%s\n' "$reqs" | sed 's/^/check-glibc-floor: requires /'
-    v="$(printf '%s\n' "$reqs" | sed -n 's/^libc\.so\.6(GLIBC_\([0-9.]*\)).*/\1/p' | sort -V | tail -n1)"
+    # libc, libm, libpthread, ld-linux ...: every GLIBC_ version need.
+    v="$(printf '%s\n' "$reqs" | sed -n 's/^.*(GLIBC_\([0-9.]*\)).*/\1/p' | sort -V | tail -n1)"
     [[ -n "$v" ]] || { echo "check-glibc-floor: FAIL: no generated GLIBC requirement (AutoReq off?)" >&2; exit 1; }
     if ! le "$v" "$RPM_FLOOR"; then
         echo "check-glibc-floor: FAIL: needs GLIBC_$v, above $RPM_FLOOR: the package would not install on RHEL 9" >&2

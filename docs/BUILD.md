@@ -514,8 +514,9 @@ same file tree as the `.deb` (`build-deb.sh --stage-only`): units,
 tmpfiles/sysusers fragments, man pages, docs, examples, rules and modes
 are the `.deb`'s, only the programs differ. `%config(noreplace)` for the
 `.deb`'s conffiles, scriptlets that do what the maintainer scripts do
-(sysusers, tmpfiles, daemon-reload, `try-restart` on upgrade, stop and the
-executor's nft table on removal; no agentd-tree migration, which only
+(sysusers, tmpfiles, daemon-reload, `try-restart` on upgrade, stop,
+`disable` and the executor's nft table on erase; licence files as
+`%license`, so `tsflags=nodocs` keeps them; no agentd-tree migration, which only
 concerns `.deb` releases older than any RPM), no strip / debuginfo /
 build-id links, `SOURCE_DATE_EPOCH` for every mtime and the build time.
 

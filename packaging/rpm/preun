@@ -18,6 +18,17 @@ if [ "${1:-0}" -eq 0 ]; then
             systemctl stop "$u" 2>/dev/null || :
         done
     fi
+    # Erase disables what the operator enabled (RPM convention): a later
+    # reinstall must not start an uncommissioned service at the next boot.
+    # Works without a running systemd (it only removes the symlinks).
+    if command -v systemctl >/dev/null 2>&1; then
+        for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
+            robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
+            robodr-executor.service robodr-firewall-gw.service robodr-firewall-gw-rules.service \
+            robodr-deliverd.service; do
+            systemctl --no-reload disable "$u" >/dev/null 2>&1 || :
+        done
+    fi
     # executor v1: without the executor nothing would lift its actions at
     # their TTL, so its table goes with it (only this table, never another).
     if command -v nft >/dev/null 2>&1 && nft list table inet robodr >/dev/null 2>&1; then

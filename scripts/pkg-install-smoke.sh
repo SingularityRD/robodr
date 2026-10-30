@@ -78,6 +78,9 @@ if [[ $kind == deb ]]; then
     out="$(dpkg --verify "$name" 2>&1 || true)"
     [[ -z "$out" ]] || bad "dpkg --verify: $out"
 else
+    # Container images set tsflags=nodocs (docs not installed); a real host
+    # installs them, and %license files must be there either way.
+    sed -i '/^tsflags=/d' /etc/dnf/dnf.conf 2>/dev/null || true
     dnf install -y -q --setopt=install_weak_deps=False binutils >/dev/null
     dnf install -y --setopt=install_weak_deps=False "$pkgfile"
     name="$(rpm -qp --qf '%{NAME}' "$pkgfile")"
@@ -173,11 +176,20 @@ else
     rpm -U --replacepkgs "$pkgfile"
 fi
 
+# An operator enabled a service (offline enable: symlinks only). After the
+# package is gone (rpm erase, deb purge) nothing may stay enabled: a later
+# reinstall must not start an uncommissioned service at the next boot.
+step "enable robodr-agentd (as an operator would)"
+systemctl enable robodr-agentd.service >/dev/null 2>&1 || bad "systemctl enable robodr-agentd failed"
+wants() { find -P /etc/systemd/system -mindepth 2 -maxdepth 2 -name 'robodr-*.service' -type l 2>/dev/null; }
+[[ -n "$(wants)" ]] || bad "systemctl enable created no wants link"
+
 step "remove"
 if [[ $kind == deb ]]; then
     apt-get remove -y "$name" >/dev/null
 else
     dnf remove -y "$name" >/dev/null
+    [[ -z "$(wants)" ]] || bad "rpm erase left the service enabled: $(wants | tr '\n' ' ')"
 fi
 [[ ! -e /usr/lib/systemd/system/robodr-agentd.service ]] || bad "robodr-agentd.service still installed after removal"
 [[ -f /var/lib/robodr/blackbox/agentd/smoke-segment ]] || bad "removal deleted evidence"
@@ -188,6 +200,7 @@ if [[ $kind == deb ]]; then
     [[ -f /var/lib/robodr/blackbox/agentd/smoke-segment ]] || bad "purge deleted evidence"
     [[ -d /etc/robodr/keys ]] || bad "purge deleted /etc/robodr/keys"
     [[ ! -e /var/lib/robodr/executor/journal.json ]] || bad "purge kept the executor journal"
+    [[ -z "$(wants)" ]] || bad "purge left the service enabled: $(wants | tr '\n' ' ')"
 fi
 
 if [[ $fail -ne 0 ]]; then
