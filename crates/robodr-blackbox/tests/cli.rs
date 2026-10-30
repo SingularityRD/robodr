@@ -911,3 +911,70 @@ fn rotate_previous_keys_get_the_agentd_checks() {
     assert!(o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("no TPM anchor sidecar"), "{}", text(&o));
 }
+
+/// T15: `export-pending` writes bundles that `verify` accepts, advances the
+/// cursor, and on a second run has nothing to do; a wrong device is a
+/// usage error and writes nothing.
+#[test]
+fn export_pending_writes_verifiable_bundles_and_advances_the_cursor() {
+    let d = TestDir::new("cli-export-pending");
+    let (k, dir) = log_with_key_file(&d);
+    let out = d.sub("outbox");
+    std::fs::create_dir(&out).unwrap();
+    let o = run(&[
+        "export-pending",
+        s(&dir),
+        "--key",
+        s(&k),
+        "--device",
+        "other-unit",
+        "--out-dir",
+        s(&out),
+    ]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(!dir.join(robodr_blackbox::store::CURSOR_FILE).exists());
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    let o = run(&[
+        "export-pending",
+        s(&dir),
+        "--key",
+        s(&k),
+        "--device",
+        "ugv-01",
+        "--out-dir",
+        s(&out),
+        "--max-records",
+        "8",
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    let mut bundles: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    bundles.sort();
+    assert!(bundles.len() >= 3, "{}", text(&o));
+    for b in &bundles {
+        let v = run(&["verify", s(b), "--keyring", s(&k), "--device", "ugv-01"]);
+        assert!(v.status.success(), "{}", text(&v));
+    }
+    assert!(dir.join(robodr_blackbox::store::CURSOR_FILE).exists());
+    let o = run(&[
+        "export-pending",
+        s(&dir),
+        "--key",
+        s(&k),
+        "--device",
+        "ugv-01",
+        "--out-dir",
+        s(&out),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("nothing pending"), "{}", text(&o));
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), bundles.len());
+    // The recorder accepts the cursor the CLI wrote.
+    let key = KeyFile::load(&k).unwrap().signer().unwrap();
+    let mut c = cfg(&dir, big());
+    c.device_id = "ugv-01".into();
+    let r = Recorder::open(c, key, clock()).unwrap();
+    assert!(r.export_cursor().is_some());
+}

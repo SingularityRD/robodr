@@ -88,6 +88,7 @@ pub mod crl;
 pub mod crypto;
 pub mod export;
 pub mod keys;
+pub mod outbox;
 pub mod record;
 pub mod remote_anchor;
 pub mod sign;
@@ -109,6 +110,7 @@ pub use state_seal::StateSealKey;
 pub use store::{
     AnchoredHead, AppendOutcome, EntryKind, Error, FileHeadAnchor, FsyncPolicy, HeadAnchor,
     MemoryHeadAnchor, OpenIncident, Recorder, RecorderConfig, Refusal, RetentionMode,
+    RetentionStatus,
 };
 pub use time::{Clock, SteppingClock, SystemClock, TimeSource, Timestamp};
 pub use tpm_anchor::{TpmAnchorConfig, TpmNvCounterAnchor};

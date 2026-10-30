@@ -1,0 +1,106 @@
+# robodr-blackbox-export: moves robodr-agentd's unexported black-box records
+# out of the unit as signed RBBXBND1 bundles, for the diode or the media
+# station (docs/OPERATIONS.md 8.2, man robodr-blackbox: export-pending).
+# Started by robodr-blackbox-export.timer; one run exports everything
+# pending (at most 64 bundles of 100000 records / 64 MiB) and exits.
+#
+# Checked against crates/robodr-blackbox (robodr-blackbox export-pending):
+#   * It reads the black box while agentd records (read only, one segment
+#     in memory at a time; its own export.lock, never agentd's lock), checks
+#     every record's hash, signature and link, writes each bundle durably,
+#     then advances the signed export cursor (export-cursor.json). agentd
+#     re-reads the cursor before cyclic retention would drop a segment
+#     (blackbox.retention.unexported_reserve_segments) and reports pressure
+#     before it does (robot.agent.evidence_retention_pressure).
+#   * It runs as root with only CAP_DAC_OVERRIDE (to read agentd's 0700
+#     black box and write its cursor and export.lock there) and CAP_CHOWN
+#     (the cursor is handed to the directory's owner, robodr-agentd, so
+#     agentd can read it); one uid per service, so not agentd's. Group
+#     robodr: the bundles are 0640 root:robodr for the transfer to the
+#     diode.
+#   * The cursor is signed with agentd's black-box key (LoadCredential
+#     below; the same file agentd loads). After a key rotation, add the
+#     retired public keys: ROBODR_BLACKBOX_EXPORT_ARGS="--previous-keys
+#     /etc/robodr/keys/agentd-blackbox-2025.key.pub".
+#   * Exit 1: records after the cursor were lost before they were exported
+#     (the bundles written still hold what is there; the receiver reports
+#     the gap): the unit shows failed until the next clean run. Exit 2:
+#     usage, key or I/O error.
+#
+# Site settings: /etc/robodr/blackbox-export.env (0640 root:robodr):
+#   ROBODR_UNIT_ID=<robot id, agentd's robot.id>             (required)
+#   ROBODR_BLACKBOX_EXPORT_ARGS="--max-bundles 64"           (optional extra flags)
+#
+# Installed disabled. Enable on diode / media sites after commissioning:
+#   systemctl enable --now robodr-blackbox-export.timer
+# Verify after editing: systemd-analyze verify robodr-blackbox-export.service
+#                       systemd-analyze security robodr-blackbox-export.service
+
+[Unit]
+Description=RoboDR black-box export (unexported records to signed bundles)
+Documentation=man:robodr-blackbox(1) file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr/blackbox-export.env
+After=local-fs.target robodr-agentd.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/robodr/blackbox-export.env
+ExecStart=/usr/bin/robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd --key /run/credentials/robodr-blackbox-export.service/blackbox.key --device ${ROBODR_UNIT_ID} --out-dir /var/lib/robodr/export/blackbox $ROBODR_BLACKBOX_EXPORT_ARGS
+TimeoutStartSec=15min
+OOMScoreAdjust=300
+MemoryHigh=192M
+MemoryMax=320M
+TasksMax=8
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# --- Identity and capabilities ---------------------------------------------
+User=root
+Group=robodr
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0027
+
+# --- Key material ------------------------------------------------------------
+LoadCredential=blackbox.key:/etc/robodr/keys/agentd-blackbox.key
+InaccessiblePaths=-/etc/robodr/keys
+TemporaryFileSystem=/run/credentials:ro
+BindReadOnlyPaths=-/run/credentials/robodr-blackbox-export.service
+
+# --- Filesystem --------------------------------------------------------------
+# The outbox is created by systemd (0750 root:robodr).
+StateDirectory=robodr/export/blackbox
+StateDirectoryMode=0750
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ReadWritePaths=/var/lib/robodr/blackbox/agentd
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network: none at all ------------------------------------------------------
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @chown
+SystemCallFilter=~@resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM

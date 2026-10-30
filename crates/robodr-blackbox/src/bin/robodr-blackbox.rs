@@ -20,6 +20,9 @@
 //! robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
 //!                            [--index-auth-file FILE]
 //! robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE] [--allow-hmac]
+//! robodr-blackbox export-pending DIR --key FILE --device ID --out-dir DIR
+//!                            [--previous-keys FILE]... [--max-records N] [--max-bytes N]
+//!                            [--max-bundles N] [--allow-hmac]
 //! ```
 //!
 //! **Legacy HMAC keys are refused by default** (symmetric: whoever can
@@ -96,6 +99,22 @@
 //!   signed mark of unit `--unit` (the `advance` request line) to `--out`
 //!   (created new, never overwritten) or stdout, for
 //!   `robodr-anchor-receiver ingest` on the far side of a diode.
+//! - `export-pending` moves the black box's unexported records out of the
+//!   unit **while the recorder runs** (`robodr_blackbox::outbox`): every
+//!   record after the signed export cursor of log `DIR` (unit `--device`)
+//!   becomes `RBBXBND1` bundles in `--out-dir` (the diode / media outbox,
+//!   `rbbx-<device>-<chain>-<first>-<last>.rbbx`), each written durably
+//!   before the cursor is advanced (signed with `--key`, the recorder's
+//!   current secret key; records signed by keys retired by a rotation need
+//!   `--previous-keys`). Each record's hash, signature and link are checked
+//!   first; a bundle stops at a break. With
+//!   `blackbox.retention.unexported_reserve_segments` the recorder keeps
+//!   segments this has not exported. Up to `--max-bundles` (default 64)
+//!   bundles of at most `--max-records` (100000) records / `--max-bytes`
+//!   (64 MiB) per run. It prints one line per bundle; records lost before
+//!   they were exported (a gap after the cursor) are reported and make the
+//!   run exit 1 after writing what is there. Packaged as
+//!   `robodr-blackbox-export.timer` (OPERATIONS 8.2).
 //!
 //! Exit codes: 0 = verified intact (warnings allowed unless `--strict`),
 //! 1 = verification failed, 2 = usage, I/O or key error.
@@ -140,6 +159,9 @@ const USAGE: &str = "usage:
   robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--index-auth-file FILE]
   robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE] [--allow-hmac]
+  robodr-blackbox export-pending DIR --key FILE --device ID --out-dir DIR
+                             [--previous-keys FILE]... [--max-records N] [--max-bytes N]
+                             [--max-bundles N] [--allow-hmac]
   robodr-blackbox --version
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
@@ -255,6 +277,7 @@ fn main() -> ExitCode {
         Some("tpm-anchor-init") => tpm_anchor_init(&argv[1..]),
         Some("tpm-anchor-check") => tpm_anchor_check(&argv[1..]),
         Some("anchor-mark") => anchor_mark(&argv[1..]),
+        Some("export-pending") => export_pending(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -810,6 +833,119 @@ fn anchor_mark(raw: &[String]) -> Result<(), Fail> {
                 m.seq
             );
         }
+    }
+    Ok(())
+}
+
+fn positive(a: &Args, name: &str, default: u64) -> Result<u64, String> {
+    match a.one(name)? {
+        None => Ok(default),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!("--{name} must be a positive integer")),
+        },
+    }
+}
+
+fn export_pending(raw: &[String]) -> Result<(), Fail> {
+    use robodr_blackbox::outbox::{export_pending_to, PendingOptions};
+    let a = Args::parse(
+        raw,
+        &[
+            "key",
+            "device",
+            "out-dir",
+            "previous-keys",
+            "max-records",
+            "max-bytes",
+            "max-bundles",
+        ],
+        &["allow-hmac"],
+    )?;
+    let dir = PathBuf::from(a.single_positional("log directory")?);
+    let req = |n: &str| -> Result<String, String> {
+        a.one(n)?
+            .map(str::to_string)
+            .ok_or_else(|| format!("--{n} is required"))
+    };
+    let (key_p, device, out) = (req("key")?, req("device")?, req("out-dir")?);
+    let out = PathBuf::from(out);
+    if !out.is_dir() {
+        return Err(format!("--out-dir {}: not a directory", out.display()).into());
+    }
+    let allow_hmac = a.flag("allow-hmac");
+    let key = KeyFile::load_secret(Path::new(&key_p)).map_err(|e| format!("{key_p}: {e}"))?;
+    hmac_gate(&key, &key_p, allow_hmac)?;
+    let prev_files = a.all("previous-keys");
+    if prev_files.len() > MAX_PREVIOUS_KEY_FILES {
+        return Err(format!("at most {MAX_PREVIOUS_KEY_FILES} --previous-keys files").into());
+    }
+    let prev_paths: Vec<&Path> = prev_files.iter().map(Path::new).collect();
+    let mut warnings = Vec::new();
+    let prev = robodr_blackbox::keys::load_previous_keys(
+        "--previous-keys",
+        &prev_paths,
+        &device,
+        &[(
+            key.key_id.as_str(),
+            "the --key (the key the log is signed with now)",
+        )],
+        allow_hmac,
+        &mut warnings,
+    )?;
+    for w in warnings {
+        eprintln!("robodr-blackbox: warning: {w}");
+    }
+    let signer = key.signer().map_err(|e| format!("{key_p}: {e}"))?;
+    let opts = PendingOptions {
+        max_records: usize::try_from(positive(&a, "max-records", 100_000)?)
+            .map_err(|_| "--max-records is too large".to_string())?,
+        max_bytes: positive(&a, "max-bytes", 64 * 1024 * 1024)?,
+    };
+    let max_bundles = positive(&a, "max-bundles", 64)?;
+    let authentic = |m: &[u8], s: &[u8]| {
+        signer.verify_own(m, s) == Some(true)
+            || (!prev.is_empty() && robodr_blackbox::Verifier::verify_any(&prev, m, s))
+    };
+    let mut lost = false;
+    let mut written = 0u64;
+    for _ in 0..max_bundles {
+        let res = export_pending_to(&dir, &out, &*signer, &authentic, opts, Some(&device))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        let Some((p, path)) = res else {
+            break;
+        };
+        written += 1;
+        if let Some(why) = &p.cursor_rejected {
+            eprintln!(
+                "robodr-blackbox: warning: export cursor ignored ({why}); exported from the \
+                 oldest retained record"
+            );
+        }
+        if let Some([lo, hi]) = p.gap {
+            lost = true;
+            eprintln!(
+                "robodr-blackbox: EVIDENCE LOST BEFORE EXPORT: records {lo}..={hi} after the \
+                 export cursor are no longer in the black box (dropped by retention or \
+                 quarantined); the receiver will report the gap"
+            );
+        }
+        println!(
+            "exported seq {}..={} ({} records) to {}",
+            p.first_seq,
+            p.last_seq,
+            p.records,
+            path.display()
+        );
+        if !p.more {
+            break;
+        }
+    }
+    if written == 0 {
+        println!("nothing pending");
+    }
+    if lost {
+        return Err(Fail::Verify);
     }
     Ok(())
 }
