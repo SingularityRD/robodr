@@ -459,6 +459,12 @@ pub struct Config {
     /// absent, the agent refuses them (`unsupported`).
     #[serde(default)]
     pub seal: Option<SealCfg>,
+    /// Sprint 14a: LAN delivery from the depot.
+    #[serde(default)]
+    pub depot: Option<DepotCfg>,
+    /// Sprint 14b: executed crypto-erase triggers.
+    #[serde(default)]
+    pub erase: Option<EraseCfg>,
 }
 
 /// How the runtime volume is checked before anything is installed into it.
@@ -571,6 +577,57 @@ pub struct SealCfg {
     /// erase stops them first.
     #[serde(default)]
     pub stop_units: Vec<String>,
+    /// Sprint 14b: an NV counter of the unit's TPM (`0x01NNNNNN`, defined
+    /// with `robodr-seal counter define`) that anchors the signed
+    /// high-water record (floors, deployment sequence, chain heads)
+    /// against rollback ([`crate::highwater`]). Needs `tpm`.
+    #[serde(default)]
+    pub anti_rollback_nv: Option<String>,
+}
+
+/// LAN delivery from the site depot over mutual TLS (Sprint 14a,
+/// [`crate::lan`]). The client key is the unit's TPM-resident identity
+/// key (`seal` is required).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepotCfg {
+    /// `host:port` of the depot.
+    pub address: String,
+    /// The name in the depot's server certificate.
+    pub server_name: String,
+    /// The depot's unit CA certificate (PEM): the only trust anchor.
+    pub ca_file: PathBuf,
+    /// This unit's client certificate from enrolment (PEM).
+    pub cert_file: PathBuf,
+    /// Bound on one exchange, seconds.
+    #[serde(default = "d_depot_deadline")]
+    pub deadline_s: u64,
+    /// Largest pack accepted, MiB.
+    #[serde(default = "d_depot_max_mb")]
+    pub max_pack_mb: u64,
+}
+
+fn d_depot_deadline() -> u64 {
+    600
+}
+fn d_depot_max_mb() -> u64 {
+    16 * 1024
+}
+
+/// Executed crypto-erase (Sprint 14b, [`crate::erasex`]): the platform's
+/// trigger socket and who may write to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EraseCfg {
+    /// Unix socket the platform's tamper / attestation / authentication
+    /// inputs connect to (created by the agent, mode 0660).
+    pub trigger_socket: PathBuf,
+    /// Peers allowed besides root (`SO_PEERCRED` uid, or a supplementary
+    /// group in `feeder_gids`).
+    #[serde(default)]
+    pub feeder_uids: Vec<u32>,
+    #[serde(default)]
+    pub feeder_gids: Vec<u32>,
 }
 
 fn d_pack_digest_max_mb() -> u64 {
@@ -733,6 +790,22 @@ impl Config {
                     return Err("seal.mapper_name: [a-z0-9][a-z0-9_-]{0,31}".into());
                 }
             }
+            if let Some(nv) = &sc.anti_rollback_nv {
+                if sc.tpm.is_none() {
+                    return Err("seal.anti_rollback_nv needs seal.tpm".into());
+                }
+                let i = robodr_seal::unit::parse_handle(nv, 0x01)
+                    .map_err(|e| format!("seal.anti_rollback_nv: {}", e.detail))?;
+                if let Some(t) = &sc.tpm {
+                    let c = t.tpm_config()?;
+                    if i == c.epoch_nv || i == c.floor_nv {
+                        return Err(
+                            "seal.anti_rollback_nv must differ from the epoch and floor indices"
+                                .into(),
+                        );
+                    }
+                }
+            }
             for u in &sc.stop_units {
                 if !robodr_seal::luks::is_unit_name(u) {
                     return Err(format!("seal.stop_units: {u:?} is not a unit name"));
@@ -760,6 +833,40 @@ impl Config {
         // The runtime volume holds only installed plaintext; the seal
         // directory (TPM blobs, policy) is outside it and outside every
         // tree an RPK can write.
+        if let Some(d) = &self.depot {
+            if self.seal.is_none() {
+                return Err(
+                    "depot needs seal (the TLS client key is the unit identity key)".into(),
+                );
+            }
+            for (w, p) in [
+                ("depot.ca_file", &d.ca_file),
+                ("depot.cert_file", &d.cert_file),
+            ] {
+                if !is_clean_abs(p) {
+                    return Err(format!("{w}: a normalised absolute path"));
+                }
+            }
+            robodr_blackbox::tls::server_name(&d.server_name)
+                .map_err(|e| format!("depot.server_name: {e}"))?;
+            if d.address.is_empty() || d.address.len() > 255 || !d.address.contains(':') {
+                return Err("depot.address: host:port".into());
+            }
+            if !(1..=86_400).contains(&d.deadline_s) || !(1..=1 << 20).contains(&d.max_pack_mb) {
+                return Err("depot.deadline_s 1..=86400, max_pack_mb 1..=1048576".into());
+            }
+        }
+        if let Some(e) = &self.erase {
+            if self.seal.is_none() {
+                return Err("erase needs seal".into());
+            }
+            if !is_clean_abs(&e.trigger_socket) {
+                return Err("erase.trigger_socket: a normalised absolute path".into());
+            }
+            if e.feeder_uids.len() > 32 || e.feeder_gids.len() > 32 {
+                return Err("erase: at most 32 feeder uids and gids".into());
+            }
+        }
         if let Some(sc) = &self.seal {
             trees.push(("seal.seal_dir", &sc.seal_dir));
             trees.push(("seal.runtime_root", &sc.runtime_root));

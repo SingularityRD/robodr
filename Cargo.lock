@@ -2629,9 +2629,33 @@ dependencies = [
  "robodr-release",
  "robodr-responder",
  "robodr-seal",
+ "rustls",
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "robodr-depot"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "p256",
+ "robodr-agentd",
+ "robodr-blackbox",
+ "robodr-deliverd",
+ "robodr-diode",
+ "robodr-events",
+ "robodr-ocsf",
+ "robodr-pkg",
+ "robodr-release",
+ "robodr-responder",
+ "robodr-seal",
+ "rustls",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

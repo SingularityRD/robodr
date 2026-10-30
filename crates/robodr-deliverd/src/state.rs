@@ -230,6 +230,24 @@ pub struct State {
     /// (review M-B; `highwater`). A record older than this locks the agent.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub hw_generation: u64,
+    /// Sprint 14b: a crypto-erase the responder planned and the safety
+    /// state deferred (`erasex`): executed as soon as the state allows,
+    /// also after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erase_pending: Option<PendingErase>,
+}
+
+/// A deferred crypto-erase (Sprint 14b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingErase {
+    /// `robodr_responder::erase::EraseTrigger` name.
+    pub trigger: String,
+    /// Unix seconds (system clock) of the trigger.
+    pub since: u64,
+    pub deferrals: u32,
+    /// The safety state of the last deferral.
+    pub last_state: String,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -275,6 +293,7 @@ impl State {
             seen_packs: Vec::new(),
             locked: None,
             hw_generation: 0,
+            erase_pending: None,
         }
     }
 

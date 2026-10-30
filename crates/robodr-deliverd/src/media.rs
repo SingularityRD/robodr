@@ -5,6 +5,7 @@
 //!   trust.json, trust.json.sig            the site trust file (root quorum)
 //!   deployment.json, deployment.json.sig  one deployment naming this unit (depot + operators)
 //!   bundles/<label>/                      1..=16 robodr-bundle/1 directories (release quorum)
+//!   lease.json                            optional (Sprint 14b): the unit's site lease
 //! ```
 //!
 //! Nothing else may be in the pack (a stray file, a symlink or a special
@@ -69,6 +70,8 @@ pub const MAX_MEDIA_ENTRIES: usize = 32;
 pub const TRUST_FILE: &str = "trust.json";
 pub const DEPLOYMENT_FILE: &str = "deployment.json";
 pub const BUNDLES_DIR: &str = "bundles";
+/// Sprint 14b: the optional site lease of a pack.
+pub const LEASE_FILE: &str = "lease.json";
 
 /// A refusal of a pack, with what it means for findings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,8 +368,21 @@ fn check_layout(pack: &Path) -> Result<Vec<(String, PathBuf)>, Refused> {
     for e in rd {
         let e = e.map_err(|e| Refused::new(Code::Invalid, format!("pack: {e}")))?;
         let name = e.file_name().to_string_lossy().into_owned();
+        // Sprint 14b: an optional site lease (verified by the seal
+        // directory, `lan::lease_from_pack`; not part of the import).
+        if name == LEASE_FILE {
+            let md = fs::symlink_metadata(e.path())
+                .map_err(|e| Refused::new(Code::Invalid, e.to_string()))?;
+            if !md.file_type().is_file() {
+                return Err(Refused::new(
+                    Code::FileMismatch,
+                    "pack: lease.json is a symlink or of the wrong type",
+                ));
+            }
+            continue;
+        }
         // Every entry is judged: the first unexpected one refuses the pack
-        // (so a listing is never read past six entries).
+        // (so a listing is never read past seven entries).
         if !want.contains(&name) {
             return Err(Refused::new(
                 Code::UnexpectedFile,

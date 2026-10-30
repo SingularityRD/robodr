@@ -30,6 +30,9 @@ robodr-responder = { workspace = true }
 robodr-seal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Sprint 14a: LAN delivery from the depot over mutual TLS (the configs are
+# robodr_blackbox::tls's; the client key is the unit's TPM-held identity key).
+rustls = { workspace = true }
 # robodr-rules payloads: structural check of Pulsar rule files (already in
 # the lock through Pulsar; parse + serde only, bounded recursion).
 toml = { workspace = true }

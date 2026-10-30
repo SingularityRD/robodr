@@ -102,6 +102,9 @@ pub mod rules {
     pub const SEAL_ERASED: &str = "robot.seal.erased";
     /// Enclosure tamper or erase trigger fired.
     pub const SEAL_TAMPER: &str = "robot.seal.tamper";
+    /// Sprint 14b (contract 2.3, `catalog_2_3_depot`): an executed erase
+    /// deferred by the safety state.
+    pub const SEAL_ERASE_DEFERRED: &str = "robot.seal.erase_deferred";
     /// Every `robot.seal.*` id.
     pub const SEAL_ALL: [&str; 4] = [
         SEAL_UNSEAL_FAILED,

@@ -116,6 +116,8 @@ pub struct Engine {
     hw_gen: u64,
     /// Sealing (13c), when configured.
     sealing: Option<crate::sealing::Sealing>,
+    /// Sprint 14b: the TPM NV counter anchoring the high-water record.
+    nv: Option<(robodr_seal::tpm::Tpm, u32)>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -262,6 +264,51 @@ impl Engine {
                 ));
             }
         }
+        // Sprint 14b: the high-water record against the TPM NV counter.
+        let nv = match cfg
+            .seal
+            .as_ref()
+            .and_then(|s| s.anti_rollback_nv.as_ref().map(|i| (s, i)))
+        {
+            None => None,
+            Some((s, i)) => {
+                let t = s
+                    .tpm
+                    .as_ref()
+                    .ok_or_else(|| EngineError("seal.anti_rollback_nv needs seal.tpm".into()))?;
+                let tpm = robodr_seal::tpm::Tpm::new(
+                    t.tpm_config().map_err(EngineError)?,
+                    Box::new(robodr_seal::cmd::System),
+                )
+                .map_err(|e| EngineError(e.to_string()))?;
+                let idx = robodr_seal::unit::parse_handle(i, 0x01)
+                    .map_err(|e| EngineError(e.to_string()))?;
+                Some((tpm, idx))
+            }
+        };
+        let mut migrate = false;
+        if let Some((tpm, idx)) = &nv {
+            use robodr_seal::nvcounter::{judge, Verdict};
+            let rec_nv = hw.as_ref().ok().and_then(Option::as_ref).and_then(|h| h.nv);
+            let why = match tpm.counter(*idx) {
+                Err(e) => Some(format!("the anti-rollback NV counter is unreadable: {e}")),
+                Ok(c) => match judge(rec_nv, c) {
+                    Verdict::Current => None,
+                    Verdict::Migrate => {
+                        migrate = true;
+                        None
+                    }
+                    Verdict::CompleteIncrement => tpm
+                        .increment_counter(*idx)
+                        .err()
+                        .map(|e| format!("the anti-rollback NV counter: {e}")),
+                    Verdict::Locked(w) => Some(format!("anti-rollback NV counter: {w}")),
+                },
+            };
+            if let Some(w) = why {
+                lock.get_or_insert(w);
+            }
+        }
         // Legacy (before review L4): name-keyed media entries.
         state.seen_media.clear();
         let mut behind: Vec<serde_json::Value> = Vec::new();
@@ -307,6 +354,7 @@ impl Engine {
             hw_key,
             hw_written: None,
             hw_gen,
+            nv,
         };
         e.load_anchor();
         e.journal.note(
@@ -316,7 +364,7 @@ impl Engine {
                    "hw_generation": hw.as_ref().ok().and_then(Option::as_ref).map(|h| h.generation)}),
         )?;
         match &hw {
-            Ok(Some(h)) if lock.is_none() => e.hw_written = Some(h.clone()),
+            Ok(Some(h)) if lock.is_none() && !migrate => e.hw_written = Some(h.clone()),
             Ok(_) => {}
             Err(err) => {
                 e.journal.note(
@@ -359,6 +407,13 @@ impl Engine {
                 Some(r),
             );
             e.save()?;
+        }
+        if migrate && lock.is_none() && e.nv.is_some() {
+            e.journal.note(
+                kinds::ANCHOR_MIGRATED,
+                json!({"why": "the high-water record is anchored in the TPM NV counter from now on",
+                       "hw_generation": hw.as_ref().ok().and_then(Option::as_ref).map(|h| h.generation)}),
+            )?;
         }
         if !e.file.path().exists() || e.hw_written.is_none() {
             e.save()?;
@@ -521,7 +576,7 @@ impl Engine {
             .is_some_and(|w| w.same_baseline(&hw))
         {
             hw.generation = self.hw_gen.saturating_add(1);
-            highwater::store(&self.cfg.blackbox.dir, &hw, self.hw_key.as_ref())?;
+            self.store_anchored(&mut hw)?;
             self.hw_gen = hw.generation;
             self.journal.note(
                 kinds::HIGHWATER,
@@ -534,6 +589,46 @@ impl Engine {
         }
         self.state.hw_generation = self.hw_gen;
         Ok(self.file.save(&self.state)?)
+    }
+
+    /// Write the record; with the NV anchor, `nv = T + 1` first and then
+    /// the increment ([`robodr_seal::nvcounter`]).
+    fn store_anchored(&mut self, hw: &mut HighWater) -> R<()> {
+        use robodr_seal::tpm_ident::Counter;
+        let Some((tpm, idx)) = &self.nv else {
+            return Ok(highwater::store(
+                &self.cfg.blackbox.dir,
+                hw,
+                self.hw_key.as_ref(),
+            )?);
+        };
+        let e = |x: robodr_seal::SealError| EngineError(format!("anti-rollback NV counter: {x}"));
+        match tpm.counter(*idx).map_err(e)? {
+            Counter::Value(t) => {
+                hw.nv = Some(t.saturating_add(1));
+                highwater::store(&self.cfg.blackbox.dir, hw, self.hw_key.as_ref())?;
+                tpm.increment_counter(*idx).map_err(e)
+            }
+            Counter::Unwritten => {
+                tpm.increment_counter(*idx).map_err(e)?;
+                match tpm.counter(*idx).map_err(e)? {
+                    Counter::Value(v) => hw.nv = Some(v),
+                    _ => {
+                        return Err(EngineError(
+                            "NV counter unreadable after an increment".into(),
+                        ))
+                    }
+                }
+                Ok(highwater::store(
+                    &self.cfg.blackbox.dir,
+                    hw,
+                    self.hw_key.as_ref(),
+                )?)
+            }
+            Counter::Undefined => Err(EngineError(
+                "the anti-rollback NV counter is not defined (robodr-seal counter define)".into(),
+            )),
+        }
     }
 
     fn sys_now(&self) -> R<u64> {
@@ -606,6 +701,10 @@ impl Engine {
     pub fn tick(&mut self) -> R<TickReport> {
         let mut rep = TickReport::default();
         let sys = self.sys_now()?;
+        // Sprint 14b: a deferred crypto-erase runs first, locked or not.
+        if self.state.erase_pending.is_some() {
+            self.erase_pending(sys, &mut rep)?;
+        }
         if let Some(l) = &self.state.locked {
             // Fail closed (review M1): nothing is imported, installed or
             // rolled back until an operator re-anchors the unit.
@@ -654,6 +753,18 @@ impl Engine {
             };
             if self.state.seen_pack(&key) {
                 continue;
+            }
+            // Sprint 14b: a lease in the pack (whatever the deployment).
+            if self.sealing.is_some() {
+                if let Err(e) = crate::lan::lease_from_pack(self, &path) {
+                    let k = format!("lease-media:{name}:{e}");
+                    if self.reported.insert(k) {
+                        self.journal.note(
+                            kinds::REFUSED,
+                            json!({"stage": "lease", "media": name, "detail": e}),
+                        )?;
+                    }
+                }
             }
             match media::import(&self.cfg, &self.state, &path, sys) {
                 Ok(Outcome::AlreadyAccepted) => {
@@ -992,11 +1103,20 @@ impl Engine {
         trigger: &str,
         device: Option<&std::path::Path>,
     ) -> R<serde_json::Value> {
+        self.erase_with(trigger, device, true)
+    }
+
+    fn erase_with(
+        &mut self,
+        trigger: &str,
+        device: Option<&std::path::Path>,
+        announce: bool,
+    ) -> R<serde_json::Value> {
         let s = self
             .sealing
             .clone()
             .ok_or_else(|| EngineError("no seal configuration: nothing to erase".into()))?;
-        if trigger == "tamper" {
+        if trigger == "tamper" && announce {
             let ev = self
                 .journal
                 .note(kinds::TAMPER, json!({"trigger": trigger}))?;
@@ -1030,6 +1150,233 @@ impl Engine {
             Some(ev),
         );
         Ok(v)
+    }
+
+    // ----------------------------------------------- executed erase (14b) --
+
+    /// An authenticated erase trigger (the platform's trigger socket,
+    /// [`crate::erasex`], or an operator): recorded and planned by the
+    /// responder ([`robodr_responder::erase`]); executed now when the
+    /// live safety state allows it, otherwise kept pending (also across a
+    /// restart) and executed by a later tick. `approvers`: distinct people
+    /// who approved (0 for a platform input). Returns what happened.
+    pub fn erase_trigger(
+        &mut self,
+        trigger: robodr_responder::erase::EraseTrigger,
+        approvers: u8,
+    ) -> R<String> {
+        use robodr_responder::erase::{plan_erase, EraseDecision};
+        let sys = self.sys_now()?;
+        if self.sealing.is_none() {
+            return Err(EngineError(
+                "no seal configuration: nothing to erase".into(),
+            ));
+        }
+        let seen = safety::observe(&self.cfg.safety);
+        let plan = plan_erase(trigger, seen.state, approvers);
+        let ev = self.journal.note(
+            kinds::ERASE_PLANNED,
+            json!({"trigger": trigger.as_str(), "plan": plan, "why_unknown": seen.why}),
+        )?;
+        if trigger == robodr_responder::erase::EraseTrigger::Tamper {
+            self.finding_in(
+                rules::SEAL_TAMPER,
+                Severity::Critical,
+                "tamper: an enclosure tamper input fired; crypto-erase is planned".into(),
+                Some(ev),
+                seen.state,
+            );
+        }
+        if let EraseDecision::AwaitApproval { persons } = plan.decision {
+            return Ok(format!(
+                "awaiting the approval of {persons} different people"
+            ));
+        }
+        if self.state.erase_pending.is_none() {
+            self.state.erase_pending = Some(crate::state::PendingErase {
+                trigger: trigger.as_str().into(),
+                since: sys,
+                deferrals: 0,
+                last_state: String::new(),
+            });
+            self.save()?;
+        }
+        let mut rep = TickReport::default();
+        self.erase_pending(sys, &mut rep)?;
+        Ok(match &self.state.erase_pending {
+            None => "erased".into(),
+            Some(p) => format!("deferred ({})", p.last_state),
+        })
+    }
+
+    /// Run a pending erase if the responder's plan says so in the live
+    /// safety state, re-read immediately before acting (executor rule 4).
+    fn erase_pending(&mut self, sys: u64, rep: &mut TickReport) -> R<()> {
+        use robodr_responder::erase::{plan_erase, EraseDecision, EraseTrigger};
+        let Some(p) = self.state.erase_pending.clone() else {
+            return Ok(());
+        };
+        let Some(trigger) = EraseTrigger::parse(&p.trigger) else {
+            self.state.erase_pending = None;
+            return self.save();
+        };
+        // The pending erase was approved when it was recorded.
+        let approvers = if trigger.needs_two_persons() { 2 } else { 0 };
+        let seen = safety::observe(&self.cfg.safety);
+        let plan = plan_erase(trigger, seen.state, approvers);
+        if let EraseDecision::Defer { until } = &plan.decision {
+            let st = state_name(seen.state).to_string();
+            if p.last_state != st {
+                let ev = self.journal.note(
+                    kinds::ERASE_DEFERRED,
+                    json!({"trigger": p.trigger, "state": st, "until": until,
+                           "why_unknown": seen.why, "since": p.since}),
+                )?;
+                self.finding_in(
+                    rules::SEAL_ERASE_DEFERRED,
+                    Severity::Medium,
+                    format!(
+                        "erase_deferred: crypto-erase ({}) deferred in safety state {st}: it runs                          as soon as the state is {until}",
+                        p.trigger
+                    ),
+                    Some(ev),
+                    seen.state,
+                );
+                if let Some(x) = self.state.erase_pending.as_mut() {
+                    x.last_state = st.clone();
+                    x.deferrals = x.deferrals.saturating_add(1);
+                }
+                self.save()?;
+            }
+            rep.deferred = Some(format!("erase deferred: {st}"));
+            return Ok(());
+        }
+        // Executor rule 4: the state again, immediately before acting.
+        let again = safety::observe(&self.cfg.safety);
+        if again.state != seen.state {
+            rep.deferred = Some("erase: the safety state changed; judged again".into());
+            return Ok(());
+        }
+        self.journal.note(
+            kinds::ERASE_INTENT,
+            json!({"trigger": p.trigger, "state": state_name(again.state), "since": p.since,
+                   "at": sys}),
+        )?;
+        let v = self.erase_with(&p.trigger, None, false)?;
+        // Read back: the epoch moved on (TPM), or the keyslots are gone.
+        let destroyed = v["destroyed"].as_array().map_or(0, Vec::len);
+        if destroyed == 0 {
+            return Err(EngineError("erase destroyed nothing".into()));
+        }
+        self.state.erase_pending = None;
+        self.save()?;
+        Ok(())
+    }
+
+    /// A refused erase trigger (not a feeder, malformed): noted, nothing
+    /// planned.
+    pub fn note_refused_trigger(&mut self, uid: Option<u32>, why: &str) {
+        let _ = self.journal.note(
+            kinds::REFUSED,
+            json!({"stage": "erase_trigger", "uid": uid, "detail": why}),
+        );
+    }
+
+    // --------------------------------------------- reports, leases (14a) --
+
+    /// This unit's install report (Sprint 14a), signed by its identity key
+    /// (TPM-resident for a TPM unit, [`robodr_seal::report`]).
+    pub fn unit_report(&self) -> R<Vec<u8>> {
+        use robodr_seal::report::*;
+        let s = self
+            .sealing
+            .as_ref()
+            .ok_or_else(|| EngineError("reports need the seal configuration".into()))?;
+        let u = s.unit().map_err(|e| EngineError(e.to_string()))?;
+        let (resets, clock) = match u.record().mode {
+            robodr_seal::unit::Mode::Tpm => {
+                let t = u.tpm_time().map_err(|e| EngineError(e.to_string()))?;
+                (t.reset_count, t.clock)
+            }
+            robodr_seal::unit::Mode::Fallback => (0, 0),
+        };
+        let d = self.state.deployment.as_ref();
+        let mut items: Vec<ReportItem> = d
+            .map(|d| {
+                d.items
+                    .iter()
+                    .map(|i| ReportItem {
+                        name: i.name.clone(),
+                        serial: i.serial,
+                        rpk_digest: i.digest.clone(),
+                        status: match i.status {
+                            ItemStatus::Pending => ItemState::Pending,
+                            ItemStatus::Installed => ItemState::Installed,
+                            ItemStatus::Failed => ItemState::Failed,
+                            ItemStatus::Refused => ItemState::Refused,
+                        },
+                        deferrals: i.deferrals,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        let installed = self
+            .state
+            .installed
+            .iter()
+            .map(|(n, i)| InstalledItem {
+                name: n.clone(),
+                serial: i.ver.serial,
+                rpk_digest: i.ver.digest.clone(),
+                healthy: i.healthy,
+            })
+            .collect();
+        let r = UnitReport {
+            format: REPORT_FORMAT.into(),
+            site: self.cfg.unit.site.clone(),
+            unit: self.cfg.unit.id.clone(),
+            reported_at: self.sys_now()?,
+            tpm_resets: resets,
+            tpm_clock: clock,
+            deployment_id: d.map(|d| d.id.clone()),
+            deployment_seq: d.map_or(0, |d| d.seq),
+            deployment_digest: d.map(|d| d.digest.clone()),
+            items,
+            installed,
+            erased: u.is_erased(),
+        };
+        r.sign(&|dg| u.sign_digest(dg))
+            .map_err(|e| EngineError(e.to_string()))
+    }
+
+    /// Install a site lease from the depot (Sprint 14b): verified by the
+    /// seal directory against the enrolled lease key; noted.
+    pub fn install_lease(&mut self, bytes: &[u8]) -> R<()> {
+        let s = self
+            .sealing
+            .as_ref()
+            .ok_or_else(|| EngineError("no seal configuration".into()))?;
+        let u = s.unit().map_err(|e| EngineError(e.to_string()))?;
+        match u.install_lease(bytes) {
+            Ok(l) => {
+                self.journal.note(
+                    kinds::LEASE_INSTALLED,
+                    json!({"lease_seq": l.lease_seq, "clock_before": l.clock_before,
+                           "resets_max": l.resets_max}),
+                )?;
+                // Sealed items waiting for a lease are tried again.
+                self.reported.retain(|k| !k.starts_with("lease:"));
+                Ok(())
+            }
+            Err(e) => {
+                self.journal.note(
+                    kinds::REFUSED,
+                    json!({"stage": "lease", "detail": e.to_string()}),
+                )?;
+                Err(EngineError(format!("lease refused: {e}")))
+            }
+        }
     }
 
     fn item(&mut self, idx: usize, sys: u64, rep: &mut TickReport) -> R<()> {

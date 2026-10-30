@@ -133,6 +133,7 @@ mod tests {
             device: None,
             mapper_name: None,
             stop_units: Vec::new(),
+            anti_rollback_nv: None,
         };
         assert!(check_volume(&cfg).is_err());
         let ok = SealCfg {
