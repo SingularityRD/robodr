@@ -348,7 +348,13 @@ impl Site {
     /// `hw/<name>-ok` of the site directory (removing it makes the release
     /// fail its health gate wherever it is installed next).
     pub fn files_rpk(&self, name: &str, serial: u64) -> PathBuf {
+        self.files_rpk_with_floor(name, serial, 1)
+    }
+
+    /// As [`Site::files_rpk`] with a `security_floor`.
+    pub fn files_rpk_with_floor(&self, name: &str, serial: u64, floor: u64) -> PathBuf {
         let mut s = spec(name, serial, Kind::Files);
+        s.security_floor = floor;
         s.health = vec![HealthCheck::FilePresent {
             path: self.hw.join(format!("{name}-ok")).display().to_string(),
         }];

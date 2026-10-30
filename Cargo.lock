@@ -2645,6 +2645,7 @@ dependencies = [
  "robodr-deliverd",
  "robodr-diode",
  "robodr-events",
+ "robodr-export",
  "robodr-ocsf",
  "robodr-pkg",
  "robodr-release",

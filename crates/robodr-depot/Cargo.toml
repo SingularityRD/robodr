@@ -38,6 +38,9 @@ webpki = { workspace = true }
 [dev-dependencies]
 robodr-ocsf = { workspace = true }
 robodr-agentd = { workspace = true }
+# tests/exit_14b.rs: the findings of a unit and of the depot go out through
+# the existing diode path (spool exporter -> diode pack -> import).
+robodr-export = { workspace = true }
 
 [[bin]]
 name = "robodr-depot"
