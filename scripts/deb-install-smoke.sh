@@ -154,8 +154,9 @@ smoke_one() {
         bad "$pkg: no systemd units shipped"
     else
         # systemd's own units and /bin/sh, without replacing anything the
-        # package installed.
-        cp -r --update=none /usr/lib/systemd/system/. "$r/usr/lib/systemd/system/"
+        # package installed (tar --skip-old-files: cp --update=none needs
+        # coreutils 9.3, the Ubuntu 22.04 build container has 8.32).
+        tar -C /usr/lib/systemd/system -cf - . | tar -C "$r/usr/lib/systemd/system" -xf - --skip-old-files
         for sh_ in /bin/sh /usr/bin/sh; do
             if [[ ! -e "$r$sh_" ]]; then
                 install -D -m 0755 "$(readlink -f /bin/sh)" "$r$sh_"

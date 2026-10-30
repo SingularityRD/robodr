@@ -29,7 +29,15 @@ unless, for every focal unit:
      unit from starting and an extra one would widen the exception.
 
 The focal drop-in examples (packaging/systemd/focal/*.service.d/*) get
-check 2 and must not use LoadCredential=.
+check 2 and must not use LoadCredential=. Drop-in examples:
+
+  5. build-deb.sh installs a unit's drop-in example into robodr-focal from
+     packaging/systemd/focal/<unit>.service.d/<file> when that exists, else
+     the regular packaging/systemd/<unit>.service.d/<file>. So every regular
+     drop-in example of a focal unit without a focal counterpart must pass
+     check 2 itself (it ships in robodr-focal as is), and every focal
+     drop-in example must have a regular counterpart of the same name (the
+     variants describe the same thing).
 
 Usage:
   scripts/check-focal-units.py [--packaging packaging]
@@ -265,11 +273,26 @@ def run(packaging: Path) -> list[str]:
     for f in sorted(focal.glob("*.service.d/*")):
         errs += check_known(f"focal/{f.parent.name}/{f.name}", directives(f.read_text()))
         loads |= root_loads(directives(f.read_text()))
+        if not (sysd / f.parent.name / f.name).is_file():
+            errs.append(f"focal/{f.parent.name}/{f.name}: no regular counterpart {f.parent.name}/{f.name}")
+    errs += check_shared_dropins(sysd)
     helper = packaging / HELPER_SRC
     if not helper.is_file():
         errs.append(f"{helper}: missing")
     else:
         errs += check_root_units(loads, helper_root_units(helper.read_text()))
+    return errs
+
+
+def check_shared_dropins(sysd: Path) -> list[str]:
+    """Check 5: regular drop-in examples that robodr-focal ships as they are."""
+    errs: list[str] = []
+    for unit in FOCAL_UNITS:
+        for f in sorted((sysd / f"{unit}.d").glob("*")):
+            if (sysd / "focal" / f"{unit}.d" / f.name).is_file():
+                continue
+            for e in check_known(f"{unit}.d/{f.name}", directives(f.read_text())):
+                errs.append(f"{e} (shipped in robodr-focal as is: add a focal variant)")
     return errs
 
 
@@ -348,7 +371,24 @@ SystemCallFilter=~@privileged @debug
     if root_loads(directives(good)) or check_root_units(set(), helper_root_units("root_units=''\n")):
         failed += 1
         print("self-test FAIL: non-root load counted, or empty allow-list refused", file=sys.stderr)
-    total = len(cases) + 2 + len(root_cases) + 1
+    # Check 5 on a temporary tree.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as t:
+        sysd = Path(t)
+        d = sysd / f"{FOCAL_UNITS[0]}.d"
+        d.mkdir()
+        (d / "50-ok.conf.example").write_text("[Service]\nIPAddressAllow=192.0.2.1\n")
+        (d / "60-cred.conf.example").write_text("[Service]\nLoadCredential=a:/b\n")
+        shared_bad = check_shared_dropins(sysd)
+        fd = sysd / "focal" / f"{FOCAL_UNITS[0]}.d"
+        fd.mkdir(parents=True)
+        (fd / "60-cred.conf.example").write_text("[Service]\nExecStartPre=+/x\n")
+        shared_ok = check_shared_dropins(sysd)
+    if len(shared_bad) != 2 or shared_ok:
+        failed += 1
+        print(f"self-test FAIL: shared drop-ins: {shared_bad} / {shared_ok}", file=sys.stderr)
+    total = len(cases) + 2 + len(root_cases) + 2
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

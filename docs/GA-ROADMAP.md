@@ -759,6 +759,22 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Temiz bir müşteri ortamında (connected + air-gapped) kılavuzla < 2 saatte
   kurulum; yükseltme `rc.1 → rc.2` veri kaybısız.
 
+> **Paketleme/platform durumu (2026-10-30):** ✅ `robodr` `.deb` en eski
+> desteklenen kullanıcı alanında (Ubuntu 22.04 konteyneri, glibc 2.35,
+> amd64+arm64 yerel, `robodr-pulsard` dahil) derleniyor: Ubuntu 22.04/24.04,
+> JetPack 6, Debian 12'ye kuruluyor; `Depends:` `dpkg-shlibdeps` ile.
+> ✅ RHEL/Rocky/Alma 9 ve Fedora için RPM (Rocky Linux 9'da derlenir,
+> `.deb` ile aynı dosya ağacı, eşdeğer scriptlet'ler). ✅ CI'da
+> `package-deb` / `package-rpm` / `package-smoke` (Debian 12, Ubuntu
+> 20.04/22.04/24.04, Rocky 9, Fedora 42 konteynerlerinde gerçek apt/dnf
+> kurulumu); release.yml aynı şekilde derliyor ve imzadan önce kurulum
+> testi yapıyor; paket tutarlılık denetimi (`scripts/check-packages.py`).
+> Yerelde yalnız amd64 doğrulandı (derleme + 5 dağıtımda kurulum);
+> arm64 derlemeleri, CI ve release workflow'u henüz koşmadı (CI faturası
+> engelli). Kalan: RPM için OpenPGP imzası ve offline bundle yok;
+> `release-dry-run.sh` konteyner işlerini desteklemiyor; L4T'de harici BTF
+> denenmedi.
+>
 > **Durum (2026-10-26):** ❌ Release workflow'u hiç koşmadı, minisign
 > anahtarları yok, provenance yok, RoboDR `THIRD_PARTY_NOTICES.md` yok.
 > 🟡 AutoSecOps: Helm chart SingularityRD reposunda (AutoSecOps `b60eda05`),
@@ -814,7 +830,7 @@ ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmı�
 | Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1, **sıkıştırılmış 614 B `LowCmd` dahil**: düzen SDK kütüphanesinin `refineCmd` makine kodundan); A2/AS2 düşük seviye tipi `unitree_go` olarak **çıkarımsal** (profil onayıyla); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama (özellikle Go1 sıkıştırılmış çerçeve, A2/AS2 tipi); Go1 sıkıştırılmış `LowState` (807 B) |
 | Go2 uygulama kanalı (WebRTC) | ✅ Oturum tespiti/sınıflandırma (sinyalleşme 8081/9991, STUN/TURN, DTLS başlıkları), eş atfı, bulgular `robot.unitree.webrtc_*` (sözleşme 2.3 §3d); gateway'de listesiz sinyalleşmeyi düşürme ve akış/eş bazında karantina (nft set'leri). İçerik DTLS-SRTP ile şifreli: **çözülmez** | Gerçek Go2 ile doğrulama; agentd pasif yakalamasına bağlama (şu an yalnız gateway besliyor); firmware sinyalleşme değişiklikleri |
 | Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — pasif modda kayıt; ✅ **in-path inline köprü gateway'i** (`robodr-firewall-gw`, NFQUEUE; S8) | Gerçek robot ve hedef sensör kutusunda doğrulama / gecikme ölçümü |
-| Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5/6 için statik `robodr-focal` paketi (agentd-only) | `robodr-pulsard` için BTF'li çekirdek + glibc 2.35 build; kapalı ana kontrolcü kapsanamaz |
+| Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5 için statik `robodr-focal` paketi (agentd-only); ✅ JetPack 6 için `robodr` artık Ubuntu 22.04'te (glibc 2.35, arm64 dahil, `robodr-pulsard` ile) derleniyor; BTF'siz L4T çekirdeği için harici BTF dosyası (`btf_path`, çekirdek damgası kontrolü, `pahole` prosedürü UNITREE.md 3.2.1) | Gerçek Jetson'da deneme (arm64 build ve harici BTF hiç koşmadı); JetPack 5'te `robodr-pulsard` yok (glibc 2.31 / systemd 245); kapalı ana kontrolcü kapsanamaz |
 | Agentless mod | ✅ Sensör kutusu yapılandırması, systemd drop-in, networkd/nftables örnekleri, VLAN | Referans donanım imajı (S7), sahada deneme |
 | Yanıt | ✅ İnsansıda enerji kesen aksiyon yok, ikameler onaylı, `min_motion_factor`; executor v1 (varsayılan kapalı) G1 örneğinde insansıda hiçbir ağ aksiyonu yürütmez (`fall_safe_restrict` boş) | Executor'ın gerçek robotta denenmesi; `restrict_motion` sport API adaptörü (SOC aksiyonu olarak) |
 

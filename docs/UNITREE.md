@@ -264,24 +264,26 @@ NVIDIA JetPack image, not on the robot model:
 | Image on the Jetson | glibc / systemd / kernel | Package | What runs |
 |---|---|---|---|
 | JetPack 5 (L4T 35.x, Ubuntu 20.04): reported as the stock image of current Go2 / G1 EDU units (check yours) | 2.31 / 245 / 5.10, usually **no BTF** | `robodr-focal` (static musl binaries, systemd 245 units) | **agentd-only EDU mode**: `robodr-agentd` and the tools; no `robodr-pulsard`, no host rules |
-| JetPack 6 (L4T 36.x, Ubuntu 22.04) | 2.35 / 249 / 5.15 | `robodr-focal` today | agentd-only EDU mode. `robodr-pulsard` with the host rules needs **both** a BTF kernel (check below) **and** a `robodr` build against glibc 2.35, which the release does not produce yet |
+| JetPack 6 (L4T 36.x, Ubuntu 22.04) | 2.35 / 249 / 5.15, BTF depends on the image | `robodr` (arm64, built in Ubuntu 22.04: `Depends: libc6 (>= 2.35)`), or `robodr-focal` | with `robodr`: `robodr-pulsard` and the host rules **if** the kernel has BTF (check below) **or** an external BTF file for the running kernel is installed (section 3.2.1); otherwise agentd-only, as with `robodr-focal` |
 
-The regular `robodr` package installs on neither: as released it is built
-on Ubuntu 24.04 and its binaries need glibc 2.39 (dpkg refuses the package,
-and ld.so would refuse the binaries), and its units use `LoadCredential=`
-(systemd 247), which JetPack 5 lacks. A `robodr` build for Ubuntu 22.04
-(glibc 2.35, with Pulsar's clang/eBPF toolchain) is an open release
-decision ([BUILD.md, arm64 section](BUILD.md#arm64-cross-compiled-2026-10-18));
-until it exists, host rules on a Jetson are not available from a release.
+Since 2026-10-30 the release builds `robodr` in an Ubuntu 22.04 userland
+(glibc 2.35, both architectures, `robodr-pulsard` included;
+[BUILD.md, "Release build userlands"](BUILD.md#release-build-userlands)),
+so it installs on JetPack 6. It does **not** install on JetPack 5: its
+units use `LoadCredential=` (systemd 247) and its binaries need glibc
+2.35. A `robodr-pulsard` for JetPack 5 (glibc 2.31, systemd 245) is not
+built.
 
 `robodr-pulsard` loads eBPF programs that need the kernel's BTF type information
-(`CONFIG_DEBUG_INFO_BTF=y`, `/sys/kernel/btf/vmlinux`); NVIDIA's L4T 35
-kernels are normally built without it, so on JetPack 5 the daemon could not
-start even if it were installed, and it is not part of `robodr-focal`.
-Rebuilding the L4T kernel with BTF is possible but is a change to the
-robot's image (and Unitree's support terms), not something RoboDR does.
-Neither the BTF status of Unitree's JetPack 6 images nor any RoboDR package
-has been checked on a real Unitree Jetson yet: run the checks below on your
+(`CONFIG_DEBUG_INFO_BTF=y`, `/sys/kernel/btf/vmlinux`); NVIDIA's L4T
+kernels are normally built without it. Without it the daemon can use an
+**external BTF file** generated for exactly the running kernel
+(section 3.2.1): Pulsar's `[pulsar] btf_path` reads the kernel types from
+that file instead, and the unit accepts either. Rebuilding the L4T kernel
+with BTF is the other way, but it changes the robot's image (and possibly
+Unitree's support terms). Neither the BTF status of Unitree's JetPack 6
+images, nor an external BTF on an L4T kernel, nor any RoboDR package has
+been checked on a real Unitree Jetson yet: run the checks below on your
 unit.
 
 1. **Check the development computer**:
@@ -296,7 +298,8 @@ unit.
    Check with Unitree whether installing software on the development
    computer affects warranty or support terms.
 2. **Install the bundle** as in step 2 of section 3.1, with the
-   `robodr-focal-<version>-arm64-offline.tar.gz` bundle (same
+   `robodr-focal-<version>-arm64-offline.tar.gz` bundle on JetPack 5, or
+   the `robodr-<version>-arm64-offline.tar.gz` bundle on JetPack 6 (same
    `install-bundle.sh install --pubkey ... --tarball ...`; it installs
    whichever package the bundle holds). `robodr` and `robodr-focal`
    conflict and replace each other, so a later move to the regular package
@@ -317,8 +320,8 @@ unit.
    the name). Install and check it as in step 6 of section 3.1. Do **not**
    install the sensor-box drop-in here. The configuration is the same for
    both packages.
-5. **Host rules (only where `robodr-pulsard` runs: a BTF kernel and the
-   regular package).** `robodr-pulsard` loads every
+5. **Host rules (only where `robodr-pulsard` runs: the regular package
+   and a BTF kernel or an external BTF file, section 3.2.1).** `robodr-pulsard` loads every
    rule under `/usr/share/robodr/rules`, including `robodr/unitree.toml`.
    Set the TUNE values (section 7) in the rule source, validate it
    (`python3 scripts/validate_rules.py --strict --pulsar-src vendor/pulsar`)
@@ -370,6 +373,94 @@ arm64 ones are static but not position-independent (the Rust
 is not address-randomised, the stack, heap and mappings are. The amd64 ones
 are static-pie. The musl resolver does not read `nsswitch.conf`: give
 `robodr-kafka-publish` IP literals (it then needs no resolver at all).
+
+#### 3.2.1 External BTF for an L4T kernel (JetPack 6, `robodr` package)
+
+Only for a kernel without `/sys/kernel/btf/vmlinux`. The file must
+describe **exactly** the running kernel build: Pulsar relocates its probes
+(CO-RE) with the field offsets it reads there, and a file from another
+build or configuration can give wrong offsets, so the probes may load and
+report garbage without any error. BTFHub does not cover NVIDIA's L4T
+kernels; the file is generated from the kernel's DWARF debug information
+with `pahole`, on a build host, from NVIDIA's sources for that L4T release.
+
+1. **On the Jetson**, record what identifies the kernel build:
+
+   ```sh
+   cat /etc/nv_tegra_release        # e.g. R36 (release), REVISION: 4.3
+   uname -r; uname -v; cat /proc/version   # release, build stamp, compiler
+   zcat /proc/config.gz > l4t.config       # the kernel's configuration
+   grep -E 'CONFIG_DEBUG_INFO_BTF|CONFIG_BPF_SYSCALL|CONFIG_BPF_EVENTS|CONFIG_KPROBE_EVENTS' l4t.config
+   ```
+
+   `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_EVENTS` and `CONFIG_KPROBE_EVENTS`
+   must be `y`; otherwise no BTF file helps.
+2. **On a build host**, unpack the kernel source of exactly that L4T
+   release (NVIDIA's "Driver Package (BSP) Sources",
+   `public_sources.tbz2` → `kernel_src.tbz2`; for a vendor image, the
+   vendor's kernel source of that image) and use the cross toolchain NVIDIA
+   documents for it (the compiler in `/proc/version`). Build `vmlinux`
+   with the Jetson's own configuration plus DWARF only:
+
+   ```sh
+   cp l4t.config .config
+   scripts/config --enable DEBUG_INFO --enable DEBUG_INFO_DWARF4 \
+       --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT --disable DEBUG_INFO_BTF
+   make ARCH=arm64 CROSS_COMPILE=aarch64-buildroot-linux-gnu- olddefconfig
+   diff <(grep -v DEBUG_INFO l4t.config) <(grep -v DEBUG_INFO .config)   # must be empty
+   make ARCH=arm64 CROSS_COMPILE=aarch64-buildroot-linux-gnu- vmlinux
+   ```
+
+   Debug information does not change type layouts; the `diff` makes sure
+   `olddefconfig` changed nothing else (if it did, the source or the
+   toolchain is not the one the image was built with: stop).
+3. **Encode the BTF** (pahole 1.22 or newer):
+
+   ```sh
+   pahole --btf_encode_detached=vmlinux.btf vmlinux
+   bpftool btf dump file vmlinux.btf format raw | head    # parses
+   printf '%s\n%s\n%s\n' "<uname -r of the Jetson>" "<uname -v of the Jetson>" \
+       "$(sha256sum vmlinux.btf | cut -d' ' -f1)" > vmlinux.kernel
+   ```
+
+   `vmlinux.kernel` is the stamp the unit checks: exactly the lines
+   `uname -r` and `uname -v` print on the Jetson, then the SHA-256 of the
+   BTF file, so a file replaced without a new stamp is refused too.
+4. **Install** (through the site's vetted media, like any other file that
+   reaches the unit) and point Pulsar at it:
+
+   ```sh
+   sudo install -d -m 0755 -o root -g root /etc/robodr/btf
+   sudo install -m 0644 -o root -g root vmlinux.btf /etc/robodr/btf/vmlinux
+   sudo install -m 0644 -o root -g root vmlinux.kernel /etc/robodr/btf/vmlinux.kernel
+   # /etc/robodr/pulsar.toml, [pulsar]: uncomment
+   #   btf_path = "/etc/robodr/btf/vmlinux"
+   sudo systemctl restart robodr-pulsard
+   ```
+
+   The unit starts when `/sys/kernel/btf/vmlinux` **or**
+   `/etc/robodr/btf/vmlinux` exists. Its `ExecStartPre=`
+   (`/usr/lib/robodr/robodr-btf-check`) reads `btf_path` from
+   `pulsar.toml`: any other path than `/etc/robodr/btf/vmlinux` is refused,
+   and with that path the daemon does not start when the file or
+   `vmlinux.kernel` is missing, or the stamp names another kernel or
+   another file hash than the running kernel and the installed file: after an L4T update (OTA) the daemon stays down, visibly in the
+   journal, until the file is regenerated (steps 1 to 4) for the new
+   kernel.
+5. **Check that the probes see the truth**, not only that they load:
+   `journalctl -u robodr-pulsard` shows the modules starting without
+   relocation errors; then run a known command (e.g. `sudo -u nobody
+   /usr/bin/true`) and confirm the process event Pulsar reports (threat
+   logger / `pulsar` CLI on `/run/robodr-pulsard/pulsar.sock`) carries the
+   right image path, PID and parent. Wrong offsets show up as nonsense
+   paths, PIDs or arguments.
+
+Without BTF, eBPF LSM programs cannot be used (Pulsar's LSM feature
+check reads the kernel's own BTF and disables them); L4T kernels do not
+enable BPF LSM anyway. **Not verified:** no external BTF has been
+generated for or loaded on an L4T kernel yet; the procedure follows
+Pulsar's loader (`btf_path` → aya `Btf::parse_file`, raw BTF as `pahole
+--btf_encode_detached` writes it) and the kernel build documentation.
 
 ## 4. Commissioning: learn, then lock
 
@@ -821,11 +912,13 @@ the contract's section 5.
 * **The sensor box mode is not field-tested**: capture of mirrored frames
   addressed to other hosts on a promiscuous NIC, and the drop-in under a
   real systemd, have not run on hardware.
-* **No host rules on current Unitree EDU images.** JetPack 5 (Ubuntu
-  20.04, L4T kernel without BTF) runs agentd only (`robodr-focal`); the
-  released `robodr` package needs glibc 2.39, so JetPack 6 also gets
-  agentd only until a glibc 2.35 build of `robodr` (with
-  `robodr-pulsard`) exists (section 3.2).
+* **No host rules on JetPack 5; on JetPack 6 only with BTF.** JetPack 5
+  (Ubuntu 20.04, glibc 2.31, systemd 245, L4T kernel without BTF) runs
+  agentd only (`robodr-focal`): no `robodr-pulsard` is built for it.
+  JetPack 6 runs the regular `robodr` package (built for glibc 2.35 since
+  2026-10-30) with `robodr-pulsard` when the kernel has BTF or an external
+  BTF file is installed (section 3.2.1); neither has been tried on a real
+  Jetson.
 * **`robodr-focal` has not run on a Jetson or under a real systemd 245.**
   Its static binaries were built and smoke-run (amd64 natively, arm64 under
   qemu-user: `--version`, `--check-config`, a short agentd run, black-box

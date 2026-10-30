@@ -1,0 +1,64 @@
+# robodr RPM spec TEMPLATE, filled by packaging/build-rpm.sh. Not for
+# rpmbuild on its own: the file tree is build-deb.sh's (--stage-only), so
+# the units, tmpfiles/sysusers fragments, docs and modes of the RPM and the
+# .deb cannot drift apart (scripts/check-packages.py compares them); only
+# the binaries differ (built on Rocky Linux 9, glibc 2.34).
+#
+# Nothing is compiled or rewritten here: no strip, no debuginfo, no
+# build-id links, no man page recompression (the binaries stay exactly as
+# built and hashed).
+%global __os_install_post %{nil}
+%global debug_package %{nil}
+%global _build_id_links none
+%global _binary_payload w9.xzdio
+%global _buildhost reproducible
+%global source_date_epoch_from_changelog 0
+%global use_source_date_epoch_as_buildtime 1
+%global clamp_mtime_to_source_epoch 1
+# Requires are generated from the ELF binaries (sonames with their symbol
+# versions, e.g. libc.so.6(GLIBC_2.34)(64bit)), the RPM counterpart of
+# dpkg-shlibdeps. Provides are generated too: the programs have no SONAME,
+# so that is only config(robodr), which the pulsar.toml config file requires.
+AutoReq: yes
+AutoProv: yes
+
+Name:           robodr
+Version:        @VERSION@
+Release:        @RELEASE@
+Summary:        @SYNOPSIS@
+License:        LicenseRef-Proprietary
+URL:            https://github.com/SingularityRD/robodr
+# The units use LoadCredential= and ProtectProc= (systemd 247); RHEL 9 has 252.
+Requires:       systemd >= 247
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+Suggests:       nftables
+Suggests:       iproute
+
+%description
+Runtime security for ROS 2 robots built on the Pulsar eBPF runtime: a
+Pulsar daemon with the RoboDR ROS 2 sensor (robodr-pulsard), the decision
+chain agent (robodr-agentd), commissioning, replay and capture tools,
+systemd units, tmpfiles/sysusers fragments and man pages.
+
+RoboDR detects, records signed evidence and requests a safe state through
+the platform's own interface. It never overrides the robot's safety system,
+e-stop or command authority. Services are installed disabled: enable them
+only after commissioning (see /usr/share/doc/robodr/OPERATIONS.md).
+
+%install
+cp -a @PAYLOAD@/. %{buildroot}/
+
+%post -p /bin/sh
+@POST@
+
+%preun -p /bin/sh
+@PREUN@
+
+%postun -p /bin/sh
+@POSTUN@
+
+%files
+%defattr(-,root,root,-)
+@FILES@
