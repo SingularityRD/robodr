@@ -330,8 +330,10 @@ and does not try. With a `webrtc` section it:
 
 Findings are reported once per peer session (forgotten when it ends or is
 evicted, so a returning peer is reported again), at most 32 non-Critical
-findings per minute with the rest aggregated per rule; an unlisted
-controller's established session (Critical) is never rate limited.
+findings per minute with the rest aggregated per rule (reported by the
+gateway's housekeeping as soon as the minute is over, also when no further
+packet arrives); an unlisted controller's established session (Critical)
+is never rate limited.
 
 A top-level `robot_model` (optional) cross-checks the channels: an A2 /
 AS2 `rt/lowcmd` must use `unitree_a2_lowcmd`, `allow_battery_off` is

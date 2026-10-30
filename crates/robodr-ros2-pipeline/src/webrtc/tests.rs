@@ -778,6 +778,48 @@ fn spoofed_flood_never_silences_a_real_intruder() {
     assert!(m.sessions().count() <= DEFAULT_MAX_PEERS);
 }
 
+/// Red team 2026-10-30 (WebRTC flood through the inline gateway): after a
+/// spoofed-source flood stopped, the aggregate ("N further ... suppressed")
+/// was only reported with the next packet the monitor saw, minutes later
+/// or never; with a quiet robot the SOC learnt of 30 attempts, not of the
+/// ~24000 suppressed. `tick` (the gateway's housekeeping) reports it once
+/// the window is over, with no further traffic.
+#[test]
+fn the_flood_aggregate_is_reported_without_further_traffic() {
+    let mut m = WebRtcMonitor::new(listed_opts());
+    let s = bare_stun();
+    let mut seen = Vec::new();
+    for b in 1..=200u8 {
+        let src = IpAddr::V4(Ipv4Addr::new(10, 66, 0, b));
+        seen.extend(m.process(&pkt(
+            u64::from(b) * 1000,
+            L4::Udp,
+            (src, 1),
+            (ROBOT, 2),
+            None,
+            &s,
+        )));
+    }
+    assert!(m.stats.findings_suppressed > 0);
+    assert!(!seen.iter().any(|d| d.detail.contains("suppressed")));
+    // `pkt` puts its packets at mono 10 s + t. Inside the window: nothing.
+    assert!(m.tick(40 * S).is_empty());
+    // The window is over, no packet since: the aggregate now, once.
+    let agg = m.tick(71 * S);
+    assert_eq!(agg.len(), 1, "{agg:?}");
+    assert!(agg[0].detail.contains("further") && agg[0].detail.contains("suppressed"));
+    let n: u64 = agg[0]
+        .detail
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(n, m.stats.findings_suppressed);
+    assert!(m.tick(72 * S).is_empty());
+    assert!(m.tick(200 * S).is_empty());
+}
+
 /// F1: a flood of new peers does not evict an established session.
 #[test]
 fn a_new_peer_flood_does_not_evict_established_sessions() {

@@ -922,6 +922,23 @@ impl Gateway {
         }
     }
 
+    /// Housekeeping of the WebRTC monitor without a copy (every tick of
+    /// the run loop): ends idle sessions and reports a flood's
+    /// "N further ... suppressed" aggregate once its window is over, also
+    /// when no further copy arrives. `mono_ns` on the decision clock.
+    pub fn tick_webrtc(&mut self, mono_ns: u64) {
+        let Some(m) = self.webrtc.as_mut() else {
+            return;
+        };
+        for d in m.tick(mono_ns) {
+            if self.webrtc_out.len() < crate::findings::MAX_SLOTS {
+                self.webrtc_out.push(d);
+            } else {
+                self.findings.dropped += 1;
+            }
+        }
+    }
+
     /// The WebRTC findings since the last call (`robot.unitree.webrtc_*`).
     pub fn drain_webrtc(&mut self) -> Vec<robodr_events::Deviation> {
         std::mem::take(&mut self.webrtc_out)

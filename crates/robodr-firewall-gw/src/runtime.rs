@@ -491,6 +491,7 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
         GatewayMode::Enforce => robodr_events::Mode::Enforce,
         GatewayMode::Observe => robodr_events::Mode::Observe,
     };
+    gw.tick_webrtc(sys::monotonic_ns());
     let mut out: Vec<(robodr_events::Deviation, Option<String>, u64)> = gw
         .firewall_mut()
         .drain_deviations()

@@ -635,3 +635,33 @@ fn robot_model_cross_checks_the_a2_channel() {
     let r = GatewayConfig::from_json(&v.to_string()).and_then(|c| c.validate());
     assert!(r.unwrap_err().contains("allow_battery_off"));
 }
+
+/// Red team 2026-10-30, WebRTC flood through the real bridge: ~24000
+/// spoofed STUN / SYN copies, then silence. 30 findings reached agentd;
+/// the "N further ... suppressed" aggregate waited for the next copy (it
+/// came 2.5 minutes later, with a wrong "in the last 60 s"). The gateway's
+/// housekeeping now reports it once the window is over, without traffic.
+#[test]
+fn webrtc_flood_aggregate_is_reported_by_housekeeping() {
+    use robodr_firewall_gw::ip::build_ipv4_udp;
+    let mut gw = webrtc_gateway("");
+    let t0 = 1_000 * MS;
+    for i in 0..400u32 {
+        let src = std::net::Ipv4Addr::new(10, 66, (i / 250) as u8, (i % 250) as u8 + 1);
+        let p = build_ipv4_udp(src, ROBOT_IP, 50_000, 40_000, &stun_binding());
+        gw.observe_webrtc(&p, t0 + u64::from(i) * MS, 0, None);
+    }
+    let first = gw.drain_webrtc();
+    assert!(first.len() <= 32, "{}", first.len());
+    assert!(!first.iter().any(|d| d.detail.contains("suppressed")));
+    gw.tick_webrtc(t0 + 30_000 * MS);
+    assert!(gw.drain_webrtc().is_empty(), "inside the window");
+    gw.tick_webrtc(t0 + 61_000 * MS);
+    let agg = gw.drain_webrtc();
+    assert_eq!(agg.len(), 1, "{agg:?}");
+    assert!(
+        agg[0].detail.contains("further") && agg[0].detail.contains("suppressed"),
+        "{}",
+        agg[0].detail
+    );
+}

@@ -1145,6 +1145,22 @@ impl WebRtcMonitor {
         self.stats.sessions_ended += ended as u64;
     }
 
+    /// Housekeeping without a packet (the inline gateway calls it every
+    /// tick): ends idle sessions and, once the rate-limit window is over,
+    /// reports what it suppressed. Without it the aggregate of a flood
+    /// that stopped would wait for the next packet, possibly forever.
+    pub fn tick(&mut self, mono_ns: u64) -> Vec<Deviation> {
+        let mut out = Vec::new();
+        if !self.opts.enabled {
+            return out;
+        }
+        self.expire(mono_ns);
+        if !self.suppressed.is_empty() {
+            self.roll_window(&mut out, mono_ns);
+        }
+        out
+    }
+
     /// Feed one packet; returns the new findings.
     pub fn process(&mut self, p: &FlowPacket<'_>) -> Vec<Deviation> {
         let mut out = Vec::new();

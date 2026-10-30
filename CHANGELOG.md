@@ -219,6 +219,16 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- Wave-2 soak and red team (2026-10-30, `tools/e2e/RESULTS.md`): agentd's
+  `gateway_feed` accepts only rule ids of the findings catalog
+  (`robodr_ocsf::builder::rule_known`); before, a line naming
+  `robot.firewall.` or any made-up `robot.gateway.*` / `robot.firewall.*`
+  id became a finding with the generic catalog entry. The inline
+  gateway's housekeeping reports a WebRTC flood's "N further ...
+  suppressed" aggregate once its minute is over
+  (`WebRtcMonitor::tick`); before, it waited for the next packet, so a
+  flood followed by silence was reported as its first 32 findings only.
+
 - Adversarial self-review of Sprints 14a / 14b (`docs/SECURE-DELIVERY.md`
   §10 "Adversarial self-review of 14a/14b"): leases are based on the TPM
   time the unit's AK attests, not on the time a report claims (root on a
