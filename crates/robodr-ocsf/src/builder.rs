@@ -1054,7 +1054,58 @@ fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
 /// this minor keeps its own block below (one function per block), so
 /// additions merge without touching each other.
 fn catalog_2_3(rule: &str) -> Option<RuleInfo> {
-    catalog_2_3_seal(rule).or_else(|| catalog_2_3_gateway(rule))
+    catalog_2_3_seal(rule)
+        .or_else(|| catalog_2_3_gateway(rule))
+        .or_else(|| catalog_2_3_depot(rule))
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: the site depot and executed erase (secure delivery,
+// `docs/SECURE-DELIVERY.md` §5, §7.6, §8, §9, Sprints 14a / 14b;
+// robodr-depot and robodr-deliverd), data source `robodr_delivery`.
+// ---------------------------------------------------------------------------
+
+/// The `robot.depot.*` ids of the site depot and `robot.seal.erase_deferred`
+/// of the executed erase (Sprints 14a / 14b). Not in 2.2 or earlier: a 2.2
+/// validator applies the generic entry to these ids, and so does a 2.3
+/// validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_depot(rule: &str) -> Option<RuleInfo> {
+    const DELIVERY: &str = "robodr_delivery";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: DELIVERY,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.depot.import_refused" => e(
+            "Depot refused a release bundle",
+            "The site depot refused to import a release bundle: no passing entry-station report for exactly that bundle, a signature, quorum, chain, revocation, floor or hash check failed. Nothing of the bundle can be deployed.",
+        ),
+        "robot.depot.enrolment_refused" => e(
+            "Depot refused a unit enrolment",
+            "The site depot refused to enrol a unit: its EK certificate does not chain to a TPM vendor CA the site trusts, the attestation key or a certified key is not resident in that TPM, the unit's keys are not bound to the site's policy, its boot measurements do not match the signed policy, or the credential challenge was not answered by the unit's TPM. No key is wrapped for it.",
+        ),
+        "robot.depot.unit_enrolled" => e(
+            "Unit enrolled at the depot",
+            "A unit was enrolled at the site depot after TPM credential activation and the operator quorum; the depot may now deliver and wrap keys for it.",
+        ),
+        "robot.depot.rollout_halted" => e(
+            "Staged rollout halted",
+            "A unit of the current ring reported a failed health gate or a refusal beyond the rollout's failure threshold; the site depot halted the rollout and serves nothing more of it until operators resume it.",
+        ),
+        "robot.depot.locked" => e(
+            "Depot database failed its anti-rollback check",
+            "The site depot's database is older than its TPM anti-rollback counter says, or the counter was recreated: the database was restored or replaced. The depot signs, serves and imports nothing until operators re-anchor it.",
+        ),
+        "robot.seal.erase_deferred" => e(
+            "Crypto-erase deferred by the safety state",
+            "A crypto-erase trigger fired, and the responder deferred the erase because the robot is moving (or its safety state is unknown); it runs as soon as the robot is idle or its safety system holds it.",
+        ),
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------

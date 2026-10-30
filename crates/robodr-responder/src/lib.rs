@@ -74,6 +74,7 @@
 
 pub mod action;
 pub mod actions;
+pub mod erase;
 pub mod escalation;
 pub mod planner;
 pub mod policy;

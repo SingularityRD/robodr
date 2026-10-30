@@ -308,6 +308,128 @@ pub fn load_client(f: &ClientTlsFiles) -> Result<ClientTls, String> {
     })
 }
 
+/// A client key held outside the process (a TPM, Sprint 14a): ECDSA
+/// P-256 / SHA-256 only. `sign` receives the SHA-256 digest of the
+/// handshake message and returns a DER signature.
+pub type ExternalSign = dyn Fn(&[u8; 32]) -> Result<Vec<u8>, String> + Send + Sync;
+
+/// As [`load_client`], with the client certificate's key held elsewhere
+/// (`f.key_file` must be unset, `f.cert_chain` set): every signature of
+/// the handshake is made by `sign` (`robodr-deliverd` hands it the unit's
+/// TPM-resident identity key). Server verification is unchanged.
+pub fn load_client_with_signer(
+    f: &ClientTlsFiles,
+    sign: Arc<ExternalSign>,
+) -> Result<ClientTls, String> {
+    if f.key_file.is_some() {
+        return Err("an external client key replaces key_file; set only cert_chain".into());
+    }
+    let chain_path = f
+        .cert_chain
+        .as_ref()
+        .ok_or("an external client key needs cert_chain")?;
+    let chain = certs("cert_chain", chain_path)?;
+    let mut files = f.clone();
+    files.cert_chain = None;
+    let base = load_client(&files)?;
+    // Rebuild with the same verifier and the external key.
+    let roots = Arc::new(roots("ca_file", &f.ca_file)?);
+    let pins = f
+        .spki_sha256
+        .iter()
+        .map(|p| parse_pin(p))
+        .collect::<Result<Vec<_>, _>>()?;
+    let provider = provider();
+    let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
+        .build()
+        .map_err(|e| format!("TLS: {e}"))?;
+    let key: Arc<dyn rustls::sign::SigningKey> = Arc::new(ExternalP256 { sign });
+    let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, key));
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinningVerifier { inner, pins }))
+        .with_client_cert_resolver(Arc::new(FixedClientCert(certified)));
+    Ok(ClientTls {
+        config: Arc::new(config),
+        server_name: base.server_name,
+        client_auth: true,
+        pins: base.pins,
+    })
+}
+
+#[derive(Debug)]
+struct FixedClientCert(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for FixedClientCert {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        sigschemes
+            .contains(&SignatureScheme::ECDSA_NISTP256_SHA256)
+            .then(|| self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+struct ExternalP256 {
+    sign: Arc<ExternalSign>,
+}
+
+impl fmt::Debug for ExternalP256 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExternalP256(..)")
+    }
+}
+
+impl rustls::sign::SigningKey for ExternalP256 {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered
+            .contains(&SignatureScheme::ECDSA_NISTP256_SHA256)
+            .then(|| {
+                Box::new(ExternalP256Signer {
+                    sign: self.sign.clone(),
+                }) as Box<dyn rustls::sign::Signer>
+            })
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::ECDSA
+    }
+}
+
+struct ExternalP256Signer {
+    sign: Arc<ExternalSign>,
+}
+
+impl fmt::Debug for ExternalP256Signer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExternalP256Signer(..)")
+    }
+}
+
+impl rustls::sign::Signer for ExternalP256Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        (self.sign)(&crate::crypto::sha256(message)).map_err(rustls::Error::General)
+    }
+
+    fn scheme(&self) -> SignatureScheme {
+        SignatureScheme::ECDSA_NISTP256_SHA256
+    }
+}
+
+/// The SubjectPublicKeyInfo (DER) of the peer's end-entity certificate.
+pub fn spki_der(cert: &CertificateDer<'_>) -> Result<Vec<u8>, String> {
+    let ee = webpki::EndEntityCert::try_from(cert).map_err(|e| format!("certificate: {e}"))?;
+    Ok(ee.subject_public_key_info().as_ref().to_vec())
+}
+
 /// Load the server settings (module docs, "Server").
 pub fn load_server(f: &ServerTlsFiles) -> Result<Arc<ServerConfig>, String> {
     let chain = certs("cert_chain", &f.cert_chain)?;

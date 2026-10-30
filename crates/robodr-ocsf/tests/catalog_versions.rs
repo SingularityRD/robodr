@@ -13,7 +13,9 @@
 //! * 2.3: + the in-path gateway ids of `robodr-firewall-gw`
 //!   (`robot.gateway.*`, data source `ros2_motion_commands`, Sprint 8) and
 //!   the sealing ids (`robot.seal.*`, data source `robodr_delivery`,
-//!   `docs/SECURE-DELIVERY.md` §7, §9, Sprint 13c).
+//!   `docs/SECURE-DELIVERY.md` §7, §9, Sprint 13c), the site depot ids
+//!   (`robot.depot.*`) and `robot.seal.erase_deferred` (Sprints 14a / 14b,
+//!   data source `robodr_delivery`).
 
 mod common;
 
@@ -316,10 +318,20 @@ const IDS_2_3_SEAL: &[&str] = &[
     "robot.seal.tamper",
 ];
 
+/// Depot and executed-erase ids added in 2.3 (Sprints 14a / 14b).
+const IDS_2_3_DEPOT: &[&str] = &[
+    "robot.depot.import_refused",
+    "robot.depot.enrolment_refused",
+    "robot.depot.unit_enrolled",
+    "robot.depot.rollout_halted",
+    "robot.depot.locked",
+    "robot.seal.erase_deferred",
+];
+
 #[test]
 fn seal_entries_added_after_2_2_are_not_in_2_2_or_earlier() {
     let g = generic();
-    for id in IDS_2_3_SEAL {
+    for id in IDS_2_3_SEAL.iter().chain(IDS_2_3_DEPOT) {
         let full = rule_info(id);
         assert_ne!(full, g, "{id} has its own entry in the current catalog");
         assert_eq!(full.data_source, "robodr_delivery", "{id}");
@@ -352,7 +364,7 @@ fn seal_as_2_2(json: &str, id: &str) -> String {
 
 #[test]
 fn a_2_2_seal_message_validates_with_its_own_catalog() {
-    for id in IDS_2_3_SEAL {
+    for id in IDS_2_3_SEAL.iter().chain(IDS_2_3_DEPOT) {
         let v23 = build(id);
         robodr_ocsf::parse_and_validate(&v23).unwrap_or_else(|e| panic!("{id}: {e:?}"));
         let v22 = seal_as_2_2(&v23, id);

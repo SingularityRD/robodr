@@ -129,6 +129,15 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.seal.lease_expired",
     "robot.seal.erased",
     "robot.seal.tamper",
+    // Sprints 14a / 14b (contract 2.3): the executed erase's deferral
+    // (robodr-deliverd) and the site depot's own findings (robodr-depot),
+    // spooled directly like the delivery agent's.
+    "robot.seal.erase_deferred",
+    "robot.depot.import_refused",
+    "robot.depot.enrolment_refused",
+    "robot.depot.unit_enrolled",
+    "robot.depot.rollout_halted",
+    "robot.depot.locked",
     // robodr-firewall-gw in-path gateway (Sprint 8, contract 2.3): fed to
     // agentd through its `gateway_feed` socket and correlated like any input.
     "robot.gateway.trajectory_rejected",
