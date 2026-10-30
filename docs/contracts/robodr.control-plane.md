@@ -75,12 +75,16 @@ that as "not applied", never as success.
     client end-entity certificate's DER `SubjectPublicKeyInfo` must be one
     of them **in addition**. Several CA certificates and pins may be listed
     for a rotation (§10).
-  * Optional `tls.client_crl` (PEM, X.509 v2 CRLs): the client certificate
-    chain is also checked for revocation. A certificate whose issuer has no
-    CRL in the file is refused (unknown status fails closed), so give a
+  * Optional `tls.crl_files` (PEM or DER, X.509 v2 CRLs, up to 16 files;
+    the older single `tls.client_crl` is still read): the whole client
+    certificate chain is also checked for revocation. A certificate whose
+    issuer has no CRL is refused (unknown status fails closed), so give a
     current CRL of every CA in `tls.client_ca` that issues SOC client
-    certificates. Loaded at start (a new CRL takes a restart); its
-    `nextUpdate` is not enforced.
+    certificates. An expired CRL (`nextUpdate` passed) or an unreadable one
+    refuses every client. The files are re-read when they change, on the
+    next handshake, without a restart; reloads and rejections are counted
+    in `status.json` (`control_plane.tls.crl`), and a revoked client is an
+    authentication failure with reason `Revoked`.
   * No session resumption (no tickets, no session cache): every connection
     presents and checks the client certificate.
   * A failed handshake (no certificate, unknown CA, expired, pin mismatch,
@@ -749,8 +753,16 @@ torn append (cut): every append is a single synced write, so a crash leaves
 at most that one line. Anything more is **damage**: a bad line followed by
 good ones, or two or more bad lines at the end. Damaged lines are counted,
 the file is copied to `quarantine/` and rewritten from the good entries.
-The journal is operational state, not evidence: it is checksummed, not
-signed; the black box stays the record.
+The journal is operational state, not evidence, but it is **sealed**
+(`robodr-cp-journal/v2`): an HMAC chain under a key derived from the
+black-box key, so an edited, deleted, reordered or foreign-key entry is
+damage, never a crash. Its end point is recorded in a signed black-box note
+at start, on heartbeat and at a clean stop; an older or shorter file is a
+rollback. Damage or rollback raises
+`robot.agent.control_plane_state_untrusted` (High; Critical for a
+rollback). A v1 (checksummed) journal is adopted once, only while the black
+box has no end-point note, and that upgrade is recorded; afterwards a v1
+file is refused as a downgrade. The black box stays the record.
 
 **After damage** agentd falls back to the record:
 
@@ -858,8 +870,8 @@ What a SOC integration must do to use this API correctly:
   `tls.client_ca` (and both pins) and both SOC keys in `soc_keys` while
   the SOC switches, then remove the old ones; the robot's own TLS key and
   certificate are replaced by files and a restart (state survives it).
-  With `tls.client_crl`, ship a current CRL of every client CA and restart
-  agentd when it changes.
+  With `tls.crl_files`, keep a current CRL of every client CA in place
+  (a changed file is picked up without a restart).
 
 ## 11. Evidence API (`control_plane.evidence`)
 
@@ -1096,15 +1108,16 @@ another robot), 13 (signed in the removed v1 domain); all 401
 * The judgment is only as right as the safety state source (live feed or
   static configuration) and the response policy; `control`, `phase` and
   `connectivity` are still configuration.
-* TLS material is loaded at start: a rotation of the robot's certificate or
-  of the trusted SOC CAs / pins / CRLs takes a restart (the state survives
-  it). Revocation is by CRL file only (`tls.client_crl`, its `nextUpdate`
-  not enforced); there is no OCSP.
-* The request journal and replay store are checksummed, not signed: a
-  person with write access to the state directory can make the robot fence,
-  or remove whole valid lines, which no checksum detects: those requests
-  are forgotten (a resubmission is judged anew and recorded again; the
-  black box keeps both). Such a person cannot forge a decision (the black
+* TLS material other than CRLs is loaded at start: a rotation of the
+  robot's certificate or of the trusted SOC CAs / pins takes a restart (the
+  state survives it). Revocation is by CRL file only (`tls.crl_files`,
+  re-read on change, `nextUpdate` enforced); there is no OCSP.
+* The request journal and replay store are sealed and anchored in the black
+  box: an edit, deletion, truncation or rollback is detected, quarantined
+  and reported, and the requests are rebuilt from the black box. Entries
+  written after the last recorded end point and lost in a crash cannot be
+  proven missing (the restart rebuilds from the black box and fences the
+  replay store, without a finding). Such a person cannot forge a decision (the black
   box holds every decision, signed). Damage the checksums do detect is
   rebuilt from the black box (§9).
 * The first start on an empty state directory (and any start after the

@@ -1,6 +1,6 @@
 # Known limitations
 
-> **Pre-release draft (refreshed 2026-10-26).** This is a consolidated,
+> **Pre-release draft (refreshed 2026-10-30).** This is a consolidated,
 > deliberately blunt list. Each item names its source document, and its
 > planned fix where one exists. Sprint numbers refer to GA-ROADMAP. The
 > source documents are authoritative. If this page and a source disagree,
@@ -138,13 +138,14 @@
   package runs `robodr-pulsard` when the kernel has BTF or an external BTF
   file for the running kernel is installed; not yet tried on a Jetson
   ([`docs/UNITREE.md`](../UNITREE.md) section 3.2).
-- **The RPM has no offline bundle**: `install-bundle.sh` (signature check,
-  rollback, security floor) is dpkg-based. On RHEL / Rocky / Fedora,
-  verify the minisign signature by hand, then `dnf install`; rollback is
-  `dnf downgrade` without the security-floor gate.
-- **Host-side (Pulsar) signals do not reach correlation** yet. Every host
-  detection reaches the planner as `robot.host.pulsar_threat`, so a policy
-  cannot single out one host rule.
+- **The RPM offline bundle** (`make-bundle.sh --rpm`, same signature,
+  format, downgrade and security-floor checks as the `.deb` bundle) has
+  been tested against `rpm` in a separate root only, not on a real RHEL /
+  Rocky / Fedora host.
+- **Host-side (Pulsar) signals reach correlation** by their Pulsar rule
+  name, but the response planner sees every host detection as
+  `robot.host.pulsar_threat`, so a response policy cannot single out one
+  host rule.
 - **The sensor box sees only what is mirrored to it** (or, inline, what
   crosses its bridge). It cannot see unicast between the robot's internal
   computers without a mirror, or traffic over Wi-Fi or cellular, or the
@@ -164,21 +165,28 @@
 - **TLS on the Kafka exporter and the anchor receiver** (mutual TLS and,
   for Kafka, SASL/SCRAM) since 2026-10-30; plain TCP only when explicitly
   allowed. Tested against a local test PKI and a single-node Apache Kafka
-  3.9.1, not a deployed SOC; no CRL / OCSP on these paths. The control
-  plane (v2) uses mutual TLS off loopback, but it has only been tested
-  against a local test PKI, not a deployed SOC; SOC client certificates
-  cannot be revoked other than by removing the CA or pins and restarting.
+  3.9.1, not a deployed SOC. The control plane (v2) uses mutual TLS off
+  loopback, but it has only been tested against a local test PKI, not a
+  deployed SOC. Every TLS path checks CRLs (fail closed, reloaded on
+  change, since 2026-10-30); there is no OCSP (by design, for air-gapped
+  fleets), so revocation is only as fresh as the CRL files the operator
+  installs, and there is no early warning before a CRL's `nextUpdate`.
 - **Keys are files**, not TPM-held. The robot side of SOC-driven uplink
   and finding key rotation exists (`robodr-enroll`), and the SOC side is
-  on an unreleased AutoSecOps branch; the black-box key is rotated by
-  hand. Anti-rollback state
-  is a plain file (S9, S10).
+  on an unreleased AutoSecOps branch. The black-box key is rotated with
+  `robodr-blackbox rotate` while agentd is stopped (retired keys in
+  `blackbox.previous_keys`); rotation with a remote head anchor has no
+  end-to-end test. Anti-rollback state is a plain file (S9, S10).
 - **The TPM head anchor is tested on swtpm only.** Head anchors make
   rollback and truncation *detectable*, not impossible
   ([`SECURITY.md`](../../SECURITY.md)).
-- **The control-plane journal and replay store are checksummed, not
-  signed.** Someone with write access to the state directory can make the
-  robot forget requests or fence; the black box keeps every decision.
+- **The control-plane journal and replay store are sealed** (HMAC chain
+  under a key derived from the black-box key, end points in signed
+  black-box notes), so an edit, deletion, truncation or rollback is
+  detected, quarantined and reported. Entries written after the last
+  recorded end point and lost in a crash cannot be proven missing. The
+  executor seals its journal too, but has no black box to anchor to, so an
+  older sealed copy put back is not detected.
 - **The robot cannot verify the SOC's internal approval process** (who
   approved, a two-person rule), and SOC keys have no per-key action
   scopes. agentd and the executor each verify the SOC's signature on the
@@ -191,10 +199,13 @@
   the audited `sha2` crate; HMAC is the RFC 2104 construction over it (a
   few lines, so every keyed buffer can be wiped).
 - **`panic = "abort"`:** a panic stops the daemon until systemd restarts
-  it. Panic-family calls are denied in daemon code, but indexing can
-  still panic.
-- **Legacy HMAC keys** still load, with a warning. Verifiers holding an
-  HMAC key can forge.
+  it. Panic-family calls and unchecked indexing are denied in daemon code
+  and in the in-process parsers; arithmetic overflow and the remaining
+  library code are left to review and fuzzing.
+- **Legacy HMAC keys** are refused unless explicitly allowed
+  (`blackbox.allow_hmac`, `--allow-hmac`). Where they are allowed,
+  verifiers holding an HMAC key can forge. The deliverd finding key
+  (`findings.finding_key`) has no HMAC check yet.
 - **No time-source authentication.** Signatures and replay windows depend
   on NTP.
 
@@ -211,18 +222,26 @@
   robot list and detail pages and the SOC side of the fleet API on its
   unreleased development branch (enrollment ran end to end against it in
   one container, `tools/e2e/RESULTS.md`), but there is no released fleet
-  console yet, so keys and updates are still handled per robot. Update rings are information only; the secure-delivery design is
-  not implemented ([`docs/SECURE-DELIVERY.md`](../SECURE-DELIVERY.md)).
-- **More state to back up.** The control-plane state directory, the
-  executor journal, the gateway's `rtps.state_file` and the fleet state
-  join `/etc/robodr`; no backup procedure is documented yet.
+  console yet, so keys and updates are still handled per robot. Secure
+  delivery (sprints 13a–14b: signed releases, unit agent, sealing, site
+  depot, leases, crypto-erase) is implemented and tested against software
+  TPMs only; OS A/B updates (14c), depot keys in a TPM / HSM and a signed
+  remote erase are not done ([`docs/SECURE-DELIVERY.md`](../SECURE-DELIVERY.md) §10).
+- **Backup and restore** are documented ([`docs/OPERATIONS.md`](../OPERATIONS.md)
+  §14), but the restore order has not been rehearsed on a unit.
 - **Debian 12 and Ubuntu 22.04 hosts** get the agentd-only package
   ([`support-matrix.md`](support-matrix.md)).
 - **Resource budgets are unmeasured** on target hardware.
-- **The Kafka exporter** is at-least-once (idempotence off), and
-  multi-broker behaviour has only been tested against a fake broker.
-- **The `done/` markers and dead-letter files** of the exporters must be
-  pruned by the operator.
+- **The Kafka exporter** is idempotent by default (exactly-once per
+  partition within a producer id's lifetime), tested against an in-process
+  fake broker only; a batch can still be written twice after the broker
+  expires the producer id (`producer.id.expiration.ms`, default 1 day) or
+  after a producer reset during a lost acknowledgement. No epoch bump
+  (KIP-360). Multi-broker behaviour has only been tested against a fake
+  broker.
+- **Exporter retention** prunes `done/` markers and rotated dead-letter
+  files; the reinject ledger, the publish / uplink `rejected/` directories
+  and the importer's `out/` are still pruned by the operator.
 - **`robodr-uplink` has run against the AutoSecOps ingest module only in
   one container** (TLS and loopback HTTP, `tools/e2e/RESULTS.md`), not
   across a real network; the module is on an unreleased AutoSecOps
@@ -234,4 +253,7 @@
   legal ([`sla-support-draft.md`](sla-support-draft.md),
   [`eula-draft.md`](eula-draft.md)).
 - No production licence key exists on the SOC side yet.
-- RoboDR packages do not yet ship a third-party notices file (S12).
+- Third-party notices and the eBPF GPL-2.0 source offer ship in the
+  packages; legal has not yet confirmed the source offer's contact wording.
+- Release builds need the repository variable `ROBODR_MAINTAINER` (a real
+  maintainer address); it is not set yet.

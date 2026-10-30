@@ -73,7 +73,8 @@ crates/
                           execution) and the humanoid rule (no executable
                           safe pause / safe state: a humanoid would fall).
   robodr-blackbox/        Signed (Ed25519 by default, via the audited
-                          ed25519-dalek crate; legacy HMAC-SHA256 warned),
+                          ed25519-dalek crate; legacy HMAC-SHA256 refused
+                          unless allowed),
                           hash-chained evidence recorder with append-only
                           segments and export bundles. Owns the one key file
                           format (robodr-blackbox-key/v2 secret + .pub) also
@@ -102,7 +103,7 @@ crates/
                           combine already-reported findings into
                           robot.correlate.* findings citing every input. Pure,
                           bounded memory. Wired into robodr-agentd; host-side
-                          (Pulsar) signals do not reach it yet, and the default
+                          (Pulsar) signals reach it by rule name, and the default
                           rules are untuned engineering defaults.
   robodr-cdr/             ROS 2 CDR (XCDR1/XCDR2) decoder for motion topics
                           (Twist, TwistStamped, JointTrajectory, Odometry, Imu,
@@ -118,7 +119,7 @@ crates/
                           robodr-spool-export (robot side: agentd spool ->
                           diode outbox, crash-safe) and robodr-kafka-publish
                           (SOC side: importer output or a connected spool ->
-                          Kafka; in-crate client, acks=all, idempotence off,
+                          Kafka; in-crate client, acks=all, idempotent producer,
                           TLS required, mutual TLS, SASL/SCRAM). Tested against
                           an in-process fake broker
                           in CI and against single-node Apache Kafka 3.9.1 and
@@ -163,7 +164,7 @@ rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
 config/                 Profile, response-policy and daemon config examples.
 docs/ROADMAP.md         The engineering plan: phases, components, research.
 docs/SPRINTS.md         The roadmap broken into sprints, with status.
-docs/SECURE-DELIVERY.md Design (not implemented): air-gapped fleet distribution,
+docs/SECURE-DELIVERY.md Air-gapped fleet distribution (13a-14b implemented, swtpm only),
                         staged updates, captured-unit software protection.
 docs/BUILD.md           Toolchain, MSRV, Cargo.lock policy, air-gapped builds, CI.
 docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
@@ -251,8 +252,8 @@ qemu. No release has been cut or signed, and GitHub CI has never run
   arm64 hardware are untested; `robodr-pulsard` ran only under WSL2, and
   the host rules were never loaded into a running rules engine on a robot.
 - Kafka and the anchor receiver use TLS (plain TCP only when explicitly
-  allowed); mutual TLS authenticates hosts, not robot ids, and there is no
-  CRL / OCSP check on those paths. Keys are files, not TPM-held.
+  allowed); mutual TLS authenticates hosts, not robot ids. Every TLS path
+  checks CRLs (no OCSP). Keys are files, not TPM-held.
   The executor verifies the SOC's signed request itself, but not the
   SOC's internal approval process.
 - Reviews were done by independent AI agents, not humans; there has been no

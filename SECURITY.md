@@ -109,7 +109,7 @@ plain TCP only when both sides are explicitly configured with
 `allow_plaintext`. Not claimed: confidentiality of marks with
 `allow_plaintext` (hashes and seqs only); binding of a TLS client
 certificate to a unit id (marks are bound to units by their signatures);
-certificate revocation (no CRL / OCSP);
+OCSP (revocation is by CRL file only: `tls.crl_files`, fail closed);
 protection of a unit whose configuration (receiver address and public key)
 an attacker rewrote: then only the receiver's side shows it (marks stop
 arriving, or arrive lower). The receiver's own host, state directory and
@@ -185,11 +185,11 @@ Not claimed: confidentiality or authentication on the loopback listener and
 the unix socket (local only, file permissions); availability against a
 network attacker; protection when the SOC's private key **and** client
 certificate, or the robot's configuration (`soc_keys`, `tls`), are
-compromised; revocation of a SOC client certificate other than by removing
-its CA or pin and restarting; integrity of the request journal against a
-person with write access to the state directory (it is checksummed, not
-signed: it can be made to forget or to fence, the black box keeps every
-decision); correct judgment when the safety state source is wrong (see the
+compromised; revocation of a SOC client certificate other than by a CRL
+(`tls.crl_files`; no OCSP); detection of request-journal entries written
+after the last end point recorded in the black box and lost in a crash (an
+edited, deleted, truncated or rolled-back journal is detected: it is
+sealed and anchored in the black box); correct judgment when the safety state source is wrong (see the
 live safety feed's own limits). Reports that break the claims above, or any
 way the API reaches the robot, are in scope (the latter is always
 Critical).
