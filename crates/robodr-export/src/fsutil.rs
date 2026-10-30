@@ -133,7 +133,11 @@ fn libc_o_nofollow() -> i32 {
 /// file, the parent directory is fsynced so the new entry survives a crash.
 pub fn append_durable(path: &Path, line: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
-    if line.last() != Some(&b'\n') || line.len() < 2 || line[..line.len() - 1].contains(&b'\n') {
+    let one_line = matches!(
+        line.split_last(),
+        Some((b'\n', text)) if !text.is_empty() && !text.contains(&b'\n')
+    );
+    if !one_line {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "append_durable: exactly one non-empty LF-terminated line",

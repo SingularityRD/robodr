@@ -14,7 +14,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for pair in header.chunks(2) {
-        let hi = u32::from(pair[0]) << 8;
+        let hi = u32::from(*pair.first().unwrap_or(&0)) << 8;
         let lo = u32::from(*pair.get(1).unwrap_or(&0));
         sum += hi | lo;
     }
@@ -43,7 +43,9 @@ fn ipv4_header(src: Ipv4Addr, dst: Ipv4Addr, id: u16, frag: u16, body_len: usize
     h.extend_from_slice(&src.octets());
     h.extend_from_slice(&dst.octets());
     let c = ipv4_checksum(&h);
-    h[10..12].copy_from_slice(&c.to_be_bytes());
+    if let Some(field) = h.get_mut(10..12) {
+        field.copy_from_slice(&c.to_be_bytes());
+    }
     h
 }
 
@@ -70,28 +72,32 @@ pub fn ipv4_udp_checksummed(
     payload: &[u8],
 ) -> Vec<u8> {
     let mut p = ipv4_udp(src, dst, src_port, dst_port, payload);
-    let c = crate::checksum::udp_checksum(src.into(), dst.into(), &p[20..]);
-    p[26..28].copy_from_slice(&c.to_be_bytes());
+    let c = crate::checksum::udp_checksum(src.into(), dst.into(), p.get(20..).unwrap_or_default());
+    if let Some(field) = p.get_mut(26..28) {
+        field.copy_from_slice(&c.to_be_bytes());
+    }
     p
 }
 
 /// Split an (option-less) IPv4 packet into fragments carrying at most
 /// `chunk` payload bytes each (`chunk` is rounded down to a multiple of 8,
-/// minimum 8).
+/// minimum 8). A packet shorter than the IPv4 header yields no fragments.
 pub fn ipv4_fragment(packet: &[u8], chunk: usize) -> Vec<Vec<u8>> {
     let chunk = (chunk / 8).max(1) * 8;
-    let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let id = u16::from_be_bytes([packet[4], packet[5]]);
-    let body = &packet[20..];
+    let Some((h, body)) = packet.split_first_chunk::<20>() else {
+        return Vec::new();
+    };
+    let src = Ipv4Addr::new(h[12], h[13], h[14], h[15]);
+    let dst = Ipv4Addr::new(h[16], h[17], h[18], h[19]);
+    let id = u16::from_be_bytes([h[4], h[5]]);
     let mut out = Vec::new();
     let mut off = 0;
-    while off < body.len() {
-        let end = (off + chunk).min(body.len());
+    for piece in body.chunks(chunk) {
+        let end = off + piece.len();
         let more = end < body.len();
         let frag = ((off / 8) as u16) | if more { 0x2000 } else { 0 };
-        let mut p = ipv4_header(src, dst, id, frag, end - off);
-        p.extend_from_slice(&body[off..end]);
+        let mut p = ipv4_header(src, dst, id, frag, piece.len());
+        p.extend_from_slice(piece);
         out.push(p);
         off = end;
     }
@@ -112,17 +118,21 @@ pub fn ipv6_udp(
 ) -> Vec<u8> {
     let mut u = udp(src_port, dst_port, payload);
     let c = crate::checksum::udp_checksum(src.into(), dst.into(), &u);
-    u[6..8].copy_from_slice(&c.to_be_bytes());
+    if let Some(field) = u.get_mut(6..8) {
+        field.copy_from_slice(&c.to_be_bytes());
+    }
     let mut chain = Vec::new();
-    for (i, &(_, len)) in ext.iter().enumerate() {
+    for (i, &(code, len)) in ext.iter().enumerate() {
         let next = ext.get(i + 1).map_or(17, |e| e.0);
         let mut h = vec![0u8; len];
-        h[0] = next;
-        h[1] = if ext[i].0 == 51 {
-            (len / 4 - 2) as u8
-        } else {
-            (len / 8 - 1) as u8
-        };
+        if let [nh, hlen, ..] = h.as_mut_slice() {
+            *nh = next;
+            *hlen = if code == 51 {
+                (len / 4 - 2) as u8
+            } else {
+                (len / 8 - 1) as u8
+            };
+        }
         chain.extend_from_slice(&h);
     }
     chain.extend_from_slice(&u);
@@ -143,15 +153,18 @@ fn ipv6_raw(src: Ipv6Addr, dst: Ipv6Addr, next: u8, body: &[u8]) -> Vec<u8> {
 /// Fragment an IPv6 packet *without* extension headers (next header taken from
 /// the fixed header) into fragments of at most `chunk` bytes (rounded down to
 /// a multiple of 8). If the payload fits in one chunk, the result is a single
-/// atomic fragment (offset 0, M = 0).
+/// atomic fragment (offset 0, M = 0). A packet shorter than the IPv6 header
+/// yields no fragments.
 pub fn ipv6_fragment(packet: &[u8], chunk: usize, id: u32) -> Vec<Vec<u8>> {
     let chunk = (chunk / 8).max(1) * 8;
+    let Some((h, body)) = packet.split_first_chunk::<40>() else {
+        return Vec::new();
+    };
     let mut src = [0u8; 16];
-    src.copy_from_slice(&packet[8..24]);
+    src.copy_from_slice(&h[8..24]);
     let mut dst = [0u8; 16];
-    dst.copy_from_slice(&packet[24..40]);
-    let next = packet[6];
-    let body = &packet[40..];
+    dst.copy_from_slice(&h[24..40]);
+    let next = h[6];
     let mut out = Vec::new();
     let mut off = 0;
     loop {
@@ -160,7 +173,7 @@ pub fn ipv6_fragment(packet: &[u8], chunk: usize, id: u32) -> Vec<Vec<u8>> {
         let mut fh = vec![next, 0];
         fh.extend_from_slice(&((off as u16) | u16::from(more)).to_be_bytes());
         fh.extend_from_slice(&id.to_be_bytes());
-        fh.extend_from_slice(&body[off..end]);
+        fh.extend_from_slice(body.get(off..end).unwrap_or_default());
         out.push(ipv6_raw(src.into(), dst.into(), 44, &fh));
         off = end;
         if !more {

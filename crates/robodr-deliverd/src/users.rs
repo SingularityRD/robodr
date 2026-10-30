@@ -38,18 +38,14 @@ pub fn lookup(text: &str, name: &str) -> Result<Ids, String> {
             continue;
         }
         let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() != 7 {
+        let &[_, _, uid_s, gid_s, _, _, _] = parts.as_slice() else {
             return Err(format!("user {name}: malformed database line"));
-        }
-        let uid: u32 = parts[2]
-            .parse()
-            .map_err(|_| format!("user {name}: bad uid"))?;
-        let gid: u32 = parts[3]
-            .parse()
-            .map_err(|_| format!("user {name}: bad gid"))?;
+        };
+        let uid: u32 = uid_s.parse().map_err(|_| format!("user {name}: bad uid"))?;
+        let gid: u32 = gid_s.parse().map_err(|_| format!("user {name}: bad gid"))?;
         // A leading '+' or '0' variant ("01") would be accepted by parse
         // differently than by libc; require the canonical decimal form.
-        if parts[2] != uid.to_string() || parts[3] != gid.to_string() {
+        if uid_s != uid.to_string() || gid_s != gid.to_string() {
             return Err(format!("user {name}: non-canonical uid or gid"));
         }
         if found.is_some() {

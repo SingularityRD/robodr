@@ -171,14 +171,17 @@ impl<'a> Reader<'a> {
         self.remaining() == 0
     }
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        if n > self.remaining() {
+        let Some(s) = self
+            .pos
+            .checked_add(n)
+            .and_then(|end| self.buf.get(self.pos..end))
+        else {
             return derr(format!(
                 "need {n} bytes at offset {}, have {}",
                 self.pos,
                 self.remaining()
             ));
-        }
-        let s = &self.buf[self.pos..self.pos + n];
+        };
         self.pos += n;
         Ok(s)
     }

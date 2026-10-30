@@ -673,7 +673,8 @@ pub(crate) fn check_record(
                     robodr_ocsf::SIG_HEADER
                 ));
             }
-            (&rec.headers[..rec.headers.len() - 1], Some(parsed))
+            let base = rec.headers.split_last().map_or(&[][..], |(_, base)| base);
+            (base, Some(parsed))
         }
         None => (&rec.headers[..], None),
     };
@@ -940,7 +941,7 @@ impl<S: Sink> Publisher<S> {
         if self.dead.contains(context, pos)? {
             return Ok(());
         }
-        let raw = String::from_utf8_lossy(&raw[..raw.len().min(self.cfg.max_record_bytes)]);
+        let raw = String::from_utf8_lossy(raw.get(..self.cfg.max_record_bytes).unwrap_or(raw));
         let mut line = serde_json::to_vec(&serde_json::json!({
             "source": context,
             "position": pos,

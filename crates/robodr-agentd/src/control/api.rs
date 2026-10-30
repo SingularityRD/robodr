@@ -87,6 +87,14 @@ pub fn error_body(code: &str, message: &str) -> Value {
     json!({"error": {"code": code, "message": message}})
 }
 
+/// `obj[key] = value` without `Value`'s panicking `IndexMut`: every caller
+/// passes an object it built with `json!({..})`; anything else is left as is.
+pub(crate) fn json_set(obj: &mut Value, key: &str, value: Value) {
+    if let Some(o) = obj.as_object_mut() {
+        o.insert(key.to_owned(), value);
+    }
+}
+
 fn bad(code: &'static str, message: impl Into<String>) -> ApiError {
     ApiError::new(400, code, message)
 }
@@ -1874,10 +1882,10 @@ impl Engine {
             });
         }
         let mut body = answer_of(s, &robot_id, false, now, held);
-        body["status"] = json!(result);
-        body["revert_evidence"] = json!(evidence);
+        json_set(&mut body, "status", json!(result));
+        json_set(&mut body, "revert_evidence", json!(evidence));
         match refusal {
-            Some(r) => body["refusal"] = json!(r),
+            Some(r) => json_set(&mut body, "refusal", json!(r)),
             None => {
                 if let Some(o) = body.as_object_mut() {
                     o.remove("refusal");
@@ -1932,28 +1940,28 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64, held:
         "evidence": s.evidence,
     });
     if let Some(a) = &s.accepted {
-        state["ladder_step"] = json!(a.step);
-        state["plan_actions"] = json!(a.actions);
+        json_set(&mut state, "ladder_step", json!(a.step));
+        json_set(&mut state, "plan_actions", json!(a.actions));
         if !a.notes.is_empty() {
-            state["notes"] = json!(a.notes);
+            json_set(&mut state, "notes", json!(a.notes));
         }
     }
     if s.status == Status::RecordedNotExecuted {
-        state["note"] = json!(NOT_EXECUTED_NOTE);
+        json_set(&mut state, "note", json!(NOT_EXECUTED_NOTE));
     }
     if let Some(e) = &s.error {
-        state["error"] = json!(e);
+        json_set(&mut state, "error", json!(e));
     }
     if let Some(r) = &s.revert {
-        state["revert"] = json!(r);
+        json_set(&mut state, "revert", json!(r));
     }
     let enforcing = matches!(s.status, Status::Verified | Status::Applied);
     if held && enforcing {
-        state["executor_state"] = json!("held");
+        json_set(&mut state, "executor_state", json!("held"));
     }
     // Review R2-3: how far a quarantine reaches (contract §6a).
     if let Some(q) = &s.quarantine {
-        state["quarantine"] = json!(q);
+        json_set(&mut state, "quarantine", json!(q));
     }
     let mut out = json!({
         "request_id": s.request.request_id,
@@ -1963,16 +1971,17 @@ pub fn answer_of(s: &Stored, robot_id: &str, duplicate: bool, now_ms: u64, held:
         "state": state,
     });
     if enforcing && s.request.action == ActionKind::QuarantineNode {
-        out["containment"] = json!(s
+        let containment = s
             .quarantine
             .as_ref()
-            .map_or("unknown", QuarantineScope::containment));
+            .map_or("unknown", QuarantineScope::containment);
+        json_set(&mut out, "containment", json!(containment));
     }
     if duplicate {
-        out["duplicate"] = json!(true);
+        json_set(&mut out, "duplicate", json!(true));
     }
     if let Some(r) = &s.refusal {
-        out["refusal"] = json!(r);
+        json_set(&mut out, "refusal", json!(r));
     }
     out
 }

@@ -208,6 +208,20 @@ fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Read at most `room` bytes into `chunk`; returns the bytes read (empty on
+/// EOF).
+fn read_upto<'c, S: Stream>(
+    s: &mut S,
+    chunk: &'c mut [u8],
+    room: usize,
+    deadline: Instant,
+) -> Result<&'c [u8], HttpError> {
+    let (part, _) = chunk.split_at_mut(room.min(chunk.len()));
+    let n = read_some(s, part, deadline)?;
+    let part: &'c [u8] = part;
+    Ok(part.get(..n).unwrap_or(part))
+}
+
 /// Read and parse one request before `deadline`.
 pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
@@ -218,7 +232,7 @@ pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, 
     // delimiter search resumes where the last one stopped (linear time).
     let mut searched = 0usize;
     let head_end = loop {
-        if let Some(i) = find_crlfcrlf(&buf[searched..]) {
+        if let Some(i) = buf.get(searched..).and_then(find_crlfcrlf) {
             break searched + i;
         }
         searched = buf.len().saturating_sub(3);
@@ -229,16 +243,15 @@ pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, 
                 format!("the request head is longer than {MAX_HEAD_BYTES} bytes"),
             ));
         }
-        let room = (MAX_HEAD_BYTES + 4 - buf.len()).min(chunk.len());
-        let n = read_some(s, &mut chunk[..room], deadline)?;
-        if n == 0 {
+        let got = read_upto(s, &mut chunk, MAX_HEAD_BYTES + 4 - buf.len(), deadline)?;
+        if got.is_empty() {
             return Err(err(
                 400,
                 "truncated",
                 "the connection closed before the request head ended",
             ));
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(got);
     };
     if head_end > MAX_HEAD_BYTES {
         return Err(err(
@@ -247,7 +260,9 @@ pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, 
             format!("the request head is longer than {MAX_HEAD_BYTES} bytes"),
         ));
     }
-    let (method, target, headers) = parse_head(&buf[..head_end])?;
+    // head_end + 4 <= buf.len(): the delimiter was found inside `buf`.
+    let head = buf.get(..head_end).unwrap_or_default();
+    let (method, target, headers) = parse_head(head)?;
     let mut rest = buf.split_off(head_end + 4);
 
     if headers.iter().any(|(n, _)| n == "transfer-encoding") {
@@ -297,16 +312,15 @@ pub fn read_request<S: Stream>(s: &mut S, deadline: Instant) -> Result<Request, 
     // per connection.
     rest.truncate(len);
     while rest.len() < len {
-        let room = (len - rest.len()).min(chunk.len());
-        let n = read_some(s, &mut chunk[..room], deadline)?;
-        if n == 0 {
+        let got = read_upto(s, &mut chunk, len - rest.len(), deadline)?;
+        if got.is_empty() {
             return Err(err(
                 400,
                 "truncated",
                 "the connection closed before the body ended",
             ));
         }
-        rest.extend_from_slice(&chunk[..n]);
+        rest.extend_from_slice(got);
     }
     Ok(Request {
         method,

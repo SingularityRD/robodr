@@ -246,7 +246,8 @@ pub fn is_label(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= MAX_LABEL_LEN
-        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && b.iter().all(|&c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-')
         })
@@ -259,7 +260,8 @@ pub fn is_pkg_name(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= MAX_LABEL_LEN
-        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && b.iter().all(|&c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'+' | b'-')
         })
@@ -281,7 +283,7 @@ pub fn is_version_display(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= MAX_LABEL_LEN
-        && b[0].is_ascii_alphanumeric()
+        && b.first().is_some_and(u8::is_ascii_alphanumeric)
         && b.iter().all(|&c| {
             c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'~' | b':' | b'_' | b'-')
         })
@@ -302,7 +304,9 @@ pub fn is_safe_rel_path(s: &str) -> bool {
         let b = c.as_bytes();
         if b.is_empty()
             || b.len() > MAX_COMPONENT_LEN
-            || !(b[0].is_ascii_alphanumeric() || b[0] == b'_')
+            || !b
+                .first()
+                .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
             || !b
                 .iter()
                 .all(|&x| x.is_ascii_alphanumeric() || matches!(x, b'.' | b'_' | b'+' | b'-'))
@@ -335,8 +339,8 @@ pub(crate) fn strictly_sorted<T, K: Ord>(
     key: impl Fn(&T) -> K,
     what: &str,
 ) -> Result<(), Refusal> {
-    for w in items.windows(2) {
-        if key(&w[0]) >= key(&w[1]) {
+    for (a, b) in items.iter().zip(items.iter().skip(1)) {
+        if key(a) >= key(b) {
             return Err(invalid(format!(
                 "{what} must be sorted ascending without duplicates"
             )));

@@ -1208,8 +1208,11 @@ impl Engine {
             };
             match &done {
                 Ok(()) => {
-                    self.state.entries[pos].phase = Phase::Active;
-                    let action = self.state.entries[pos].action;
+                    let Some(en) = self.state.entries.get_mut(pos) else {
+                        continue;
+                    };
+                    en.phase = Phase::Active;
+                    let action = en.action;
                     self.state.event(
                         now_ms,
                         EventKind::Verified,
@@ -1372,7 +1375,12 @@ impl Engine {
         let Some(pos) = self.state.entries.iter().position(|e| e.id == id) else {
             return self.status(id);
         };
-        if self.state.entries[pos].phase == Phase::Held {
+        if self
+            .state
+            .entries
+            .get(pos)
+            .is_some_and(|e| e.phase == Phase::Held)
+        {
             // Not installed: nothing to remove.
             let en = self.state.entries.remove(pos);
             self.finish(&en, Final::Reverted, now_ms, reason);
@@ -1395,7 +1403,9 @@ impl Engine {
         if self.removed_by_operator(now_ms) {
             return self.status(id);
         }
-        self.state.entries[pos].phase = Phase::Reverting;
+        if let Some(en) = self.state.entries.get_mut(pos) {
+            en.phase = Phase::Reverting;
+        }
         if let Err(e) = self.save() {
             self.journal_failed(id, now_ms, &e);
         }

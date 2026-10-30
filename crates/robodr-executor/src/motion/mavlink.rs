@@ -114,7 +114,7 @@ pub fn decode(d: &[u8]) -> Result<(Option<Frame>, usize), String> {
     if d.first() != Some(&STX) {
         return Err("not a MAVLink 2 frame (start octet)".into());
     }
-    let h = d.get(..10).ok_or("truncated header")?;
+    let (h, rest) = d.split_first_chunk::<10>().ok_or("truncated header")?;
     let len = usize::from(h[1]);
     let incompat = h[2];
     if incompat & 0x01 != 0 {
@@ -126,15 +126,17 @@ pub fn decode(d: &[u8]) -> Result<(Option<Frame>, usize), String> {
     let msgid = u32::from_le_bytes([h[7], h[8], h[9], 0]);
     let total = 10 + len + 2;
     let frame = d.get(..total).ok_or("truncated frame")?;
-    let payload = &frame[10..10 + len];
+    let payload = rest.get(..len).ok_or("truncated frame")?;
+    // `frame` is header + payload + 2 checksum octets.
+    let (covered, checksum) = frame.split_at_checked(10 + len).ok_or("truncated frame")?;
     let Some(extra) = crc_extra(msgid) else {
         // Unknown message: skipped (its CRC cannot be checked without its
         // CRC_EXTRA), never interpreted.
         return Ok((None, total));
     };
-    let mut c = crc(&frame[1..10 + len]);
+    let mut c = crc(covered.get(1..).unwrap_or_default());
     c = crc_accumulate(c, extra);
-    if c.to_le_bytes() != [frame[10 + len], frame[11 + len]] {
+    if c.to_le_bytes().as_slice() != checksum {
         return Err("bad checksum".into());
     }
     let full = full_len(msgid);

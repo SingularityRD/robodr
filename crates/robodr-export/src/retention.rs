@@ -59,17 +59,22 @@ impl Retention {
     /// in `items` counts as the newer.
     pub fn over(&self, items: &[(SystemTime, u64)], now: SystemTime) -> Vec<bool> {
         let mut order: Vec<usize> = (0..items.len()).collect();
-        order.sort_by(|a, b| items[*b].0.cmp(&items[*a].0).then(b.cmp(a)));
+        order.sort_by(|a, b| {
+            let time = |i: &usize| items.get(*i).map(|it| it.0);
+            time(b).cmp(&time(a)).then(b.cmp(a))
+        });
         let mut out = vec![false; items.len()];
         let (mut count, mut bytes) = (0u64, 0u64);
         for i in order {
-            let (t, n) = items[i];
+            let (Some(&(t, n)), Some(slot)) = (items.get(i), out.get_mut(i)) else {
+                continue;
+            };
             count += 1;
             bytes = bytes.saturating_add(n);
             let old = self
                 .max_age
                 .is_some_and(|a| now.duration_since(t).is_ok_and(|age| age > a));
-            out[i] = old
+            *slot = old
                 || self.max_count.is_some_and(|c| count > c)
                 || self.max_bytes.is_some_and(|b| bytes > b);
         }

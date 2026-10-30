@@ -242,7 +242,7 @@ pub fn run(
             drain_observed(&mut rtc_log, gw, false);
             let t_batch = sys::monotonic_ns();
             let buf = std::mem::take(&mut q.buf);
-            nfq::parse_packets(&buf[..n], |item| {
+            nfq::parse_packets(buf.get(..n).unwrap_or_default(), |item| {
                 let Item::Packet(p) = item else { return };
                 packets += 1;
                 let (verdict, payload) = if p.cap_len.is_some() || p.hw_protocol != 0x0800 {
@@ -337,7 +337,7 @@ fn drain_observed(log: &mut Option<nflog::Log>, gw: &mut Gateway, robot_side: bo
         let buf = std::mem::take(&mut l.buf);
         let mono = sys::monotonic_ns();
         let real = sys::realtime_ns();
-        nflog::parse_packets(&buf[..n], |item| {
+        nflog::parse_packets(buf.get(..n).unwrap_or_default(), |item| {
             let nflog::Item::Packet(p) = item else { return };
             if p.hw_protocol != 0x0800 {
                 return;

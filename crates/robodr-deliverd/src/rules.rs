@@ -130,7 +130,9 @@ pub fn check_file(
                 _ => return Err(format!("{at}: `{k}` must be a non-empty string")),
             }
         }
-        let (name, ty, cond, cat, sev) = (vals[0], vals[1], vals[2], vals[3], vals[4]);
+        let &[name, ty, cond, cat, sev, ..] = vals.as_slice() else {
+            return Err(format!("{at}: missing required keys"));
+        };
         if name.len() > 256 {
             return Err(format!("{at}: name too long"));
         }

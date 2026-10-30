@@ -1145,7 +1145,9 @@ impl<'a> Daemon<'a> {
                 .name(format!("agentd-in-{i}"))
                 .spawn(move || body(feed))
                 .map_err(|e| DaemonError::Io(format!("spawning input thread: {e}")))?;
-            inputs[i].thread = Some(h);
+            if let Some(input) = inputs.get_mut(i) {
+                input.thread = Some(h);
+            }
         }
 
         let health = HealthMonitor::new(
@@ -2233,10 +2235,12 @@ impl<'a> Daemon<'a> {
 
     /// Handle inputs that ended since the last tick.
     fn handle_ended(&mut self) {
-        let newly: Vec<usize> = (0..self.inputs.len())
-            .filter(|&i| {
-                !self.inputs[i].end_handled && self.inputs[i].stats.ended.load(Ordering::SeqCst)
-            })
+        let newly: Vec<usize> = self
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| !input.end_handled && input.stats.ended.load(Ordering::SeqCst))
+            .map(|(i, _)| i)
             .collect();
         if newly.is_empty() {
             return;
@@ -2246,17 +2250,20 @@ impl<'a> Daemon<'a> {
             self.handle(m);
         }
         for i in newly {
-            self.inputs[i].end_handled = true;
-            let err = self.inputs[i].stats.end_error();
+            let Some(input) = self.inputs.get_mut(i) else {
+                continue;
+            };
+            input.end_handled = true;
+            let err = input.stats.end_error();
             let _ = writeln!(
                 self.log,
                 "robodr-agentd: input {} ended{}",
-                sanitize(&self.inputs[i].name),
+                sanitize(&input.name),
                 err.as_deref()
                     .map(|e| format!(" with an error: {e}"))
                     .unwrap_or_default()
             );
-            if self.inputs[i].kind == InputKind::Capture {
+            if input.kind == InputKind::Capture {
                 let mut found = Vec::new();
                 if let Some(h) = self.capture_health.latest() {
                     found.extend(self.pipeline.capture_findings(&h));
@@ -2351,12 +2358,20 @@ impl<'a> Daemon<'a> {
                 _ => None,
             };
             if let Some(what) = what {
-                let status = a.body["status"]
-                    .as_str()
-                    .or_else(|| a.body["error"]["code"].as_str())
+                let status = a
+                    .body
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        a.body
+                            .pointer("/error/code")
+                            .and_then(serde_json::Value::as_str)
+                    })
                     .unwrap_or("?");
-                let code = a.body["refusal"]["code"]
-                    .as_str()
+                let code = a
+                    .body
+                    .pointer("/refusal/code")
+                    .and_then(serde_json::Value::as_str)
                     .map(|c| format!(" ({c})"))
                     .unwrap_or_default();
                 let _ = writeln!(
@@ -2387,14 +2402,18 @@ impl<'a> Daemon<'a> {
         let now_ms = self.now_ms();
         let every = self.r.config.daemon.health_report_ms;
         for (i, &count) in counts.iter().enumerate() {
-            if count <= self.control_reported[i]
-                || self.control_reported_at_ms[i].is_some_and(|t| now_ms.saturating_sub(t) < every)
-            {
+            let (Some(reported), Some(reported_at)) = (
+                self.control_reported.get_mut(i),
+                self.control_reported_at_ms.get_mut(i),
+            ) else {
+                continue;
+            };
+            if count <= *reported || reported_at.is_some_and(|t| now_ms.saturating_sub(t) < every) {
                 continue;
             }
-            let delta = count - self.control_reported[i];
-            self.control_reported[i] = count;
-            self.control_reported_at_ms[i] = Some(now_ms);
+            let delta = count - *reported;
+            *reported = count;
+            *reported_at = Some(now_ms);
             let dev = if i == 0 {
                 robodr_events::Deviation::new(
                     health_rules::CONTROL_PLANE_UNAUTHENTICATED,

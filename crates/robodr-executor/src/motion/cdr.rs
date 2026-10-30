@@ -76,7 +76,9 @@ pub struct Dec<'a> {
 impl<'a> Dec<'a> {
     /// Open a payload (`CDR_BE` / `CDR_LE` only).
     pub fn open(payload: &'a [u8]) -> Result<Self, String> {
-        let h = payload.get(..4).ok_or("payload shorter than its header")?;
+        let (h, b) = payload
+            .split_first_chunk::<4>()
+            .ok_or("payload shorter than its header")?;
         let big = match (h[0], h[1]) {
             (0, 0) => true,
             (0, 1) => false,
@@ -87,11 +89,7 @@ impl<'a> Dec<'a> {
                 ))
             }
         };
-        Ok(Dec {
-            b: &payload[4..],
-            pos: 0,
-            big,
-        })
+        Ok(Dec { b, pos: 0, big })
     }
     fn align(&mut self, n: usize) {
         let r = self.pos % n;
@@ -108,7 +106,10 @@ impl<'a> Dec<'a> {
         Ok(s)
     }
     pub fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or_else(|| "truncated".into())
     }
     pub fn u32(&mut self) -> Result<u32, String> {
         self.align(4);

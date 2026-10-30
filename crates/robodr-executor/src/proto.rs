@@ -374,7 +374,7 @@ pub fn read_line_by(
             return Err("connection closed".into());
         }
         if let Some(i) = buf.iter().position(|b| *b == b'\n') {
-            line.extend_from_slice(&buf[..i]);
+            line.extend_from_slice(buf.get(..i).unwrap_or(buf));
             r.consume(i + 1);
             break;
         }
@@ -400,7 +400,7 @@ pub fn read_line(r: &mut impl BufRead) -> Result<Vec<u8>, String> {
             return Err("connection closed".into());
         }
         if let Some(i) = buf.iter().position(|b| *b == b'\n') {
-            line.extend_from_slice(&buf[..i]);
+            line.extend_from_slice(buf.get(..i).unwrap_or(buf));
             r.consume(i + 1);
             break;
         }

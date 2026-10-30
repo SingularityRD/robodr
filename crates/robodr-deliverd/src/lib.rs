@@ -50,10 +50,11 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 // Review L3 (S10, R9): release builds use `panic = "abort"`, so a panic
 // kills the daemon. Non-test code has no unwrap / expect / panic!-family
-// call; slice indexing and arithmetic are left to review and fuzzing.
+// call and no unchecked indexing; arithmetic is left to review and fuzzing.
 #![cfg_attr(
     not(test),
     deny(
+        clippy::indexing_slicing,
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,

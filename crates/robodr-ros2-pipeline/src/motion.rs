@@ -403,8 +403,8 @@ impl Table {
             } else if reading.motion.is_some() {
                 // Never let junk readings displace a motion reading; a
                 // motion reading may displace the newest non-motion one.
-                if let Some(i) = e.readings.iter().rposition(|r| r.motion.is_none()) {
-                    e.readings[i] = reading;
+                if let Some(slot) = e.readings.iter_mut().rfind(|r| r.motion.is_none()) {
+                    *slot = reading;
                 }
             }
             return None;

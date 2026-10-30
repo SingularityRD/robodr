@@ -36,11 +36,12 @@
 // Review L3 (S10, R9): the release tool, and later the depot and the unit
 // agent, link this library and release builds use `panic = "abort"`, so a
 // panic here kills the process. Non-test code has no unwrap / expect /
-// panic!-family call; slice indexing and arithmetic are left to review and
-// fuzzing.
+// panic!-family call and no unchecked indexing; arithmetic is left to
+// review and fuzzing.
 #![cfg_attr(
     not(test),
     deny(
+        clippy::indexing_slicing,
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,

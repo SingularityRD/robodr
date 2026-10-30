@@ -61,7 +61,7 @@ const PCAPNG_EPB: u32 = 6;
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool, CaptureError> {
     let mut got = 0;
     while got < buf.len() {
-        match r.read(&mut buf[got..]) {
+        match r.read(buf.get_mut(got..).unwrap_or_default()) {
             Ok(0) if got == 0 => return Ok(false),
             Ok(0) => return Err(CaptureError::Truncated),
             Ok(n) => got += n,
@@ -87,28 +87,36 @@ enum Endian {
 }
 
 impl Endian {
-    fn u16(self, b: &[u8], at: usize) -> u16 {
-        let a = [b[at], b[at + 1]];
-        match self {
+    fn u16(self, b: &[u8], at: usize) -> Result<u16, CaptureError> {
+        let a = field(b, at)?;
+        Ok(match self {
             Self::Little => u16::from_le_bytes(a),
             Self::Big => u16::from_be_bytes(a),
-        }
+        })
     }
-    fn u32(self, b: &[u8], at: usize) -> u32 {
-        let a = [b[at], b[at + 1], b[at + 2], b[at + 3]];
-        match self {
+    fn u32(self, b: &[u8], at: usize) -> Result<u32, CaptureError> {
+        let a = field(b, at)?;
+        Ok(match self {
             Self::Little => u32::from_le_bytes(a),
             Self::Big => u32::from_be_bytes(a),
-        }
+        })
     }
-    fn u64(self, b: &[u8], at: usize) -> u64 {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&b[at..at + 8]);
-        match self {
+    fn u64(self, b: &[u8], at: usize) -> Result<u64, CaptureError> {
+        let a = field(b, at)?;
+        Ok(match self {
             Self::Little => u64::from_le_bytes(a),
             Self::Big => u64::from_be_bytes(a),
-        }
+        })
     }
+}
+
+/// The `N` bytes of `b` at `at`; a field running past the end of its
+/// header or block is a format error.
+fn field<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], CaptureError> {
+    b.get(at..)
+        .and_then(|t| t.first_chunk::<N>())
+        .copied()
+        .ok_or_else(|| CaptureError::Format("field runs past the end of its block".into()))
 }
 
 // ---------------------------------------------------------------- classic pcap
@@ -153,14 +161,14 @@ impl<R: Read> PcapReader<R> {
         };
         let mut h = [0u8; 20];
         read_must(&mut r, &mut h)?;
-        let major = endian.u16(&h, 0);
+        let major = endian.u16(&h, 0)?;
         if major != 2 {
             return Err(CaptureError::Format(format!(
                 "unsupported pcap version {major}"
             )));
         }
-        let snaplen = endian.u32(&h, 12);
-        let linktype = LinkType(endian.u32(&h, 16) & 0xffff);
+        let snaplen = endian.u32(&h, 12)?;
+        let linktype = LinkType(endian.u32(&h, 16)? & 0xffff);
         Ok(Self {
             r,
             endian,
@@ -212,10 +220,10 @@ impl<R: Read> PacketSource for PcapReader<R> {
             return Ok(None);
         }
         let e = self.endian;
-        let sec = e.u32(&h, 0);
-        let frac = e.u32(&h, 4);
-        let incl = e.u32(&h, 8) as usize;
-        let orig = e.u32(&h, 12);
+        let sec = e.u32(&h, 0)?;
+        let frac = e.u32(&h, 4)?;
+        let incl = e.u32(&h, 8)? as usize;
+        let orig = e.u32(&h, 12)?;
         if incl > MAX_RECORD_LEN {
             return Err(CaptureError::Format(format!(
                 "record length {incl} exceeds {MAX_RECORD_LEN}"
@@ -380,8 +388,8 @@ impl<R: Read> PcapNgReader<R> {
             prefix_len = 12;
         }
         let e = self.endian;
-        let btype = e.u32(&head, 0);
-        let len = e.u32(&head, 4) as usize;
+        let btype = e.u32(&head, 0)?;
+        let len = e.u32(&head, 4)? as usize;
         let min = if btype == PCAPNG_SHB { 28 } else { 12 };
         if !len.is_multiple_of(4) || len < min || len > MAX_BLOCK_LEN {
             return Err(CaptureError::Format(format!("bad block length {len}")));
@@ -392,15 +400,19 @@ impl<R: Read> PcapNgReader<R> {
             self.block.extend_from_slice(&bom);
         }
         self.block.resize(len, 0);
-        read_must(&mut self.r, &mut self.block[prefix_len..])?;
-        if e.u32(&self.block, len - 4) as usize != len {
+        // len >= min >= prefix_len, so the tail exists.
+        read_must(
+            &mut self.r,
+            self.block.get_mut(prefix_len..).unwrap_or_default(),
+        )?;
+        if e.u32(&self.block, len - 4)? as usize != len {
             return Err(CaptureError::Format("block trailer length mismatch".into()));
         }
         Ok(Some(btype))
     }
 
     fn parse_shb(&mut self) -> Result<(), CaptureError> {
-        let major = self.endian.u16(&self.block, 12);
+        let major = self.endian.u16(&self.block, 12)?;
         if major != 1 {
             return Err(CaptureError::Format(format!(
                 "unsupported pcapng version {major}"
@@ -412,23 +424,26 @@ impl<R: Read> PcapNgReader<R> {
 
     fn parse_idb(&mut self) -> Result<(), CaptureError> {
         let e = self.endian;
-        let body = &self.block[8..self.block.len() - 4];
+        let body = self
+            .block
+            .get(8..self.block.len().saturating_sub(4))
+            .unwrap_or_default();
         if body.len() < 8 {
             return Err(CaptureError::Format(
                 "short interface description block".into(),
             ));
         }
         let mut iface = Interface {
-            linktype: LinkType(u32::from(e.u16(body, 0))),
-            snaplen: e.u32(body, 4),
+            linktype: LinkType(u32::from(e.u16(body, 0)?)),
+            snaplen: e.u32(body, 4)?,
             tsresol: 6,
             tsoffset: 0,
             ingress: self.fallback.clone(),
         };
-        let mut opts = &body[8..];
+        let mut opts = body.get(8..).unwrap_or_default();
         while opts.len() >= 4 {
-            let code = e.u16(opts, 0);
-            let olen = usize::from(e.u16(opts, 2));
+            let code = e.u16(opts, 0)?;
+            let olen = usize::from(e.u16(opts, 2)?);
             if code == 0 {
                 break; // opt_endofopt
             }
@@ -436,18 +451,20 @@ impl<R: Read> PcapNgReader<R> {
             if 4 + padded > opts.len() {
                 break; // truncated option list: keep what we have
             }
-            let val = &opts[4..4 + olen];
+            let Some(val) = opts.get(4..4 + olen) else {
+                break;
+            };
             match code {
                 2 if olen >= 1 => {
                     // if_name (UTF-8, not necessarily NUL-terminated).
                     let name = bounded_name(val);
                     iface.ingress = named_interface(&name);
                 }
-                9 if olen >= 1 => iface.tsresol = val[0],
-                14 if olen >= 8 => iface.tsoffset = e.u64(val, 0) as i64,
+                9 if olen >= 1 => iface.tsresol = val.first().copied().unwrap_or(iface.tsresol),
+                14 if olen >= 8 => iface.tsoffset = e.u64(val, 0)? as i64,
                 _ => {}
             }
-            opts = &opts[4 + padded..];
+            opts = opts.get(4 + padded..).unwrap_or_default();
         }
         if self.interfaces.len() >= MAX_INTERFACES {
             return Err(CaptureError::Format("too many interfaces".into()));
@@ -492,8 +509,8 @@ fn pcapng_ts(units: u64, tsresol: u8, tsoffset: i64) -> Result<Duration, Capture
 /// the bytes after the padded packet data). Malformed options end the scan.
 fn epb_flags(e: Endian, mut opts: &[u8]) -> Option<u32> {
     while opts.len() >= 4 {
-        let code = e.u16(opts, 0);
-        let olen = usize::from(e.u16(opts, 2));
+        let code = e.u16(opts, 0).ok()?;
+        let olen = usize::from(e.u16(opts, 2).ok()?);
         if code == 0 {
             return None; // opt_endofopt
         }
@@ -502,9 +519,9 @@ fn epb_flags(e: Endian, mut opts: &[u8]) -> Option<u32> {
             return None;
         }
         if code == 2 && olen == 4 {
-            return Some(e.u32(opts, 4));
+            return e.u32(opts, 4).ok();
         }
-        opts = &opts[4 + padded..];
+        opts = opts.get(4 + padded..).unwrap_or_default();
     }
     None
 }
@@ -534,14 +551,14 @@ impl<R: Read> PacketSource for PcapNgReader<R> {
                     }
                     let b = &self.block;
                     let id = if btype == PCAPNG_EPB {
-                        e.u32(b, 8) as usize
+                        e.u32(b, 8)? as usize
                     } else {
-                        usize::from(e.u16(b, 8))
+                        usize::from(e.u16(b, 8)?)
                     };
                     let iface = self.iface(id)?;
-                    let units = (u64::from(e.u32(b, 12)) << 32) | u64::from(e.u32(b, 16));
-                    let caplen = e.u32(b, 20) as usize;
-                    let orig = e.u32(b, 24);
+                    let units = (u64::from(e.u32(b, 12)?) << 32) | u64::from(e.u32(b, 16)?);
+                    let caplen = e.u32(b, 20)? as usize;
+                    let orig = e.u32(b, 24)?;
                     if caplen > body_end - 28 {
                         return Err(CaptureError::Format("captured length exceeds block".into()));
                     }
@@ -561,7 +578,7 @@ impl<R: Read> PacketSource for PcapNgReader<R> {
                         return Err(CaptureError::Format("short simple packet block".into()));
                     }
                     let iface = self.iface(0)?;
-                    let orig = e.u32(&self.block, 8);
+                    let orig = e.u32(&self.block, 8)?;
                     let mut caplen = (orig as usize).min(body_end - 12);
                     if iface.snaplen != 0 {
                         caplen = caplen.min(iface.snaplen as usize);
@@ -576,7 +593,10 @@ impl<R: Read> PacketSource for PcapNgReader<R> {
             return Ok(Some(Packet {
                 ts,
                 linktype: iface.linktype,
-                data: &self.block[start..start + caplen],
+                data: self
+                    .block
+                    .get(start..start + caplen)
+                    .ok_or_else(|| CaptureError::Format("captured length exceeds block".into()))?,
                 orig_len: orig,
                 ingress,
             }));

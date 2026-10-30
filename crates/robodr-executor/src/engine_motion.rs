@@ -350,7 +350,9 @@ impl Engine {
             let Some(pos) = self.state.entries.iter().position(|x| &x.id == id) else {
                 continue;
             };
-            let en = self.state.entries[pos].clone();
+            let Some(en) = self.state.entries.get(pos).cloned() else {
+                continue;
+            };
             let Effect::Motion(mut spec) = en.effect.clone() else {
                 continue;
             };

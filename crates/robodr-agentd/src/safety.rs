@@ -1273,8 +1273,10 @@ impl SafetyFeed {
             return out;
         };
         let writer = format!("conn:{conn}");
-        let outcome =
-            self.sources[idx].set(&writer, Claim::State(report.state), Level::Idle, now_ms);
+        let Some(source) = self.sources.get_mut(idx) else {
+            return out;
+        };
+        let outcome = source.set(&writer, Claim::State(report.state), Level::Idle, now_ms);
         self.stats.applied += 1;
         if outcome == SetOutcome::Overflow {
             self.overflow_finding(&mut out, idx, "", &writer);
@@ -1460,7 +1462,10 @@ impl SafetyFeed {
             };
             let writer = hex_guid(&s.address.writer);
             for idx in 0..self.spec.topics.len() {
-                let spec = self.spec.topics[idx].clone();
+                // `sources` is built from `spec.topics`, one per topic.
+                let Some(spec) = self.spec.topics.get(idx).cloned() else {
+                    continue;
+                };
                 if !info.readings.iter().any(|(t, _)| *t == spec.topic) {
                     continue;
                 }
@@ -1487,9 +1492,10 @@ impl SafetyFeed {
                     self.finding(&mut out, key, dev, &datagram.src_ip, &spec.topic, &writer);
                     continue;
                 }
-                let prev = self.sources[idx]
-                    .readings
-                    .get(&writer)
+                let prev = self
+                    .sources
+                    .get(idx)
+                    .and_then(|src| src.readings.get(&writer))
                     .map(|r| r.level)
                     .unwrap_or_default();
                 let decoded = if s.non_standard_payload {
@@ -1530,7 +1536,10 @@ impl SafetyFeed {
                         (Claim::State(SafetyState::Unknown), prev)
                     }
                 };
-                let outcome = self.sources[idx].set(&writer, claim, level, now_ms);
+                let Some(source) = self.sources.get_mut(idx) else {
+                    continue;
+                };
+                let outcome = source.set(&writer, claim, level, now_ms);
                 self.stats.applied += 1;
                 if outcome == SetOutcome::Overflow {
                     self.overflow_finding(&mut out, idx, &datagram.src_ip, &writer);

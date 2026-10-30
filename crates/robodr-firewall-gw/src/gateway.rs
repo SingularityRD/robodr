@@ -829,7 +829,12 @@ impl Gateway {
             .iter()
             .position(|c| !c.codec.is_rtps() && c.ports.contains(&port))
         {
-            match self.legacy(ci, &mut pkt[ip.payload()], ip.src, meta) {
+            // `parse_ipv4_udp` bounds the payload range by the packet.
+            let Some(payload) = pkt.get_mut(ip.payload()) else {
+                self.stats.dropped_ip += 1;
+                return Verdict::Drop;
+            };
+            match self.legacy(ci, payload, ip.src, meta) {
                 Outcome::Pass => false,
                 Outcome::Rewritten => true,
                 Outcome::Suppress => return Verdict::Drop,
@@ -839,7 +844,11 @@ impl Gateway {
             .iter()
             .any(|(lo, hi)| (*lo..=*hi).contains(&port))
         {
-            match self.rtps(&mut pkt[ip.payload()], ip.src, meta) {
+            let Some(payload) = pkt.get_mut(ip.payload()) else {
+                self.stats.dropped_ip += 1;
+                return Verdict::Drop;
+            };
+            match self.rtps(payload, ip.src, meta) {
                 Ok(m) => m,
                 Err(()) => {
                     self.stats.rtps_malformed += 1;
@@ -1254,7 +1263,13 @@ impl Gateway {
             if late {
                 self.stats.late += 1;
             }
-            let o = self.decide_noting(ci, &mut d[range], source, meta.now_ns, late, !guarded);
+            // The parser's ranges lie inside `d`; one that does not is
+            // suppressed (fail closed).
+            let Some(slot) = d.get_mut(range) else {
+                self.stats.suppressed += 1;
+                return Outcome::Suppress;
+            };
+            let o = self.decide_noting(ci, slot, source, meta.now_ns, late, !guarded);
             self.count(o);
             return o;
         }
@@ -1306,9 +1321,9 @@ impl Gateway {
             self.stats.replays += 1;
             let cached = w.lookup(s.sn).and_then(|e| e.bytes.clone());
             return match cached {
-                Some(b) if b.len() == range.len() => {
+                Some(b) if b.len() == range.len() && d.get(range.clone()).is_some() => {
                     self.stats.replays_reemitted += 1;
-                    let slot = &mut d[range];
+                    let slot = d.get_mut(range).unwrap_or_default();
                     if slot == b.as_slice() {
                         Outcome::Pass
                     } else {
@@ -1347,7 +1362,11 @@ impl Gateway {
         if late {
             self.stats.late += 1;
         }
-        let outcome = self.decide_noting(ci, &mut d[range.clone()], source, now, late, true);
+        let Some(slot) = d.get_mut(range.clone()) else {
+            self.stats.suppressed += 1;
+            return Outcome::Suppress;
+        };
+        let outcome = self.decide_noting(ci, slot, source, now, late, true);
         self.count(outcome);
         // 5. Only what was forwarded advances the stream (and binds it);
         //    a suppression is remembered (a retransmission is suppressed

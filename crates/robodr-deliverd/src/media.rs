@@ -332,7 +332,7 @@ pub fn pack_digest(pack: &Path, max_total: u64) -> Option<String> {
                 match f.read(&mut buf) {
                     Ok(0) => break,
                     Ok(k) => {
-                        fh.update(&buf[..k]);
+                        fh.update(buf.get(..k).unwrap_or_default());
                         n += k as u64;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}

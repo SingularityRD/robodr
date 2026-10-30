@@ -392,7 +392,7 @@ pub fn run_udp(sock: std::net::UdpSocket, stop: Arc<AtomicBool>, feed: Feed) {
     while !stop.load(Ordering::Relaxed) {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
-                let d = Datagram::new(buf[..n].to_vec(), from.ip().to_string());
+                let d = Datagram::new(buf.get(..n).unwrap_or(&buf).to_vec(), from.ip().to_string());
                 if !feed.send(Payload::Datagram(d)) {
                     break;
                 }

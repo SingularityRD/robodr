@@ -305,7 +305,8 @@ fn is_ros2_node(s: &str) -> bool {
             r.split('/').all(|seg| {
                 let b = seg.as_bytes();
                 !b.is_empty()
-                    && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+                    && b.first()
+                        .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_')
                     && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
             })
         })
@@ -315,7 +316,8 @@ fn is_unprivileged_user(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= 32
-        && (b[0].is_ascii_lowercase() || b[0] == b'_')
+        && b.first()
+            .is_some_and(|&c| c.is_ascii_lowercase() || c == b'_')
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
         && s != "root"
@@ -334,7 +336,7 @@ impl HealthCheck {
             } => {
                 !argv.is_empty()
                     && argv.len() <= MAX_PROBE_ARGS
-                    && is_abs_path(&argv[0])
+                    && argv.first().is_some_and(|a| is_abs_path(a))
                     && argv.iter().all(|a| {
                         a.len() <= MAX_PROBE_ARG_LEN
                             && a.bytes().all(|c| c.is_ascii_graphic() || c == b' ')
@@ -581,14 +583,16 @@ impl Manifest {
                         f.path
                     )));
                 }
-                if exclusive && used[ci as usize] {
+                if exclusive && used.get(ci as usize) == Some(&true) {
                     return Err(invalid(format!(
                         "RPK manifest: {}: a chunk of a sealed RPK used twice",
                         f.path
                     )));
                 }
                 sum += piece;
-                used[ci as usize] = true;
+                if let Some(u) = used.get_mut(ci as usize) {
+                    *u = true;
+                }
             }
             if sum != f.size {
                 return Err(invalid(format!(
@@ -656,7 +660,7 @@ impl Manifest {
             }
         }
         let payload: Vec<&ContentFile> = self.payload_files().collect();
-        let one_with = |suffix: &str| payload.len() == 1 && payload[0].path.ends_with(suffix);
+        let one_with = |suffix: &str| matches!(payload.as_slice(), [p] if p.path.ends_with(suffix));
         let ok = match self.kind {
             Kind::Deb => one_with(".deb"),
             Kind::OciImage => one_with(".tar"),

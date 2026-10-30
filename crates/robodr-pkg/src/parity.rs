@@ -106,10 +106,13 @@ pub fn layout(
             "parity: more than {MAX_GROUPS} groups; raise data_shards"
         )));
     }
-    Ok((0..groups)
-        .map(|g| {
-            let r = g * k..((g + 1) * k).min(sizes.len());
-            let max = sizes[r.clone()].iter().copied().max().unwrap_or(0);
+    // k >= 1 (check_params), so `chunks` cannot panic.
+    Ok(sizes
+        .chunks(k)
+        .enumerate()
+        .map(|(g, group)| {
+            let r = g * k..g * k + group.len();
+            let max = group.iter().copied().max().unwrap_or(0);
             (r, parity_len(max, shard_size))
         })
         .collect())
@@ -130,17 +133,20 @@ pub fn plan(b: &BundleManifest) -> Result<Vec<Group>, Refusal> {
     }
     let (k, m) = (p.data_shards as usize, p.parity_shards as usize);
     let mut data = Vec::new();
+    let mut sizes: Vec<u64> = Vec::new();
     let mut parity = std::collections::BTreeMap::new();
     for (i, f) in b.files.iter().enumerate() {
         match crate::bundle::classify(&f.path) {
             Some(PathKind::Parity { group, index }) => {
-                parity.insert((group as usize, index as usize), i);
+                parity.insert((group as usize, index as usize), (i, f));
             }
-            Some(_) => data.push(i),
+            Some(_) => {
+                data.push(i);
+                sizes.push(f.size);
+            }
             None => return Err(invalid("parity: unclassifiable path")),
         }
     }
-    let sizes: Vec<u64> = data.iter().map(|&i| b.files[i].size).collect();
     let lay = layout(&sizes, k, m, p.shard_size)?;
     if lay.len() != p.groups as usize {
         return Err(invalid(format!(
@@ -153,19 +159,20 @@ pub fn plan(b: &BundleManifest) -> Result<Vec<Group>, Refusal> {
     for (g, (r, len)) in lay.into_iter().enumerate() {
         let mut pf = Vec::with_capacity(m);
         for j in 1..=m {
-            let i = parity.remove(&(g + 1, j)).ok_or_else(|| {
+            let (i, f) = parity.remove(&(g + 1, j)).ok_or_else(|| {
                 invalid(format!("parity: {} is not listed", parity_path(g + 1, j)))
             })?;
-            if b.files[i].size != len {
-                return Err(invalid(format!(
-                    "parity: {} must be {len} bytes",
-                    b.files[i].path
-                )));
+            if f.size != len {
+                return Err(invalid(format!("parity: {} must be {len} bytes", f.path)));
             }
             pf.push(i);
         }
+        // `layout` ranges cover `0..sizes.len()` == `0..data.len()`.
+        let group_data = data
+            .get(r)
+            .ok_or_else(|| invalid("parity: group out of range"))?;
         out.push(Group {
-            data: data[r].to_vec(),
+            data: group_data.to_vec(),
             parity: pf,
             len,
         });
@@ -244,8 +251,8 @@ pub fn rebuild_group(
     while off < len {
         let n = usize::try_from((len - off).min(shard_size)).map_err(|_| invalid("block size"))?;
         let mut known = vec![vec![0u8; n]; dec.known().len()];
-        for (q, &pos) in dec.known().iter().enumerate() {
-            read(pos, off, &mut known[q])?;
+        for (buf, &pos) in known.iter_mut().zip(dec.known()) {
+            read(pos, off, buf)?;
         }
         let mut out = vec![vec![0u8; n]; erased.len()];
         {
@@ -253,8 +260,8 @@ pub fn rebuild_group(
             let mut orefs: Vec<&mut [u8]> = out.iter_mut().map(Vec::as_mut_slice).collect();
             dec.reconstruct(&krefs, &mut orefs).map_err(fec)?;
         }
-        for (e, &pos) in dec.erased().iter().enumerate() {
-            write(pos, off, &out[e])?;
+        for (buf, &pos) in out.iter().zip(dec.erased()) {
+            write(pos, off, buf)?;
         }
         off += n as u64;
     }

@@ -321,7 +321,9 @@ impl Pending {
     }
 
     fn has(&self, n: usize) -> bool {
-        self.received[n / 64] & (1 << (n % 64)) != 0
+        self.received
+            .get(n / 64)
+            .is_some_and(|w| w & (1 << (n % 64)) != 0)
     }
 }
 
@@ -476,7 +478,9 @@ impl FragmentReassembler {
         events: &mut Vec<FragmentEvent>,
     ) -> FragOutcome {
         self.late_copies += 1;
-        let d = &self.done[i];
+        let Some(d) = self.done.get(i) else {
+            return FragOutcome::LateCopy;
+        };
         let same_shape = d.sample_size == f.sample_size
             && d.frag_size == f.frag_size
             && d.key_only == f.key_only;
@@ -576,7 +580,7 @@ impl FragmentReassembler {
         self.pending
             .iter()
             .enumerate()
-            .filter(|(_, p)| per_source[&self.quota_key(&p.key)] == most)
+            .filter(|(_, p)| per_source.get(&self.quota_key(&p.key)) == Some(&most))
             .min_by_key(|(_, p)| (p.got_bytes, std::cmp::Reverse(p.created)))
             .map(|(i, _)| (i, EvictionReason::Pressure))
     }
@@ -587,16 +591,15 @@ impl FragmentReassembler {
         //    pays with its own least recently progressed sample.
         let mine = self.quota_key(key);
         loop {
-            let own: Vec<usize> = (0..self.pending.len())
-                .filter(|&i| self.quota_key(&self.pending[i].key) == mine)
-                .collect();
-            if own.len() < self.limits.max_pending_per_source {
+            let own = self
+                .pending
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| self.quota_key(&p.key) == mine);
+            if own.clone().count() < self.limits.max_pending_per_source {
                 break;
             }
-            let Some(&i) = own.iter().min_by_key(|&&i| {
-                let p = &self.pending[i];
-                (p.last_progress, p.created)
-            }) else {
+            let Some((i, _)) = own.min_by_key(|(_, p)| (p.last_progress, p.created)) else {
                 break;
             };
             self.evict(i, EvictionReason::SourceQuota, events);
@@ -646,12 +649,13 @@ impl FragmentReassembler {
         }
         let idx = match pending_at {
             Some(i) => {
-                let p = &self.pending[i];
-                if p.sample_size != f.sample_size || p.frag_size != f.frag_size {
-                    return self.reject(&f, RejectReason::GeometryMismatch, p.nfrags, events);
-                }
-                if p.key_only != f.key_only {
-                    return self.reject(&f, RejectReason::KeyFlagMismatch, p.nfrags, events);
+                if let Some(p) = self.pending.get(i) {
+                    if p.sample_size != f.sample_size || p.frag_size != f.frag_size {
+                        return self.reject(&f, RejectReason::GeometryMismatch, p.nfrags, events);
+                    }
+                    if p.key_only != f.key_only {
+                        return self.reject(&f, RejectReason::KeyFlagMismatch, p.nfrags, events);
+                    }
                 }
                 i
             }
@@ -698,19 +702,32 @@ impl FragmentReassembler {
         // First copy wins: fill only fragments not received yet, and note a
         // conflict if an already-received one differs.
         let clock = self.clock;
-        let p = &mut self.pending[idx];
+        let Some(p) = self.pending.get_mut(idx) else {
+            return FragOutcome::Pending;
+        };
         let mut conflict = false;
         let mut progressed = false;
         let delivers_head = first == 0 && !p.has(0);
         for n in first..last {
             let lo = n * frag_size - offset;
             let hi = ((n + 1) * frag_size).min(sample_size) - offset;
-            if p.has(n) {
-                conflict |= data[lo..hi] != p.buf[offset + lo..offset + hi];
+            let have = p.has(n);
+            // lo..hi lies within `data` (want bytes from `offset`), and
+            // offset + hi <= sample_size == p.buf.len(); a miss is skipped.
+            let (Some(src), Some(dst)) =
+                (data.get(lo..hi), p.buf.get_mut(offset + lo..offset + hi))
+            else {
+                continue;
+            };
+            if have {
+                conflict |= src != &*dst;
                 continue;
             }
-            p.buf[offset + lo..offset + hi].copy_from_slice(&data[lo..hi]);
-            p.received[n / 64] |= 1 << (n % 64);
+            let Some(word) = p.received.get_mut(n / 64) else {
+                continue;
+            };
+            dst.copy_from_slice(src);
+            *word |= 1 << (n % 64);
             p.got += 1;
             p.got_bytes += hi - lo;
             progressed = true;
@@ -753,20 +770,15 @@ impl FragmentReassembler {
         if delivers_head {
             p.head_inline = Some(f.inline);
         }
-        if conflict {
+        let overlap = conflict.then(|| Self::event_for(p, FragmentEventKind::ConflictingOverlap));
+        let qos = qos_conflicts
+            .into_iter()
+            .map(|pid| Self::event_for(p, FragmentEventKind::ConflictingInlineQos(pid)));
+        for ev in overlap.into_iter().chain(qos) {
             self.conflicts += 1;
-            let ev = Self::event_for(&self.pending[idx], FragmentEventKind::ConflictingOverlap);
             events.push(ev);
         }
-        for pid in qos_conflicts {
-            self.conflicts += 1;
-            let ev = Self::event_for(
-                &self.pending[idx],
-                FragmentEventKind::ConflictingInlineQos(pid),
-            );
-            events.push(ev);
-        }
-        if self.pending[idx].got == self.pending[idx].nfrags {
+        if p.got == p.nfrags {
             let p = self.remove(idx);
             self.completed += 1;
             let inline = match p.head_inline {

@@ -232,7 +232,14 @@ impl TlsSection {
             .iter()
             .map(|p| parse_pin(p))
             .collect::<Result<Vec<_>, _>>()?;
-        let server_spki = spki_sha256(&chain[0]).map_err(|e| {
+        // `certs` refuses an empty file, so the leaf is there.
+        let leaf = chain.first().ok_or_else(|| {
+            format!(
+                "control_plane.tls.cert_chain {}: no certificate",
+                self.cert_chain.display()
+            )
+        })?;
+        let server_spki = spki_sha256(leaf).map_err(|e| {
             format!(
                 "control_plane.tls.cert_chain {}: {e}",
                 self.cert_chain.display()

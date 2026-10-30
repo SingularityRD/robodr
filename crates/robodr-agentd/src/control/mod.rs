@@ -1209,8 +1209,8 @@ pub fn pct_decode(seg: &str) -> Option<String> {
     let b = seg.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
+    while let Some(&c) = b.get(i) {
+        if c == b'%' {
             let hex = b.get(i + 1..i + 3)?;
             // Two hex digits: from_str_radix alone would take a sign ("+1").
             if !hex.iter().all(u8::is_ascii_hexdigit) {
@@ -1220,7 +1220,7 @@ pub fn pct_decode(seg: &str) -> Option<String> {
             out.push(u8::from_str_radix(h, 16).ok()?);
             i += 3;
         } else {
-            out.push(b[i]);
+            out.push(c);
             i += 1;
         }
     }
@@ -1615,14 +1615,15 @@ fn evidence_call(
                 Ok(ix) => evidence::inventory(&ix, &sh.robot_id),
                 Err(e) => return Reply::error(&e),
             };
-            inv["exports"] = json!(lock().list());
-            inv["limits"] = json!({
+            api::json_set(&mut inv, "exports", json!(lock().list()));
+            let limits = json!({
                 "max_export_bytes": svc.spec.max_export_bytes,
                 "chunk_bytes": svc.spec.chunk_bytes,
                 "max_exports": svc.spec.max_exports,
                 "max_storage_bytes": svc.spec.max_storage_bytes,
                 "export_ttl_s": svc.spec.export_ttl_s,
             });
+            api::json_set(&mut inv, "limits", limits);
             Reply::json(200, &inv)
         }
         Route::EvidenceManifest(id) => match lock().exports.get(id) {
@@ -1799,7 +1800,7 @@ fn evidence_call(
             });
             let key_id = meta.key_id.clone();
             let evidence_ref = match dispatch(sh, Call::EvidenceNote(Box::new(note)), meta) {
-                Ok(a) if a.status == 200 => match a.body["evidence"].as_str() {
+                Ok(a) if a.status == 200 => match a.body.get("evidence").and_then(Value::as_str) {
                     Some(e) => e.to_string(),
                     None => return Reply::json(503, &api::error_body("evidence_unavailable", "")),
                 },

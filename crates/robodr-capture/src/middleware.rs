@@ -91,18 +91,18 @@ pub fn classify_udp(u: &UdpDatagram<'_>) -> Option<ForeignMiddleware> {
 /// without extension headers; IPv4 non-first fragments never match.
 pub fn classify_tcp_frame(link: LinkType, frame: &[u8]) -> Option<(IpAddr, ForeignMiddleware)> {
     let ip = link_ip(link, frame)?;
-    let (src, l4) = match ip.first()? >> 4 {
+    let &first = ip.first()?;
+    let (src, l4) = match first >> 4 {
         4 => {
-            let ihl = usize::from(ip[0] & 0x0f) * 4;
+            let ihl = usize::from(first & 0x0f) * 4;
             let frag = u16::from_be_bytes([*ip.get(6)?, *ip.get(7)?]);
             if ihl < 20 || *ip.get(9)? != IPPROTO_TCP || frag & 0x1fff != 0 {
                 return None;
             }
-            let s = ip.get(12..16)?;
-            (
-                IpAddr::V4(Ipv4Addr::new(s[0], s[1], s[2], s[3])),
-                ip.get(ihl..)?,
-            )
+            let &[a, b, c, d] = ip.get(12..16)? else {
+                return None;
+            };
+            (IpAddr::V4(Ipv4Addr::new(a, b, c, d)), ip.get(ihl..)?)
         }
         6 => {
             if *ip.get(6)? != IPPROTO_TCP {

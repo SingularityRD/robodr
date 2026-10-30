@@ -9,11 +9,13 @@
 #![forbid(unsafe_code)]
 // S10 (R9): release builds use `panic = "abort"`, so any panic kills the
 // daemon (systemd restarts it; docs/OPERATIONS.md, "Crashes and restarts").
-// Non-test code has no unwrap / expect / panic!-family call; slice indexing
-// and arithmetic are left to review and fuzzing (fuzz/README.md).
+// Non-test code has no unwrap / expect / panic!-family call and no
+// unchecked indexing (a proven bound carries a local allow and a `// bound:`
+// note); arithmetic is left to review and fuzzing (fuzz/README.md).
 #![cfg_attr(
     not(test),
     deny(
+        clippy::indexing_slicing,
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,

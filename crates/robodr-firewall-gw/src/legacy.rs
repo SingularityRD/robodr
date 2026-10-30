@@ -204,7 +204,7 @@ pub fn write_low(
         return Err(RewriteError::Length);
     }
     let mut written = [(0u8, [0f32; 5]); LEGACY_MOTORS];
-    for (i, o) in out.motors().iter().enumerate() {
+    for (i, (o, written)) in out.motors().iter().zip(written.iter_mut()).enumerate() {
         let (in_mode, input) = low_motor(frame, i).ok_or(RewriteError::Length)?;
         let want = [o.q, o.dq, o.tau, o.kp, o.kd];
         let mut v = [0f32; 5];
@@ -213,23 +213,20 @@ pub fn write_low(
                 if MotorMode::from_u8(in_mode) != o.mode {
                     return Err(RewriteError::Value);
                 }
-                for k in 0..5 {
-                    v[k] = round::away_from(want[k], f64::from(input[k]))
-                        .ok_or(RewriteError::Value)?;
+                for (v, (&want, &input)) in v.iter_mut().zip(want.iter().zip(&input)) {
+                    *v = round::away_from(want, f64::from(input)).ok_or(RewriteError::Value)?;
                 }
                 in_mode
             }
             LowSource::Substitute { held } => {
                 let h = held.and_then(|(f, w)| Some((*f.motor(i)?, low_motor(w, i)?)));
-                for k in 0..5 {
-                    v[k] = match h {
-                        Some((fm, (_, wv)))
-                            if [fm.q, fm.dq, fm.tau, fm.kp, fm.kd][k].to_bits()
-                                == want[k].to_bits() =>
-                        {
-                            wv[k]
-                        }
-                        _ => round::toward_zero(want[k]).ok_or(RewriteError::Value)?,
+                // (held firewall value, held wire value) per field.
+                let held_v = h.map(|(fm, (_, wv))| ([fm.q, fm.dq, fm.tau, fm.kp, fm.kd], wv));
+                for (k, (v, &want)) in v.iter_mut().zip(&want).enumerate() {
+                    let kept = held_v.and_then(|(hf, wv)| Some((*hf.get(k)?, *wv.get(k)?)));
+                    *v = match kept {
+                        Some((hf, wv)) if hf.to_bits() == want.to_bits() => wv,
+                        _ => round::toward_zero(want).ok_or(RewriteError::Value)?,
                     };
                 }
                 match o.mode {
@@ -243,7 +240,7 @@ pub fn write_low(
             }
         };
         put_low_motor(frame, i, mode, v).ok_or(RewriteError::Length)?;
-        written[i] = (mode, v);
+        *written = (mode, v);
     }
     seal(frame).ok_or(RewriteError::Length)?;
     if !crc_ok(frame) || LegacyLowCmd::decode(frame).is_err() {
@@ -263,9 +260,9 @@ pub fn write_low(
 /// forwarded yet.
 pub fn low_template() -> Vec<u8> {
     let mut f = vec![0u8; LEGACY_LOW_CMD_LEN];
-    f[0] = 0xFE;
-    f[1] = 0xEF;
-    f[2] = 0xFF;
+    if let Some(head) = f.first_chunk_mut() {
+        *head = [0xFE, 0xEF, 0xFF];
+    }
     let _ = seal(&mut f);
     f
 }
@@ -353,7 +350,7 @@ pub fn write_low_compressed(
         return Err(RewriteError::Length);
     }
     let mut written = [(0u8, [0f32; 2], [0i16; 3]); LEGACY_MOTORS];
-    for (i, o) in out.motors().iter().enumerate() {
+    for (i, (o, written)) in out.motors().iter().zip(written.iter_mut()).enumerate() {
         let (in_mode, in_f, in_x) = lowc_motor(frame, i).ok_or(RewriteError::Length)?;
         let want_f = [o.q, o.dq];
         let want_x = [o.tau, o.kp, o.kd];
@@ -364,38 +361,34 @@ pub fn write_low_compressed(
                 if MotorMode::from_u8(in_mode) != o.mode {
                     return Err(RewriteError::Value);
                 }
-                for k in 0..2 {
-                    f[k] = round::away_from(want_f[k], f64::from(in_f[k]))
-                        .ok_or(RewriteError::Value)?;
+                for (f, (&want, &input)) in f.iter_mut().zip(want_f.iter().zip(&in_f)) {
+                    *f = round::away_from(want, f64::from(input)).ok_or(RewriteError::Value)?;
                 }
-                for k in 0..3 {
-                    x[k] =
-                        round::fixed_away_from(want_x[k], fixed_value(in_x[k], k), LOWC_SCALES[k])
-                            .ok_or(RewriteError::Value)?;
+                let fixed = want_x.iter().zip(&in_x).zip(&LOWC_SCALES);
+                for (k, (x, ((&want, &input), &scale))) in x.iter_mut().zip(fixed).enumerate() {
+                    *x = round::fixed_away_from(want, fixed_value(input, k), scale)
+                        .ok_or(RewriteError::Value)?;
                 }
                 in_mode
             }
             LowSource::Substitute { held } => {
                 let h = held.and_then(|(fr, w)| Some((*fr.motor(i)?, lowc_motor(w, i)?)));
-                for k in 0..2 {
-                    f[k] = match h {
-                        Some((fm, (_, wf, _)))
-                            if [fm.q, fm.dq][k].to_bits() == want_f[k].to_bits() =>
-                        {
-                            wf[k]
-                        }
-                        _ => round::toward_zero(want_f[k]).ok_or(RewriteError::Value)?,
+                // (held firewall values, held wire values) per field.
+                let held_f = h.map(|(fm, (_, wf, _))| ([fm.q, fm.dq], wf));
+                let held_x = h.map(|(fm, (_, _, wx))| ([fm.tau, fm.kp, fm.kd], wx));
+                for (k, (f, &want)) in f.iter_mut().zip(&want_f).enumerate() {
+                    let kept = held_f.and_then(|(hf, wf)| Some((*hf.get(k)?, *wf.get(k)?)));
+                    *f = match kept {
+                        Some((hf, wf)) if hf.to_bits() == want.to_bits() => wf,
+                        _ => round::toward_zero(want).ok_or(RewriteError::Value)?,
                     };
                 }
-                for k in 0..3 {
-                    x[k] = match h {
-                        Some((fm, (_, _, wx)))
-                            if [fm.tau, fm.kp, fm.kd][k].to_bits() == want_x[k].to_bits() =>
-                        {
-                            wx[k]
-                        }
-                        _ => round::fixed_toward_zero(want_x[k], LOWC_SCALES[k])
-                            .ok_or(RewriteError::Value)?,
+                let fixed = want_x.iter().zip(&LOWC_SCALES);
+                for (k, (x, (&want, &scale))) in x.iter_mut().zip(fixed).enumerate() {
+                    let kept = held_x.and_then(|(hx, wx)| Some((*hx.get(k)?, *wx.get(k)?)));
+                    *x = match kept {
+                        Some((hx, wx)) if hx.to_bits() == want.to_bits() => wx,
+                        _ => round::fixed_toward_zero(want, scale).ok_or(RewriteError::Value)?,
                     };
                 }
                 match o.mode {
@@ -409,7 +402,7 @@ pub fn write_low_compressed(
             }
         };
         put_lowc_motor(frame, i, (mode, f, x)).ok_or(RewriteError::Length)?;
-        written[i] = (mode, f, x);
+        *written = (mode, f, x);
     }
     seal(frame).ok_or(RewriteError::Length)?;
     if !crc_ok(frame) || decode_low_compressed(frame).is_none() {
@@ -429,9 +422,9 @@ pub fn write_low_compressed(
 /// frame was forwarded yet.
 pub fn lowc_template() -> Vec<u8> {
     let mut f = vec![0u8; LEGACY_LOW_CMD_COMPRESSED_LEN];
-    f[0] = 0xFE;
-    f[1] = 0xEF;
-    f[2] = 0xFF;
+    if let Some(head) = f.first_chunk_mut() {
+        *head = [0xFE, 0xEF, 0xFF];
+    }
     let _ = seal(&mut f);
     f
 }
@@ -442,9 +435,14 @@ pub fn lowc_template() -> Vec<u8> {
 pub fn build_low_compressed(motors: &[(u8, [f32; 5])]) -> Vec<u8> {
     let mut f = lowc_template();
     for (i, (m, v)) in motors.iter().enumerate().take(LEGACY_MOTORS) {
-        let fx =
-            |k: usize| round::fixed_toward_zero(f64::from(v[k + 2]), LOWC_SCALES[k]).unwrap_or(0);
-        let _ = put_lowc_motor(&mut f, i, (*m, [v[0], v[1]], [fx(0), fx(1), fx(2)]));
+        let fx = |x: f32, scale: f64| round::fixed_toward_zero(f64::from(x), scale).unwrap_or(0);
+        let [q, dq, tau, kp, kd] = *v;
+        let [s0, s1, s2] = LOWC_SCALES;
+        let _ = put_lowc_motor(
+            &mut f,
+            i,
+            (*m, [q, dq], [fx(tau, s0), fx(kp, s1), fx(kd, s2)]),
+        );
     }
     let _ = seal(&mut f);
     f
@@ -453,10 +451,12 @@ pub fn build_low_compressed(motors: &[(u8, [f32; 5])]) -> Vec<u8> {
 /// Test / harness helper: a sealed `HighCmd`.
 pub fn build_high(mode: u8, vx: f32, vy: f32, yaw: f32) -> Vec<u8> {
     let mut f = vec![0u8; LEGACY_HIGH_CMD_LEN];
-    f[0] = 0xFE;
-    f[1] = 0xEF;
-    f[2] = 0xEE;
-    f[HIGH_MODE_AT] = mode;
+    if let Some(head) = f.first_chunk_mut() {
+        *head = [0xFE, 0xEF, 0xEE];
+    }
+    if let Some(m) = f.get_mut(HIGH_MODE_AT) {
+        *m = mode;
+    }
     let _ = put_f32(&mut f, HIGH_VX_AT, vx);
     let _ = put_f32(&mut f, HIGH_VY_AT, vy);
     let _ = put_f32(&mut f, HIGH_YAW_AT, yaw);

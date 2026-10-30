@@ -40,7 +40,9 @@ fn sum16(initial: u64, data: &[u8]) -> u64 {
     let mut sum = initial;
     let mut chunks = data.chunks_exact(2);
     for c in &mut chunks {
-        sum += u64::from(u16::from_be_bytes([c[0], c[1]]));
+        if let &[hi, lo] = c {
+            sum += u64::from(u16::from_be_bytes([hi, lo]));
+        }
     }
     if let [last] = chunks.remainder() {
         sum += u64::from(*last) << 8;
@@ -99,14 +101,20 @@ fn pseudo_sum(src: IpAddr, dst: IpAddr, len: usize) -> u64 {
     }
 }
 
+/// The checksum field (bytes 6..8) of a UDP header; `None` if `segment` is
+/// shorter than a UDP header.
+fn stored_checksum(segment: &[u8]) -> Option<u16> {
+    let (header, _) = segment.split_first_chunk::<8>()?;
+    Some(u16::from_be_bytes([header[6], header[7]]))
+}
+
 /// The UDP checksum for `segment` (UDP header + payload, exactly UDP-length
 /// bytes) between `src` and `dst`, computed as if the checksum field were
 /// zero. A computed 0 is returned as 0xffff (RFC 768: 0 means "none").
 pub fn udp_checksum(src: IpAddr, dst: IpAddr, segment: &[u8]) -> u16 {
     let mut sum = pseudo_sum(src, dst, segment.len()) + sum16(0, segment);
-    if segment.len() >= 8 {
+    if let Some(stored) = stored_checksum(segment) {
         // Remove the stored checksum field from the sum.
-        let stored = u16::from_be_bytes([segment[6], segment[7]]);
         sum += u64::from(!stored); // x + ~x == 0xffff == -0 in ones' complement
     }
     match !fold(sum) {
@@ -133,10 +141,9 @@ pub enum UdpChecksumStatus {
 /// Classify the UDP checksum of `segment` (UDP header + payload, exactly
 /// UDP-length bytes). Segments shorter than a UDP header are [`Bad`](UdpChecksumStatus::Bad).
 pub fn udp_checksum_status(src: IpAddr, dst: IpAddr, segment: &[u8]) -> UdpChecksumStatus {
-    if segment.len() < 8 {
+    let Some(stored) = stored_checksum(segment) else {
         return UdpChecksumStatus::Bad;
-    }
-    let stored = u16::from_be_bytes([segment[6], segment[7]]);
+    };
     if stored == 0 {
         return if src.is_ipv4() && dst.is_ipv4() {
             UdpChecksumStatus::NotComputed

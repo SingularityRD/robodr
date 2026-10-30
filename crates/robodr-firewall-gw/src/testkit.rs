@@ -617,7 +617,10 @@ pub fn hg_lowstate_payload(q: &[f32]) -> Vec<u8> {
         },
         Err(e) => panic!("fixture lowstate does not decode: {e:?}"),
     };
-    p[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+    match p.get_mut(crc_at..crc_at + 4) {
+        Some(field) => field.copy_from_slice(&crc.to_le_bytes()),
+        None => panic!("fixture lowstate shorter than its crc offset"),
+    }
     p
 }
 

@@ -106,17 +106,18 @@ pub fn judge(status: &[u8], now_mono_ms: u64, boot_id: &str) -> Observed {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(status) else {
         return Observed::unknown("agentd status is not JSON");
     };
-    if v["kind"].as_str() != Some("robodr.agentd_status") {
+    let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+    let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    if s("kind") != Some("robodr.agentd_status") {
         return Observed::unknown("not an agentd status");
     }
-    if v["running"].as_bool() != Some(true) {
+    if v.get("running").and_then(serde_json::Value::as_bool) != Some(true) {
         return Observed::unknown("agentd is not running");
     }
-    if boot_id.is_empty() || v["boot_id"].as_str() != Some(boot_id) {
+    if boot_id.is_empty() || s("boot_id") != Some(boot_id) {
         return Observed::unknown("agentd status is from another boot");
     }
-    let (Some(at), Some(stale)) = (v["updated_mono_ms"].as_u64(), v["stale_after_ms"].as_u64())
-    else {
+    let (Some(at), Some(stale)) = (n("updated_mono_ms"), n("stale_after_ms")) else {
         return Observed::unknown("agentd status has no freshness fields");
     };
     if at > now_mono_ms || now_mono_ms - at > stale.min(MAX_STALE_MS) {
@@ -127,13 +128,14 @@ pub fn judge(status: &[u8], now_mono_ms: u64, boot_id: &str) -> Observed {
             "agentd has no live safety feed (a configured static state is not a reading)",
         );
     }
-    let Ok(state) = serde_json::from_value::<SafetyState>(v["safety_state"].clone()) else {
+    let raw_state = v.get("safety_state").cloned().unwrap_or_default();
+    let Ok(state) = serde_json::from_value::<SafetyState>(raw_state) else {
         return Observed::unknown("agentd status has no valid safety_state");
     };
     Observed {
         state,
         why: None,
-        agentd_health: v["state"].as_str().map(str::to_string),
+        agentd_health: s("state").map(str::to_string),
     }
 }
 

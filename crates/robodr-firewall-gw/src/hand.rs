@@ -170,8 +170,8 @@ pub fn plausible(slot: &[u8], codec: Codec, slots: usize) -> bool {
         return false;
     };
     let Some(rep) = slot
-        .get(..2)
-        .and_then(|h| robodr_cdr::Representation::from_id(u16::from_be_bytes([h[0], h[1]])))
+        .first_chunk::<2>()
+        .and_then(|h| robodr_cdr::Representation::from_id(u16::from_be_bytes(*h)))
     else {
         return false;
     };

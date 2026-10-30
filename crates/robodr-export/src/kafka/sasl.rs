@@ -90,10 +90,11 @@ impl Mechanism {
         let mut k0 = vec![0u8; b];
         if key.len() > b {
             let mut h = self.hash(&[key]);
-            k0[..h.len()].copy_from_slice(&h);
+            // A digest is shorter than the block.
+            k0.iter_mut().zip(&h).for_each(|(d, s)| *d = *s);
             h.zeroize();
         } else {
-            k0[..key.len()].copy_from_slice(key);
+            k0.iter_mut().zip(key).for_each(|(d, s)| *d = *s);
         }
         let mut pad: Vec<u8> = k0.iter().map(|k| k ^ 0x36).collect();
         let mut ih = self.hash(&[&pad, msg]);
@@ -180,12 +181,17 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 pub fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
+        let n = (u32::from(c.first().copied().unwrap_or(0)) << 16)
             | (u32::from(c.get(1).copied().unwrap_or(0)) << 8)
             | u32::from(c.get(2).copied().unwrap_or(0));
         for (i, shift) in [18u32, 12, 6, 0].iter().enumerate() {
             if i <= c.len() {
-                out.push(char::from(B64[((n >> shift) & 63) as usize]));
+                // Masked to 0..64: always a B64 entry.
+                let d = B64
+                    .get(((n >> shift) & 63) as usize)
+                    .copied()
+                    .unwrap_or(b'=');
+                out.push(char::from(d));
             } else {
                 out.push('=');
             }
@@ -213,7 +219,7 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
             n = (n << 6) | v;
         }
         let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&bytes[..3 - pad]);
+        out.extend_from_slice(bytes.get(..3 - pad).unwrap_or_default());
     }
     Some(out)
 }

@@ -215,22 +215,21 @@ impl LinkIngress {
 /// SLL2 (276): `protocol(2) reserved(2) ifindex(4) hatype(2) pkttype(1)
 /// halen(1) addr(8)`; all big-endian (libpcap `sll.h`).
 pub fn link_ingress(link: LinkType, frame: &[u8]) -> Option<LinkIngress> {
-    let be16 = |at: usize| {
-        frame
-            .get(at..at + 2)
-            .map(|s| u16::from_be_bytes([s[0], s[1]]))
-    };
+    let be16 = |at: usize| Some(u16::from_be_bytes(*frame.get(at..)?.first_chunk()?));
     match link {
         LinkType::LINUX_SLL if frame.len() >= 16 => Some(LinkIngress {
             ifindex: None,
             hatype: be16(2)?,
             pkttype: PacketType::from_linux(be16(0)?),
         }),
-        LinkType::LINUX_SLL2 if frame.len() >= 20 => Some(LinkIngress {
-            ifindex: Some(u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])),
-            hatype: be16(8)?,
-            pkttype: PacketType::from_linux(u16::from(frame[10])),
-        }),
+        LinkType::LINUX_SLL2 => {
+            let (h, _) = frame.split_first_chunk::<20>()?;
+            Some(LinkIngress {
+                ifindex: Some(u32::from_be_bytes([h[4], h[5], h[6], h[7]])),
+                hatype: be16(8)?,
+                pkttype: PacketType::from_linux(u16::from(h[10])),
+            })
+        }
         _ => None,
     }
 }

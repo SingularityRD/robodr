@@ -223,18 +223,20 @@ pub enum Decoded<'a> {
 }
 
 fn be16(b: &[u8], at: usize) -> Option<u16> {
-    let s = b.get(at..at.checked_add(2)?)?;
-    Some(u16::from_be_bytes([s[0], s[1]]))
+    Some(u16::from_be_bytes(*b.get(at..)?.first_chunk()?))
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
-    let s = b.get(at..at.checked_add(4)?)?;
-    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    Some(u32::from_be_bytes(*b.get(at..)?.first_chunk()?))
 }
 
 fn le32(b: &[u8], at: usize) -> Option<u32> {
-    let s = b.get(at..at.checked_add(4)?)?;
-    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    Some(u32::from_le_bytes(*b.get(at..)?.first_chunk()?))
+}
+
+/// `b[at..]`, or a truncation error at `layer`.
+fn tail(b: &[u8], at: usize, layer: Layer) -> Result<&[u8], DecodeError> {
+    b.get(at..).ok_or(DecodeError::Truncated(layer))
 }
 
 /// Decode a captured frame of the given link type down to UDP, returning
@@ -281,7 +283,7 @@ fn link_payload(link: LinkType, frame: &[u8]) -> Result<(Option<u8>, &[u8]), Dec
     match link {
         LinkType::ETHERNET => {
             let et = be16(frame, 12).ok_or(DecodeError::Truncated(Layer::Link))?;
-            ethertype_dispatch(et, &frame[14..])
+            ethertype_dispatch(et, tail(frame, 14, Layer::Link)?)
         }
         LinkType::LINUX_SLL => {
             // pkttype(2) hatype(2) halen(2) addr(8) protocol(2)
@@ -292,7 +294,7 @@ fn link_payload(link: LinkType, frame: &[u8]) -> Result<(Option<u8>, &[u8]), Dec
                 return Err(DecodeError::NotIp);
             }
             let proto = be16(frame, 14).ok_or(DecodeError::Truncated(Layer::Link))?;
-            ethertype_dispatch(proto, &frame[16..])
+            ethertype_dispatch(proto, tail(frame, 16, Layer::Link)?)
         }
         LinkType::LINUX_SLL2 => {
             // protocol(2) reserved(2) ifindex(4) hatype(2) pkttype(1) halen(1) addr(8)
@@ -303,7 +305,7 @@ fn link_payload(link: LinkType, frame: &[u8]) -> Result<(Option<u8>, &[u8]), Dec
                 return Err(DecodeError::NotIp);
             }
             let proto = be16(frame, 0).ok_or(DecodeError::Truncated(Layer::Link))?;
-            ethertype_dispatch(proto, &frame[20..])
+            ethertype_dispatch(proto, tail(frame, 20, Layer::Link)?)
         }
         LinkType::RAW => Ok((None, frame)),
         LinkType::IPV4 => Ok((Some(4), frame)),
@@ -315,11 +317,17 @@ fn link_payload(link: LinkType, frame: &[u8]) -> Result<(Option<u8>, &[u8]), Dec
             // know. Every AF_ value fits in 16 bits, so whichever reading
             // keeps the high half zero is the right one.
             let family = if le & 0xffff_0000 == 0 { le } else { be };
-            Ok((Some(family_to_version(family)?), &frame[4..]))
+            Ok((
+                Some(family_to_version(family)?),
+                tail(frame, 4, Layer::Link)?,
+            ))
         }
         LinkType::LOOP => {
             let family = be32(frame, 0).ok_or(DecodeError::Truncated(Layer::Link))?;
-            Ok((Some(family_to_version(family)?), &frame[4..]))
+            Ok((
+                Some(family_to_version(family)?),
+                tail(frame, 4, Layer::Link)?,
+            ))
         }
         other => Err(DecodeError::UnsupportedLinkType(other)),
     }
@@ -334,7 +342,7 @@ pub fn link_src_mac(link: LinkType, frame: &[u8]) -> Option<[u8; 6]> {
     match link {
         LinkType::ETHERNET if frame.len() >= 14 => mac(6),
         LinkType::LINUX_SLL if frame.len() >= 16 && be16(frame, 4) == Some(6) => mac(6),
-        LinkType::LINUX_SLL2 if frame.len() >= 20 && frame[11] == 6 => mac(12),
+        LinkType::LINUX_SLL2 if frame.len() >= 20 && frame.get(11) == Some(&6) => mac(12),
         _ => None,
     }
 }
@@ -374,7 +382,7 @@ pub(crate) fn ethertype_dispatch(
                 }
                 // TCI(2) + inner ethertype(2)
                 ethertype = be16(rest, 2).ok_or(DecodeError::Truncated(Layer::Link))?;
-                rest = &rest[4..];
+                rest = tail(rest, 4, Layer::Link)?;
                 tags += 1;
             }
             _ => return Err(DecodeError::NotIp),
@@ -409,13 +417,13 @@ fn decode_ip_expect(expected: Option<u8>, p: &[u8]) -> Result<Detail<'_>, Decode
 
 fn decode_ipv4(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
     const L: Layer = Layer::Ipv4;
-    if p.len() < 20 {
+    let Some(hdr) = p.first_chunk::<20>() else {
         return Err(DecodeError::Truncated(L));
-    }
-    if p[0] >> 4 != 4 {
+    };
+    if hdr[0] >> 4 != 4 {
         return Err(DecodeError::Malformed(L, "version is not 4"));
     }
-    let ihl = usize::from(p[0] & 0x0f) * 4;
+    let ihl = usize::from(hdr[0] & 0x0f) * 4;
     if ihl < 20 {
         return Err(DecodeError::Malformed(L, "header length below 20 bytes"));
     }
@@ -429,21 +437,19 @@ fn decode_ipv4(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
             "total length below header length",
         ));
     }
-    if total > p.len() {
-        return Err(DecodeError::Truncated(L));
-    }
-    let p = &p[..total]; // drop link padding / FCS
+    // Drop link padding / FCS; `total > p.len()` is a truncated packet.
+    let p = p.get(..total).ok_or(DecodeError::Truncated(L))?;
     let frag = be16(p, 6).ok_or(DecodeError::Truncated(L))?;
     let more = frag & 0x2000 != 0;
     let offset = usize::from(frag & 0x1fff) * 8;
-    let protocol = p[9];
-    let src = IpAddr::V4(Ipv4Addr::new(p[12], p[13], p[14], p[15]));
-    let dst = IpAddr::V4(Ipv4Addr::new(p[16], p[17], p[18], p[19]));
-    let data = &p[ihl..];
+    let protocol = hdr[9];
+    let src = IpAddr::V4(Ipv4Addr::new(hdr[12], hdr[13], hdr[14], hdr[15]));
+    let dst = IpAddr::V4(Ipv4Addr::new(hdr[16], hdr[17], hdr[18], hdr[19]));
+    let (header, data) = p.split_at_checked(ihl).ok_or(DecodeError::Truncated(L))?;
     if protocol != IPPROTO_UDP {
         return Err(DecodeError::NotUdp);
     }
-    let ipv4_header = Some(&p[..ihl]);
+    let ipv4_header = Some(header);
     if more || offset != 0 {
         let id = u32::from(be16(p, 4).ok_or(DecodeError::Truncated(L))?);
         return Ok(Detail {
@@ -470,18 +476,12 @@ fn decode_ipv4(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
     })
 }
 
-fn ipv6_addr(b: &[u8]) -> Ipv6Addr {
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&b[..16]);
-    Ipv6Addr::from(a)
-}
-
 fn decode_ipv6(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
     const L: Layer = Layer::Ipv6;
-    if p.len() < 40 {
+    let Some((hdr, rest)) = p.split_first_chunk::<40>() else {
         return Err(DecodeError::Truncated(L));
-    }
-    if p[0] >> 4 != 6 {
+    };
+    if hdr[0] >> 4 != 6 {
         return Err(DecodeError::Malformed(L, "version is not 6"));
     }
     let plen = usize::from(be16(p, 4).ok_or(DecodeError::Truncated(L))?);
@@ -491,12 +491,14 @@ fn decode_ipv6(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
             "zero payload length (jumbogram) unsupported",
         ));
     }
-    if 40 + plen > p.len() {
-        return Err(DecodeError::Truncated(L));
-    }
-    let src = IpAddr::V6(ipv6_addr(&p[8..24]));
-    let dst = IpAddr::V6(ipv6_addr(&p[24..40]));
-    walk_ipv6(src, dst, p[6], &p[40..40 + plen], true)
+    let payload = rest.get(..plen).ok_or(DecodeError::Truncated(L))?;
+    let addr = |at: usize| -> Result<IpAddr, DecodeError> {
+        let a: [u8; 16] = *tail(hdr, at, L)?
+            .first_chunk()
+            .ok_or(DecodeError::Truncated(L))?;
+        Ok(IpAddr::V6(Ipv6Addr::from(a)))
+    };
+    walk_ipv6(addr(8)?, addr(24)?, hdr[6], payload, true)
 }
 
 /// Decode the upper layers of a *reassembled* IPv6 payload, starting from the
@@ -549,7 +551,7 @@ fn walk_ipv6(
     const L: Layer = Layer::Ipv6;
     let mut off = 0usize;
     for walked in 0..=MAX_IPV6_EXT_HEADERS {
-        let rest = &buf[off..];
+        let rest = tail(buf, off, L)?;
         if nh == IP6_HOP_BY_HOP && (walked > 0 || !allow_fragment) {
             // RFC 8200 4.1: only directly after the IPv6 header. Linux
             // has no handler for it elsewhere and drops the packet.
@@ -569,10 +571,9 @@ fn walk_ipv6(
                 if !allow_fragment {
                     return Err(DecodeError::Malformed(L, "nested fragment header"));
                 }
-                if rest.len() < 8 {
+                let Some((&[frag_nh, ..], data)) = rest.split_first_chunk::<8>() else {
                     return Err(DecodeError::Truncated(L));
-                }
-                let frag_nh = rest[0];
+                };
                 let fo = be16(rest, 2).ok_or(DecodeError::Truncated(L))?;
                 let offset = usize::from(fo & 0xfff8);
                 let more = fo & 1 != 0;
@@ -599,7 +600,7 @@ fn walk_ipv6(
                         protocol: frag_nh,
                         offset,
                         more,
-                        data: &buf[off..],
+                        data,
                     }),
                     ipv4_header: None,
                     udp_segment: None,
@@ -607,25 +608,25 @@ fn walk_ipv6(
                 });
             }
             IP6_AH => {
-                if rest.len() < 2 {
+                let &[next, hlen, ..] = rest else {
                     return Err(DecodeError::Truncated(L));
-                }
-                let len = (usize::from(rest[1]) + 2) * 4;
+                };
+                let len = (usize::from(hlen) + 2) * 4;
                 if len > rest.len() {
                     return Err(DecodeError::Truncated(L));
                 }
-                nh = rest[0];
+                nh = next;
                 off += len;
             }
             h if is_ipv6_ext_header(h) => {
-                if rest.len() < 2 {
+                let &[next, hlen, ..] = rest else {
                     return Err(DecodeError::Truncated(L));
-                }
-                let len = (usize::from(rest[1]) + 1) * 8;
+                };
+                let len = (usize::from(hlen) + 1) * 8;
                 if len > rest.len() {
                     return Err(DecodeError::Truncated(L));
                 }
-                nh = rest[0];
+                nh = next;
                 off += len;
             }
             _ => return Err(DecodeError::NotUdp), // TCP, ICMPv6, ESP, no-next-header, ...
@@ -666,18 +667,16 @@ pub(crate) fn udp_segment_inner(
     if len < 8 {
         return Err(DecodeError::Malformed(L, "length below 8"));
     }
-    if len > seg.len() {
-        return Err(DecodeError::Truncated(L));
-    }
+    let seg = seg.get(..len).ok_or(DecodeError::Truncated(L))?;
     Ok((
         UdpDatagram {
             src,
             dst,
             src_port,
             dst_port,
-            payload: &seg[8..len],
+            payload: tail(seg, 8, L)?,
         },
-        &seg[..len],
+        seg,
     ))
 }
 

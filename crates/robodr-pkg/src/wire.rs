@@ -145,11 +145,13 @@ pub fn head_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn lines(head: &[u8]) -> Result<Vec<&str>, Refusal> {
-    if head.len() > MAX_HEAD || !head.ends_with(b"\r\n\r\n") {
+    let Some(text) = head
+        .strip_suffix(b"\r\n\r\n")
+        .filter(|_| head.len() <= MAX_HEAD)
+    else {
         return Err(invalid("header block too large or unterminated"));
-    }
-    let t =
-        std::str::from_utf8(&head[..head.len() - 4]).map_err(|_| invalid("header not UTF-8"))?;
+    };
+    let t = std::str::from_utf8(text).map_err(|_| invalid("header not UTF-8"))?;
     if t.bytes()
         .any(|b| b != b'\r' && b != b'\n' && !(0x20..0x7f).contains(&b))
     {

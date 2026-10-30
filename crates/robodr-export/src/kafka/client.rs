@@ -582,7 +582,7 @@ fn write_all_deadline(s: &mut Stream, mut buf: &[u8], deadline: Instant) -> io::
                     "broker closed the connection",
                 ))
             }
-            Ok(n) => buf = &buf[n..],
+            Ok(n) => buf = buf.get(n..).unwrap_or_default(),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"))
@@ -656,7 +656,7 @@ fn read_exact_deadline(s: &mut Stream, buf: &mut [u8], deadline: Instant) -> io:
         }
         s.tcp().set_read_timeout(Some(deadline - now))?;
         s.tcp().set_write_timeout(Some(deadline - now))?;
-        match s.read(&mut buf[off..]) {
+        match s.read(buf.get_mut(off..).unwrap_or_default()) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -723,7 +723,7 @@ impl Conn {
             self.fresh = false;
         }
         self.last_used = Instant::now();
-        let got = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let got = buf.first_chunk().map_or(-1, |b| i32::from_be_bytes(*b));
         if got != id {
             return Err(NetError::Protocol(format!(
                 "correlation id {got}, expected {id}"
@@ -1145,7 +1145,9 @@ impl Producer {
                 continue;
             };
             if i < n && p.error_code != errors::LEADER_NOT_AVAILABLE && p.leader >= 0 {
-                leaders[i] = Some(p.leader);
+                if let Some(l) = leaders.get_mut(i) {
+                    *l = Some(p.leader);
+                }
             }
         }
         self.topics.insert(
@@ -1378,7 +1380,10 @@ impl Producer {
                 return Err(ProduceError::Config(format!("negative partition {p}")));
             }
             if r.size_bound() > single_cap {
-                call.out[i] = Some(Outcome::Rejected {
+                let Some(slot) = call.out.get_mut(i) else {
+                    continue;
+                };
+                *slot = Some(Outcome::Rejected {
                     code: errors::MESSAGE_TOO_LARGE,
                     reason: format!(
                         "record needs up to {} bytes, more than fits in max_request_bytes {}",
@@ -1553,7 +1558,8 @@ impl Producer {
                 let need: usize = f
                     .records
                     .iter()
-                    .map(|&i| records[i as usize].1.size_bound())
+                    .filter_map(|&i| records.get(i as usize))
+                    .map(|(_, r)| r.size_bound())
                     .sum();
                 if need <= room {
                     budget = room - need;
@@ -1595,7 +1601,10 @@ impl Producer {
             let mut take = Vec::new();
             let limit = call.limits.get(&p).copied().unwrap_or(usize::MAX);
             for &i in call.queues.get(&p).into_iter().flatten() {
-                let need = records[i].1.size_bound();
+                let Some((_, r)) = records.get(i) else {
+                    break;
+                };
+                let need = r.size_bound();
                 if need > room || take.len() >= limit {
                     break;
                 }
@@ -1645,7 +1654,11 @@ impl Producer {
         }
         let mut batches = Vec::with_capacity(plan.len());
         for (p, idx, fields) in &plan {
-            let recs: Vec<ProduceRecord> = idx.iter().map(|&i| records[i].1.clone()).collect();
+            let recs: Vec<ProduceRecord> = idx
+                .iter()
+                .filter_map(|&i| records.get(i))
+                .map(|(_, r)| r.clone())
+                .collect();
             let b = encode_batch_idempotent(&recs, *fields)
                 .map_err(|e| ProduceError::Config(format!("encoding batch: {e:?}")))?;
             batches.push((*p, b));
@@ -1747,18 +1760,25 @@ impl Producer {
                     self.unnumber(call, p, fields);
                     call.remove_from_queue(p, &idx);
                     call.limits.remove(&p);
-                    call.out[idx[0]] = Some(Outcome::Rejected {
-                        code: pr.error_code,
-                        reason: format!(
-                            "{}{}",
-                            errors::name(pr.error_code),
-                            pr.error_message
-                                .as_deref()
-                                .map(|m| format!(": {}", m.chars().take(200).collect::<String>()))
-                                .unwrap_or_default()
-                        ),
-                    });
-                    self.stats.rejected += 1;
+                    // `idx` is a non-empty plan entry; a missing slot only
+                    // leaves the record undecided (retried), never aborts.
+                    if let Some(slot) = idx.first().and_then(|&i| call.out.get_mut(i)) {
+                        *slot = Some(Outcome::Rejected {
+                            code: pr.error_code,
+                            reason: format!(
+                                "{}{}",
+                                errors::name(pr.error_code),
+                                pr.error_message
+                                    .as_deref()
+                                    .map(|m| format!(
+                                        ": {}",
+                                        m.chars().take(200).collect::<String>()
+                                    ))
+                                    .unwrap_or_default()
+                            ),
+                        });
+                        self.stats.rejected += 1;
+                    }
                     res.progress = true;
                 }
                 ErrorClass::Retriable { refresh } => {
