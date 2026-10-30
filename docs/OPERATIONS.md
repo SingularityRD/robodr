@@ -250,8 +250,9 @@ take the **`.pub`** file, whatever its mode.
 *Legacy key files*: HMAC JSON key files (`robodr-blackbox-key/v1`) and bare
 hex (0.1.0-alpha.1, made with `od ... /dev/urandom`; `robodr-agentd` only)
 are refused unless explicitly allowed: `blackbox.allow_hmac: true` in
-`/etc/robodr/agentd.json`, `--allow-hmac` for `robodr-blackbox`
-(`robodr-replay` still accepts them with a warning). **Upgrading a unit that
+`/etc/robodr/agentd.json`, `blackbox.allow_hmac: true` in
+`/etc/robodr/deliverd.json`, `--allow-hmac` for `robodr-blackbox` and
+`robodr-replay`. **Upgrading a unit that
 still has an HMAC key:** agentd will not start until you either set
 `blackbox.allow_hmac: true` (a stopgap) or migrate to Ed25519 with 4.3; do
 not hand-write JSON around an old secret on a shared terminal.
@@ -366,6 +367,9 @@ also how an HMAC unit moves to Ed25519.
    deployment sequence, the chain heads and the time floor (§11.3).
    Without it the agent cannot open its journal and locks itself. Verify
    the archive with the retired key and keep it with the same retention.
+   Moving off HMAC: set `"allow_hmac": true` in the `blackbox` section of
+   `/etc/robodr/deliverd.json` for the rekey (robodr-deliverd refuses an
+   HMAC key without it), then remove it.
 8. Retention: keep the retired public key (HMAC: the key) in
    `previous_keys` while the black box still holds segments it signed, and
    with the verifiers as long as the evidence must remain verifiable. Once

@@ -211,12 +211,35 @@ fn boot_id() -> String {
         .unwrap_or_else(|| "unknown-boot".into())
 }
 
+/// Load a black-box secret key file (`what` names it in errors) under the
+/// legacy-HMAC policy: an HMAC key is refused unless `allow_hmac`
+/// (`blackbox.allow_hmac`).
+pub fn load_blackbox_key(key: &Path, allow_hmac: bool, what: &str) -> Result<KeyFile, String> {
+    let kf = KeyFile::load_secret(key).map_err(|e| format!("{what} {}: {e}", key.display()))?;
+    kf.check_hmac_policy(allow_hmac).map_err(|e| {
+        format!(
+            "{what} {}: {}",
+            key.display(),
+            e.to_string().replace(
+                "--allow-hmac (robodr-agentd: blackbox.allow_hmac)",
+                "blackbox.allow_hmac"
+            )
+        )
+    })?;
+    Ok(kf)
+}
+
 impl Journal {
     /// Open (or create) the journal in `dir` for `unit`, signed with the
-    /// black-box secret key file `key`.
+    /// black-box secret key file `key`. A legacy HMAC key is refused; see
+    /// [`Journal::open_with`].
     pub fn open(dir: &Path, unit: &str, key: &Path) -> Result<Self, String> {
-        let kf = KeyFile::load_secret(key)
-            .map_err(|e| format!("black-box key {}: {e}", key.display()))?;
+        Self::open_with(dir, unit, key, false)
+    }
+
+    /// [`Journal::open`], accepting a legacy HMAC key if `allow_hmac`.
+    pub fn open_with(dir: &Path, unit: &str, key: &Path, allow_hmac: bool) -> Result<Self, String> {
+        let kf = load_blackbox_key(key, allow_hmac, "black-box key")?;
         let signer = kf
             .signer()
             .map_err(|e| format!("black-box key {}: {e}", key.display()))?;

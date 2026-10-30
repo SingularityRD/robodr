@@ -345,6 +345,11 @@ pub struct BlackboxCfg {
     /// The unit's black-box signing key (`robodr-blackbox` secret key file).
     #[serde(default = "d_bb_key")]
     pub key: PathBuf,
+    /// Accept a legacy HMAC-SHA256 key (default `false`: refused, as by
+    /// `robodr-agentd`'s `blackbox.allow_hmac`); a stopgap until the
+    /// unit's key is migrated to Ed25519.
+    #[serde(default)]
+    pub allow_hmac: bool,
 }
 
 impl Default for BlackboxCfg {
@@ -352,6 +357,7 @@ impl Default for BlackboxCfg {
         Self {
             dir: d_bb_dir(),
             key: d_bb_key(),
+            allow_hmac: false,
         }
     }
 }

@@ -10,7 +10,8 @@
 //! design.
 //!
 //! The black-box key is read only from a key file (`--key-file`, as written
-//! by `robodr-blackbox keygen`: Ed25519 by default, or legacy HMAC),
+//! by `robodr-blackbox keygen`: Ed25519; a legacy HMAC key is refused
+//! unless `--allow-hmac`),
 //! checked by `robodr_blackbox::KeyFile::load` (regular file, no symlink;
 //! a file with secret material must have no group/other bits and be owned
 //! by this user or root); its key id comes from the file. `run` needs the
@@ -64,9 +65,9 @@ USAGE:
                 [--firewall] [--firewall-allow CHANNEL=GUID[,GUID...]]...
                 [--firewall-max-angular CHANNEL=RAD_PER_S]...
                 [--monitor | --monitor-config FILE] [--feedback-source CHANNEL=SOURCE]...
-                [--record-all-events] [--partitions N] [--log-plans]
+                [--record-all-events] [--partitions N] [--log-plans] [--allow-hmac]
   robodr-replay verify --blackbox DIR --key-file FILE
-                [--robot-id ID] [--findings findings.jsonl]
+                [--robot-id ID] [--findings findings.jsonl] [--allow-hmac]
   robodr-replay --help | --version
 
   STATE:  idle | moving_slow | moving_fast | collaborative_human_nearby |
@@ -80,7 +81,8 @@ USAGE:
   run needs the secret file (mode 0600 or stricter, own user or root);
   verify also accepts the public FILE.pub (any mode). Its key id is used.
   Keys are never taken on the command line. Legacy hmac-sha256 key files
-  still work but are symmetric (whoever verifies can forge).
+  are symmetric (whoever verifies can forge) and refused unless
+  --allow-hmac is given (then a warning is printed).
   --blackbox must be absent or empty (a replay starts a fresh chain).
   A locked profile is enforced only with a valid <profile>.sig from a key in
   --trusted-keys (robodr-profile-trust/v1); otherwise the replay is
@@ -135,6 +137,7 @@ const SWITCHES: &[&str] = &[
     "log-plans",
     "no-operator",
     "revocations-required",
+    "allow-hmac",
     "help",
 ];
 
@@ -236,19 +239,14 @@ fn parse_u64(what: &str, v: &str) -> Result<u64, String> {
 }
 
 /// Load the black-box signing key from `--key-file` (secret key file,
-/// permission-checked; Ed25519 or HMAC). Returns the key material, the key
+/// permission-checked; Ed25519, or HMAC with `--allow-hmac`). Returns the key material, the key
 /// id from the file and the algorithm.
 fn key_from(a: &Args) -> Result<(Vec<u8>, String, String), String> {
     let p = a.req("key-file")?;
     let kf = robodr_blackbox::KeyFile::load_secret(p.as_ref()).map_err(|e| format!("{p}: {e}"))?;
     // Refuses unknown algorithms and re-checks the key length.
     kf.signer().map_err(|e| format!("{p}: {e}"))?;
-    if kf.is_symmetric() {
-        eprintln!(
-            "robodr-replay: warning: {p} is an hmac-sha256 key (symmetric placeholder; \
-             use `robodr-blackbox keygen` for ed25519)"
-        );
-    }
+    hmac_policy(a, p, &kf)?;
     Ok((
         kf.secret().to_vec(),
         kf.key_id.clone(),
@@ -256,12 +254,25 @@ fn key_from(a: &Args) -> Result<(Vec<u8>, String, String), String> {
     ))
 }
 
+/// Refuse a legacy HMAC key unless `--allow-hmac`; warn when allowed.
+fn hmac_policy(a: &Args, p: &str, kf: &robodr_blackbox::KeyFile) -> Result<(), String> {
+    kf.check_hmac_policy(a.has("allow-hmac"))
+        .map_err(|e| format!("{p}: {e}"))?;
+    if kf.is_symmetric() {
+        eprintln!(
+            "robodr-replay: warning: {p} is an hmac-sha256 key (symmetric placeholder, \
+             allowed by --allow-hmac; use `robodr-blackbox keygen` for ed25519)"
+        );
+    }
+    Ok(())
+}
+
 /// The verifier for `verify`: a secret or public key file.
 fn verifier_from(a: &Args) -> Result<Box<dyn robodr_blackbox::Verifier>, String> {
     let p = a.req("key-file")?;
-    robodr_blackbox::KeyFile::load(p.as_ref())
-        .and_then(|kf| kf.verifier())
-        .map_err(|e| format!("{p}: {e}"))
+    let kf = robodr_blackbox::KeyFile::load(p.as_ref()).map_err(|e| format!("{p}: {e}"))?;
+    hmac_policy(a, p, &kf)?;
+    kf.verifier().map_err(|e| format!("{p}: {e}"))
 }
 
 fn kv(what: &str, v: &str) -> Result<(String, String), String> {

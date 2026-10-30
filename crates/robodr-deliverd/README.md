@@ -144,6 +144,15 @@ journal and the record with the old key, archives the journal as
 `<blackbox.dir>.archived-g<N>` and starts a new journal and record under
 the new key carrying the whole baseline.
 
+**Legacy HMAC keys.** The black-box key (`blackbox.key`, and `--key`,
+`--old-key`, `--new-key`) must be Ed25519: a legacy HMAC-SHA256 key file
+(symmetric, so whoever can verify can also forge) is refused at start and
+by `reanchor` and `rekey`, naming `blackbox.allow_hmac`. Setting
+`"blackbox": {..., "allow_hmac": true}` (default `false`, as in
+`robodr-agentd`) accepts it with a warning, as a stopgap. Migrate with
+`rekey --old-key <hmac key> --new-key <ed25519 key>` while `allow_hmac` is
+still set, then remove it.
+
 ## Modules
 
 | Module | What |
