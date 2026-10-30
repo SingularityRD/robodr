@@ -14,7 +14,7 @@ pub const USAGE: &str = "\
 usage:
   robodr-release keygen --out SECRET_KEY_FILE [--key-id ID]
   robodr-release fingerprint --key KEY_FILE
-  robodr-release build rpk --spec SPEC.json --payload DIR --out-dir DIR
+  robodr-release build rpk --spec SPEC.json --payload DIR --out-dir DIR [--seal-to DEPOT.pub]...
   robodr-release build bundle --programme P --seq N [--prev-bundle DIR | --prev-hash HEX]
         --rpk DIR [--rpk DIR]... TRUST [--parity M [--parity-group K] [--shard-size BYTES]]
         [--created-at SECS] [--now SECS] --out DIR
@@ -62,6 +62,11 @@ accepted head, named by the operator) or --state FILE (a
 robodr-bundle-chain/1 head; with --genesis it may be absent; --commit
 writes the new head after an accepted bundle). --now defaults to the
 system clock (Unix seconds); a clock before 1970 is an error.
+
+build rpk --seal-to (one per site depot wrapping key, robodr-seal keygen
+depot) builds a sealed RPK (docs/SECURE-DELIVERY.md §7.2): every payload
+file but the SBOM is encrypted under a fresh content key that is written
+only wrapped to those depot keys; the depots re-wrap it per unit.
 
 import copies a bundle from untrusted media into NEW_DIR (created; on
 trusted storage) and verifies the copy before publishing it: use only
@@ -359,15 +364,23 @@ fn fingerprint_cmd(args: Vec<String>) -> Result<(), Cmd> {
 }
 
 fn build_rpk(args: Vec<String>) -> Result<(), Cmd> {
-    let a = parse(args, &["spec", "payload", "out-dir"], &[])?;
+    let a = parse(args, &["spec", "payload", "out-dir", "seal-to"], &[])?;
     let spec = ops::parse_spec(&read_capped(
         Path::new(req(&a, "spec")?),
         ops::MAX_SPEC_BYTES,
     )?)?;
-    let b = ops::build_rpk(
+    let mut depots = Vec::new();
+    for p in a.all("seal-to") {
+        depots.push(
+            robodr_seal::keys::x25519_load_public(Path::new(p))
+                .map_err(|e| Cmd::Fail(Fail::Io(format!("--seal-to {p}: {e}"))))?,
+        );
+    }
+    let b = ops::build_rpk_with(
         &spec,
         Path::new(req(&a, "payload")?),
         Path::new(req(&a, "out-dir")?),
+        (!depots.is_empty()).then_some(depots.as_slice()),
     )?;
     print(json!({
         "rpk": b.dir.display().to_string(),
@@ -376,6 +389,7 @@ fn build_rpk(args: Vec<String>) -> Result<(), Cmd> {
         "serial": b.manifest.version.serial,
         "files": b.manifest.content.len(),
         "chunks": b.manifest.chunks.len(),
+        "sealed": b.manifest.is_sealed(),
         "signed": false,
     }));
     Ok(())

@@ -267,7 +267,12 @@ impl BundleManifest {
                 }
                 PathKind::Chunk { dir, sha256 } => {
                     dir_listed(dir)?;
-                    if *sha256 != f.sha256 || f.size == 0 || f.size > CHUNK_SIZE {
+                    // Up to a sealed chunk's size; the exact size is the
+                    // RPK manifest's (check_rpk_files).
+                    if *sha256 != f.sha256
+                        || f.size == 0
+                        || f.size > CHUNK_SIZE + rpk::SEALED_CHUNK_OVERHEAD
+                    {
                         return Err(invalid(format!(
                             "bundle: chunk {} has another hash or a bad size",
                             f.path
@@ -773,7 +778,7 @@ mod tests {
                 "huge chunk",
                 Box::new(|b| {
                     let i = chunk_ix(b);
-                    b.files[i].size = CHUNK_SIZE + 1;
+                    b.files[i].size = CHUNK_SIZE + rpk::SEALED_CHUNK_OVERHEAD + 1;
                 }),
             ),
             (
