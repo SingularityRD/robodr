@@ -18,6 +18,11 @@ usage:
   robodr-deliverd rekey        --config FILE --old-key FILE --new-key FILE
   robodr-deliverd status       --config FILE
   robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
+  robodr-deliverd erase        --config FILE --trigger TRIGGER [--device DEV] [--key FILE]
+  robodr-deliverd pull         --config FILE
+  robodr-deliverd report       --config FILE [--out FILE]
+  robodr-deliverd lease        --config FILE --lease FILE
+  robodr-deliverd tamper       --socket PATH [--trigger tamper|attestation_failed|auth_failures]
   robodr-deliverd --version
 
 The on-unit delivery agent (docs/SECURE-DELIVERY.md §4.2, §6; man
@@ -54,6 +59,30 @@ rekey         after the unit's black-box key was rotated (OPERATIONS
 status        print the state (installed versions, floors, deployment).
 confirm       record a local operator's confirmation for an RPK that
               requires one (install.requires_operator_present).
+erase         crypto-erase the unit's sealing keys (docs/SECURE-DELIVERY.md
+              §7.6; needs the seal section): the TPM's erase epoch moves
+              on, so every key sealed to the unit is dead; without a TPM
+              the runtime volume's LUKS2 keyslots are wiped (seal.device or
+              --device, required). With a TPM, a device wipes them too.
+              Then seal.stop_units are stopped, runtime_root unmounted and
+              seal.mapper_name closed (or suspended when busy). The report
+              and robot.seal.erased say what was destroyed and what was
+              not. Final: recovery is re-enrolment and re-delivery. TRIGGER is [a-z0-9_]{1,64} (operator, tamper,
+              attestation, lease, auth_failures, remote); tamper also
+              reports robot.seal.tamper. --key as for reanchor.
+pull          fetch this unit's pack from the depot over mutual TLS (the
+              depot section; the client key is the TPM-held identity key)
+              into media_dir/depot-lan (Sprint 14a). run does this every
+              loop when the depot section is set.
+report        send this unit's signed install report to the depot (or
+              write it to --out for media); a lease in the answer is
+              installed (Sprint 14b).
+lease         install a site lease file (verified against the enrolled
+              lease key).
+tamper        the platform feeder's side of the erase trigger socket
+              (erase.trigger_socket): sends one trigger line. The agent
+              plans the erase with the responder and runs it when the
+              live safety state allows (never while moving; Sprint 14b).
 
 Exit codes: 0 ok, 1 refused or error, 2 usage.";
 
@@ -107,7 +136,11 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "reanchor" => &["config", "trust", "key"],
         "rekey" => &["config", "old-key", "new-key"],
         "confirm" => &["config", "deployment", "package"],
-        "run" | "once" | "check-config" | "status" => &["config"],
+        "erase" => &["config", "trigger", "device", "key"],
+        "run" | "once" | "check-config" | "status" | "pull" => &["config"],
+        "report" => &["config", "out"],
+        "lease" => &["config", "lease"],
+        "tamper" => &["socket", "trigger"],
         other => {
             return usage(
                 &format!("unknown command {other:?}"),
@@ -120,6 +153,22 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         Ok(a) => a,
         Err(e) => return usage(&e, USAGE, "robodr-deliverd"),
     };
+    if cmd == "tamper" {
+        let r = (|| -> Result<(), String> {
+            let t = a.one("trigger")?.unwrap_or("tamper");
+            let t = robodr_responder::erase::EraseTrigger::parse(t)
+                .filter(|t| t.is_platform_input())
+                .ok_or("--trigger tamper|attestation_failed|auth_failures")?;
+            crate::erasex::send(Path::new(a.req("socket")?), t)
+        })();
+        return match r {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("robodr-deliverd: {e}");
+                1
+            }
+        };
+    }
     let cfg = match a.req("config") {
         Ok(p) => match Config::load(Path::new(p)) {
             Ok(c) => c,
@@ -140,7 +189,11 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "rekey" => rekey(&cfg, &a),
         "status" => status(&cfg),
         "confirm" => confirm(&cfg, &a),
+        "erase" => erase(cfg, &a),
         "once" => once(cfg),
+        "pull" => crate::lan::pull(&cfg).map(|p| print(serde_json::json!({"pack": p}))),
+        "report" => report_cmd(cfg, &a),
+        "lease" => lease_cmd(cfg, &a),
         _ => run_loop(cfg),
     };
     match r {
@@ -188,6 +241,49 @@ fn reanchor(mut cfg: Config, a: &Args) -> Result<(), String> {
     let v = e.reanchor(Path::new(&trust)).map_err(|e| e.0);
     let closed = e.close().map_err(|e| e.0);
     print(v?);
+    closed
+}
+
+fn erase(mut cfg: Config, a: &Args) -> Result<(), String> {
+    let trigger = a.req("trigger")?.to_string();
+    let device = a.one("device")?.map(std::path::PathBuf::from);
+    if let Some(k) = a.one("key")? {
+        let p = Path::new(k);
+        check_key_file(p)?;
+        cfg.blackbox.key = p.to_path_buf();
+    }
+    let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    let v = e.erase(&trigger, device.as_deref()).map_err(|e| e.0);
+    let closed = e.close().map_err(|e| e.0);
+    print(v?);
+    closed
+}
+
+fn report_cmd(cfg: Config, a: &Args) -> Result<(), String> {
+    let out = a.one("out")?.map(std::path::PathBuf::from);
+    let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    let r = match &out {
+        Some(p) => e
+            .unit_report()
+            .map_err(|e| e.0)
+            .and_then(|b| std::fs::write(p, b).map_err(|x| x.to_string()))
+            .map(|()| serde_json::json!({"report": p})),
+        None => crate::lan::report(&mut e).map(|l| serde_json::json!({"sent": true, "lease": l})),
+    };
+    let closed = e.close().map_err(|e| e.0);
+    print(r?);
+    closed
+}
+
+fn lease_cmd(cfg: Config, a: &Args) -> Result<(), String> {
+    let p = Path::new(a.req("lease")?);
+    let b = robodr_release::fsio::read_capped(p, robodr_seal::lease::MAX_LEASE_BYTES)
+        .map_err(|e| e.to_string())?;
+    let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    let r = e.install_lease(&b).map_err(|e| e.0);
+    let closed = e.close().map_err(|e| e.0);
+    r?;
+    print(serde_json::json!({"lease": "installed"}));
     closed
 }
 
@@ -277,11 +373,47 @@ fn once(cfg: Config) -> Result<(), String> {
 fn run_loop(cfg: Config) -> Result<(), String> {
     robodr_agentd::signal::install().map_err(|e| format!("signal handler: {e}"))?;
     let interval = Duration::from_millis(cfg.interval_ms);
+    let triggers = match &cfg.erase {
+        Some(ec) => Some(crate::erasex::TriggerSocket::bind(ec)?),
+        None => None,
+    };
+    let lan = cfg.depot.is_some();
+    let mut last_report: Option<Instant> = None;
+    let mut last_pull: Option<Instant> = None;
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
     let notifier = robodr_agentd::notify::Notifier::from_env();
     notifier.notify("READY=1");
     let mut res = Ok(());
     while !robodr_agentd::signal::requested() {
+        // Sprint 14b: erase triggers first (planned by the responder,
+        // executed when the safety state allows).
+        if let Some(t) = &triggers {
+            for ev in t.poll() {
+                match ev {
+                    crate::erasex::Event::Trigger { trigger, uid } => {
+                        match e.erase_trigger(trigger, 0) {
+                            Ok(what) => println!(
+                                "{}",
+                                serde_json::json!({"erase_trigger": trigger.as_str(), "uid": uid, "result": what})
+                            ),
+                            Err(err) => eprintln!("robodr-deliverd: erase: {err}"),
+                        }
+                    }
+                    crate::erasex::Event::Refused { uid, why } => {
+                        eprintln!("robodr-deliverd: erase trigger refused (uid {uid:?}): {why}");
+                        e.note_refused_trigger(uid, &why);
+                    }
+                }
+            }
+        }
+        // Sprint 14a: LAN delivery, at most once a minute (failures are
+        // retried then; an unchanged pack is not downloaded again).
+        if lan && last_pull.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60)) {
+            last_pull = Some(Instant::now());
+            if let Err(err) = crate::lan::pull_if_changed(e.config()) {
+                eprintln!("robodr-deliverd: pull: {err}");
+            }
+        }
         match e.tick() {
             Ok(r) => {
                 let v = report_json(&r);
@@ -293,6 +425,16 @@ fn run_loop(cfg: Config) -> Result<(), String> {
                     && r.recovered.is_empty());
                 if busy {
                     println!("{v}");
+                }
+                // Reports after any change and at least every minute (the
+                // depot's soak needs fresh reports).
+                if lan
+                    && (busy || last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)))
+                {
+                    last_report = Some(Instant::now());
+                    if let Err(err) = crate::lan::report(&mut e) {
+                        eprintln!("robodr-deliverd: report: {err}");
+                    }
                 }
             }
             Err(err) => {

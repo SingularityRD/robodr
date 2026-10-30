@@ -23,15 +23,15 @@
 //!   NDJSON batches over TLS (rustls, ring), batch ids derived from the
 //!   input position and the body, the batch in flight persisted, records
 //!   acknowledged only after a `200` names them.
-//! * [`kafka`]: a minimal std-only Kafka producer (ApiVersions, Metadata,
+//! * [`kafka`]: a minimal in-crate Kafka producer (ApiVersions, Metadata,
 //!   Produce v3+ with RecordBatch v2 and CRC-32C ([`crc32c`]), `acks=all`,
-//!   no compression, no idempotence, **no TLS/SASL**).
+//!   no compression, no idempotence) over **TLS** (rustls, ring; plain TCP
+//!   only when explicitly allowed), optional mutual TLS and SASL/SCRAM.
 //!
-//! Honest limits (details in README): the Kafka client is tested only
-//! against an in-process fake broker, never against a real Kafka; no TLS
-//! or SASL (use a local TLS proxy or an isolated SOC network); idempotent
-//! production is off, so delivery is at-least-once and consumers dedupe on
-//! `event-uid`.
+//! Honest limits (details in README): the Kafka client is tested against
+//! an in-process fake broker and single-node real brokers only;
+//! idempotent production is off, so delivery is at-least-once and
+//! consumers dedupe on `event-uid`.
 
 // S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc
 // symbols std already links) carries a local `#[allow(unsafe_code)]` and a

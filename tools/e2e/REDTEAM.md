@@ -1,5 +1,10 @@
 # RoboDR red team, S11-lite (task #10b)
 
+> The wave-2 re-run (2026-10-30: the scenarios below again, plus
+> trajectory, gateway-feed, WebRTC, approver, restriction, executor,
+> slowloris and delivery attacks, through the binaries) is in
+> [RESULTS.md, "Wave-2 soak and red team"](RESULTS.md#wave-2-soak-and-red-team-2026-10-30).
+
 Run on 2026-10-26, about 18:43 to 18:55 UTC, at robodr `0a1b040` (release
 build).
 

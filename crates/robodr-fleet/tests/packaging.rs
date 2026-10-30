@@ -408,6 +408,7 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "robodr-executor",
         "robodr-firewall-gw",
         "robodr-deliverd",
+        "robodr-depot",
         // The replay helper is a test tool: built, never packaged.
         "robodr-safety-replay",
     ] {
@@ -423,7 +424,7 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         .arg(&out)
         .env(
             "ROBODR_DEB_REQUIRE",
-            "robodr-enroll robodr-uplink robodr-executor robodr-firewall-gw robodr-deliverd",
+            "robodr-enroll robodr-uplink robodr-executor robodr-firewall-gw robodr-deliverd robodr-depot",
         )
         .env("SOURCE_DATE_EPOCH", "1790000000")
         .output()
@@ -454,6 +455,13 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "./usr/share/man/man8/robodr-deliverd.8.gz",
         "./usr/share/doc/robodr/examples/deliverd.example.json",
         "./usr/share/doc/robodr/SECURE-DELIVERY.md",
+        "./usr/share/doc/robodr/examples/robodr-deliverd.service.d/50-depot-lan.conf.example",
+        // The site depot (Sprint 14a): tool, unit, man page, examples.
+        "./usr/sbin/robodr-depot",
+        "./usr/lib/systemd/system/robodr-depot.service",
+        "./usr/share/man/man8/robodr-depot.8.gz",
+        "./usr/share/doc/robodr/examples/depot.example.json",
+        "./usr/share/doc/robodr/examples/robodr-depot.service.d/50-tpm-anchor.conf.example",
     ] {
         assert!(list.contains(want), "{want} missing from the .deb:\n{list}");
     }
@@ -468,6 +476,16 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
     assert!(tmpf.contains("/var/lib/robodr/fleet             0700 root   root"));
     assert!(tmpf.contains("/var/lib/robodr/deliverd          0700 root   root"));
     assert!(tmpf.contains("/var/lib/robodr/blackbox/deliverd 0750 root   robodr"));
+    assert!(tmpf.contains("/var/lib/robodr/depot             0700 robodr-depot robodr-depot"));
+    assert!(tmpf.contains("/etc/robodr-depot/keys            0700 robodr-depot robodr-depot"));
+    let sysu = ok(&sh(Command::new("sh").arg("-c").arg(format!(
+        "dpkg-deb --fsys-tarfile {} | tar -xOf - ./usr/lib/sysusers.d/robodr.conf",
+        deb.display()
+    ))));
+    assert!(
+        sysu.lines().any(|l| l.starts_with("u      robodr-depot ")),
+        "{sysu}"
+    );
     // The offline bundle around it verifies.
     let o = Command::new("bash")
         .arg(repo().join("packaging/make-bundle.sh"))

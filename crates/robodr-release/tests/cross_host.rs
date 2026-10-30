@@ -113,6 +113,9 @@ fn host_a(tmp: &Tmp) -> HostA {
         revoked_rpks: vec![],
         revoked_serials: vec![],
         floors: vec![],
+        entry_keys: vec![],
+        depot_wrap_keys: vec![],
+        ek_ca_certs: vec![],
     };
     let trust = dir.join("trust.json");
     fs::write(&trust, to_canonical(&t).unwrap()).unwrap();

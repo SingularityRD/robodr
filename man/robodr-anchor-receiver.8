@@ -63,13 +63,26 @@ JSON, unknown fields refused, paths absolute:
  "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver.key",
  "units": [{"unit": "ugv\-07",
             "public_key": "/etc/robodr\-anchor\-receiver/units/ugv\-07.pub"}],
- "max_connections": 64, "io_timeout_ms": 5000}
+ "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
+ "tls": {"cert_chain": "/etc/robodr\-anchor\-receiver/tls/receiver.pem",
+         "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver\-tls.key",
+         "client_ca": "/etc/robodr\-anchor\-receiver/tls/robots\-ca.pem"}}
 .fi
 .PP
 \fBkey_file\fR is an Ed25519 secret key file (\fBrobodr\-blackbox keygen\fR,
 mode 0600); the robots get its \fB.pub\fR. \fBunit\fR is the robot id;
 \fBpublic_key\fR the robot's black\-box public key file (a key bound to a
 device must name that robot).
+.PP
+\fBserve\fR speaks TLS: \fBtls.cert_chain\fR and \fBtls.key_file\fR are the
+receiver's certificate chain and key (key: no access for others, no group
+write); with \fBtls.client_ca\fR every robot must present a client
+certificate chaining to it (mutual TLS). Without \fBtls\fR, \fBserve\fR exits
+2 unless \fB"allow_plaintext": true\fR is set (lab or private link only);
+both together are refused. \fBio_timeout_ms\fR bounds a whole connection,
+TLS handshake included; \fBmax_connections_per_source\fR (default 8) caps the
+connections one address may hold. Key, certificate and CA files must be owned
+by root or the service user.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -81,10 +94,11 @@ Success.
 .B 2
 Usage, configuration, key, state or I/O error.
 .SH NOTES
-No TLS: marks and answers are authenticated with Ed25519, not encrypted (they
-carry hashes and sequence numbers, no evidence content). A network attacker
-can drop marks or answers (the robot counts anchor failures) but cannot make
-the receiver go back or a robot accept a lower mark.
+Marks and answers are authenticated with Ed25519 whatever the transport; TLS
+adds confidentiality and, with \fBclient_ca\fR, keeps unknown hosts out. A
+network attacker can drop marks or answers (the robot counts anchor
+failures) but cannot make the receiver go back or a robot accept a lower
+mark. Mutual TLS authenticates hosts, not unit ids; no CRL or OCSP check.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-blackbox (1)

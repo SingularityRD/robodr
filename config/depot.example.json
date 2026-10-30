@@ -1,0 +1,49 @@
+{
+  "format": "robodr-depot-config/1",
+  "site": "site-a",
+  "depot_id": "depot-a",
+  "roots": [
+    "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+    "sha256:0000000000000000000000000000000000000000000000000000000000000003"
+  ],
+  "state_dir": "/var/lib/robodr/depot",
+  "keys": {
+    "signing": "/etc/robodr-depot/keys/depot-signing.key",
+    "wrap": "/etc/robodr-depot/keys/depot-wrap.key",
+    "lease": "/etc/robodr-depot/keys/lease.key",
+    "ca": "/etc/robodr-depot/keys/unit-ca.key"
+  },
+  "enrolment": {
+    "policy_authority": "/etc/robodr-depot/policy-authority.pub",
+    "ek_cas": "/etc/robodr-depot/ek-ca",
+    "ek_intermediates": null,
+    "allow_without_tpm": false,
+    "cert_days": 365
+  },
+  "lease": {
+    "lifetime_s": 2592000,
+    "reboots": 64
+  },
+  "serve": {
+    "listen": "0.0.0.0:8443",
+    "server_name": "depot.site-a.internal",
+    "max_connections": 16,
+    "deadline_s": 600
+  },
+  "anchor": {
+    "tcti": "device:/dev/tpmrm0",
+    "index": "0x01500050",
+    "work_dir": "/run/robodr-depot",
+    "tools_dir": "/usr/bin"
+  },
+  "findings": {
+    "spool": "/var/lib/robodr/spool/agentd",
+    "data_source": "robodr",
+    "topic": "robodr.findings",
+    "max_ready_files": 10000,
+    "stale_grace_s": 86400,
+    "deferral_medium_after": 10,
+    "finding_key": null
+  }
+}

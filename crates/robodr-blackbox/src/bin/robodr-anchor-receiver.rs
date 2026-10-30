@@ -30,8 +30,20 @@
 //!  "key_file": "/etc/robodr-anchor-receiver/receiver.key",
 //!  "units": [{"unit": "ugv-07",
 //!             "public_key": "/etc/robodr-anchor-receiver/units/ugv-07-blackbox.key.pub"}],
-//!  "max_connections": 64, "io_timeout_ms": 5000}
+//!  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
+//!  "tls": {"cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
+//!          "key_file": "/etc/robodr-anchor-receiver/tls/receiver.key",
+//!          "client_ca": "/etc/robodr-anchor-receiver/tls/units-ca.pem"}}
 //! ```
+//!
+//! `serve` speaks **TLS** (`tls`: the receiver's certificate chain and key;
+//! with `client_ca`, every unit must present a client certificate that
+//! chains to it: mutual TLS). Without `tls` it refuses to start unless
+//! `"allow_plaintext": true` is set explicitly (lab / private link only;
+//! the marks stay Ed25519-authenticated either way, see
+//! `robodr_blackbox::remote_anchor`, "Transport"). `tls` and
+//! `allow_plaintext` together are refused (ambiguous). Key file: no access
+//! for others, no group write (0600 / 0640).
 //!
 //! `key_file` is the receiver's own Ed25519 secret key file
 //! (`robodr-blackbox keygen`; 0600, refused otherwise); the units are
@@ -78,6 +90,21 @@ struct Config {
     max_connections: Option<usize>,
     #[serde(default)]
     io_timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_connections_per_source: Option<usize>,
+    #[serde(default)]
+    tls: Option<TlsConfig>,
+    #[serde(default)]
+    allow_plaintext: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsConfig {
+    cert_chain: PathBuf,
+    key_file: PathBuf,
+    #[serde(default)]
+    client_ca: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -197,10 +224,25 @@ fn load_config(path: &Path) -> Result<Config, String> {
     if c.max_connections.is_some_and(|n| !(1..=4096).contains(&n)) {
         return Err("max_connections must be 1..=4096".into());
     }
+    if c.max_connections_per_source
+        .is_some_and(|n| !(1..=4096).contains(&n))
+    {
+        return Err("max_connections_per_source must be 1..=4096".into());
+    }
     if c.io_timeout_ms
         .is_some_and(|t| !(100..=60_000).contains(&t))
     {
         return Err("io_timeout_ms must be 100..=60000".into());
+    }
+    if let Some(t) = &c.tls {
+        abs("tls.cert_chain", &t.cert_chain)?;
+        abs("tls.key_file", &t.key_file)?;
+        if let Some(ca) = &t.client_ca {
+            abs("tls.client_ca", ca)?;
+        }
+        if c.allow_plaintext {
+            return Err("tls and allow_plaintext are both set: remove one".into());
+        }
     }
     Ok(c)
 }
@@ -260,6 +302,29 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
         .listen
         .clone()
         .ok_or_else(|| "serve needs \"listen\" in the config".to_string())?;
+    let (tls, mode) = match &c.tls {
+        Some(t) => (
+            Some(
+                robodr_blackbox::tls::load_server(&robodr_blackbox::tls::ServerTlsFiles {
+                    cert_chain: t.cert_chain.clone(),
+                    key_file: t.key_file.clone(),
+                    client_ca: t.client_ca.clone(),
+                })
+                .map_err(|e| format!("tls: {e}"))?,
+            ),
+            if t.client_ca.is_some() {
+                "mutual TLS"
+            } else {
+                "TLS"
+            },
+        ),
+        None if c.allow_plaintext => (None, "PLAIN TCP (allow_plaintext)"),
+        None => {
+            return Err("serve needs \"tls\" (or, for a lab or a private link only,                         \"allow_plaintext\": true)"
+                .to_string()
+                .into())
+        }
+    };
     let r = Arc::new(open_receiver(&c)?);
     let l = TcpListener::bind(&listen).map_err(|e| format!("binding {listen}: {e}"))?;
     let bound = l
@@ -272,12 +337,17 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
         io_timeout: c
             .io_timeout_ms
             .map_or(remote_anchor::DEFAULT_IO_TIMEOUT, Duration::from_millis),
+        allow_plaintext: tls.is_none() && c.allow_plaintext,
+        tls,
+        max_connections_per_source: c
+            .max_connections_per_source
+            .unwrap_or(remote_anchor::DEFAULT_MAX_CONNECTIONS_PER_SOURCE),
     };
     {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(
             out,
-            "robodr-anchor-receiver: listening on {bound} ({} units)",
+            "robodr-anchor-receiver: listening on {bound} ({} units, {mode})",
             c.units.len()
         );
         let _ = out.flush();

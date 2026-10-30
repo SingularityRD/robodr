@@ -14,10 +14,12 @@
 #
 # Use IP addresses, and have the brokers advertise IP-literal listeners: the
 # unit denies every other address, DNS servers included, so a broker that
-# advertises a host name resolves only through /etc/hosts. If the brokers
-# sit behind a local TLS proxy (stunnel), allow the proxy instead
-# (localhost) and point --bootstrap at it; the advertised listeners must
-# then resolve to the proxy too.
+# advertises a host name resolves only through /etc/hosts. With TLS the
+# broker certificates must name the advertised hosts (an IP SAN for an IP
+# literal), or give --tls-server-name. If the brokers sit behind a local TLS
+# proxy (--allow-plaintext), allow the proxy instead (localhost) and point
+# --bootstrap at it; the advertised listeners must then resolve to the
+# proxy too.
 #
 # All addresses below are documentation placeholders (RFC 5737): replace them.
 # A /32 per broker (or the broker subnet, if it holds nothing else).

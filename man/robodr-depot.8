@@ -1,0 +1,335 @@
+.\" robodr-depot(8). Source of truth: the USAGE text in
+.\" crates/robodr-depot/src/cli.rs, the crate docs and
+.\" docs/SECURE-DELIVERY.md (sections 4-6, 8 and 10). Keep them in sync.
+.TH ROBODR\-DEPOT 8 "2026-10-30" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-depot \- the site depot of RoboDR's secure delivery: import, enrolment, staged rollouts, mutual-TLS serving, leases
+.SH SYNOPSIS
+.B robodr\-depot entry scan \-\-bundle
+.I DIR
+.B \-\-trust
+.I TRUST.json
+.B \-\-trust\-anchor
+.I ANCHOR.json
+.B \-\-root
+.IR FINGERPRINT ...
+.B \-\-site
+.I SITE
+.B \-\-station
+.I NAME
+.B \-\-key
+.I ENTRY.key
+.B \-\-history
+.I DIR
+.RB [ \-\-vulndb
+.IR DB.json ]
+.RB [ \-\-fail\-on
+.IR low | medium | high | critical ]
+.RB [ \-\-lifetime\-days
+.IR N ]
+.B \-\-out
+.I REPORT.json
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B init \-\-trust
+.I TRUST.json
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B trust update \-\-trust
+.I TRUST.json
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B import \-\-bundle
+.I DIR
+.B \-\-report
+.I REPORT.json
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B enrol begin|verify|finish|approve|export
+.I ...
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B unit revoke \-\-unit
+.I U
+.B \-\-key
+.I OP.key
+.B \-\-key
+.I OP.key
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B inventory
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B rollout create|advance|resume|abort
+.I ...
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B deploy approve \-\-seq
+.I N
+.B \-\-key
+.I OPERATOR.key
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B report import \-\-report
+.I REPORT.json
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B pack \-\-unit
+.I U
+.B \-\-out
+.I DIR
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B serve
+.br
+.B robodr\-depot \-\-config
+.I FILE
+.B reanchor \-\-min\-deployment\-seq
+.I N
+.B \-\-key
+.I OP.key
+.B \-\-key
+.I OP.key
+.br
+.B robodr\-depot \-\-version
+.SH DESCRIPTION
+The single-box control plane inside a site's air gap (Sprint 14a). A
+release bundle enters only as the verified copy of
+.B robodr\-release
+import and only with a passing, signed
+.B entry report
+for exactly that bundle. Units enrol with their TPM (endorsement-key
+certificate, credential activation, certified keys, a quote) and two
+operators. Rollouts go ring by ring
+.RB ( lab " \(-> " canary " \(-> " ring\-1 " ...),"
+each stage a deployment signed by the depot and approved by the operator
+quorum of its ring; the next stage exists only after every unit of the
+current one reported its items installed and healthy after the soak, and a
+failing report halts the rollout. Sealed content keys are re-wrapped for
+each enrolled unit of a stage, never for another. Units fetch their pack
+over mutual TLS or receive a per-unit media pack. With leases (Sprint 14b)
+each accepted report renews the unit's site lease.
+.SH COMMANDS
+.TP
+.B entry scan
+On the entry station (no depot configuration): verify the bundle as
+.B robodr\-release
+would against the trust file and the pinned roots, check every RPK's SBOM
+(CycloneDX) against the vulnerability database
+.RB ( robodr\-vulndb/1 ),
+and write the report
+.RB ( robodr\-entry\-report/1 )
+and its signature (the trust file's
+.B entry
+role). The verdict is
+.B fail
+when a vulnerability at or above
+.B \-\-fail\-on
+(default high) is listed; a report lives at most 30 days.
+.TP
+.B init
+Once: create the state directory, the site's trust anchor (the trust file
+under the pinned roots and site), the unit CA certificate, the TLS server
+key and certificate (with
+.BR serve ),
+an empty database and its anchor.
+.TP
+.B trust update
+Advance to a rotation of the trust file.
+.TP
+.B import
+Import a bundle with its entry report. Refused: no report, a report for
+another bundle, site or RPK list, an expired or failing report, a report
+not signed by an entry key; a revoked or below-floor RPK; a chain gap,
+replay or equivocation; RPKs sealed to depot keys the trust file does not
+list
+.RB ( robot.depot.import_refused ).
+.TP
+.B enrol begin
+A fresh nonce for unit
+.I U
+(which the trust file must assign to a ring). On the unit:
+.BR "robodr\-seal enrol\-request \-\-nonce" .
+.TP
+.B enrol verify
+Check the unit's request: the EK certificate chains to a TPM vendor CA
+whose SHA-256 the trust file lists
+.RB ( ek_ca_certs );
+the AK, UWK and unit identity key are TPM-resident (attributes) and
+certified by the AK; the UWK is bound to the site's policy authority,
+erase epoch and (with leases) lease key; the quote over the nonce matches
+the signed policy's PCRs. Writes the credential challenge
+.RB ( TPM2_MakeCredential
+to the EK for the AK's name).
+.TP
+.B enrol finish
+The unit's answer
+.RB ( "robodr\-seal enrol\-activate" ):
+only the TPM holding both the EK and the AK can recover the secret. One
+wrong answer closes the enrolment.
+.TP
+.B enrol approve
+An operator signs the activated enrolment; at two distinct operators the
+unit is enrolled
+.RB ( robot.depot.unit_enrolled ;
+a refusal at any step is
+.BR robot.depot.enrolment_refused ).
+.TP
+.B enrol export
+The unit's client certificate (issued by the depot's unit CA for its TPM
+identity key) and the CA certificate, for its
+.B depot
+section.
+.TP
+.B unit revoke
+Operator quorum: the unit is served nothing more and nothing is wrapped
+to it.
+.TP
+.B inventory
+Units (ring, state, attestation, last report, installed items, erased),
+rollouts and deployments, and whether the depot is locked, as JSON.
+.TP
+.B rollout create
+A rollout of RPK digests over
+.B \-\-stages
+(rings in ascending order, starting at
+.B lab
+or
+.BR canary ;
+a production ring needs a canary stage first), with
+.B \-\-batch
+(default 1),
+.B \-\-soak\-s
+(default 600),
+.B \-\-max\-failures
+(default 0),
+.B \-\-validity\-days
+(default 30) and optionally only some units
+.RB ( \-\-unit ).
+Makes the first stage's deployment.
+.TP
+.B rollout advance
+The next stage, only when the current one passed.
+.TP
+.B rollout resume|abort
+Operator quorum: resume a halted rollout (its stage is deployed again under
+a new sequence number and approved again) or abort it.
+.TP
+.B deploy approve
+An operator signs a deployment; at the quorum of its ring it is active.
+.TP
+.B report import
+A unit's signed report from media
+.RB ( "robodr\-deliverd report \-\-out" ).
+A failure beyond
+.B \-\-max\-failures
+halts the rollout
+.RB ( robot.depot.rollout_halted ).
+.TP
+.B pack
+Write unit
+.IR U 's
+media pack (its newest active deployment, the trust file, the RPKs it
+targets, with only that unit's wrapped keys; its lease).
+.TP
+.B serve
+The LAN server (mutual TLS, rustls with its safe default protocol
+versions). A client is a
+unit only if its certificate chains to the depot's unit CA
+.B and
+its public key is an enrolled unit's identity key; that unit gets its own
+pack
+.RB ( "GET /v1/pack" )
+and may post its own reports
+.RB ( "POST /v1/report" ,
+answered with its lease). No request names a unit.
+.TP
+.B reanchor
+Operator quorum: accept a database the anchor check locked
+.RB ( robot.depot.locked ),
+with the deployment sequence raised to at least
+.I N
+so no sequence number is reused.
+.SH CONFIGURATION
+.I /etc/robodr\-depot/depot.json
+.RB ( robodr\-depot\-config/1 ,
+unknown members refused; example in
+.IR /usr/share/doc/robodr/examples/depot.example.json ):
+.BR site ", " depot_id ,
+the pinned
+.BR roots ,
+.BR state_dir ,
+.B keys
+.RB ( signing :
+the trust file's depot key;
+.BR wrap :
+the X25519 depot wrapping key;
+.BR lease :
+the P-256 lease key;
+.BR ca :
+the unit CA key),
+.B enrolment
+.RB ( policy_authority ", " ek_cas ", " ek_intermediates ,
+.BR allow_without_tpm " (default false), " cert_days ),
+and optionally
+.B lease
+.RB ( lifetime_s :
+TPM powered-on time,
+.BR reboots ),
+.B serve
+.RB ( listen ", " server_name ", " max_connections ", " deadline_s ),
+.B anchor
+(an NV counter of the depot's TPM:
+.BR tcti ", " index ", " work_dir ", " tools_dir )
+and
+.B findings
+(the box's agentd spool).
+.SH FILES
+.TP
+.I /var/lib/robodr/depot/
+State (0700 robodr\-depot): database, trust anchor, store, deployments,
+unit records and reports, TLS server key, and
+.I depot.lock
+(one writer at a time: the server per request, an operator command for its
+run; the other waits at most 60 seconds).
+.TP
+.I /etc/robodr\-depot/keys/
+The depot's keys (0700 robodr\-depot).
+.SH EXIT STATUS
+0 ok, 1 refused or error, 2 usage.
+.SH SYSTEMD UNIT
+.B robodr\-depot.service
+(installed disabled, for the depot box) runs
+.B serve
+as
+.B robodr\-depot
+without capabilities,
+.BR ProtectSystem=strict ,
+the TPM only through
+.BR DevicePolicy=closed " and " DeviceAllow=/dev/tpmrm0 .
+Run operator commands as the same user:
+.B runuser \-u robodr\-depot \-\- robodr\-depot \-\-config /etc/robodr\-depot/depot.json
+.IR ... .
+.SH LIMITS
+Keys are files (the design's HSM or depot-TPM keys are not implemented).
+One depot per site: no high availability. Tested with software TPMs
+(swtpm) and EK certificates from swtpm's local CA only, never a vendor
+EK CA or a hardware TPM. The quote is checked against the signed policy's
+PCR values, not against an event log. A lease bounds a unit's powered-on
+time and reboots, not wall time.
+.SH SEE ALSO
+.BR robodr\-deliverd (8),
+.BR robodr\-seal (8),
+/usr/share/doc/robodr/OPERATIONS.md,
+/usr/share/doc/robodr/SECURE-DELIVERY.md

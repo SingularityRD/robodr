@@ -118,8 +118,9 @@ crates/
                           robodr-spool-export (robot side: agentd spool ->
                           diode outbox, crash-safe) and robodr-kafka-publish
                           (SOC side: importer output or a connected spool ->
-                          Kafka; std-only client, acks=all, idempotence off, no
-                          TLS/SASL). Tested against an in-process fake broker
+                          Kafka; in-crate client, acks=all, idempotence off,
+                          TLS required, mutual TLS, SASL/SCRAM). Tested against
+                          an in-process fake broker
                           in CI and against single-node Apache Kafka 3.9.1 and
                           4.1.0 brokers (scripts/kafka-it.sh, docker). And
                           robodr-uplink: the same inputs -> the AutoSecOps
@@ -136,8 +137,15 @@ crates/
   robodr-release/         Connected-side release tool: build RPKs, sign with a
                           key quorum, assemble chained bundles with parity,
                           verify anywhere, repair from parity. Binary:
-                          robodr-release. Sprint 13a; no sealing, no unit
-                          agent, no depot yet.
+                          robodr-release. Sprint 13a; sealed RPKs
+                          (`build rpk --seal-to`) since 13c; no depot yet.
+  robodr-seal/            Captured-unit protection (docs/SECURE-DELIVERY.md
+                          §7): XChaCha20-Poly1305 sealed chunks, key wraps
+                          to depots and units, a TPM-resident unit key
+                          behind a signed PCR policy, a policy floor and an
+                          erase epoch (tpm2-tools), the LUKS2 runtime
+                          volume and the Clevis/Tang fallback. Binary:
+                          robodr-seal. Sprint 13c; tested against swtpm.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's
@@ -194,7 +202,7 @@ qemu. No release has been cut or signed, and GitHub CI has never run
 - **Findings to a SOC**: `robodr.findings` 2.1 over `robodr-uplink`
   (signed NDJSON batches, TLS, contract
   [`robodr.ingest-api`](docs/contracts/robodr.ingest-api.md)), the diode,
-  or Kafka (no TLS).
+  or Kafka (TLS, mutual TLS, SASL/SCRAM).
 - **Control plane `robodr-control-plane/v2`** (off by default; v1 is
   removed): mutual TLS off loopback, Ed25519-signed requests and answers,
   a persistent request journal and replay store, and an evidence API that
@@ -242,7 +250,9 @@ qemu. No release has been cut or signed, and GitHub CI has never run
 - Zenoh is detected, not decoded; DDS-Security payloads, RTI Connext and
   arm64 hardware are untested; `robodr-pulsard` ran only under WSL2, and
   the host rules were never loaded into a running rules engine on a robot.
-- Kafka and the anchor receiver have no TLS. Keys are files, not TPM-held.
+- Kafka and the anchor receiver use TLS (plain TCP only when explicitly
+  allowed); mutual TLS authenticates hosts, not robot ids, and there is no
+  CRL / OCSP check on those paths. Keys are files, not TPM-held.
   The executor verifies the SOC's signed request itself, but not the
   SOC's internal approval process.
 - Reviews were done by independent AI agents, not humans; there has been no

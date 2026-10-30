@@ -15,6 +15,8 @@ description = "RoboDR executor v1: reversible containment actions (isolate_netwo
 [dependencies]
 robodr-blackbox = { workspace = true }
 robodr-responder = { workspace = true }
+# Parsing the replies of the motion adapters' ROS 2 peers (src/motion/rtps.rs).
+robodr-rtps = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -26,6 +28,10 @@ fault-injection = []
 
 [dev-dependencies]
 robodr-executor = { path = ".", features = ["fault-injection"] }
+# tests: the Unitree request layout against the reference decoder, the
+# gateway restriction file against the gateway's own parser.
+robodr-cdr = { workspace = true }
+robodr-firewall-gw = { workspace = true }
 
 [[bin]]
 name = "robodr-executor"

@@ -4,7 +4,7 @@
 //! rpk_<name>_<serial>_<arch>/
 //!   MANIFEST.json      canonical JSON; its raw bytes are signed and hashed
 //!   MANIFEST.sig       robodr-sigset/1, release quorum (crate::sig)
-//!   chunks/<sha256>    payload chunks (plain in 13a; sealed is 13c)
+//!   chunks/<sha256>    payload chunks (plain, or sealed: §7.2, Sprint 13c)
 //! ```
 //!
 //! * signed message: `"robodr-pkg/manifest/v1\0" || MANIFEST.json bytes`
@@ -18,6 +18,22 @@
 //!
 //! Every value rule is in [`Manifest::validate`]; the decisions where §3.1
 //! left room are recorded in §3.5 of the design.
+//!
+//! # Sealed RPKs (Sprint 13c, §7.2)
+//!
+//! `confidentiality: "sealed"` needs the member [`Manifest::seal`], which
+//! public manifests do not carry at all (so every 13a / 13b manifest keeps
+//! its bytes and digest). Every content file except the SBOM is stored as
+//! sealed chunks (`robodr-seal`: XChaCha20-Poly1305, 24-byte nonce and
+//! 16-byte tag, so a stored chunk is [`SEALED_CHUNK_OVERHEAD`] bytes longer
+//! than its plaintext piece); the SBOM stays in clear so an entry station
+//! can scan it without the key. For a sealed file, `sha256` is not the
+//! plaintext's SHA-256 (that would let anyone confirm a guess of a
+//! low-entropy file) but a digest keyed by the content key, and every
+//! sealed chunk belongs to exactly one position of one file (its nonce
+//! and associated data bind that position). Sealing is for the kinds
+//! `files`, `model` and `config`, which the unit installs into its sealed
+//! runtime volume (§7.4); paths and sizes stay visible.
 
 use crate::common::{
     domain_hash, invalid, is_hex64, is_label, is_pkg_name, is_safe_rel_path, is_version_display,
@@ -63,6 +79,15 @@ pub const MAX_PROBE_TIMEOUT_S: u32 = 300;
 pub const MAX_SBOM_BYTES: u64 = 64 * 1024 * 1024;
 /// Suffix the SBOM content file must have.
 pub const SBOM_SUFFIX: &str = ".cdx.json";
+/// Bytes a sealed chunk adds to its plaintext piece (24-byte XChaCha20
+/// nonce, 16-byte Poly1305 tag; `robodr-seal`).
+pub const SEALED_CHUNK_OVERHEAD: u64 = 40;
+/// `seal.scheme` of sealed RPKs.
+pub const SEAL_SCHEME: &str = "robodr-seal/1";
+/// Most depot wraps of one content key.
+pub const MAX_DEPOT_WRAPS: usize = 16;
+/// Largest depot wrap (bytes, before hex).
+pub const MAX_DEPOT_WRAP_BYTES: usize = 256;
 
 /// What the package is (closed set, §4.2; no "run this script" kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -189,6 +214,35 @@ pub enum HealthCheck {
     },
 }
 
+/// Key material of a sealed RPK (`docs/SECURE-DELIVERY.md` §7.1, §7.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seal {
+    /// [`SEAL_SCHEME`].
+    pub scheme: String,
+    /// 32 random bytes (hex) chosen at build time; bound into every
+    /// chunk's associated data and every wrap of the content key (the RPK
+    /// digest cannot be: the manifest lists the ciphertext hashes).
+    pub seal_id: String,
+    /// Commitment to the content key (`robodr-seal`), checked after every
+    /// unwrap: a wrap of another key is refused before any chunk is
+    /// opened.
+    pub ck_commit: String,
+    /// The content key wrapped to the site depots' wrapping keys (§7.1:
+    /// the release never needs to know the fleet), sorted by recipient.
+    pub depot_wraps: Vec<DepotWrap>,
+}
+
+/// The content key wrapped to one depot wrapping key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepotWrap {
+    /// `sha256:<hex>` fingerprint of the recipient's raw public key.
+    pub recipient: String,
+    /// Lower-case hex of the wrap bytes.
+    pub wrap: String,
+}
+
 /// The manifest (members in canonical order).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,6 +264,9 @@ pub struct Manifest {
     pub install: Install,
     pub health: Vec<HealthCheck>,
     pub expires_at: Option<u64>,
+    /// Sealed RPKs only (absent, never `null`, in public ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<Seal>,
 }
 
 /// The RPK digest of manifest bytes.
@@ -353,12 +410,7 @@ impl Manifest {
                 "RPK manifest: security_floor must be 1..=serial (a release cannot forbid itself)",
             ));
         }
-        if self.confidentiality == Confidentiality::Sealed {
-            return Err(Refusal::new(
-                Code::Unsupported,
-                "RPK manifest: sealed RPKs need the key-wrap format of Sprint 13c",
-            ));
-        }
+        self.validate_seal()?;
         if let Some(e) = self.expires_at {
             if e > MAX_SAFE_INTEGER {
                 return Err(invalid("RPK manifest: expires_at out of range"));
@@ -381,6 +433,64 @@ impl Manifest {
         self.validate_kind()
     }
 
+    fn validate_seal(&self) -> Result<(), Refusal> {
+        match (self.confidentiality, &self.seal) {
+            (Confidentiality::Public, None) => Ok(()),
+            (Confidentiality::Public, Some(_)) => {
+                Err(invalid("RPK manifest: a public RPK carries no seal"))
+            }
+            (Confidentiality::Sealed, None) => {
+                Err(invalid("RPK manifest: a sealed RPK needs its seal member"))
+            }
+            (Confidentiality::Sealed, Some(s)) => {
+                if !matches!(self.kind, Kind::Files | Kind::Model | Kind::Config) {
+                    return Err(Refusal::new(
+                        Code::Unsupported,
+                        "RPK manifest: only files, model and config RPKs can be sealed \
+                         (they are installed into the sealed runtime volume, §7.4)",
+                    ));
+                }
+                if s.scheme != SEAL_SCHEME {
+                    return Err(Refusal::new(
+                        Code::Unsupported,
+                        "RPK manifest: unknown seal scheme",
+                    ));
+                }
+                if !is_hex64(&s.seal_id) || !is_hex64(&s.ck_commit) {
+                    return Err(invalid("RPK manifest: bad seal_id or ck_commit"));
+                }
+                if s.depot_wraps.is_empty() || s.depot_wraps.len() > MAX_DEPOT_WRAPS {
+                    return Err(invalid(format!(
+                        "RPK manifest: 1..={MAX_DEPOT_WRAPS} depot wraps"
+                    )));
+                }
+                for w in &s.depot_wraps {
+                    if !crate::common::is_fingerprint(&w.recipient)
+                        || !crate::deployment::is_hex_bytes(&w.wrap, MAX_DEPOT_WRAP_BYTES)
+                    {
+                        return Err(invalid("RPK manifest: bad depot wrap"));
+                    }
+                }
+                strictly_sorted(
+                    &s.depot_wraps,
+                    |w| w.recipient.clone(),
+                    "seal.depot_wraps (by recipient)",
+                )
+            }
+        }
+    }
+
+    /// Whether this manifest is sealed.
+    pub fn is_sealed(&self) -> bool {
+        self.confidentiality == Confidentiality::Sealed
+    }
+
+    /// Whether content file `f` is stored sealed: every file of a sealed
+    /// RPK except its SBOM.
+    pub fn is_sealed_file(&self, f: &ContentFile) -> bool {
+        self.is_sealed() && self.sbom.as_ref() != Some(&f.sha256)
+    }
+
     fn validate_payload(&self) -> Result<(), Refusal> {
         if self.content.len() > MAX_CONTENT_FILES {
             return Err(invalid(format!(
@@ -392,8 +502,13 @@ impl Manifest {
                 "RPK manifest: more than {MAX_CHUNKS} chunks"
             )));
         }
+        let max_chunk = if self.is_sealed() {
+            CHUNK_SIZE + SEALED_CHUNK_OVERHEAD
+        } else {
+            CHUNK_SIZE
+        };
         for c in &self.chunks {
-            if !is_hex64(&c.sha256) || c.size == 0 || c.size > CHUNK_SIZE {
+            if !is_hex64(&c.sha256) || c.size == 0 || c.size > max_chunk {
                 return Err(invalid("RPK manifest: bad chunk entry"));
             }
         }
@@ -443,19 +558,36 @@ impl Manifest {
                     f.path
                 )));
             }
+            // Sealed chunks carry nonce and tag, and each belongs to one
+            // position of one file only.
+            let (overhead, exclusive) = if self.is_sealed_file(f) {
+                (SEALED_CHUNK_OVERHEAD, true)
+            } else {
+                (0, self.is_sealed())
+            };
             let mut sum: u64 = 0;
             for (i, &ci) in f.chunks.iter().enumerate() {
                 let Some(c) = self.chunks.get(ci as usize) else {
                     return Err(invalid("RPK manifest: chunk index out of range"));
                 };
+                if c.size <= overhead || c.size > CHUNK_SIZE + overhead {
+                    return Err(invalid(format!("RPK manifest: {}: bad chunk size", f.path)));
+                }
+                let piece = c.size - overhead;
                 let last = i + 1 == f.chunks.len();
-                if !last && c.size != CHUNK_SIZE {
+                if !last && piece != CHUNK_SIZE {
                     return Err(invalid(format!(
                         "RPK manifest: {}: only the last chunk may be short",
                         f.path
                     )));
                 }
-                sum += c.size;
+                if exclusive && used[ci as usize] {
+                    return Err(invalid(format!(
+                        "RPK manifest: {}: a chunk of a sealed RPK used twice",
+                        f.path
+                    )));
+                }
+                sum += piece;
                 used[ci as usize] = true;
             }
             if sum != f.size {
@@ -597,6 +729,29 @@ pub fn check_policy(
             ));
         }
     }
+    // Sprint 14a (§11, 13c open question): when the site lists its depot
+    // wrapping keys, a sealed RPK may be wrapped to those keys only.
+    if let Some(seal) = m.seal.as_ref().filter(|_| m.is_sealed()) {
+        let listed = trust.depot_wrap_fingerprints();
+        if !listed.is_empty() {
+            if let Some(w) = seal
+                .depot_wraps
+                .iter()
+                .find(|w| !listed.contains(&w.recipient))
+            {
+                return Err(Refusal::new(
+                    Code::WrongScope,
+                    format!(
+                        "sealed RPK {} {} is wrapped to depot key {}, which this site's trust \
+                         file does not list",
+                        m.name,
+                        m.version.serial,
+                        crate::common::trunc(&w.recipient)
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -659,15 +814,18 @@ pub fn check_chunk(c: &Chunk, bytes: &[u8]) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Recompute every content file's plaintext SHA-256 from its chunks
-/// (public RPKs). `chunk` returns the stored bytes of a chunk entry; they
-/// are checked against the entry before use.
+/// Recompute every content file's plaintext SHA-256 from its chunks.
+/// `chunk` returns the stored bytes of a chunk entry; they are checked
+/// against the entry before use. A sealed file's chunks are checked by
+/// size and hash only (its plaintext needs the content key: `robodr-seal`
+/// checks it when it opens the chunks on the unit).
 pub fn verify_content(
     m: &Manifest,
     chunk: &mut dyn FnMut(&Chunk) -> Result<Vec<u8>, Refusal>,
 ) -> Result<(), Refusal> {
     for f in &m.content {
         let mut h = robodr_blackbox::crypto::Sha256::new();
+        let sealed = m.is_sealed_file(f);
         for &ci in &f.chunks {
             let c = m
                 .chunks
@@ -676,6 +834,9 @@ pub fn verify_content(
             let bytes = chunk(c)?;
             check_chunk(c, &bytes)?;
             h.update(&bytes);
+        }
+        if sealed {
+            continue;
         }
         if robodr_blackbox::crypto::to_hex(&h.finalize()) != f.sha256 {
             return Err(Refusal::new(
@@ -750,6 +911,7 @@ pub(crate) mod test_support {
             },
             health: vec![],
             expires_at: None,
+            seal: None,
         }
     }
 }
@@ -874,8 +1036,8 @@ mod tests {
                 Box::new(|m| m.security_floor = 8),
             ),
             (
-                "sealed",
-                Code::Unsupported,
+                "sealed without seal",
+                Code::Invalid,
                 Box::new(|m| m.confidentiality = Confidentiality::Sealed),
             ),
             (
@@ -1167,5 +1329,232 @@ mod tests {
                 .code,
             Code::FileMismatch
         );
+    }
+
+    fn sealed() -> Manifest {
+        // One sealed file of 4 MiB + 10 bytes (two sealed chunks) and a
+        // clear SBOM.
+        let sbom = br#"{"bomFormat":"CycloneDX","specVersion":"1.5"}"#;
+        let mut m = manifest(&[("model.cdx.json", sbom)]);
+        m.kind = Kind::Model;
+        m.confidentiality = Confidentiality::Sealed;
+        m.sbom = Some(sha256_hex(sbom));
+        let a = Chunk {
+            sha256: "11".repeat(32),
+            size: CHUNK_SIZE + SEALED_CHUNK_OVERHEAD,
+        };
+        let b = Chunk {
+            sha256: "22".repeat(32),
+            size: 10 + SEALED_CHUNK_OVERHEAD,
+        };
+        let sb = m.chunks[0].clone();
+        m.chunks = vec![a, b, sb];
+        m.chunks.sort_by(|x, y| x.sha256.cmp(&y.sha256));
+        let idx = |h: &str| m.chunks.iter().position(|c| c.sha256 == h).unwrap() as u32;
+        let (ia, ib, is) = (
+            idx(&"11".repeat(32)),
+            idx(&"22".repeat(32)),
+            idx(&sha256_hex(sbom)),
+        );
+        m.content = vec![
+            ContentFile {
+                path: "model.cdx.json".into(),
+                mode: 0o644,
+                size: sbom.len() as u64,
+                sha256: sha256_hex(sbom),
+                chunks: vec![is],
+            },
+            ContentFile {
+                path: "weights.onnx".into(),
+                mode: 0o640,
+                size: CHUNK_SIZE + 10,
+                sha256: "33".repeat(32),
+                chunks: vec![ia, ib],
+            },
+        ];
+        m.seal = Some(Seal {
+            scheme: SEAL_SCHEME.into(),
+            seal_id: "44".repeat(32),
+            ck_commit: "55".repeat(32),
+            depot_wraps: vec![DepotWrap {
+                recipient: format!("sha256:{}", "66".repeat(32)),
+                wrap: "77".repeat(88),
+            }],
+        });
+        m
+    }
+
+    #[test]
+    fn sealed_manifest_round_trips() {
+        let m = sealed();
+        m.validate().unwrap();
+        let b = crate::common::to_canonical(&m).unwrap();
+        assert_eq!(parse_manifest(&b).unwrap(), m);
+        assert!(m.is_sealed_file(&m.content[1]));
+        assert!(!m.is_sealed_file(&m.content[0]), "the SBOM stays clear");
+        // A public manifest has no seal member at all (13a/13b bytes).
+        let p = good();
+        let pb = crate::common::to_canonical(&p).unwrap();
+        assert!(!std::str::from_utf8(&pb).unwrap().contains("seal"));
+        let mut with_null = String::from_utf8(pb).unwrap();
+        with_null.truncate(with_null.len() - 1);
+        with_null.push_str(",\"seal\":null}");
+        assert_eq!(
+            parse_manifest(with_null.as_bytes()).unwrap_err().code,
+            Code::NonCanonical
+        );
+    }
+
+    /// Sprint 14a: a site that lists its depot wrapping keys refuses a
+    /// sealed RPK wrapped to any other key.
+    #[test]
+    fn sealed_rpk_wrapped_to_an_unlisted_depot_key_is_refused() {
+        use crate::trust::test_support::{base, verified};
+        use crate::trust::{WrapKey, X25519};
+        let m = sealed();
+        let d = "99".repeat(32);
+        // No list: 13c behaviour.
+        check_policy(&m, &d, &verified(&base()), 1_790_000_000).unwrap();
+        let mut t = base();
+        t.depot_wrap_keys = vec![WrapKey {
+            key_id: "depot-1-wrap".into(),
+            algorithm: X25519.into(),
+            public_hex: "08".repeat(32),
+        }];
+        let e = check_policy(&m, &d, &verified(&t), 1_790_000_000).unwrap_err();
+        assert_eq!(e.code, Code::WrongScope);
+        let mut ok = m.clone();
+        ok.seal.as_mut().unwrap().depot_wraps[0].recipient =
+            t.depot_wrap_keys[0].fingerprint().unwrap();
+        check_policy(&ok, &d, &verified(&t), 1_790_000_000).unwrap();
+    }
+
+    #[test]
+    fn sealed_rules_refuse() {
+        type Case = (&'static str, Code, Box<dyn Fn(&mut Manifest)>);
+        let cases: Vec<Case> = vec![
+            (
+                "public with seal",
+                Code::Invalid,
+                Box::new(|m| m.confidentiality = Confidentiality::Public),
+            ),
+            (
+                "deb sealed",
+                Code::Unsupported,
+                Box::new(|m| m.kind = Kind::RobodrRules),
+            ),
+            (
+                "scheme",
+                Code::Unsupported,
+                Box::new(|m| m.seal.as_mut().unwrap().scheme = "robodr-seal/2".into()),
+            ),
+            (
+                "seal_id",
+                Code::Invalid,
+                Box::new(|m| m.seal.as_mut().unwrap().seal_id = "4".into()),
+            ),
+            (
+                "ck_commit",
+                Code::Invalid,
+                Box::new(|m| m.seal.as_mut().unwrap().ck_commit = "X".repeat(64)),
+            ),
+            (
+                "no depot wraps",
+                Code::Invalid,
+                Box::new(|m| m.seal.as_mut().unwrap().depot_wraps.clear()),
+            ),
+            (
+                "bad recipient",
+                Code::Invalid,
+                Box::new(|m| m.seal.as_mut().unwrap().depot_wraps[0].recipient = "66".repeat(32)),
+            ),
+            (
+                "wrap too long",
+                Code::Invalid,
+                Box::new(|m| m.seal.as_mut().unwrap().depot_wraps[0].wrap = "77".repeat(257)),
+            ),
+            (
+                "wraps unsorted",
+                Code::Invalid,
+                Box::new(|m| {
+                    let s = m.seal.as_mut().unwrap();
+                    let mut w = s.depot_wraps[0].clone();
+                    w.recipient = format!("sha256:{}", "00".repeat(32));
+                    s.depot_wraps.push(w);
+                }),
+            ),
+            (
+                "plain-size sealed chunk",
+                Code::Invalid,
+                Box::new(|m| {
+                    let i = m.content[1].chunks[1] as usize;
+                    m.chunks[i].size = 10;
+                }),
+            ),
+            (
+                "sealed chunk overhead only",
+                Code::Invalid,
+                Box::new(|m| {
+                    let i = m.content[1].chunks[1] as usize;
+                    m.chunks[i].size = SEALED_CHUNK_OVERHEAD;
+                }),
+            ),
+            (
+                "full chunk without overhead",
+                Code::Invalid,
+                Box::new(|m| {
+                    let i = m.content[1].chunks[0] as usize;
+                    m.chunks[i].size = CHUNK_SIZE;
+                }),
+            ),
+            (
+                "a sealed chunk used twice",
+                Code::Invalid,
+                Box::new(|m| {
+                    // weights is 2 * 4 MiB; both positions name chunk a.
+                    let a = m.content[1].chunks[0];
+                    m.content[1].size = 2 * CHUNK_SIZE;
+                    m.content[1].chunks = vec![a, a];
+                    let b = m
+                        .chunks
+                        .iter()
+                        .position(|c| c.size == 10 + SEALED_CHUNK_OVERHEAD)
+                        .unwrap();
+                    m.chunks.remove(b);
+                    // Re-index after the removal.
+                    let ia = m
+                        .chunks
+                        .iter()
+                        .position(|c| c.sha256 == "11".repeat(32))
+                        .unwrap() as u32;
+                    let is = m.chunks.iter().position(|c| c.size < 100).unwrap() as u32;
+                    m.content[1].chunks = vec![ia, ia];
+                    m.content[0].chunks = vec![is];
+                }),
+            ),
+        ];
+        for (name, code, f) in cases {
+            let mut m = sealed();
+            f(&mut m);
+            assert_eq!(m.validate().unwrap_err().code, code, "{name}");
+        }
+    }
+
+    #[test]
+    fn verify_content_checks_only_ciphertext_of_sealed_files() {
+        let m = sealed();
+        let sbom = br#"{"bomFormat":"CycloneDX","specVersion":"1.5"}"#.to_vec();
+        // Chunks whose hashes match their (fake) names: build them so.
+        let mut store = std::collections::BTreeMap::new();
+        store.insert(sha256_hex(&sbom), sbom.clone());
+        let r = verify_content(&m, &mut |c| {
+            store
+                .get(&c.sha256)
+                .cloned()
+                .ok_or_else(|| Refusal::new(Code::MissingFile, "x"))
+        });
+        // The sealed chunks are not available: refused as missing, so the
+        // check does read them.
+        assert_eq!(r.unwrap_err().code, Code::MissingFile);
     }
 }

@@ -10,7 +10,330 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Added (packaging and platforms)
+
+- The `robodr` `.deb` is built in an **Ubuntu 22.04** userland (glibc
+  2.35), natively for amd64 and arm64, `robodr-pulsard` included (clang-20
+  from apt.llvm.org, archive key pinned by fingerprint): it installs on
+  Ubuntu 22.04 / NVIDIA JetPack 6, Debian 12 and newer. Before, it was
+  built on Ubuntu 24.04 and needed glibc 2.39. `Depends:` now comes from
+  `dpkg-shlibdeps` plus a soname table (an unknown library fails the
+  build), with the libc6 floor checked (`scripts/check-glibc-floor.sh`).
+- **RPM** for RHEL / Rocky / Alma 9 and Fedora (`packaging/build-rpm.sh`,
+  `packaging/rpm/`): built on Rocky Linux 9 (glibc 2.34), the `.deb`'s file
+  tree (`build-deb.sh --stage-only`), `%config(noreplace)` for
+  `pulsar.toml`, scriptlets equivalent to the maintainer scripts, rpm's
+  generated ELF requirements. Released with its own `SHA256SUMS-rpm-<arch>`
+  and minisign signatures; no offline bundle, no OpenPGP signature yet.
+- External BTF for kernels without it (NVIDIA L4T): the
+  `robodr-pulsard` unit accepts `/etc/robodr/btf/vmlinux` (Pulsar's
+  `[pulsar] btf_path`, commented in `pulsar.toml`) instead of
+  `/sys/kernel/btf/vmlinux`, and `robodr-btf-check` refuses to start with
+  any other `btf_path`, or a file whose stamp names another kernel build
+  or another SHA-256. Generation with `pahole`:
+  `docs/UNITREE.md` 3.2.1.
+- `robodr-focal`: a systemd 245 variant of the Kafka TLS / SASL credential
+  drop-in example (`robodr-load-credential` instead of `LoadCredential=`).
+- CI: `package-deb`, `package-rpm` (container jobs per architecture, with
+  the reproducibility proof in the build userland) and `package-smoke`
+  (apt / dnf installs in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky
+  Linux 9 and Fedora 42 containers, `scripts/pkg-install-smoke.sh`).
+  `release.yml` builds the same way, smoke-installs before signing, and
+  its build jobs no longer hold `contents: write`.
+- `scripts/check-packages.py`: every workspace program classified per
+  package variant, every `ROBODR_DEB_REQUIRE` list complete, deb and rpm
+  scripts handling the same units, and built packages compared (paths,
+  modes, content, ownership, no setuid / group-writable file, no private
+  key material). `scripts/check-focal-units.py` also checks the regular
+  drop-in examples that `robodr-focal` ships unchanged.
+
+### Fixed (packaging)
+
+- CI's `robodr-focal` build did not require `robodr-executor` and
+  `robodr-firewall-gw` (the release did): a CI package could lack them.
+- `robodr-focal` shipped the Kafka credential drop-in example with
+  `LoadCredential=`, which systemd 245 ignores.
+- `build-deb.sh` created man pages with the caller's umask: under umask
+  000 (as in a container) they were world-writable in the package. It now
+  sets umask 022 and the mode explicitly.
+- The `.deb`'s `prerm` did not stop `robodr-deliverd` on removal.
+- `scripts/deb-install-smoke.sh` used `cp --update=none` (coreutils >= 9.3).
+- Removal left services enabled, so a reinstall started them at the next
+  boot before commissioning: RPM erase now disables them, deb purge
+  removes their `.wants` / `.requires` links (masks and drop-ins stay).
+- `robodr-pulsard.service` set `SecureBits=noroot-locked` without
+  `AmbientCapabilities=`, so the daemon would have run without any
+  capability (no `CAP_BPF`): the ambient set now equals the bounding set.
+- The pinned clang of ring now also pins the LLVM libraries that hold its
+  code generator (`libllvm*`, `libclang-cpp*`, ...), not only the driver.
+
+### Added (Unitree coverage gaps)
+
+- `robodr-cdr`: the Go1 `unitree_legged_sdk` v3.8.6 **compressed
+  `LowCmd`** (614 bytes) is decoded (`LegacyLowCmdCompressed`). Its layout
+  was read from the shipped library's `refineCmd`, with offsets pinned by
+  tests. It expands exactly into the declared `LowCmd`, so the passive
+  path applies the same motion checks. The compressed `LowState` (807
+  bytes) is still reported as not inspected.
+- `robodr-cdr`: `ModelInfo::inferred_idl`. A2 / AS2 low-level commands
+  are inferred to be `unitree_go` and marked as inferred, because the SDK
+  ships no A2 / AS2 low-level type. agentd refuses a profile that recorded
+  another layout on such a robot.
+- `robodr-firewall-gw`: codec `go1_low_cmd_compressed`. Limited
+  fixed-point values round to the safe side. Values outside `i16` are
+  suppressed, and holds use the last accepted frame.
+- `robodr-firewall-gw`: codec `unitree_a2_lowcmd` (the go `LowCmd_` path
+  with `require_crc`, a type recorded in the profile, no bypass and no
+  battery off).
+- `robodr-ros2-pipeline`: `webrtc` monitor for Go2 WebRTC control
+  sessions. It reads the signalling metadata, ICE, TURN and DTLS headers,
+  and attributes peers.
+- `robodr-firewall-gw`: a `webrtc` section. It feeds the monitor from
+  NFLOG copies, can drop unlisted signalling (`block_unlisted`) and
+  provides quarantine sets by peer or flow. `webrtc-block` prints the
+  `nft` command.
+- Findings contract 2.3.0, Unitree block (§3d):
+  `robot.unitree.webrtc_unknown_controller`, `webrtc_new_peer`,
+  `webrtc_controller_mac_mismatch`, `webrtc_session_in_denied_window`,
+  `webrtc_concurrent_sessions`, `webrtc_relayed_session`,
+  `webrtc_media_without_signalling`. agentd's `gateway_feed` accepts them.
+- Fuzz targets `go1_compressed_lowcmd` and `unitree_webrtc`.
+- Review fixes, WebRTC monitor:
+  - Findings are deduplicated per peer session, so a returning peer is
+    reported again.
+  - Non-Critical findings are rate limited per minute with an aggregate
+    count. The Critical established-session finding is never suppressed.
+  - Eviction prefers single-packet, non-established peers.
+- Review fixes, gateway:
+  - It passes `NFULA_HWADDR` to the monitor, so the MAC binding of
+    controllers is now checked.
+  - `block_unlisted` also refuses a MAC-bound controller's IP from
+    another MAC, and logs every drop so the refused host is still
+    reported as a `TcpConnect` attempt.
+  - A top-level `robot_model` cross-checks the A2 / AS2 channel.
+- Review fixes, agentd: the feed accepts exactly the monitor's WebRTC
+  ids.
+
+### Changed
+
+- `robodr-firewall-gw`: a Go1 `HighCmd` or `LowCmd` with a non-zero
+  `bms.off` (`0xA5` turns the battery off) is now refused like on
+  `unitree_go_lowcmd`. It was forwarded before.
+- `robodr-ros2-pipeline`: a 614-byte legacy `LowCmd` is decoded and
+  checked against the profile; it is no longer reported as
+  `robot.motion.undecodable_sample`.
+
+### Added (Sprint 8: motion gateway channels and adapters)
+
+- `robodr-firewall-gw`: ROS 2 joint-trajectory channels
+  `ros2_joint_trajectory` (`trajectory_msgs/JointTrajectory`) and
+  `ros2_follow_joint_trajectory_goal` (`FollowJointTrajectory` send_goal):
+  strict CDR decode (verified on the Jazzy Fast DDS / Cyclone captures),
+  per-joint position / velocity / acceleration / effort and point-count /
+  duration bounds, passed, time-scaled in place (`on_velocity_violation:
+  time_scale`) or suppressed; fuzz target `firewall_gw_trajectory`.
+- `robodr-firewall-gw`: its own findings (`robot.gateway.*`) aggregated per
+  (rule, channel) and, with `findings_socket`, fed to agentd together
+  with the firewall's deviations; `restriction_path`: a `restrict_motion`
+  restriction written by the executor (twist caps, trajectory joint
+  speeds; expires on its own).
+- `robodr-agentd`: `gateway_feed` input; gateway findings become findings
+  of the normal pipeline. The control-plane body (and the revert body)
+  accept `approved_by`.
+- Findings contract **2.3.0**: `robot.gateway.trajectory_rejected`,
+  `trajectory_time_scaled`, `undecodable_command`, `fragmented_command`,
+  `writer_binding_conflict`, `sequence_jump`, `port_bypass_risk`,
+  `restriction_changed`, `findings_dropped` (`docs/contracts/robodr.findings.md`
+  §3b).
+- `robodr-executor`: motion adapters behind a `motion` section (off by
+  default): `restrict_motion` through the gateway and the Unitree sport
+  `SpeedLevel`; `safe_pause` through Nav2 (cancel every goal, zero
+  twist), ros2_control (controller switch) and PX4 (MAVLink hold);
+  `request_safe_state` (PX4 hold / RTL, Nav2, ros2_control) and
+  `rollback_config` (site program, `config: program` only), not
+  reversible (`applied`). Each adapter needs the site's `oem_validated`;
+  two-person actions need two approvers in the SOC-signed body; adapter
+  allowed states (no pause while `moving_fast` by default). New refusal
+  codes `no_adapter`, `adapter_not_validated`, `safety_state_not_allowed`,
+  `requires_idle`, `behaviour_unsupported` (control-plane contract §6a,
+  "Revision: motion adapters"). Protocols (RTPS participant, CDR,
+  MAVLink 2) tested against simulated peers only. The on-robot planner's
+  `limit_motion` becomes a `restrict_motion` order. **Upgrade the
+  executor before agentd** (new order target `motion`).
+
+### Added (Sprints 14a and 14b: site depot, leases, executed erase)
+
+- Secure delivery, Sprints 14a and 14b (site depot, leases, executed
+  erase; `docs/SECURE-DELIVERY.md` §7.5, §7.6, §8, §10 "14a status" and
+  "14b status"; `docs/OPERATIONS.md` §12.8, §12.9, §13):
+  - `robodr-depot` (new crate and binary, `man robodr-depot(8)`): entry
+    station scan and signed entry report (`robodr-entry-report/1`,
+    CycloneDX SBOMs against an offline `robodr-vulndb/1`); import only
+    with a passing report for exactly that bundle; inventory; TPM
+    enrolment (EK certificate chain to a vendor CA listed by digest in the
+    trust file, AK credential activation, AK-certified UWK and unit
+    identity key, quote of the signed policy's PCRs, two operators);
+    staged rollouts lab -> canary -> ring-n with per-ring operator
+    quorums, soak and halt-on-failure (`rollout create|advance|resume|
+    abort`, `deploy approve`); per-unit re-wrapping of sealed content
+    keys; mutual-TLS LAN serving (`serve`; the unit's client key stays in
+    its TPM, a client is identified by its key) and per-unit media packs
+    (`pack`); unit reports and leases; a single-writer lock; the
+    database anchored in a TPM NV counter (`reanchor`).
+  - `robodr-depot.service` (user `robodr-depot`, no capabilities,
+    `ProtectSystem=strict`) and its focal variant, sysusers / tmpfiles
+    entries, `config/depot.example.json`, drop-in examples
+    `robodr-depot.service.d/50-tpm-anchor.conf.example` and
+    `robodr-deliverd.service.d/50-depot-lan.conf.example`.
+  - `robodr-pkg`: trust file members `entry_keys`, `depot_wrap_keys`,
+    `ek_ca_certs` (omitted when empty; earlier trust files unchanged);
+    sealed RPKs wrapped to unlisted depot keys refused; the entry report;
+    the LAN framing (`wire.rs`).
+  - `robodr-seal`: `keygen lease`, `enroll --lease-key`, `enrol-request`,
+    `enrol-activate`, `lease install`, `counter define|read`; TPM-enforced
+    site leases (`PolicyAuthorize` by the lease key, `PolicyCounterTimer`
+    on the TPM clock and reset count; error kind `lease_expired`); unit
+    reports signed by the TPM-resident identity key with an AK time
+    attestation.
+  - `robodr-deliverd`: `pull`, `report`, `lease`, `tamper`; the `depot`,
+    `erase` and `seal.anti_rollback_nv` configuration; LAN delivery from
+    the depot; executed crypto-erase from the platform's trigger socket
+    (feeders by `SO_PEERCRED`), planned by the responder and deferred
+    while the robot moves, also across restarts; the anti-rollback record
+    anchored in a TPM NV counter, with a one-time migration of the 13b
+    record.
+  - `robodr-responder`: the `crypto_erase` plan (`erase.rs`): executes in
+    `idle`, `safe_state_active`, `estop_active`; defers otherwise;
+    two-person for a signed command or an operator's erase.
+  - `robodr-blackbox::tls`: client keys behind an external signer
+    (`load_client_with_signer`), `spki_der`.
+  - Findings contract 2.3.0, block `catalog_2_3_depot`:
+    `robot.depot.import_refused`, `robot.depot.enrolment_refused`,
+    `robot.depot.unit_enrolled`, `robot.depot.rollout_halted`,
+    `robot.depot.locked`, `robot.seal.erase_deferred`
+    (`docs/contracts/robodr.findings.md` §3e); also in `robodr-correlate`'s
+    catalog. `robot.seal.lease_expired` is now emitted.
+  - Fuzz targets `pkg_entry` and `seal_attest`.
+  - Verified against software TPMs (swtpm) on loopback only; not on a
+    hardware TPM, a vendor EK CA or a robot.
+
 ### Security
+
+- Wave-2 soak and red team (2026-10-30, `tools/e2e/RESULTS.md`): agentd's
+  `gateway_feed` accepts only rule ids of the findings catalog
+  (`robodr_ocsf::builder::rule_known`); before, a line naming
+  `robot.firewall.` or any made-up `robot.gateway.*` / `robot.firewall.*`
+  id became a finding with the generic catalog entry. The inline
+  gateway's housekeeping reports a WebRTC flood's "N further ...
+  suppressed" aggregate once its minute is over
+  (`WebRtcMonitor::tick`); before, it waited for the next packet, so a
+  flood followed by silence was reported as its first 32 findings only.
+- The inline gateway's findings feed sends a heartbeat line
+  (`robodr-gateway-heartbeat/v1`) every 5 s while idle and agentd accepts
+  it as activity (`daemon.gateway_heartbeats`): before, a quiet, healthy
+  gateway made agentd report `robot.agent.input_silent` (High, daemon
+  state `unknown`) after every `silence_ms` (8 times in the 75-minute
+  soak). Upgrade agentd before the gateway.
+
+- Adversarial self-review of Sprints 14a / 14b (`docs/SECURE-DELIVERY.md`
+  §10 "Adversarial self-review of 14a/14b"): leases are based on the TPM
+  time the unit's AK attests, not on the time a report claims (root on a
+  unit could otherwise obtain a lease that never expires); the depot's
+  handshake, request head and report body share one deadline (a trickling
+  client held a connection slot indefinitely); trust files signed before
+  14a keep parsing; a lease renewed in a media pack next to a known
+  deployment is installed; units no longer download an unchanged pack
+  every pass.
+
+- **Kafka export and remote head anchor over TLS** (R2 / GAP-03). New
+  `robodr_blackbox::tls` (rustls + ring, the stack `robodr-uplink` and the
+  control plane already use; no new crypto crates): server verification
+  always on (the configured CA file only, validity, `serverAuth`, the
+  dialled host or an explicit `server_name`: SNI and the verified name are
+  the same), optional SPKI pins, optional client certificate (mutual TLS),
+  bounded handshakes, key-file mode checks. Test PKI and generator in
+  `fixtures/tls/`.
+  - `robodr-kafka-publish` / `ProducerConfig`: `--tls-ca`, `--tls-cert`,
+    `--tls-key`, `--tls-server-name`, `--tls-spki-sha256`; every broker
+    (bootstrap and advertised) verified. SASL/SCRAM-SHA-256 / -512
+    (`--sasl-mechanism`, `--sasl-username`, `--sasl-password-file`; over
+    TLS only; server signature checked, iteration count bounded, failures
+    fatal; broker session lifetimes honoured by reconnecting). Verified
+    against Apache Kafka 3.9.1 (SSL, SSL with required client
+    certificates, SASL_SSL SCRAM; `scripts/kafka-tls-it.sh`, native, no
+    docker) and the fake cluster (`tests/kafka_tls.rs`).
+  - Remote anchor: agentd `blackbox.head_anchor.tls` {`ca_file`,
+    `server_name`, `server_spki_sha256`, `cert_chain`, `key_file`};
+    `robodr-anchor-receiver` `"tls"` {`cert_chain`, `key_file`,
+    `client_ca`} (with `client_ca`: mutual TLS, no session resumption).
+  - **Breaking: plain TCP is refused unless explicitly allowed.**
+    `robodr-kafka-publish` exits 2 without `--tls-ca` or
+    `--allow-plaintext`; agentd refuses a `remote` head anchor without
+    `tls` or `"allow_plaintext": true`; `robodr-anchor-receiver serve`
+    exits 2 without `"tls"` or `"allow_plaintext": true`. TLS together
+    with allow-plaintext is refused. No fallback in either direction: a
+    TLS client never retries in plain TCP, a TLS server never parses a
+    plain request. Upgrade: give the brokers' / receiver's CA (or, on an
+    isolated link, add the explicit flag) before upgrading; the
+    `robodr-kafka-publish.service` units take `ROBODR_KAFKA_TLS_ARGS` from
+    `/etc/robodr/kafka-publish.env` (new drop-in example
+    `60-tls-credentials.conf.example` for the client key and the SCRAM
+    password).
+  - Adversarial tests: untrusted CA, wrong host name, expired
+    certificate, certificate without `serverAuth`, pin mismatch, missing /
+    foreign client certificate, downgrade both ways, plain TCP refused,
+    wrong SCRAM credentials, an impostor broker that cannot produce the
+    server signature, a downgraded iteration count, key file modes.
+  - Independent review of this work (fixed, each with a regression test):
+    a peer trickling one byte per socket timeout held a TLS handshake
+    open for ever (the timeout was armed once; rustls loops over reads):
+    every anchor-receiver slot (F1), the anchor's delivery thread with no
+    failure counted (F2) and the Kafka producer past all its deadlines
+    (F3). Every TLS read and write now re-arms the timeout with the time
+    left (`tls::DeadlineTcp`); the receiver bounds a connection by
+    `io_timeout` and caps connections per source address
+    (`max_connections_per_source`, default 8); the anchor bounds each
+    exchange as a whole and reports an attempt that outlives its bound.
+    TLS key / CA / password files must now be owned by root or the
+    process's user and are opened without blocking on a FIFO (F5); secret
+    file contents, the SCRAM proof and the SCRAM hash states are wiped
+    (F4).
+  - Limits: no CRL / OCSP on these paths; mutual TLS authenticates hosts,
+    not robot ids (anchor marks stay bound to units by their Ed25519
+    signatures); no `PLAIN` / `GSSAPI` / `OAUTHBEARER`; KIP-368 in-band
+    re-authentication is replaced by reconnecting; idempotence still off.
+  - Build: `robodr-blackbox` now depends on rustls / rustls-webpki, so
+    ring's C is compiled for every crate that depends on it
+    (`docs/BUILD.md`).
+- Adversarial review of Sprint 13c (sealing; `docs/SECURE-DELIVERY.md` §10
+  "Adversarial review of 13c"); each fix has a regression test that failed
+  before it (`crates/robodr-seal/tests/review_13c.rs`):
+  - H1 (high): **a revoked PCR policy worked again on a TPM with an empty
+    owner authorization**: root could undefine and redefine the policy
+    floor. `robodr-seal provision` now refuses unless the owner and lockout
+    authorizations are set (`--owner-auth-file` is required), `policy
+    commit` refuses while they are empty, `status` warns. **Units
+    provisioned with an earlier build:** set both authorizations
+    (OPERATIONS §12.1) before the next `policy commit`.
+  - H2 (high): **erasing a unit without a TPM could report success while
+    destroying nothing** (UWK file absent because the runtime volume was
+    closed). The erase of such a unit is now the LUKS2 keyslot wipe; the
+    device is required (`seal.device`, required in `deliverd.json` without
+    a TPM; `--device`), and the report and `robot.seal.erased` list exactly
+    what was destroyed.
+  - M1 (medium): erase now stops `seal.stop_units`, unmounts the runtime
+    root and closes `seal.mapper_name`, or suspends it when busy; it used
+    to leave an open volume readable.
+  - M2 (medium): TPM session contexts (session keys) are written only under
+    a tmpfs work directory (`/run/robodr-seal`, checked; `--work-dir`,
+    `seal.tpm.work_dir`), never the seal directory, and leftovers of killed
+    commands are swept.
+  - L1: `enroll-fallback` refuses a key directory that is not on dm-crypt.
+    L2: a successful epoch increment with a failed read-back counts as the
+    erase. L3: the fallback key and the owner-auth file are opened with
+    `O_NOFOLLOW`.
+  - `robodr-deliverd.service` reached no TPM (`PrivateDevices=yes`): now
+    `DevicePolicy=closed` with `DeviceAllow=/dev/tpmrm0 rw`.
 
 - Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
   review of the F1 / F3 fixes"); each fixed finding has a regression test
@@ -476,6 +799,44 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Secure delivery, Sprint 13c (sealing; `docs/SECURE-DELIVERY.md` §7,
+  §7.9, §10 "13c status"; `docs/OPERATIONS.md` §12):
+  - `robodr-seal` (new crate and binary): sealed chunks (XChaCha20-Poly1305
+    under HKDF-SHA256 subkeys of a fresh content key, bound to the RPK's
+    `seal_id` and the chunk's place, synthetic nonces, key commitment,
+    keyed file digests); key wraps (X25519 to depots and units without a
+    TPM, P-256 to a TPM-resident UWK) bound to recipient and purpose; the
+    signed PCR policy `robodr-seal-policy/1` (ECDSA P-256 by the policy
+    authority, verified by the TPM through `TPM2_PolicyAuthorize`); a
+    policy floor (NV bit field: older signed policies revoked after a
+    committed update) and an erase epoch (NV counter: one increment kills
+    every key sealed to the unit); provisioning, enrolment, unwrap in an
+    encrypted policy session, the LUKS2 runtime volume keyed through the
+    UWK, the Clevis/Tang fallback, `rewrap` (the depot's step until 14a),
+    erase. Driven through `tpm2-tools`, `cryptsetup` and `clevis`.
+  - `robodr-release build rpk --seal-to DEPOT.pub`: sealed RPKs (`files`,
+    `model`, `config`; every file but the SBOM encrypted, the content key
+    written only wrapped to the depots).
+  - `robodr-pkg`: the manifest member `seal` (sealed RPKs only; public
+    manifests unchanged byte for byte) and typed deployment
+    `wrapped_keys` (`{unit, rpk_digest, wrap}`); bundle listings accept
+    sealed chunk sizes.
+  - `robodr-deliverd`: optional `seal` configuration; sealed RPKs and every
+    `model` installed only into the mounted dm-crypt runtime volume, the
+    unit's wrap kept in the store, chunks authenticated before they are
+    written; `robodr-deliverd erase`.
+  - Findings contract `robodr.findings` **2.3.0**: catalog entries
+    `robot.seal.unseal_failed` (High), `lease_expired` (Medium, emitted
+    from 14b), `erased` and `tamper` (Critical), data source
+    `robodr_delivery`; `robodr.ingest` vectors regenerated. SOC
+    validators must move to 2.3 before units install sealed RPKs.
+  - Fuzz targets `seal_policy`, `seal_wrap` (std-only smoke runs).
+  - New dependencies (MIT / Apache-2.0, no C): `chacha20poly1305`, `hkdf`,
+    `hmac`, `x25519-dalek`, `p256`.
+  - Tested against swtpm 0.7.3 / tpm2-tools 5.6 (`ROBODR_SWTPM=1`), a real
+    Tang server (`ROBODR_TANG=1`) and `cryptsetup` on image files; the
+    dm-crypt open path is gated (`ROBODR_SEAL_DM=1`) and was not run.
+    `robodr-seal` is packaged (`/usr/sbin`, both variants).
 - Secure delivery, Sprint 13b (unit agent, local; `docs/SECURE-DELIVERY.md`
   §4.2, §6, §10 "13b status"):
   - `robodr-deliverd` (new crate and daemon, `/usr/sbin`, unit

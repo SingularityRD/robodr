@@ -447,9 +447,25 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   swtpm (`scripts/swtpm-anchor-it.sh`), not yet on a hardware TPM.
 - **Remote head anchor** (`remote_anchor::RemoteHeadAnchor` on the unit,
   `remote_anchor::AnchorReceiver` / the `robodr-anchor-receiver` binary on
-  a base station or fleet host). Std only, TCP, one JSON line per request
-  and answer (`robodr-anchor/v1`, at most 16 KiB), no TLS: everything that
-  matters is signed with Ed25519 at the application layer.
+  a base station or fleet host). TCP, one JSON line per request and answer
+  (`robodr-anchor/v1`, at most 16 KiB), everything that matters signed
+  with Ed25519 at the application layer, inside **TLS** (`src/tls.rs`:
+  rustls + ring, the stack of `robodr-uplink` and the control plane):
+  the client verifies the receiver's certificate against its CA file only
+  (chain, validity, `serverAuth`, the address's host or `server_name`),
+  optionally pins its SPKI and presents a client certificate; the
+  receiver can require one (`client_ca`, mutual TLS; no session
+  resumption). Plain TCP is refused on both sides unless
+  `allow_plaintext` is set explicitly, and there is no fallback: a TLS
+  client never retries in plain TCP, a TLS receiver never parses a
+  plain request (`tests/remote_anchor_tls.rs`: bad CA, wrong host,
+  expired, no `serverAuth`, pins, missing / foreign client certificate,
+  downgrades both ways, key file modes and owners). Every TLS read and
+  write runs on `tls::DeadlineTcp` (socket timeout re-armed with the time
+  left): the receiver's `io_timeout` bounds a connection handshake
+  included, the client bounds each exchange as a whole, so a peer
+  trickling bytes is cut (regressions for both); the receiver also caps
+  connections per source address (`max_connections_per_source`).
   - *advance*: the mark is the recorder's `Checkpoint` plus `mark_sig`, the
     unit's signature over `robodr-blackbox/remote-anchor/mark/v1\0 ||
     lp(unit) || chain_id || seq || hash || lp(key_id)`. The checkpoint's
@@ -480,7 +496,7 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
     waits for the network. Transport failures are retried with backoff
     (250 ms .. 30 s), refusals are not; a failure is reported by the next
     `advance` (counted one mark late). `current` is bounded by about three
-    times the timeout (default 2 s), DNS included. Dropping the anchor
+    (TLS: four) times the timeout (default 2 s), DNS included. Dropping the anchor
     tries once more to deliver the last mark.
   - Air gap: the query needs a reverse channel; use a local base-station
     receiver, or the **detect-only** mode: `robodr-blackbox anchor-mark`
@@ -493,8 +509,9 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
     in transit); an attacker who controls the network can suppress marks
     and block the query (anchor failure on the record), but cannot lower
     what the receiver holds. Key rotation is a new chain: move the unit's
-    receiver state aside when its key changes. Marks are not encrypted
-    (hashes and seqs only). Tested over loopback with a real receiver
+    receiver state aside when its key changes. With `allow_plaintext`
+    marks are not encrypted (hashes and seqs only). Mutual TLS
+    authenticates hosts, not unit ids; no CRL / OCSP. Tested over loopback with a real receiver
     process (`tests/remote_anchor.rs`), not across a real network.
 - **Truncation evidence:** an authentic `checkpoint.json` or
   `export-cursor.json` naming a seq **beyond** the head proves the tail was

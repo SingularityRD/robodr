@@ -1,0 +1,110 @@
+# robodr-depot: the site depot's LAN server (docs/SECURE-DELIVERY.md §4-§6,
+# §8, Sprint 14a; man robodr-depot(8); docs/OPERATIONS.md section 13).
+#
+# Runs on the DEPOT BOX inside the site's air gap, never on a robot. It
+# serves each enrolled unit its own pack (the newest active deployment of
+# the unit's stage, re-wrapped for that unit only) over mutual TLS, takes
+# the units' signed install reports (a failing one halts the rollout) and
+# hands out site leases. Imports, enrolments, approvals and rollouts are
+# operator commands of the same binary, not of this service.
+#
+# Checked against crates/robodr-depot:
+#   * CLI: `robodr-depot --config <depot.json> serve`; exit 0 on stop, 1
+#     runtime failure (refused key, trust or database: an anchor mismatch
+#     locks the depot, robot.depot.locked), 2 usage.
+#   * /etc/robodr-depot/depot.json (robodr-depot-config/1, example in
+#     /usr/share/doc/robodr/examples/depot.example.json); its keys under
+#     /etc/robodr-depot/keys (0700 robodr-depot) are read by path because
+#     the operator commands load the same keys. Initialise once with
+#     `runuser -u robodr-depot -- robodr-depot --config ... init --trust ...`.
+#   * Single writer: the server opens the depot per request and holds
+#     state_dir/depot.lock (flock) only for it; an operator command waits
+#     at most 60 s for it, and vice versa.
+#   * Findings: robot.depot.* into the box's agentd spool
+#     /var/lib/robodr/spool/agentd (group robodr), when "findings" is set.
+#   * The database anchor (Sprint 14b, "anchor"): an NV counter of the
+#     depot box's TPM through /dev/tpmrm0 and tpm2-tools; session files in
+#     /run/robodr-depot (RuntimeDirectory). /dev/tpmrm0 is usually
+#     root:tss 0660: add the user to tss with the drop-in example
+#     50-tpm-anchor.conf.example.
+#
+# Installed disabled. Enable after `init` and the first trust file:
+#   systemctl enable --now robodr-depot
+# Verify after editing: systemd-analyze verify robodr-depot.service
+#                       systemd-analyze security robodr-depot.service
+
+[Unit]
+Description=RoboDR site depot (mutual-TLS pack server for enrolled units)
+Documentation=man:robodr-depot(8) file:/usr/share/doc/robodr/OPERATIONS.md
+AssertPathExists=/etc/robodr-depot/depot.json
+After=local-fs.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/robodr-depot --config /etc/robodr-depot/depot.json serve
+Restart=on-failure
+RestartSec=10s
+# Exit 2 = usage error: restarting cannot fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=30s
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=256
+
+# --- Identity --------------------------------------------------------------
+# Its own user (packaging/sysusers.d/robodr.conf); no capability: the
+# listen port is unprivileged (serve.listen, default example :8443).
+User=robodr-depot
+Group=robodr-depot
+SupplementaryGroups=robodr
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+
+# --- Filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ReadWritePaths=/var/lib/robodr/depot
+ReadWritePaths=-/var/lib/robodr/spool/agentd
+ReadOnlyPaths=/etc/robodr-depot
+RuntimeDirectory=robodr-depot
+RuntimeDirectoryMode=0700
+ProtectHome=yes
+PrivateTmp=yes
+# The TPM for the database anchor (as robodr-deliverd.service):
+# PrivateDevices=yes would hide /dev/tpmrm0, so the device cgroup narrows
+# instead (standard pseudo devices plus the resource manager, never the
+# raw /dev/tpm0). Without an anchor the entry is unused.
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network / syscalls --------------------------------------------------------
+# TCP to the site LAN only. Restrict who may connect with IPAddressAllow= /
+# IPAddressDeny= in a drop-in (the units' subnet); mutual TLS against the
+# depot's own unit CA authenticates every unit, the filter only cuts noise.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @module @debug
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

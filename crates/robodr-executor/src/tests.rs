@@ -437,6 +437,7 @@ fn check_cell(cell: &Cell<'_>, p: &ResponsePolicy, c: &Resolved) {
                 Effect::Advisory { .. } => "advisory",
                 Effect::Isolate(_) => "isolate",
                 Effect::Quarantine(_) => "quarantine",
+                Effect::Motion(_) => "motion",
             };
             assert_eq!(k, kind, "{cell:?}");
         }

@@ -93,6 +93,7 @@ pub mod sign;
 pub mod sign_ed25519;
 pub mod store;
 pub mod time;
+pub mod tls;
 pub mod tpm_anchor;
 pub mod verify;
 

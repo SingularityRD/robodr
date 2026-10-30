@@ -94,6 +94,10 @@
 //!   `{"socket_path": "/run/robodr-agentd/host-threats.sock"}`, the socket
 //!   the `robodr-threat-forward` Pulsar module writes Pulsar threats to (see
 //!   [`crate::host`]). Its path must differ from every other socket input.
+//! * `gateway_feed` (optional, [`crate::gateway_feed::GatewayFeedSection`]):
+//!   the same keys, the socket the in-path gateway `robodr-firewall-gw`
+//!   writes its findings to (`findings_socket` there; see
+//!   [`crate::gateway_feed`]). `allowed_uids` names the gateway's uid.
 //! * `findings` (optional, [`FindingsSection`]): `{"topic":
 //!   "robodr.findings", "data_source": "robodr"}` (the defaults), the
 //!   deployment labels every finding carries (`ocsf.metadata.log_name`, the
@@ -238,6 +242,10 @@ pub struct DaemonConfig {
     /// `None` = no host-side signals.
     #[serde(default)]
     pub host_threats: Option<crate::host::HostThreatsSection>,
+    /// The in-path gateway's findings feed (see [`crate::gateway_feed`]);
+    /// `None` = gateway findings stay in the gateway's events file.
+    #[serde(default)]
+    pub gateway_feed: Option<crate::gateway_feed::GatewayFeedSection>,
     /// The control-plane action API (see [`crate::control`]); `None` (the
     /// default) = no listener.
     #[serde(default)]
@@ -427,11 +435,38 @@ pub enum HeadAnchorConfig {
         /// The receiver's Ed25519 public key file (absolute; outside
         /// `blackbox.dir` and `spool.dir`).
         receiver_public_key: PathBuf,
-        /// Bound on connect, write and read each; default 2000,
-        /// 100..=30000.
+        /// Bound on connect, TLS handshake, write and read each; default
+        /// 2000, 100..=30000.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// TLS to the receiver (required unless `allow_plaintext`).
+        #[serde(default)]
+        tls: Option<AnchorTlsConfig>,
+        /// Plain TCP to the receiver (lab / private link only; marks and
+        /// answers stay Ed25519-signed). Default `false`: without `tls`
+        /// the configuration is refused.
+        #[serde(default)]
+        allow_plaintext: bool,
     },
+}
+
+/// `blackbox.head_anchor.tls` (kind `remote`): see
+/// `robodr_blackbox::tls`. The receiver's certificate is always verified
+/// (chain to `ca_file`, validity, `serverAuth`, the address's host or
+/// `server_name`); `server_spki_sha256` pins add to that; `cert_chain` +
+/// `key_file` present a client certificate (mutual TLS).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorTlsConfig {
+    pub ca_file: PathBuf,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub server_spki_sha256: Vec<String>,
+    #[serde(default)]
+    pub cert_chain: Option<PathBuf>,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
 }
 
 impl HeadAnchorConfig {
@@ -463,6 +498,8 @@ impl HeadAnchorConfig {
             address,
             receiver_public_key,
             timeout_ms,
+            tls,
+            allow_plaintext,
         } = self
         else {
             return None;
@@ -489,6 +526,52 @@ impl HeadAnchorConfig {
                 }
                 Some(ms) => c.timeout = std::time::Duration::from_millis(ms),
                 None => {}
+            }
+            match (tls, *allow_plaintext) {
+                (Some(_), true) => {
+                    return Err(
+                        "blackbox.head_anchor: tls and allow_plaintext are both set: remove one"
+                            .into(),
+                    )
+                }
+                (None, false) => {
+                    return Err(
+                        "blackbox.head_anchor kind remote: set tls (the receiver's CA file; \
+                         plain TCP needs an explicit \"allow_plaintext\": true, lab or \
+                         private link only)"
+                            .into(),
+                    )
+                }
+                (None, true) => c.allow_plaintext = true,
+                (Some(t), false) => {
+                    for (f, p) in [
+                        ("ca_file", Some(&t.ca_file)),
+                        ("cert_chain", t.cert_chain.as_ref()),
+                        ("key_file", t.key_file.as_ref()),
+                    ] {
+                        if let Some(p) = p {
+                            require_abs(&format!("blackbox.head_anchor.tls.{f}"), p)?;
+                        }
+                    }
+                    let files = robodr_blackbox::tls::ClientTlsFiles {
+                        ca_file: t.ca_file.clone(),
+                        cert_chain: t.cert_chain.clone(),
+                        key_file: t.key_file.clone(),
+                        server_name: t.server_name.clone(),
+                        spki_sha256: t.server_spki_sha256.clone(),
+                    };
+                    let loaded = robodr_blackbox::tls::load_client(&files).map_err(|e| {
+                        format!(
+                            "blackbox.head_anchor.tls: {}",
+                            robodr_ros2_pipeline::sanitize(&e)
+                        )
+                    })?;
+                    // The name verified must be a valid TLS name.
+                    loaded
+                        .name_for(robodr_blackbox::tls::host_of(address))
+                        .map_err(|e| format!("blackbox.head_anchor: {e}"))?;
+                    c.tls = Some(loaded);
+                }
             }
             Ok((c, key))
         })())
@@ -762,6 +845,8 @@ pub struct Resolved {
     pub finding_key: Option<(KeyBytes, String)>,
     /// The validated host-threat socket, if configured.
     pub host_threats: Option<crate::host::HostThreatsSpec>,
+    /// The validated gateway feed socket, if configured.
+    pub gateway_feed: Option<crate::host::HostThreatsSpec>,
     /// The validated control-plane API (listeners, SOC keys), if configured.
     pub control_plane: Option<crate::control::ControlPlaneSpec>,
     /// executor v1: the enabled executor link (`None` = off).
@@ -1336,6 +1421,37 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             Some(spec)
         }
     };
+    let gateway_feed = match &config.gateway_feed {
+        None => None,
+        Some(g) => {
+            let spec = g.resolve()?;
+            let clash = config.event_inputs.iter().any(
+                |i| matches!(i, EventInputConfig::UnixSocket { path, .. } if *path == spec.path),
+            ) || safety_feed
+                .as_ref()
+                .and_then(|f| f.socket.as_ref())
+                .is_some_and(|s| s.path == spec.path)
+                || host_threats.as_ref().is_some_and(|h| h.path == spec.path);
+            if clash {
+                return Err(
+                    "gateway_feed.socket_path is also an event_inputs, safety_feed or \
+                            host_threats socket path"
+                        .into(),
+                );
+            }
+            for (what, d) in [
+                ("spool.dir", &config.spool.dir),
+                ("blackbox.dir", &config.blackbox.dir),
+            ] {
+                if resolve_path(&spec.path).starts_with(resolve_path(d)) {
+                    return Err(format!(
+                        "gateway_feed.socket_path must not be inside {what}"
+                    ));
+                }
+            }
+            Some(spec)
+        }
+    };
     let finding_key = match &config.finding_signing {
         None => None,
         Some(fs) => {
@@ -1558,6 +1674,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         correlation,
         finding_key,
         host_threats,
+        gateway_feed,
         control_plane,
         executor,
         firewall_joint,
@@ -1668,7 +1785,7 @@ pub fn check_robot_model(
             }
         }
     }
-    if let (Some(j), Some(slots)) = (joint, info.motor_slots) {
+    if let (Some(j), Some(slots)) = (joint, info.lowcmd_motor_slots()) {
         for (ch, spec) in &j.joint_channels {
             let low = matches!(ch.as_str(), "/lowcmd" | "/arm_sdk" | "/user_lowcmd");
             if low && info.generation == Generation::Sdk2Dds && spec.motors.len() != slots {
@@ -1783,11 +1900,20 @@ pub fn check_profile_channels(
             }
             if let Some(m) = model {
                 let info = m.info();
-                if info.idl.is_some_and(|idl| idl != layout.0) {
+                // A2 / AS2: the inferred family counts too (a profile
+                // that learned another layout on such a robot is a model
+                // alias or a wrong model, never silently accepted).
+                if info.lowcmd_idl().is_some_and(|idl| idl != layout.0) {
                     return Err(format!(
                         "firewall.joint_config channel {ch:?}: the profile records its type as \
-                         {t}, which is not the low-level layout of robot.robot_model {}",
-                        info.name
+                         {t}, which is not the low-level layout of robot.robot_model {}{}",
+                        info.name,
+                        if info.lowcmd_inferred() {
+                            " (inferred: the SDK publishes no low-level type for this model; \
+                             confirm the type on the robot and report it)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
             }

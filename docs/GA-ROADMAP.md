@@ -18,7 +18,7 @@
 | Dil / yığın | Rust (22 workspace üyesi: 19 saf + 3 Pulsar'a bağlı; `crates/**/*.rs` testler dahil ~240k satır), Pulsar (eBPF) | Python FastAPI + Next.js + Temporal + Postgres + MinIO + Redis (Tracecat çatalı) |
 | Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı**. Kodda (2026-10-26): kontrol düzlemi v2 (mTLS, journal, kanıt API'si; v1 kaldırıldı), executor v1 (varsayılan kapalı), in-path gateway `robodr-firewall-gw`, filo yaşam döngüsünün robot tarafı (`robodr-enroll`), S10 sertleştirmesi, `robodr-uplink`, Unitree desteği | Çalışan platform, `1.0.0` imajları. `claude/robodr-ingest` dalında (henüz `main`'e birleşmedi): RoboDR ingest modülü, `tools.robodr.*`, imza/onay (sign-off, iki kişi), Robot SOC preset'i, Robots UI sayfaları, kontrol düzlemi v2 istemcisi + kanıt, Helm, güvenlik taramaları, filo API'sinin SOC tarafı (filo kaydı tek konteynerde uçtan uca çalıştı, `tools/e2e/RESULTS.md`) |
 | Test | Son kayıtlı toplam: **2196+ test, 0 hata** (§3a, 2026-10-26; S7–S10 birleşmelerinden önce). Birleşmelerden sonra çalışma alanı genelinde yeniden sayılmadı; her parça kendi testleriyle birleşti (network namespace'te gerçek nftables / NFQUEUE, gerçek `dpkg`, libFuzzer 10 hedef × 630 s) | Ortak sözleşme vektörleri gerçek uç noktaya karşı geçiyor (ingest 26 vaka, kontrol düzlemi v2); ingest benchmark'ı 1000 satırlık batch'te p95 ≈ 1,27 s (`gc.freeze`, yüklü 4 vCPU VM, AutoSecOps `09133dc0`). Bu dalın CI koşu sonuçları burada kayıtlı değil |
-| GA'yı en çok engelleyen | Saha doğrulaması yok (gerçek robot, soak, FP oranı); CI GitHub'da hiç koşmadı; release imzalanmadı; Kafka/anchor TLS yok; `restrict_motion`/`safe_pause` adaptörleri yok; executor SOC imzasını kendisi doğrulamıyor | Dal birleşmedi; filo API'si bitmedi; üretim lisans anahtarı yok; robot sayısı kotası yok; uçtan uca (robot ↔ SOC) gerçek ağda hiç çalışmadı |
+| GA'yı en çok engelleyen | Saha doğrulaması yok (gerçek robot, soak, FP oranı); CI GitHub'da hiç koşmadı; release imzalanmadı; `restrict_motion`/`safe_pause` adaptörleri yok; executor SOC imzasını kendisi doğrulamıyor | Dal birleşmedi; filo API'si bitmedi; üretim lisans anahtarı yok; robot sayısı kotası yok; uçtan uca (robot ↔ SOC) gerçek ağda hiç çalışmadı |
 
 **GA tanımı (özet):** Bir müşteri, AutoSecOps1'i self-host kurup RoboDR ajanını
 desteklenen bir robot platformuna (ROS 2 Humble/Jazzy, Fast DDS + Cyclone, amd64 +
@@ -49,7 +49,7 @@ paketleme (Reed-Solomon), reproducible build + SBOM + minisign release pipeline'
 | # | Açık | Kanıt |
 |---|---|---|
 | R1 | 🟡 **Kısmen çözüldü:** executor v1 geri alınabilir ağ aksiyonlarını yürütüyor (varsayılan kapalı; 0499a47, inceleme 31d1aa4), in-path gateway Unitree hareket kanallarını uyguluyor (a4e0b4b, inceleme e85471c). Kalan: SOC'tan `restrict_motion`, `safe_pause` adaptörleri, ROS 2 `/cmd_vel` / `JointTrajectory` gateway'i, gerçek robotta doğrulama. Eski durum: yanıt **hiçbir şey yürütmüyordu** (responder yalnız plan, agentd `NoopExecutor`, Motion Firewall recording-only, kontrol düzlemi yalnızca `recorded_not_executed`) | `crates/robodr-responder/README.md:160-191`, `crates/robodr-firewall/README.md:194-255`, `docs/contracts/legacy/robot-edr.control-plane.md` §10 |
-| R2 | 🟡 **Kısmen çözüldü:** kontrol düzlemi v2 mTLS (a158536); uplink ve enroll TLS. **Açık:** Kafka istemcisi (TLS/SASL yok) ve anchor receiver düz metin | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
+| R2 | 🟡 **Kodda çözüldü:** kontrol düzlemi v2 mTLS (a158536); uplink ve enroll TLS; Kafka istemcisi TLS + mTLS + SASL/SCRAM-SHA-256/512 ve anchor receiver TLS/mTLS (2026-10-30, `wt/tls`; düz TCP yalnız açıkça `allow_plaintext` ile; Kafka 3.9.1'e karşı gerçek broker testi). **Açık:** saha doğrulaması, bu yollarda CRL/OCSP yok, idempotent producer yok | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
 | R3 | ❌ **Açık.** Saha doğrulaması yok: gerçek robot, RTI Connext, SROS2/DDS-Security, donanım TPM, 72 saat soak, FP oranı ölçümü yok; Zenoh kör; Pulsar kuralları gerçek motora hiç yüklenmedi; pulsard sadece WSL2'de | `README.md` Status, `docs/SPRINTS.md` S1–S4 |
 | R4 | 🟡 **Kısmen çözüldü:** `robodr-fleet` / `robodr-enroll` robot tarafı (1de502d, inceleme 3083030); `install-bundle.sh` gerçek `dpkg` ile test edildi, format kapısı, downgrade ve güvenlik tabanı (3d36c65, ace7fba); AutoSecOps Robots sayfaları (AutoSecOps `05a431e0`); filo API'sinin SOC tarafı dalda (kayıt tek konteynerde uçtan uca, `tools/e2e/RESULTS.md`). **Açık:** SOC tarafının yayımlanması, hedef cihazda kurulum provası, staged rollout, çok kiracılık | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
 | R5 | 🟡 **Kısmen çözüldü:** uplink/finding anahtar rotasyonu ve iptal listesi dağıtımı robot tarafında (`robodr-enroll`). **Açık:** TPM, SOC tarafı, black-box anahtarı rotasyonu hâlâ elle | `crates/robodr-blackbox/README.md:670-704` |
@@ -357,8 +357,11 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > penceresi kapatıldı, `control_plane_request` fuzz hedefi, her yanıt
 > imzalı, sözleşme vektörleri. ✅ A (dalda): `tools.robodr.*` v2: mTLS,
 > imzalı istek/yanıt, executor durumları, kanıt araçları (AutoSecOps
-> `f9e334ab` → `a9fca839`). ❌ R: Kafka TLS + SASL ve anchor receiver TLS
-> yapılmadı. ❌ AC: ağ üzerinden (aynı host değil) AutoSecOps → robot döngüsü
+> `f9e334ab` → `a9fca839`). ✅ R (2026-10-30): Kafka TLS + mTLS +
+> SASL/SCRAM-SHA-256/512 (`robodr_blackbox::tls`, `src/kafka/sasl.rs`;
+> sahte broker ve gerçek Apache Kafka 3.9.1, `scripts/kafka-tls-it.sh`) ve
+> anchor receiver TLS/mTLS; düz TCP her iki yolda varsayılan olarak
+> reddedilir. ❌ Idempotent producer yapılmadı. ❌ AC: ağ üzerinden (aynı host değil) AutoSecOps → robot döngüsü
 > koşturulmadı; yalnız yerel test PKI'si ve süreç içi istemci. Kontrol
 > düzlemi v2 için bağımsız inceleme turu commit geçmişinde yok. SSRF /
 > özel CIDR allowlist'inin robot ağları için ayarı kayıtlı değil.
@@ -563,6 +566,38 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > edilemez. ❌ AC: gerçek robotta `restrict_motion` ve TTL, hedef sensör
 > kutusunda p99 ölçümü, `safe_pause` adaptörleri (Nav2 / ros2_control /
 > PX4) yok.
+>
+> **Güncelleme (2026-10-30) — Sprint 8 kalanları kodda:** ✅ ROS 2
+> `JointTrajectory` / `FollowJointTrajectory` (send_goal) gateway kanalları
+> (`ros2_joint_trajectory`, `ros2_follow_joint_trajectory_goal`): katı CDR
+> çözümü (Jazzy Fast DDS ve Cyclone DDS lab kayıtlarındaki gerçek 40
+> noktalı, 6 eklemli yörüngeler katı çözülüyor), eklem başına konum / hız /
+> ivme / efor ve nokta sayısı / süre sınırları (yapılandırmadan; hız
+> profil zarfıyla sınırlı), eklem adı karışıklığı, NaN/Inf, zamanda geri
+> giden noktalar, türetilmiş hız ve ivmeler; ihlal → PAD (ikame yok,
+> datagram / SN üretilmez), `time_scale` modunda hız/ivme ihlali yerinde
+> yavaşlatma; DATA_FRAG bastırılır; referans karşılaştırmalı rastgele
+> test ve fuzz hedefi `firewall_gw_trajectory`. ✅ Gateway bulguları
+> (`robot.gateway.*`, bulgu sözleşmesi **2.3.0**) (kural, kanal) başına
+> toplanıp `findings_socket` ile agentd'nin `gateway_feed` girdisine,
+> oradan normal bulgu hattına (kara kutu, spool, responder, korelasyon)
+> akıyor. ✅ Yürütücü hareket adaptörleri (`motion` bölümü, varsayılan
+> kapalı): `restrict_motion` gateway kısıt dosyasıyla (gateway durumundan
+> geri okuma, TTL'de kendiliğinden düşer) ve Unitree sport `SpeedLevel`
+> ile; `safe_pause` Nav2 (tüm hedefleri iptal + sıfır twist), ros2_control
+> (STRICT controller switch) ve PX4 (MAVLink 2 hold); `request_safe_state`
+> (PX4 hold/RTL, Nav2, ros2_control) ve `rollback_config` (yalnız
+> `program`, saha programı) geri alınamaz (`applied`). Her adaptör
+> sahanın `oem_validated` bayrağı olmadan reddeder; iki kişilik aksiyonlar
+> imzalı gövdede iki onaylayıcı (`approved_by`, talep eden hariç) ister;
+> adaptörün izinli güvenlik durumları uygulama anında yeniden denetlenir
+> (varsayılan: `moving_fast` iken duraklatma yok). Protokoller (asgari
+> RTPS katılımcısı, CDR, MAVLink 2) yalnız süreç içi simüle eş'lere karşı
+> test edildi. ❌ AC hâlâ açık: gerçek robotta `restrict_motion` + TTL,
+> gerçek Nav2 / ros2_control / PX4 / Unitree ile birlikte çalışma, hedef
+> sensör kutusunda p99; `rmw_fastrtps` servis istek başlığı (yalnız
+> `rmw_cyclonedds`), MAVLink imzalama, birden çok DATA'ya bölünen
+> yörüngeler desteklenmiyor.
 
 ### Sprint 9 — Filo yaşam döngüsü: kayıt, anahtar, güncelleme
 
@@ -704,8 +739,45 @@ sprint, AC'leri karşılanmadan kapanmaz.
   red-team kritik bulgu 0 açık, soak'ta veri kaybı/sızıntı yok, RC sürümü (`v1.0.0-rc.1`)
   imzalı yayınlandı.
 
-> **Durum (2026-10-26):** başlanmadı. Saha doğrulaması, soak, FP ölçümü,
-> red-team ve harici pentest yok; gerçek robot ve sensör kutusu yok.
+> **Durum (2026-10-30):** 🟡 Laboratuvar düzeyinde başladı (tek VM,
+> paylaşılan ve yüklü CPU; gerçek robot, sensör kutusu, RT çekirdek ve
+> donanım TPM yok). Ayrıntılar: `tools/e2e/RESULTS.md` ("Wave-2 soak and
+> red team") ve `tools/e2e/REDTEAM.md`.
+> - ✅ 2026-10-26: AutoSecOps'a uçtan uca akış (10 ingest doğrulaması) ve
+>   17 satırlık S11-lite red-team; F1 / F3 düzeltmeleri ve üç bağımsız
+>   inceleme turu.
+> - ✅ 2026-10-30, wave-2 başı (`1356263`): **2 saatlik simüle soak**,
+>   gerçek ikililerle: agentd (canlı yakalama, mTLS kontrol düzlemi,
+>   executor + motion adapter'ları, `gateway_feed`, mTLS uzak kafa
+>   çapası), netns köprüsünde NFQUEUE ile `robodr-firewall-gw` (Go2
+>   LowCmd 500 Hz, sport, JointTrajectory), mTLS Kafka'ya
+>   `robodr-kafka-publish`, 15 dakikada bir SOC `restrict_motion`.
+>   Çökme / yeniden başlama yok, sızıntı görülmedi (agentd tabanı
+>   ~11.9 MiB, gateway 4.2 MiB), veri kaybı yok (2946 bulgu = Kafka'ya
+>   2946, 0 dead-letter; kara kutu INTACT, CLEAN; çapa alarmı 0); 3.6 M
+>   LowCmd'den 12'si kayıp, köprü gecikmesi p50 166 µs / p99 1.7 ms.
+> - ✅ swtpm ile depo → **`robodr-deliverd` ikilisine** 12 sürümlük
+>   rollout (16 kurulum, kira yenileme), erase tetik sahteciliği, hareket
+>   halinde ertelenen / idle'da yürütülen erase, kira tekrarı: hepsi
+>   beklendiği gibi.
+> - ✅ Red-team (ikililer üzerinden): önceki R1–R6 yeniden (R6e artık
+>   yürütülüyor, `guid_only`) ve wave-2 için ~60 yeni senaryo
+>   (trajectory overshoot / stamp hileleri, gateway feed sahteciliği,
+>   WebRTC flood, onaylayıcı takma adları, kısıtlama dosyası
+>   kurcalama, executor sahteciliği, TLS slowloris, erase / kira).
+>   Bulunan 3 kusur düzeltildi (testler önce): gateway feed'de katalog
+>   dışı kural kimliği (W2-1), WebRTC flood özetinin gecikmesi (W2-2),
+>   sessiz gateway için `input_silent` yanlış alarmı (W2-3).
+> - 🟡 Açık: çok kaynaklı TLS slowloris kontrol düzlemine SOC erişimini
+>   saldırı süresince kesiyor (W2-4, Orta; `IPAddressAllow=` ile
+>   azaltılır, ürün düzeltmesi yok); bu hostta gateway paketlerin
+>   %0.46'sını 5 ms'den geç okudu → `internal_fault` Critical gürültüsü
+>   (O1, gerçek donanımda yeniden ölçülmeli; kural adı / toplama ürün
+>   kararı).
+> - ❌ 72 saat soak, gerçek robot / sensör kutusu, RT çekirdek, arm64,
+>   donanım TPM, Pulsar / eBPF, Nav2 / PX4 / Unitree eşleriyle motion
+>   adapter'ları, AutoSecOps ingest'in (R7) yeniden koşusu, harici
+>   pentest, FP < 1/robot/gün kanıtı yok; Kapı 3 AC karşılanmadı.
 
 ### Sprint 12 — Paketleme, kurulum, gözlemlenebilirlik
 
@@ -724,6 +796,22 @@ sprint, AC'leri karşılanmadan kapanmaz.
 - **AC:** Temiz bir müşteri ortamında (connected + air-gapped) kılavuzla < 2 saatte
   kurulum; yükseltme `rc.1 → rc.2` veri kaybısız.
 
+> **Paketleme/platform durumu (2026-10-30):** ✅ `robodr` `.deb` en eski
+> desteklenen kullanıcı alanında (Ubuntu 22.04 konteyneri, glibc 2.35,
+> amd64+arm64 yerel, `robodr-pulsard` dahil) derleniyor: Ubuntu 22.04/24.04,
+> JetPack 6, Debian 12'ye kuruluyor; `Depends:` `dpkg-shlibdeps` ile.
+> ✅ RHEL/Rocky/Alma 9 ve Fedora için RPM (Rocky Linux 9'da derlenir,
+> `.deb` ile aynı dosya ağacı, eşdeğer scriptlet'ler). ✅ CI'da
+> `package-deb` / `package-rpm` / `package-smoke` (Debian 12, Ubuntu
+> 20.04/22.04/24.04, Rocky 9, Fedora 42 konteynerlerinde gerçek apt/dnf
+> kurulumu); release.yml aynı şekilde derliyor ve imzadan önce kurulum
+> testi yapıyor; paket tutarlılık denetimi (`scripts/check-packages.py`).
+> Yerelde yalnız amd64 doğrulandı (derleme + 5 dağıtımda kurulum);
+> arm64 derlemeleri, CI ve release workflow'u henüz koşmadı (CI faturası
+> engelli). Kalan: RPM için OpenPGP imzası ve offline bundle yok;
+> `release-dry-run.sh` konteyner işlerini desteklemiyor; L4T'de harici BTF
+> denenmedi.
+>
 > **Durum (2026-10-26):** ❌ Release workflow'u hiç koşmadı, minisign
 > anahtarları yok, provenance yok, RoboDR `THIRD_PARTY_NOTICES.md` yok.
 > 🟡 AutoSecOps: Helm chart SingularityRD reposunda (AutoSecOps `b60eda05`),
@@ -776,9 +864,10 @@ ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmı�
 | Yetenek | Bugün (2026-10-26) | Kalan |
 |---|---|---|
 | DDS grafiği, rogue participant / bilinmeyen yayıncı tespiti (`rt/lowcmd` vb.) | ✅ Canlı (agentd), sentetik Cyclone trafiğiyle uçtan uca test | Gerçek Go2/G1 yakalamaları |
-| Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama; Go1 sıkıştırılmış düşük seviye çerçeve |
+| Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1, **sıkıştırılmış 614 B `LowCmd` dahil**: düzen SDK kütüphanesinin `refineCmd` makine kodundan); A2/AS2 düşük seviye tipi `unitree_go` olarak **çıkarımsal** (profil onayıyla); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama (özellikle Go1 sıkıştırılmış çerçeve, A2/AS2 tipi); Go1 sıkıştırılmış `LowState` (807 B) |
+| Go2 uygulama kanalı (WebRTC) | ✅ Oturum tespiti/sınıflandırma (sinyalleşme 8081/9991, STUN/TURN, DTLS başlıkları), eş atfı, bulgular `robot.unitree.webrtc_*` (sözleşme 2.3 §3d); gateway'de listesiz sinyalleşmeyi düşürme ve akış/eş bazında karantina (nft set'leri). İçerik DTLS-SRTP ile şifreli: **çözülmez** | Gerçek Go2 ile doğrulama; agentd pasif yakalamasına bağlama (şu an yalnız gateway besliyor); firmware sinyalleşme değişiklikleri |
 | Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — pasif modda kayıt; ✅ **in-path inline köprü gateway'i** (`robodr-firewall-gw`, NFQUEUE; S8) | Gerçek robot ve hedef sensör kutusunda doğrulama / gecikme ölçümü |
-| Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5/6 için statik `robodr-focal` paketi (agentd-only) | `robodr-pulsard` için BTF'li çekirdek + glibc 2.35 build; kapalı ana kontrolcü kapsanamaz |
+| Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5 için statik `robodr-focal` paketi (agentd-only); ✅ JetPack 6 için `robodr` artık Ubuntu 22.04'te (glibc 2.35, arm64 dahil, `robodr-pulsard` ile) derleniyor; BTF'siz L4T çekirdeği için harici BTF dosyası (`btf_path`, çekirdek damgası kontrolü, `pahole` prosedürü UNITREE.md 3.2.1) | Gerçek Jetson'da deneme (arm64 build ve harici BTF hiç koşmadı); JetPack 5'te `robodr-pulsard` yok (glibc 2.31 / systemd 245); kapalı ana kontrolcü kapsanamaz |
 | Agentless mod | ✅ Sensör kutusu yapılandırması, systemd drop-in, networkd/nftables örnekleri, VLAN | Referans donanım imajı (S7), sahada deneme |
 | Yanıt | ✅ İnsansıda enerji kesen aksiyon yok, ikameler onaylı, `min_motion_factor`; executor v1 (varsayılan kapalı) G1 örneğinde insansıda hiçbir ağ aksiyonu yürütmez (`fall_safe_restrict` boş) | Executor'ın gerçek robotta denenmesi; `restrict_motion` sport API adaptörü (SOC aksiyonu olarak) |
 
@@ -836,15 +925,32 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 >   **Yalnız sentetik trafik ve IDL'den türetilmiş bağımsız vektörlerle;
 >   gerçek bir Unitree yakalaması henüz yok.**
 >
+> - ✅ **Unitree kapsam boşlukları (2026-10-30, `wt/unitree`):** Go1 v3.8.6
+>   sıkıştırılmış `LowCmd` (614 B) çözülüyor — düzen başlıklarda yok, SDK'nın
+>   gönderilen statik kütüphanesindeki `refineCmd` makine kodundan okundu
+>   (motor başına 27 B; `tau`/`Kp`/`Kd` i16 sabit nokta ÷256/÷32/÷16), ofsetler
+>   testlerle sabitlendi; pasif yolda bildirilen çerçeveyle aynı kontroller,
+>   gateway'de `go1_low_cmd_compressed` kanalı (sınırlama güvenli tarafa
+>   yuvarlanır, i16 dışı değer bastırılır, tutma son kabul edilen 614 B
+>   çerçeveye yazılır). A2/AS2: kaynaklarda düşük seviye tip yok; sport
+>   durumu `unitree_go` olduğundan `unitree_go::LowCmd_` **çıkarımsal**
+>   (`inferred_idl`), `unitree_a2_lowcmd` yalnız profil robotun SEDP'sinden bu
+>   tipi kaydetmişse, `require_crc` ile ve `bypass` olmadan başlar. Go2 WebRTC:
+>   oturumlar tespit/atıf edilir, gateway'de karantinaya alınabilir; içerik
+>   çözülmez. Eski UDP'de `bms.off` (pil kapatma) artık reddediliyor. Sözleşme
+>   2.3.0'a Unitree bloğu (§3d, 7 kimlik). Hepsi yalnız sentetik çerçevelerle.
+>
 > **Kalan (dürüst durum):** firewall'ın **in-path gateway**'i artık var
 > (`robodr-firewall-gw`, S8 durumuna bakın) ama yalnız sentetik trafikle ve
 > ağ ad alanlarında test edildi; decoder'lar, kurallar
 > ve canlı yol **gerçek Go2/G1 trafiğiyle doğrulanmadı** (yalnız yayımlanmış
 > IDL, el yapımı ve bağımsız vektörler, sentetik yakalamalar); **A2 / AS2**
-> düşük seviye örneği olmadığı için motor sayısı / IDL ailesi ve modele özgü
-> kimlikler belirsiz; A1 / Aliengo / B1 çerçeve düzeni kaynaklarda yok;
-> Go1'in v3.8.6 sıkıştırılmış düşük seviye çerçevesi çözülemiyor (bulgu
-> olarak raporlanıyor); eski UDP'de gönderici kimliği yalnız IP (sahtelenebilir);
+> düşük seviye tipi çıkarımsal (gerçek robotta doğrulanmalı), motor sayısı ve
+> modele özgü kimlikler belirsiz; A1 / Aliengo / B1 çerçeve düzeni kaynaklarda yok;
+> Go1 sıkıştırılmış `LowCmd` düzeni gerçek yakalamayla doğrulanmadı,
+> sıkıştırılmış `LowState` çözülmüyor; Go2 WebRTC içeriği çözülemez (yalnız
+> oturum tespiti/karantina), WebRTC izleyicisi agentd pasif yakalamasına
+> bağlı değil; eski UDP'de gönderici kimliği yalnız IP (sahtelenebilir);
 > **ajansız sensör kutusu** referans imajı (S7) yok (örnek yapılandırma var);
 > Unitree döngü hızında **gecikme bütçesi ölçümü** yapılmadı;
 > Pulsar sensörü `robot_model` almıyor; `restrict_motion` sport API adaptörü yok.
@@ -880,7 +986,8 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 - **S11:** Go2 ve G1 üzerinde 72 saat soak, UniPwn benzeri saldırı senaryolarıyla
   red-team (izole lab, yetkili cihazlarda).
 - **Kapsam dışı (GA):** Go1 (DDS değil, eski UDP SDK), Air/Pro üzerine ajan kurulumu,
-  insansıda otomatik güvenli duruş, Go2 uygulama kanalı (WebRTC) içeriğinin çözümü.
+  insansıda otomatik güvenli duruş, Go2 uygulama kanalı (WebRTC) içeriğinin çözümü
+  (şifreli; oturum tespiti ve karantina var, bkz. yukarı).
 
 ---
 
@@ -902,7 +1009,7 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 - [ ] Harici pentest + red-team: açık Critical/High 0.
 
 **Güvenlik / tedarik zinciri**
-- [ ] Tüm ağ yolları TLS/mTLS; anahtarlar TPM'de (destekli donanımda). *(Kontrol düzlemi mTLS, uplink/enroll TLS; Kafka ve anchor düz metin; TPM yok.)*
+- [ ] Tüm ağ yolları TLS/mTLS; anahtarlar TPM'de (destekli donanımda). *(Kontrol düzlemi mTLS, uplink/enroll TLS; Kafka ve anchor TLS/mTLS (düz TCP yalnız açık `allow_plaintext` ile); TPM yok.)*
 - [ ] İmzalı, reproducible release; SBOM; cosign/SLSA provenance; SCA temiz.
 - [ ] Üretim lisans anahtarı; dev anahtarı koddan kaldırıldı.
 

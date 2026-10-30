@@ -668,3 +668,77 @@ pub fn spdp_with_locator(prefix: GuidPrefix, ip: Ipv4Addr, port: u32) -> Vec<u8>
         .data([0, 1, 0, 0xc2], 1, &[], &p)
         .finish()
 }
+
+// --- ROS 2 joint trajectories (crate::trajectory) ----------------------------
+
+/// Writer entities of the trajectory channels (participant [`PREFIX`]).
+pub const TRAJ_WRITER: [u8; 4] = [0, 0, 0x08, 0x03];
+pub const GOAL_WRITER: [u8; 4] = [0, 0, 0x09, 0x03];
+/// Joints of the trajectory fixtures: `|q| <= 2`, `|v| <= 1.5` (the
+/// envelope's `max_joint_speed` is 1.0, so 1.0 applies), `|a| <= 4`,
+/// `|effort| <= 20`.
+pub const TRAJ_JOINTS: [&str; 3] = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint"];
+pub const TRAJ_Q: f64 = 2.0;
+pub const TRAJ_V: f64 = 1.0;
+pub const TRAJ_A: f64 = 4.0;
+pub const TRAJ_EFFORT: f64 = 20.0;
+
+/// The Go2 fixture plus `/arm_trajectory` (`ros2_joint_trajectory`) and
+/// `/arm_goal` (`ros2_follow_joint_trajectory_goal`), both `joints: 3`.
+/// `edit` patches the gateway JSON first.
+pub fn trajectory_gateway(edit: impl FnOnce(&mut serde_json::Value)) -> Gateway {
+    let mut p = profile(Fixture::Go2);
+    for name in ["/arm_trajectory", "/arm_goal"] {
+        p.writer_topics.insert(name.to_string());
+        p.motion_envelopes.insert(
+            name.to_string(),
+            Envelope {
+                max_joint_speed: Some(TRAJ_V),
+                ..Default::default()
+            },
+        );
+    }
+    let mut f = firewall(Fixture::Go2);
+    for (name, w) in [("/arm_trajectory", TRAJ_WRITER), ("/arm_goal", GOAL_WRITER)] {
+        f.channels.insert(
+            name.into(),
+            ChannelSpec {
+                kind: ChannelKind::Joints { count: 3 },
+                allowed_sources: vec![guid_hex(&PREFIX, w)],
+                ..Default::default()
+            },
+        );
+    }
+    let joints: Vec<serde_json::Value> = TRAJ_JOINTS
+        .iter()
+        .map(|n| {
+            serde_json::json!({"name": n, "min_position": -TRAJ_Q, "max_position": TRAJ_Q,
+                "max_velocity": 1.5, "max_acceleration": TRAJ_A, "max_effort": TRAJ_EFFORT})
+        })
+        .collect();
+    let mut v = serde_json::to_value(serde_json::json!({
+        "mode": "enforce",
+        "profile": "/nonexistent/profile.json",
+        "firewall": "/nonexistent/firewall.json",
+        "queue": { "num": 0, "controller_port": "ctrl0", "robot_port": "robot0" },
+        "channels": [
+            {"firewall_channel": "/lowcmd", "codec": "unitree_go_lowcmd"},
+            {"firewall_channel": "/arm_trajectory", "codec": "ros2_joint_trajectory",
+             "topic": "rt/arm_controller/joint_trajectory",
+             "trajectory": {"joints": joints, "max_points": 64, "max_duration_s": 20.0}},
+            {"firewall_channel": "/arm_goal", "codec": "ros2_follow_joint_trajectory_goal",
+             "topic": "rq/arm_controller/follow_joint_trajectory/_action/send_goalRequest",
+             "trajectory": {"joints": joints, "max_points": 64, "max_duration_s": 20.0}}
+        ],
+    }))
+    .unwrap_or_default();
+    edit(&mut v);
+    let cfg = match GatewayConfig::from_json(&v.to_string()) {
+        Ok(c) => c,
+        Err(e) => panic!("fixture config: {e}"),
+    };
+    match Gateway::new(&cfg, &p, &f) {
+        Ok(g) => g,
+        Err(e) => panic!("fixture trajectory gateway: {e}"),
+    }
+}

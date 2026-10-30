@@ -38,6 +38,17 @@
 //!    quadruped) it never terminates a process and never quarantines one
 //!    without approval (see `robodr_responder::Morphology`).
 //!
+//! **Crypto-erase** (`docs/SECURE-DELIVERY.md` §7.6, Sprint 14b) is the
+//! first response that is executed. It is outside the ladder (it destroys
+//! the unit's own sealing keys and touches no actuator) and is planned by
+//! `robodr_responder::erase::plan_erase`, graded by the safety state like
+//! every action (never mid-motion). The unit delivery agent
+//! (`robodr-deliverd`) executes it under rules 1-5 above: it re-derives
+//! the plan from the trigger, acts on nothing for an unauthenticated or
+//! replayed trigger, re-reads the live safety state immediately before
+//! acting, journals the intent before the erase and reads the TPM's erase
+//! epoch back afterwards. Rule 4's "never cut power" is unaffected.
+//!
 //! [`ExecutionRequest::steps_without_approval_for`] encodes rules 1-5 and 7
 //! for the steps a real executor may request without a human: it re-derives
 //! the disposition from the plan (a mislabelled request offers nothing),

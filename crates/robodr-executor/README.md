@@ -159,6 +159,105 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
    `robodr-executor rearm --config /etc/robodr/executor.json`. So the next
    order or revert can never re-create the table the operator removed.
 
+## Motion adapters (Sprint 8)
+
+With a `motion` section in `executor.json` (example
+`config/executor.motion.example.json`; without it everything below is
+off and executor v1 behaves as before), `restrict_motion`, `safe_pause`,
+`request_safe_state` and `rollback_config` are carried out through
+**platform adapters** (`src/motion/`). Each adapter refuses to run unless
+the site set its `oem_validated: true` (`adapter_not_validated`), on top
+of every rule of the precheck (policy OEM-validated, profile locked,
+morphology, safety system not engaged, state known).
+
+| Action | Adapter | Apply (and read back) | Revert |
+|---|---|---|---|
+| `restrict_motion` | `gateway` | restriction file for `robodr-firewall-gw` (`motion.gateway.restriction_path`, expiry = TTL); the gateway's status must report its id within `verify_timeout_ms` | file removed, read back; the gateway also lifts it at its expiry on its own |
+| | `unitree_sport` | sport `SpeedLevel(speed_level)` (`rt/api/sport/request`, `unitree_api` `Request_`), the `Response_` with the same identity and code 0 | `SpeedLevel(0)` (the SDK's default level: **not** necessarily the level before; documented) |
+
+`SpeedLevel` is a firmware speed range, not a cap: on its own anyone on
+the bus can set another level. With the gateway in the path, list
+`restrict_motion: ["unitree_sport", "gateway"]` (that order is enforced):
+the gateway refuses every `SpeedLevel` while its restriction is in force
+(it applies after the level is set and is lifted before it is reset).
+Without the gateway, the level is advisory. A restriction limits commands
+decided after it is applied; a joint trajectory the controller already
+accepted keeps executing at its accepted speeds (use `safe_pause`).
+| `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel` | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
+| | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch |
+| | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
+| `request_safe_state` | `px4` (hold, or RTL when the policy's `safe_state` is `return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
+| `rollback_config` | `rollback` (`config: program`) | the site's OEM-validated program, `--verify` afterwards | not reversible: `applied`; `config: profile` is refused (`not_executor_action`: the profile's anti-rollback chain) |
+
+Gates, in order after the common ones (refusal codes): the action refused
+for the morphology (`fall_hazard`: a pause / safe state on a humanoid,
+a rollback on a robot that balances); **two people** for `safe_pause`,
+`request_safe_state` and `rollback_config` — the SOC-signed body's
+`approved_by` names at least two different people, neither the requester
+(names `[A-Za-z0-9._%+@-]{1,100}`, compared case-insensitively, the
+requester's too; a name outside that grammar refuses the order:
+`approval_missing`; checked when the executor authenticates the order;
+the on-robot planner can never order them; a revert of a `safe_pause`
+needs two too); an adapter configured (`no_adapter`) and validated
+(`adapter_not_validated`); the safety state one the adapter allows
+(`safety_state_not_allowed`; defaults: a restriction in any state the
+safety system does not own, a pause or safe state not while
+`moving_fast`, an abrupt stop at speed being a hazard; an OEM may list
+`allowed_states`) — re-checked with the state **at the moment of apply**;
+`rollback_config` only `idle` (`requires_idle`); the policy's safe
+behaviour one the adapter can carry out (`behaviour_unsupported`); the
+restriction's parameters (`invalid_order`, also for a `workspace_zone`,
+which no adapter can enforce; a factor below
+`min_motion_factor` on a balancing robot: `fall_hazard`). A control-plane
+order carries the parameters in its target (`{"kind": "motion", ...}`),
+which must equal the signed body's (`order_mismatch`); the planner's
+`limit_motion` becomes a `restrict_motion` with its factor and the
+default TTL.
+
+Lifecycle: a reversible action is journalled (`applying`) before the
+adapter is called and committed (`active`) after its read-back; a failed
+apply is undone and answered `failed`. TTL expiry, a revert, restart
+reconciliation (expired, interrupted or reverting entries), an operator's
+emergency disable and a failed re-arm after a reboot call the adapter's
+undo; a failed undo leaves the action `reverting` and is retried every
+tick. After a reboot a held motion action is re-applied only when re-armed
+(fresh safety state, and one its adapters allow: a `safe_pause` held while
+the robot moves fast stays held until it does not). The periodic read-back re-writes a restriction the
+gateway no longer reports. Non-reversible actions are journalled as an
+event before the adapter is called and finish `applied` or `failed`.
+
+The ROS 2 adapters' participant uses `ros2.participant_prefix` (24 hex
+digits) when set, so commissioning can profile the executor's host on the
+robot's bus; otherwise a fresh random prefix per call, which agentd's
+sensor reports as an unknown participant. Each call announces fresh
+writer / reader entities (no reused sequence numbers). Correlation ids
+(service client id and sequence number, Unitree request id) are random per
+call, and with `ros2.peer_participant_prefix` (the robot participant's 24
+hex digits, recommended) only the peer's own writers can answer: a forged
+reply then needs both the peer's prefix and the id from the request on
+the wire. Source ports are not checked (Fast DDS sends from an ephemeral
+socket). PX4: only a `COMMAND_ACK` naming the executor's own
+`system_id` / `component_id` counts (an autopilot that leaves the target
+fields zero is not confirmed: the call fails), and the mode is confirmed
+by the vehicle's `HEARTBEAT`. The rollback program receives the version
+as one `--to-version=<v>` argument; a version starting with `-` is
+refused (`invalid_order`).
+
+Protocols (implemented here, std only): a minimal RTPS 2.3 participant
+(`src/motion/rtps.rs`: SPDP / SEDP announcements to one configured peer,
+reliable writers re-sending until answered, replies read with
+`robodr-rtps`), CDR (`src/motion/cdr.rs`), the `rmw_cyclonedds` service
+request header (the only RMW implemented: `rmw: cyclonedds`), the Unitree
+SDK request / response, and MAVLink 2 (`src/motion/mavlink.rs`: unsigned
+frames only; signed frames are refused). **Verified only against
+in-process simulated peers** (`src/motion_tests.rs`: a gateway using
+`robodr-firewall-gw`'s own restriction parser, ROS 2 / Unitree peers
+parsing our RTPS with `robodr-rtps`, a PX4 speaking MAVLink): not against
+a real Nav2, ros2_control, Unitree robot or PX4 (README "Limits"). The
+systemd unit denies IP; a site with ROS 2 / PX4 adapters adds the
+`40-motion.conf.example` drop-in (AF_INET, `IPAddressAllow=` the peers,
+the gateway's restriction directory).
+
 ## Restart, crash and reboot
 
 Writes to `journal.json` are atomic and write-ahead. At start
@@ -596,6 +695,20 @@ and `src/config.rs` for every field and its limits. agentd's side is the
 
 ## Limits (v1)
 
+* **Motion adapters (Sprint 8) are verified only synthetically.** Every
+  protocol (RTPS discovery and reliable writer, CDR layouts of `Twist`,
+  `CancelGoal`, `SwitchController` Jazzy / Humble, the Unitree
+  `Request_` / `Response_`, MAVLink 2) is tested against in-process
+  simulated peers, never against a real Nav2, ros2_control, Unitree robot
+  or PX4. Not implemented: `rmw_fastrtps` service requests (its request
+  header travels in the inline QoS; `rmw: cyclonedds` only), ACKNACK
+  processing (the reliable writer re-sends until the reply arrives),
+  DATA_FRAG of our own samples (requests are small), MAVLink signing
+  (signed frames are refused). Nav2 and PX4 pauses are not latches: a new
+  goal or a mode change by someone else moves the robot again (combine
+  with the gateway's restriction). Unitree `SpeedLevel` is reverted to 0,
+  not to the level before. The rollback adapter runs the site's program
+  with the executor's privileges (systemd drop-in).
 * **Not run on a robot or under systemd.** The unit passes
   `systemd-analyze verify` (systemd 255); its syscall filter and
   `ProtectKernelModules=` have not been exercised with `nft` under

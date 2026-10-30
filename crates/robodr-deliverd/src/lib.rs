@@ -30,9 +30,16 @@
 //! ([`findings`]). [`replay`] is the small helper that replays recorded
 //! safety reports into agentd's `safety_feed` socket (tests, demos).
 //!
-//! Not here: sealed RPKs and TPM-held keys (13c), the depot and LAN
-//! delivery (14a), OS A/B updates (14c), and the kinds `oci-image`,
-//! `model`, `robodr-profile` and `os-image` (refused as `unsupported`).
+//! Sealed RPKs (13c, [`sealing`]): a sealed `files`, `model` or `config`
+//! RPK is staged by unwrapping its content key with the unit's UWK
+//! (`robodr-seal`: TPM under the signed PCR policy, or the fallback key on
+//! the runtime volume) and opening its chunks straight into the sealed
+//! runtime volume; every `model` is installed there too. `robodr-deliverd
+//! erase` crypto-erases the unit's keys.
+//!
+//! Not here: the depot and LAN delivery (14a), the lease and executed
+//! erase triggers (14b), OS A/B updates (14c), and the kinds `oci-image`,
+//! `robodr-profile` and `os-image` (refused as `unsupported`).
 
 // S10: `unsafe` is denied crate-wide; the items that need it (FFI to
 // libc, which std already links: `kill(2)`, `prctl`, `setrlimit`, `setsid` and `getsid` in
@@ -61,6 +68,7 @@ pub mod clock;
 pub mod config;
 pub mod debfs;
 pub mod engine;
+pub mod erasex;
 pub mod fault;
 pub mod fdio;
 pub mod findings;
@@ -69,12 +77,14 @@ pub mod health;
 pub mod highwater;
 pub mod install;
 pub mod journal;
+pub mod lan;
 pub mod media;
 pub mod rekey;
 pub mod replay;
 pub mod rules;
 pub mod runner;
 pub mod safety;
+pub mod sealing;
 pub mod state;
 pub mod store;
 pub mod users;

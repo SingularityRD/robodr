@@ -17,8 +17,10 @@
 //!
 //! One request per TCP connection: a single JSON line (at most
 //! [`MAX_FRAME`] bytes, newline-terminated), answered by a single JSON line.
-//! No TLS stack is available without new crates, so everything that
-//! matters is authenticated at the application layer with Ed25519:
+//! The connection is TLS (see "Transport" below) unless plain TCP is
+//! explicitly allowed; either way everything that matters is also
+//! authenticated at the application layer with Ed25519, so the guarantees
+//! below hold even over plain TCP:
 //!
 //! - **advance** `{"protocol","op":"advance","mark":{..}}`. The mark is a
 //!   [`RemoteMark`]: the recorder's [`Checkpoint`] (chain id, seq, record
@@ -46,6 +48,25 @@
 //!   unit's mark. It can drop or garble the answer: that is an anchor
 //!   *failure* (counted, named in the signed `Resume` record), never "no
 //!   anchor".
+//!
+//! # Transport
+//!
+//! **TLS by default** ([`crate::tls`]: rustls, TLS 1.3 / 1.2): the client
+//! ([`RemoteAnchorConfig::tls`]) verifies the receiver's certificate
+//! against the configured CA file only (chain, validity, `serverAuth`, the
+//! server name: the address's host or `server_name`), optionally pins its
+//! SPKI and presents a client certificate; the receiver
+//! ([`ServeOptions::tls`]) can require one (mutual TLS, `client_ca`). TLS
+//! adds confidentiality (marks are no longer readable on the wire), makes a
+//! man-in-the-middle unable to drop or fake answers silently (it can still
+//! cut the connection, which is an anchor failure), and with mutual TLS
+//! keeps unknown hosts from reaching the request parser at all.
+//!
+//! Plain TCP is **refused** on both sides unless explicitly allowed
+//! ([`RemoteAnchorConfig::allow_plaintext`], [`ServeOptions::allow_plaintext`]).
+//! There is no fallback: a TLS client never retries in plain TCP and a TLS
+//! receiver never answers a plain-TCP request (a downgrade is a failed
+//! handshake, an anchor failure on the unit).
 //!
 //! # Receiver rule (per unit)
 //!
@@ -85,7 +106,7 @@
 //! not retried. A delivery failure is reported by the next `advance` call
 //! (so the recorder counts it as an anchor failure, one mark late).
 //! [`RemoteHeadAnchor::current`] (once, at open) is synchronous and bounded
-//! by about three times the configured timeout, DNS included (it runs on a
+//! by about three (TLS: four) times the configured timeout, DNS included (it runs on a
 //! helper thread). Dropping the anchor makes one last bounded attempt to
 //! deliver a pending mark (the recorder's final mark at close).
 //!
@@ -116,14 +137,19 @@
 //!   aside on the receiver when its key changes.
 //! - The receiver's own state is only as safe as its host. Its signing key
 //!   stays there (0600); the units hold only its public half.
-//! - No transport confidentiality: marks (hashes, seqs) are visible on the
-//!   wire. They reveal no evidence content.
+//! - With `allow_plaintext` there is no transport confidentiality: marks
+//!   (hashes, seqs) are visible on the wire. They reveal no evidence
+//!   content.
+//! - Mutual TLS authenticates the host, not the unit: any client
+//!   certificate the receiver's `client_ca` accepts may send marks for any
+//!   configured unit; they still have to verify under that unit's key.
 
 use crate::crypto::{fill_random, from_hex, hash_from_hex, to_hex};
 use crate::export::Checkpoint;
 use crate::record::{signing_message, Hash, MAX_SIG_LEN};
 use crate::sign::{Signer, Verifier, MAX_KEY_ID_LEN};
 use crate::store::{atomic_write, lock_file, read_state, AnchoredHead, Error, HeadAnchor};
+use crate::tls::DeadlineTcp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -584,16 +610,28 @@ fn read_frame(r: &mut impl Read, deadline: Instant) -> Result<Vec<u8>, FrameErro
     }
 }
 
-/// One request/answer exchange with bounded connect, write and read.
-fn exchange(address: &str, line: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+/// One request/answer exchange with bounded connect, (TLS handshake,)
+/// write and read.
+fn exchange(cfg: &RemoteAnchorConfig, line: &str) -> Result<Vec<u8>, String> {
+    let (address, timeout) = (cfg.address.as_str(), cfg.timeout);
+    if cfg.tls.is_none() && !cfg.allow_plaintext {
+        return Err("plain TCP is not allowed (configure TLS)".into());
+    }
     let addrs: Vec<SocketAddr> = address
         .to_socket_addrs()
         .map_err(|e| format!("resolving {address}: {e}"))?
         .collect();
+    // Connect: all addresses together within one timeout.
+    let connect_end = Instant::now() + timeout;
     let mut last = format!("{address}: no address");
     let mut stream = None;
     for a in addrs {
-        match TcpStream::connect_timeout(&a, timeout) {
+        let left = connect_end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            last = format!("{address}: connect timed out");
+            break;
+        }
+        match TcpStream::connect_timeout(&a, left) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -601,17 +639,36 @@ fn exchange(address: &str, line: &str, timeout: Duration) -> Result<Vec<u8>, Str
             Err(e) => last = format!("connecting to {a}: {e}"),
         }
     }
-    let mut s = stream.ok_or(last)?;
-    let io = |e: io::Error| format!("{address}: {e}");
-    s.set_read_timeout(Some(timeout)).map_err(io)?;
-    s.set_write_timeout(Some(timeout)).map_err(io)?;
+    let s = stream.ok_or(last)?;
     let _ = s.set_nodelay(true);
+    // Everything after the connect shares one deadline (review F2): each
+    // read and write re-arms the socket timeout with the time left, so a
+    // peer that trickles bytes cannot stretch the exchange.
+    let end = Instant::now() + timeout * if cfg.tls.is_some() { 3 } else { 2 };
     let mut req = Vec::with_capacity(line.len() + 1);
     req.extend_from_slice(line.as_bytes());
     req.push(b'\n');
-    s.write_all(&req).map_err(io)?;
-    s.flush().map_err(io)?;
-    read_frame(&mut s, Instant::now() + timeout).map_err(|e| format!("{address}: answer: {e}"))
+    let io = |e: io::Error| format!("{address}: {}", crate::tls::describe(&e));
+    match &cfg.tls {
+        None => {
+            let mut d = DeadlineTcp::new(s);
+            d.set_deadline(end);
+            d.write_all(&req).map_err(io)?;
+            d.flush().map_err(io)?;
+            read_frame(&mut d, end).map_err(|e| format!("{address}: answer: {e}"))
+        }
+        Some(tls) => {
+            let name = tls.name_for(crate::tls::host_of(address))?;
+            let mut t = crate::tls::connect_client(s, tls, name, end)
+                .map_err(|e| format!("{address}: {e}"))?;
+            t.write_all(&req).map_err(io)?;
+            t.flush().map_err(io)?;
+            let r = read_frame(&mut t, end).map_err(|e| format!("{address}: answer: {e}"));
+            t.conn.send_close_notify();
+            let _ = t.conn.complete_io(&mut t.sock);
+            r
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,19 +765,35 @@ struct AlertJson<'a> {
     offered_seq: Option<u64>,
 }
 
-/// Connection limits of [`AnchorReceiver::serve`].
+/// Connection limits and transport of [`AnchorReceiver::serve`].
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub max_connections: usize,
-    /// Bound on reading one request (from accept to its newline).
+    /// Bound on reading one request (from accept to its newline, the TLS
+    /// handshake included).
     pub io_timeout: Duration,
+    /// TLS server configuration ([`crate::tls::load_server`]); with a
+    /// `client_ca` it requires client certificates (mutual TLS).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Serve plain TCP when `tls` is `None` (default `false`: refused).
+    pub allow_plaintext: bool,
+    /// Most connections open at once from one source address (default
+    /// [`DEFAULT_MAX_CONNECTIONS_PER_SOURCE`]): one host cannot take every
+    /// slot, before or after authenticating.
+    pub max_connections_per_source: usize,
 }
+
+/// Default of [`ServeOptions::max_connections_per_source`].
+pub const DEFAULT_MAX_CONNECTIONS_PER_SOURCE: usize = 8;
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             io_timeout: DEFAULT_IO_TIMEOUT,
+            tls: None,
+            allow_plaintext: false,
+            max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
         }
     }
 }
@@ -733,6 +806,8 @@ pub struct AnchorReceiver {
     signer: Mutex<Box<dyn Signer>>,
     alerts_lock: Mutex<u64>,
     log: LogFn,
+    /// Failed TLS handshakes (logged: the first 16, then at powers of two).
+    tls_failures: std::sync::atomic::AtomicU64,
     _lock: File,
 }
 
@@ -824,12 +899,19 @@ impl AnchorReceiver {
             signer: Mutex::new(signer),
             alerts_lock: Mutex::new(alerts_len),
             log,
+            tls_failures: std::sync::atomic::AtomicU64::new(0),
             _lock: lock_f,
         };
         for (unit, e) in broken {
             r.write_alert(&unit, "state_unusable", &e, None, None);
         }
         Ok(r)
+    }
+
+    /// TLS handshakes that failed since start (no, unknown or expired
+    /// client certificate, plain TCP, scanners).
+    pub fn tls_handshake_failures(&self) -> u64 {
+        self.tls_failures.load(Ordering::Relaxed)
     }
 
     /// The configured units.
@@ -1055,18 +1137,62 @@ impl AnchorReceiver {
         }
     }
 
-    fn connection(&self, mut s: TcpStream, io_timeout: Duration) {
+    fn connection(
+        &self,
+        s: TcpStream,
+        io_timeout: Duration,
+        tls: Option<Arc<rustls::ServerConfig>>,
+        peer: SocketAddr,
+    ) {
         let _ = s.set_nonblocking(false);
-        let _ = s.set_read_timeout(Some(io_timeout));
-        let _ = s.set_write_timeout(Some(io_timeout));
         let _ = s.set_nodelay(true);
-        let answer = match read_frame(&mut s, Instant::now() + io_timeout) {
-            Ok(line) => self.handle(&line),
-            Err(FrameError::TooLarge) => error_line(&format!("request exceeds {MAX_FRAME} bytes")),
-            Err(_) => return,
+        // Review F1: `io_timeout` bounds the request as a whole (TLS
+        // handshake included): every read and write re-arms the socket
+        // timeout with the time left, so a trickling peer is cut. Writing
+        // the answer gets its own `io_timeout`.
+        let deadline = Instant::now() + io_timeout;
+        let answer = |r: Result<Vec<u8>, FrameError>| match r {
+            Ok(line) => Some(self.handle(&line)),
+            Err(FrameError::TooLarge) => {
+                Some(error_line(&format!("request exceeds {MAX_FRAME} bytes")))
+            }
+            Err(_) => None,
         };
-        let _ = s.write_all(&answer);
-        let _ = s.flush();
+        match tls {
+            None => {
+                let mut s = DeadlineTcp::new(s);
+                s.set_deadline(deadline);
+                if let Some(a) = answer(read_frame(&mut s, deadline)) {
+                    s.set_deadline(Instant::now() + io_timeout);
+                    let _ = s.write_all(&a);
+                    let _ = s.flush();
+                }
+            }
+            Some(cfg) => {
+                let mut t = match crate::tls::accept_server(s, cfg, deadline) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // A failed handshake (no / unknown client
+                        // certificate, plain TCP, scanner) never reaches
+                        // the request parser.
+                        let n = self.tls_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 16 || n.is_power_of_two() {
+                            (self.log)(&format!(
+                                "robodr-anchor-receiver: {peer}: {e} ({n} failed handshakes)"
+                            ));
+                        }
+                        return;
+                    }
+                };
+                if let Some(a) = answer(read_frame(&mut t, deadline)) {
+                    t.sock.set_deadline(Instant::now() + io_timeout);
+                    let _ = t.write_all(&a);
+                    let _ = t.flush();
+                }
+                t.conn.send_close_notify();
+                let _ = t.conn.complete_io(&mut t.sock);
+            }
+        }
     }
 
     /// Accept connections on `listener` until `stop` is set: one thread per
@@ -1078,15 +1204,31 @@ impl AnchorReceiver {
         opts: &ServeOptions,
         stop: &AtomicBool,
     ) -> io::Result<()> {
-        struct Active(Arc<AtomicUsize>);
+        type PerSource = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
+        struct Active(Arc<AtomicUsize>, PerSource, std::net::IpAddr);
         impl Drop for Active {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::SeqCst);
+                let mut m = lock(&self.1);
+                if let Some(n) = m.get_mut(&self.2) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        m.remove(&self.2);
+                    }
+                }
             }
+        }
+        if opts.tls.is_none() && !opts.allow_plaintext {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the anchor receiver serves TLS only unless plain TCP is explicitly allowed",
+            ));
         }
         listener.set_nonblocking(true)?;
         let active = Arc::new(AtomicUsize::new(0));
+        let per_source: PerSource = Arc::new(Mutex::new(HashMap::new()));
         let max = opts.max_connections.max(1);
+        let max_src = opts.max_connections_per_source.max(1);
         let mut warned_full = false;
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -1103,15 +1245,27 @@ impl AnchorReceiver {
                         continue;
                     }
                     warned_full = false;
+                    let src = peer.ip();
+                    {
+                        let mut m = lock(&per_source);
+                        let n = m.entry(src).or_insert(0);
+                        if *n >= max_src {
+                            drop(m);
+                            drop(s);
+                            continue;
+                        }
+                        *n += 1;
+                    }
                     active.fetch_add(1, Ordering::SeqCst);
-                    let guard = Active(Arc::clone(&active));
+                    let guard = Active(Arc::clone(&active), Arc::clone(&per_source), src);
                     let me = Arc::clone(self);
                     let t = opts.io_timeout;
+                    let tls = opts.tls.clone();
                     let r = std::thread::Builder::new()
                         .name("anchor-conn".into())
                         .spawn(move || {
                             let _g = guard;
-                            me.connection(s, t);
+                            me.connection(s, t, tls, peer);
                         });
                     if let Err(e) = r {
                         (self.log)(&format!("robodr-anchor-receiver: spawning: {e}"));
@@ -1218,17 +1372,25 @@ pub struct RemoteAnchorConfig {
     pub address: String,
     /// This unit's id at the receiver (agentd: the robot id).
     pub unit: String,
-    /// Bound on connect, on write and on read, each.
+    /// Bound on connect, on the TLS handshake, on write and on read, each.
     pub timeout: Duration,
+    /// TLS to the receiver ([`crate::tls::load_client`]).
+    pub tls: Option<crate::tls::ClientTls>,
+    /// Use plain TCP when `tls` is `None` (default `false`:
+    /// [`RemoteHeadAnchor::new`] refuses a configuration without TLS).
+    pub allow_plaintext: bool,
 }
 
 impl RemoteAnchorConfig {
-    /// [`DEFAULT_TIMEOUT`].
+    /// [`DEFAULT_TIMEOUT`], no TLS and plain TCP not allowed: set
+    /// [`Self::tls`] (or, for a lab, [`Self::allow_plaintext`]).
     pub fn new(address: impl Into<String>, unit: impl Into<String>) -> Self {
         Self {
             address: address.into(),
             unit: unit.into(),
             timeout: DEFAULT_TIMEOUT,
+            tls: None,
+            allow_plaintext: false,
         }
     }
 }
@@ -1242,6 +1404,12 @@ struct Slot {
     failures: u64,
     shutdown: bool,
     worker_gone: bool,
+    /// When the delivery attempt in progress started (backstop: one that
+    /// outlives its bound, e.g. a hanging name lookup, is reported as a
+    /// failure by `advance`).
+    attempt_since: Option<Instant>,
+    /// That overdue attempt was already counted.
+    attempt_reported: bool,
 }
 
 struct Shared {
@@ -1255,8 +1423,7 @@ enum SendError {
 }
 
 fn send_mark(cfg: &RemoteAnchorConfig, m: &RemoteMark) -> Result<(), SendError> {
-    let raw =
-        exchange(&cfg.address, &m.to_request_line(), cfg.timeout).map_err(SendError::Transport)?;
+    let raw = exchange(cfg, &m.to_request_line()).map_err(SendError::Transport)?;
     let r: ResponseJson = serde_json::from_slice(&raw)
         .map_err(|_| SendError::Transport("malformed answer".into()))?;
     if r.protocol != PROTOCOL {
@@ -1294,8 +1461,14 @@ fn worker(shared: Arc<Shared>, cfg: RemoteAnchorConfig, done: mpsc::Sender<()>) 
                 s = shared.cv.wait(s).unwrap_or_else(|p| p.into_inner());
             }
         };
+        {
+            let mut s = lock(&shared.slot);
+            s.attempt_since = Some(Instant::now());
+            s.attempt_reported = false;
+        }
         let res = send_mark(&cfg, &mark);
         let mut s = lock(&shared.slot);
+        s.attempt_since = None;
         let same = |s: &Slot| s.pending.as_ref().map(|p| p.seq) == Some(mark.seq);
         match res {
             Ok(()) => {
@@ -1370,6 +1543,11 @@ impl RemoteHeadAnchor {
                 cfg.unit
             )));
         }
+        if cfg.tls.is_none() && !cfg.allow_plaintext {
+            return Err(Error::Config(
+                "remote anchor: no TLS configured and plain TCP not explicitly allowed".into(),
+            ));
+        }
         if cfg.timeout.is_zero() || cfg.timeout > Duration::from_secs(60) {
             return Err(Error::Config(
                 "remote anchor timeout must be in (0, 60 s]".into(),
@@ -1403,6 +1581,15 @@ impl RemoteHeadAnchor {
             shared,
             done: Mutex::new(Some(rx)),
         })
+    }
+
+    /// Bounded steps of one exchange: connect, (TLS handshake,) write, read.
+    fn steps(&self) -> u32 {
+        if self.cfg.tls.is_some() {
+            4
+        } else {
+            3
+        }
     }
 
     /// Highest seq the receiver accepted from this process.
@@ -1515,6 +1702,20 @@ impl HeadAnchor for RemoteHeadAnchor {
         }
         s.pending = Some(m);
         self.shared.cv.notify_all();
+        let bound = self.cfg.timeout * self.steps() + Duration::from_secs(1);
+        if !s.attempt_reported
+            && s.attempt_since
+                .is_some_and(|t| t.elapsed() > bound && s.error.is_none())
+        {
+            s.attempt_reported = true;
+            s.failures += 1;
+            return Err(format!(
+                "remote anchor {}: a delivery attempt has not finished within {} ms \
+                 (name lookup or network stalled)",
+                self.cfg.address,
+                bound.as_millis()
+            ));
+        }
         match s.error.take() {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1530,10 +1731,10 @@ impl HeadAnchor for RemoteHeadAnchor {
         std::thread::Builder::new()
             .name("remote-anchor-q".into())
             .spawn(move || {
-                let _ = tx.send(exchange(&cfg.address, &line, cfg.timeout));
+                let _ = tx.send(exchange(&cfg, &line));
             })
             .map_err(|e| format!("remote anchor: {e}"))?;
-        let bound = self.cfg.timeout * 3 + Duration::from_millis(100);
+        let bound = self.cfg.timeout * self.steps() + Duration::from_millis(100);
         let raw = rx
             .recv_timeout(bound)
             .map_err(|_| {
@@ -1557,7 +1758,7 @@ impl Drop for RemoteHeadAnchor {
         }
         // One last bounded delivery attempt of a pending mark.
         if let Some(rx) = lock(&self.done).take() {
-            let _ = rx.recv_timeout(self.cfg.timeout * 3 + Duration::from_millis(200));
+            let _ = rx.recv_timeout(self.cfg.timeout * self.steps() + Duration::from_millis(200));
         }
     }
 }
@@ -1929,6 +2130,9 @@ mod tests {
                 &ServeOptions {
                     max_connections: 4,
                     io_timeout,
+                    tls: None,
+                    allow_plaintext: true,
+                    ..ServeOptions::default()
                 },
                 &s2,
             )
@@ -1945,6 +2149,7 @@ mod tests {
     fn client(addr: &str, timeout: Duration) -> RemoteHeadAnchor {
         let mut c = RemoteAnchorConfig::new(addr, "ugv-07");
         c.timeout = timeout;
+        c.allow_plaintext = true;
         RemoteHeadAnchor::new(
             c,
             Box::new(receiver_key().verifying_key()),
@@ -2063,6 +2268,7 @@ mod tests {
         let mk = |a: &str, t: Duration| {
             let mut c = RemoteAnchorConfig::new(a, "ugv-07");
             c.timeout = t;
+            c.allow_plaintext = true;
             RemoteHeadAnchor::new(c, rv(), Box::new(k()))
         };
         assert!(mk("127.0.0.1:1", Duration::from_secs(1)).is_ok());

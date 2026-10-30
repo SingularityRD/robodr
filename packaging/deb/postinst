@@ -62,6 +62,11 @@ configure)
         fi
         adduser robodr-agentd robodr >/dev/null
         getent group robodr-safety >/dev/null || addgroup --system robodr-safety
+        if ! getent passwd robodr-depot >/dev/null; then
+            adduser --system --group --home /var/lib/robodr/depot --no-create-home \
+                --shell /usr/sbin/nologin robodr-depot
+        fi
+        adduser robodr-depot robodr >/dev/null
     fi
     # Upgrade from a version where robodr-agentd ran as robodr (review H1):
     # agentd's own trees move to its own user before tmpfiles sets the
@@ -103,7 +108,8 @@ configure)
             # Upgrade: restart only what was running.
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
                 robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
-                robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service; do
+                robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service \
+                robodr-depot.service; do
                 systemctl try-restart "$u" || true
             done
         else

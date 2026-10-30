@@ -60,7 +60,8 @@ fn rules_of(o: &robodr_ros2_pipeline::ProcessOutput) -> Vec<(String, Severity)> 
 
 /// H1: every real Go1 low-level command is sent in the 614-byte compressed
 /// form (`comm.h`). Such a frame from a host that is not a listed command
-/// sender is a Critical unknown-sender finding, not only "undecodable".
+/// sender is a Critical unknown-sender finding. Since the compressed layout
+/// is decoded (`LegacyLowCmdCompressed`), it is also inspected.
 #[test]
 fn compressed_low_cmd_from_unknown_host_is_critical() {
     let mut p = legacy_pipeline();
@@ -77,11 +78,13 @@ fn compressed_low_cmd_from_unknown_host_is_critical() {
         "{r:?}"
     );
     assert!(
-        r.iter()
+        !r.iter()
             .any(|(id, _)| id == rules::MOTION_UNDECODABLE_SAMPLE),
-        "still reported as not inspected: {r:?}"
+        "the compressed LowCmd is decoded now: {r:?}"
     );
     assert_eq!(p.stats().legacy.unknown_sender, 1);
+    assert_eq!(p.stats().legacy.commands, 1);
+    assert_eq!(p.stats().legacy.undecodable, 0);
     // From the listed sender: only "not inspected".
     let o = p.process_legacy_at(&[0x5a; 614], OPERATOR, &to_low_server(), Instant::now(), 2);
     let r = rules_of(&o);
@@ -329,4 +332,73 @@ fn legacy_low_cmd_carries_its_joint_frame() {
         robodr_cdr::unitree_legacy::LEGACY_MOTORS
     );
     assert_eq!(j.crc_ok, None);
+}
+
+/// A compressed `LowCmd` (614 bytes, the library's `refineCmd` layout) gets
+/// the same motion checks as the declared one: its fixed-point torque over
+/// the profile's joint envelope is a finding, the motion sample carries the
+/// 20-slot joint frame, and a compressed `LowState` (807 bytes) is still
+/// reported as not inspected.
+#[test]
+fn compressed_low_cmd_gets_the_declared_motion_checks() {
+    use robodr_cdr::unitree_legacy::{compressed_layout as L, LEGACY_LOW_CMD_COMPRESSED_LEN};
+    let mut profile = go1_profile();
+    profile.motion_envelopes.insert(
+        channels::LOW_CMD.into(),
+        Envelope {
+            max_joint_speed: Some(20.0),
+            max_joint_torque: Some(30.0),
+            max_joint_kp: Some(100.0),
+            max_joint_position_step: Some(0.5),
+            ..Default::default()
+        },
+    );
+    let mut p = Pipeline::new(
+        profile,
+        PipelineOptions {
+            legacy: LegacyOptions {
+                enabled: true,
+                command_senders: [OPERATOR.parse().unwrap()].into_iter().collect(),
+                ..LegacyOptions::default()
+            },
+            ..Default::default()
+        },
+    );
+    let frame = |tau: i16| {
+        let mut f = vec![0u8; LEGACY_LOW_CMD_COMPRESSED_LEN];
+        f[2] = 0xff;
+        let m = L::MOTOR_AT + 2 * L::MOTOR_LEN;
+        f[m] = 0x0A;
+        f[m + L::M_TAU..m + L::M_TAU + 2].copy_from_slice(&tau.to_le_bytes());
+        f[m + L::M_KP..m + L::M_KP + 2].copy_from_slice(&(20i16 * 32).to_le_bytes());
+        f
+    };
+    let t0 = Instant::now();
+    // 10 N.m: inside the envelope.
+    let o = p.process_legacy_at(&frame(10 * 256), OPERATOR, &to_low_server(), t0, 1);
+    assert!(o.findings.is_empty(), "{:?}", rules_of(&o));
+    assert_eq!(o.motion.len(), 1);
+    assert_eq!(o.motion[0].topic, channels::LOW_CMD);
+    let j = o.motion[0].joint.as_ref().expect("joint frame");
+    assert_eq!(j.frame.as_slice().len(), 20);
+    assert_eq!(j.frame.as_slice()[2].tau, 10.0);
+    // 60 N.m: over the envelope.
+    let o = p.process_legacy_at(&frame(60 * 256), OPERATOR, &to_low_server(), t0, 2);
+    let r = rules_of(&o);
+    assert!(
+        r.iter()
+            .any(|(id, _)| id == "robot.motion.joint_over_envelope"),
+        "{r:?}"
+    );
+    // The compressed LowState from the robot: not inspected.
+    let robot_to_pc = LegacyUdp::new(8007, 8080, OPERATOR.parse().unwrap());
+    let o = p.process_legacy_at(&[0x5a; 807], ROBOT, &robot_to_pc, t0, 3);
+    let r = rules_of(&o);
+    assert!(
+        r.iter()
+            .any(|(id, _)| id == rules::MOTION_UNDECODABLE_SAMPLE),
+        "{r:?}"
+    );
+    let st = p.stats().legacy;
+    assert_eq!((st.commands, st.undecodable), (2, 1));
 }

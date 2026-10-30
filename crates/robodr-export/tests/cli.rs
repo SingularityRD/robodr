@@ -23,7 +23,13 @@ fn usage_errors_exit_2() {
         assert_eq!(o.status.code(), Some(2), "{bin}");
     }
     let o = Command::new(PUBLISH)
-        .args(["--bootstrap", "x:1", "--state-dir", "/tmp/x"])
+        .args([
+            "--bootstrap",
+            "x:1",
+            "--allow-plaintext",
+            "--state-dir",
+            "/tmp/x",
+        ])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
@@ -83,7 +89,12 @@ fn export_then_publish_spool_once() {
     }
     let c = Cluster::start(1, 2);
     let o = Command::new(PUBLISH)
-        .args(["--bootstrap", &c.bootstrap()[0], "--once"])
+        .args([
+            "--bootstrap",
+            &c.bootstrap()[0],
+            "--allow-plaintext",
+            "--once",
+        ])
         .args(["--spool".as_ref(), spool.as_os_str()])
         .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
         .output()
@@ -99,7 +110,14 @@ fn export_then_publish_spool_once() {
         .unwrap();
     fs::rename(first.path(), spool.join("ready").join(first.file_name())).unwrap();
     let o = Command::new(PUBLISH)
-        .args(["--bootstrap", "127.0.0.1:1", "--once", "--retries", "1"])
+        .args([
+            "--bootstrap",
+            "127.0.0.1:1",
+            "--allow-plaintext",
+            "--once",
+            "--retries",
+            "1",
+        ])
         .args(["--spool".as_ref(), spool.as_os_str()])
         .args(["--state-dir".as_ref(), t.path().join("soc2").as_os_str()])
         .output()

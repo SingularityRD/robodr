@@ -261,9 +261,9 @@ their wire names (`robot_<name>`); it sends the plain name here.
 | `quarantine_node` | `robot_quarantine_node` | exactly one of `participant_guid` (24 or 32 lower-case hex), `node` (plain ROS 2 name) | not allowed | yes | `restrict` (participant) | single | executed |
 | `isolate_network` | `robot_isolate_network` | none | required, 1..=86400 | yes | `restrict` (network) | single | executed |
 | `record_evidence` | `robot_record_evidence` | none | not allowed | not applicable: evidence is never reverted (a revert answers `not_reversible`) | `record` | single | executed; accepted in every safety state and in observe mode |
-| `safe_pause` | `robot_safe_pause` | none | not allowed | yes | `safe_pause` | two-person | platform adapter only (OEM-validated policy); never on a humanoid |
-| `request_safe_state` | `robot_request_safe_state` | none | not allowed | no (an operator restarts) | `request_safe_state` | two-person | plan only; never on a humanoid |
-| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only; never on a humanoid or quadruped (a controller restart) |
+| `safe_pause` | `robot_safe_pause` | none | not allowed | yes | `safe_pause` | two-person | platform adapter only (OEM-validated policy and adapter, executor `motion` section, §6a); never on a humanoid |
+| `request_safe_state` | `robot_request_safe_state` | none | not allowed | no (an operator restarts) | `request_safe_state` | two-person | plan only by default; executed through an OEM-validated adapter when the executor has a `motion` section (§6a); never on a humanoid |
+| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`, not starting with `-`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only by default; `config: program` executed through the site's OEM-validated rollback adapter when the executor has a `motion` section (§6a); never on a humanoid or quadruped (a controller restart) |
 
 No action is ever autonomous: the SOC sends one only after the approval
 above. The "GA" column is the catalog's plan for the first executing
@@ -271,8 +271,21 @@ release; in this release nothing is executed (§5).
 
 `authority` must be `"request"`. `reason` ≤ 500 characters (may be empty),
 `requested_by` 1..=100 characters, neither with control characters;
-`source` `[a-z0-9_-]{1,32}`. No field can carry a motion command, a force or
-an override.
+`source` `[a-z0-9_-]{1,32}`. Optional `approved_by`: the SOC-side approvers,
+an array of at most 4 names, each `[A-Za-z0-9._%+@-]{1,100}` (user names
+and email-like identifiers such as `alice.smith+ops@soc.example`; white
+space, quotes, non-ASCII, invisible and combining characters are
+refused `invalid_field`) (since Sprint 8; §6a, "Motion adapters": the
+executor carries out `safe_pause`, `request_safe_state` and
+`rollback_config` only when it names at least two different people,
+neither the requester). Names are compared **ASCII case-insensitively**
+(`Alice@SOC` and `alice@soc` are one person), the requester's trimmed
+`requested_by` too. The names are **asserted by the SOC**: the executor
+verifies one signature, the SOC key's, over the whole body; it cannot
+tell whether two named people actually approved. The two-person rule is
+therefore as strong as the SOC's own approval workflow and the custody of
+its signing key (one compromised SOC key can name any two people). No
+field can carry a motion command, a force or an override.
 
 Body errors are answered with an HTTP error (§7) and recorded
 (`robodr.control_plane_rejected`), never judged: `unknown_action`,
@@ -370,6 +383,10 @@ request id the robot cannot reconcile is answered 503 `state_unavailable`
 | Stored request | Revert answer `status` |
 | --- | --- |
 | `request_safe_state`, `rollback_config`, `record_evidence` | `refused`, `refusal.code: not_reversible` (an operator restores the robot; evidence is never reverted) |
+
+The revert body is strict too: `{"reason"?, "requested_by", "approved_by"?}`
+(`approved_by` as in §4; the executor lifts a two-person action it
+carried out, `safe_pause`, only with two approvers, §6a).
 | `recorded_not_executed`, `refused`, `failed` | `not_applied`: it never took effect; recorded (`robodr.control_plane_revert`), `state.revert` filled (the first revert is kept, also across restarts) |
 | `pending`, `verified`, `reverted` (executor v1) | `pending` or `reverted`, see §6a |
 
@@ -396,7 +413,8 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 | `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
 | `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, the trust-boundary codes `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing`, `soc_keys_unavailable`, `approval_key_removed` (below), `locator_out_of_scope` (a participant locator outside the executor's `network.quarantine` scope), or `executor_refused` for a code this agentd does not know | yes |
 | `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
-| `recorded_not_executed` | `restrict_motion` (advisory in v1: the executor does not drive the separate motion firewall gateway, `robodr-firewall-gw`) | yes |
+| `recorded_not_executed` | `restrict_motion` when the executor has no `motion` section (advisory: the executor v1 behaviour, unchanged) | yes |
+| `applied` | (Sprint 8, executor `motion` section) `request_safe_state` / `rollback_config` carried out by their platform adapter; not reversible (`in_force: true`: the adapter did it; the platform owns the result) | yes |
 
 * **Statuses by action.**
   * `isolate_network` and `quarantine_node` (by `participant_guid`) can
@@ -421,6 +439,37 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     `robodr.evidence_mark` note naming the request's evidence is in the
     black box. It is never reverted.
   * An action the executor never carries out is `refused`.
+  * **Motion adapters** (Sprint 8, only with a `motion` section in
+    `executor.json`; without one everything above is unchanged):
+    `restrict_motion` reaches `verified` through its adapters (the
+    in-path gateway's restriction file, read back from the gateway's
+    status; the Unitree sport `SpeedLevel`) and `reverted` at its TTL or
+    by revert; `safe_pause` reaches `verified` through Nav2 (cancel every
+    goal + zero twist), ros2_control (controller switch) or PX4 (hold
+    mode), and `reverted` by a revert (two approvers) or after the
+    executor's `motion.safe_pause_ttl_s`; reverting it **releases** the
+    pause and never resumes a mission (Nav2: goals are not restored; PX4:
+    no mode change; ros2_control: the inverse switch);
+    `request_safe_state` and `rollback_config` (`config: program` only)
+    reach `applied` (terminal). The executor's order carries the
+    restriction's parameters (`max_linear_speed`, `max_joint_speed`,
+    `workspace_zone`) or the rollback's (`config`, `to_version`); they must
+    equal the signed body's (`order_mismatch`). Additional `refusal.code`s
+    of the executor: `no_adapter` (no adapter configured for the action),
+    `adapter_not_validated` (the site's `oem_validated` flag of the adapter
+    is not set), `safety_state_not_allowed` (not in a state the adapter
+    allows; by default `safe_pause` / `request_safe_state` not while
+    `moving_fast`), `requires_idle` (`rollback_config`), and
+    `behaviour_unsupported` (the policy's safe behaviour is not one the
+    adapter can carry out); `approval_missing` also when a two-person
+    action's signed body (or its revert's) does not name two approvers
+    other than the requester, and for any planner order of one;
+    `not_executor_action` for `rollback_config` of the `profile` (the
+    anti-rollback chain refuses an older profile); `fall_hazard` for a
+    restriction factor below `min_motion_factor` on a robot that
+    balances; `invalid_order` for a `restrict_motion` with
+    `workspace_zone` (no adapter enforces a zone: never silently
+    ignored).
 * **Trust boundary (executor M1).** agentd forwards the SOC's request
   with the order exactly as it was signed (method, target, the four
   credentials of §2, body). The executor verifies it itself, with its own
@@ -1192,6 +1241,41 @@ with `executor.enabled` (§6a). What a SOC client sees:
   unanswered order cannot be told apart from an executor that applied it
   and lost the answer, and resending a changed order under the same
   `request_id` could be answered `id_conflict` for an action in force.
+
+### Revision: motion adapters (Sprint 8, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`). What a SOC
+integration must change (exactly):
+
+* **Request body** (§4): new optional `approved_by` (array, at most 4
+  names, each `[A-Za-z0-9._%+@-]{1,100}`, compared case-insensitively;
+  asserted by the SOC key, §4). Send the
+  approvers of the platform sign-off there. For `safe_pause`,
+  `request_safe_state` and `rollback_config` it must name at least two
+  different people, neither `requested_by`, or the executor refuses
+  `approval_missing` (only when it executes them: with a `motion` section).
+* **Revert body** (§6): new optional `approved_by`, same rules; a revert
+  of a `safe_pause` the executor carried out needs two approvers.
+* **Statuses** (§6a): `applied` is now reported (no longer reserved) for
+  `request_safe_state` / `rollback_config` carried out by an adapter
+  (terminal, `executed: true`, `in_force: true`); `restrict_motion` can be
+  `verified` / `reverted` (instead of `recorded_not_executed`) and
+  `safe_pause` `verified` / `reverted` when the robot has the adapters.
+* **New refusal codes** (§6a): `no_adapter`, `adapter_not_validated`,
+  `safety_state_not_allowed`, `requires_idle` (now also an executor code),
+  `behaviour_unsupported`. Changed meaning: `approval_missing` (two-person
+  approvers), `order_mismatch` (restriction / rollback parameters),
+  `not_executor_action` (`rollback_config` of the profile, or no `motion`
+  section).
+* Nothing changes for a robot whose executor has no `motion` section.
+* Robot side: agentd sends the restriction / rollback parameters in the
+  order's target (`{"kind": "motion", ...}`) and turns the on-robot
+  planner's `limit_motion` into a `restrict_motion` order (factor, the
+  executor's default TTL). **Upgrade the executor first**: an older one
+  does not understand that target.
+* The answer shapes (§5 JSON) are unchanged; the control-plane test
+  vectors (`fixtures/control-plane-v2/`) are unchanged (none uses a
+  motion action with the executor).
 
 ### Revision: address-level quarantine (red-team fix review R3-1, 2026-10)
 

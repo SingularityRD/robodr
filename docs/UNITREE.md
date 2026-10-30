@@ -34,8 +34,27 @@ RoboDR decodes two generations of Unitree traffic:
   Go2-W, B2, B2-W, A2, AS2, H1, H1-2, H2, G1, R1. The low-level loop is a DDS
   writer of `rt/lowcmd`; high-level control is the request/response API on
   `rt/api/<service>/request`.
-* **Legacy UDP** (`unitree_legged_sdk` v3.8.6): Go1 high-level frames.
-  A1, Aliengo and B1 are known by frame layout only.
+* **Legacy UDP** (`unitree_legged_sdk` v3.8.6): Go1 high-level frames and
+  low-level commands in both forms: the `comm.h` struct (734 bytes) and the
+  compressed form (614 bytes) that a v3.8.6 client actually sends. The
+  compressed layout was read from the shipped library. A1, Aliengo and B1
+  are known by frame layout only.
+
+**Coverage by model** (decode = content read; enforce = the inline
+gateway can limit / hold / remove it; detect = findings only):
+
+| Model | Low-level command | High-level / API | App channel (WebRTC) |
+|---|---|---|---|
+| Go2, Go2-W, B2, B2-W | decode + enforce (`unitree_go_lowcmd`) | decode + enforce (sport `Request_`, `/cmd_vel`) | Go2: detect + attribute + block unlisted signalling + quarantine by flow (inline gateway `webrtc`); content never decoded |
+| A2, AS2 | decode + enforce (`unitree_a2_lowcmd`) **only if** the robot announces the inferred `unitree_go` `LowCmd_` (type recorded in the profile); motor count unknown | decode + enforce (sport `Request_`) | not covered (no WebRTC information for these models) |
+| H1 | decode + enforce (`unitree_go_lowcmd`, `rt/arm_sdk`) | decode + enforce (`loco`) | — |
+| H1-2, H2, G1, R1 | decode + enforce (`unitree_hg_lowcmd`, `rt/arm_sdk`, hands) | decode + enforce (loco / arm) | — |
+| Go1 | decode + enforce, declared (`go1_low_cmd`) and compressed (`go1_low_cmd_compressed`) | decode + enforce (`go1_high_cmd`) | — |
+| A1, Aliengo, B1 | detect only (sender check by length; layout not in the sources) | detect only | — |
+
+All of it is built from the SDK sources, the shipped Go1 library and
+RFCs, and tested on synthetic frames; none of it has run against a real
+robot (see [Known limits](#known-limits)).
 
 What is decoded per model (IDL family, motor slots, morphology, topics and
 API services) is the model matrix in
@@ -245,24 +264,26 @@ NVIDIA JetPack image, not on the robot model:
 | Image on the Jetson | glibc / systemd / kernel | Package | What runs |
 |---|---|---|---|
 | JetPack 5 (L4T 35.x, Ubuntu 20.04): reported as the stock image of current Go2 / G1 EDU units (check yours) | 2.31 / 245 / 5.10, usually **no BTF** | `robodr-focal` (static musl binaries, systemd 245 units) | **agentd-only EDU mode**: `robodr-agentd` and the tools; no `robodr-pulsard`, no host rules |
-| JetPack 6 (L4T 36.x, Ubuntu 22.04) | 2.35 / 249 / 5.15 | `robodr-focal` today | agentd-only EDU mode. `robodr-pulsard` with the host rules needs **both** a BTF kernel (check below) **and** a `robodr` build against glibc 2.35, which the release does not produce yet |
+| JetPack 6 (L4T 36.x, Ubuntu 22.04) | 2.35 / 249 / 5.15, BTF depends on the image | `robodr` (arm64, built in Ubuntu 22.04: `Depends: libc6 (>= 2.35)`), or `robodr-focal` | with `robodr`: `robodr-pulsard` and the host rules **if** the kernel has BTF (check below) **or** an external BTF file for the running kernel is installed (section 3.2.1); otherwise agentd-only, as with `robodr-focal` |
 
-The regular `robodr` package installs on neither: as released it is built
-on Ubuntu 24.04 and its binaries need glibc 2.39 (dpkg refuses the package,
-and ld.so would refuse the binaries), and its units use `LoadCredential=`
-(systemd 247), which JetPack 5 lacks. A `robodr` build for Ubuntu 22.04
-(glibc 2.35, with Pulsar's clang/eBPF toolchain) is an open release
-decision ([BUILD.md, arm64 section](BUILD.md#arm64-cross-compiled-2026-10-18));
-until it exists, host rules on a Jetson are not available from a release.
+Since 2026-10-30 the release builds `robodr` in an Ubuntu 22.04 userland
+(glibc 2.35, both architectures, `robodr-pulsard` included;
+[BUILD.md, "Release build userlands"](BUILD.md#release-build-userlands)),
+so it installs on JetPack 6. It does **not** install on JetPack 5: its
+units use `LoadCredential=` (systemd 247) and its binaries need glibc
+2.35. A `robodr-pulsard` for JetPack 5 (glibc 2.31, systemd 245) is not
+built.
 
 `robodr-pulsard` loads eBPF programs that need the kernel's BTF type information
-(`CONFIG_DEBUG_INFO_BTF=y`, `/sys/kernel/btf/vmlinux`); NVIDIA's L4T 35
-kernels are normally built without it, so on JetPack 5 the daemon could not
-start even if it were installed, and it is not part of `robodr-focal`.
-Rebuilding the L4T kernel with BTF is possible but is a change to the
-robot's image (and Unitree's support terms), not something RoboDR does.
-Neither the BTF status of Unitree's JetPack 6 images nor any RoboDR package
-has been checked on a real Unitree Jetson yet: run the checks below on your
+(`CONFIG_DEBUG_INFO_BTF=y`, `/sys/kernel/btf/vmlinux`); NVIDIA's L4T
+kernels are normally built without it. Without it the daemon can use an
+**external BTF file** generated for exactly the running kernel
+(section 3.2.1): Pulsar's `[pulsar] btf_path` reads the kernel types from
+that file instead, and the unit accepts either. Rebuilding the L4T kernel
+with BTF is the other way, but it changes the robot's image (and possibly
+Unitree's support terms). Neither the BTF status of Unitree's JetPack 6
+images, nor an external BTF on an L4T kernel, nor any RoboDR package has
+been checked on a real Unitree Jetson yet: run the checks below on your
 unit.
 
 1. **Check the development computer**:
@@ -277,7 +298,8 @@ unit.
    Check with Unitree whether installing software on the development
    computer affects warranty or support terms.
 2. **Install the bundle** as in step 2 of section 3.1, with the
-   `robodr-focal-<version>-arm64-offline.tar.gz` bundle (same
+   `robodr-focal-<version>-arm64-offline.tar.gz` bundle on JetPack 5, or
+   the `robodr-<version>-arm64-offline.tar.gz` bundle on JetPack 6 (same
    `install-bundle.sh install --pubkey ... --tarball ...`; it installs
    whichever package the bundle holds). `robodr` and `robodr-focal`
    conflict and replace each other, so a later move to the regular package
@@ -298,8 +320,8 @@ unit.
    the name). Install and check it as in step 6 of section 3.1. Do **not**
    install the sensor-box drop-in here. The configuration is the same for
    both packages.
-5. **Host rules (only where `robodr-pulsard` runs: a BTF kernel and the
-   regular package).** `robodr-pulsard` loads every
+5. **Host rules (only where `robodr-pulsard` runs: the regular package
+   and a BTF kernel or an external BTF file, section 3.2.1).** `robodr-pulsard` loads every
    rule under `/usr/share/robodr/rules`, including `robodr/unitree.toml`.
    Set the TUNE values (section 7) in the rule source, validate it
    (`python3 scripts/validate_rules.py --strict --pulsar-src vendor/pulsar`)
@@ -351,6 +373,94 @@ arm64 ones are static but not position-independent (the Rust
 is not address-randomised, the stack, heap and mappings are. The amd64 ones
 are static-pie. The musl resolver does not read `nsswitch.conf`: give
 `robodr-kafka-publish` IP literals (it then needs no resolver at all).
+
+#### 3.2.1 External BTF for an L4T kernel (JetPack 6, `robodr` package)
+
+Only for a kernel without `/sys/kernel/btf/vmlinux`. The file must
+describe **exactly** the running kernel build: Pulsar relocates its probes
+(CO-RE) with the field offsets it reads there, and a file from another
+build or configuration can give wrong offsets, so the probes may load and
+report garbage without any error. BTFHub does not cover NVIDIA's L4T
+kernels; the file is generated from the kernel's DWARF debug information
+with `pahole`, on a build host, from NVIDIA's sources for that L4T release.
+
+1. **On the Jetson**, record what identifies the kernel build:
+
+   ```sh
+   cat /etc/nv_tegra_release        # e.g. R36 (release), REVISION: 4.3
+   uname -r; uname -v; cat /proc/version   # release, build stamp, compiler
+   zcat /proc/config.gz > l4t.config       # the kernel's configuration
+   grep -E 'CONFIG_DEBUG_INFO_BTF|CONFIG_BPF_SYSCALL|CONFIG_BPF_EVENTS|CONFIG_KPROBE_EVENTS' l4t.config
+   ```
+
+   `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_EVENTS` and `CONFIG_KPROBE_EVENTS`
+   must be `y`; otherwise no BTF file helps.
+2. **On a build host**, unpack the kernel source of exactly that L4T
+   release (NVIDIA's "Driver Package (BSP) Sources",
+   `public_sources.tbz2` → `kernel_src.tbz2`; for a vendor image, the
+   vendor's kernel source of that image) and use the cross toolchain NVIDIA
+   documents for it (the compiler in `/proc/version`). Build `vmlinux`
+   with the Jetson's own configuration plus DWARF only:
+
+   ```sh
+   cp l4t.config .config
+   scripts/config --enable DEBUG_INFO --enable DEBUG_INFO_DWARF4 \
+       --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT --disable DEBUG_INFO_BTF
+   make ARCH=arm64 CROSS_COMPILE=aarch64-buildroot-linux-gnu- olddefconfig
+   diff <(grep -v DEBUG_INFO l4t.config) <(grep -v DEBUG_INFO .config)   # must be empty
+   make ARCH=arm64 CROSS_COMPILE=aarch64-buildroot-linux-gnu- vmlinux
+   ```
+
+   Debug information does not change type layouts; the `diff` makes sure
+   `olddefconfig` changed nothing else (if it did, the source or the
+   toolchain is not the one the image was built with: stop).
+3. **Encode the BTF** (pahole 1.22 or newer):
+
+   ```sh
+   pahole --btf_encode_detached=vmlinux.btf vmlinux
+   bpftool btf dump file vmlinux.btf format raw | head    # parses
+   printf '%s\n%s\n%s\n' "<uname -r of the Jetson>" "<uname -v of the Jetson>" \
+       "$(sha256sum vmlinux.btf | cut -d' ' -f1)" > vmlinux.kernel
+   ```
+
+   `vmlinux.kernel` is the stamp the unit checks: exactly the lines
+   `uname -r` and `uname -v` print on the Jetson, then the SHA-256 of the
+   BTF file, so a file replaced without a new stamp is refused too.
+4. **Install** (through the site's vetted media, like any other file that
+   reaches the unit) and point Pulsar at it:
+
+   ```sh
+   sudo install -d -m 0755 -o root -g root /etc/robodr/btf
+   sudo install -m 0644 -o root -g root vmlinux.btf /etc/robodr/btf/vmlinux
+   sudo install -m 0644 -o root -g root vmlinux.kernel /etc/robodr/btf/vmlinux.kernel
+   # /etc/robodr/pulsar.toml, [pulsar]: uncomment
+   #   btf_path = "/etc/robodr/btf/vmlinux"
+   sudo systemctl restart robodr-pulsard
+   ```
+
+   The unit starts when `/sys/kernel/btf/vmlinux` **or**
+   `/etc/robodr/btf/vmlinux` exists. Its `ExecStartPre=`
+   (`/usr/lib/robodr/robodr-btf-check`) reads `btf_path` from
+   `pulsar.toml`: any other path than `/etc/robodr/btf/vmlinux` is refused,
+   and with that path the daemon does not start when the file or
+   `vmlinux.kernel` is missing, or the stamp names another kernel or
+   another file hash than the running kernel and the installed file: after an L4T update (OTA) the daemon stays down, visibly in the
+   journal, until the file is regenerated (steps 1 to 4) for the new
+   kernel.
+5. **Check that the probes see the truth**, not only that they load:
+   `journalctl -u robodr-pulsard` shows the modules starting without
+   relocation errors; then run a known command (e.g. `sudo -u nobody
+   /usr/bin/true`) and confirm the process event Pulsar reports (threat
+   logger / `pulsar` CLI on `/run/robodr-pulsard/pulsar.sock`) carries the
+   right image path, PID and parent. Wrong offsets show up as nonsense
+   paths, PIDs or arguments.
+
+Without BTF, eBPF LSM programs cannot be used (Pulsar's LSM feature
+check reads the kernel's own BTF and disables them); L4T kernels do not
+enable BPF LSM anyway. **Not verified:** no external BTF has been
+generated for or loaded on an L4T kernel yet; the procedure follows
+Pulsar's loader (`btf_path` → aya `Btf::parse_file`, raw BTF as `pahole
+--btf_encode_detached` writes it) and the kernel build documentation.
 
 ## 4. Commissioning: learn, then lock
 
@@ -417,7 +527,9 @@ In short:
 | `rt/lowcmd` (G1, H1-2) | `unitree_hg_lowcmd` | `check_joint` per frame: a valid frame passes byte-identical, an out-of-envelope one is limited in place (CRC recomputed), a rejected one is replaced **in the same sample** by the hold of the last accepted frame (never damping, never limp, on a humanoid) or removed if there is none yet |
 | `rt/lowcmd` (Go2, B2, H1) | `unitree_go_lowcmd` | as above; a quadruped may damp after the hold (`fail_behaviour`) |
 | `rt/api/sport/request` | `unitree_sport_request` | `Move` speed limited (parameter rewritten), a rejected `Move` replaced by the hold / zero; other calls only if `allowed_api_ids` lists them (`StopMove` always) |
-| Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; uncompressed `LowCmd` as `rt/lowcmd` (the compressed form cannot be decided) |
+| Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` or `go1_low_cmd_compressed` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; `LowCmd` as `rt/lowcmd`, in the declared (734 B) or, with `go1_low_cmd_compressed`, the compressed (614 B, what v3.8.6 clients send) form (fixed-point `tau` / `Kp` / `Kd` rounded to the safe side); a non-zero `bms.off` (battery off) is refused on both |
+| `rt/lowcmd` (A2, AS2) | `unitree_a2_lowcmd` | as `unitree_go_lowcmd`, for the **inferred** go `LowCmd_`: starts only with `require_crc`, the type recorded in the locked profile (learned on the robot) and without `bypass`; set the gateway's top-level `robot_model: a2` / `as2` so that a `unitree_go_lowcmd` or `allow_battery_off` configuration is refused |
+| Go2 WebRTC (TCP 8081 / 9991, ICE / DTLS) | `webrtc` section (not a codec) | sessions detected and attributed from NFLOG copies (findings `robot.unitree.webrtc_*`); `block_unlisted` drops signalling from non-controllers; `webrtc-block` quarantines a peer or flow; the encrypted content is never decoded or limited (section 5.2) |
 | `rt/api/sport/request` (G1, H2, R1: ids 7xxx), `rt/api/loco/request` (H1: ids 8xxx) | `unitree_loco_request` (`robot_model` required) | `SetVelocity` / `Move` limited and their duration capped (`max_velocity_duration_s`); every `SetFsmId` (`Damp`, `ZeroTorque`, posture changes, **and `Start`**) and the hand-over calls refused unless `allowed_fsm_ids` / `allowed_api_ids` list them; queries pass. A humanoid configured with `unitree_sport_request` is refused at start |
 | `rt/arm_sdk` (G1, H1-2, H2, R1 `hg`; H1 `go`) | `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` | every slot with gains or torque decided whatever its mode octet; the blend weight (`weight_slot`) bounded, step and rate limited, and its rise from 0 checked against the robot's `rt/lowstate` (below) |
 | `rt/dex3/{left,right}/cmd`, `rt/hand_sdk` | `unitree_dex3_hand_cmd` / `unitree_hand_sdk` | mode octets must be the SDK's, the hand-SDK weight bounded and step / rate limited; a frame the firewall passes is forwarded byte-identical, anything else is suppressed (no hand rewrite). The hand's firewall channel sets `balance_critical: false`, so `stopMotors` (`kp = kd = 0`) is allowed |
@@ -497,6 +609,45 @@ channels `config/firewall-gw.unitree-{g1,go2}.channels.example.json` and
 `config/firewall.unitree-{g1,go2}.channels.example.json` (G1: arm SDK,
 loco, both Dex3 hands, arm actions; Go2: sport, ROS 2 `/cmd_vel`; each
 channel carries a `note` explaining its values).
+
+### 5.2 Go2 WebRTC (app channel)
+
+The Go2 app (and community clients) control the robot over WebRTC. The
+content of a session is DTLS-SRTP encrypted and **cannot be read by a
+sensor that does not hold the keys**; RoboDR does not try. With a
+`webrtc` section in the inline gateway's configuration
+([`crates/robodr-firewall-gw/README.md`](../crates/robodr-firewall-gw/README.md),
+"Go2 WebRTC sessions") it:
+
+* detects and classifies sessions to the robot: signalling on the robot's
+  HTTP ports (8081 `POST /offer` with a plaintext SDP on older firmware;
+  9991 `con_notify` / `con_ing_*` with an encrypted SDP on newer firmware;
+  as used by community clients, not documented by Unitree), ICE (STUN)
+  checks, TURN relaying, the DTLS handshake, SRTP;
+* attributes the peer (IP, MAC where the copy has it) and reports, contract
+  2.3 §3d: `webrtc_unknown_controller` (High; Critical once established),
+  `webrtc_new_peer` (no list configured), `webrtc_controller_mac_mismatch`,
+  `webrtc_session_in_denied_window` (`deny_windows`, UTC),
+  `webrtc_concurrent_sessions` (`max_sessions`), `webrtc_relayed_session`
+  (TURN or a non-local peer: remote control via a cloud relay),
+  `webrtc_media_without_signalling` (signalled over Wi-Fi / another path);
+  each once per peer session (a peer that comes back is reported again),
+  non-Critical ones rate limited per minute with an aggregate count; the
+  MAC binding is checked on every packet the gateway copies;
+* from the plaintext legacy offer, keeps metadata only (ICE user fragment,
+  fingerprint hash, candidates, media kinds; the `token` by length);
+* blocks: `action: block_unlisted` drops signalling from hosts that are not
+  `controllers` and from a MAC-bound controller's IP with another MAC
+  (each drop logged first, so the refused host is still reported); a
+  running session is quarantined by peer or by flow
+  (`robodr-firewall-gw webrtc-block --peer ... --flow ...` prints the
+  `nft` command; the findings name the flows).
+
+On a passive sensor box the same monitor is a library
+(`robodr_ros2_pipeline::webrtc`); agentd's live capture does not feed it
+yet (UDP / RTPS-only capture). What the Go2 does when its controller's
+session is cut mid-motion is not published: test a quarantine with the
+robot at rest first.
 
 ## 6. Humanoid and quadruped safety rules
 
@@ -610,8 +761,17 @@ Rules for Unitree, all enforced in code:
     listed in `control_buses` or `motion_control_path`.
 * **What is never sent.** `safe_pause`, `request_safe_state` and
   `rollback_config` (damp, stand-down, controller restart) are never sent
-  by the executor on any model. `restrict_motion` is advisory only: there
-  is no sport-API adapter (Sprint 8).
+  through the Unitree SDK: there is no SDK adapter for them, and on a
+  humanoid (and, for `rollback_config`, a quadruped) they are refused
+  `fall_hazard` anyway. `restrict_motion` is advisory unless the executor
+  has a `motion` section (Sprint 8): then it goes through the in-path
+  gateway (`gateway` adapter: sport `Move` / loco `SetVelocity` caps on the
+  sensor box; `LowCmd_` is never restricted) and / or the sport API
+  (`unitree_sport` adapter: `SpeedLevel(-1)`, reverted to `SpeedLevel(0)`
+  at the TTL, not to the level before; Go2-family sport service only,
+  verified against a simulated robot only), each with the site's
+  `oem_validated`. On a quadruped a restriction factor is never below the
+  policy's `min_motion_factor`.
 * **Quarantine coverage.** Quarantine matches RTPS over UDP by GUID
   prefix. Traffic between processes on the same computer over shared
   memory is not covered.
@@ -741,6 +901,7 @@ Findings use the `robodr.findings` contract, version **2.1.0**
 A consumer must accept contract 2.1 to validate the 2.1 rule entries; see
 the contract's section 5.
 
+
 ## Known limits
 
 * **No real-robot validation yet.** Decoders, rules, firewall examples and
@@ -751,11 +912,13 @@ the contract's section 5.
 * **The sensor box mode is not field-tested**: capture of mirrored frames
   addressed to other hosts on a promiscuous NIC, and the drop-in under a
   real systemd, have not run on hardware.
-* **No host rules on current Unitree EDU images.** JetPack 5 (Ubuntu
-  20.04, L4T kernel without BTF) runs agentd only (`robodr-focal`); the
-  released `robodr` package needs glibc 2.39, so JetPack 6 also gets
-  agentd only until a glibc 2.35 build of `robodr` (with
-  `robodr-pulsard`) exists (section 3.2).
+* **No host rules on JetPack 5; on JetPack 6 only with BTF.** JetPack 5
+  (Ubuntu 20.04, glibc 2.31, systemd 245, L4T kernel without BTF) runs
+  agentd only (`robodr-focal`): no `robodr-pulsard` is built for it.
+  JetPack 6 runs the regular `robodr` package (built for glibc 2.35 since
+  2026-10-30) with `robodr-pulsard` when the kernel has BTF or an external
+  BTF file is installed (section 3.2.1); neither has been tried on a real
+  Jetson.
 * **`robodr-focal` has not run on a Jetson or under a real systemd 245.**
   Its static binaries were built and smoke-run (amd64 natively, arm64 under
   qemu-user: `--version`, `--check-config`, a short agentd run, black-box
@@ -766,20 +929,32 @@ the contract's section 5.
   controller.** They fire only where the provisioning service runs on the
   pulsard host (section 7); the controller itself is covered only by the
   network detections.
-* **Go2 app channel (WebRTC) is not decoded.** The mobile app's channel is
-  encrypted media/data over WebRTC; RoboDR does not see its content, and on
-  Wi-Fi or cellular it is not on the Ethernet link at all.
+* **Go2 app channel (WebRTC) content is not decoded, and cannot be.** The
+  channel is DTLS-SRTP encrypted; RoboDR detects, attributes and can
+  quarantine sessions on the Ethernet link at the inline gateway
+  (section 5.2), never what they command. On Wi-Fi or cellular it is not
+  on the Ethernet link at all (a cloud-relayed session shows as the
+  robot's flows to the relay). The signalling formats come from community
+  clients and may change with firmware. agentd's passive capture does not
+  run the WebRTC monitor yet.
 * **Telemetry over Wi-Fi or cellular** is not on the Ethernet link the
   sensor box watches, and agentd's capture analyses DDS (and legacy Unitree
   UDP) only, not general IP flows. The host rule sees outbound connections
   only on the EDU computer. Watch the site's Wi-Fi / firewall logs for the
   robot's own external traffic.
-* **Legacy Go1 "compressed" low-level frames** (`unitree_legged_sdk`
-  v3.8.6, 614 / 807 bytes) have no published layout and are reported as
-  undecodable; A1 / Aliengo / B1 layouts are not in the sources.
-* **A2 / AS2**: no low-level example is published, so their motor count,
-  IDL family and model-specific API ids are unknown; only the sport state
-  and sport client are covered.
+* **Legacy Go1 "compressed" frames** (`unitree_legged_sdk` v3.8.6): the
+  614-byte `LowCmd` is decoded and enforced using the layout read from the
+  shipped library's machine code (`refineCmd`), not a header. It has not
+  been compared with a capture from a real Go1, and a fleet using the
+  library's `encryptCRC` cannot be enforced. The 807-byte `LowState` is
+  still reported as not inspected. A1 / Aliengo / B1 layouts are not in
+  the sources.
+* **A2 / AS2**: no low-level type, example or topic is published. Their
+  low-level command is **inferred** to be `unitree_go` `LowCmd_` on
+  `rt/lowcmd`, because their sport state is a `unitree_go` type. It is
+  enforced (`unitree_a2_lowcmd`) only when the profile learned that type
+  from the robot itself. Their motor count and model-specific API ids are
+  unknown.
 * **The inline gateway (section 5.1) is new and not field-tested**: run
   on synthetic traffic through real network namespaces only; latency on the
   target sensor box, Unitree's `rt/lowcmd` QoS and the motor board's

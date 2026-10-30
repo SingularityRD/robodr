@@ -383,7 +383,7 @@ pub struct CaptureDiagnostics {
     /// Legacy commands (`HighCmd` / decodable `LowCmd`) learned.
     #[serde(default)]
     pub unitree_legacy_commands: u64,
-    /// Legacy datagrams that are no decodable frame (compressed low-level
+    /// Legacy datagrams that are no decodable frame (compressed `LowState`
     /// form, unknown length): not learned.
     #[serde(default)]
     pub unitree_legacy_undecodable: u64,

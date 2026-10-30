@@ -187,3 +187,18 @@ fn unitree_g1_example_never_cuts_the_balance_loop() {
         e => panic!("{e:?}"),
     }
 }
+
+/// Sprint 8: the motion example validates; its adapters ship with
+/// `oem_validated: false` (the site sets it after OEM sign-off), so a
+/// motion action is refused until then.
+#[test]
+fn motion_example_validates_and_is_not_validated_by_default() {
+    let c = example("executor.motion.example.json");
+    let m = c.config.motion.as_ref().expect("motion section");
+    assert_eq!(
+        m.restrict_motion,
+        vec![robodr_executor::motion::AdapterKind::Gateway]
+    );
+    assert!(!m.gateway.as_ref().unwrap().oem_validated);
+    assert!(!m.nav2.as_ref().unwrap().oem_validated);
+}

@@ -130,6 +130,8 @@
 pub mod armsdk;
 pub mod config;
 pub mod discovery;
+pub mod feed;
+pub mod findings;
 pub mod gateway;
 pub mod hand;
 pub mod ip;
@@ -138,6 +140,7 @@ pub mod lowcmd;
 pub mod nflog;
 pub mod nfq;
 pub mod observe;
+pub mod restrict;
 pub mod ros2;
 pub mod round;
 pub mod rtps;
@@ -148,6 +151,8 @@ pub mod sys;
 #[cfg(feature = "testkit")]
 #[doc(hidden)]
 pub mod testkit;
+pub mod trajectory;
+pub mod webrtc;
 
 pub use config::{Codec, GatewayConfig, GatewayMode, LocoModel, OnGatewayDown};
 pub use gateway::{Gateway, GatewayStats, PacketMeta, Verdict};

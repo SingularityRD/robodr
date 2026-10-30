@@ -12,9 +12,9 @@ import pcaplib, rtlib
 
 rt, pid = sys.argv[1], int(sys.argv[2])
 steps = sys.argv[3:]
-F = "/home/user/robodr/fixtures/captures/ros2-jazzy/"
+F = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../fixtures/captures/ros2-jazzy/")
 spool = os.path.join(rt, "spool")
-s = rtlib.packet_socket("rdr-gen", "gen-rt")
+s = rtlib.packet_socket(os.environ.get("RT_GEN_NS", "rdr-gen"), "gen-rt")
 rogue_pcap, _ = pcaplib.read(F + "fastrtps_gz_rogue_cmd_vel.pcap")
 base_pcap, _ = pcaplib.read(F + "fastrtps_gz_baseline.pcap")
 profile = json.load(open(os.path.join(rt, "locked.json")))

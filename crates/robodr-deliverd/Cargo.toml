@@ -25,8 +25,14 @@ robodr-ocsf = { workspace = true }
 robodr-pkg = { workspace = true }
 robodr-release = { workspace = true }
 robodr-responder = { workspace = true }
+# Sealed RPKs (Sprint 13c): content keys unwrapped by the unit's UWK (TPM
+# or fallback) and chunks opened into the sealed runtime volume.
+robodr-seal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Sprint 14a: LAN delivery from the depot over mutual TLS (the configs are
+# robodr_blackbox::tls's; the client key is the unit's TPM-held identity key).
+rustls = { workspace = true }
 # robodr-rules payloads: structural check of Pulsar rule files (already in
 # the lock through Pulsar; parse + serde only, bounded recursion).
 toml = { workspace = true }

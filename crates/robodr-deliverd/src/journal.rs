@@ -48,6 +48,24 @@ pub mod kinds {
     /// generation, trust version, deployment, chain heads, time floor),
     /// carried over under the new key.
     pub const REKEYED: &str = "robodr.deliver.rekeyed";
+    /// Sealing (13c): a sealed item's key could not be unsealed.
+    pub const UNSEAL_FAILED: &str = "robodr.seal.unseal_failed";
+    /// Sealing (13c): an erase trigger reported tamper.
+    pub const TAMPER: &str = "robodr.seal.tamper";
+    /// Sealing (13c): crypto-erase executed.
+    pub const ERASED: &str = "robodr.seal.erased";
+    /// Sprint 14b: the high-water record is anchored in the TPM NV counter.
+    pub const ANCHOR_MIGRATED: &str = "robodr.deliver.anchor_migrated";
+    /// Sprint 14b: the responder planned a crypto-erase for a trigger.
+    pub const ERASE_PLANNED: &str = "robodr.seal.erase_planned";
+    /// Sprint 14b: the planned erase was deferred by the safety state.
+    pub const ERASE_DEFERRED: &str = "robodr.seal.erase_deferred";
+    /// Sprint 14b: the erase is about to run (written before it).
+    pub const ERASE_INTENT: &str = "robodr.seal.erase_intent";
+    /// Sprint 14b: a site lease was installed.
+    pub const LEASE_INSTALLED: &str = "robodr.seal.lease_installed";
+    /// Sprint 14b: a sealed item waits for a site lease.
+    pub const LEASE_EXPIRED: &str = "robodr.seal.lease_expired";
 }
 
 /// What the notes still in the journal say about the unit's history

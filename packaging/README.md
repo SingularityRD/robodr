@@ -16,19 +16,23 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-spool-export.service` | `/usr/lib/systemd/system/` | robot-side findings exporter for **diode sites**: agentd spool -> signed batches in `/var/lib/robodr/export/diode`; `User=robodr`, `PrivateNetwork=yes`, key via `LoadCredential=` (`/etc/robodr/keys/diode.key`), settings in `/etc/robodr/spool-export.env` (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service` | `/usr/lib/systemd/system/` | findings publisher for **connected sites**, running on the unit or sensor box: agentd spool -> Kafka; `User=robodr`, `IPAddressDeny=any` plus the broker drop-in, settings in `/etc/robodr/kafka-publish.env`. Conflicts with the exporter above (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service.d/50-brokers.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for **every** Kafka broker (the publisher connects to each partition leader, not only to the bootstrap broker) |
+| `systemd/robodr-kafka-publish.service.d/60-tls-credentials.conf.example` | `/usr/share/doc/robodr/examples/` | `LoadCredential=` for the mutual-TLS client key and the SASL/SCRAM password file, named in `ROBODR_KAFKA_TLS_ARGS` (`--tls-key`, `--sasl-password-file`); in **`robodr-focal`** the same path holds `systemd/focal/robodr-kafka-publish.service.d/60-tls-credentials.conf.example`, which does it with `robodr-load-credential` (systemd 245) |
 | `systemd/robodr-uplink.service` | `/usr/lib/systemd/system/` | findings uplink to the SOC's AutoSecOps ingest API for **connected sites**, running on the unit or sensor box: agentd spool -> HTTPS (signed batches, CA bundle `/etc/robodr/uplink-ca.pem`, optional SPKI pin); `User=robodr`, key via `LoadCredential=` (`/etc/robodr/keys/uplink.key`), `IPAddressDeny=any` plus the SOC drop-in, settings in `/etc/robodr/uplink.env`. Conflicts with both units above (only if the binary is built) |
 | `systemd/robodr-uplink.service.d/50-soc.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for the SOC ingest address(es) (map the URL's host name in `/etc/hosts`: DNS is not reachable) |
 | `etc/spool-export.env.example`, `etc/kafka-publish.env.example`, `etc/uplink.env.example` | `/usr/share/doc/robodr/examples/` | the three exporter units' site settings (unit id; bootstrap brokers; ingest URL and pin) |
-| `systemd/focal/*.service`, `systemd/focal/robodr-agentd.service.d/{20-finding-key,30-control-plane}.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py` |
+| `systemd/focal/*.service`, `systemd/focal/<unit>.service.d/*.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py`. `build-deb.sh --variant focal` takes a drop-in example from `systemd/focal/` when it exists there and the regular one otherwise; the checker then requires the regular one to need nothing newer than systemd 245 |
 | `focal/robodr-load-credential` | `/usr/lib/robodr/` of **`robodr-focal`** | POSIX sh helper run as root (`ExecStartPre=+`): copies a root-only key to `/run/credentials/<unit>/<name>`, `0400` owned by the service user, in a root-owned `0711` directory; `clear` on stop. Refuses `root` as the owner except for `robodr-deliverd.service` (`root_units`, checked by `scripts/check-focal-units.py`; tests: `scripts/test-load-credential.sh`) |
 | `systemd/robodr-anchor-receiver.service` | `/usr/lib/systemd/system/` | **base station only**: remote head-anchor receiver (only if the binary is built; OPERATIONS 6.4, "Remote anchor"). Not yet checked with `systemd-analyze` |
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
+| `btf/robodr-btf-check` | `/usr/lib/robodr/` of **`robodr`** (with `robodr-pulsard`) | `ExecStartPre=` of `robodr-pulsard.service`: on a kernel without BTF, reads `[pulsar] btf_path` from `pulsar.toml`, refuses any path but `/etc/robodr/btf/vmlinux`, and refuses to start when that file was not generated for the running kernel or was replaced (stamp `vmlinux.kernel` = `uname -r`, `uname -v`, SHA-256 of the file); no-op while `btf_path` is unset (tests: `scripts/test-btf-check.sh`) ([`docs/UNITREE.md`](../docs/UNITREE.md) 3.2.1) |
 | `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr-agentd` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |
 | `tmpfiles.d/robodr.conf` | `/usr/lib/tmpfiles.d/` | directories, modes, owners |
 | `sysusers.d/robodr.conf` | `/usr/lib/sysusers.d/` | the `robodr` system user |
 | `etc/pulsar.base.toml` | header of `/etc/robodr/pulsar.toml` | daemon config (conffile) |
 | `deb/` | `DEBIAN/` | control template, maintainer scripts |
-| `build-deb.sh` | (build time) | reproducible `.deb` from built binaries: `robodr` (default) or `robodr-focal` (`--variant focal`, static binaries only) |
+| `rpm/robodr.spec.in`, `rpm/{post,preun,postun}` | RPM header / scriptlets | spec template and the scriptlets, the counterparts of `deb/postinst`, `prerm`, `postrm` (`scripts/check-packages.py` checks both stop and restart the same units) |
+| `build-deb.sh` | (build time) | reproducible `.deb` from built binaries: `robodr` (default) or `robodr-focal` (`--variant focal`, static binaries only); `--stage-only DIR` writes just the file tree (for `build-rpm.sh`). `Depends:` from `dpkg-shlibdeps` and a soname table, libc6 floor from `readelf -V` (docs/BUILD.md "Release build userlands") |
+| `build-rpm.sh` | (build time) | `robodr` RPM (RHEL / Rocky / Alma 9, Fedora) from binaries built on Rocky Linux 9, with the `.deb`'s file tree; reproducible mtimes and build time |
 | `make-bundle.sh` | (build time) | offline install bundle |
 | `install-bundle.sh` | inside the bundle; `/usr/lib/robodr/install-bundle.sh` | verify (signature, then a private extraction), install, list, roll back on the robot; the installed copy is the trusted verifier for the next upgrade |
 | `security-floor` | inside the bundle | `min_version=`: no install or rollback below it (recorded per unit, only rises) |
@@ -49,6 +53,8 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
 | `robodr-enroll` | **not a service**: root-only operator tool (`/usr/sbin`) | enrollment, key rotation, revocation lists, SOC profiles and ring information (OPERATIONS 8.6); every step is a deliberate operator act, nothing is applied by the SOC on its own |
 | `robodr-deliverd` | systemd service on the **unit**, root with a bounded capability set, no network | installs delivered RPKs (dpkg, `/opt` / `/etc` install roots, dropping to probe users); runs only after commissioning and `init-anchor` (OPERATIONS 11) |
+| `robodr-seal` | **not a service**: root-only operator tool (`/usr/sbin`) | the unit's TPM (provisioning, refused without an owner and lockout authorization), enrolment, signed PCR policies, the sealed runtime volume, crypto-erase (OPERATIONS 12). `robodr-deliverd.service` reaches the TPM through `DeviceAllow=/dev/tpmrm0 rw` under `DevicePolicy=closed` (not `PrivateDevices=yes`, which would hide it); TPM session files go to `/run/robodr-seal` (tmpfs) |
+| `robodr-depot` | systemd service on the **depot box** (never a robot), user `robodr-depot` (member of `robodr` for the spool), no capabilities, `ProtectSystem=strict`, TCP only; its other commands are operator tools run as the same user | the site depot (Sprint 14a, OPERATIONS 13): `serve` gives each enrolled unit its own pack over mutual TLS and takes its reports; imports, enrolments, approvals, rollouts and media packs are deliberate operator acts. The database anchor uses the box's TPM (`DeviceAllow=/dev/tpmrm0 rw`, group `tss` through the drop-in `50-tpm-anchor.conf.example`). `robodr-deliverd.service` needs the drop-in `50-depot-lan.conf.example` for LAN pulls (TCP to the depot only) and the erase trigger socket |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 | `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
 | `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
@@ -75,6 +81,13 @@ patching Pulsar. The unit confines that root process instead:
   `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETUID` or
   `CAP_SYS_MODULE`. Without `CAP_DAC_OVERRIDE` this root process cannot write
   files it does not own.
+- `AmbientCapabilities=` is the same list. The unit sets
+  `SecureBits=noroot-locked`, under which a uid-0 `execve()` gets no
+  capabilities from the bounding set, only the ambient ones: without the
+  ambient list the daemon would start with an empty effective set and
+  `bpf()` would fail with `EPERM` (shown with `setpriv`; fixed
+  2026-10-30, `scripts/check-packages.py` keeps the two lists equal for
+  every `noroot` unit and drop-in). Not yet run on a BTF kernel.
 - `NoNewPrivileges=yes`. It only affects `execve()` of setuid or file-cap
   binaries, so it does not affect `bpf()` or `perf_event_open()`, and Pulsar
   never execs.
@@ -141,6 +154,7 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
 ├── deliverd/                    0700 root:root     robodr-deliverd: state, trust anchor, content-addressed store, imported packs
 ├── deliverd-media/              0700 root:root     media packs put here for robodr-deliverd (untrusted)
+├── depot/                       0700 robodr-depot:robodr-depot  robodr-depot (depot box only): database, store, deployments, unit CA, depot.lock
 ├── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
 └── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
@@ -154,6 +168,9 @@ Neither watchdog has been exercised under a real systemd yet.
 /opt/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered files (robodr-deliverd only)
 /etc/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered configuration (robodr-deliverd only)
 /etc/robodr-delivered-rules/<name>                  link to the active delivered Pulsar rules
+/etc/robodr-depot/                0750 root:robodr-depot  depot.json (depot box only)
+/etc/robodr-depot/keys/           0700 robodr-depot:robodr-depot  the depot's signing, wrap, lease and unit-CA keys
+/run/robodr-depot/                                  TPM session contexts of the depot's anchor (RuntimeDirectory)
 ```
 
 `tmpfiles.d/robodr.conf` creates every directory and **resets** mode and owner
@@ -223,12 +240,28 @@ the unit can read. A TPM-held, non-exportable key is the planned fix; the
 `LoadCredential=` path stays the same, and with a TPM,
 `LoadCredentialEncrypted=` can seal the key to the machine.
 
+## Package variants
+
+| Package | Built in | For | Contents |
+|---|---|---|---|
+| `robodr` `.deb` | Ubuntu 22.04 container (glibc 2.35) | Ubuntu 22.04 / 24.04, JetPack 6, Debian 12 / 13 | everything, `robodr-pulsard` included |
+| `robodr` `.rpm` | Rocky Linux 9 container (glibc 2.34) | RHEL / Rocky / Alma 9, Fedora | the same file tree as the `.deb` |
+| `robodr-focal` `.deb` | Ubuntu 24.04 runner, static musl | Ubuntu 20.04, JetPack 5 (systemd 245) | no `robodr-pulsard`, no `robodr-anchor-receiver`; systemd 245 units and drop-in examples, `robodr-load-credential` |
+
+`scripts/check-packages.py` holds the list of programs per variant (a new
+program fails CI until it is classified) and compares built packages
+(docs/BUILD.md "Package matrix"); `scripts/pkg-install-smoke.sh` installs
+one in a real userland.
+
 ## Building a package locally
 
 ```sh
 cargo build --release --workspace --locked   # plus Pulsar deps for robodr-pulsard
 packaging/build-deb.sh --bin-dir target/release --arch amd64 --out dist
 packaging/make-bundle.sh --deb dist/robodr_*_amd64.deb --sbom-dir dist/sbom --out dist
+
+# robodr RPM (on Rocky Linux 9, or any host with rpmbuild for a test build):
+packaging/build-rpm.sh --bin-dir target/release --arch amd64 --out dist
 
 # robodr-focal (static, systemd 245; docs/BUILD.md "Static (musl) build"):
 rustup target add aarch64-unknown-linux-musl
@@ -238,15 +271,16 @@ packaging/make-bundle.sh --deb dist/robodr-focal_*_arm64.deb --sbom-dir dist/sbo
 ```
 
 `build-deb.sh` requires `robodr-commission`, `robodr-replay` and
-`robodr-ros2-watch`. It adds `robodr-pulsard`, `robodr-agentd`,
-`robodr-blackbox`, `robodr-diode-pack`, `robodr-diode-unpack`,
-`robodr-spool-export` (robot side of a diode site: agentd spool -> diode
-outbox) and `robodr-kafka-publish` (on the unit or sensor box of a connected
-site from agentd's spool, or on the SOC side of a diode site from the
-importer's output) if they were built, and installs each unit (and each man
-page) only together with its binary. The release workflow sets
-`ROBODR_DEB_REQUIRE` to all seven, so a release cannot silently ship without
-them. Both exporters ship with a unit (`robodr-spool-export.service`,
+`robodr-ros2-watch`. It adds every other packaged program if it was built
+(`robodr-pulsard`, `robodr-agentd`, `robodr-blackbox`, `robodr-diode-pack`,
+`robodr-diode-unpack`, `robodr-spool-export`, `robodr-kafka-publish`,
+`robodr-uplink`, `robodr-enroll`, `robodr-executor`, `robodr-firewall-gw`,
+`robodr-anchor-receiver`, `robodr-deliverd`, `robodr-seal`, `robodr-depot`; the list per
+variant is `PROGRAMS` in `scripts/check-packages.py`), and installs each
+unit (and each man page) only together with its binary. Every
+`ROBODR_DEB_REQUIRE` in the workflows names all of the variant's
+programs (checked by `scripts/check-packages.py`), so neither a release
+nor CI can silently ship without one. Both exporters ship with a unit (`robodr-spool-export.service`,
 `robodr-kafka-publish.service`, conflicting with each other) for the
 robot / sensor-box side; see `docs/OPERATIONS.md` section 8.3.
 
@@ -265,6 +299,25 @@ this was checked with stub binaries (`robodr`) and with the real static
 binaries (`robodr-focal`, arm64).
 
 ## Not verified
+
+- The RPM and the Ubuntu 22.04 / Rocky 9 builds (added 2026-10-30) were
+  built and installed locally for **amd64 only** (docs/BUILD.md,
+  "Package userlands, local run 2026-10-30"); the arm64 builds, the CI
+  jobs and the release workflow have not run. No RPM scriptlet ran under a
+  booted systemd (containers: no `systemctl` branch), and none of the
+  packages ran on a Jetson.
+- External BTF (`robodr-btf-check`, `btf_path`): the check script and the
+  unit's assert logic were tested; no BTF file was ever generated for or
+  loaded on an L4T kernel.
+
+- `robodr-depot.service` and its focal variant (added 2026-10-30, Sprint
+  14a) pass `scripts/check-focal-units.py` and `systemd-analyze verify`
+  apart from the missing binary; not started by systemd. The
+  depot's tests run `serve` in-process on loopback with software TPMs.
+  `/etc/robodr-depot` (0750 root:robodr-depot) and its `keys/` (0700
+  robodr-depot) are created by tmpfiles; the keys are read by path, not
+  through `LoadCredential=`, because the operator commands load the same
+  keys.
 
 - `robodr-deliverd.service` and its focal variant (added 2026-10-26, Sprint
   13b) pass `scripts/check-focal-units.py` and `systemd-analyze verify`

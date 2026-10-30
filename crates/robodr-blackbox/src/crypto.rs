@@ -115,6 +115,46 @@ impl Sha256 {
     }
 }
 
+const _: () = assert!(!std::mem::needs_drop::<sha2::Sha512>());
+
+/// Streaming SHA-512 (`sha2::Sha512`) whose state is wiped on drop (the
+/// SCRAM-SHA-512 HMAC of the Kafka producer; same rules as [`Sha256`]).
+#[derive(Clone)]
+pub struct Sha512 {
+    inner: ManuallyDrop<sha2::Sha512>,
+}
+
+impl Drop for Sha512 {
+    fn drop(&mut self) {
+        wipe_state(&mut self.inner);
+    }
+}
+
+impl Default for Sha512 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha512 {
+    /// A fresh hasher.
+    pub fn new() -> Self {
+        Self {
+            inner: ManuallyDrop::new(sha2::Sha512::new()),
+        }
+    }
+
+    /// Absorb `data`.
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /// Pad, finish and return the digest.
+    pub fn finalize(mut self) -> [u8; 64] {
+        self.inner.finalize_reset().into()
+    }
+}
+
 /// One-shot SHA-256, through the wiping [`Sha256`] wrapper (the input may
 /// be secret, e.g. a key whose id is derived from its digest).
 pub fn sha256(data: &[u8]) -> [u8; DIGEST_LEN] {

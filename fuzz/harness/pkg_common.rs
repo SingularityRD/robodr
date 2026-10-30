@@ -34,6 +34,11 @@ pub fn depot() -> Ed25519SigningKey {
     key("depot-1", 21)
 }
 
+/// The entry station (Sprint 14a).
+pub fn entry() -> Ed25519SigningKey {
+    key("entry-1", 41)
+}
+
 pub fn operators() -> Vec<Ed25519SigningKey> {
     vec![key("op-1", 31), key("op-2", 32)]
 }
@@ -72,6 +77,9 @@ pub fn trust_file() -> TrustFile {
         revoked_rpks: vec![],
         revoked_serials: vec![],
         floors: vec![],
+        entry_keys: vec![tk(&entry())],
+        depot_wrap_keys: vec![],
+        ek_ca_certs: vec![],
     }
 }
 

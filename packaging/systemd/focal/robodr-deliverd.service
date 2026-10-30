@@ -136,8 +136,18 @@ InaccessiblePaths=-/etc/robodr/keys
 # --- Filesystem --------------------------------------------------------------
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
+# The TPM: sealed installs unwrap content keys through it (robodr-seal,
+# docs/SECURE-DELIVERY.md 7.9). PrivateDevices=yes would hide it (a private
+# /dev without hardware nodes), so the device cgroup narrows instead:
+# DevicePolicy=closed allows only the standard pseudo devices (null, zero,
+# random, ...) plus /dev/tpmrm0, the kernel's resource manager (never the
+# raw /dev/tpm0). On a unit without a TPM the entry is ignored. What
+# PrivateDevices=yes also implied stays: CAP_MKNOD and CAP_SYS_RAWIO are
+# outside CapabilityBoundingSet, @raw-io is filtered. TPM session files go
+# to /run/robodr-seal (tmpfs, checked by robodr-seal).
+PrivateDevices=no
 DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
 # No ProcSubset=pid: it reads /proc/sys/kernel/random/boot_id.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

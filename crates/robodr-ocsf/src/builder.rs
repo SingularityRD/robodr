@@ -194,6 +194,8 @@ pub const CATALOG_1_3_MINOR: u64 = 3;
 pub const CATALOG_2_1_MINOR: u64 = 1;
 /// Contract 2.x minor that added [`catalog_2_2`]'s entries.
 pub const CATALOG_2_2_MINOR: u64 = 2;
+/// Contract 2.x minor that added [`catalog_2_3`]'s entries.
+pub const CATALOG_2_3_MINOR: u64 = 3;
 
 /// The trusted rule catalog of the current contract
 /// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
@@ -204,7 +206,21 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         .or_else(|| catalog_1_3(rule))
         .or_else(|| catalog_2_1(rule))
         .or_else(|| catalog_2_2(rule))
+        .or_else(|| catalog_2_3(rule))
         .unwrap_or(GENERIC)
+}
+
+/// Whether `rule` has an entry in the current contract's catalog (not the
+/// generic fallback of [`rule_info`]). For rule ids that arrive from
+/// outside the detection core (agentd's gateway feed), where an unknown id
+/// must be refused rather than reported with the generic entry.
+pub fn rule_known(rule: &str) -> bool {
+    catalog_1_0(rule)
+        .or_else(|| catalog_1_3(rule))
+        .or_else(|| catalog_2_1(rule))
+        .or_else(|| catalog_2_2(rule))
+        .or_else(|| catalog_2_3(rule))
+        .is_some()
 }
 
 /// The catalog as a validator for a message of `contract_version` must
@@ -217,7 +233,8 @@ pub fn rule_info(rule: &str) -> RuleInfo {
 /// | 1.0 - 1.2 | base ([`catalog_1_0`]) |
 /// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
 /// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
-/// | 2.2+ | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+/// | 2.2 | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+/// | 2.3+ | base + 1.3 + 2.1 + 2.2 + 2.3 ([`catalog_2_3`]) |
 ///
 /// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
@@ -231,10 +248,13 @@ pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_1_MINOR);
     let with_2_2 =
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_2_MINOR);
+    let with_2_3 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_3_MINOR);
     catalog_1_0(rule)
         .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
         .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
         .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
+        .or_else(|| with_2_3.then(|| catalog_2_3(rule)).flatten())
         .unwrap_or(GENERIC)
 }
 
@@ -1042,6 +1062,223 @@ fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
         _ => return None,
     })
 }
+
+/// Entries added in contract **2.3**. Each feature that adds entries in
+/// this minor keeps its own block below (one function per block), so
+/// additions merge without touching each other.
+fn catalog_2_3(rule: &str) -> Option<RuleInfo> {
+    catalog_2_3_seal(rule)
+        .or_else(|| catalog_2_3_gateway(rule))
+        .or_else(|| catalog_2_3_unitree(rule))
+        .or_else(|| catalog_2_3_depot(rule))
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: the site depot and executed erase (secure delivery,
+// `docs/SECURE-DELIVERY.md` §5, §7.6, §8, §9, Sprints 14a / 14b;
+// robodr-depot and robodr-deliverd), data source `robodr_delivery`.
+// ---------------------------------------------------------------------------
+
+/// The `robot.depot.*` ids of the site depot and `robot.seal.erase_deferred`
+/// of the executed erase (Sprints 14a / 14b). Not in 2.2 or earlier: a 2.2
+/// validator applies the generic entry to these ids, and so does a 2.3
+/// validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_depot(rule: &str) -> Option<RuleInfo> {
+    const DELIVERY: &str = "robodr_delivery";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: DELIVERY,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.depot.import_refused" => e(
+            "Depot refused a release bundle",
+            "The site depot refused to import a release bundle: no passing entry-station report for exactly that bundle, a signature, quorum, chain, revocation, floor or hash check failed. Nothing of the bundle can be deployed.",
+        ),
+        "robot.depot.enrolment_refused" => e(
+            "Depot refused a unit enrolment",
+            "The site depot refused to enrol a unit: its EK certificate does not chain to a TPM vendor CA the site trusts, the attestation key or a certified key is not resident in that TPM, the unit's keys are not bound to the site's policy, its boot measurements do not match the signed policy, or the credential challenge was not answered by the unit's TPM. No key is wrapped for it.",
+        ),
+        "robot.depot.unit_enrolled" => e(
+            "Unit enrolled at the depot",
+            "A unit was enrolled at the site depot after TPM credential activation and the operator quorum; the depot may now deliver and wrap keys for it.",
+        ),
+        "robot.depot.rollout_halted" => e(
+            "Staged rollout halted",
+            "A unit of the current ring reported a failed health gate or a refusal beyond the rollout's failure threshold; the site depot halted the rollout and serves nothing more of it until operators resume it.",
+        ),
+        "robot.depot.locked" => e(
+            "Depot database failed its anti-rollback check",
+            "The site depot's database is older than its TPM anti-rollback counter says, or the counter was recreated: the database was restored or replaced. The depot signs, serves and imports nothing until operators re-anchor it.",
+        ),
+        "robot.seal.erase_deferred" => e(
+            "Crypto-erase deferred by the safety state",
+            "A crypto-erase trigger fired, and the responder deferred the erase because the robot is moving (or its safety state is unknown); it runs as soon as the robot is idle or its safety system holds it.",
+        ),
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: sealing (captured-unit software protection,
+// `docs/SECURE-DELIVERY.md` §7 and §9, Sprint 13c; robodr-seal through
+// robodr-deliverd), data source `robodr_delivery`.
+// ---------------------------------------------------------------------------
+
+/// The `robot.seal.*` ids of `docs/SECURE-DELIVERY.md` §9. Not in 2.2 or
+/// earlier: a 2.2 validator applies the generic entry to these ids, and so
+/// does a 2.3 validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_seal(rule: &str) -> Option<RuleInfo> {
+    const DELIVERY: &str = "robodr_delivery";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: DELIVERY,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.seal.unseal_failed" => e(
+            "Unit could not unseal delivered software",
+            "The unit's TPM refused to release the key of a sealed (encrypted) delivered package: the boot measurements do not match the signed PCR policy, the policy was revoked, or the unit's sealing keys were crypto-erased. The package stays unreadable on the unit; RoboDR detection keeps running.",
+        ),
+        "robot.seal.lease_expired" => e(
+            "Site lease expired",
+            "The unit's site lease for unsealing delivered software expired: sealed packages become unavailable after its next reboot until a fresh lease is issued.",
+        ),
+        "robot.seal.erased" => e(
+            "Crypto-erase of delivered software executed",
+            "The unit's sealing keys were cryptographically erased (the TPM erase epoch moved on, or the fallback key and volume keyslots were destroyed), with the trigger named in the finding. Every sealed package on the unit is permanently unreadable; recovery is re-enrolment and re-delivery.",
+        ),
+        "robot.seal.tamper" => e(
+            "Enclosure tamper or erase trigger fired",
+            "An enclosure tamper input or another crypto-erase trigger fired on the unit; a crypto-erase of its sealing keys follows.",
+        ),
+        _ => return None,
+    })
+}
+
+// --- Contract 2.3: in-path gateway (robot.gateway.*) -------------------------
+// Kept in its own function and block: other 2.3 additions (e.g. sealing)
+// live in their own `catalog_2_3_*` function, chained the same way.
+
+/// Entries added in contract **2.3** for the in-path Motion Firewall
+/// gateway `robodr-firewall-gw` (its own decisions, fed to agentd through
+/// the `gateway_feed` socket; Sprint 8), data source
+/// `ros2_motion_commands` (like the firewall's own entries). Not in 2.2 or
+/// earlier: a 2.2 validator applies the generic entry to these ids, and so
+/// does a 2.3 validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_gateway(rule: &str) -> Option<RuleInfo> {
+    const MOTION: &str = "ros2_motion_commands";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: MOTION,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.gateway.trajectory_rejected" => e(
+            "Joint trajectory blocked by the in-path gateway",
+            "The in-path motion gateway suppressed a ROS 2 joint trajectory or FollowJointTrajectory goal that was outside the channel's bounds: an unknown or repeated joint name, a non-finite value, time not increasing, too many points or too long, or a position, velocity, acceleration or effort beyond its joint limit. It never reached the robot.",
+        ),
+        "robot.gateway.trajectory_time_scaled" => e(
+            "Joint trajectory slowed down by the in-path gateway",
+            "The in-path motion gateway forwarded a ROS 2 joint trajectory slowed down in place, because its velocities or accelerations exceeded the channel's limits; the path is unchanged.",
+        ),
+        "robot.gateway.undecodable_command" => e(
+            "Undecodable motion command blocked by the in-path gateway",
+            "The in-path motion gateway could not decode a sample of an enforced motion channel strictly (truncated, non-canonical or unsupported encoding) and decided it as an integrity failure: it was suppressed or replaced by the firewall's substitute.",
+        ),
+        "robot.gateway.fragmented_command" => e(
+            "Fragmented motion command blocked by the in-path gateway",
+            "The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify; such a sample cannot be decided in place.",
+        ),
+        "robot.gateway.writer_binding_conflict" => e(
+            "Authorised motion writer seen from another address",
+            "The in-path motion gateway received samples under an authorised writer's GUID from another source address or MAC than the one the writer's stream is bound to, while the bound side was live: a spoofing attempt, suppressed.",
+        ),
+        "robot.gateway.sequence_jump" => e(
+            "Motion command sequence jump held back",
+            "The in-path motion gateway held back a sample whose RTPS sequence number jumped far past the writer's stream until the writer confirmed it: a forged high sequence number could otherwise make the robot drop the genuine commands.",
+        ),
+        "robot.gateway.port_bypass_risk" => e(
+            "Motion traffic may bypass the in-path gateway",
+            "DDS discovery announced a locator on a UDP port the in-path motion gateway does not inspect: commands sent there would reach the robot unchecked until the gateway's port ranges are fixed.",
+        ),
+        "robot.gateway.restriction_changed" => e(
+            "Motion restriction changed on the in-path gateway",
+            "A restrict_motion restriction was applied, changed, lifted or expired on the in-path motion gateway. Informational: the evidence trail of the robot's effective motion limits.",
+        ),
+        "robot.gateway.findings_dropped" => e(
+            "In-path gateway findings lost",
+            "The in-path motion gateway had more distinct findings in one reporting period than it can hold; some were counted but not reported individually.",
+        ),
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: Unitree coverage (Go2 WebRTC control sessions,
+// `robodr-ros2-pipeline::webrtc`, reported by the in-path gateway's
+// `webrtc` section through agentd's gateway feed), data source
+// `ros2_motion_commands`.
+// ---------------------------------------------------------------------------
+
+/// The `robot.unitree.webrtc_*` ids. Not in 2.2 or earlier: a 2.2
+/// validator applies the generic entry to these ids, and so does a 2.3
+/// validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_unitree(rule: &str) -> Option<RuleInfo> {
+    const MOTION: &str = "ros2_motion_commands";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: MOTION,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.unitree.webrtc_unknown_controller" => e(
+            "WebRTC control session from an unlisted host",
+            "A host that is not a listed controller signalled, started or established a WebRTC session with the robot (Go2 app channel). The session content is encrypted and not inspected; the finding names the peer and its flows so the session can be quarantined.",
+        ),
+        "robot.unitree.webrtc_new_peer" => e(
+            "New WebRTC peer of the robot",
+            "A host opened a WebRTC session with the robot for the first time while no controller list is configured. Informational for learning the controllers; list them to turn unlisted peers into unknown-controller findings.",
+        ),
+        "robot.unitree.webrtc_controller_mac_mismatch" => e(
+            "Listed WebRTC controller seen with another link-layer address",
+            "WebRTC traffic to the robot came from a listed controller's IP address but with another source MAC than the one it is bound to: another host may be using the controller's address.",
+        ),
+        "robot.unitree.webrtc_session_in_denied_window" => e(
+            "WebRTC control session during a denied window",
+            "A WebRTC session with the robot was attempted or active during a time window in which the site policy allows none.",
+        ),
+        "robot.unitree.webrtc_concurrent_sessions" => e(
+            "More concurrent WebRTC control sessions than allowed",
+            "More WebRTC sessions with the robot were established at the same time than the site allows: a second controller next to the operator's.",
+        ),
+        "robot.unitree.webrtc_relayed_session" => e(
+            "Remote WebRTC session through a relay",
+            "The robot exchanges WebRTC traffic through a TURN relay or with a peer outside the local networks: a remote control path (for example a cloud relay) that bypasses the local controller list.",
+        ),
+        "robot.unitree.webrtc_media_without_signalling" => e(
+            "WebRTC session without observed signalling",
+            "A WebRTC session with the robot was established without any signalling on the watched link: it was signalled over another path (Wi-Fi, a relay) or by an unknown method.",
+        ),
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// End of the contract 2.3 sealing block.
+// ---------------------------------------------------------------------------
 
 /// The contract 1.0 - 1.2 catalog.
 fn catalog_1_0(rule: &str) -> Option<RuleInfo> {

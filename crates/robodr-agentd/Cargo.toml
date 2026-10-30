@@ -42,6 +42,8 @@ webpki = { workspace = true }
 
 [dev-dependencies]
 robodr-capture = { workspace = true }
+# tests/gateway_feed.rs: the gateway's own feed writer against the daemon.
+robodr-firewall-gw = { workspace = true }
 
 [[bin]]
 name = "robodr-agentd"

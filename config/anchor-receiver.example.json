@@ -1,0 +1,16 @@
+{
+  "listen": "0.0.0.0:7461",
+  "state_dir": "/var/lib/robodr-anchor-receiver",
+  "key_file": "/run/credentials/robodr-anchor-receiver.service/receiver.key",
+  "units": [
+    {"unit": "ugv-007", "public_key": "/etc/robodr-anchor-receiver/units/ugv-007.pub"}
+  ],
+  "max_connections": 64,
+  "max_connections_per_source": 8,
+  "io_timeout_ms": 5000,
+  "tls": {
+    "cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
+    "key_file": "/run/credentials/robodr-anchor-receiver.service/receiver-tls.key",
+    "client_ca": "/etc/robodr-anchor-receiver/tls/robots-ca.pem"
+  }
+}

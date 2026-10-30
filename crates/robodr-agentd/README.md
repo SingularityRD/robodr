@@ -53,6 +53,7 @@ level, and every path must be absolute.
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
+| `gateway_feed` | Optional. Same keys as `host_threats`: the socket the in-path gateway writes its findings to. See "In-path gateway feed" below. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
 | `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_crl` (PEM CRLs of the client CAs), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
@@ -175,7 +176,8 @@ path:
   `feedback_topics`). A command from an IP not in `command_senders` is
   `robot.unitree.legacy_unknown_sender` (Critical; Medium for state from an
   address not in `robot_addresses`) — also for a compressed v3.8.6
-  `LowCmd`, which is additionally `robot.motion.undecodable_sample`. More
+  `LowCmd` (614 B), which is decoded and checked like the declared one;
+  a compressed `LowState` (807 B) is `robot.motion.undecodable_sample`. More
   than 16 unlisted senders of a class are aggregated
   (`robot.unitree.legacy_sender_flood`); a MAC-bound sender seen with
   another MAC is `robot.unitree.legacy_sender_mac_mismatch` (High); RTPS on
@@ -306,6 +308,25 @@ one JSON object per line:
 - **Status.** The input `host:<path>` shows `received`, `malformed`,
   `rejected_connections`, `connections`, `upstream_dropped`;
   `daemon.host_threats`, `host_heartbeats`, `host_threats_own_skipped`.
+
+## In-path gateway feed (`gateway_feed`)
+
+With `gateway_feed` (the `host_threats` keys: `socket_path`,
+`socket_mode`, `allowed_uids` = the gateway's uid, `max_connections`),
+`robodr-firewall-gw` reports its findings (`robot.gateway.*`, contract
+2.3) and the Motion Firewall's deviations (`robot.firewall.*`) over this
+socket (`src/gateway_feed.rs`). Each line (`robodr-gateway-finding/v1`) is
+parsed strictly — another format, a rule outside those two prefixes or
+not in the findings catalog, oversized fields: malformed, dropped and
+counted — and becomes a finding of the normal pipeline
+(`Agent::handle_external`, source `gateway:<channel>`, subject topic the
+channel). An idle gateway writes a heartbeat line
+(`robodr-gateway-heartbeat/v1`, every 5 s): activity on the input, never a
+finding, so a quiet gateway is not reported silent. Status:
+`daemon.gateway_findings`, `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
+same path; with `socket_mode: "0660"` give the gateway's user the daemon's
+group. Test: `tests/gateway_feed.rs` (the gateway's own writer against a
+running daemon).
 
 ## Control plane (SOC action requests and evidence)
 
@@ -755,7 +776,8 @@ request.
   (spool → diode batches) and `robodr-kafka-publish` (spool or diode output
   → Kafka) implement it and are tested against an in-process fake broker
   and real single-node Apache Kafka 3.9.1 / 4.1.0 (`scripts/kafka-it.sh`);
-  not against a production cluster, and without TLS/SASL.
+  not against a production cluster; TLS, mutual TLS and SASL/SCRAM against
+  a real 3.9.1 broker (`scripts/kafka-tls-it.sh`).
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
   (handed over by systemd `LoadCredential=`); root on the unit can read it
   and sign as the unit. The Ed25519 implementation is the audited

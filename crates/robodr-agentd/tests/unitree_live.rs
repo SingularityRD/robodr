@@ -982,8 +982,11 @@ fn go1_legacy_udp_end_to_end() {
         2000,
         udp(PC_IP, BASIC_IP, 8090, 8007, &legacy_low_cmd(10, 60.0)),
     );
-    // A v3.8.6 compressed LowCmd (614 bytes): reported, not inspected.
+    // A v3.8.6 compressed LowCmd (614 bytes) is decoded like the declared
+    // one (its absurd joint values are over the envelope); a compressed
+    // LowState (807 bytes) is still reported, not inspected.
     tl.after(2000, udp(PC_IP, BASIC_IP, 8090, 8007, &[0x5a; 614]));
+    tl.after(2000, udp(BASIC_IP, PC_IP, 8007, 8090, &[0x5a; 807]));
     // Spoofed robot state from the intruder.
     tl.after(2000, udp(INTRUDER_IP, PC_IP, 8082, 8090, &vec![0; 1087]));
     let x = run(

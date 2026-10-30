@@ -1,0 +1,33 @@
+[package]
+name = "robodr-seal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Captured-unit software protection (docs/SECURE-DELIVERY.md §7, Sprint 13c): XChaCha20-Poly1305 sealed chunks, content-key wraps to depot and unit keys, a TPM-resident unit wrapping key behind a signed PCR policy and an erase-epoch NV counter (tpm2-tools), the LUKS2 runtime volume (cryptsetup) and the Clevis/Tang fallback for units without a TPM."
+
+[dependencies]
+robodr-blackbox = { workspace = true }
+robodr-pkg = { workspace = true }
+# `--flag value` argument parser shared with the diode and release binaries.
+robodr-diode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+p256 = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+
+[[bin]]
+name = "robodr-seal"
+path = "src/bin/robodr-seal.rs"
+# Same crate name as the library: keep it out of rustdoc to avoid a collision.
+doc = false

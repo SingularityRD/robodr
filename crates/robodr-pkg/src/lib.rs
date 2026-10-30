@@ -11,7 +11,11 @@
 //!   (depot + operator quorum by ring, freshness, replay);
 //! * [`trust`]: the site's delivery trust file, `robodr-delivery-trust/1`
 //!   (roles, quorums, revocations, floors, root rotation);
+//! * [`entry`]: the entry station's signed scan report of one bundle,
+//!   `robodr-entry-report/1` (Sprint 14a, §6.1);
 //! * [`sig`]: detached signature sets `robodr-sigset/1` and quorum checks;
+//! * [`wire`]: the depot ↔ unit LAN request framing and pack stream
+//!   (Sprint 14a; pure, the sockets are the depot's and the agent's);
 //! * [`parity`]: Reed-Solomon parity over bundle files with
 //!   `robodr-diode`'s code;
 //! * [`common`]: refusal codes, the canonical-JSON reader, validators.
@@ -49,10 +53,12 @@
 pub mod bundle;
 pub mod common;
 pub mod deployment;
+pub mod entry;
 pub mod parity;
 pub mod rpk;
 pub mod sig;
 pub mod trust;
+pub mod wire;
 
 pub use common::{Code, Refusal};
 

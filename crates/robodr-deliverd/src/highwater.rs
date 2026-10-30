@@ -37,7 +37,16 @@
 //! shows the unit's history. Root deleting the journal **as well** (or
 //! flooding it with notes signed with the black-box key until the
 //! generation notes are evicted, and then putting an older record back)
-//! is not detected: a TPM NV counter (14b) closes that gap.
+//! is not detected without a TPM. **Sprint 14b:** with
+//! `seal.anti_rollback_nv` the record also names the value of an NV
+//! counter in the unit's TPM (`nv`, [`robodr_seal::nvcounter`]): every
+//! record write first writes `nv = T + 1`, then increments the counter.
+//! A restored older record (a disk image, a backup), a record deleted
+//! together with the journal and the state file, and a counter undefined
+//! and defined again (owner authorization) all lock the agent. A 13b
+//! record without `nv` is adopted once, while the counter is still
+//! unwritten (the migration); afterwards a record without `nv` is a
+//! rollback.
 
 use crate::state::{LastDeployment, Locked, State};
 use robodr_blackbox::Signer;
@@ -73,6 +82,11 @@ pub struct HighWater {
     /// The agent is locked until an operator re-anchors it (review M-A).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked: Option<Locked>,
+    /// Sprint 14b: the value of the TPM NV counter (`seal.anti_rollback_nv`)
+    /// this record belongs to ([`robodr_seal::nvcounter`]). Absent in a
+    /// record written without the anchor (13b, or before the migration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nv: Option<u64>,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -112,13 +126,16 @@ impl HighWater {
             chains: s.chains.clone(),
             generation: 0,
             locked: s.locked.clone(),
+            nv: None,
         }
     }
 
-    /// The same baseline as `o` (everything but the generation).
+    /// The same baseline as `o` (everything but the generation and the
+    /// NV counter value).
     pub fn same_baseline(&self, o: &Self) -> bool {
         Self {
             generation: o.generation,
+            nv: o.nv,
             ..self.clone()
         } == *o
     }

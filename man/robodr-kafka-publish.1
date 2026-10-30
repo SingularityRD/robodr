@@ -36,6 +36,24 @@ robodr\-kafka\-publish \- publish RoboDR findings to the robot\-edr.findings Kaf
 .RB [ \-\-once ]
 .RB [ \-\-upgrade\-data\-source
 .IR LABEL ]
+.RB ( \-\-tls\-ca
+.I FILE
+.RB [ \-\-tls\-cert
+.I FILE
+.B \-\-tls\-key
+.IR FILE ]
+.RB [ \-\-tls\-server\-name
+.IR NAME ]
+.RB [ \-\-tls\-spki\-sha256
+.IR HEX ]...
+.RB [ \-\-sasl\-mechanism
+.I M
+.B \-\-sasl\-username
+.I U
+.B \-\-sasl\-password\-file
+.IR FILE ]
+|
+.BR \-\-allow\-plaintext )
 .SH DESCRIPTION
 SOC\-side (high side) publisher. It reads either the
 .BR robodr\-diode\-unpack (1)
@@ -60,11 +78,16 @@ Producer settings: acks=all, idempotence off (at\-least\-once delivery:
 consumers drop duplicates on
 .BR event\-uid ),
 one request in flight, no compression.
-.B No TLS or SASL:
-run it on an isolated SOC network or through a local TLS proxy.
+TLS is required: every broker connection, bootstrap and advertised, is TLS
+and the broker certificate is verified against
+.B \-\-tls\-ca
+(chain, validity, serverAuth and the broker's host name as dialled). Plain TCP
+only with an explicit
+.BR \-\-allow\-plaintext .
 Verified against single\-node Apache Kafka 3.9.1 and 4.1.0 brokers
-(\fBscripts/kafka\-it.sh\fR in the source tree). Pointed at a TLS or SASL
-listener it fails with an error that says so.
+(\fBscripts/kafka\-it.sh\fR) and, for TLS, mutual TLS and SCRAM, 3.9.1
+(\fBscripts/kafka\-tls\-it.sh\fR). Pointed at a TLS listener in plain TCP,
+or at a SASL listener without SASL, it fails with an error that says so.
 .PP
 Without
 .B \-\-once
@@ -111,6 +134,37 @@ Loop interval, > 0 (default 2000).
 .B \-\-once
 One pass, then exit.
 .TP
+.BI \-\-tls\-ca " FILE"
+PEM CA bundle: the only trust anchors for the brokers' certificates (no
+system roots).
+.TP
+.BI \-\-tls\-cert " FILE" " \-\-tls\-key " FILE
+Client certificate chain and key (mutual TLS). The key file must not be
+readable by others or writable by the group.
+.TP
+.BI \-\-tls\-server\-name " NAME"
+Name sent as SNI and verified in every broker certificate instead of the
+dialled host (a DNS name or an IP literal).
+.TP
+.BI \-\-tls\-spki\-sha256 " HEX"
+SHA\-256 of a broker's SubjectPublicKeyInfo (64 hex digits, repeatable),
+checked in addition to the chain.
+.TP
+.BI \-\-sasl\-mechanism " M" " \-\-sasl\-username " U " \-\-sasl\-password\-file " FILE
+SASL/SCRAM after the TLS handshake:
+.B SCRAM\-SHA\-256
+or
+.BR SCRAM\-SHA\-512 .
+The password is the file's content (one trailing newline removed; mode as
+for the key). Needs
+.BR \-\-tls\-ca .
+An authentication failure is not retried.
+.TP
+.B \-\-allow\-plaintext
+Plain TCP to the brokers (an isolated SOC network or a local TLS proxy
+only). Refused together with
+.BR \-\-tls\-ca .
+.TP
 .BI \-\-upgrade\-data\-source " LABEL"
 An unsigned contract 1.x record (written before an upgrade) is upgraded to
 contract 2.0 with this
@@ -133,7 +187,10 @@ Error with
 (without it, errors are printed and retried).
 .TP
 .B 2
-Usage error.
+Usage or configuration error (also: neither
+.B \-\-tls\-ca
+nor
+.BR \-\-allow\-plaintext ).
 .SH SYSTEMD UNIT
 The package ships
 .B robodr\-kafka\-publish.service

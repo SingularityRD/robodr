@@ -72,6 +72,8 @@ pub enum Role {
     Release,
     Depot,
     Operator,
+    /// An entry station (Sprint 14a, §6.1): signs entry reports only.
+    Entry,
 }
 
 impl Role {
@@ -81,6 +83,7 @@ impl Role {
             Role::Release => "release",
             Role::Depot => "depot",
             Role::Operator => "operator",
+            Role::Entry => "entry",
         }
     }
 }

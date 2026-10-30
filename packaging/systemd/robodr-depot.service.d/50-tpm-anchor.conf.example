@@ -1,0 +1,7 @@
+# robodr-depot.service drop-in: the database anchor in the depot box's TPM
+# (Sprint 14b; depot.json "anchor"). Copy to
+#   /etc/systemd/system/robodr-depot.service.d/50-tpm-anchor.conf
+# then `systemctl daemon-reload`. /dev/tpmrm0 is root:tss 0660 on Debian and
+# Ubuntu (tpm-udev); the unit already allows the device (DeviceAllow=).
+[Service]
+SupplementaryGroups=tss

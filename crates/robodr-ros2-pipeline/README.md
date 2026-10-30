@@ -174,6 +174,26 @@ joint firewall's clock).
 - A SEDP dispose does not forget a writer (a spoofed dispose must not blind
   the decoder); the tables are bounded and evict non-motion entries first.
 
+## Go2 WebRTC sessions (`webrtc`)
+
+`webrtc::WebRtcMonitor` (off by default) classifies the Go2's WebRTC
+control sessions from what is readable without the session keys: HTTP
+signalling on the robot's ports (the legacy `POST /offer` with a
+plaintext SDP, of which only ICE user fragment, fingerprint hash
+algorithm, candidates and media kinds are kept; the encrypted
+`con_notify` / `con_ing_*` exchange by step only), ICE STUN messages
+(username, ICE attributes, FINGERPRINT CRC), TURN methods and
+ChannelData, DTLS record headers and SRTP demultiplexing (RFC 7983). One
+bounded record per peer, attributed by IP and MAC; findings
+`robot.unitree.webrtc_*` (unknown controller, new peer, controller MAC
+mismatch, session in a denied window, concurrent sessions, relayed or
+non-local session, media without signalling), each naming the flows. It
+takes `FlowPacket`s (`decode_ipv4` builds them from an IPv4 packet); the
+in-path gateway feeds it from its NFLOG copies. agentd's passive capture
+does not feed it yet (its capture is UDP / RTPS-only). Limits are in the
+module docs: nothing inside a session is visible, signalling formats come
+from community clients, HTTP is read per segment.
+
 ## `robodr-ros2-watch`
 
 ```sh

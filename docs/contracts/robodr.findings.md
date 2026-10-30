@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Contract | `robodr.findings`, version **2.2.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
-| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings into the same spool), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
+| Contract | `robodr.findings`, version **2.3.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings, and since 2.3 its `robot.seal.*` findings, into the same spool; since 2.3 the in-path gateway `robodr-firewall-gw` reports its `robot.gateway.*` findings through agentd's `gateway_feed` socket), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
-| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.2.0`; it also describes 2.0.x and 2.1.x messages, whose only difference is the rule catalog the validator applies, §3) |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`; it also describes 2.0.x, 2.1.x and 2.2.x messages, whose only difference is the rule catalog the validator applies, §3) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 | Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
@@ -71,7 +71,7 @@ each one against the robot's current safety state and may refuse it.
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | the value's own `contract_version` (`2.2.0` from this producer; a forwarded or replayed 2.0 or 2.1 message keeps its version) |
+| `robodr-contract-version` | the value's own `contract_version` (`2.3.0` from this producer; a forwarded or replayed 2.0, 2.1 or 2.2 message keeps its version) |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -86,7 +86,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "2.2.0",
+  "contract_version": "2.3.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robodr",
@@ -422,7 +422,8 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.0 – 1.2 | base catalog |
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
-  | 2.2 and later | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
+  | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
+  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c), and the Unitree WebRTC entries `robot.unitree.webrtc_*`, data source `ros2_motion_commands`, no techniques (§3d), and the depot entries `robot.depot.import_refused` (High), `robot.depot.enrolment_refused` (High), `robot.depot.unit_enrolled` (Low), `robot.depot.rollout_halted` (High), `robot.depot.locked` (Critical) and `robot.seal.erase_deferred` (Medium), data source `robodr_delivery`, no techniques (§3e) |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -485,6 +486,150 @@ restored from the signed high-water record), `state_lost` (it could not
 be restored completely: the unit refuses imports and installs until it is
 re-anchored), `highwater_invalid` (the high-water record did not verify).
 
+## 3b. Rule catalog 2.3: in-path gateway (`robot.gateway.*`)
+
+<!-- 2.3 gateway block: keep separate from other 2.3 additions (e.g. robot.seal.*). -->
+
+Added in 2.3 for the in-path Motion Firewall gateway `robodr-firewall-gw`
+(Sprint 8). The gateway counts its own decisions per (rule, channel) and
+reports one aggregated deviation per housekeeping period (detail: `channel
+<name>: <n> time(s) since the last report; first: <reason> (<what>),
+value <v>, limit <l>`) to agentd's `gateway_feed` socket; agentd turns
+each line into a finding of its normal pipeline (black box, spool,
+responder, correlation). The Motion Firewall's own deviations from the
+gateway keep their `robot.firewall.*` ids (2.0 / 2.1 entries). Every entry
+has data source `ros2_motion_commands` and no techniques.
+
+| Id | Title | Severity |
+| --- | --- | --- |
+| `robot.gateway.trajectory_rejected` | Joint trajectory blocked by the in-path gateway | High |
+| `robot.gateway.trajectory_time_scaled` | Joint trajectory slowed down by the in-path gateway | Medium |
+| `robot.gateway.undecodable_command` | Undecodable motion command blocked by the in-path gateway | High |
+| `robot.gateway.fragmented_command` | Fragmented motion command blocked by the in-path gateway | Medium |
+| `robot.gateway.writer_binding_conflict` | Authorised motion writer seen from another address | High |
+| `robot.gateway.sequence_jump` | Motion command sequence jump held back | Medium |
+| `robot.gateway.port_bypass_risk` | Motion traffic may bypass the in-path gateway | High |
+| `robot.gateway.restriction_changed` | Motion restriction changed on the in-path gateway | Low (informational) |
+| `robot.gateway.findings_dropped` | In-path gateway findings lost | Medium |
+
+Catalog sentences (`description`):
+
+* `robot.gateway.trajectory_rejected`: The in-path motion gateway suppressed a ROS 2 joint trajectory or FollowJointTrajectory goal that was outside the channel's bounds: an unknown or repeated joint name, a non-finite value, time not increasing, too many points or too long, or a position, velocity, acceleration or effort beyond its joint limit. It never reached the robot.
+* `robot.gateway.trajectory_time_scaled`: The in-path motion gateway forwarded a ROS 2 joint trajectory slowed down in place, because its velocities or accelerations exceeded the channel's limits; the path is unchanged.
+* `robot.gateway.undecodable_command`: The in-path motion gateway could not decode a sample of an enforced motion channel strictly (truncated, non-canonical or unsupported encoding) and decided it as an integrity failure: it was suppressed or replaced by the firewall's substitute.
+* `robot.gateway.fragmented_command`: The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify; such a sample cannot be decided in place.
+* `robot.gateway.writer_binding_conflict`: The in-path motion gateway received samples under an authorised writer's GUID from another source address or MAC than the one the writer's stream is bound to, while the bound side was live: a spoofing attempt, suppressed.
+* `robot.gateway.sequence_jump`: The in-path motion gateway held back a sample whose RTPS sequence number jumped far past the writer's stream until the writer confirmed it: a forged high sequence number could otherwise make the robot drop the genuine commands.
+* `robot.gateway.port_bypass_risk`: DDS discovery announced a locator on a UDP port the in-path motion gateway does not inspect: commands sent there would reach the robot unchecked until the gateway's port ranges are fixed.
+* `robot.gateway.restriction_changed`: A restrict_motion restriction was applied, changed, lifted or expired on the in-path motion gateway. Informational: the evidence trail of the robot's effective motion limits.
+* `robot.gateway.findings_dropped`: The in-path motion gateway had more distinct findings in one reporting period than it can hold; some were counted but not reported individually.
+
+Reasons a `robot.gateway.trajectory_rejected` finding names (`first:`):
+`unknown_joint`, `duplicate_joint`, `too_many_points`, `no_joints`,
+`point_shape`, `non_finite`, `negative_time`, `time_not_increasing`,
+`too_long`, `position`, `velocity`, `acceleration`, `effort`,
+`tolerance`, `time_scale_failed`.
+
+<!-- end of the 2.3 gateway block -->
+## 3c. Rule catalog 2.3: sealing (`robot.seal.*`)
+
+The 2.3 addition for captured-unit software protection
+(`docs/SECURE-DELIVERY.md` §7, §9; Sprint 13c), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.3.x (or later 2.x). Like §3a: data source
+`robodr_delivery` (`finding_info.data_sources` exactly
+`["robodr_delivery"]`, `types` exactly `["robot_deviation",
+"robodr_delivery"]`), no techniques, producer `robodr-deliverd`. Other
+2.3 additions are documented in their own section (§3b).
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.seal.unseal_failed` | Unit could not unseal delivered software | High |
+| `robot.seal.lease_expired` | Site lease expired | Medium (catalogued; emitted from Sprint 14b, which adds the lease) |
+| `robot.seal.erased` | Crypto-erase of delivered software executed | Critical |
+| `robot.seal.tamper` | Enclosure tamper or erase trigger fired | Critical |
+
+Catalog sentences (`finding_info.desc`):
+
+* `robot.seal.unseal_failed`: The unit's TPM refused to release the key of a sealed (encrypted) delivered package: the boot measurements do not match the signed PCR policy, the policy was revoked, or the unit's sealing keys were crypto-erased. The package stays unreadable on the unit; RoboDR detection keeps running.
+* `robot.seal.lease_expired`: The unit's site lease for unsealing delivered software expired: sealed packages become unavailable after its next reboot until a fresh lease is issued.
+* `robot.seal.erased`: The unit's sealing keys were cryptographically erased (the TPM erase epoch moved on, or the fallback key and volume keyslots were destroyed), with the trigger named in the finding. Every sealed package on the unit is permanently unreadable; recovery is re-enrolment and re-delivery.
+* `robot.seal.tamper`: An enclosure tamper input or another crypto-erase trigger fired on the unit; a crypto-erase of its sealing keys follows.
+
+The detail of `robot.seal.unseal_failed` starts with the reason
+(`policy_refused` or `erased`, before the first `:`); that of
+`robot.seal.erased` names the trigger (`operator`, `tamper`, ...). A wrap
+that does not authenticate (tampered, or another unit's) is not a sealing
+finding but a `robot.deliver.refused` with reason `unauthentic_key`.
+
+## 3d. Rule catalog 2.3: Unitree WebRTC sessions (`robot.unitree.webrtc_*`)
+
+<!-- 2.3 Unitree block: keep separate from the other 2.3 blocks (§3b, §3c). -->
+
+The 2.3 addition for Go2 WebRTC control sessions
+(`robodr-ros2-pipeline::webrtc`; reported by the in-path gateway's
+`webrtc` section through agentd's `gateway_feed`, channel `webrtc`), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.3.x (or later 2.x). Data source
+`ros2_motion_commands`, no techniques. The session content is DTLS-SRTP
+encrypted and never inspected: these findings say who holds a WebRTC
+session with the robot and when, not what it commands. Details name the
+peer and its flows (`peer ip:port <-> robot ip:port`).
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.unitree.webrtc_unknown_controller` | WebRTC control session from an unlisted host | High (attempt), Critical (established) |
+| `robot.unitree.webrtc_new_peer` | New WebRTC peer of the robot | Medium |
+| `robot.unitree.webrtc_controller_mac_mismatch` | Listed WebRTC controller seen with another link-layer address | High |
+| `robot.unitree.webrtc_session_in_denied_window` | WebRTC control session during a denied window | High |
+| `robot.unitree.webrtc_concurrent_sessions` | More concurrent WebRTC control sessions than allowed | High |
+| `robot.unitree.webrtc_relayed_session` | Remote WebRTC session through a relay | Medium |
+| `robot.unitree.webrtc_media_without_signalling` | WebRTC session without observed signalling | Medium |
+
+Catalog sentences (`finding_info.desc`): see
+`catalog_2_3_unitree` in `crates/robodr-ocsf/src/builder.rs` (one per id,
+in the same order as the table).
+
+<!-- end of the 2.3 Unitree block -->
+
+## 3e. Rule catalog 2.3: site depot and executed erase (`robot.depot.*`)
+
+The 2.3 addition of the site depot and the executed crypto-erase
+(`docs/SECURE-DELIVERY.md` §5, §7.6, §8, §9; Sprints 14a / 14b), in a
+block of its own (`catalog_2_3_depot` in `robodr-ocsf`), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.3.x (or later 2.x); a 2.2 validator, and a 2.3
+validator given a 2.2 message, apply the generic entry. Like §3a: data
+source `robodr_delivery` (`finding_info.data_sources` exactly
+`["robodr_delivery"]`, `types` exactly `["robot_deviation",
+"robodr_delivery"]`), no techniques. Producers: `robodr-depot` for
+`robot.depot.*` (its `robot` is the depot's `depot_id`; written into the
+agentd spool of the depot box with `robodr-deliverd`'s writer) and
+`robodr-deliverd` for `robot.seal.erase_deferred`.
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.depot.import_refused` | Depot refused a release bundle | High |
+| `robot.depot.enrolment_refused` | Depot refused a unit enrolment | High |
+| `robot.depot.unit_enrolled` | Unit enrolled at the depot | Low |
+| `robot.depot.rollout_halted` | Staged rollout halted | High |
+| `robot.depot.locked` | Depot database failed its anti-rollback check | Critical |
+| `robot.seal.erase_deferred` | Crypto-erase deferred by the safety state | Medium |
+
+Catalog sentences (`finding_info.desc`):
+
+* `robot.depot.import_refused`: The site depot refused to import a release bundle: no passing entry-station report for exactly that bundle, a signature, quorum, chain, revocation, floor or hash check failed. Nothing of the bundle can be deployed.
+* `robot.depot.enrolment_refused`: The site depot refused to enrol a unit: its EK certificate does not chain to a TPM vendor CA the site trusts, the attestation key or a certified key is not resident in that TPM, the unit's keys are not bound to the site's policy, its boot measurements do not match the signed policy, or the credential challenge was not answered by the unit's TPM. No key is wrapped for it.
+* `robot.depot.unit_enrolled`: A unit was enrolled at the site depot after TPM credential activation and the operator quorum; the depot may now deliver and wrap keys for it.
+* `robot.depot.rollout_halted`: A unit of the current ring reported a failed health gate or a refusal beyond the rollout's failure threshold; the site depot halted the rollout and serves nothing more of it until operators resume it.
+* `robot.depot.locked`: The site depot's database is older than its TPM anti-rollback counter says, or the counter was recreated: the database was restored or replaced. The depot signs, serves and imports nothing until operators re-anchor it.
+* `robot.seal.erase_deferred`: A crypto-erase trigger fired, and the responder deferred the erase because the robot is moving (or its safety state is unknown); it runs as soon as the robot is idle or its safety system holds it.
+
+`robot.seal.lease_expired` (§3c) is emitted from Sprint 14b: Medium, once
+per reason, while a sealed item waits for a site lease. The executed erase
+reports `robot.seal.tamper` and `robot.seal.erased` as in §3c, with
+`robot.seal.erase_deferred` between them when the robot was moving.
+
 ## 4. Ordering and partitioning
 
 * Partition = `toPositive(murmur2(utf8(robot_id))) % partitions` — Kafka's
@@ -514,14 +659,15 @@ re-anchored), `highwater_invalid` (the high-water record did not verify).
   parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
-* **2.0 vs 2.1 vs 2.2.** 2.1 and 2.2 only added rule-catalog entries
-  (§3; 2.2 also the data source `robodr_delivery` they use). A 2.2
-  validator accepts 2.0 and 2.1 messages with their own catalogs; an older
+* **2.0 vs 2.1 vs 2.2 vs 2.3.** 2.1, 2.2 and 2.3 only added rule-catalog
+  entries (§3; 2.2 also the data source `robodr_delivery` they use). A 2.3
+  validator accepts 2.0, 2.1 and 2.2 messages with their own catalogs; an older
   validator accepts a newer message for every rule both catalogs share and
   rejects one for a rule only the newer minor catalogues (title / data
   source differ): upgrade consumers (and both sides of a diode) before
   producers. Sites that run `robodr-deliverd` need 2.2 validators on the
-  SOC side before its findings are exported.
+  SOC side before its findings are exported, and 2.3 validators once it
+  installs sealed RPKs (`robot.seal.*`).
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -748,8 +894,8 @@ The two hops around the diode are implemented in `crates/robodr-export`
 * **Producer settings actually used** (std-only client; verified against
   single-node Apache Kafka 3.9.1 and 4.1.0 with `scripts/kafka-it.sh`,
   including the §4 partition against the Java client's partitioner):
-  `acks=all`, **idempotence off**, one request in flight, no compression, **no TLS/SASL** (isolated network or local TLS
-  proxy); a per-request deadline covering writes and reads that exceeds the
+  `acks=all`, **idempotence off**, one request in flight, no compression, TLS (required unless plain TCP is
+  explicitly allowed), optional mutual TLS and SASL/SCRAM-SHA-256/512; a per-request deadline covering writes and reads that exceeds the
   broker-side produce timeout; host names resolved with a timeout (IP
   literals recommended). This deviates from §4's `enable.idempotence=true`: delivery is
   at-least-once and consumers must drop duplicates on `event-uid`.
@@ -810,6 +956,50 @@ safely. Nothing here is specific to one product.
       eval inputs.
 
 ## 10. Changelog
+
+<!-- 2.3 gateway block (merge with other 2.3 entries, e.g. robot.seal.*). -->
+* **2.3.0** — rule-catalog entries only (minor), Sprint 8:
+  - New entries (data source `ros2_motion_commands`, already in the
+    schema's enums): `robot.gateway.trajectory_rejected`,
+    `robot.gateway.trajectory_time_scaled`,
+    `robot.gateway.undecodable_command`,
+    `robot.gateway.fragmented_command`,
+    `robot.gateway.writer_binding_conflict`,
+    `robot.gateway.sequence_jump`, `robot.gateway.port_bypass_risk`,
+    `robot.gateway.restriction_changed`,
+    `robot.gateway.findings_dropped` (§3b), emitted by
+    `robodr-firewall-gw` and reported by agentd (`gateway_feed`).
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
+<!-- end of the 2.3 gateway block -->
+* **2.3.0** — rule-catalog entries only (minor). Sealing block, Sprint 13c
+  (other 2.3 additions are listed as their own items):
+  - New entries (data source `robodr_delivery`, already in the schema's
+    enums since 2.2): `robot.seal.unseal_failed`, `robot.seal.lease_expired`,
+    `robot.seal.erased`, `robot.seal.tamper` (`docs/SECURE-DELIVERY.md`
+    §9), emitted by `robodr-deliverd` (`lease_expired` from 14b). §3c.
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
+
+<!-- 2.3 Unitree block -->
+* **2.3.0** — rule-catalog entries only (minor). Unitree block (other 2.3
+  additions are listed as their own items):
+  - New entries (data source `ros2_motion_commands`, already in the
+    schema's enums): `robot.unitree.webrtc_unknown_controller`,
+    `webrtc_new_peer`, `webrtc_controller_mac_mismatch`,
+    `webrtc_session_in_denied_window`, `webrtc_concurrent_sessions`,
+    `webrtc_relayed_session`, `webrtc_media_without_signalling` (§3d),
+    emitted by `robodr-firewall-gw` (`webrtc` section) and reported by
+    agentd (`gateway_feed`, which now accepts the `robot.unitree.webrtc_*`
+    ids besides `robot.gateway.*` / `robot.firewall.*`).
+<!-- end of the 2.3 Unitree block -->
+
+* **2.3.0** — rule-catalog entries only (minor). Depot block, Sprints
+  14a / 14b (other 2.3 additions are listed as their own items):
+  - New entries (data source `robodr_delivery`): `robot.depot.import_refused`,
+    `robot.depot.enrolment_refused`, `robot.depot.unit_enrolled`,
+    `robot.depot.rollout_halted`, `robot.depot.locked` (emitted by
+    `robodr-depot`) and `robot.seal.erase_deferred` (emitted by
+    `robodr-deliverd`). §3e. `robot.seal.lease_expired` is now emitted.
+  - Schema `$id` unchanged (`.../findings/2.3.0`).
 
 * **2.2.0** — rule-catalog entries only (minor), Sprint 13b:
   - New entries (data source `robodr_delivery`, added to the schema's

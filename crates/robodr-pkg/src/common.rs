@@ -100,6 +100,9 @@ pub enum Code {
     ChainBroken,
     /// A document for another programme or site.
     WrongScope,
+    /// The entry station failed the bundle, or its report contradicts its
+    /// own verdict (Sprint 14a, §6.1).
+    ScanFailed,
 }
 
 impl Code {
@@ -130,6 +133,7 @@ impl Code {
             Code::Equivocation => "equivocation",
             Code::ChainBroken => "chain_broken",
             Code::WrongScope => "wrong_scope",
+            Code::ScanFailed => "scan_failed",
         }
     }
 }

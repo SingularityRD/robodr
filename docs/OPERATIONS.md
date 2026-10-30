@@ -1361,9 +1361,43 @@ robodr-blackbox keygen --out /etc/robodr-anchor-receiver/receiver.key --key-id a
     {"unit": "ugv-07", "public_key": "/etc/robodr-anchor-receiver/units/ugv-07.pub"}
   ],
   "max_connections": 64,
-  "io_timeout_ms": 5000
+  "max_connections_per_source": 8,
+  "io_timeout_ms": 5000,
+  "tls": {
+    "cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
+    "key_file": "/run/credentials/robodr-anchor-receiver.service/receiver-tls.key",
+    "client_ca": "/etc/robodr-anchor-receiver/tls/robots-ca.pem"
+  }
 }
 ```
+
+**TLS** (required by default). `tls.cert_chain` is the receiver's
+certificate chain (PEM, end-entity first; its SAN must name the address the
+robots dial: an `IP:` SAN for an IP literal, a `DNS:` SAN for a name, or
+the robots' `server_name`); `tls.key_file` its private key (no access for
+others, no group write); `tls.client_ca` (optional) makes every robot
+present a client certificate chaining to that CA (mutual TLS: unknown
+hosts never reach the request parser). Hand the key over with a drop-in
+(`systemctl edit robodr-anchor-receiver`):
+
+```ini
+[Service]
+LoadCredential=receiver-tls.key:/etc/robodr-anchor-receiver/tls/receiver.key
+```
+
+Without `tls` the receiver refuses to start unless the config says
+`"allow_plaintext": true` (a lab, or a private link you accept to run in
+clear: marks and answers stay Ed25519-signed, see below, but hashes and
+sequence numbers are readable on the wire); `tls` together with
+`allow_plaintext` is refused. Failed handshakes are logged (the first 16,
+then at powers of two). `io_timeout_ms` bounds a whole connection, TLS
+handshake included (every read and write is re-armed with the time left,
+so a peer trickling bytes is cut), and the answer gets another one;
+`max_connections_per_source` (default 8, 1..=4096) caps the connections
+one address may hold, authenticated or not, so a single host cannot take
+every one of `max_connections`. Every TLS file (and the robot's and the
+publisher's, below) must be owned by root or by the service's own user
+(`LoadCredential=` files are).
 
 `unit` is the robot's `robot.id`; a public key bound to a device
 (`keygen --device`) must name that robot. Then
@@ -1383,15 +1417,40 @@ On the robot (`agentd.json`):
   "kind": "remote",
   "address": "10.20.0.1:7461",
   "receiver_public_key": "/etc/robodr/anchor-receiver.pub",
-  "timeout_ms": 2000
+  "timeout_ms": 2000,
+  "tls": {
+    "ca_file": "/etc/robodr/anchor/receiver-ca.pem",
+    "cert_chain": "/etc/robodr/anchor/ugv-07.pem",
+    "key_file": "/run/credentials/robodr-agentd.service/anchor-tls.key"
+  }
 }
 ```
 
 `address` is `host:port` (an IP literal avoids DNS at start);
 `receiver_public_key` must be absolute and outside `blackbox.dir` and
-`spool.dir`; `timeout_ms` (100..=30000, default 2000) bounds connect, write
-and read each, so a start waits at most about three times that for the
-receiver. Marks never wait for the network.
+`spool.dir`; `timeout_ms` (100..=30000, default 2000) bounds connect, TLS
+handshake, write and read each, so a start waits at most about four times
+that for the receiver (three without TLS). Marks never wait for the
+network.
+
+`tls` (required unless `"allow_plaintext": true`; both together are
+refused, neither is refused at load): `ca_file` holds the only trust
+anchors for the receiver's certificate, which is always verified (chain,
+validity, `serverAuth`, and the host of `address`, or `server_name` if
+set: SNI and the verified name are the same); `server_spki_sha256`
+(optional, 64 hex digits each) pins the receiver's public key in addition;
+`cert_chain` + `key_file` (both or neither) present a client certificate
+for a receiver with `client_ca`. All paths absolute; the key file needs
+no access for others and no group write; give it to agentd through a
+`LoadCredential=anchor-tls.key:/etc/robodr/anchor/ugv-07.key` drop-in
+(section 6.4 explains drop-ins). A TLS failure is an anchor failure (the
+robot keeps recording, `anchor_failures` counts it); there is no fallback
+to plain TCP. Each exchange is bounded as a whole (connect within
+`timeout_ms`, then handshake, request and answer within three times it),
+so an on-path host that trickles bytes produces counted failures, not a
+stalled delivery; a delivery attempt that still has not finished after
+its bound (a hanging name lookup: prefer an IP literal) is reported by the
+next mark as a failure.
 
 **Alerts.** The receiver refuses and records (journal line,
 `/var/lib/robodr-anchor-receiver/alerts.jsonl`, per-robot counter): `lower`
@@ -1432,8 +1491,12 @@ rollback is detected on the far side, at the next mark that arrives.
 
 Limits: tested over loopback with a real receiver process, not across a
 real network. Rollback and truncation become detectable, not prevented;
-the window is the newest marks that have not reached the receiver. No TLS:
-marks (hashes, sequence numbers) are visible on the wire.
+the window is the newest marks that have not reached the receiver. With
+`allow_plaintext`, marks (hashes, sequence numbers) are visible on the
+wire. Mutual TLS authenticates the robot's host, not its unit id: any
+certificate `client_ca` accepts may send marks for any configured robot
+(each still has to verify under that robot's key). No CRL / OCSP check:
+revoke by replacing the CA or the receiver certificate.
 
 ### 6.5 Executor v1 (`robodr-executor`, reversible actions)
 
@@ -1644,6 +1707,52 @@ A failed revert is retried every 500 ms until it verifies. Treat
 `revert_failures > 0` as urgent. The finding for it is not in the
 findings contract yet, so watch this counter instead.
 
+**Motion adapters (Sprint 8).** Off unless `executor.json` has a `motion`
+section (example `config/executor.motion.example.json`; contract §6a,
+"Motion adapters"; design and gates:
+[`crates/robodr-executor/README.md`](../crates/robodr-executor/README.md#motion-adapters-sprint-8)).
+To enable:
+
+1. Choose the adapters per action: `restrict_motion` (`gateway`,
+   `unitree_sport`), `safe_pause` / `request_safe_state` (`nav2`,
+   `ros2_control`, `px4`), `rollback_config` (`rollback`, the site's
+   program). The response policy's `safe_pause` / `safe_state` behaviour
+   must be one the adapter carries out (Nav2: `controlled_stop`;
+   ros2_control: `protective_stop_category2`; PX4: `hold`, and
+   `return_to_launch` for the safe state).
+2. Test each adapter on the robot with the OEM, then set its
+   `oem_validated: true`. Until then every motion order is refused
+   `adapter_not_validated`, nothing is sent.
+3. Allow the network: install the `40-motion.conf.example` drop-in
+   (`AF_INET`, `IPAddressAllow=` the ROS 2 / PX4 peers, the gateway's
+   restriction directory) and restart the executor. Give the ROS 2
+   adapters a fixed `ros2.participant_prefix` and profile it at
+   commissioning (otherwise agentd reports the executor's participant as
+   unknown). Keep each action within 4 s (the configuration is refused
+   otherwise): agentd waits `executor.timeout_ms` (default 5 s).
+4. Gateway adapter: set `restriction_path` / `status_path` in both the
+   executor's `motion.gateway` and the gateway's configuration
+   (`restriction_path`, `status_path`); create the restriction directory
+   owned by `robodr-exec`, group `robodr`, mode `0750`.
+5. SOC side: `safe_pause`, `request_safe_state` and `rollback_config` need
+   `approved_by` with two people in the signed request (and in a revert of
+   a `safe_pause`): names `[A-Za-z0-9._%+@-]{1,100}`, compared
+   case-insensitively. The executor trusts the SOC key for who approved:
+   enforce the two-person rule in the SOC's workflow too.
+6. Set `ros2.peer_participant_prefix` to the robot participant's GUID
+   prefix (from the commissioning capture) so only its replies count. With
+   both `unitree_sport` and `gateway` for `restrict_motion`, list
+   `unitree_sport` first (enforced).
+
+What to expect: `restrict_motion` and `safe_pause` answer `verified` and
+are lifted at their TTL (`motion.safe_pause_ttl_s` for a pause) or by
+revert; lifting a pause **releases** it and never resumes a mission
+(Nav2 goals are not restored, PX4 stays in hold); `request_safe_state` and
+`rollback_config` answer `applied` and are not reversible. A pause or safe
+state is refused while `moving_fast` unless the adapter lists it in
+`allowed_states`. Watch the executor's events: an adapter undo that fails
+(`revert_failed`) is retried every tick; check the platform by hand.
+
 ### 6.6 Inline Motion Firewall gateway (`robodr-firewall-gw`)
 
 The in-path enforcement mode for a sensor box bridged into the controller
@@ -1755,6 +1864,40 @@ while the chain is flushed.
 * Large IP datagrams from the controller side disappear: defragmentation
   did not run (another ruleset flushed the `raw` table); re-run the rules
   unit.
+
+**ROS 2 joint trajectories, findings feed, restriction (Sprint 8).**
+
+* Trajectory channels (`ros2_joint_trajectory`,
+  `ros2_follow_joint_trajectory_goal`, example
+  `config/firewall-gw.ros2-arm.example.json`): list every joint with its
+  bounds in `trajectory`; the firewall channel is `kind joints` with that
+  count. Make the controller send each trajectory in one RTPS DATA (raise
+  the DDS message / fragment size, or bound `max_points`): a fragmented
+  one is suppressed (`robot.gateway.fragmented_command`). Start with
+  `mode: observe` and check `status.json` `gateway.trajectory_refused` /
+  `trajectory_time_scaled` against the controller's real trajectories.
+* Findings to agentd: set agentd's `gateway_feed` (`socket_path`,
+  `allowed_uids` = the gateway's uid, `socket_mode: "0660"` with the
+  gateway's user in agentd's group) and the gateway's `findings_socket` to
+  the same path. `status.json` `findings_feed` shows `connected`, `sent`,
+  `pending`, `dropped`, `last_error`; agentd counts
+  `daemon.gateway_findings`. An idle gateway writes a heartbeat line
+  every 5 s (`daemon.gateway_heartbeats`), so a quiet gateway is not
+  reported as a silent input; a gateway that stops writing still is
+  (`robot.agent.input_silent` after `daemon.silence_ms`). Upgrade agentd
+  before the gateway: an older agentd counts the heartbeat as a
+  malformed line.
+* `restrict_motion`: with `restriction_path`, `status.json` `restriction`
+  is the restriction in force (`null`: none) and `restriction_error` why a
+  file was ignored. Removing the file lifts it at the next housekeeping
+  tick; it also lapses at its own expiry. The file must be a regular
+  file, not group- or world-writable, owned by root or the directory's
+  owner (a symlink or FIFO is refused without blocking). While it is in
+  force the gateway refuses the sport `SpeedLevel`. A trajectory the
+  controller accepted before the restriction keeps its speeds: pause it.
+* Trajectories: a non-zero `header.stamp` is zeroed (status
+  `trajectory_stamp_zeroed`); the segments between points are checked as
+  the controller's default spline interpolation executes them.
 
 ## 7. Upgrade and rollback
 
@@ -2011,10 +2154,31 @@ with, `findings.topic`, and records relabelled to `--topic` are counted),
 upgrades unsigned contract 1.x records to 2.0 and dead-letters signed
 ones (section 7), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
-broker-rejected records go to a dead-letter file. **No TLS / SASL** and
-**idempotence off** (at-least-once: consumers drop duplicates on
-`event-uid`): run it on an isolated SOC network or through a local TLS
-proxy. Without `--once` it loops every `--interval-ms` (default 2000).
+broker-rejected records go to a dead-letter file. **Idempotence off**
+(at-least-once: consumers drop duplicates on `event-uid`). Without
+`--once` it loops every `--interval-ms` (default 2000).
+
+**TLS, mutual TLS, SASL/SCRAM.** TLS is required: `--tls-ca FILE` (PEM,
+the only trust anchors) makes every broker connection TLS and verifies
+each broker's certificate, bootstrap and advertised alike (chain,
+validity, `serverAuth`, the broker's host as dialled, or
+`--tls-server-name NAME` for all of them); `--tls-spki-sha256 HEX`
+(repeatable) pins broker keys in addition; `--tls-cert FILE --tls-key
+FILE` present a client certificate (`ssl.client.auth=required`
+listeners). `--sasl-mechanism SCRAM-SHA-256|SCRAM-SHA-512
+--sasl-username U --sasl-password-file FILE` authenticate after the
+handshake (SASL_SSL listeners; SCRAM only, never `PLAIN`; over TLS only;
+a wrong credential, or a broker that cannot prove it knows it, fails the
+call at once). A broker session lifetime (`connections.max.reauth.ms`) is
+honoured by reconnecting before it ends. Key and password files: no
+access for others, no group write, owner root or the service user; hand
+them to the unit with the drop-in
+example `robodr-kafka-publish.service.d/60-tls-credentials.conf.example`
+and set `ROBODR_KAFKA_TLS_ARGS` in `/etc/robodr/kafka-publish.env`. Plain
+TCP needs an explicit `--allow-plaintext` (an isolated SOC network or a
+local TLS proxy only); without TLS and without it, the publisher exits 2
+at start. Upgrading from a release without TLS: add one or the other, or
+the unit stops (exit 2 is not restarted).
 `robodr-spool-export.service` and `robodr-kafka-publish.service` run the
 loop (no timer needed: both binaries retry on their own; exit 2, a usage
 error, is not restarted); the transfer of `/var/lib/robodr/export/diode`
@@ -2026,7 +2190,14 @@ test against the SOC's Kafka version (needs docker and the source tree):
 ```sh
 scripts/kafka-it.sh                                   # apache/kafka:3.9.1
 KAFKA_IT_IMAGE=apache/kafka:4.1.0 scripts/kafka-it.sh  # any apache/kafka tag
+KAFKA_HOME=/opt/kafka_2.13-3.9.1 scripts/kafka-tls-it.sh  # no docker: TLS, mTLS, SCRAM
 ```
+
+`kafka-tls-it.sh` starts a native broker (a Kafka distribution and Java,
+no docker) whose certificate is the test PKI of `fixtures/tls/`, with SSL,
+SSL + required client certificate and SASL_SSL SCRAM-SHA-256/512
+(`connections.max.reauth.ms` 8 s) listeners, and runs the whole
+real-broker suite plus the TLS tests (verified 2026-10-30 with 3.9.1).
 
 It starts a single-node broker, publishes signed findings with
 `robodr-kafka-publish` and the library (spool and diode paths, crash and
@@ -2042,10 +2213,14 @@ few records with `kafka-console-consumer.sh --property print.headers=true
 must be in contract order with `robodr-finding-sig` last (connected sites
 that sign), and a robot's findings must all be in one partition.
 
-Troubleshooting the publisher: an error naming a **TLS record** or **SASL**
-means the bootstrap address (or an advertised listener) is a TLS or SASL
-listener; this client speaks PLAINTEXT only (use a PLAINTEXT listener or a
-local TLS proxy). `UNKNOWN_TOPIC_OR_PARTITION`: the topic does not exist
+Troubleshooting the publisher: an error naming a **TLS record** means a
+TLS listener was dialled in plain TCP (`--allow-plaintext`): give
+`--tls-ca` instead. **SASL** after ApiVersions: the listener wants SASL
+(`--sasl-*`). `TLS handshake: invalid peer certificate` names the reason
+(`UnknownIssuer`: wrong `--tls-ca`; `NotValidForName`: the advertised host
+is not in the broker certificate's SAN, fix `advertised.listeners` or use
+`--tls-server-name`; `Expired`; a pin mismatch). `SASL_AUTHENTICATION_FAILED`:
+wrong user or password, or the mechanism is not enabled for that user. `UNKNOWN_TOPIC_OR_PARTITION`: the topic does not exist
 (it is never auto-created). `TOPIC_AUTHORIZATION_FAILED`: grant WRITE and
 DESCRIBE on the findings topic (default `robodr.findings`) to the
 publisher's principal.
@@ -2727,3 +2902,370 @@ or other permissions, as for `--key`.
   is accepted from this release on; remove any workaround such as
   `allowed_gids` = the `robodr` gid (agentd now refuses to start with
   it).
+
+## 12. Sealed delivery: captured-unit protection (`robodr-seal`, Sprint 13c)
+
+Sealed RPKs keep delivered software, models and mission configuration
+unreadable on a captured unit (`docs/SECURE-DELIVERY.md` §7, decisions
+§7.9; `man robodr-seal(8)`). The plaintext exists only inside the unit's
+**runtime volume**, a LUKS2 volume whose key, like every content key, is
+usable only through the unit's TPM under a **signed PCR policy**, a
+**policy floor** and an **erase epoch**. Units without a TPM use the
+Clevis/Tang fallback (weaker; §12.5). Verified against a software TPM
+(swtpm) and a real Tang server in tests only: not yet on a hardware TPM,
+a robot or with device-mapper.
+
+### 12.1 Provision the unit's TPM (once, as root)
+
+1. Set the **owner authorization** and the **lockout authorization** to
+   secrets that are **not stored on the unit** (kept by the site security
+   officer). Required: `provision` refuses a TPM where either is empty,
+   and `policy commit` refuses then too, because with an empty owner
+   authorization anyone with root could undefine and redefine the policy
+   floor and revive every revoked policy:
+   `tpm2_changeauth -c o file:-` and `tpm2_changeauth -c l file:-` (each
+   reads the new value on stdin; on a TPM that already has one, add
+   `-p file:<old>`). `robodr-seal status` shows `owner_auth_set`,
+   `lockout_auth_set` and a warning when either is missing.
+2. `robodr-seal provision --owner-auth-file /root/owner.auth` (required;
+   a regular file only root can read, not a symlink; delete it
+   afterwards): defines the erase-epoch
+   counter (`0x01500040`), the policy-floor bit field (`0x01500041`) and
+   the persistent SRK (`0x81000001`); idempotent; an index that exists
+   with other attributes is an error, never redefined. Other handles:
+   `--epoch-nv`, `--floor-nv`, `--srk` (then the same in every command and
+   in the agent's configuration).
+3. TPM session files (they hold session keys) go to `/run/robodr-seal`
+   (`--work-dir`, `seal.tpm.work_dir`), which must be on tmpfs: every
+   TPM command refuses a work directory on a disk. Directories a killed
+   command left behind are removed by the next one.
+
+### 12.2 Keys of the programme office and the site
+
+| Key | Command | Kept |
+|---|---|---|
+| Policy authority (P-256) | `robodr-seal keygen policy --out authority.key` | offline with the delivery roots; signs PCR policies |
+| Depot wrapping key (X25519), one per site depot | `robodr-seal keygen depot --out depot.key` | the site depot (`keys.wrap`; a file today, TPM / HSM planned); `depot.key.pub` goes to the release station and into the trust file's `depot_wrap_keys` (14a) |
+| Lease key (P-256), one per site depot (14b) | `robodr-seal keygen lease --out lease.key` | the site depot (`keys.lease`); `lease.key.pub` is given to `enroll --lease-key` on every unit of a site that uses leases (§13.5) |
+| Entry-station key (Ed25519, 14a) | `robodr-blackbox keygen` format, listed in the trust file's `entry_keys` | the entry station only; signs entry reports (§13.2) |
+
+### 12.3 Enrol, sign the policy, create the runtime volume
+
+1. On the unit: `robodr-seal enroll --seal-dir /var/lib/robodr-seal
+   --unit ugv-07 --platform ugv-x1 --policy-authority authority.key.pub`
+   creates the UWK **inside the TPM** and prints the enrolment record
+   (public). With a site depot, enrol through it instead (§13.3): it
+   verifies the TPM's EK certificate and that the UWK is in that TPM. At
+   a site that uses leases, add `--lease-key lease.key.pub` (§13.5).
+2. The policy authority signs the platform's reference boot measurements
+   (from the golden image, e.g. `tpm2_pcrread sha256:0,2,4,7` on a
+   reference unit booted with it):
+   `robodr-seal policy sign --key authority.key --platform ugv-x1
+   --version 1 --pcr 0=<hex> --pcr 7=<hex> ... --out policy-v1.json`.
+3. On the unit: `robodr-seal policy install --seal-dir ... --policy
+   policy-v1.json`, then **`robodr-seal policy commit --seal-dir ...`**:
+   it first unseals a probe key under the installed policy and only then
+   revokes every older version in the TPM. The floor has 64 versions
+   (0..=63). Version 63 can never be revoked, so `policy sign --version
+   63` needs `--last-version`; the boot-chain update after it needs a new
+   enrolment: `erase`, undefine and redefine the floor with the owner
+   authorization (`tpm2_nvundefine 0x01500041 -C o -P file:-`, then
+   `provision`), enrol again (a new seal directory), re-deliver.
+4. Runtime volume: `robodr-seal volume format --seal-dir ... --device
+   /dev/<partition>` (a random key, stored only wrapped to the UWK), then
+   at every boot, before `robodr-deliverd` starts:
+   `robodr-seal volume open --seal-dir ... --device /dev/<partition>
+   --name robodr-sealed` and mount `/dev/mapper/robodr-sealed` on the
+   runtime root (e.g. `/run/robodr-sealed`, `nodev,nosuid`). If the boot
+   does not match the signed policy, the volume does not open: the unit
+   still runs everything that is not sealed, RoboDR detection included.
+   Configure delivered services as §7.4 says (no core dumps,
+   `ProtectSystem=strict`, private `/tmp`, swap encrypted with an
+   ephemeral key).
+5. The agent's configuration (`/etc/robodr/deliverd.json`):
+
+   ```json
+   "seal": {
+     "seal_dir": "/var/lib/robodr-seal",
+     "runtime_root": "/run/robodr-sealed",
+     "device": "/dev/disk/by-partlabel/robodr-sealed",
+     "mapper_name": "robodr-sealed",
+     "stop_units": ["robot-planner.service"],
+     "tpm": {"tcti": "device:/dev/tpmrm0"}
+   }
+   ```
+
+   `volume_check` defaults to `dm_crypt` (the runtime root must be a
+   mounted dm-crypt mapping, otherwise sealed items and models wait);
+   `unchecked` exists for tests and labs only, never in production.
+   `device` (a stable path to the LUKS2 partition), `mapper_name` and
+   `stop_units` (the services that run delivered software from the
+   volume) are what erase acts on (§12.6); `device` is required on a unit
+   without a TPM. `tpm.work_dir` defaults to `/run/robodr-seal`.
+6. The package's `robodr-deliverd.service` reaches the TPM through
+   `DeviceAllow=/dev/tpmrm0 rw` under `DevicePolicy=closed` (no
+   `PrivateDevices=`, which would hide it); remove a `40-seal.conf`
+   drop-in made for an earlier build. `robodr-seal` is in the package
+   (`/usr/sbin`).
+
+**Authorised OS / firmware updates** change the PCRs: ship the new
+signed policy (next version) with the update, install it before the
+reboot, and run `policy commit` after the first boot that unseals with
+it. Do not commit before that boot: the old policy is what still works.
+
+### 12.4 Release and depot
+
+* Release station: `robodr-release build rpk --spec SPEC.json --payload
+  DIR --out-dir DIR --seal-to depot.key.pub` (one `--seal-to` per site
+  depot). Only `files`, `model` and `config` can be sealed; every file
+  but the SBOM is encrypted; the content key is written only wrapped to
+  the depots. Sign and bundle as usual.
+* Depot: `robodr-depot` re-wraps every sealed item for each enrolled
+  unit of a stage when it makes the stage's deployment (§13.4); each
+  unit's pack carries only its own wraps. Without a depot (labs),
+  `robodr-seal rewrap --depot-key depot.key --rpk <imported RPK dir>
+  --unit-record ugv-07.json` prints one `wrapped_keys` entry; put all
+  entries, sorted by unit and digest, into the deployment before it is
+  signed. A media pack moved to another unit gives it nothing: the wraps
+  are bound to the unit's own TPM key.
+
+### 12.5 Units without a TPM (fallback)
+
+1. `robodr-seal volume format-tang --device /dev/<partition> --tang-url
+   http://<depot>:<port> --tang-thp <thumbprint>` (thumbprint:
+   `tang-show-keys <port>` on the Tang server): the volume opens only
+   while the unit reaches the site's Tang server; no key is stored on
+   the unit. Open at boot with `robodr-seal volume open-tang` (or the
+   distribution's `clevis-luks` unlockers) and mount as above.
+2. With the volume open: `robodr-seal enroll-fallback --seal-dir ...
+   --unit ... --platform ... --key /run/robodr-sealed/.robodr-seal/uwk.key`
+   (the UWK lives inside the volume; a key directory that is not on a
+   dm-crypt mapping is refused). Configure `seal` without `tpm` and with
+   `device` (required: erasing such a unit is wiping that device's
+   keyslots).
+3. Limits (§7.8): a disk image taken before an erase can be unlocked by
+   anyone who reaches the Tang server; on site, the fallback protects
+   nothing against someone who can use the site network. Tang keeps no
+   per-unit state, so a single unit cannot be "retired" at the server.
+   After a unit is lost with its disk intact, rotate the server's keys:
+   `/usr/libexec/tangd-rotate-keys -d <keydir>` on the Tang server,
+   `clevis luks regen -d DEV -s SLOT` on every remaining unit (while the old keys still answer), then
+   delete the old (now hidden, `.`-prefixed) keys from the key database.
+
+### 12.6 Crypto-erase
+
+`robodr-deliverd erase --config /etc/robodr/deliverd.json --trigger
+operator [--device /dev/<partition>]` (stop the service first; `--key`
+as for `reanchor`; `--device` overrides `seal.device`):
+
+1. **The erase itself.** With a TPM: the erase epoch is incremented, so
+   every key sealed to the unit is dead at once; the UWK blobs and the
+   volume wrap are deleted, and with a device its keyslots are wiped.
+   Without a TPM: the device's LUKS2 keyslots are wiped (required; with
+   no device nothing is erased and the command fails), and the UWK file
+   is destroyed if the volume is open (if not, the report says it was
+   not destroyed: it stays inside the volume, which can no longer be
+   opened).
+2. **The open runtime volume.** `seal.stop_units` are stopped, the
+   runtime root is unmounted and `seal.mapper_name` closed; when it is
+   busy it is suspended instead (the kernel wipes the volume key and
+   blocks I/O). Plaintext already in memory survives until power-off:
+   power the unit off when that matters. Without `mapper_name` the volume
+   stays open and the finding says so.
+
+The JSON report lists `destroyed` and `incomplete`; `robot.seal.erased`
+(Critical; with `--trigger tamper` also `robot.seal.tamper`) says the
+same in words. It is final: recovery is re-enrolment (a new seal
+directory) and re-delivery. Automatic erase from the platform's inputs
+is §12.8. `robodr-seal erase` (`--device`,
+`--mapper`, `--mount`, `--stop-unit`) does the same without the agent's
+journal and findings.
+
+### 12.7 Findings and what to do
+
+| Finding | Meaning | Action |
+|---|---|---|
+| `robot.seal.unseal_failed` (`policy_refused`) | the TPM refused: boot measurements differ from every non-revoked signed policy, or the authority's signature | expected after an update without its policy; otherwise treat the unit as tampered (`Deviation`) |
+| `robot.seal.unseal_failed` (`erased`) | the unit's keys were erased | re-enrol and re-deliver, if the unit is trusted again |
+| `robot.deliver.refused` (`unauthentic_key`) | a wrap in the deployment is not this unit's (another unit's, tampered) | check the depot's re-wrapping |
+| `robot.seal.erased`, `robot.seal.tamper` | crypto-erase ran (trigger, what was destroyed and the volume's state in the detail) | investigate the trigger; if the volume is "STILL OPEN", power the unit off |
+| `robot.seal.lease_expired` | a sealed item waits for a site lease (none yet, or the TPM's clock or reboot budget passed it) | bring the unit back into LAN reach of the depot, or give it a media pack with a fresh lease (§13.5) |
+| `robot.seal.erase_deferred` | an erase trigger fired while the robot moved (or its state was unknown); the erase runs as soon as it is idle, safe-state or e-stopped | treat as tamper in progress; bring the robot to a safe state |
+
+### 12.8 Executed crypto-erase from platform inputs (Sprint 14b)
+
+The platform's enclosure-tamper input, repeated attestation failure and
+repeated failed operator authentication can erase the unit without an
+operator: `robodr-deliverd` plans the erase with the responder and runs it
+only when agentd's live safety state is `idle`, `safe_state_active` or
+`estop_active`; in any other state (also `unknown`) it waits, also across
+restarts, and runs as soon as the state allows.
+
+1. In `/etc/robodr/deliverd.json`:
+
+   ```json
+   "erase": {
+     "trigger_socket": "/run/robodr-deliverd/erase.sock",
+     "feeder_uids": [],
+     "feeder_gids": [<gid of the platform's tamper-input service>]
+   }
+   ```
+
+   and the drop-in
+   `/usr/share/doc/robodr/examples/robodr-deliverd.service.d/50-depot-lan.conf.example`
+   (its `RuntimeDirectory=` creates the socket's directory).
+2. The platform's input service (root, or a feeder uid / gid) sends one
+   line per event: `robodr-deliverd tamper --socket
+   /run/robodr-deliverd/erase.sock --trigger tamper` (or
+   `attestation_failed`, `auth_failures`). Anything from another peer, or
+   a trigger a person must approve (`operator`, `signed_command`), is
+   journaled and ignored.
+3. Test it on a bench unit with a disposable enrolment: the erase is
+   final.
+
+### 12.9 Anti-rollback floors in a TPM NV counter (Sprint 14b)
+
+Without it, the floors live in the state file, the signed high-water
+record and the black box: restoring all three from an old disk image
+rolls them back unnoticed. With an NV counter the record names the
+counter value it was written at, and an older record is detected:
+
+1. `robodr-seal counter define --index 0x01500042 --owner-auth-file
+   /root/owner.auth` (owner authorization, as §12.1).
+2. `"seal": {..., "anti_rollback_nv": "0x01500042"}` in deliverd.json, then
+   restart the agent: the existing record is migrated into the counter
+   once (`robodr.deliver.anchor_migrated` in the journal).
+3. From then on a restored disk image, a deleted black box and state, or
+   an undefined and redefined counter lock the agent (no import, no
+   install; `robot.deliver.refused`). Recovery is `robodr-deliverd
+   reanchor` as §11.3, after finding out why.
+
+The counter detects a restored **older** record; it does not stop root,
+who holds the black-box key, from writing a new record with lower floors.
+
+---
+
+## 13. Site depot (`robodr-depot`, Sprints 14a and 14b)
+
+The single-box control plane inside the air gap
+(`docs/SECURE-DELIVERY.md` §4-§6, §8, §10; `man robodr-depot(8)`): a
+bundle enters only with a passing entry report, units enrol with their
+TPM and two operators, rollouts go ring by ring and halt on a failing
+report, and each unit fetches only its own pack (mutual TLS) or gets a
+per-unit media pack. Verified with software TPMs on loopback only.
+
+### 13.1 Set up the depot box
+
+1. Install the `robodr` package; the depot runs as `robodr-depot`
+   (`/var/lib/robodr/depot`, `/etc/robodr-depot`, created by the package).
+   Run every command below as that user:
+   `runuser -u robodr-depot -- robodr-depot --config /etc/robodr-depot/depot.json ...`.
+2. Keys in `/etc/robodr-depot/keys` (0600, owned by `robodr-depot`):
+   `depot-signing.key` (`robodr-blackbox keygen`, the trust file's depot
+   key), `depot-wrap.key` (`robodr-seal keygen depot`), `unit-ca.key`
+   (`robodr-seal keygen policy`: the unit CA), and with leases `lease.key`
+   (`robodr-seal keygen lease`).
+3. The trust file (root-signed, as §11.1) lists the depot's signing key,
+   its wrapping key (`depot_wrap_keys`), the entry stations' keys
+   (`entry_keys`), the SHA-256 of the TPM vendors' EK CA certificates the
+   site accepts (`ek_ca_certs`), and the units' rings. Put those CA
+   certificates (PEM or DER) into `enrolment.ek_cas` and their
+   intermediates into `enrolment.ek_intermediates`; a certificate whose
+   digest the trust file does not list is ignored.
+4. `/etc/robodr-depot/depot.json` from
+   `/usr/share/doc/robodr/examples/depot.example.json`, then
+   `robodr-depot ... init --trust trust.json`. With `anchor` (recommended),
+   define the counter first: `robodr-seal counter define --index
+   0x01500050 --owner-auth-file ... --tcti device:/dev/tpmrm0` on the depot
+   box, and install the drop-in `50-tpm-anchor.conf.example`
+   (group `tss`).
+5. `systemctl enable --now robodr-depot` (the LAN server). Restrict who
+   can connect with `IPAddressAllow=` in a drop-in.
+
+### 13.2 Bring a bundle in
+
+1. On the entry station: `robodr-depot entry scan --bundle DIR --trust
+   trust.json --trust-anchor anchor.json --root ... --site SITE --station
+   entry-1 --key entry.key --history DIR [--vulndb vulndb.json]
+   --out report.json` (the report and `report.json.sig`). A verdict
+   `fail` lists what was found at or above `--fail-on`.
+2. On the depot: `robodr-depot ... import --bundle DIR --report
+   report.json`. Refused (`robot.depot.import_refused`): no or another
+   bundle's report, a failing or expired report, a chain gap, a revoked or
+   below-floor RPK, a sealed RPK for a depot key the trust file does not
+   list.
+
+### 13.3 Enrol a unit
+
+1. Depot: `enrol begin --unit ugv-07` prints a nonce.
+2. Unit (root): `robodr-seal enrol-request --seal-dir /var/lib/robodr-seal
+   --nonce <hex> --out req.json` (after `provision` and `enroll`, §12).
+3. Depot: `enrol verify --request req.json --out challenge.json`.
+4. Unit: `robodr-seal enrol-activate --seal-dir ... --challenge
+   challenge.json --out resp.json`.
+5. Depot: `enrol finish --response resp.json`, then two different
+   operators: `enrol approve --unit ugv-07 --key op1.key` and again with
+   `op2.key`. `enrol export --unit ugv-07 --out DIR` writes `client.pem`
+   and `depot-ca.pem` for the unit.
+6. Unit: copy both to `/etc/robodr/depot/`, add to deliverd.json
+
+   ```json
+   "depot": {
+     "address": "192.0.2.10:8443",
+     "server_name": "depot.site-a.internal",
+     "ca_file": "/etc/robodr/depot/depot-ca.pem",
+     "cert_file": "/etc/robodr/depot/client.pem"
+   }
+   ```
+
+   and install the drop-in `50-depot-lan.conf.example` with the depot's
+   address in `IPAddressAllow=`. The TLS key is the identity key inside
+   the TPM; it never leaves it.
+
+Any refusal is `robot.depot.enrolment_refused` with the reason (EK chain,
+credential activation, certification, quote, nonce, lease key); after a
+wrong challenge answer start again with `enrol begin`.
+
+### 13.4 Roll out
+
+1. `rollout create --id r1 --rpk <digest> [--rpk ...] --stages
+   lab,canary,ring-1 [--soak-s 600] [--max-failures 0]` makes the first
+   stage's deployment.
+2. `deploy approve --seq N --key op1.key` (and a second operator for a
+   production ring) activates it; units pull it within a minute and
+   report.
+3. `inventory` shows each unit's reports; `rollout advance --id r1` makes
+   the next stage only when every unit of this one reported its items
+   installed and healthy for the soak time.
+4. A failing report beyond `--max-failures` halts the rollout
+   (`robot.depot.rollout_halted`): nothing more of it is served. Fix the
+   release, then `rollout abort` (two operators) and start a new rollout,
+   or `rollout resume` (two operators) to deploy the stage again.
+5. Units without LAN: `pack --unit ugv-07 --out DIR` writes that unit's
+   media pack; carry the unit's report back with `robodr-deliverd report
+   --out FILE` and `report import --report FILE`.
+
+### 13.5 Leases (Sprint 14b)
+
+With `keys.lease` and `lease` (`lifetime_s` of TPM powered-on time,
+`reboots`) in depot.json, every unit must be enrolled with
+`robodr-seal enroll --lease-key lease.key.pub`; the depot refuses others.
+Each accepted report renews the unit's lease from its TPM-attested time;
+it travels in the answer (LAN) or the media pack. A unit carried off site
+keeps running what it has unsealed, but after the lease's time or reboot
+budget its TPM refuses every unseal (`robot.seal.lease_expired`). Choose
+`reboots` and `lifetime_s` for the longest legitimate time out of LAN
+reach.
+
+### 13.6 Recovery
+
+* `robot.depot.locked` (with `anchor`): the database is older than the
+  NV counter (a restored backup or disk image) or the counter was
+  redefined. Find out why first; then `reanchor --min-deployment-seq N
+  --key op1.key --key op2.key`, with `N` the highest deployment sequence
+  any unit has seen (`inventory`, units' `status`), so no sequence number
+  is reused.
+* `unit revoke --unit U --key op1.key --key op2.key`: a lost or retired
+  unit is served nothing more and gets no new wraps.
+* The depot's keys and database are the site's crown jewels: back up the
+  keys offline; a database backup restored later locks the depot (above).

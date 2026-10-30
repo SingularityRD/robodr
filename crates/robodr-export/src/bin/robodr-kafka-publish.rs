@@ -13,11 +13,16 @@ use std::time::Duration;
 const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootstrap ...] \
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
 [--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
-[--interval-ms N] [--once] [--upgrade-data-source LABEL]\n\
+[--interval-ms N] [--once] [--upgrade-data-source LABEL] \
+(--tls-ca FILE [--tls-cert FILE --tls-key FILE] [--tls-server-name NAME] [--tls-spki-sha256 HEX]... \
+[--sasl-mechanism SCRAM-SHA-256|SCRAM-SHA-512 --sasl-username U --sasl-password-file FILE] \
+| --allow-plaintext)\n\
 Unsigned contract 1.x records are upgraded to contract 2.0 (data_source --upgrade-data-source, \
 default robodr; topic --topic); signed ones are dead-lettered \
 (\"legacy 1.x signed record: re-sign required\").\n\
-No TLS/SASL: run on an isolated SOC network or through a local TLS proxy (stunnel).";
+TLS is required: every broker certificate is verified against --tls-ca (and the broker's \
+host name, or --tls-server-name); --tls-cert/--tls-key add a client certificate (mutual TLS). \
+Plain TCP only with an explicit --allow-plaintext (isolated network or a local TLS proxy).";
 
 struct Opts {
     producer: ProducerConfig,
@@ -50,6 +55,10 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if let Some(n) = a.num("max-request-bytes")? {
         p.max_request_bytes = n;
     }
+    security(a, &mut p)?;
+    // Configuration errors (plain TCP not allowed, SASL without TLS, bad
+    // bounds) are usage errors (exit 2), not retried at run time.
+    Producer::new(p.clone()).map_err(|e| e.to_string())?;
     let source = match (a.one("diode-out")?, a.one("spool")?) {
         (Some(d), None) => Source::DiodeOut(d.into()),
         (None, Some(s)) => Source::Spool(s.into()),
@@ -75,6 +84,67 @@ fn opts(a: &Args) -> Result<Opts, String> {
         interval: Duration::from_millis(interval),
         once: a.flag("once"),
     })
+}
+
+/// `--tls-*`, `--sasl-*`, `--allow-plaintext` (checked again by
+/// `Producer::new`: no TLS and no `--allow-plaintext` is refused).
+fn security(a: &Args, p: &mut ProducerConfig) -> Result<(), String> {
+    use robodr_blackbox::tls;
+    use robodr_export::kafka::sasl::{Mechanism, SaslConfig};
+    p.allow_plaintext = a.flag("allow-plaintext");
+    let ca = a.one("tls-ca")?;
+    let (cert, key) = (a.one("tls-cert")?, a.one("tls-key")?);
+    let name = a.one("tls-server-name")?;
+    let pins: Vec<String> = a
+        .all("tls-spki-sha256")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    match ca {
+        Some(ca) => {
+            if p.allow_plaintext {
+                return Err("--tls-ca and --allow-plaintext are both given: remove one".into());
+            }
+            let t = tls::load_client(&tls::ClientTlsFiles {
+                ca_file: ca.into(),
+                cert_chain: cert.map(Into::into),
+                key_file: key.map(Into::into),
+                server_name: name.map(str::to_string),
+                spki_sha256: pins,
+            })
+            .map_err(|e| format!("TLS: {e}"))?;
+            p.tls = Some(t);
+        }
+        None if cert.is_some() || key.is_some() || name.is_some() || !pins.is_empty() => {
+            return Err(
+                "--tls-cert / --tls-key / --tls-server-name / --tls-spki-sha256 need \
+                        --tls-ca"
+                    .into(),
+            )
+        }
+        None => {}
+    }
+    let mech = a.one("sasl-mechanism")?;
+    let user = a.one("sasl-username")?;
+    let pw_file = a.one("sasl-password-file")?;
+    match (mech, user, pw_file) {
+        (None, None, None) => {}
+        (Some(m), Some(u), Some(f)) => {
+            // `raw` is wiped when dropped; the password is borrowed from it
+            // (no other copy) until SaslConfig takes its own (wiped on drop).
+            let raw = tls::read_pem("--sasl-password-file", std::path::Path::new(f), true)?;
+            let pw = std::str::from_utf8(&raw)
+                .map_err(|_| "--sasl-password-file: not UTF-8".to_string())?
+                .trim_end_matches(['\n', '\r']);
+            p.sasl = Some(SaslConfig::new(Mechanism::parse(m)?, u, pw)?);
+        }
+        _ => {
+            return Err("SASL needs --sasl-mechanism, --sasl-username and \
+                        --sasl-password-file together"
+                .into())
+        }
+    }
+    Ok(())
 }
 
 fn run(o: &Opts) -> Result<(), String> {
@@ -122,8 +192,16 @@ fn main() -> ExitCode {
             "max-request-bytes",
             "interval-ms",
             "upgrade-data-source",
+            "tls-ca",
+            "tls-cert",
+            "tls-key",
+            "tls-server-name",
+            "tls-spki-sha256",
+            "sasl-mechanism",
+            "sasl-username",
+            "sasl-password-file",
         ],
-        &["once"],
+        &["once", "allow-plaintext"],
     );
     let o = match parsed.and_then(|a| opts(&a)) {
         Ok(o) => o,

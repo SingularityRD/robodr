@@ -294,8 +294,12 @@ pub struct DaemonStats {
     pub head_mark_errors: u64,
     /// Pulsar threats taken from the host-threat socket (finding + signal).
     pub host_threats: u64,
+    /// In-path gateway findings taken from the gateway feed.
+    pub gateway_findings: u64,
     /// Forwarder heartbeats received.
     pub host_heartbeats: u64,
+    /// In-path gateway feed heartbeats received.
+    pub gateway_heartbeats: u64,
     /// Host threats of `robodr-sensor-ros2` dropped (seen via the pipeline).
     pub host_threats_own_skipped: u64,
 }
@@ -1067,6 +1071,35 @@ impl<'a> Daemon<'a> {
                 }),
             ));
         }
+        if let Some(h) = &r.gateway_feed {
+            let l =
+                crate::host::bind_host_socket(h, crate::config::effective_uid()).map_err(|e| {
+                    DaemonError::Io(format!("gateway_feed socket {}: {e}", h.path.display()))
+                })?;
+            let input_feed = add(
+                format!("gateway:{}", h.path.display()),
+                InputKind::Events,
+                true,
+            );
+            let (stop, max, allowed) = (
+                stop_inputs.clone(),
+                h.max_connections,
+                h.allowed_uids.clone(),
+            );
+            spawns.push((
+                input_feed,
+                Box::new(move |f| {
+                    input::run_unix_listener_peers(
+                        l,
+                        max,
+                        stop,
+                        f,
+                        crate::gateway_feed::parse_gateway_line,
+                        Some(input::PeerPolicy::uids(allowed)),
+                    )
+                }),
+            ));
+        }
         // The status socket (review H1): the robot's safety state, from this
         // process alone, for robodr-deliverd (which checks SO_PEERCRED).
         let status_snapshot: Arc<std::sync::Mutex<Arc<Vec<u8>>>> = Arc::default();
@@ -1430,6 +1463,13 @@ impl<'a> Daemon<'a> {
                 self.host_heartbeat(m.input, hb);
             }
             Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
+            Payload::Gateway(g) => self.gateway_finding(&g),
+            Payload::GatewayHeartbeat(hb) => {
+                // Activity on the input (it is not silent); the gateway's
+                // own drops count as upstream drops, as a forwarder's.
+                self.stats.gateway_heartbeats += 1;
+                self.upstream_dropped(m.input, hb.dropped);
+            }
             Payload::Event(ev) => {
                 self.stats.events += 1;
                 if let Some(link) = self.executor.as_mut() {
@@ -1762,23 +1802,59 @@ impl<'a> Daemon<'a> {
     /// (a smaller count than last time = the forwarder restarted).
     fn host_heartbeat(&mut self, input: usize, hb: crate::host::HostHeartbeat) {
         self.stats.host_heartbeats += 1;
+        self.upstream_dropped(input, hb.dropped);
+    }
+
+    /// A forwarder's cumulative `dropped` (host-threat forwarder, gateway
+    /// feed): the increase since its last heartbeat is added to the
+    /// input's `upstream_dropped`.
+    fn upstream_dropped(&mut self, input: usize, dropped: u64) {
         if self.host_upstream_seen.len() < self.inputs.len() {
             self.host_upstream_seen.resize(self.inputs.len(), 0);
         }
         let Some(seen) = self.host_upstream_seen.get_mut(input) else {
             return;
         };
-        let delta = if hb.dropped >= *seen {
-            hb.dropped - *seen
+        let delta = if dropped >= *seen {
+            dropped - *seen
         } else {
-            hb.dropped
+            dropped
         };
-        *seen = hb.dropped;
+        *seen = dropped;
         if delta > 0 {
             if let Some(i) = self.inputs.get(input) {
                 i.stats.upstream_dropped.fetch_add(delta, Ordering::Relaxed);
             }
         }
+    }
+
+    /// An in-path gateway finding (`crate::gateway_feed`): agent (black
+    /// box, plan), spool and correlation like any sensor finding; the
+    /// subject is the gateway's channel.
+    fn gateway_finding(&mut self, g: &crate::gateway_feed::GatewayLine) {
+        self.stats.gateway_findings += 1;
+        let _ = writeln!(
+            self.log,
+            "robodr-agentd: gateway: {} x{}: {}",
+            sanitize(&g.rule),
+            g.count,
+            sanitize(&g.detail)
+        );
+        let safety = self.safety();
+        let now = self.clock.now();
+        let subject = Subject {
+            topic: g.channel.clone(),
+            ..Subject::default()
+        };
+        let o = self.agent.handle_external(
+            now,
+            Detector::Sensor,
+            &g.source(),
+            subject,
+            g.deviation(),
+            safety,
+        );
+        self.emit(o);
     }
 
     /// A Pulsar threat: a `robot.host.pulsar_threat` finding (agent, black

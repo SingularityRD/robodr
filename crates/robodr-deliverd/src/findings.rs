@@ -83,7 +83,7 @@ pub mod rules {
     pub const STALE: &str = "robot.deliver.stale";
     /// Bundle sequence gap, replay or equivocation.
     pub const CHAIN_GAP: &str = "robot.deliver.chain_gap";
-    /// Every id above.
+    /// Every `robot.deliver.*` id above.
     pub const ALL: [&str; 7] = [
         INSTALLED,
         DEFERRED_SAFETY,
@@ -92,6 +92,25 @@ pub mod rules {
         REFUSED,
         STALE,
         CHAIN_GAP,
+    ];
+    /// Sealing (13c, contract 2.3): the TPM refused to unseal (policy
+    /// mismatch, revoked policy) or the unit's keys were erased.
+    pub const SEAL_UNSEAL_FAILED: &str = "robot.seal.unseal_failed";
+    /// Lease expired (§7.5; catalogued, emitted from 14b).
+    pub const SEAL_LEASE_EXPIRED: &str = "robot.seal.lease_expired";
+    /// Crypto-erase executed, with its trigger.
+    pub const SEAL_ERASED: &str = "robot.seal.erased";
+    /// Enclosure tamper or erase trigger fired.
+    pub const SEAL_TAMPER: &str = "robot.seal.tamper";
+    /// Sprint 14b (contract 2.3, `catalog_2_3_depot`): an executed erase
+    /// deferred by the safety state.
+    pub const SEAL_ERASE_DEFERRED: &str = "robot.seal.erase_deferred";
+    /// Every `robot.seal.*` id.
+    pub const SEAL_ALL: [&str; 4] = [
+        SEAL_UNSEAL_FAILED,
+        SEAL_LEASE_EXPIRED,
+        SEAL_ERASED,
+        SEAL_TAMPER,
     ];
 }
 

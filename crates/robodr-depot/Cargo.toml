@@ -1,0 +1,49 @@
+[package]
+name = "robodr-depot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Site depot (docs/SECURE-DELIVERY.md §4, §5, §6, §8, Sprints 14a/14b): imports bundles that passed the entry station's signed scan, keeps the fleet inventory, enrols units with TPM credential activation, rolls deployments out ring by ring under operator quorum with halt-on-failure, re-wraps sealed content keys per unit, serves units over mutual TLS or per-unit media packs, and issues TPM-enforced site leases."
+
+# Formats, quorum and chain rules are robodr-pkg's; the verified-copy
+# bundle import and the trust anchor robodr-release's (the 13a code,
+# reused); TPM evidence, re-wrapping and leases robodr-seal's; findings go
+# through robodr-deliverd's spool writer into the site agentd's spool.
+[dependencies]
+robodr-blackbox = { workspace = true }
+robodr-deliverd = { workspace = true }
+# `--flag value` argument parser shared with the diode, release and seal binaries.
+robodr-diode = { workspace = true }
+robodr-events = { workspace = true }
+robodr-pkg = { workspace = true }
+robodr-release = { workspace = true }
+robodr-responder = { workspace = true }
+robodr-seal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+p256 = { workspace = true }
+zeroize = { workspace = true }
+# Mutual TLS to the units (robodr_blackbox::tls builds the configs) and the
+# EK certificate chain check at enrolment (rustls-webpki, already used for
+# SPKI pinning).
+rustls = { workspace = true }
+webpki = { workspace = true }
+
+[dev-dependencies]
+robodr-ocsf = { workspace = true }
+robodr-agentd = { workspace = true }
+# tests/exit_14b.rs: the findings of a unit and of the depot go out through
+# the existing diode path (spool exporter -> diode pack -> import).
+robodr-export = { workspace = true }
+
+[[bin]]
+name = "robodr-depot"
+path = "src/bin/robodr-depot.rs"
+# Same crate name as the library: keep it out of rustdoc to avoid a collision.
+doc = false
