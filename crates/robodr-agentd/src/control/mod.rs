@@ -380,6 +380,7 @@ impl ControlPlaneSection {
                 t.client_ca.as_path(),
             ]);
             v.extend(t.client_crl.as_deref());
+            v.extend(t.crl_files.iter().map(PathBuf::as_path));
         }
         v
     }
@@ -589,6 +590,8 @@ pub struct ControlPlane {
     threads: Vec<JoinHandle<()>>,
     listening: Vec<String>,
     tls: Option<Value>,
+    /// Live revocation counters of the client verifier (with CRLs).
+    crl: Option<Arc<robodr_blackbox::crl::CrlStats>>,
     state: StateStatus,
     evidence: Option<Arc<evidence::Service>>,
     stop: Arc<AtomicBool>,
@@ -829,6 +832,7 @@ impl ControlPlane {
                     "client_crls": t.client_crls,
                 })
             }),
+            crl: spec.tls.as_ref().and_then(|t| t.crl.clone()),
             state: st,
             evidence,
             stop,
@@ -895,7 +899,12 @@ impl ControlPlane {
             answers_signed: g(&c.answers_signed),
             answer_sign_failures: g(&c.answer_sign_failures),
             last_auth_failure: c.last_auth_failure(),
-            tls: self.tls.clone(),
+            tls: self.tls.clone().map(|mut t| {
+                if let (Some(c), Some(o)) = (&self.crl, t.as_object_mut()) {
+                    o.insert("crl".into(), json!(c.status()));
+                }
+                t
+            }),
             replay_entries,
             replay_store_errors,
             replay_fence,

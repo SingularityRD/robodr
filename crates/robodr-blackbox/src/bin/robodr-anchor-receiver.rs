@@ -33,12 +33,15 @@
 //!  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
 //!  "tls": {"cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
 //!          "key_file": "/etc/robodr-anchor-receiver/tls/receiver.key",
-//!          "client_ca": "/etc/robodr-anchor-receiver/tls/units-ca.pem"}}
+//!          "client_ca": "/etc/robodr-anchor-receiver/tls/units-ca.pem",
+//!          "crl_files": ["/etc/robodr-anchor-receiver/tls/units-ca.crl.pem"]}}
 //! ```
 //!
 //! `serve` speaks **TLS** (`tls`: the receiver's certificate chain and key;
 //! with `client_ca`, every unit must present a client certificate that
-//! chains to it: mutual TLS). Without `tls` it refuses to start unless
+//! chains to it: mutual TLS; with `crl_files`, that certificate is also
+//! checked against the CRLs, reloaded when the files change, an expired or
+//! unusable CRL refusing every unit: `robodr_blackbox::crl`). Without `tls` it refuses to start unless
 //! `"allow_plaintext": true` is set explicitly (lab / private link only;
 //! the marks stay Ed25519-authenticated either way, see
 //! `robodr_blackbox::remote_anchor`, "Transport"). `tls` and
@@ -105,6 +108,9 @@ struct TlsConfig {
     key_file: PathBuf,
     #[serde(default)]
     client_ca: Option<PathBuf>,
+    /// CRLs of the unit client CA (`robodr_blackbox::crl`; needs `client_ca`).
+    #[serde(default)]
+    crl_files: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +246,9 @@ fn load_config(path: &Path) -> Result<Config, String> {
         if let Some(ca) = &t.client_ca {
             abs("tls.client_ca", ca)?;
         }
+        for f in &t.crl_files {
+            abs("tls.crl_files", f)?;
+        }
         if c.allow_plaintext {
             return Err("tls and allow_plaintext are both set: remove one".into());
         }
@@ -309,6 +318,7 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
                     cert_chain: t.cert_chain.clone(),
                     key_file: t.key_file.clone(),
                     client_ca: t.client_ca.clone(),
+                    crl_files: t.crl_files.clone(),
                 })
                 .map_err(|e| format!("tls: {e}"))?,
             ),

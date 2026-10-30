@@ -454,7 +454,10 @@ pub enum HeadAnchorConfig {
 /// `robodr_blackbox::tls`. The receiver's certificate is always verified
 /// (chain to `ca_file`, validity, `serverAuth`, the address's host or
 /// `server_name`); `server_spki_sha256` pins add to that; `cert_chain` +
-/// `key_file` present a client certificate (mutual TLS).
+/// `key_file` present a client certificate (mutual TLS); `crl_files`
+/// (CRLs of the receiver's CA, `robodr_blackbox::crl`) refuse a revoked
+/// receiver certificate, reloaded when the files change (an expired or
+/// unusable CRL fails closed: the anchor cannot be delivered).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnchorTlsConfig {
@@ -467,6 +470,8 @@ pub struct AnchorTlsConfig {
     pub cert_chain: Option<PathBuf>,
     #[serde(default)]
     pub key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub crl_files: Vec<PathBuf>,
 }
 
 impl HeadAnchorConfig {
@@ -553,12 +558,16 @@ impl HeadAnchorConfig {
                             require_abs(&format!("blackbox.head_anchor.tls.{f}"), p)?;
                         }
                     }
+                    for p in &t.crl_files {
+                        require_abs("blackbox.head_anchor.tls.crl_files", p)?;
+                    }
                     let files = robodr_blackbox::tls::ClientTlsFiles {
                         ca_file: t.ca_file.clone(),
                         cert_chain: t.cert_chain.clone(),
                         key_file: t.key_file.clone(),
                         server_name: t.server_name.clone(),
                         spki_sha256: t.server_spki_sha256.clone(),
+                        crl_files: t.crl_files.clone(),
                     };
                     let loaded = robodr_blackbox::tls::load_client(&files).map_err(|e| {
                         format!(

@@ -7,8 +7,9 @@
 //! explicitly allowed; an untrusted CA, a wrong host name, an expired
 //! certificate, a certificate without `serverAuth`, a pin mismatch; a
 //! missing or foreign client certificate; a downgrade in both directions
-//! (TLS client to a plain receiver, plain client to a TLS receiver). In
-//! every refused case the receiver holds nothing.
+//! (TLS client to a plain receiver, plain client to a TLS receiver); a
+//! revoked receiver or unit certificate (`crl_files`). In every refused
+//! case the receiver holds nothing.
 
 mod common;
 
@@ -60,6 +61,7 @@ impl Pki {
             cert_chain: self.p(&format!("{leaf}.pem")),
             key_file: self.p(&format!("{leaf}.key")),
             client_ca: client_ca.map(|c| self.p(c)),
+            crl_files: Vec::new(),
         })
         .unwrap()
     }
@@ -76,6 +78,7 @@ impl Pki {
             key_file: cert.map(|c| self.p(&format!("{c}.key"))),
             server_name: name.map(str::to_string),
             spki_sha256: pins.to_vec(),
+            crl_files: Vec::new(),
         })
         .unwrap()
     }
@@ -411,6 +414,7 @@ fn file_checks() {
         cert_chain: pki.p("server.pem"),
         key_file: pki.p(key),
         client_ca: None,
+        crl_files: Vec::new(),
     };
     std::fs::set_permissions(pki.p("server.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
     let e = tls::load_server(&files("server.key")).unwrap_err();
@@ -662,7 +666,76 @@ fn files_owned_by_another_account_are_refused() {
         cert_chain: pki.p("server.pem"),
         key_file: pki.p("server.key"),
         client_ca: None,
+        crl_files: Vec::new(),
     })
     .unwrap_err();
     assert!(e.contains("owned by uid 4242"), "{e}");
+}
+
+#[test]
+fn crl_files_refuse_a_revoked_receiver_and_a_revoked_unit() {
+    let pki = Pki::new();
+    let crl = vec![pki.p("crl-ca.crl.pem")];
+    let client = |cert: Option<&str>| {
+        tls::load_client(&ClientTlsFiles {
+            ca_file: pki.p("crl-ca.pem"),
+            cert_chain: cert.map(|c| pki.p(&format!("{c}.pem"))),
+            key_file: cert.map(|c| pki.p(&format!("{c}.key"))),
+            crl_files: crl.clone(),
+            ..ClientTlsFiles::default()
+        })
+        .unwrap()
+    };
+    let server = |leaf: &str, mutual: bool| {
+        tls::load_server_tls(&ServerTlsFiles {
+            cert_chain: pki.p(&format!("{leaf}.pem")),
+            key_file: pki.p(&format!("{leaf}.key")),
+            client_ca: mutual.then(|| pki.p("crl-ca.pem")),
+            crl_files: if mutual { crl.clone() } else { Vec::new() },
+        })
+        .unwrap()
+    };
+    // The unit refuses a revoked receiver certificate, and counts it.
+    let s = serve(Some(server("crl-revoked-server", false).config), false);
+    let t = client(None);
+    let stats = t.crl.clone().unwrap();
+    let a = anchor(&s.addr, Some(t), false).unwrap();
+    let e = a.current().unwrap_err();
+    assert!(e.contains("Revoked"), "{e}");
+    assert!(round_trip(&a).is_err());
+    untouched(&s);
+    assert!(stats.status().revoked_rejections >= 1);
+    // The unrevoked receiver of the same CA is accepted.
+    let s = serve(Some(server("crl-server", false).config), false);
+    let a = anchor(&s.addr, Some(client(None)), false).unwrap();
+    assert_eq!(round_trip(&a), Ok(Some(5)));
+    // The receiver refuses a revoked unit certificate (mutual TLS) ...
+    let srv = server("crl-server", true);
+    let rstats = srv.crl.clone().unwrap();
+    let s = serve(Some(srv.config.clone()), false);
+    let a = anchor(&s.addr, Some(client(Some("crl-revoked-client"))), false).unwrap();
+    assert!(round_trip(&a).is_err());
+    untouched(&s);
+    assert!(rstats.status().revoked_rejections >= 1);
+    assert!(s.recv.tls_handshake_failures() >= 1);
+    // ... and serves its unrevoked sibling.
+    let a = anchor(&s.addr, Some(client(Some("crl-client"))), false).unwrap();
+    assert_eq!(round_trip(&a), Ok(Some(5)));
+    // CRLs of client certificates need a client CA.
+    let e = tls::load_server(&ServerTlsFiles {
+        cert_chain: pki.p("crl-server.pem"),
+        key_file: pki.p("crl-server.key"),
+        client_ca: None,
+        crl_files: crl.clone(),
+    })
+    .unwrap_err();
+    assert!(e.contains("client_ca"), "{e}");
+    // A file without a CRL is a configuration error.
+    let e = tls::load_client(&ClientTlsFiles {
+        ca_file: pki.p("crl-ca.pem"),
+        crl_files: vec![pki.p("crl-ca.pem")],
+        ..ClientTlsFiles::default()
+    })
+    .unwrap_err();
+    assert!(e.contains("no X509 CRL"), "{e}");
 }
