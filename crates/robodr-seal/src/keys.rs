@@ -207,7 +207,7 @@ impl PolicyKey {
             .0
             .sign_prehash(digest)
             .map_err(|_| invalid("ECDSA signing failed"))?;
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         Ok(sig.to_der().as_bytes().to_vec())
     }
 }

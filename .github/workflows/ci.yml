@@ -536,6 +536,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: docker.io/library/ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+      # PATH spelled out: a step after a $GITHUB_PATH addition runs with
+      # PATH = <additions>:<PATH from the container's Config.Env>, and the
+      # Rocky Linux image sets no PATH there, so the runner's
+      # `docker exec ... sh` found no shell ("exec: sh: executable file
+      # not found"). Same value as the Ubuntu image's (and the shells') default.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     strategy:
       fail-fast: false
       matrix:
@@ -601,6 +608,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: quay.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+      # PATH spelled out: a step after a $GITHUB_PATH addition runs with
+      # PATH = <additions>:<PATH from the container's Config.Env>, and the
+      # Rocky Linux image sets no PATH there, so the runner's
+      # `docker exec ... sh` found no shell ("exec: sh: executable file
+      # not found"). Same value as the Ubuntu image's (and the shells') default.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     strategy:
       fail-fast: false
       matrix:
