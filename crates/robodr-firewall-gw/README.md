@@ -241,7 +241,15 @@ segment, `allowed_src_macs`) on every channel.
 | `unitree_dex3_hand_cmd` | RTPS DATA `unitree_hg::msg::dds_::HandCmd_` on `rt/dex3/{left,right}/cmd` (topic required) | joint, one slot per finger motor (`balance_critical: false`) | mode octets checked; decided; passed byte-identical or suppressed (below, "Hands") |
 | `unitree_hand_sdk` | RTPS DATA `unitree_go::msg::dds_::MotorCmds_` on `rt/hand_sdk` | joint, one slot per element (`balance_critical: false`) | as Dex3; the blend weight (`cmds[0].mode`) bounded and step / rate limited |
 | `unitree_arm_request` | RTPS DATA `Request_` of the G1 / H2 arm action service on `rt/api/arm/request` (`robot_model` `g1` / `h2`) | twist (source / rate only) | `ExecuteAction` 7106, `ExecuteCustomAction` 7108, `StopCustomAction` 7113 refused unless in `allowed_api_ids`; `GetActionList` passes |
-| `ros2_twist`, `ros2_twist_stamped` | RTPS DATA ROS 2 `geometry_msgs/msg/Twist` / `TwistStamped` on `rt/cmd_vel` (XCDR1) | twist (6 DoF) | limited / substitute values written in place (`float64`, no rounding) |
+| `ros2_twist`, `ros2_twist_stamped` | RTPS DATA ROS 2 `geometry_msgs/msg/Twist` / `TwistStamped` on `rt/cmd_vel` (XCDR1) | twist (6 DoF) | limited / substitute values written in place (`float64`, no rounding); a `TwistStamped`'s non-zero `header.stamp` is zeroed in every forwarded command (`twist_stamp_zeroed`: `diff_drive_controller` ages a command by its stamp, so a far-future one outlived `cmd_vel_timeout`; zero means "now") |
+| `unitree_obstacles_avoid_request` | RTPS DATA `Request_` on Go2 `rt/api/obstacles_avoid/request` | twist | decoded for the `obstacles_avoid` service (never as sport: its 1003 is `Move`, sport's `StopMove`): `Move` with `mode` 0 limited and rewritten as `{"x","y","yaw","mode":0}`; `mode` 1 / 2 (position targets), `SwitchSet`, `UseRemoteCommandFromApi` refused unless in `allowed_api_ids`; `SwitchGet` passes |
+| `unitree_uwbswitch_request` | RTPS DATA `Request_` on Go2 `rt/api/uwbswitch/request` | twist (source / rate only) | `SwitchSet` (the robot follows the UWB remote) refused unless in `allowed_api_ids`; the queries pass |
+
+In enforce mode a Go2 (`robot_model` `go2` / `go2w`, or no `robot_model`
+and a `unitree_sport_request` channel) must have channels for all three of
+its motion services (`sport`, `obstacles_avoid`, `uwbswitch`), a B2
+(`b2` / `b2w`) one for `sport`; otherwise the gateway refuses to start (a
+service without a channel is a motion path nobody decides).
 
 Every representation the decoder reads is rewritten in kind (CDR / CDR2 /
 D_CDR2, either endianness). Only the plain Unitree CRC is supported for Go1
@@ -710,14 +718,31 @@ humanoid locomotion ranges (7001..=7199, 8001..=8299), the arm action range
 (7106..=7113) or alias one; a hand frame matches when its sequence count, or
 its length (non-zero padding, a `DHEADER` and trailing octets allowed),
 gives the channel's element count; a `Twist` matches any CDR / CDR2 body of
-48..=80 octets, a `TwistStamped` a stamp, a `frame_id` of 1..=256 octets
-and six `float64` with at most 48 octets around them. The probe classifies
-the writer for good (its later samples are decided on that channel). Cost:
-an unknown writer's non-motion sample of plausible shape (a 48..=80-octet
-CDR sample when a `ros2_twist` channel is configured) is suppressed as a
-foreign `/cmd_vel` command; every controller-side writer the robot uses
-must therefore be announced through the bridge (deployment rule below) or
-persisted in `rtps.state_file`.
+at least 48 octets (trailing octets a reader ignores included: a padded
+twist used to miss the probe and pass), a `TwistStamped` a stamp, a
+`frame_id` of 1..=256 octets and at least six `float64`; the twist probe
+ranks after the trajectory probe. A request that two configured services
+read with the same priority (Go2 sport and `obstacles_avoid` /
+`uwbswitch` share ids 1001..=1004 with different meanings) is suppressed
+(`ambiguous_api_request`): without the writer's SEDP topic its service is
+not known. The probe classifies the writer until it is evicted (least
+recently used; its later samples are decided on that channel). Cost: an
+unknown writer's non-motion sample of plausible shape (any CDR sample of
+48 octets or more when a `ros2_twist` channel is configured) is suppressed
+as a foreign `/cmd_vel` command; every controller-side writer the robot
+uses must therefore be announced through the bridge (deployment rule
+below) or persisted in `rtps.state_file`.
+
+A writer the gateway **knows** as writing another topic is not decided,
+but its samples are still probed for the strong motion shapes: a
+CRC-valid `LowCmd_`, a hand frame or a joint trajectory from such a writer
+is suppressed (`suspicious_writer`, finding `fragmented_command` with
+reason `unenforced_writer_motion_payload`); so is a twist when the writer
+announced a twist type, and a request when its announcement's INFO_DST
+could not be checked. This is the shape of a discovery differential (the
+robot matched the writer on the motion topic through an announcement the
+gateway did not see). A same-type topic the robot acts on (`rt/arm_sdk`
+next to `rt/lowcmd`) therefore needs its own channel.
 
 ## Robot-side observation (NFLOG)
 
@@ -805,8 +830,9 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `rtps.domain_ids` | `[0]` | queued DDS port ranges (7400 + 250·d .. +249) |
 | `rtps.malformed_datagram` | `drop` | whole-datagram policy |
 | `rtps.unknown_writers` | `probe` | `probe` or `pass` |
-| `rtps.max_writers`, `rtps.max_writers_per_channel` | 4096, 16 | bounds (oldest / least recently used evicted) |
-| `rtps.state_file` | none | persisted writer → channel map |
+| `rtps.max_writers`, `rtps.max_writers_per_channel` | 4096, 16 | not-enforced writers remembered (least recently used evicted: it is then unknown and probed again); per-channel sequence state |
+| `rtps.max_enforced_writers` | 1024 | writers ever classified as enforced (`1..=65536`); **never evicted or removed** (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer is refused (finding `fragmented_command`, reason `enforced_writer_table_full`) and probed, also with `unknown_writers: pass` |
+| `rtps.state_file` | none | persisted writer → channel map (format `robodr-firewall-gw-writers/v2`, v1 still read): the enforced table and the not-enforced writers. Read only if a regular file (symlinks refused), owned by root or the directory's owner and not group / world writable; written through an `O_EXCL` 0600 temporary file |
 | `rtps.max_sn_jump` | 64 | largest sequence-number step decided at once (larger: held until confirmed) |
 | `rtps.binding_takeover_ns` | 1 s | silence after which another (IP, MAC) may continue an authorised GUID's stream |
 | `rtps.extra_port_ranges` | none | further `[lo, hi]` UDP port ranges queued and decided as RTPS (non-default DDS ports; at most 16) |
@@ -980,14 +1006,27 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   segment) source IPs can be spoofed; the gateway's position on the
   controller-side port is what keeps robot-side traffic out of its scope.
 - **Discovery differential: classification needs every SEDP the robot
-  sees.** A writer the gateway learned (from SEDP) as writing another
-  topic is not decided on, which is what lets same-type channels such as
-  G1's `rt/arm_sdk` pass. If the robot ever matched that writer on
-  `rt/lowcmd` through an announcement the gateway did not see (a discovery
-  path around the bridge, a fragmented SEDP the gateway's bounded
-  reassembler dropped), its DATA would pass unchecked. Unknown writers are
-  probed (and their unprobeable samples suppressed); set
-  `rtps.state_file` so a restart does not forget the robot's writers.
+  sees.** Gateway review, findings 1 / 2 / 7, closed the paths the gateway
+  itself opened: an announcement or removal addressed by INFO_DST to
+  anyone but the robot's participants (learned from the robot's observed
+  SPDP / SEDP; `discovery.misaddressed`) is ignored, as the robot ignores
+  it; a not-enforced announcement or a removal sent by another participant
+  than the writer's own is ignored (`discovery.relayed_ignored`); a writer
+  ever classified as enforced stays enforced (own table, never evicted,
+  persisted; `discovery.enforced_kept`); the not-enforced table evicts the
+  least recently used; only the standard builtin entity ids are discovery
+  (a user writer with builtin kind bits is decided). Until the robot's
+  participants are known (observation off, or its SPDP not seen yet) an
+  INFO_DST cannot be checked: such an announcement is learned but marked
+  unverified (its requests and twists are then probed as suspicious) and
+  such a removal is ignored. What remains: if the robot ever matched a
+  writer the gateway knows on another topic through an announcement the
+  gateway did not see at all (a discovery path around the bridge, a
+  fragmented SEDP the bounded reassembler dropped), only the suspicious-
+  payload probe stands between its samples and the robot (strong shapes
+  always, twists / requests as above). Unknown writers are probed (and
+  their unprobeable samples suppressed); set `rtps.state_file` so a
+  restart does not forget the robot's writers.
   Deployment rule: **all SEDP / SPDP between controller-side participants
   and the robot must cross the bridge** — the robot must have no other
   link (Wi-Fi, a second NIC, a cellular modem) that reaches controller-side

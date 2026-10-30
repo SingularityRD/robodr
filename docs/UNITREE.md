@@ -534,7 +534,9 @@ In short:
 | `rt/arm_sdk` (G1, H1-2, H2, R1 `hg`; H1 `go`) | `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` | every slot with gains or torque decided whatever its mode octet; the blend weight (`weight_slot`) bounded, step and rate limited, and its rise from 0 checked against the robot's `rt/lowstate` (below) |
 | `rt/dex3/{left,right}/cmd`, `rt/hand_sdk` | `unitree_dex3_hand_cmd` / `unitree_hand_sdk` | mode octets must be the SDK's, the hand-SDK weight bounded and step / rate limited; a frame the firewall passes is forwarded byte-identical, anything else is suppressed (no hand rewrite). The hand's firewall channel sets `balance_critical: false`, so `stopMotors` (`kp = kd = 0`) is allowed |
 | `rt/api/arm/request` (G1, H2 arm actions) | `unitree_arm_request` | `ExecuteAction`, `ExecuteCustomAction`, `StopCustomAction` refused unless `allowed_api_ids` lists them; `GetActionList` passes |
-| `rt/cmd_vel` (ROS 2) | `ros2_twist` / `ros2_twist_stamped` | `geometry_msgs` `Twist` / `TwistStamped` (XCDR1) limited in place, all six components |
+| `rt/cmd_vel` (ROS 2) | `ros2_twist` / `ros2_twist_stamped` | `geometry_msgs` `Twist` / `TwistStamped` (XCDR1) limited in place, all six components; a `TwistStamped`'s `header.stamp` is zeroed ("now") so a far-future stamp cannot outlive `diff_drive_controller`'s `cmd_vel_timeout` |
+| `rt/api/obstacles_avoid/request` (Go2) | `unitree_obstacles_avoid_request` | `Move` (1003) with `mode` 0 limited like the sport `Move`; position targets (`mode` 1 / 2), `SwitchSet`, `UseRemoteCommandFromApi` refused unless `allowed_api_ids` lists them; `SwitchGet` passes |
+| `rt/api/uwbswitch/request` (Go2) | `unitree_uwbswitch_request` | `SwitchSet` (follow the UWB remote) refused unless `allowed_api_ids` lists it; queries pass |
 
 **What "hold" means on the wire.** The gateway never sends a datagram of
 its own: re-sending an old `LowCmd` is discarded by the robot's DDS reader
@@ -583,6 +585,23 @@ ports (`tcpdump -i <port> -w ... udp`) through a full robot and controller
 start-up and confirm every port either side receives RTPS on is queued.
 
 **Upgrading an existing gateway configuration:**
+
+* **Go2 / B2 in enforce mode need a channel for every motion service**
+  (gateway review, finding 3): a Go2 (`robot_model: go2` / `go2w`, or no
+  `robot_model` and a sport channel) adds `unitree_obstacles_avoid_request`
+  and `unitree_uwbswitch_request` channels (and twist channels of the same
+  names in `firewall.json`), a B2 (`robot_model: b2` / `b2w`) a sport
+  channel; otherwise the gateway does not start. See the Go2 examples.
+* **A same-type topic needs its own channel.** A writer the gateway knows
+  on another topic that sends a CRC-valid `LowCmd_` (a G1 `rt/arm_sdk`
+  without a `unitree_hg_arm_sdk` channel), a hand frame or a trajectory is
+  now suppressed (`suspicious_writer`).
+* **Joint step bound across `kp = 0` frames.** A slot's previous target
+  now survives frames in which it holds no position and expires after
+  `step_reference_ttl_ns` (joint channel, default 500 ms). A controller
+  that re-engages a released joint far from its last target within that
+  time is held / limited; raise it with care or lower the TTL.
+* **`TwistStamped` stamps are zeroed** in forwarded commands.
 
 * **G1 / H1 / H2 / R1 `Start` is refused** (`SetFsmId` 500 / 204 / 601 /
   811) unless the loco channel's `allowed_fsm_ids` lists it. List it only
