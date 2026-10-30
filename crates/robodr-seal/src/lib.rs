@@ -136,6 +136,24 @@ pub(crate) fn io_err(p: &std::path::Path, e: impl fmt::Display) -> SealError {
     SealError::new(ErrorKind::Io, format!("{}: {e}", p.display()))
 }
 
+/// `O_NOFOLLOW` (declared by hand like `robodr-blackbox`'s `store::sys`:
+/// no libc crate; its value differs between architectures).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const O_NOFOLLOW: i32 = if cfg!(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "powerpc",
+    target_arch = "powerpc64"
+)) {
+    0o100000
+} else {
+    0o400000
+};
+/// Elsewhere: no flag (the opened file is still checked to be a regular
+/// file; creation is `O_EXCL`, which never follows a final symlink).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) const O_NOFOLLOW: i32 = 0;
+
 /// 32 bytes from the kernel CSPRNG (`robodr-blackbox`'s `getrandom(2)`).
 pub(crate) fn random32() -> Result<zeroize::Zeroizing<[u8; 32]>, SealError> {
     let mut b = zeroize::Zeroizing::new([0u8; 32]);

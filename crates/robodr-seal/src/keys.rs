@@ -76,9 +76,8 @@ fn write_public(path: &Path, format: &str, public: &[u8]) -> Result<(), SealErro
     f.sync_all().map_err(|e| io_err(path, e))
 }
 
-/// `O_NOFOLLOW` (Linux value; std has no constant for it).
-const fn libc_nofollow() -> i32 {
-    0o400000
+fn libc_nofollow() -> i32 {
+    crate::O_NOFOLLOW
 }
 
 fn read_bounded(path: &Path, secret: bool) -> Result<Zeroizing<Vec<u8>>, SealError> {

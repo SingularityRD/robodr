@@ -290,15 +290,36 @@ impl Tang {
         if self.child.is_some() {
             return;
         }
-        let c = Command::new("/usr/libexec/tangd")
-            .args(["-l", "-p", &self.port.to_string()])
-            .arg(&self.db)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("tangd");
-        self.child = Some(c);
-        wait_port(self.port, "tangd");
+        // After a `down`, the port may still be held for a moment (tangd
+        // then exits at once): respawn until it listens.
+        let t0 = Instant::now();
+        loop {
+            let mut c = Command::new("/usr/libexec/tangd")
+                .args(["-l", "-p", &self.port.to_string()])
+                .arg(&self.db)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("tangd");
+            let t1 = Instant::now();
+            while t1.elapsed() < Duration::from_secs(2) {
+                if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                    self.child = Some(c);
+                    return;
+                }
+                if c.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            let _ = c.kill();
+            let _ = c.wait();
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "tangd did not start"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     pub fn down(&mut self) {

@@ -55,6 +55,17 @@ const FILE_DIGEST_DOMAIN: &[u8] = b"robodr-seal/file/v1\0";
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// HMAC-SHA256 keyed with a 32-byte key. HMAC pads a key shorter than the
+/// 64-byte block with zeros, so the padded key is the same MAC (RFC 2104),
+/// and the fixed-size constructor cannot fail.
+fn hmac32(key: &[u8; 32]) -> HmacSha256 {
+    let mut k = Zeroizing::new([0u8; 64]);
+    k[..32].copy_from_slice(key);
+    <HmacSha256 as Mac>::new(hmac::digest::generic_array::GenericArray::from_slice(
+        &k[..],
+    ))
+}
+
 /// A content key. Wiped on drop; never printed.
 pub struct ContentKey(Zeroizing<[u8; CK_LEN]>);
 
@@ -119,8 +130,7 @@ impl ContentKey {
     /// a sealed content file).
     pub fn file_digest(&self, seal_id: &SealId) -> FileDigest {
         let k = self.derive(seal_id, b"robodr-seal/file-digest/v1");
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&k[..])
-            .unwrap_or_else(|_| <HmacSha256 as Mac>::new(&Default::default()));
+        let mut mac = hmac32(&k);
         mac.update(FILE_DIGEST_DOMAIN);
         FileDigest(mac)
     }
@@ -162,8 +172,7 @@ fn associated_data(seal_id: &SealId, at: ChunkPlace) -> Vec<u8> {
 
 fn synthetic_nonce(ck: &ContentKey, seal_id: &SealId, ad: &[u8], pt: &[u8]) -> [u8; NONCE_LEN] {
     let k = ck.derive(seal_id, b"robodr-seal/nonce-key/v1");
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&k[..])
-        .unwrap_or_else(|_| <HmacSha256 as Mac>::new(&Default::default()));
+    let mut mac = hmac32(&k);
     mac.update(ad);
     mac.update(&Sha256::digest(pt));
     let full = mac.finalize().into_bytes();
@@ -325,6 +334,16 @@ mod tests {
         forged.extend_from_slice(&forged_ct);
         let e = open_chunk(&ck, &SID, AT, &forged).unwrap_err();
         assert!(e.detail.contains("synthetic nonce"), "{e}");
+    }
+
+    #[test]
+    fn padded_hmac_key_is_the_same_mac() {
+        let k = [0x42u8; 32];
+        let mut a = hmac32(&k);
+        a.update(b"x");
+        let mut b = <HmacSha256 as Mac>::new_from_slice(&k).unwrap();
+        b.update(b"x");
+        assert_eq!(a.finalize().into_bytes(), b.finalize().into_bytes());
     }
 
     #[test]

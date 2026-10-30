@@ -982,7 +982,7 @@ impl Engine {
         let luks = robodr_seal::luks::Luks::system();
         let rep = unit
             .erase(trigger, volume.map(|v| (&luks, v)))
-            .map_err(|e| EngineError(format!("erase failed (not erased): {e}")))?;
+            .map_err(|e| EngineError(format!("erase failed: {e}")))?;
         let v = serde_json::to_value(&rep).map_err(|e| EngineError(e.to_string()))?;
         let ev = self.journal.note(kinds::ERASED, v.clone())?;
         self.finding(

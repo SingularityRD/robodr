@@ -271,13 +271,12 @@ fn policy_sign(args: Vec<String>) -> Result<(), Cmd> {
     let platform = req(&a, "platform")?;
     let key = keys::policy_load(&path(&a, "key")?)?;
     let b = policy::sign(&key, platform, version, &pcrs, floor)?;
-    if std::fs::symlink_metadata(&out).is_ok() {
-        return Err(Cmd::Fail(crate::invalid(format!(
-            "{}: already exists",
-            out.display()
-        ))));
-    }
-    std::fs::write(&out, &b).map_err(|e| crate::io_err(&out, e))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out)
+        .map_err(|e| crate::io_err(&out, e))?;
+    std::io::Write::write_all(&mut f, &b).map_err(|e| crate::io_err(&out, e))?;
     print(json!({"policy": out.display().to_string(), "version": version}));
     Ok(())
 }

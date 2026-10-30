@@ -144,6 +144,10 @@ pub struct EraseReport {
     pub epoch_before: Option<u64>,
     pub epoch_after: Option<u64>,
     pub volume_header_erased: bool,
+    /// Steps after the essential one that failed (the erase itself
+    /// happened).
+    #[serde(default)]
+    pub incomplete: Vec<String>,
 }
 
 /// Status of a unit's sealing.
@@ -206,7 +210,7 @@ fn robodr_release_like_read(p: &Path, max: usize) -> Result<Vec<u8>, SealError> 
     use std::io::Read;
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(0o400000) // O_NOFOLLOW
+        .custom_flags(crate::O_NOFOLLOW)
         .open(p)
         .map_err(|e| io_err(p, e))?;
     let md = f.metadata().map_err(|e| io_err(p, e))?;
@@ -660,9 +664,13 @@ impl Unit {
             epoch_before: None,
             epoch_after: None,
             volume_header_erased: false,
+            incomplete: Vec::new(),
         };
         match self.rec.mode {
             Mode::Tpm => {
+                // The essential step: once the epoch moved, every key
+                // sealed to the unit is dead. Everything after it is
+                // hygiene and reported, never a reason to say "not erased".
                 let tpm = self.tpm()?;
                 let before = tpm.epoch()?;
                 let after = tpm.increment_epoch()?;
@@ -675,10 +683,16 @@ impl Unit {
                 rep.epoch_before = Some(before);
                 rep.epoch_after = Some(after);
                 for f in [UWK_PRIV_FILE, UWK_PUB_FILE, VOLUME_WRAP_FILE] {
-                    let _ = fs::remove_file(self.dir.join(f));
+                    let p = self.dir.join(f);
+                    if let Err(e) = fs::remove_file(&p) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            rep.incomplete.push(format!("{}: {e}", p.display()));
+                        }
+                    }
                 }
             }
             Mode::Fallback => {
+                // The essential step: the UWK file is gone.
                 if let Some(p) = &self.rec.fallback_key {
                     let p = Path::new(p);
                     if let Ok(md) = fs::symlink_metadata(p) {
@@ -694,11 +708,19 @@ impl Unit {
             }
         }
         if let Some((luks, dev)) = volume {
-            luks.erase(dev)?;
-            rep.volume_header_erased = true;
+            match luks.erase(dev) {
+                Ok(()) => rep.volume_header_erased = true,
+                Err(e) => rep.incomplete.push(format!("volume header: {e}")),
+            }
         }
-        let bytes = serde_json::to_vec(&rep).map_err(|e| invalid(e.to_string()))?;
-        write_atomic(&self.dir, ERASED_FILE, &bytes)?;
+        match serde_json::to_vec(&rep) {
+            Ok(bytes) => {
+                if let Err(e) = write_atomic(&self.dir, ERASED_FILE, &bytes) {
+                    rep.incomplete.push(format!("erase marker: {e}"));
+                }
+            }
+            Err(e) => rep.incomplete.push(format!("erase marker: {e}")),
+        }
         Ok(rep)
     }
 
