@@ -2392,6 +2392,7 @@ mod tests {
             participant: p,
             attribution: robodr_rtps::Attribution::EndpointGuid,
             source: p,
+            destination: [0; 12],
             participant_guid_param: None,
             guid_conflict: false,
             topic: topic.into(),
@@ -2414,6 +2415,7 @@ mod tests {
             guid_prefix: p,
             attribution: robodr_rtps::Attribution::KeyHash,
             source,
+            destination: [0; 12],
             status: robodr_rtps::StatusInfo { raw: [0, 0, 0, 3] },
         }
     }

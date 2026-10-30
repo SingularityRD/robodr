@@ -266,6 +266,11 @@ pub struct EndpointInfo {
     pub attribution: Attribution,
     /// The participant that *sent* the announcement (header / INFO_SRC).
     pub source: GuidPrefix,
+    /// The destination prefix in effect (INFO_DST; [`GUIDPREFIX_UNKNOWN`]:
+    /// every participant the message reaches). A receiver whose prefix is
+    /// neither ignores the announcement (DDSI-RTPS 2.5 §8.3.7.7), so an
+    /// enforcement point must not act on it either.
+    pub destination: GuidPrefix,
     /// `PID_PARTICIPANT_GUID`, if present.
     pub participant_guid_param: Option<Guid>,
     /// `PID_PARTICIPANT_GUID`'s prefix disagrees with the endpoint GUID's.
@@ -360,6 +365,8 @@ pub struct EndpointRemoval {
     pub participant: GuidPrefix,
     pub attribution: Attribution,
     pub source: GuidPrefix,
+    /// The destination prefix in effect (see [`EndpointInfo::destination`]).
+    pub destination: GuidPrefix,
     pub status: StatusInfo,
 }
 
@@ -369,6 +376,8 @@ pub struct ParticipantRemoval {
     pub guid_prefix: GuidPrefix,
     pub attribution: Attribution,
     pub source: GuidPrefix,
+    /// The destination prefix in effect (see [`EndpointInfo::destination`]).
+    pub destination: GuidPrefix,
     pub status: StatusInfo,
 }
 
@@ -612,6 +621,7 @@ impl DatagramReport {
 struct Sample<'a> {
     topic: DiscoveryTopic,
     source: GuidPrefix,
+    destination: GuidPrefix,
     inline: InlineQos,
     payload: Option<&'a [u8]>,
     key_only: bool,
@@ -745,7 +755,7 @@ impl Report {
 
     /// DATA body: extraFlags(2) | octetsToInlineQos(2) | readerId(4) |
     /// writerId(4) | writerSN(8) | [inlineQos] | [serializedPayload].
-    fn handle_data(&mut self, body: &[u8], flags: u8, source: GuidPrefix) {
+    fn handle_data(&mut self, body: &[u8], flags: u8, source: GuidPrefix, destination: GuidPrefix) {
         let le = flags & FLAG_E != 0;
         if body.len() < 20 {
             self.anomaly(Anomaly::MalformedData);
@@ -772,6 +782,7 @@ impl Report {
         self.handle_sample(Sample {
             topic,
             source,
+            destination,
             inline,
             payload,
             key_only: flags & FLAG_D == 0 && flags & FLAG_K != 0,
@@ -851,6 +862,7 @@ impl Report {
         body: &[u8],
         flags: u8,
         source: GuidPrefix,
+        destination: GuidPrefix,
     ) {
         let le = flags & FLAG_E != 0;
         if body.len() < 32 {
@@ -887,6 +899,7 @@ impl Report {
             FragIn {
                 key: SampleKey {
                     source,
+                    destination,
                     writer,
                     sn: (u64::from(sn_hi) << 32) | u64::from(sn_lo),
                 },
@@ -912,6 +925,7 @@ impl Report {
                 self.handle_sample(Sample {
                     topic,
                     source,
+                    destination,
                     inline,
                     payload: Some(&buf),
                     key_only,
@@ -1081,6 +1095,7 @@ impl Report {
                         guid_prefix: prefix,
                         attribution,
                         source: s.source,
+                        destination: s.destination,
                         status,
                     });
                     return;
@@ -1153,6 +1168,7 @@ impl Report {
                         participant,
                         attribution,
                         source: s.source,
+                        destination: s.destination,
                         status,
                     });
                     return;
@@ -1257,6 +1273,7 @@ impl Report {
             participant: first.participant,
             attribution: primary.2,
             source: s.source,
+            destination: s.destination,
             participant_guid_param: pg,
             guid_conflict,
             topic: first.topic,
@@ -1299,6 +1316,8 @@ pub(crate) fn parse(
         ));
     }
     let mut source = header.guid_prefix;
+    // The receiver's initial destGuidPrefix is its own: "every receiver".
+    let mut destination = GUIDPREFIX_UNKNOWN;
     let mut buf = datagram.get(RTPS_HEADER_LEN..)?;
     while !buf.is_empty() {
         let (Some(&id), Some(&flags)) = (buf.first(), buf.get(1)) else {
@@ -1325,7 +1344,14 @@ pub(crate) fn parse(
         match id {
             SUBMSG_PAD => r.stats.pad += 1,
             SUBMSG_INFO_TS => r.stats.info_ts += 1,
-            SUBMSG_INFO_DST => r.stats.info_dst += 1,
+            SUBMSG_INFO_DST => {
+                // guidPrefix(12). A short one leaves the destination as it
+                // was (as `crate::user` does).
+                r.stats.info_dst += 1;
+                if let Some(p) = read_array::<12>(body, 0) {
+                    destination = p;
+                }
+            }
             SUBMSG_INFO_SRC => {
                 // unused(4) | version(2) | vendorId(2) | guidPrefix(12)
                 r.stats.info_src += 1;
@@ -1339,11 +1365,11 @@ pub(crate) fn parse(
             }
             SUBMSG_DATA => {
                 r.stats.data += 1;
-                r.handle_data(body, flags, source);
+                r.handle_data(body, flags, source, destination);
             }
             SUBMSG_DATA_FRAG => {
                 r.stats.data_frag += 1;
-                r.handle_data_frag(reasm, body, flags, source);
+                r.handle_data_frag(reasm, body, flags, source, destination);
             }
             SUBMSG_ACKNACK
             | SUBMSG_HEARTBEAT
@@ -1414,6 +1440,7 @@ mod tests {
             participant,
             attribution: Attribution::EndpointGuid,
             source,
+            destination: GUIDPREFIX_UNKNOWN,
             participant_guid_param: None,
             guid_conflict: false,
             topic: "rt/cmd_vel".into(),

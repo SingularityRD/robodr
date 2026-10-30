@@ -248,6 +248,9 @@ pub struct FragmentEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleKey {
     pub source: [u8; 12],
+    /// The INFO_DST destination in effect: fragments addressed to different
+    /// receivers are different samples (a receiver only sees its own).
+    pub destination: [u8; 12],
     pub writer: [u8; 4],
     pub sn: u64,
 }
@@ -806,6 +809,7 @@ mod tests {
     fn key_from(source: [u8; 12], sn: u64) -> SampleKey {
         SampleKey {
             source,
+            destination: [0; 12],
             writer: [0, 0, 3, 0xc2],
             sn,
         }

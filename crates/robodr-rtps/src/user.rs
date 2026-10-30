@@ -653,6 +653,7 @@ impl<'a> Walk<'a> {
             FragIn {
                 key: SampleKey {
                     source: address.writer_prefix(),
+                    destination: read_array(&address.reader, 0).unwrap_or_default(),
                     writer: address.writer_entity(),
                     sn: address.sequence_number as u64, // > 0, checked
                 },

@@ -269,3 +269,30 @@ fn r3_r2_inline_duplicates_same_value_and_bad_values() {
         .contains(&Anomaly::BadParameterValue(PID_STATUS_INFO)));
     assert_eq!(motion_writers(&r.to_events("x")), 1);
 }
+
+/// Gateway review (INFO_DST differential): a discovery announcement or
+/// removal carries the INFO_DST destination in effect, so an enforcement
+/// point can ignore what the robot (which drops misaddressed submessages)
+/// never sees. `INFO_DST(unknown)` addresses every receiver again.
+#[test]
+fn info_dst_destination_is_reported_on_announcements_and_removals() {
+    const ELSEWHERE: [u8; 12] = [0x5e; 12];
+    let g = guid_of(ATT, ROGUE_ENT);
+    let dispose = Pl::new(true).guid(PID_KEY_HASH, g).status(0x03).end();
+    let announce = sedp_payload(true, g, "rt/x", "T");
+    let subs = vec![
+        info_dst(true, ELSEWHERE),
+        data(true, PUB, Some(dispose.clone()), Payload::None),
+        data(true, PUB, None, Payload::Data(announce.clone())),
+        info_dst(true, GUIDPREFIX_UNKNOWN),
+        data(true, PUB, Some(dispose), Payload::None),
+        data(true, PUB, None, Payload::Data(announce)),
+    ];
+    let r = parse_datagram_detailed(&dg(ATT, &subs)).unwrap();
+    assert_eq!(r.removed_endpoints.len(), 2);
+    assert_eq!(r.endpoints.len(), 2);
+    assert_eq!(r.removed_endpoints[0].destination, ELSEWHERE);
+    assert_eq!(r.endpoints[0].destination, ELSEWHERE);
+    assert_eq!(r.removed_endpoints[1].destination, GUIDPREFIX_UNKNOWN);
+    assert_eq!(r.endpoints[1].destination, GUIDPREFIX_UNKNOWN);
+}

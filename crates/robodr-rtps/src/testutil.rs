@@ -205,6 +205,10 @@ pub(crate) fn info_src(le: bool, prefix: [u8; 12]) -> Vec<u8> {
     submsg(SUBMSG_INFO_SRC, if le { FLAG_E } else { 0 }, &body)
 }
 
+pub(crate) fn info_dst(le: bool, prefix: [u8; 12]) -> Vec<u8> {
+    submsg(SUBMSG_INFO_DST, if le { FLAG_E } else { 0 }, &prefix)
+}
+
 pub(crate) fn guid_of(prefix: [u8; 12], entity: [u8; 4]) -> [u8; 16] {
     let mut g = [0u8; 16];
     g[..12].copy_from_slice(&prefix);
