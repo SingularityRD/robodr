@@ -50,6 +50,7 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-enroll` | **not a service**: root-only operator tool (`/usr/sbin`) | enrollment, key rotation, revocation lists, SOC profiles and ring information (OPERATIONS 8.6); every step is a deliberate operator act, nothing is applied by the SOC on its own |
 | `robodr-deliverd` | systemd service on the **unit**, root with a bounded capability set, no network | installs delivered RPKs (dpkg, `/opt` / `/etc` install roots, dropping to probe users); runs only after commissioning and `init-anchor` (OPERATIONS 11) |
 | `robodr-seal` | **not a service**: root-only operator tool (`/usr/sbin`) | the unit's TPM (provisioning, refused without an owner and lockout authorization), enrolment, signed PCR policies, the sealed runtime volume, crypto-erase (OPERATIONS 12). `robodr-deliverd.service` reaches the TPM through `DeviceAllow=/dev/tpmrm0 rw` under `DevicePolicy=closed` (not `PrivateDevices=yes`, which would hide it); TPM session files go to `/run/robodr-seal` (tmpfs) |
+| `robodr-depot` | systemd service on the **depot box** (never a robot), user `robodr-depot` (member of `robodr` for the spool), no capabilities, `ProtectSystem=strict`, TCP only; its other commands are operator tools run as the same user | the site depot (Sprint 14a, OPERATIONS 13): `serve` gives each enrolled unit its own pack over mutual TLS and takes its reports; imports, enrolments, approvals, rollouts and media packs are deliberate operator acts. The database anchor uses the box's TPM (`DeviceAllow=/dev/tpmrm0 rw`, group `tss` through the drop-in `50-tpm-anchor.conf.example`). `robodr-deliverd.service` needs the drop-in `50-depot-lan.conf.example` for LAN pulls (TCP to the depot only) and the erase trigger socket |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
 | `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
 | `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
@@ -142,6 +143,7 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
 ├── deliverd/                    0700 root:root     robodr-deliverd: state, trust anchor, content-addressed store, imported packs
 ├── deliverd-media/              0700 root:root     media packs put here for robodr-deliverd (untrusted)
+├── depot/                       0700 robodr-depot:robodr-depot  robodr-depot (depot box only): database, store, deployments, unit CA, depot.lock
 ├── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
 └── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
@@ -155,6 +157,9 @@ Neither watchdog has been exercised under a real systemd yet.
 /opt/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered files (robodr-deliverd only)
 /etc/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered configuration (robodr-deliverd only)
 /etc/robodr-delivered-rules/<name>                  link to the active delivered Pulsar rules
+/etc/robodr-depot/                0750 root:robodr-depot  depot.json (depot box only)
+/etc/robodr-depot/keys/           0700 robodr-depot:robodr-depot  the depot's signing, wrap, lease and unit-CA keys
+/run/robodr-depot/                                  TPM session contexts of the depot's anchor (RuntimeDirectory)
 ```
 
 `tmpfiles.d/robodr.conf` creates every directory and **resets** mode and owner
@@ -266,6 +271,15 @@ this was checked with stub binaries (`robodr`) and with the real static
 binaries (`robodr-focal`, arm64).
 
 ## Not verified
+
+- `robodr-depot.service` and its focal variant (added 2026-10-30, Sprint
+  14a) pass `scripts/check-focal-units.py` and `systemd-analyze verify`
+  apart from the missing binary; not started by systemd. The
+  depot's tests run `serve` in-process on loopback with software TPMs.
+  `/etc/robodr-depot` (0750 root:robodr-depot) and its `keys/` (0700
+  robodr-depot) are created by tmpfiles; the keys are read by path, not
+  through `LoadCredential=`, because the operator commands load the same
+  keys.
 
 - `robodr-deliverd.service` and its focal variant (added 2026-10-26, Sprint
   13b) pass `scripts/check-focal-units.py` and `systemd-analyze verify`

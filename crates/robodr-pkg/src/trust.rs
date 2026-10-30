@@ -78,6 +78,9 @@
 //!   SHA-256 digests of the DER certificates of the TPM vendors' EK CAs a
 //!   depot accepts at enrolment (§8; the certificates travel next to the
 //!   trust file and are accepted only if their digest is listed).
+//!   The three members are omitted when empty (and must be: canonical
+//!   form), so a trust file signed before 14a keeps its bytes, its
+//!   signatures and its meaning.
 //! * `issued_at` and `expires_at` are judged on the verifier's clock;
 //!   units have no trusted clock (13b decides how they use them).
 
@@ -235,12 +238,15 @@ pub struct TrustFile {
     pub revoked_serials: Vec<RevokedSerial>,
     pub floors: Vec<Floor>,
     /// Entry-station keys (Sprint 14a, §6.1), sorted by key_id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_keys: Vec<TrustKey>,
     /// The site depots' X25519 wrapping keys (Sprint 14a, §7.3), sorted by
     /// key_id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depot_wrap_keys: Vec<WrapKey>,
     /// SHA-256 of the DER EK CA certificates a depot accepts (Sprint 14a,
     /// §8), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ek_ca_certs: Vec<String>,
 }
 
@@ -1130,6 +1136,25 @@ mod tests {
 
     type Mutation = Box<dyn Fn(&mut TrustFile)>;
     const T0: u64 = 1_790_000_000;
+
+    /// A trust file of 13a/13b/13c (no 14a members) keeps its canonical
+    /// bytes; an empty 14a member written out is not canonical.
+    #[test]
+    fn pre_14a_trust_files_keep_their_bytes() {
+        let mut t = base();
+        t.entry_keys.clear();
+        t.depot_wrap_keys.clear();
+        t.ek_ca_certs.clear();
+        let doc = to_canonical(&t).unwrap();
+        let text = String::from_utf8(doc.clone()).unwrap();
+        for m in ["entry_keys", "depot_wrap_keys", "ek_ca_certs"] {
+            assert!(!text.contains(m), "{m} in {text}");
+        }
+        assert_eq!(parse_trust(&doc).unwrap().file, t);
+        let with_empty = text.replacen("\"expires_at\"", "\"ek_ca_certs\":[],\"expires_at\"", 1);
+        assert_ne!(with_empty, text);
+        assert!(parse_trust(with_empty.as_bytes()).is_err());
+    }
 
     #[test]
     fn valid_trust_file_verifies_under_pins() {
