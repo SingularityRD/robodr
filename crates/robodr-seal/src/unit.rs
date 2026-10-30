@@ -1112,6 +1112,25 @@ impl Unit {
         ))
     }
 
+    /// A TPM attestation (a quote by the AK) qualified by `digest`: its
+    /// `clockInfo` is the TPM's own time (unit reports, 14b review).
+    pub fn time_attest(&self, digest: &[u8; 32]) -> Result<crate::enrol::SignedHex, SealError> {
+        if self.rec.mode != Mode::Tpm {
+            return Err(invalid("time attestation needs a TPM unit"));
+        }
+        let t = self.tpm()?;
+        let (akp, akr) = self.ak_blobs()?;
+        let idx: Vec<u8> = match self.policy() {
+            Ok(p) if !p.pcrs.is_empty() => p.pcrs.iter().map(|(i, _)| *i).collect(),
+            _ => vec![0],
+        };
+        let (q, _) = t.quote((&akp, &akr), &idx, digest)?;
+        Ok(crate::enrol::SignedHex {
+            attest: crate::to_hex(&q.attest),
+            sig: crate::to_hex(&q.sig),
+        })
+    }
+
     /// The enrolment request for the depot's `nonce` (Sprint 14a,
     /// [`crate::enrol`]).
     pub fn enrol_request(&self, nonce: &[u8; 32]) -> Result<crate::enrol::EnrolRequest, SealError> {

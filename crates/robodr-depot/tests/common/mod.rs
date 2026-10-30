@@ -324,7 +324,7 @@ impl Site {
                 "ek_cas": d.join("ek-cas"),
                 "ek_intermediates": d.join("ek-int")
             },
-            "serve": {"listen": "127.0.0.1:0", "server_name": "depot.site-a", "deadline_s": 60},
+            "serve": {"listen": "127.0.0.1:0", "server_name": "depot.site-a", "deadline_s": 8},
             "findings": {"spool": d.join("depot-spool")}
         });
         std::fs::create_dir_all(d.join("depot-spool/ready")).unwrap();

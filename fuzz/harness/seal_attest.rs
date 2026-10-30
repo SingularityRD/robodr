@@ -156,6 +156,7 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         }],
         installed: vec![],
         erased: false,
+        time: None,
     };
     let id = identity();
     let signed = r.sign(&|d| id.sign_digest(d)).expect("sign");

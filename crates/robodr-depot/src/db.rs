@@ -112,6 +112,10 @@ pub struct Unit {
     /// SEC1 P-256 hex of the unit identity key (TLS, reports).
     pub identity_public: Option<String>,
     pub ak_name: Option<String>,
+    /// The AK's TPM2B_PUBLIC (hex), checked against `ak_name` at
+    /// enrolment: verifies the TPM time attestation of reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ak_public: Option<String>,
     /// SHA-256 (hex) of the EK public area.
     pub ek: Option<String>,
     pub policy_version: Option<u32>,

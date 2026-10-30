@@ -202,6 +202,36 @@ fn lease_expiry_blocks_unseal_after_reboot() {
     let e = u.open();
     let rep = e.unit_report().unwrap();
     drop(e);
+    // Root on the unit has the identity key sign a report with a TPM clock
+    // far ahead (a lease that would never run out): without the AK's
+    // attestation, or with the genuine attestation of another clock, the
+    // depot refuses it.
+    {
+        use robodr_seal::report::*;
+        let (mut forged, _) = parse_unverified(&rep).unwrap();
+        forged.tpm_clock += 1_000_000_000;
+        let sign = |r: &UnitReport| r.sign(&|dg| u.seal().sign_digest(dg)).unwrap();
+        let e1 = s
+            .with(|d| d.accept_report(None, &sign(&forged), now()))
+            .unwrap_err();
+        assert!(e1.0.contains("another report"), "{e1}");
+        forged.time = None;
+        let e2 = s
+            .with(|d| d.accept_report(None, &sign(&forged), now()))
+            .unwrap_err();
+        assert!(e2.0.contains("no TPM time attestation"), "{e2}");
+        // A fresh attestation by the AK for the forged report: the TPM
+        // writes its real clock into it.
+        forged.time = Some(
+            u.seal()
+                .time_attest(&forged.time_digest().unwrap())
+                .unwrap(),
+        );
+        let e3 = s
+            .with(|d| d.accept_report(None, &sign(&forged), now()))
+            .unwrap_err();
+        assert!(e3.0.contains("differs from the attested"), "{e3}");
+    }
     assert!(s
         .with(|d| d.accept_report(None, &rep, now()))
         .unwrap()

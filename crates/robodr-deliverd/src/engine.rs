@@ -1340,7 +1340,7 @@ impl Engine {
                 healthy: i.healthy,
             })
             .collect();
-        let r = UnitReport {
+        let mut r = UnitReport {
             format: REPORT_FORMAT.into(),
             site: self.cfg.unit.site.clone(),
             unit: self.cfg.unit.id.clone(),
@@ -1353,7 +1353,14 @@ impl Engine {
             items,
             installed,
             erased: u.is_erased(),
+            time: None,
         };
+        // TPM units: the TPM's own attestation of its time, for this
+        // report (the depot bases leases on it; 14b review).
+        if u.record().mode == robodr_seal::unit::Mode::Tpm && !r.erased {
+            let d = r.time_digest().map_err(|e| EngineError(e.to_string()))?;
+            r.time = Some(u.time_attest(&d).map_err(|e| EngineError(e.to_string()))?);
+        }
         r.sign(&|dg| u.sign_digest(dg))
             .map_err(|e| EngineError(e.to_string()))
     }

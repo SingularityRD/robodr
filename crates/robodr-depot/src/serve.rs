@@ -21,7 +21,13 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// The handshake, the request head and a report body must arrive within
+/// this (or `serve.deadline_s`, if shorter) in total: a client that
+/// trickles bytes cannot hold one of the `max_connections` slots for
+/// longer. Streaming a pack is bounded by `deadline_s` per write.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The clock the server judges reports and leases on.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -81,6 +87,38 @@ pub fn serve(
     Ok(())
 }
 
+/// The client socket with one deadline for everything read from it (the
+/// handshake, the request head, a report body): each read waits only for
+/// what is left, so trickling bytes does not extend it. Writes keep the
+/// socket's own per-write timeout.
+pub struct Timed {
+    sock: TcpStream,
+    until: Instant,
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rest = self
+            .until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline passed")
+            })?;
+        self.sock.set_read_timeout(Some(rest))?;
+        self.sock.read(buf)
+    }
+}
+
+impl Write for Timed {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.sock.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sock.flush()
+    }
+}
+
 fn respond(s: &mut impl Write, status: u16, body: &[u8]) -> std::io::Result<()> {
     s.write_all(&wire::encode_response(status, body.len() as u64))?;
     s.write_all(body)?;
@@ -99,9 +137,12 @@ pub fn handle(
     deadline: Duration,
     clock: &Clock,
 ) -> Result<(), DepotError> {
-    let _ = sock.set_read_timeout(Some(deadline));
     let _ = sock.set_write_timeout(Some(deadline));
     let conn = ServerConnection::new(tls).map_err(|e| err(e.to_string()))?;
+    let sock = Timed {
+        sock,
+        until: Instant::now() + deadline.min(REQUEST_DEADLINE),
+    };
     let mut s = StreamOwned::new(conn, sock);
     // Drive the handshake.
     while s.conn.is_handshaking() {

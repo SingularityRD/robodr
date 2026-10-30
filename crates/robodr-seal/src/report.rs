@@ -80,7 +80,18 @@ pub struct UnitReport {
     pub installed: Vec<InstalledItem>,
     /// The unit's keys were crypto-erased.
     pub erased: bool,
+    /// TPM units: an attestation by the unit's AK (a restricted key: it
+    /// signs only TPM-generated structures) whose `extraData` is
+    /// [`UnitReport::time_digest`] of this report and whose `clockInfo`
+    /// the TPM filled in itself. The depot bases a lease on the TPM time
+    /// only through it: `tpm_clock` and `tpm_resets` alone are whatever
+    /// root on the unit had the identity key sign (14b review).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<crate::enrol::SignedHex>,
 }
+
+/// Domain of [`UnitReport::time_digest`].
+pub const REPORT_TIME_DOMAIN: &[u8] = b"robodr-unit-report-time/v1\0";
 
 /// The signed envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +155,54 @@ impl UnitReport {
         Ok(())
     }
 
+    /// What the TPM time attestation qualifies: SHA-256 of the domain and
+    /// the canonical report without `time`.
+    pub fn time_digest(&self) -> Result<[u8; 32], SealError> {
+        let mut r = self.clone();
+        r.time = None;
+        let body = to_canonical(&r).map_err(|e| invalid(e.to_string()))?;
+        let mut h = Sha256::new();
+        h.update(REPORT_TIME_DOMAIN);
+        h.update(&body);
+        Ok(h.finalize().into())
+    }
+
+    /// Check the TPM time attestation against the unit's AK (TPM2B_PUBLIC
+    /// bytes from its enrolment): signed by that AK, for this report, and
+    /// with the reported reset count and a TPM clock at or after the
+    /// reported one, at most `max_skew_ms` later. Returns the attested
+    /// time.
+    pub fn check_time(
+        &self,
+        ak_public: &[u8],
+        max_skew_ms: u64,
+    ) -> Result<crate::attest::Attest, SealError> {
+        let t = self
+            .time
+            .as_ref()
+            .ok_or_else(|| unauthentic("unit report: no TPM time attestation"))?;
+        let ak = crate::attest::check_ak(&crate::attest::parse_tpm2b_public(ak_public)?)?;
+        let attest = crate::from_hex(&t.attest).ok_or_else(|| invalid("time attest hex"))?;
+        let sig = crate::from_hex(&t.sig).ok_or_else(|| invalid("time sig hex"))?;
+        let a = crate::attest::verify_attest(&ak, &attest, &sig)?;
+        if a.extra_data != self.time_digest()? {
+            return Err(unauthentic(
+                "unit report: the TPM time attestation is for another report",
+            ));
+        }
+        if a.reset_count != self.tpm_resets
+            || a.clock < self.tpm_clock
+            || a.clock - self.tpm_clock > max_skew_ms
+        {
+            return Err(unauthentic(format!(
+                "unit report: reported TPM time (resets {}, clock {}) differs from the attested \
+                 time (resets {}, clock {})",
+                self.tpm_resets, self.tpm_clock, a.reset_count, a.clock
+            )));
+        }
+        Ok(a)
+    }
+
     /// Sign with `sign` (the unit identity key over a SHA-256 digest).
     pub fn sign(&self, sign: &DigestSigner<'_>) -> Result<Vec<u8>, SealError> {
         self.validate()?;
@@ -204,6 +263,7 @@ mod tests {
             }],
             installed: vec![],
             erased: false,
+            time: None,
         }
     }
 

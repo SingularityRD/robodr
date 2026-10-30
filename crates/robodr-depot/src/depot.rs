@@ -110,6 +110,10 @@ impl Default for RolloutParams {
     }
 }
 
+/// Most a unit report's TPM clock may lag its AK's time attestation
+/// (the attestation is taken right after the clock is read).
+pub const MAX_TIME_SKEW_MS: u64 = 60_000;
+
 /// DER certificates.
 type DerCerts = Vec<Vec<u8>>;
 
@@ -527,6 +531,7 @@ impl Depot {
                 platform: None,
                 identity_public: None,
                 ak_name: None,
+                ak_public: None,
                 ek: None,
                 policy_version: None,
                 approvals: None,
@@ -642,6 +647,7 @@ impl Depot {
                 let secret = crate::random32()?;
                 let cred = self.make_credential(&ek.tpmt, ak_name, &secret)?;
                 nu.ak_name = Some(robodr_seal::to_hex(ak_name));
+                nu.ak_public = req.tpm.as_ref().map(|t| t.ak_public.clone());
                 nu.ek = Some(sha256_hex(&ek.tpmt));
                 nu.secret_sha256 = Some(sha256_hex(&secret));
                 nu.state = EnrolState::Challenged;
@@ -1390,6 +1396,18 @@ impl Depot {
             return Err(err("report of another site"));
         }
         let tpm = u.attestation == Attestation::Verified;
+        // An attested unit's TPM time only through its AK's attestation
+        // (root on the unit can have the identity key sign any clock).
+        let attested = if tpm && !rep.erased {
+            let ak = u
+                .ak_public
+                .as_deref()
+                .and_then(robodr_seal::from_hex)
+                .ok_or_else(|| err("the unit's AK is not on record"))?;
+            Some(rep.check_time(&ak, MAX_TIME_SKEW_MS).map_err(fail)?)
+        } else {
+            None
+        };
         if let Some(l) = &u.last_report {
             let newer = if tpm {
                 (rep.tpm_resets, rep.tpm_clock) > (l.tpm_resets, l.tpm_clock)
@@ -1521,11 +1539,18 @@ impl Depot {
                         authority_name: &aname,
                         lease_seq: uu.lease_seq,
                         issued_at: now,
-                        now: robodr_seal::lease::TpmTime {
-                            clock: rep.tpm_clock,
-                            reset_count: rep.tpm_resets,
-                            restart_count: 0,
-                            safe: true,
+                        // Only from the TPM's attestation (`gated`
+                        // implies an attested TPM unit).
+                        now: {
+                            let a = attested
+                                .as_ref()
+                                .ok_or_else(|| err("no attested TPM time for the lease"))?;
+                            robodr_seal::lease::TpmTime {
+                                clock: rep.tpm_clock,
+                                reset_count: a.reset_count,
+                                restart_count: a.restart_count,
+                                safe: a.safe,
+                            }
                         },
                         lifetime_ms: cfg.lifetime_s * 1000,
                         reboots: cfg.reboots,
@@ -1647,7 +1672,7 @@ impl Depot {
         self.db
             .units
             .values()
-            .filter(|u| u.state == EnrolState::Enrolled)
+            .filter(|u| u.state == EnrolState::Enrolled && !u.erased)
             .find(|u| {
                 u.identity_public
                     .as_deref()

@@ -421,6 +421,42 @@ fn mtls_client_confusion_wrong_quorum_ring_skipping_and_report_replay() {
         u.connect(s.port);
     }
     let ca = us[1].dir.join("depot/depot-ca.pem");
+    // Slot exhaustion by trickling: a client that sends a TLS record
+    // header and then one byte every 1.5 s would hold a connection slot
+    // forever under a per-read timeout. The server closes it at the
+    // request deadline (deadline_s = 8 here) however it trickles.
+    {
+        use std::io::{Read, Write};
+        let t0 = std::time::Instant::now();
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+            .unwrap();
+        c.write_all(&[0x16, 0x03, 0x01, 0x02, 0x00]).unwrap();
+        let closed_after = loop {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(20),
+                "a trickling client outlived the request deadline"
+            );
+            let mut b = [0u8; 64];
+            match c.read(&mut b) {
+                Ok(0) => break t0.elapsed(),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break t0.elapsed(),
+            }
+            if c.write_all(&[0]).is_err() {
+                break t0.elapsed();
+            }
+        };
+        assert!(
+            closed_after < std::time::Duration::from_secs(12),
+            "{closed_after:?}"
+        );
+    }
     // ugv-08's identity: its own pack only.
     let (st8, body8) = tls(
         s.port,
