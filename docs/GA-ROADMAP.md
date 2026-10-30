@@ -18,7 +18,7 @@
 | Dil / yığın | Rust (22 workspace üyesi: 19 saf + 3 Pulsar'a bağlı; `crates/**/*.rs` testler dahil ~240k satır), Pulsar (eBPF) | Python FastAPI + Next.js + Temporal + Postgres + MinIO + Redis (Tracecat çatalı) |
 | Olgunluk | `0.1.0-alpha.1`, hiç release/tag yok, **gerçek robotta hiç çalışmadı**. Kodda (2026-10-26): kontrol düzlemi v2 (mTLS, journal, kanıt API'si; v1 kaldırıldı), executor v1 (varsayılan kapalı), in-path gateway `robodr-firewall-gw`, filo yaşam döngüsünün robot tarafı (`robodr-enroll`), S10 sertleştirmesi, `robodr-uplink`, Unitree desteği | Çalışan platform, `1.0.0` imajları. `claude/robodr-ingest` dalında (henüz `main`'e birleşmedi): RoboDR ingest modülü, `tools.robodr.*`, imza/onay (sign-off, iki kişi), Robot SOC preset'i, Robots UI sayfaları, kontrol düzlemi v2 istemcisi + kanıt, Helm, güvenlik taramaları, filo API'sinin SOC tarafı (filo kaydı tek konteynerde uçtan uca çalıştı, `tools/e2e/RESULTS.md`) |
 | Test | Son kayıtlı toplam: **2196+ test, 0 hata** (§3a, 2026-10-26; S7–S10 birleşmelerinden önce). Birleşmelerden sonra çalışma alanı genelinde yeniden sayılmadı; her parça kendi testleriyle birleşti (network namespace'te gerçek nftables / NFQUEUE, gerçek `dpkg`, libFuzzer 10 hedef × 630 s) | Ortak sözleşme vektörleri gerçek uç noktaya karşı geçiyor (ingest 26 vaka, kontrol düzlemi v2); ingest benchmark'ı 1000 satırlık batch'te p95 ≈ 1,27 s (`gc.freeze`, yüklü 4 vCPU VM, AutoSecOps `09133dc0`). Bu dalın CI koşu sonuçları burada kayıtlı değil |
-| GA'yı en çok engelleyen | Saha doğrulaması yok (gerçek robot, soak, FP oranı); CI GitHub'da hiç koşmadı; release imzalanmadı; Kafka/anchor TLS yok; `restrict_motion`/`safe_pause` adaptörleri yok; executor SOC imzasını kendisi doğrulamıyor | Dal birleşmedi; filo API'si bitmedi; üretim lisans anahtarı yok; robot sayısı kotası yok; uçtan uca (robot ↔ SOC) gerçek ağda hiç çalışmadı |
+| GA'yı en çok engelleyen | Saha doğrulaması yok (gerçek robot, soak, FP oranı); CI GitHub'da hiç koşmadı; release imzalanmadı; `restrict_motion`/`safe_pause` adaptörleri yok; executor SOC imzasını kendisi doğrulamıyor | Dal birleşmedi; filo API'si bitmedi; üretim lisans anahtarı yok; robot sayısı kotası yok; uçtan uca (robot ↔ SOC) gerçek ağda hiç çalışmadı |
 
 **GA tanımı (özet):** Bir müşteri, AutoSecOps1'i self-host kurup RoboDR ajanını
 desteklenen bir robot platformuna (ROS 2 Humble/Jazzy, Fast DDS + Cyclone, amd64 +
@@ -49,7 +49,7 @@ paketleme (Reed-Solomon), reproducible build + SBOM + minisign release pipeline'
 | # | Açık | Kanıt |
 |---|---|---|
 | R1 | 🟡 **Kısmen çözüldü:** executor v1 geri alınabilir ağ aksiyonlarını yürütüyor (varsayılan kapalı; 0499a47, inceleme 31d1aa4), in-path gateway Unitree hareket kanallarını uyguluyor (a4e0b4b, inceleme e85471c). Kalan: SOC'tan `restrict_motion`, `safe_pause` adaptörleri, ROS 2 `/cmd_vel` / `JointTrajectory` gateway'i, gerçek robotta doğrulama. Eski durum: yanıt **hiçbir şey yürütmüyordu** (responder yalnız plan, agentd `NoopExecutor`, Motion Firewall recording-only, kontrol düzlemi yalnızca `recorded_not_executed`) | `crates/robodr-responder/README.md:160-191`, `crates/robodr-firewall/README.md:194-255`, `docs/contracts/legacy/robot-edr.control-plane.md` §10 |
-| R2 | 🟡 **Kısmen çözüldü:** kontrol düzlemi v2 mTLS (a158536); uplink ve enroll TLS. **Açık:** Kafka istemcisi (TLS/SASL yok) ve anchor receiver düz metin | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
+| R2 | 🟡 **Kodda çözüldü:** kontrol düzlemi v2 mTLS (a158536); uplink ve enroll TLS; Kafka istemcisi TLS + mTLS + SASL/SCRAM-SHA-256/512 ve anchor receiver TLS/mTLS (2026-10-30, `wt/tls`; düz TCP yalnız açıkça `allow_plaintext` ile; Kafka 3.9.1'e karşı gerçek broker testi). **Açık:** saha doğrulaması, bu yollarda CRL/OCSP yok, idempotent producer yok | `crates/robodr-export/README.md:264-303`, `SECURITY.md:118-121` |
 | R3 | ❌ **Açık.** Saha doğrulaması yok: gerçek robot, RTI Connext, SROS2/DDS-Security, donanım TPM, 72 saat soak, FP oranı ölçümü yok; Zenoh kör; Pulsar kuralları gerçek motora hiç yüklenmedi; pulsard sadece WSL2'de | `README.md` Status, `docs/SPRINTS.md` S1–S4 |
 | R4 | 🟡 **Kısmen çözüldü:** `robodr-fleet` / `robodr-enroll` robot tarafı (1de502d, inceleme 3083030); `install-bundle.sh` gerçek `dpkg` ile test edildi, format kapısı, downgrade ve güvenlik tabanı (3d36c65, ace7fba); AutoSecOps Robots sayfaları (AutoSecOps `05a431e0`); filo API'sinin SOC tarafı dalda (kayıt tek konteynerde uçtan uca, `tools/e2e/RESULTS.md`). **Açık:** SOC tarafının yayımlanması, hedef cihazda kurulum provası, staged rollout, çok kiracılık | `docs/ROADMAP.md:110-132`, `packaging/README.md:205-208` |
 | R5 | 🟡 **Kısmen çözüldü:** uplink/finding anahtar rotasyonu ve iptal listesi dağıtımı robot tarafında (`robodr-enroll`). **Açık:** TPM, SOC tarafı, black-box anahtarı rotasyonu hâlâ elle | `crates/robodr-blackbox/README.md:670-704` |
@@ -357,8 +357,11 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > penceresi kapatıldı, `control_plane_request` fuzz hedefi, her yanıt
 > imzalı, sözleşme vektörleri. ✅ A (dalda): `tools.robodr.*` v2: mTLS,
 > imzalı istek/yanıt, executor durumları, kanıt araçları (AutoSecOps
-> `f9e334ab` → `a9fca839`). ❌ R: Kafka TLS + SASL ve anchor receiver TLS
-> yapılmadı. ❌ AC: ağ üzerinden (aynı host değil) AutoSecOps → robot döngüsü
+> `f9e334ab` → `a9fca839`). ✅ R (2026-10-30): Kafka TLS + mTLS +
+> SASL/SCRAM-SHA-256/512 (`robodr_blackbox::tls`, `src/kafka/sasl.rs`;
+> sahte broker ve gerçek Apache Kafka 3.9.1, `scripts/kafka-tls-it.sh`) ve
+> anchor receiver TLS/mTLS; düz TCP her iki yolda varsayılan olarak
+> reddedilir. ❌ Idempotent producer yapılmadı. ❌ AC: ağ üzerinden (aynı host değil) AutoSecOps → robot döngüsü
 > koşturulmadı; yalnız yerel test PKI'si ve süreç içi istemci. Kontrol
 > düzlemi v2 için bağımsız inceleme turu commit geçmişinde yok. SSRF /
 > özel CIDR allowlist'inin robot ağları için ayarı kayıtlı değil.
@@ -902,7 +905,7 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 - [ ] Harici pentest + red-team: açık Critical/High 0.
 
 **Güvenlik / tedarik zinciri**
-- [ ] Tüm ağ yolları TLS/mTLS; anahtarlar TPM'de (destekli donanımda). *(Kontrol düzlemi mTLS, uplink/enroll TLS; Kafka ve anchor düz metin; TPM yok.)*
+- [ ] Tüm ağ yolları TLS/mTLS; anahtarlar TPM'de (destekli donanımda). *(Kontrol düzlemi mTLS, uplink/enroll TLS; Kafka ve anchor TLS/mTLS (düz TCP yalnız açık `allow_plaintext` ile); TPM yok.)*
 - [ ] İmzalı, reproducible release; SBOM; cosign/SLSA provenance; SCA temiz.
 - [ ] Üretim lisans anahtarı; dev anahtarı koddan kaldırıldı.
 

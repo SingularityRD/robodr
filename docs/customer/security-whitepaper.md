@@ -57,7 +57,7 @@ box). Section 7 lists exactly what each does.
 | `robodr-pulsard` | root. Pulsar's eBPF probes load into the kernel. Bounded capabilities. | Local only |
 | `robodr-uplink` | User `robodr` | Only the SOC address in its drop-in. TLS. |
 | `robodr-spool-export` | User `robodr` | None (`PrivateNetwork=yes`) |
-| `robodr-kafka-publish` | User `robodr` | Only the brokers in its drop-in. **No TLS.** |
+| `robodr-kafka-publish` | User `robodr` | Only the brokers in its drop-in. TLS (plain TCP only if explicitly allowed); optional mutual TLS, SASL/SCRAM. |
 | `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only, writes only its journal directory, runs `nft` with an argument vector and an empty environment | None: `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` |
 | `robodr-firewall-gw` (inline mode only) | `CAP_NET_ADMIN` only (NFQUEUE), FIFO priority 40, watchdog 2 s | No IP sockets; the bridge needs no IP address |
 | `robodr-enroll` | root, run by an operator (key files) | Only the SOC, over TLS, or files on media |

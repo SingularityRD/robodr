@@ -1361,9 +1361,43 @@ robodr-blackbox keygen --out /etc/robodr-anchor-receiver/receiver.key --key-id a
     {"unit": "ugv-07", "public_key": "/etc/robodr-anchor-receiver/units/ugv-07.pub"}
   ],
   "max_connections": 64,
-  "io_timeout_ms": 5000
+  "max_connections_per_source": 8,
+  "io_timeout_ms": 5000,
+  "tls": {
+    "cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
+    "key_file": "/run/credentials/robodr-anchor-receiver.service/receiver-tls.key",
+    "client_ca": "/etc/robodr-anchor-receiver/tls/robots-ca.pem"
+  }
 }
 ```
+
+**TLS** (required by default). `tls.cert_chain` is the receiver's
+certificate chain (PEM, end-entity first; its SAN must name the address the
+robots dial: an `IP:` SAN for an IP literal, a `DNS:` SAN for a name, or
+the robots' `server_name`); `tls.key_file` its private key (no access for
+others, no group write); `tls.client_ca` (optional) makes every robot
+present a client certificate chaining to that CA (mutual TLS: unknown
+hosts never reach the request parser). Hand the key over with a drop-in
+(`systemctl edit robodr-anchor-receiver`):
+
+```ini
+[Service]
+LoadCredential=receiver-tls.key:/etc/robodr-anchor-receiver/tls/receiver.key
+```
+
+Without `tls` the receiver refuses to start unless the config says
+`"allow_plaintext": true` (a lab, or a private link you accept to run in
+clear: marks and answers stay Ed25519-signed, see below, but hashes and
+sequence numbers are readable on the wire); `tls` together with
+`allow_plaintext` is refused. Failed handshakes are logged (the first 16,
+then at powers of two). `io_timeout_ms` bounds a whole connection, TLS
+handshake included (every read and write is re-armed with the time left,
+so a peer trickling bytes is cut), and the answer gets another one;
+`max_connections_per_source` (default 8, 1..=4096) caps the connections
+one address may hold, authenticated or not, so a single host cannot take
+every one of `max_connections`. Every TLS file (and the robot's and the
+publisher's, below) must be owned by root or by the service's own user
+(`LoadCredential=` files are).
 
 `unit` is the robot's `robot.id`; a public key bound to a device
 (`keygen --device`) must name that robot. Then
@@ -1383,15 +1417,40 @@ On the robot (`agentd.json`):
   "kind": "remote",
   "address": "10.20.0.1:7461",
   "receiver_public_key": "/etc/robodr/anchor-receiver.pub",
-  "timeout_ms": 2000
+  "timeout_ms": 2000,
+  "tls": {
+    "ca_file": "/etc/robodr/anchor/receiver-ca.pem",
+    "cert_chain": "/etc/robodr/anchor/ugv-07.pem",
+    "key_file": "/run/credentials/robodr-agentd.service/anchor-tls.key"
+  }
 }
 ```
 
 `address` is `host:port` (an IP literal avoids DNS at start);
 `receiver_public_key` must be absolute and outside `blackbox.dir` and
-`spool.dir`; `timeout_ms` (100..=30000, default 2000) bounds connect, write
-and read each, so a start waits at most about three times that for the
-receiver. Marks never wait for the network.
+`spool.dir`; `timeout_ms` (100..=30000, default 2000) bounds connect, TLS
+handshake, write and read each, so a start waits at most about four times
+that for the receiver (three without TLS). Marks never wait for the
+network.
+
+`tls` (required unless `"allow_plaintext": true`; both together are
+refused, neither is refused at load): `ca_file` holds the only trust
+anchors for the receiver's certificate, which is always verified (chain,
+validity, `serverAuth`, and the host of `address`, or `server_name` if
+set: SNI and the verified name are the same); `server_spki_sha256`
+(optional, 64 hex digits each) pins the receiver's public key in addition;
+`cert_chain` + `key_file` (both or neither) present a client certificate
+for a receiver with `client_ca`. All paths absolute; the key file needs
+no access for others and no group write; give it to agentd through a
+`LoadCredential=anchor-tls.key:/etc/robodr/anchor/ugv-07.key` drop-in
+(section 6.4 explains drop-ins). A TLS failure is an anchor failure (the
+robot keeps recording, `anchor_failures` counts it); there is no fallback
+to plain TCP. Each exchange is bounded as a whole (connect within
+`timeout_ms`, then handshake, request and answer within three times it),
+so an on-path host that trickles bytes produces counted failures, not a
+stalled delivery; a delivery attempt that still has not finished after
+its bound (a hanging name lookup: prefer an IP literal) is reported by the
+next mark as a failure.
 
 **Alerts.** The receiver refuses and records (journal line,
 `/var/lib/robodr-anchor-receiver/alerts.jsonl`, per-robot counter): `lower`
@@ -1432,8 +1491,12 @@ rollback is detected on the far side, at the next mark that arrives.
 
 Limits: tested over loopback with a real receiver process, not across a
 real network. Rollback and truncation become detectable, not prevented;
-the window is the newest marks that have not reached the receiver. No TLS:
-marks (hashes, sequence numbers) are visible on the wire.
+the window is the newest marks that have not reached the receiver. With
+`allow_plaintext`, marks (hashes, sequence numbers) are visible on the
+wire. Mutual TLS authenticates the robot's host, not its unit id: any
+certificate `client_ca` accepts may send marks for any configured robot
+(each still has to verify under that robot's key). No CRL / OCSP check:
+revoke by replacing the CA or the receiver certificate.
 
 ### 6.5 Executor v1 (`robodr-executor`, reversible actions)
 
@@ -2011,10 +2074,31 @@ with, `findings.topic`, and records relabelled to `--topic` are counted),
 upgrades unsigned contract 1.x records to 2.0 and dead-letters signed
 ones (section 7), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
-broker-rejected records go to a dead-letter file. **No TLS / SASL** and
-**idempotence off** (at-least-once: consumers drop duplicates on
-`event-uid`): run it on an isolated SOC network or through a local TLS
-proxy. Without `--once` it loops every `--interval-ms` (default 2000).
+broker-rejected records go to a dead-letter file. **Idempotence off**
+(at-least-once: consumers drop duplicates on `event-uid`). Without
+`--once` it loops every `--interval-ms` (default 2000).
+
+**TLS, mutual TLS, SASL/SCRAM.** TLS is required: `--tls-ca FILE` (PEM,
+the only trust anchors) makes every broker connection TLS and verifies
+each broker's certificate, bootstrap and advertised alike (chain,
+validity, `serverAuth`, the broker's host as dialled, or
+`--tls-server-name NAME` for all of them); `--tls-spki-sha256 HEX`
+(repeatable) pins broker keys in addition; `--tls-cert FILE --tls-key
+FILE` present a client certificate (`ssl.client.auth=required`
+listeners). `--sasl-mechanism SCRAM-SHA-256|SCRAM-SHA-512
+--sasl-username U --sasl-password-file FILE` authenticate after the
+handshake (SASL_SSL listeners; SCRAM only, never `PLAIN`; over TLS only;
+a wrong credential, or a broker that cannot prove it knows it, fails the
+call at once). A broker session lifetime (`connections.max.reauth.ms`) is
+honoured by reconnecting before it ends. Key and password files: no
+access for others, no group write, owner root or the service user; hand
+them to the unit with the drop-in
+example `robodr-kafka-publish.service.d/60-tls-credentials.conf.example`
+and set `ROBODR_KAFKA_TLS_ARGS` in `/etc/robodr/kafka-publish.env`. Plain
+TCP needs an explicit `--allow-plaintext` (an isolated SOC network or a
+local TLS proxy only); without TLS and without it, the publisher exits 2
+at start. Upgrading from a release without TLS: add one or the other, or
+the unit stops (exit 2 is not restarted).
 `robodr-spool-export.service` and `robodr-kafka-publish.service` run the
 loop (no timer needed: both binaries retry on their own; exit 2, a usage
 error, is not restarted); the transfer of `/var/lib/robodr/export/diode`
@@ -2026,7 +2110,14 @@ test against the SOC's Kafka version (needs docker and the source tree):
 ```sh
 scripts/kafka-it.sh                                   # apache/kafka:3.9.1
 KAFKA_IT_IMAGE=apache/kafka:4.1.0 scripts/kafka-it.sh  # any apache/kafka tag
+KAFKA_HOME=/opt/kafka_2.13-3.9.1 scripts/kafka-tls-it.sh  # no docker: TLS, mTLS, SCRAM
 ```
+
+`kafka-tls-it.sh` starts a native broker (a Kafka distribution and Java,
+no docker) whose certificate is the test PKI of `fixtures/tls/`, with SSL,
+SSL + required client certificate and SASL_SSL SCRAM-SHA-256/512
+(`connections.max.reauth.ms` 8 s) listeners, and runs the whole
+real-broker suite plus the TLS tests (verified 2026-10-30 with 3.9.1).
 
 It starts a single-node broker, publishes signed findings with
 `robodr-kafka-publish` and the library (spool and diode paths, crash and
@@ -2042,10 +2133,14 @@ few records with `kafka-console-consumer.sh --property print.headers=true
 must be in contract order with `robodr-finding-sig` last (connected sites
 that sign), and a robot's findings must all be in one partition.
 
-Troubleshooting the publisher: an error naming a **TLS record** or **SASL**
-means the bootstrap address (or an advertised listener) is a TLS or SASL
-listener; this client speaks PLAINTEXT only (use a PLAINTEXT listener or a
-local TLS proxy). `UNKNOWN_TOPIC_OR_PARTITION`: the topic does not exist
+Troubleshooting the publisher: an error naming a **TLS record** means a
+TLS listener was dialled in plain TCP (`--allow-plaintext`): give
+`--tls-ca` instead. **SASL** after ApiVersions: the listener wants SASL
+(`--sasl-*`). `TLS handshake: invalid peer certificate` names the reason
+(`UnknownIssuer`: wrong `--tls-ca`; `NotValidForName`: the advertised host
+is not in the broker certificate's SAN, fix `advertised.listeners` or use
+`--tls-server-name`; `Expired`; a pin mismatch). `SASL_AUTHENTICATION_FAILED`:
+wrong user or password, or the mechanism is not enabled for that user. `UNKNOWN_TOPIC_OR_PARTITION`: the topic does not exist
 (it is never auto-created). `TOPIC_AUTHORIZATION_FAILED`: grant WRITE and
 DESCRIBE on the findings topic (default `robodr.findings`) to the
 publisher's principal.

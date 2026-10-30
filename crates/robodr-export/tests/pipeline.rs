@@ -164,6 +164,7 @@ fn key_of(i: u64) -> String {
 
 fn producer(c: &Cluster) -> Producer {
     let mut p = ProducerConfig::new(c.bootstrap());
+    p.allow_plaintext = true;
     p.retry_backoff = Duration::from_millis(5);
     Producer::new(p).unwrap()
 }

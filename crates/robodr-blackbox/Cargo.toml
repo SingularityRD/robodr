@@ -18,6 +18,10 @@ ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }
+# TLS of the remote head anchor (src/tls.rs): the same rustls (+ ring) and
+# rustls-webpki as robodr-uplink and agentd's control plane.
+rustls = { workspace = true }
+webpki = { workspace = true }
 
 [[bin]]
 name = "robodr-blackbox"

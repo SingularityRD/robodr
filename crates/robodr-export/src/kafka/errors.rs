@@ -64,6 +64,10 @@ pub fn classify(code: i16) -> ErrorClass {
     }
 }
 
+pub const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+pub const ILLEGAL_SASL_STATE: i16 = 34;
+pub const SASL_AUTHENTICATION_FAILED: i16 = 58;
+
 /// Short name for logs.
 pub fn name(code: i16) -> &'static str {
     match code {
@@ -90,6 +94,9 @@ pub fn name(code: i16) -> &'static str {
         UNKNOWN_LEADER_EPOCH => "UNKNOWN_LEADER_EPOCH",
         INVALID_RECORD => "INVALID_RECORD",
         THROTTLING_QUOTA_EXCEEDED => "THROTTLING_QUOTA_EXCEEDED",
+        UNSUPPORTED_SASL_MECHANISM => "UNSUPPORTED_SASL_MECHANISM",
+        ILLEGAL_SASL_STATE => "ILLEGAL_SASL_STATE",
+        SASL_AUTHENTICATION_FAILED => "SASL_AUTHENTICATION_FAILED",
         _ => "OTHER",
     }
 }
@@ -108,5 +115,7 @@ mod tests {
         assert_eq!(classify(12345), ErrorClass::Fatal);
         assert_eq!(name(6), "NOT_LEADER_OR_FOLLOWER");
         assert_eq!(name(999), "OTHER");
+        assert_eq!(name(58), "SASL_AUTHENTICATION_FAILED");
+        assert_eq!(classify(58), ErrorClass::Fatal);
     }
 }

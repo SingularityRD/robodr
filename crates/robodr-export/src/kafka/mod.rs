@@ -4,6 +4,8 @@
 //! * [`wire`]: primitive types and zig-zag varints.
 //! * [`batch`]: RecordBatch v2 encoding (CRC-32C, headers, no compression).
 //! * [`proto`]: ApiVersions v0, Metadata v1–8, Produce v3–8.
+//! * [`sasl`]: SASL/SCRAM-SHA-256 / -512 (SaslHandshake v1, SaslAuthenticate
+//!   v0–v1), over TLS only.
 //! * [`errors`]: error-code classification (retriable / record / fatal).
 //! * [`client`]: [`Producer`]: connections, version negotiation, metadata,
 //!   leader routing, retries with backoff, timeouts and size bounds.
@@ -18,6 +20,7 @@ pub mod batch;
 pub mod client;
 pub mod errors;
 pub mod proto;
+pub mod sasl;
 pub mod wire;
 
 pub use batch::{decode_batches, encode_batch, ProduceRecord};

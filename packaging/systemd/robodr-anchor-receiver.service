@@ -14,6 +14,12 @@
 #       /run/credentials/robodr-anchor-receiver.service/receiver.key)
 #   /etc/robodr-anchor-receiver/receiver.key       receiver Ed25519 secret, 0600
 #   /etc/robodr-anchor-receiver/units/*.pub        each robot's black-box public key
+#   /etc/robodr-anchor-receiver/tls/*.pem          TLS certificate chain (and the
+#       robots' CA for mutual TLS); the TLS key comes in through a drop-in:
+#         [Service]
+#         LoadCredential=receiver-tls.key:/etc/robodr-anchor-receiver/tls/receiver.key
+#       ("tls.key_file": /run/credentials/robodr-anchor-receiver.service/receiver-tls.key).
+#       Without "tls" the receiver exits 2 unless "allow_plaintext": true.
 # State: /var/lib/robodr-anchor-receiver (StateDirectory; set "state_dir" to
 # it): units/<id>.json (held marks) and alerts.jsonl.
 #

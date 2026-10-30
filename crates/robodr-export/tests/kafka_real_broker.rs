@@ -13,9 +13,18 @@
 //! | `robodr-it-small` | 1 | `max.message.bytes=4096` |
 //! | `robodr-it-denied` | 1 | ACL: DENY `User:ANONYMOUS` WRITE |
 //!
-//! Optional: `ROBODR_KAFKA_SASL_BROKER` (a SASL_PLAINTEXT listener: this
-//! client has no SASL, it must fail cleanly) and `ROBODR_KAFKA_RESTART_CMD`
-//! (a shell command restarting the broker, run mid-stream).
+//! Optional: `ROBODR_KAFKA_SASL_BROKER` (a SASL_PLAINTEXT/PLAIN listener:
+//! this client does not speak PLAIN, it must fail cleanly) and
+//! `ROBODR_KAFKA_RESTART_CMD` (a shell command restarting the broker, run
+//! mid-stream).
+//!
+//! TLS / SASL (`scripts/kafka-tls-it.sh`, a native broker whose
+//! certificate is `fixtures/tls/server.pem`): `ROBODR_KAFKA_TLS_PKI` (the
+//! fixtures directory) with `ROBODR_KAFKA_TLS_BROKER` (SSL),
+//! `ROBODR_KAFKA_MTLS_BROKER` (SSL, client certificate required) and
+//! `ROBODR_KAFKA_SCRAM_BROKER` (SASL_SSL, SCRAM-SHA-256/512;
+//! `ROBODR_KAFKA_SCRAM_USER` / `_PASSWORD`, `_REAUTH_MS` the listener's
+//! `connections.max.reauth.ms`).
 //!
 //! What is read back is read with a minimal Fetch v4 consumer below (test
 //! only); each fetched RecordBatch goes through
@@ -79,6 +88,7 @@ fn run_base() -> u64 {
 
 fn producer_cfg(b: &str) -> ProducerConfig {
     let mut p = ProducerConfig::new(vec![b.to_string()]);
+    p.allow_plaintext = true;
     p.retry_backoff = Duration::from_millis(50);
     p.retry_backoff_max = Duration::from_millis(1000);
     p
@@ -475,7 +485,14 @@ fn real_cli_spool_signed_exactly_once() {
     let t0 = now_ms();
     for _ in 0..2 {
         let o = Command::new(PUBLISH)
-            .args(["--bootstrap", &b, "--once", "--chunk", "40"])
+            .args([
+                "--bootstrap",
+                &b,
+                "--allow-plaintext",
+                "--once",
+                "--chunk",
+                "40",
+            ])
             .args(["--spool".as_ref(), sp.as_os_str()])
             .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
             .output()
@@ -699,7 +716,14 @@ fn real_unknown_topic_commits_nothing() {
     spool(&sp, 3000, 3, false, &ROBOTS);
     let started = Instant::now();
     let o = Command::new(PUBLISH)
-        .args(["--bootstrap", &b, "--once", "--retries", "3"])
+        .args([
+            "--bootstrap",
+            &b,
+            "--allow-plaintext",
+            "--once",
+            "--retries",
+            "3",
+        ])
         .args(["--topic", "robodr-it-does-not-exist"])
         .args(["--spool".as_ref(), sp.as_os_str()])
         .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
@@ -731,8 +755,9 @@ fn real_authorization_failure_is_fatal() {
     assert!(started.elapsed() < Duration::from_secs(10), "not retried");
 }
 
-/// This client has no SASL: against a SASL_PLAINTEXT listener it must fail
-/// in bounded time with an error naming the cause, never hang or panic.
+/// Without SASL configured, against a SASL_PLAINTEXT listener the client
+/// must fail in bounded time with an error naming the cause, never hang or
+/// panic.
 #[test]
 #[ignore = "needs a Kafka broker: ROBODR_KAFKA_SASL_BROKER (scripts/kafka-it.sh)"]
 fn real_sasl_listener_fails_cleanly() {
@@ -775,7 +800,15 @@ fn real_broker_restart_mid_stream() {
     drop(c);
     let t0 = now_ms();
     let child = Command::new(PUBLISH)
-        .args(["--bootstrap", &b, "--chunk", "20", "--interval-ms", "200"])
+        .args([
+            "--bootstrap",
+            &b,
+            "--allow-plaintext",
+            "--chunk",
+            "20",
+            "--interval-ms",
+            "200",
+        ])
         .args(["--delivery-timeout-ms", "180000", "--retries", "30"])
         .args(["--spool".as_ref(), sp.as_os_str()])
         .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
@@ -818,8 +851,9 @@ fn real_broker_restart_mid_stream() {
     assert!(dups <= 100, "{dups} duplicates");
 }
 
-/// This client has no TLS: a TLS listener answers the plaintext ApiVersions
-/// with a TLS alert; the error must say so.
+/// Plain TCP (allowed explicitly) to a TLS listener: the broker answers the
+/// plaintext ApiVersions with a TLS alert; the error must say so (and the
+/// client never retries in TLS on its own).
 #[test]
 #[ignore = "needs a Kafka broker: ROBODR_KAFKA_TLS_BROKER (scripts/kafka-it.sh)"]
 fn real_tls_listener_fails_cleanly() {
@@ -956,4 +990,193 @@ fn real_quota_throttling() {
     assert!(started.elapsed() >= Duration::from_secs(5), "not throttled");
     let got = c.since(TOPIC, &marks);
     check(&got, &want, |_| 1, t0);
+}
+
+// ------------------------------------------------------- TLS / SASL / mTLS
+
+fn env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            eprintln!("skipped: {name} is not set (see scripts/kafka-tls-it.sh)");
+            None
+        }
+    }
+}
+
+/// A private copy of the PKI (keys 0600) and a TLS client from it.
+struct Pki(TempDir);
+
+impl Pki {
+    fn new() -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let src = std::path::PathBuf::from(env("ROBODR_KAFKA_TLS_PKI")?);
+        let d = TempDir::new("real-pki");
+        for n in [
+            "ca.pem",
+            "other-ca.pem",
+            "client.pem",
+            "client.key",
+            "other-client.pem",
+            "other-client.key",
+        ] {
+            fs::copy(src.join(n), d.path().join(n)).unwrap();
+            let mode = if n.ends_with(".key") { 0o600 } else { 0o644 };
+            fs::set_permissions(d.path().join(n), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        Some(Pki(d))
+    }
+
+    fn client(
+        &self,
+        ca: &str,
+        cert: Option<&str>,
+        name: Option<&str>,
+    ) -> robodr_blackbox::tls::ClientTls {
+        let p = |n: &str| self.0.path().join(n);
+        robodr_blackbox::tls::load_client(&robodr_blackbox::tls::ClientTlsFiles {
+            ca_file: p(ca),
+            cert_chain: cert.map(|c| p(&format!("{c}.pem"))),
+            key_file: cert.map(|c| p(&format!("{c}.key"))),
+            server_name: name.map(str::to_string),
+            spki_sha256: vec![],
+        })
+        .unwrap()
+    }
+}
+
+fn tls_cfg(b: &str, t: robodr_blackbox::tls::ClientTls) -> ProducerConfig {
+    let mut p = producer_cfg(b);
+    p.allow_plaintext = false;
+    p.tls = Some(t);
+    p.retries = 2;
+    p
+}
+
+/// Send `n` records over `cfg` and read them back over the plain listener.
+fn deliver_and_read_back(cfg: ProducerConfig, n: usize, tag: &str) -> Producer {
+    let b = broker().expect("ROBODR_KAFKA_BROKER");
+    let mut c = Consumer::connect(&b);
+    let marks = c.marks(TOPIC, PARTITIONS);
+    let mut p = Producer::new(cfg).unwrap();
+    let recs: Vec<(i32, ProduceRecord)> = (0..n)
+        .map(|i| {
+            let mut r = plain(i, 10);
+            r.key = Some(format!("{tag}-{}-{i}", run_base()).into_bytes());
+            ((i % PARTITIONS as usize) as i32, r)
+        })
+        .collect();
+    let out = p.send(TOPIC, &recs).unwrap();
+    assert!(
+        out.iter().all(|o| matches!(o, Outcome::Delivered { .. })),
+        "{out:?}"
+    );
+    let got = c.since(TOPIC, &marks);
+    let mine = got
+        .iter()
+        .filter(|f| f.key().starts_with(&format!("{tag}-{}-", run_base())))
+        .count();
+    assert_eq!(mine, n, "read back over the plain listener");
+    p
+}
+
+#[test]
+#[ignore = "needs a Kafka TLS listener: scripts/kafka-tls-it.sh"]
+fn real_tls_round_trip_and_refusals() {
+    let (Some(pki), Some(tls)) = (Pki::new(), env("ROBODR_KAFKA_TLS_BROKER")) else {
+        return;
+    };
+    if broker().is_none() {
+        return;
+    }
+    deliver_and_read_back(tls_cfg(&tls, pki.client("ca.pem", None, None)), 24, "tls");
+    // The advertised `localhost` listeners are verified too (metadata
+    // routes every partition's leader through them).
+    for (what, t) in [
+        ("unrelated CA", pki.client("other-ca.pem", None, None)),
+        (
+            "wrong name",
+            pki.client("ca.pem", None, Some("wrong.example")),
+        ),
+    ] {
+        let mut p = Producer::new(tls_cfg(&tls, t)).unwrap();
+        let e = p.partition_count(TOPIC).unwrap_err().to_string();
+        eprintln!("{what}: {e}");
+        assert!(e.contains("certificate"), "{what}: {e}");
+    }
+}
+
+#[test]
+#[ignore = "needs a Kafka mTLS listener: scripts/kafka-tls-it.sh"]
+fn real_mtls_round_trip_and_refusals() {
+    let (Some(pki), Some(mtls)) = (Pki::new(), env("ROBODR_KAFKA_MTLS_BROKER")) else {
+        return;
+    };
+    if broker().is_none() {
+        return;
+    }
+    deliver_and_read_back(
+        tls_cfg(&mtls, pki.client("ca.pem", Some("client"), None)),
+        12,
+        "mtls",
+    );
+    for (what, cert) in [
+        ("no client certificate", None),
+        ("foreign client", Some("other-client")),
+    ] {
+        let mut p = Producer::new(tls_cfg(&mtls, pki.client("ca.pem", cert, None))).unwrap();
+        let e = p.partition_count(TOPIC).unwrap_err().to_string();
+        eprintln!("{what}: {e}");
+    }
+}
+
+#[test]
+#[ignore = "needs a Kafka SASL_SSL SCRAM listener: scripts/kafka-tls-it.sh"]
+fn real_scram_over_tls() {
+    use robodr_export::kafka::sasl::{Mechanism, SaslConfig};
+    let (Some(pki), Some(scram), Some(user), Some(pw)) = (
+        Pki::new(),
+        env("ROBODR_KAFKA_SCRAM_BROKER"),
+        env("ROBODR_KAFKA_SCRAM_USER"),
+        env("ROBODR_KAFKA_SCRAM_PASSWORD"),
+    ) else {
+        return;
+    };
+    if broker().is_none() {
+        return;
+    }
+    let cfg = |m: Mechanism, pw: &str| {
+        let mut c = tls_cfg(&scram, pki.client("ca.pem", None, None));
+        c.sasl = Some(SaslConfig::new(m, &user, pw).unwrap());
+        c
+    };
+    for (m, tag) in [
+        (Mechanism::ScramSha256, "scram256"),
+        (Mechanism::ScramSha512, "scram512"),
+    ] {
+        deliver_and_read_back(cfg(m, &pw), 12, tag);
+    }
+    // Wrong password: fatal, not retried.
+    let started = Instant::now();
+    let mut p = Producer::new(cfg(Mechanism::ScramSha512, "not-the-password")).unwrap();
+    let e = p.partition_count(TOPIC).unwrap_err();
+    eprintln!("wrong password: {e}");
+    assert!(matches!(e, ProduceError::Fatal { code: 58, .. }), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // The listener's connections.max.reauth.ms: the producer reconnects
+    // (a fresh authentication) before the broker would cut the session.
+    if let Some(ms) = std::env::var("ROBODR_KAFKA_SCRAM_REAUTH_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        let mut p = deliver_and_read_back(cfg(Mechanism::ScramSha256, &pw), 2, "reauth1");
+        let before = p.stats();
+        std::thread::sleep(Duration::from_millis(ms + 500));
+        let out = p.send(TOPIC, &[(0, plain(1, 10))]).unwrap();
+        assert!(matches!(out[0], Outcome::Delivered { .. }), "{out:?}");
+        let after = p.stats();
+        eprintln!("reauth: {before:?} -> {after:?}");
+        assert!(after.connects > before.connects);
+        assert_eq!(after.io_errors, before.io_errors, "no failed request");
+    }
 }

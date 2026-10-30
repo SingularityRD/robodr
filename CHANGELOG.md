@@ -12,6 +12,66 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- **Kafka export and remote head anchor over TLS** (R2 / GAP-03). New
+  `robodr_blackbox::tls` (rustls + ring, the stack `robodr-uplink` and the
+  control plane already use; no new crypto crates): server verification
+  always on (the configured CA file only, validity, `serverAuth`, the
+  dialled host or an explicit `server_name`: SNI and the verified name are
+  the same), optional SPKI pins, optional client certificate (mutual TLS),
+  bounded handshakes, key-file mode checks. Test PKI and generator in
+  `fixtures/tls/`.
+  - `robodr-kafka-publish` / `ProducerConfig`: `--tls-ca`, `--tls-cert`,
+    `--tls-key`, `--tls-server-name`, `--tls-spki-sha256`; every broker
+    (bootstrap and advertised) verified. SASL/SCRAM-SHA-256 / -512
+    (`--sasl-mechanism`, `--sasl-username`, `--sasl-password-file`; over
+    TLS only; server signature checked, iteration count bounded, failures
+    fatal; broker session lifetimes honoured by reconnecting). Verified
+    against Apache Kafka 3.9.1 (SSL, SSL with required client
+    certificates, SASL_SSL SCRAM; `scripts/kafka-tls-it.sh`, native, no
+    docker) and the fake cluster (`tests/kafka_tls.rs`).
+  - Remote anchor: agentd `blackbox.head_anchor.tls` {`ca_file`,
+    `server_name`, `server_spki_sha256`, `cert_chain`, `key_file`};
+    `robodr-anchor-receiver` `"tls"` {`cert_chain`, `key_file`,
+    `client_ca`} (with `client_ca`: mutual TLS, no session resumption).
+  - **Breaking: plain TCP is refused unless explicitly allowed.**
+    `robodr-kafka-publish` exits 2 without `--tls-ca` or
+    `--allow-plaintext`; agentd refuses a `remote` head anchor without
+    `tls` or `"allow_plaintext": true`; `robodr-anchor-receiver serve`
+    exits 2 without `"tls"` or `"allow_plaintext": true`. TLS together
+    with allow-plaintext is refused. No fallback in either direction: a
+    TLS client never retries in plain TCP, a TLS server never parses a
+    plain request. Upgrade: give the brokers' / receiver's CA (or, on an
+    isolated link, add the explicit flag) before upgrading; the
+    `robodr-kafka-publish.service` units take `ROBODR_KAFKA_TLS_ARGS` from
+    `/etc/robodr/kafka-publish.env` (new drop-in example
+    `60-tls-credentials.conf.example` for the client key and the SCRAM
+    password).
+  - Adversarial tests: untrusted CA, wrong host name, expired
+    certificate, certificate without `serverAuth`, pin mismatch, missing /
+    foreign client certificate, downgrade both ways, plain TCP refused,
+    wrong SCRAM credentials, an impostor broker that cannot produce the
+    server signature, a downgraded iteration count, key file modes.
+  - Independent review of this work (fixed, each with a regression test):
+    a peer trickling one byte per socket timeout held a TLS handshake
+    open for ever (the timeout was armed once; rustls loops over reads):
+    every anchor-receiver slot (F1), the anchor's delivery thread with no
+    failure counted (F2) and the Kafka producer past all its deadlines
+    (F3). Every TLS read and write now re-arms the timeout with the time
+    left (`tls::DeadlineTcp`); the receiver bounds a connection by
+    `io_timeout` and caps connections per source address
+    (`max_connections_per_source`, default 8); the anchor bounds each
+    exchange as a whole and reports an attempt that outlives its bound.
+    TLS key / CA / password files must now be owned by root or the
+    process's user and are opened without blocking on a FIFO (F5); secret
+    file contents, the SCRAM proof and the SCRAM hash states are wiped
+    (F4).
+  - Limits: no CRL / OCSP on these paths; mutual TLS authenticates hosts,
+    not robot ids (anchor marks stay bound to units by their Ed25519
+    signatures); no `PLAIN` / `GSSAPI` / `OAUTHBEARER`; KIP-368 in-band
+    re-authentication is replaced by reconnecting; idempotence still off.
+  - Build: `robodr-blackbox` now depends on rustls / rustls-webpki, so
+    ring's C is compiled for every crate that depends on it
+    (`docs/BUILD.md`).
 - Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
   review of the F1 / F3 fixes"); each fixed finding has a regression test
   that failed before its fix:

@@ -21,7 +21,7 @@ the motion stack depends on it**, and run the first field period
 | | Connected site | Air-gapped site |
 |---|---|---|
 | Findings to the SOC | `robodr-uplink` sends signed batches over TLS from the robot or sensor box to the SOC's ingest API | `robodr-spool-export` packs signed diode batches on the robot. You carry them across the diode or on media. On the SOC side, `robodr-diode-unpack` imports them, then `robodr-uplink` forwards them under a `relay` key. |
-| SIEM instead of AutoSecOps | `robodr-kafka-publish` (no TLS: keep it on an isolated segment) | `robodr-kafka-publish` on the SOC side after `robodr-diode-unpack` |
+| SIEM instead of AutoSecOps | `robodr-kafka-publish` (TLS with the brokers' CA; optional mutual TLS or SCRAM) | `robodr-kafka-publish` on the SOC side after `robodr-diode-unpack` |
 
 | | On-robot agent | Passive sensor box |
 |---|---|---|

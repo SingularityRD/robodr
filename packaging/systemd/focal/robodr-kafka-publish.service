@@ -36,8 +36,10 @@
 #     acknowledged them, so it runs as User=robodr, through the spool's group
 #     (agentd itself runs as robodr-agentd: an exporter cannot write its
 #     black box, its state or its sockets).
-#   * PLAINTEXT Kafka only (no TLS, no SASL): use an isolated SOC network or
-#     a local TLS proxy. It connects to the bootstrap brokers AND to every
+#   * TLS required (ROBODR_KAFKA_TLS_ARGS: --tls-ca, optional client
+#     certificate and SASL/SCRAM, secrets through the
+#     60-tls-credentials.conf drop-in example); plain TCP only with an
+#     explicit --allow-plaintext, else exit 2. It connects to the bootstrap brokers AND to every
 #     broker the metadata advertises (each partition leader), so the
 #     IPAddressAllow= drop-in must list every broker, not just one.
 #   * Name resolution: IP literals are used directly; host names go through
@@ -49,6 +51,7 @@
 # Site settings: /etc/robodr/kafka-publish.env (0640 root:robodr), from
 # /usr/share/doc/robodr/examples/kafka-publish.env.example:
 #   ROBODR_KAFKA_BOOTSTRAP="--bootstrap 192.0.2.21:9092 --bootstrap 192.0.2.22:9092"  (required)
+#   ROBODR_KAFKA_TLS_ARGS="--tls-ca /etc/robodr/kafka/ca.pem"                         (required)
 #   ROBODR_KAFKA_PUBLISH_ARGS="--topic robodr.findings"                               (optional)
 # Network: install the drop-in example
 #   /usr/share/doc/robodr/examples/robodr-kafka-publish.service.d/50-brokers.conf.example
@@ -76,7 +79,7 @@ Type=simple
 EnvironmentFile=/etc/robodr/kafka-publish.env
 # Both variables are split on white space; an empty ROBODR_KAFKA_BOOTSTRAP
 # leaves no --bootstrap, a usage error (exit 2).
-ExecStart=/usr/bin/robodr-kafka-publish $ROBODR_KAFKA_BOOTSTRAP --state-dir /var/lib/robodr/export/kafka-publish --spool /var/lib/robodr/spool/agentd $ROBODR_KAFKA_PUBLISH_ARGS
+ExecStart=/usr/bin/robodr-kafka-publish $ROBODR_KAFKA_BOOTSTRAP --state-dir /var/lib/robodr/export/kafka-publish --spool /var/lib/robodr/spool/agentd $ROBODR_KAFKA_TLS_ARGS $ROBODR_KAFKA_PUBLISH_ARGS
 Restart=on-failure
 RestartSec=10s
 # Exit 2 = usage error: restarting cannot fix it.
