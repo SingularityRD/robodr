@@ -16,7 +16,14 @@ usage:
   robodr-seal policy sign --key FILE --platform P --version N --pcr I=HEX [--pcr I=HEX]...
         [--floor-nv 0xNNNNNNNN] [--last-version] --out FILE
   robodr-seal provision --owner-auth-file FILE TPM
-  robodr-seal enroll --seal-dir DIR --unit U --platform P --policy-authority FILE.pub TPM
+  robodr-seal keygen lease --out FILE          P-256 depot lease key (FILE, FILE.pub)
+  robodr-seal enroll --seal-dir DIR --unit U --platform P --policy-authority FILE.pub
+        [--lease-key FILE.pub] TPM
+  robodr-seal enrol-request --seal-dir DIR --nonce HEX --out FILE [TPM]
+  robodr-seal enrol-activate --seal-dir DIR --challenge FILE --out FILE TPM
+  robodr-seal lease install --seal-dir DIR --lease FILE TPM
+  robodr-seal counter define --index 0x01NNNNNN --owner-auth-file FILE TPM
+  robodr-seal counter read --index 0x01NNNNNN TPM
   robodr-seal enroll-fallback --seal-dir DIR --unit U --platform P --key FILE
         [--unchecked-key-location]
   robodr-seal policy install --seal-dir DIR --policy FILE TPM
@@ -42,9 +49,13 @@ and is usable only under a policy signed by the policy authority for the
 unit's platform (PCR values), not revoked by the policy floor, and while
 the erase epoch is unchanged. erase increments the epoch: every key sealed
 to the unit is dead. Units without a TPM keep an X25519 UWK inside a
-runtime volume that only the site's Tang server unlocks. rewrap is the
-depot's step (§7.3): it prints the deployment wrapped_keys entry for one
-unit. Keys and passphrases never appear on the command line.
+runtime volume that only the site's Tang server unlocks. rewrap prints
+the deployment wrapped_keys entry for one unit (14a: robodr-depot does this
+for enrolled units; rewrap stays for labs). enroll --lease-key makes the UWK
+usable only under a current site lease signed by that key (TPM clock and
+reset count, §7.5). enrol-request / enrol-activate are the unit's side of
+the depot's enrolment (§8: EK certificate, AK credential activation, AK
+certification of the UWK and of the unit identity key, quote). Keys and passphrases never appear on the command line.
 
 erase of a unit without a TPM needs --device (its keyslots are what is
 destroyed). With --mapper (and --mount, --stop-unit) erase also stops the
@@ -110,7 +121,18 @@ pub fn run(args: Vec<String>) -> i32 {
     };
     let rest: Vec<String> = it.collect();
     let r = match cmd.as_str() {
-        "keygen" => sub(rest, &[("depot", keygen_depot), ("policy", keygen_policy)]),
+        "keygen" => sub(
+            rest,
+            &[
+                ("depot", keygen_depot),
+                ("policy", keygen_policy),
+                ("lease", keygen_policy),
+            ],
+        ),
+        "enrol-request" => enrol_request(rest),
+        "enrol-activate" => enrol_activate(rest),
+        "lease" => sub(rest, &[("install", lease_install)]),
+        "counter" => sub(rest, &[("define", counter_define), ("read", counter_read)]),
         "policy" => sub(
             rest,
             &[
@@ -337,15 +359,26 @@ fn record_json(r: &UnitRecord) -> serde_json::Value {
 fn enroll(args: Vec<String>) -> Result<(), Cmd> {
     let a = parse(
         args,
-        &["seal-dir", "unit", "platform", "policy-authority"],
+        &[
+            "seal-dir",
+            "unit",
+            "platform",
+            "policy-authority",
+            "lease-key",
+        ],
         true,
     )?;
     let authority = keys::policy_load_public(&path(&a, "policy-authority")?)?;
-    let u = Unit::enroll_tpm(
+    let lease = match opt(&a, "lease-key")? {
+        Some(p) => Some(keys::policy_load_public(Path::new(p))?),
+        None => None,
+    };
+    let u = Unit::enroll_tpm_with(
         &path(&a, "seal-dir")?,
         req(&a, "unit")?,
         req(&a, "platform")?,
         &authority,
+        lease.as_ref(),
         tpm(&a)?,
     )?;
     print(record_json(u.record()));
@@ -392,6 +425,78 @@ fn open_unit(a: &Args) -> Result<Unit, Cmd> {
         (None, crate::unit::Mode::Fallback) => None,
     };
     Ok(Unit::open(&dir, t)?)
+}
+
+fn write_out(a: &Args, bytes: &[u8]) -> Result<(), Cmd> {
+    let p = path(a, "out")?;
+    std::fs::write(&p, bytes).map_err(|e| crate::io_err(&p, e))?;
+    Ok(())
+}
+
+fn enrol_request(args: Vec<String>) -> Result<(), Cmd> {
+    let a = parse(args, &["seal-dir", "nonce", "out"], true)?;
+    let n: [u8; 32] = crate::from_hex(req(&a, "nonce")?)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Cmd::Usage("--nonce: 64 lower-case hex digits".into()))?;
+    let u = open_unit(&a)?;
+    let r = u.enrol_request(&n)?;
+    write_out(
+        &a,
+        &serde_json::to_vec(&r).map_err(|e| crate::invalid(e.to_string()))?,
+    )?;
+    print(json!({"unit": r.unit, "identity_public": r.identity_public, "tpm": r.tpm.is_some()}));
+    Ok(())
+}
+
+fn enrol_activate(args: Vec<String>) -> Result<(), Cmd> {
+    let a = parse(args, &["seal-dir", "challenge", "out"], true)?;
+    let u = open_unit(&a)?;
+    let p = path(&a, "challenge")?;
+    let c = crate::enrol::parse_challenge(&keys::read_bounded(&p, false)?)?;
+    let r = u.enrol_activate(&c)?;
+    write_out(
+        &a,
+        &serde_json::to_vec(&r).map_err(|e| crate::invalid(e.to_string()))?,
+    )?;
+    print(json!({"unit": r.unit, "activated": true}));
+    Ok(())
+}
+
+fn lease_install(args: Vec<String>) -> Result<(), Cmd> {
+    let a = parse(args, &["seal-dir", "lease"], true)?;
+    let u = open_unit(&a)?;
+    let p = path(&a, "lease")?;
+    let l = u.install_lease(&keys::read_bounded(&p, false)?)?;
+    print(
+        json!({"lease_seq": l.lease_seq, "clock_before": l.clock_before, "resets_max": l.resets_max}),
+    );
+    Ok(())
+}
+
+fn counter_index(a: &Args) -> Result<u32, Cmd> {
+    parse_handle(req(a, "index")?, 0x01).map_err(|e| Cmd::Usage(e.detail))
+}
+
+fn counter_define(args: Vec<String>) -> Result<(), Cmd> {
+    let a = parse(args, &["index", "owner-auth-file"], true)?;
+    let i = counter_index(&a)?;
+    let t = tpm(&a)?;
+    let auth = read_secret_file(&path(&a, "owner-auth-file")?)?;
+    let defined = t.define_counter(i, &auth)?;
+    print(json!({"index": format!("0x{i:08x}"), "defined": defined}));
+    Ok(())
+}
+
+fn counter_read(args: Vec<String>) -> Result<(), Cmd> {
+    let a = parse(args, &["index"], true)?;
+    let i = counter_index(&a)?;
+    let v = match tpm(&a)?.counter(i)? {
+        crate::tpm_ident::Counter::Undefined => json!("undefined"),
+        crate::tpm_ident::Counter::Unwritten => json!("unwritten"),
+        crate::tpm_ident::Counter::Value(v) => json!(v),
+    };
+    print(json!({"index": format!("0x{i:08x}"), "value": v}));
+    Ok(())
 }
 
 fn policy_install(args: Vec<String>) -> Result<(), Cmd> {

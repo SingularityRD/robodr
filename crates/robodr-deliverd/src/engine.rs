@@ -937,6 +937,30 @@ impl Engine {
                 ));
                 Ok(())
             }
+            K::LeaseExpired => {
+                // Sprint 14b: the item waits for a lease (the depot renews
+                // it over the LAN or in a media pack); reported once per
+                // reason.
+                let k = format!("lease:{}", e.detail);
+                if self.reported.insert(k) {
+                    let ev = self.journal.note(
+                        kinds::LEASE_EXPIRED,
+                        json!({"name": it.name, "serial": it.serial, "detail": e.detail}),
+                    )?;
+                    self.finding(
+                        rules::SEAL_LEASE_EXPIRED,
+                        Severity::Medium,
+                        format!(
+                            "lease_expired: {} {}: sealed payloads are unavailable until the \
+                             depot renews the site lease: {}",
+                            it.name, it.serial, e.detail
+                        ),
+                        Some(ev),
+                    );
+                }
+                rep.deferred = Some(format!("{} {}: lease_expired", it.name, it.serial));
+                Ok(())
+            }
             K::Unauthentic | K::Invalid => self.refuse_item(idx, "unauthentic_key", e.detail, rep),
             K::Unavailable | K::Io => {
                 let k = format!("unseal:{}:{}", it.name, e.detail);

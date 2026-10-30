@@ -54,6 +54,8 @@ pub mod kinds {
     pub const TAMPER: &str = "robodr.seal.tamper";
     /// Sealing (13c): crypto-erase executed.
     pub const ERASED: &str = "robodr.seal.erased";
+    /// Sprint 14b: a sealed item waits for a site lease.
+    pub const LEASE_EXPIRED: &str = "robodr.seal.lease_expired";
 }
 
 /// What the notes still in the journal say about the unit's history

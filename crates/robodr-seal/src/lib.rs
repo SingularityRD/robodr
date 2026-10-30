@@ -26,6 +26,18 @@
 //!   `robodr-seal` CLI use: unwrap a content key, open the volume, erase;
 //! * [`rpk`]: sealed RPKs end to end: seal at release, re-wrap per unit
 //!   at the depot, open on the unit;
+//! * [`attest`], [`enrol`], [`tpm_ident`] (Sprint 14a): the TPM
+//!   structures a depot checks, the enrolment request / challenge /
+//!   response with EK / AK credential activation and AK certification of
+//!   the UWK and of the unit identity key (UIK, the unit's TPM-held TLS
+//!   and report key), and the unit side of them;
+//! * [`report`] (Sprint 14a): the unit's install report, signed by its
+//!   TPM-resident identity key;
+//! * [`lease`] (Sprint 14b): site leases enforced by the TPM (clock and
+//!   reset count in the UWK's policy);
+//! * [`nvcounter`] (Sprint 14b): an NV counter that anchors a signed
+//!   record against rollback (the unit's delivery floors, the depot's
+//!   database);
 //! * [`cmd`]: the bounded subprocess runner (cleared environment, stdin,
 //!   timeout, captured output wiped after use).
 //!
@@ -50,15 +62,21 @@
     )
 )]
 
+pub mod attest;
 pub mod chunk;
 pub mod cli;
 pub mod cmd;
+pub mod enrol;
 pub mod keys;
+pub mod lease;
 pub mod luks;
 pub mod mounts;
+pub mod nvcounter;
 pub mod policy;
+pub mod report;
 pub mod rpk;
 pub mod tpm;
+pub mod tpm_ident;
 pub mod unit;
 pub mod wrap;
 
@@ -89,6 +107,9 @@ pub enum ErrorKind {
     /// The unit's keys were crypto-erased (the epoch moved on, or the key
     /// material is gone).
     Erased,
+    /// The unit's site lease (Sprint 14b, [`lease`]) is missing, expired
+    /// (TPM clock) or used up (TPM resets): `robot.seal.lease_expired`.
+    LeaseExpired,
     /// A tool, the TPM or the Tang server could not be reached or failed.
     Unavailable,
     /// Local file-system failure.
@@ -102,6 +123,7 @@ impl ErrorKind {
             ErrorKind::Unauthentic => "unauthentic",
             ErrorKind::PolicyRefused => "policy_refused",
             ErrorKind::Erased => "erased",
+            ErrorKind::LeaseExpired => "lease_expired",
             ErrorKind::Unavailable => "unavailable",
             ErrorKind::Io => "io",
         }

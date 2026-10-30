@@ -22,6 +22,26 @@
 //!   AND PolicyNV(erase-epoch counter == E)                   (TPM_EO_EQ)
 //! ```
 //!
+//! **UWK authPolicy with a site lease** (Sprint 14b, §7.5; chosen at
+//! enrolment, `robodr-seal enroll --lease-key`):
+//!
+//! ```text
+//! PolicyAuthorize(lease key, policyRef = H("robodr-seal/lease-ref/v1\0" || unit))
+//!   AND PolicyNV(erase-epoch counter == E)
+//! ```
+//!
+//! where the depot's lease key signs, per lease, the approved policy
+//!
+//! ```text
+//! PolicyAuthorize(policy authority, H(platform))       (the 13c chain, unchanged)
+//!   AND PolicyCounterTimer(TPM clock   <  clock_before)  (TPM_EO_UNSIGNED_LT, offset 8)
+//!   AND PolicyCounterTimer(resetCount  <= resets_max)    (TPM_EO_UNSIGNED_LE, offset 16)
+//! ```
+//!
+//! so the TPM itself refuses the UWK once its clock (milliseconds the TPM
+//! has been powered, never set back) passes the lease or the unit has
+//! rebooted more often than the lease allows ([`crate::lease`]).
+//!
 //! `PolicyAuthorize` accepts any approved policy the authority signed for
 //! this platform, so an authorised OS or firmware update ships a new
 //! signed policy and sealing survives it, while any other boot chain fails
@@ -78,7 +98,13 @@ pub const TPM_ALG_SHA256: u16 = 0x000B;
 pub const TPM_CC_POLICY_NV: u32 = 0x0000_0149;
 pub const TPM_CC_POLICY_AUTHORIZE: u32 = 0x0000_016A;
 pub const TPM_CC_POLICY_PCR: u32 = 0x0000_017F;
+pub const TPM_CC_POLICY_COUNTER_TIMER: u32 = 0x0000_016D;
 pub const TPM_EO_EQ: u16 = 0x0000;
+pub const TPM_EO_UNSIGNED_LT: u16 = 0x0005;
+pub const TPM_EO_UNSIGNED_LE: u16 = 0x0009;
+/// Offsets in `TPMS_TIME_INFO` (time u64, clock u64, resetCount u32, ...).
+pub const TIME_INFO_CLOCK: u16 = 8;
+pub const TIME_INFO_RESET_COUNT: u16 = 16;
 pub const TPM_EO_BITCLEAR: u16 = 0x000B;
 
 /// `TPMA_NV` of the erase-epoch counter once written:
@@ -92,6 +118,7 @@ pub const EPOCH_NV_DEFINE: &str = "authread|authwrite|nt=counter|no_da";
 pub const FLOOR_NV_DEFINE: &str = "authread|authwrite|nt=bits|no_da";
 
 const POLICY_REF_DOMAIN: &[u8] = b"robodr-seal/policy-ref/v1\0";
+const LEASE_REF_DOMAIN: &[u8] = b"robodr-seal/lease-ref/v1\0";
 
 fn h(parts: &[&[u8]]) -> [u8; 32] {
     let mut d = Sha256::new();
@@ -180,6 +207,83 @@ pub fn uwk_auth_policy(key_name: &[u8], platform: &str, epoch_nv: u32, epoch: u6
         &epoch.to_be_bytes(),
         TPM_EO_EQ,
     )
+}
+
+/// `TPM2_PolicyCounterTimer`: `operand_b <op> TPMS_TIME_INFO[offset..]`.
+pub fn policy_counter_timer(
+    prev: &[u8; 32],
+    operand_b: &[u8],
+    offset: u16,
+    operation: u16,
+) -> [u8; 32] {
+    let args = h(&[operand_b, &offset.to_be_bytes(), &operation.to_be_bytes()]);
+    h(&[prev, &TPM_CC_POLICY_COUNTER_TIMER.to_be_bytes(), &args])
+}
+
+/// The policyRef bound into a unit's lease-gated UWK.
+pub fn lease_ref(unit: &str) -> [u8; 32] {
+    h(&[LEASE_REF_DOMAIN, unit.as_bytes()])
+}
+
+/// The approved policy one lease authorizes: the 13c authority chain of
+/// `platform` (authority TPM name `authority_name`), then TPM clock below
+/// `clock_before` and reset count at most `resets_max`.
+pub fn lease_approved(
+    authority_name: &[u8],
+    platform: &str,
+    clock_before: u64,
+    resets_max: u32,
+) -> [u8; 32] {
+    let a = policy_authorize(authority_name, &policy_ref(platform));
+    let c = policy_counter_timer(
+        &a,
+        &clock_before.to_be_bytes(),
+        TIME_INFO_CLOCK,
+        TPM_EO_UNSIGNED_LT,
+    );
+    policy_counter_timer(
+        &c,
+        &resets_max.to_be_bytes(),
+        TIME_INFO_RESET_COUNT,
+        TPM_EO_UNSIGNED_LE,
+    )
+}
+
+/// The authPolicy of a lease-gated UWK of `unit` (lease key TPM name
+/// `lease_name`).
+pub fn uwk_auth_policy_lease(lease_name: &[u8], unit: &str, epoch_nv: u32, epoch: u64) -> [u8; 32] {
+    let a = policy_authorize(lease_name, &lease_ref(unit));
+    policy_nv(
+        &a,
+        &nv_name(epoch_nv, EPOCH_NV_ATTRIBUTES, 8),
+        &epoch.to_be_bytes(),
+        TPM_EO_EQ,
+    )
+}
+
+/// The TPM name `TPM2_LoadExternal` gives a P-256 public key loaded from
+/// PEM by `tpm2_loadexternal -G ecc` (attributes `userwithauth | decrypt
+/// | sign`, no policy, no scheme): what the TPM checks a policy signer
+/// against. Lets a depot compute the policies a unit's TPM enforces
+/// without a TPM.
+pub fn external_p256_name(public: &[u8; 65]) -> [u8; 34] {
+    let mut t = Vec::with_capacity(86);
+    t.extend_from_slice(&0x0023u16.to_be_bytes()); // TPM_ALG_ECC
+    t.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    t.extend_from_slice(&0x0006_0040u32.to_be_bytes());
+    t.extend_from_slice(&0u16.to_be_bytes()); // authPolicy
+    t.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric NULL
+    t.extend_from_slice(&0x0010u16.to_be_bytes()); // scheme NULL
+    t.extend_from_slice(&0x0003u16.to_be_bytes()); // NIST P-256
+    t.extend_from_slice(&0x0010u16.to_be_bytes()); // kdf NULL
+    t.extend_from_slice(&32u16.to_be_bytes());
+    t.extend_from_slice(&public[1..33]);
+    t.extend_from_slice(&32u16.to_be_bytes());
+    t.extend_from_slice(&public[33..]);
+    let mut n = [0u8; 34];
+    n[..2].copy_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    n[2..].copy_from_slice(&h(&[&t]));
+    n
 }
 
 /// `aHash` of `TPM2_PolicyAuthorize`: what the authority signs.
@@ -472,5 +576,45 @@ mod tests {
         let d = [3u8; 32];
         assert_eq!(pcr_after(&[]), [0u8; 32]);
         assert_eq!(pcr_after(&[d]), h(&[&[0u8; 32], &d]));
+    }
+
+    /// Vectors from a real TPM (swtpm 0.7, tpm2-tools 5.6): the name
+    /// `tpm2_loadexternal -G ecc` gave a P-256 PEM key, and the digests
+    /// `tpm2_policycountertimer --ult clock=900000000` then `--ule
+    /// resets=7` gave in a trial session.
+    #[test]
+    fn external_name_and_counter_timer_match_a_tpm() {
+        let x = "ca8f014227bf5de10ab0f2c1e8bb9bef059039e98263b43b25b650c29a9c4173";
+        let y = "bbd95392ae7fc0cfe52b8d07ccef40c0ffae70ced1bf5a597c5ab005846abeea";
+        let p: [u8; 65] = crate::from_hex(&format!("04{x}{y}"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            crate::to_hex(&external_p256_name(&p)),
+            "000b5f33bb637e1e904016d6ea82714fd09bcb9673de0dbdf337948c92d6fddac437"
+        );
+        let a = policy_counter_timer(
+            &[0u8; 32],
+            &900_000_000u64.to_be_bytes(),
+            TIME_INFO_CLOCK,
+            TPM_EO_UNSIGNED_LT,
+        );
+        assert_eq!(
+            crate::to_hex(&a),
+            "a23d72b333e20e411dedba1c6b53aefb9c36151f246370db62559f84fd78f9a0"
+        );
+        let b = policy_counter_timer(
+            &a,
+            &7u32.to_be_bytes(),
+            TIME_INFO_RESET_COUNT,
+            TPM_EO_UNSIGNED_LE,
+        );
+        assert_eq!(
+            crate::to_hex(&b),
+            "bece6a9d7c045cc2e2e94adb8ce418f60fa6615d0dba2978132a7f26e4f6251a"
+        );
+        // A lease for another unit is another policyRef.
+        assert_ne!(lease_ref("ugv-07"), lease_ref("ugv-08"));
     }
 }

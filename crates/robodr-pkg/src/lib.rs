@@ -11,6 +11,8 @@
 //!   (depot + operator quorum by ring, freshness, replay);
 //! * [`trust`]: the site's delivery trust file, `robodr-delivery-trust/1`
 //!   (roles, quorums, revocations, floors, root rotation);
+//! * [`entry`]: the entry station's signed scan report of one bundle,
+//!   `robodr-entry-report/1` (Sprint 14a, §6.1);
 //! * [`sig`]: detached signature sets `robodr-sigset/1` and quorum checks;
 //! * [`parity`]: Reed-Solomon parity over bundle files with
 //!   `robodr-diode`'s code;
@@ -49,6 +51,7 @@
 pub mod bundle;
 pub mod common;
 pub mod deployment;
+pub mod entry;
 pub mod parity;
 pub mod rpk;
 pub mod sig;

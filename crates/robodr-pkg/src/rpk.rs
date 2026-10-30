@@ -729,6 +729,29 @@ pub fn check_policy(
             ));
         }
     }
+    // Sprint 14a (§11, 13c open question): when the site lists its depot
+    // wrapping keys, a sealed RPK may be wrapped to those keys only.
+    if let Some(seal) = m.seal.as_ref().filter(|_| m.is_sealed()) {
+        let listed = trust.depot_wrap_fingerprints();
+        if !listed.is_empty() {
+            if let Some(w) = seal
+                .depot_wraps
+                .iter()
+                .find(|w| !listed.contains(&w.recipient))
+            {
+                return Err(Refusal::new(
+                    Code::WrongScope,
+                    format!(
+                        "sealed RPK {} {} is wrapped to depot key {}, which this site's trust \
+                         file does not list",
+                        m.name,
+                        m.version.serial,
+                        crate::common::trunc(&w.recipient)
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1380,6 +1403,30 @@ mod tests {
             parse_manifest(with_null.as_bytes()).unwrap_err().code,
             Code::NonCanonical
         );
+    }
+
+    /// Sprint 14a: a site that lists its depot wrapping keys refuses a
+    /// sealed RPK wrapped to any other key.
+    #[test]
+    fn sealed_rpk_wrapped_to_an_unlisted_depot_key_is_refused() {
+        use crate::trust::test_support::{base, verified};
+        use crate::trust::{WrapKey, X25519};
+        let m = sealed();
+        let d = "99".repeat(32);
+        // No list: 13c behaviour.
+        check_policy(&m, &d, &verified(&base()), 1_790_000_000).unwrap();
+        let mut t = base();
+        t.depot_wrap_keys = vec![WrapKey {
+            key_id: "depot-1-wrap".into(),
+            algorithm: X25519.into(),
+            public_hex: "08".repeat(32),
+        }];
+        let e = check_policy(&m, &d, &verified(&t), 1_790_000_000).unwrap_err();
+        assert_eq!(e.code, Code::WrongScope);
+        let mut ok = m.clone();
+        ok.seal.as_mut().unwrap().depot_wraps[0].recipient =
+            t.depot_wrap_keys[0].fingerprint().unwrap();
+        check_policy(&ok, &d, &verified(&t), 1_790_000_000).unwrap();
     }
 
     #[test]

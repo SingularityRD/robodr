@@ -72,6 +72,9 @@ pub fn trust_file() -> TrustFile {
         revoked_rpks: vec![],
         revoked_serials: vec![],
         floors: vec![],
+        entry_keys: vec![],
+        depot_wrap_keys: vec![],
+        ek_ca_certs: vec![],
     }
 }
 

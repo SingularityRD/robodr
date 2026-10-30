@@ -122,7 +122,7 @@ impl TpmConfig {
     }
 }
 
-fn hx(v: u32) -> String {
+pub(crate) fn hx(v: u32) -> String {
     format!("0x{v:08x}")
 }
 
@@ -193,6 +193,17 @@ impl Drop for WorkDir {
 pub struct Tpm {
     pub cfg: TpmConfig,
     runner: Box<dyn Runner>,
+}
+
+/// The site lease of a lease-gated UWK (Sprint 14b, [`crate::lease`]):
+/// the lease, the enrolled lease key and its TPM name.
+pub struct LeaseGate<'a> {
+    pub lease: &'a crate::lease::Lease,
+    pub key: &'a [u8; 65],
+    pub key_name: &'a [u8],
+    /// The approved policy and policyRef the lease key signed.
+    pub approved: [u8; 32],
+    pub policy_ref: [u8; 32],
 }
 
 /// A created UWK: public blob, private blob (encrypted by the SRK), SEC1
@@ -333,16 +344,16 @@ impl Tpm {
         )
     }
 
-    fn flush(&self) {
+    pub(crate) fn flush(&self) {
         let _ = self.run("tpm2_flushcontext", &["-t".into()], None);
     }
 
-    fn flush_sessions(&self) {
+    pub(crate) fn flush_sessions(&self) {
         let _ = self.run("tpm2_flushcontext", &["-l".into()], None);
     }
 
     /// Run a tool that must succeed; a failure is `kind` with its error.
-    fn must(
+    pub(crate) fn must(
         &self,
         name: &str,
         args: &[String],
@@ -362,7 +373,7 @@ impl Tpm {
         }
     }
 
-    fn nv_public(
+    pub(crate) fn nv_public(
         &self,
         index: u32,
     ) -> Result<Option<robodr_blackbox::tpm_anchor::NvPublic>, SealError> {
@@ -375,7 +386,7 @@ impl Tpm {
             .map_err(|e| SealError::new(ErrorKind::Unavailable, e))
     }
 
-    fn owner_args() -> Vec<String> {
+    pub(crate) fn owner_args() -> Vec<String> {
         vec!["-P".into(), "file:-".into()]
     }
 
@@ -600,9 +611,22 @@ impl Tpm {
         w: &WorkDir,
         authority: &[u8; 65],
     ) -> Result<Vec<u8>, SealError> {
-        let pem = w.write("authority.pem", crate::keys::p256_pem(authority).as_bytes())?;
-        let ctx = w.path("authority.ctx").display().to_string();
-        let name = w.path("authority.name");
+        self.external_key_name_as(w, authority, "authority")
+    }
+
+    /// As [`Tpm::external_key_name`], with the work files named `stem.*`.
+    pub fn external_key_name_as(
+        &self,
+        w: &WorkDir,
+        authority: &[u8; 65],
+        stem: &str,
+    ) -> Result<Vec<u8>, SealError> {
+        let pem = w.write(
+            &format!("{stem}.pem"),
+            crate::keys::p256_pem(authority).as_bytes(),
+        )?;
+        let ctx = w.path(&format!("{stem}.ctx")).display().to_string();
+        let name = w.path(&format!("{stem}.name"));
         self.must(
             "tpm2_loadexternal",
             &[
@@ -625,7 +649,7 @@ impl Tpm {
         if n.len() != 34 || n[..2] != [0x00, 0x0b] {
             return Err(SealError::new(
                 ErrorKind::Unavailable,
-                "unexpected TPM name of the policy authority key",
+                format!("unexpected TPM name of the {stem} key"),
             ));
         }
         Ok(n)
@@ -663,7 +687,7 @@ impl Tpm {
         Ok((pub_blob, priv_blob, point))
     }
 
-    fn load_uwk(
+    pub(crate) fn load_uwk(
         &self,
         w: &WorkDir,
         pub_blob: &[u8],
@@ -734,6 +758,7 @@ impl Tpm {
         authority_name: &[u8],
         epoch: u64,
         ephemeral: &[u8],
+        lease: Option<&LeaseGate<'_>>,
     ) -> Result<Zeroizing<[u8; 32]>, SealError> {
         let r = self.ecdh_inner(
             w,
@@ -744,6 +769,7 @@ impl Tpm {
             authority_name,
             epoch,
             ephemeral,
+            lease,
         );
         self.flush();
         self.flush_sessions();
@@ -761,6 +787,7 @@ impl Tpm {
         authority_name: &[u8],
         epoch: u64,
         ephemeral: &[u8],
+        lease: Option<&LeaseGate<'_>>,
     ) -> Result<Zeroizing<[u8; 32]>, SealError> {
         let refused = ErrorKind::PolicyRefused;
         let point = w.write("ephemeral.point", &ecc_point(ephemeral)?)?;
@@ -859,6 +886,9 @@ impl Tpm {
             refused,
             "boot measurements (PCRs) do not match the signed policy",
         )?;
+        if let Some(l) = lease {
+            self.lease_steps(w, &s, l)?;
+        }
         let e = w.write("epoch", &epoch.to_be_bytes())?;
         self.must(
             "tpm2_policynv",
@@ -891,6 +921,93 @@ impl Tpm {
             "ECDH with the UWK",
         )?;
         ecc_point_x(&o.stdout)
+    }
+}
+
+impl Tpm {
+    /// The lease steps of a lease-gated UWK's policy session (after the
+    /// authority's `PolicyAuthorize`): `PolicyCounterTimer` clock and
+    /// reset count, then `PolicyAuthorize` by the lease key. A refusal of
+    /// the counter-timer steps is [`ErrorKind::LeaseExpired`].
+    fn lease_steps(&self, w: &WorkDir, s: &str, l: &LeaseGate<'_>) -> Result<(), SealError> {
+        let expired = ErrorKind::LeaseExpired;
+        self.must(
+            "tpm2_policycountertimer",
+            &[
+                "-S".into(),
+                s.into(),
+                "--ult".into(),
+                format!("clock={}", l.lease.clock_before),
+            ],
+            None,
+            expired,
+            "site lease expired (TPM clock past the lease)",
+        )?;
+        self.must(
+            "tpm2_policycountertimer",
+            &[
+                "-S".into(),
+                s.into(),
+                "--ule".into(),
+                format!("resets={}", l.lease.resets_max),
+            ],
+            None,
+            expired,
+            "site lease used up (more TPM resets than the lease allows)",
+        )?;
+        let name = self.external_key_name_as(w, l.key, "lease")?;
+        if !crate::ct_eq(&name, l.key_name) {
+            return Err(SealError::new(
+                expired,
+                "the lease key's TPM name differs from enrolment",
+            ));
+        }
+        let ahash = w.write(
+            "lease.ahash",
+            &crate::policy::authorization_digest(&l.approved, &l.policy_ref),
+        )?;
+        let der = crate::from_hex(&l.lease.signature).ok_or_else(|| invalid("lease signature"))?;
+        let sig = w.write("lease.sig", &der)?;
+        let ticket = w.path("lease.ticket").display().to_string();
+        self.must(
+            "tpm2_verifysignature",
+            &[
+                "-c".into(),
+                w.path("lease.ctx").display().to_string(),
+                "-d".into(),
+                ahash,
+                "-s".into(),
+                sig,
+                "-f".into(),
+                "ecdsa".into(),
+                "-t".into(),
+                ticket.clone(),
+            ],
+            None,
+            expired,
+            "lease (not signed by the enrolled lease key)",
+        )?;
+        let approved = w.write("lease.approved", &l.approved)?;
+        let pref = w.write("lease.ref", &l.policy_ref)?;
+        self.must(
+            "tpm2_policyauthorize",
+            &[
+                "-S".into(),
+                s.into(),
+                "-i".into(),
+                approved,
+                "-q".into(),
+                pref,
+                "-n".into(),
+                w.path("lease.name").display().to_string(),
+                "-t".into(),
+                ticket,
+            ],
+            None,
+            expired,
+            "lease does not authorize this unit's policy",
+        )?;
+        Ok(())
     }
 }
 

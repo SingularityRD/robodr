@@ -12,7 +12,10 @@
 //!  "rings":[{"ring":"canary","units":["ugv-07"]},{"ring":"lab","units":["bench-01"]}],
 //!  "revoked_keys":["sha256:<fingerprint>"],"revoked_rpks":["<rpk digest>"],
 //!  "revoked_serials":[{"name":"nav-stack","serial":9}],
-//!  "floors":[{"name":"robodr-agentd","min_serial":12}]}
+//!  "floors":[{"name":"robodr-agentd","min_serial":12}],
+//!  "entry_keys":[...],
+//!  "depot_wrap_keys":[{"key_id":"depot-1-wrap","algorithm":"x25519","public_hex":"<64 hex>"}],
+//!  "ek_ca_certs":["<sha256 of a DER CA certificate>"]}
 //! ```
 //!
 //! Signed (detached, [`crate::sig`]) over [`TRUST_SIG_DOMAIN`] by the
@@ -65,6 +68,16 @@
 //!   or lower or drop a floor). An older version is a replay, the same
 //!   version with other bytes an equivocation. This is the only way a
 //!   verifier's accepted trust (its anchor) moves forward.
+//! * **Sprint 14a members** (`docs/SECURE-DELIVERY.md` §10, 14a status):
+//!   `entry_keys` (role [`Role::Entry`]: entry stations sign entry
+//!   reports, §6.1; disjoint from every other role like any key);
+//!   `depot_wrap_keys`, the X25519 keys the site's depots unwrap sealed
+//!   content keys with (§7.3; resolves the 13c open question: when the
+//!   list is not empty, a sealed RPK wrapped to any other key is refused
+//!   by every station, [`crate::rpk::check_policy`]); `ek_ca_certs`,
+//!   SHA-256 digests of the DER certificates of the TPM vendors' EK CAs a
+//!   depot accepts at enrolment (§8; the certificates travel next to the
+//!   trust file and are accepted only if their digest is listed).
 //! * `issued_at` and `expires_at` are judged on the verifier's clock;
 //!   units have no trusted clock (13b decides how they use them).
 
@@ -171,6 +184,33 @@ pub struct RevokedSerial {
     pub serial: u64,
 }
 
+/// A depot's X25519 wrapping key (Sprint 14a, §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WrapKey {
+    pub key_id: String,
+    /// Always `x25519`.
+    pub algorithm: String,
+    /// 64 lower-case hex digits: the 32-byte public key.
+    pub public_hex: String,
+}
+
+/// `algorithm` of a [`WrapKey`].
+pub const X25519: &str = "x25519";
+/// Most depot wrapping keys and EK CA certificates.
+pub const MAX_WRAP_KEYS: usize = 16;
+pub const MAX_EK_CAS: usize = 64;
+
+impl WrapKey {
+    /// `sha256:<hex>` of the raw public key (the fingerprint
+    /// `robodr-seal` names depot wraps by).
+    pub fn fingerprint(&self) -> Option<String> {
+        let v = from_hex(&self.public_hex)?;
+        let a: [u8; 32] = v.try_into().ok()?;
+        Some(fingerprint(&a))
+    }
+}
+
 /// A parsed trust file (members in canonical order).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -194,6 +234,14 @@ pub struct TrustFile {
     /// Sorted by (name, serial).
     pub revoked_serials: Vec<RevokedSerial>,
     pub floors: Vec<Floor>,
+    /// Entry-station keys (Sprint 14a, §6.1), sorted by key_id.
+    pub entry_keys: Vec<TrustKey>,
+    /// The site depots' X25519 wrapping keys (Sprint 14a, §7.3), sorted by
+    /// key_id.
+    pub depot_wrap_keys: Vec<WrapKey>,
+    /// SHA-256 of the DER EK CA certificates a depot accepts (Sprint 14a,
+    /// §8), sorted.
+    pub ek_ca_certs: Vec<String>,
 }
 
 /// A trust file that parsed and validated, with its key index. Signatures
@@ -275,6 +323,7 @@ impl TrustFile {
             Role::Release => &self.release_keys,
             Role::Depot => &self.depot_keys,
             Role::Operator => &self.operator_keys,
+            Role::Entry => &self.entry_keys,
         }
     }
 
@@ -372,7 +421,13 @@ impl TrustFile {
         let revoked: BTreeSet<String> = self.revoked_keys.iter().cloned().collect();
         let mut keys = BTreeMap::new();
         let mut fps = BTreeSet::new();
-        for role in [Role::Root, Role::Release, Role::Depot, Role::Operator] {
+        for role in [
+            Role::Root,
+            Role::Release,
+            Role::Depot,
+            Role::Operator,
+            Role::Entry,
+        ] {
             let list = self.keys_of(role);
             if list.len() > MAX_KEYS_PER_ROLE {
                 return Err(invalid(format!(
@@ -421,6 +476,47 @@ impl TrustFile {
         if live(Role::Root) < q.root as usize {
             return Err(invalid("trust file: fewer roots than the root quorum"));
         }
+        // Depot wrapping keys: X25519, distinct, ids unique across the
+        // whole file.
+        if self.depot_wrap_keys.len() > MAX_WRAP_KEYS {
+            return Err(invalid(format!(
+                "trust file: more than {MAX_WRAP_KEYS} depot_wrap_keys"
+            )));
+        }
+        strictly_sorted(
+            &self.depot_wrap_keys,
+            |k| k.key_id.clone(),
+            "depot_wrap_keys",
+        )?;
+        let mut wrap_fps = BTreeSet::new();
+        for k in &self.depot_wrap_keys {
+            if !is_key_id(&k.key_id) || k.algorithm != X25519 || !is_hex64(&k.public_hex) {
+                return Err(invalid(
+                    "trust file: depot_wrap_keys entries are {key_id, x25519, 64 hex}",
+                ));
+            }
+            if keys.contains_key(&k.key_id) {
+                return Err(invalid(format!(
+                    "trust file: key id {} is used twice",
+                    k.key_id
+                )));
+            }
+            let fp = k
+                .fingerprint()
+                .ok_or_else(|| invalid("trust file: depot wrap key hex"))?;
+            if fp == fingerprint(&[0u8; 32]) || !wrap_fps.insert(fp) {
+                return Err(invalid(format!(
+                    "trust file: depot wrap key {} is listed twice or all zero",
+                    k.key_id
+                )));
+            }
+        }
+        if self.ek_ca_certs.len() > MAX_EK_CAS || !self.ek_ca_certs.iter().all(|d| is_hex64(d)) {
+            return Err(invalid(format!(
+                "trust file: ek_ca_certs are at most {MAX_EK_CAS} SHA-256 digests"
+            )));
+        }
+        strictly_sorted(&self.ek_ca_certs, |d| d.clone(), "ek_ca_certs")?;
 
         // Programmes: release-key scopes and package ownership.
         let mut scopes = BTreeMap::new();
@@ -649,6 +745,27 @@ impl VerifiedTrust {
         (0..=name.len())
             .find_map(|i| name.get(..i).and_then(|pre| self.0.prefixes.get(pre)))
             .map(String::as_str)
+    }
+
+    /// Fingerprints of the depot wrapping keys (empty: the site does not
+    /// list them; then any depot key is accepted, the 13c behaviour).
+    pub fn depot_wrap_fingerprints(&self) -> BTreeSet<String> {
+        self.0
+            .file
+            .depot_wrap_keys
+            .iter()
+            .filter_map(WrapKey::fingerprint)
+            .collect()
+    }
+
+    /// Whether `digest` (SHA-256 hex of a DER certificate) is an EK CA
+    /// this site accepts.
+    pub fn accepts_ek_ca(&self, digest: &str) -> bool {
+        self.0
+            .file
+            .ek_ca_certs
+            .binary_search_by(|d| d.as_str().cmp(digest))
+            .is_ok()
     }
 
     /// The ring the roots assigned `unit` to, if any.
@@ -958,6 +1075,9 @@ pub(crate) mod test_support {
             revoked_rpks: vec![],
             revoked_serials: vec![],
             floors: vec![],
+            entry_keys: vec![],
+            depot_wrap_keys: vec![],
+            ek_ca_certs: vec![],
         }
     }
 
@@ -1614,5 +1734,48 @@ mod tests {
             parse_trust(&to_canonical(&t).unwrap()).is_err(),
             "release quorum 17 accepted"
         );
+    }
+
+    /// Sprint 14a members: entry keys are a role of their own (disjoint
+    /// from every other), depot wrapping keys are X25519 with unique ids
+    /// and keys, EK CA digests are sorted SHA-256 values.
+    #[test]
+    fn sprint_14a_members() {
+        let wrap = |id: &str, b: u8| WrapKey {
+            key_id: id.into(),
+            algorithm: X25519.into(),
+            public_hex: format!("{b:02x}").repeat(32),
+        };
+        let mut t = base();
+        t.entry_keys = vec![tk(&key("entry-1", 41))];
+        t.depot_wrap_keys = vec![wrap("depot-1-wrap", 7)];
+        t.ek_ca_certs = vec!["11".repeat(32), "22".repeat(32)];
+        let v = verified(&t);
+        assert_eq!(
+            v.depot_wrap_fingerprints().into_iter().collect::<Vec<_>>(),
+            vec![fingerprint(&[7u8; 32])]
+        );
+        assert!(v.accepts_ek_ca(&"22".repeat(32)));
+        assert!(!v.accepts_ek_ca(&"33".repeat(32)));
+        let refused = |f: &dyn Fn(&mut TrustFile)| {
+            let mut t2 = t.clone();
+            f(&mut t2);
+            parse_trust(&to_canonical(&t2).unwrap()).is_err()
+        };
+        // An entry key that is also an operator key (same public key).
+        assert!(refused(&|t| t.entry_keys = vec![tk(&key("entry-x", 31))]));
+        // An entry key id reused by a wrap key.
+        assert!(refused(&|t| t.depot_wrap_keys = vec![wrap("entry-1", 7)]));
+        // Two wrap entries with one key; an all-zero key; bad algorithm.
+        assert!(refused(
+            &|t| t.depot_wrap_keys = vec![wrap("a", 7), wrap("b", 7)]
+        ));
+        assert!(refused(&|t| t.depot_wrap_keys = vec![wrap("a", 0)]));
+        assert!(refused(
+            &|t| t.depot_wrap_keys[0].algorithm = "ed25519".into()
+        ));
+        // Unsorted or malformed EK CA digests.
+        assert!(refused(&|t| t.ek_ca_certs.reverse()));
+        assert!(refused(&|t| t.ek_ca_certs = vec!["zz".into()]));
     }
 }

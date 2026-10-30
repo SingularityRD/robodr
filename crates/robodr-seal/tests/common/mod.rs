@@ -178,6 +178,11 @@ impl SwTpm {
 
     /// Power-cycle: PCRs back to their reset values, NV and keys kept.
     pub fn restart(&mut self) {
+        // An orderly shutdown first: a TPM that loses power without one
+        // counts it against dictionary-attack protection, and a few in a
+        // row lock out the (DA-protected) SRK. `-c`: Shutdown(CLEAR), as
+        // the kernel sends at reboot, so the next start is a TPM Reset.
+        let _ = self.tool("tpm2_shutdown", &["-c"], None);
         let _ = self.child.kill();
         let _ = self.child.wait();
         // The port may linger briefly.

@@ -38,6 +38,17 @@ pub const UWK_PRIV_FILE: &str = "uwk.priv";
 pub const POLICY_FILE: &str = "policy.json";
 pub const VOLUME_WRAP_FILE: &str = "volume.wrap";
 pub const ERASED_FILE: &str = "erased.json";
+/// Sprint 14a: the AK (under the EK) and the unit identity key (under the
+/// SRK), TPM blobs.
+pub const AK_PUB_FILE: &str = "ak.pub";
+pub const AK_PRIV_FILE: &str = "ak.priv";
+pub const UIK_PUB_FILE: &str = "uik.pub";
+pub const UIK_PRIV_FILE: &str = "uik.priv";
+/// Sprint 14a: a unit without a TPM keeps its identity key next to its
+/// fallback UWK (inside the runtime volume).
+pub const FALLBACK_UIK_FILE: &str = "uik.key";
+/// Sprint 14b: the site lease in force.
+pub const LEASE_FILE: &str = "lease.json";
 const MAX_STATE_FILE: usize = 64 * 1024;
 
 /// TPM or software fallback.
@@ -63,6 +74,13 @@ pub struct TpmRecord {
     pub policy_authority_name: String,
     /// The UWK's authPolicy (hex).
     pub auth_policy: String,
+    /// Sprint 14b: the depot lease key (SEC1 P-256, hex) a lease-gated UWK
+    /// is bound to ([`crate::lease`]); absent for a UWK without a lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_key: Option<String>,
+    /// Its TPM name (hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_key_name: Option<String>,
 }
 
 /// The enrolment record (`unit.json`); also what the depot needs to wrap
@@ -108,6 +126,16 @@ impl UnitRecord {
                 parse_handle(s, top)?;
             }
             keys::policy_verify_key(&t.policy_authority)?;
+            match (&t.lease_key, &t.lease_key_name) {
+                (None, None) => {}
+                (Some(k), Some(n)) => {
+                    keys::policy_verify_key(k)?;
+                    if crate::from_hex(n).is_none_or(|b| b.len() != 34) {
+                        return Err(invalid("unit record: bad lease_key_name"));
+                    }
+                }
+                _ => return Err(invalid("unit record: lease_key without its name")),
+            }
         }
         if let Some(k) = &r.fallback_key {
             if !Path::new(k).is_absolute() {
@@ -287,6 +315,7 @@ struct TpmUnwrapper<'a> {
     tpm: &'a Tpm,
     policy: &'a CheckedPolicy,
     work: &'a WorkDir,
+    lease: Option<crate::tpm::LeaseGate<'a>>,
 }
 
 impl Unwrapper for TpmUnwrapper<'_> {
@@ -313,6 +342,7 @@ impl Unwrapper for TpmUnwrapper<'_> {
             &name,
             t.epoch,
             ephemeral,
+            self.lease.as_ref(),
         )
     }
 }
@@ -336,6 +366,20 @@ impl Unit {
         authority: &[u8; 65],
         tpm: Tpm,
     ) -> Result<Self, SealError> {
+        Self::enroll_tpm_with(dir, unit, platform, authority, None, tpm)
+    }
+
+    /// As [`Unit::enroll_tpm`]; with `lease_key` the UWK is lease-gated
+    /// (Sprint 14b, [`crate::lease`]): nothing unseals without a current
+    /// lease signed by that key.
+    pub fn enroll_tpm_with(
+        dir: &Path,
+        unit: &str,
+        platform: &str,
+        authority: &[u8; 65],
+        lease_key: Option<&[u8; 65]>,
+        tpm: Tpm,
+    ) -> Result<Self, SealError> {
         if !robodr_pkg::common::is_label(unit) || !robodr_pkg::common::is_label(platform) {
             return Err(invalid("bad unit or platform label"));
         }
@@ -349,7 +393,14 @@ impl Unit {
         let epoch = tpm.epoch()?;
         let w = tpm.work()?;
         let name = tpm.external_key_name(&w, authority)?;
-        let auth = policy::uwk_auth_policy(&name, platform, tpm.cfg.epoch_nv, epoch);
+        let lease = match lease_key {
+            Some(k) => Some((k, tpm.external_key_name_as(&w, k, "lease")?)),
+            None => None,
+        };
+        let auth = match &lease {
+            Some((_, ln)) => policy::uwk_auth_policy_lease(ln, unit, tpm.cfg.epoch_nv, epoch),
+            None => policy::uwk_auth_policy(&name, platform, tpm.cfg.epoch_nv, epoch),
+        };
         let (pu, pr, point) = tpm.create_uwk(&w, &auth)?;
         write_atomic(dir, UWK_PUB_FILE, &pu)?;
         write_atomic(dir, UWK_PRIV_FILE, &pr)?;
@@ -368,6 +419,8 @@ impl Unit {
                 policy_authority: crate::to_hex(authority),
                 policy_authority_name: crate::to_hex(&name),
                 auth_policy: crate::to_hex(&auth),
+                lease_key: lease.as_ref().map(|(k, _)| crate::to_hex(*k)),
+                lease_key_name: lease.as_ref().map(|(_, n)| crate::to_hex(n)),
             }),
             fallback_key: None,
         };
@@ -616,12 +669,35 @@ impl Unit {
         match self.rec.mode {
             Mode::Tpm => {
                 let pol = self.policy()?;
+                let lease = self.current_lease()?;
+                let t = self.tpm_record()?;
+                let lease_key = match &t.lease_key {
+                    Some(k) => Some(hex65(k)?),
+                    None => None,
+                };
+                let lease_name = match &t.lease_key_name {
+                    Some(n) => crate::from_hex(n).ok_or_else(|| invalid("lease_key_name"))?,
+                    None => Vec::new(),
+                };
+                let authority_name = crate::from_hex(&t.policy_authority_name)
+                    .ok_or_else(|| invalid("unit record: bad authority name"))?;
+                let gate = match (&lease, &lease_key) {
+                    (Some(l), Some(k)) => Some(crate::tpm::LeaseGate {
+                        lease: l,
+                        key: k,
+                        key_name: &lease_name,
+                        approved: l.approved(&authority_name, &self.rec.platform),
+                        policy_ref: policy::lease_ref(&self.rec.unit),
+                    }),
+                    _ => None,
+                };
                 let work = self.tpm()?.work()?;
                 let u = TpmUnwrapper {
                     unit: self,
                     tpm: self.tpm()?,
                     policy: &pol,
                     work: &work,
+                    lease: gate,
                 };
                 wrap::unwrap(&u, w, ctx)
             }
@@ -896,6 +972,225 @@ impl Unit {
         Ok(rep)
     }
 
+    /// Whether the UWK is lease-gated (Sprint 14b).
+    pub fn lease_gated(&self) -> bool {
+        self.rec.tpm.as_ref().is_some_and(|t| t.lease_key.is_some())
+    }
+
+    /// The lease in force (`lease.json`), if any.
+    pub fn lease(&self) -> Result<Option<crate::lease::Lease>, SealError> {
+        match fs::symlink_metadata(self.dir.join(LEASE_FILE)) {
+            Err(_) => Ok(None),
+            Ok(_) => Ok(Some(crate::lease::Lease::parse(&read_small(
+                &self.dir.join(LEASE_FILE),
+            )?)?)),
+        }
+    }
+
+    /// For a lease-gated unit: the lease, checked against the TPM's time
+    /// now ([`ErrorKind::LeaseExpired`] when missing or past). `None` for
+    /// a unit without a lease.
+    pub fn current_lease(&self) -> Result<Option<crate::lease::Lease>, SealError> {
+        if !self.lease_gated() {
+            return Ok(None);
+        }
+        let l = self.lease()?.ok_or_else(|| {
+            SealError::new(
+                ErrorKind::LeaseExpired,
+                "no site lease: this unit's keys unseal only under a current lease from the depot",
+            )
+        })?;
+        l.check_now(&self.tpm()?.read_clock()?)?;
+        Ok(Some(l))
+    }
+
+    /// Install a lease from the depot: signed by the enrolled lease key
+    /// for this unit, and not older than the lease in force (a replayed
+    /// lease never shortens or replaces a newer one).
+    pub fn install_lease(&self, bytes: &[u8]) -> Result<crate::lease::Lease, SealError> {
+        let t = self.tpm_record()?;
+        let key = hex65(
+            t.lease_key
+                .as_deref()
+                .ok_or_else(|| invalid("this unit was enrolled without a lease key"))?,
+        )?;
+        let name = crate::from_hex(&t.policy_authority_name)
+            .ok_or_else(|| invalid("unit record: bad authority name"))?;
+        let l = crate::lease::Lease::parse(bytes)?;
+        l.verify(&key, &self.rec.unit, &name, &self.rec.platform)?;
+        if let Ok(Some(cur)) = self.lease() {
+            if (l.clock_before, l.resets_max, l.lease_seq)
+                < (cur.clock_before, cur.resets_max, cur.lease_seq)
+            {
+                return Err(crate::unauthentic(format!(
+                    "lease {} is older than the lease {} in force (replay)",
+                    l.lease_seq, cur.lease_seq
+                )));
+            }
+        }
+        write_atomic(&self.dir, LEASE_FILE, &l.to_bytes()?)?;
+        Ok(l)
+    }
+
+    /// The TPM's time (TPM units).
+    pub fn tpm_time(&self) -> Result<crate::lease::TpmTime, SealError> {
+        self.tpm()?.read_clock()
+    }
+
+    fn fallback_identity_path(&self) -> Result<PathBuf, SealError> {
+        let k = self
+            .rec
+            .fallback_key
+            .as_deref()
+            .ok_or_else(|| invalid("no fallback key"))?;
+        Ok(Path::new(k)
+            .parent()
+            .ok_or_else(|| invalid("fallback key has no directory"))?
+            .join(FALLBACK_UIK_FILE))
+    }
+
+    /// Create the AK and the unit identity key once (Sprint 14a); their
+    /// public key. Without a TPM the identity key is a file next to the
+    /// fallback UWK (inside the runtime volume).
+    pub fn ensure_identity(&self) -> Result<[u8; 65], SealError> {
+        match self.rec.mode {
+            Mode::Tpm => {
+                let tpm = self.tpm()?;
+                if fs::symlink_metadata(self.dir.join(AK_PRIV_FILE)).is_err() {
+                    let (pu, pr) = tpm.create_ak()?;
+                    write_atomic(&self.dir, AK_PUB_FILE, &pu)?;
+                    write_atomic(&self.dir, AK_PRIV_FILE, &pr)?;
+                }
+                if fs::symlink_metadata(self.dir.join(UIK_PRIV_FILE)).is_err() {
+                    let (pu, pr) = tpm.create_uik()?;
+                    write_atomic(&self.dir, UIK_PUB_FILE, &pu)?;
+                    write_atomic(&self.dir, UIK_PRIV_FILE, &pr)?;
+                }
+                self.identity_public()
+            }
+            Mode::Fallback => {
+                let p = self.fallback_identity_path()?;
+                if fs::symlink_metadata(&p).is_err() {
+                    let pubp = p.with_extension("pub");
+                    keys::policy_generate(&p, &pubp)?;
+                }
+                Ok(keys::policy_load(&p)?.public())
+            }
+        }
+    }
+
+    /// The unit identity key's public key.
+    pub fn identity_public(&self) -> Result<[u8; 65], SealError> {
+        match self.rec.mode {
+            Mode::Tpm => {
+                let b = read_small(&self.dir.join(UIK_PUB_FILE))?;
+                crate::attest::parse_tpm2b_public(&b)?.p256()
+            }
+            Mode::Fallback => Ok(keys::policy_load(&self.fallback_identity_path()?)?.public()),
+        }
+    }
+
+    /// ECDSA P-256 (DER) by the identity key over a SHA-256 digest: the
+    /// TPM signs for a TPM unit.
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>, SealError> {
+        match self.rec.mode {
+            Mode::Tpm => {
+                let pu = read_small(&self.dir.join(UIK_PUB_FILE))?;
+                let pr = read_small(&self.dir.join(UIK_PRIV_FILE))?;
+                self.tpm()?.sign_digest((&pu, &pr), digest)
+            }
+            Mode::Fallback => {
+                keys::policy_load(&self.fallback_identity_path()?)?.sign_digest(digest)
+            }
+        }
+    }
+
+    fn ak_blobs(&self) -> Result<(Vec<u8>, Vec<u8>), SealError> {
+        Ok((
+            read_small(&self.dir.join(AK_PUB_FILE))?,
+            read_small(&self.dir.join(AK_PRIV_FILE))?,
+        ))
+    }
+
+    /// The enrolment request for the depot's `nonce` (Sprint 14a,
+    /// [`crate::enrol`]).
+    pub fn enrol_request(&self, nonce: &[u8; 32]) -> Result<crate::enrol::EnrolRequest, SealError> {
+        use crate::enrol::*;
+        let identity = self.ensure_identity()?;
+        let tpm = match self.rec.mode {
+            Mode::Fallback => None,
+            Mode::Tpm => {
+                let t = self.tpm()?;
+                let (akp, akr) = self.ak_blobs()?;
+                let (up, ur) = self.uwk_blobs()?;
+                let ip = read_small(&self.dir.join(UIK_PUB_FILE))?;
+                let ir = read_small(&self.dir.join(UIK_PRIV_FILE))?;
+                let c = t.certify_with_ak((&akp, &akr), &[("uwk", &up, &ur), ("uik", &ip, &ir)])?;
+                let pol = self.policy()?;
+                let pol_bytes = read_small(&self.dir.join(POLICY_FILE))?;
+                let idx: Vec<u8> = pol.pcrs.iter().map(|(i, _)| *i).collect();
+                let (q, values) = t.quote((&akp, &akr), &idx, nonce)?;
+                let hx = crate::to_hex;
+                let sh = |s: &crate::tpm_ident::Signed| SignedHex {
+                    attest: hx(&s.attest),
+                    sig: hx(&s.sig),
+                };
+                Some(TpmEvidence {
+                    ek_public: hx(&t.ek_public()?),
+                    ek_certificate: t.ek_certificate()?.map(|c| hx(&c)),
+                    ak_public: hx(&akp),
+                    uwk_public_area: hx(&up),
+                    uwk_certify: sh(&c[0]),
+                    uik_public_area: hx(&ip),
+                    uik_certify: sh(&c[1]),
+                    policy: hx(&pol_bytes),
+                    quote: QuoteHex {
+                        attest: hx(&q.attest),
+                        sig: hx(&q.sig),
+                        pcrs: values
+                            .iter()
+                            .map(|(i, v)| policy::PcrValue {
+                                index: *i,
+                                value: hx(v),
+                            })
+                            .collect(),
+                    },
+                })
+            }
+        };
+        Ok(EnrolRequest {
+            format: REQUEST_FORMAT.into(),
+            unit: self.rec.unit.clone(),
+            platform: self.rec.platform.clone(),
+            nonce: crate::to_hex(nonce),
+            record: self.rec.clone(),
+            identity_public: crate::to_hex(&identity),
+            tpm,
+        })
+    }
+
+    /// Answer the depot's credential challenge with this TPM's EK and AK.
+    pub fn enrol_activate(
+        &self,
+        c: &crate::enrol::EnrolChallenge,
+    ) -> Result<crate::enrol::EnrolResponse, SealError> {
+        if c.unit != self.rec.unit {
+            return Err(crate::unauthentic(format!(
+                "challenge for unit {}, this is {}",
+                c.unit, self.rec.unit
+            )));
+        }
+        let cred = crate::from_hex(&c.credential).ok_or_else(|| invalid("credential hex"))?;
+        let (akp, akr) = self.ak_blobs()?;
+        let secret = self.tpm()?.activate((&akp, &akr), &cred)?;
+        Ok(crate::enrol::EnrolResponse {
+            format: crate::enrol::RESPONSE_FORMAT.into(),
+            unit: self.rec.unit.clone(),
+            nonce: c.nonce.clone(),
+            secret: crate::to_hex(&secret),
+        })
+    }
+
     /// Status (reads the TPM for TPM units).
     pub fn status(&self) -> Status {
         let tpm_rec = self.rec.tpm.as_ref();
@@ -998,6 +1293,8 @@ mod tests {
                 policy_authority: String::new(),
                 policy_authority_name: String::new(),
                 auth_policy: String::new(),
+                lease_key: None,
+                lease_key_name: None,
             }),
             fallback_key: None,
         };
