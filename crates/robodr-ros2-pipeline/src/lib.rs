@@ -103,6 +103,7 @@ pub mod sanitize;
 pub mod socket;
 pub mod source;
 pub mod watch;
+pub mod webrtc;
 
 pub use binding::{BindingOptions, BindingStats, BindingTable, Ingress, QuarantineTarget, Rank};
 pub use config::{

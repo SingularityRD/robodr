@@ -803,6 +803,11 @@ pub struct GatewayConfig {
     /// Default: none (no restriction can be applied).
     #[serde(default)]
     pub restriction_path: Option<PathBuf>,
+    /// Go2 WebRTC sessions (`crate::webrtc`): detection from NFLOG copies,
+    /// optional refusal of unlisted signalling, quarantine sets. Default:
+    /// none.
+    #[serde(default)]
+    pub webrtc: Option<crate::webrtc::WebRtcConfig>,
 }
 
 fn default_max_queue_delay() -> u64 {
@@ -855,6 +860,25 @@ impl GatewayConfig {
             return Err("channels: at least one channel is required".into());
         }
         self.profile_trust.validate()?;
+        if let Some(w) = &self.webrtc {
+            w.monitor_options()?;
+            if !self.observe.enabled {
+                return Err(
+                    "webrtc needs observe.enabled (the robot side of a session comes from the \
+                     observe copies)"
+                        .into(),
+                );
+            }
+            if w.nflog_group == self.observe.nflog_group {
+                return Err("webrtc.nflog_group must differ from observe.nflog_group".into());
+            }
+            let legacy = self.legacy_ports();
+            for p in &w.signalling_ports {
+                if legacy.contains(p) {
+                    return Err(format!("webrtc.signalling_ports: {p} is a legacy UDP port"));
+                }
+            }
+        }
         for (what, p) in [("profile", &self.profile), ("firewall", &self.firewall)] {
             if !p.is_absolute() {
                 return Err(format!("{what} must be an absolute path"));

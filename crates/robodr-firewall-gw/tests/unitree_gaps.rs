@@ -439,3 +439,117 @@ fn a2_channel_enforces_like_unitree_go_lowcmd_and_rejects_aliases() {
     assert_ne!(v, Verdict::Accept);
     assert!(gw.stats.undecidable >= 1, "the hg frame is undecidable");
 }
+
+// ------------------------------------------------------------- Go2 WebRTC
+
+fn webrtc_gateway(extra: &str) -> Gateway {
+    let mut v: serde_json::Value = serde_json::from_str(&format!(
+        r#"{{"action":"block_unlisted","controllers":[{{"ip":"{CONTROLLER_IP}"}}]{extra}}}"#
+    ))
+    .unwrap();
+    let mut c = gateway_config(Fixture::Go2);
+    c.webrtc = Some(serde_json::from_value(v.take()).unwrap());
+    c.validate().unwrap();
+    Gateway::new(&c, &profile(Fixture::Go2), &firewall(Fixture::Go2)).unwrap()
+}
+
+fn stun_binding() -> Vec<u8> {
+    // Binding request, USERNAME "a:b", no FINGERPRINT.
+    let mut m = vec![0x00, 0x01, 0x00, 0x08, 0x21, 0x12, 0xA4, 0x42];
+    m.extend_from_slice(&[9; 12]);
+    m.extend_from_slice(&[0x00, 0x06, 0x00, 0x03, b'a', b':', b'b', 0]);
+    m
+}
+
+fn dtls_hello(kind: u8) -> Vec<u8> {
+    let mut r = vec![22, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0, 4, kind, 0, 0, 0];
+    r.truncate(17);
+    r
+}
+
+#[test]
+fn webrtc_sessions_are_detected_from_the_copies_and_never_touched() {
+    use robodr_firewall_gw::ip::build_ipv4_udp;
+    let mut gw = webrtc_gateway("");
+    let t = 1_000 * MS;
+    let wall = 1_793_188_800_000_000_000u64;
+    let peer = ATTACKER_IP;
+    let inb = |p: &[u8]| build_ipv4_udp(peer, ROBOT_IP, 50_000, 40_000, p);
+    let outb = |p: &[u8]| build_ipv4_udp(ROBOT_IP, peer, 40_000, 50_000, p);
+    gw.observe_webrtc(&inb(&stun_binding()), t, wall);
+    gw.observe_webrtc(&inb(&dtls_hello(1)), t + MS, wall);
+    gw.observe_webrtc(&outb(&dtls_hello(2)), t + 2 * MS, wall);
+    let f = gw.drain_webrtc();
+    let rules: Vec<(&str, robodr_events::Severity)> =
+        f.iter().map(|d| (d.rule_str(), d.severity)).collect();
+    assert!(
+        rules.contains(&(
+            "robot.unitree.webrtc_unknown_controller",
+            robodr_events::Severity::Critical
+        )),
+        "{rules:?}"
+    );
+    assert!(
+        rules.contains(&(
+            "robot.unitree.webrtc_media_without_signalling",
+            robodr_events::Severity::Medium
+        )),
+        "{rules:?}"
+    );
+    let crit = f
+        .iter()
+        .find(|d| d.severity == robodr_events::Severity::Critical)
+        .unwrap();
+    assert!(
+        crit.detail
+            .contains("192.168.123.99:50000 <-> 192.168.123.161:40000"),
+        "{}",
+        crit.detail
+    );
+    assert!(gw.drain_webrtc().is_empty());
+    let s = gw.webrtc().unwrap().session(&peer.into()).unwrap();
+    assert_eq!(s.flows.len(), 1);
+    // The listed controller: quiet.
+    let ok = build_ipv4_udp(CONTROLLER_IP, ROBOT_IP, 50_001, 40_001, &stun_binding());
+    gw.observe_webrtc(&ok, t + 3 * MS, wall);
+    assert!(gw.drain_webrtc().is_empty());
+    // Not configured: nothing tracked.
+    let mut plain = gateway(Fixture::Go2);
+    plain.observe_webrtc(&inb(&stun_binding()), t, wall);
+    assert!(plain.webrtc().is_none() && plain.drain_webrtc().is_empty());
+}
+
+#[test]
+fn webrtc_block_targets_are_strict() {
+    use robodr_firewall_gw::webrtc::BlockTarget;
+    let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let t = BlockTarget::parse_args(&a(&[
+        "--peer",
+        "192.168.123.99",
+        "--flow",
+        "50000,192.168.123.161,40000",
+        "--timeout-s",
+        "60",
+    ]))
+    .unwrap();
+    assert_eq!(
+        t.nft_argv().join(" "),
+        "nft add element bridge robodr_gw_rtc blocked_flows { 192.168.123.99 . 50000 . 192.168.123.161 . 40000 timeout 60s }"
+    );
+    let p = BlockTarget::parse_args(&a(&["--peer", "10.0.0.9"])).unwrap();
+    assert_eq!(
+        p.nft_argv().join(" "),
+        "nft add element bridge robodr_gw_rtc blocked_peers { 10.0.0.9 timeout 600s }"
+    );
+    for bad in [
+        &["--peer", "10.0.0.9; reboot"][..],
+        &["--peer", "10.0.0.9", "--flow", "1,2,3"],
+        &["--peer", "10.0.0.9", "--flow", "0,10.0.0.1,3"],
+        &["--peer", "10.0.0.9", "--timeout-s", "0"],
+        &["--flow", "1,10.0.0.1,3"],
+        &["--peer"],
+        &["--bogus", "x"],
+    ] {
+        assert!(BlockTarget::parse_args(&a(bad)).is_err(), "{bad:?}");
+    }
+}

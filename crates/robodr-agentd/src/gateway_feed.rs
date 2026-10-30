@@ -80,7 +80,9 @@ impl GatewayLine {
 }
 
 fn rule_ok(r: &str) -> bool {
-    (r.starts_with("robot.gateway.") || r.starts_with("robot.firewall."))
+    (r.starts_with("robot.gateway.")
+        || r.starts_with("robot.firewall.")
+        || r.starts_with("robot.unitree.webrtc_"))
         && r.len() <= MAX_RULE
         && r.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
@@ -94,7 +96,9 @@ pub fn parse_gateway_line(t: &str) -> Result<Payload, String> {
         return Err(format!("format must be {FORMAT}"));
     }
     if !rule_ok(&l.rule) {
-        return Err("rule must be a robot.gateway.* or robot.firewall.* id".into());
+        return Err(
+            "rule must be a robot.gateway.*, robot.firewall.* or robot.unitree.webrtc_* id".into(),
+        );
     }
     if l.detail.chars().count() > MAX_DETAIL
         || l.channel.as_deref().is_some_and(|c| {

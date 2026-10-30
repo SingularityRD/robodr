@@ -391,6 +391,10 @@ pub struct Gateway {
     /// Robot-side observation (NFLOG copies): `rt/lowstate` and the
     /// robot's discovery (see [`Gateway::observe`]).
     observer: crate::observe::Observer,
+    /// Go2 WebRTC sessions (`crate::webrtc`), when configured.
+    webrtc: Option<robodr_ros2_pipeline::webrtc::WebRtcMonitor>,
+    /// Its findings since the last drain (bounded).
+    webrtc_out: Vec<robodr_events::Deviation>,
     pub stats: GatewayStats,
     /// The gateway's own findings (`crate::findings`), drained at
     /// housekeeping.
@@ -718,6 +722,13 @@ impl Gateway {
             scratch: Vec::with_capacity(65_536),
             max_queue_delay_ns: cfg.max_queue_delay_ns,
             observer: crate::observe::Observer::new(cfg),
+            webrtc: match &cfg.webrtc {
+                Some(w) => Some(robodr_ros2_pipeline::webrtc::WebRtcMonitor::new(
+                    w.monitor_options()?,
+                )),
+                None => None,
+            },
+            webrtc_out: Vec::new(),
             stats: GatewayStats::default(),
             findings: GatewayFindings::default(),
             restriction: None,
@@ -868,6 +879,47 @@ impl Gateway {
         }
         let n = self.observer.lowstate(d, meta.now_ns);
         self.stats.lowstate_samples += n;
+    }
+
+    /// Feed one NFLOG copy (either side) to the WebRTC monitor
+    /// (`crate::webrtc`). `mono_ns` is the decision clock, `wall_ns` Unix
+    /// time (deny windows). Never changes or drops anything.
+    pub fn observe_webrtc(&mut self, pkt: &[u8], mono_ns: u64, wall_ns: u64) {
+        use robodr_ros2_pipeline::webrtc::{decode_ipv4, FlowPacket};
+        let Some(m) = self.webrtc.as_mut() else {
+            return;
+        };
+        let Some((l4, src, src_port, dst, dst_port, payload)) = decode_ipv4(pkt) else {
+            return;
+        };
+        let found = m.process(&FlowPacket {
+            wall_ns,
+            mono_ns,
+            l4,
+            src: src.into(),
+            src_port,
+            dst: dst.into(),
+            dst_port,
+            src_mac: None,
+            payload,
+        });
+        for d in found {
+            if self.webrtc_out.len() < crate::findings::MAX_SLOTS {
+                self.webrtc_out.push(d);
+            } else {
+                self.findings.dropped += 1;
+            }
+        }
+    }
+
+    /// The WebRTC findings since the last call (`robot.unitree.webrtc_*`).
+    pub fn drain_webrtc(&mut self) -> Vec<robodr_events::Deviation> {
+        std::mem::take(&mut self.webrtc_out)
+    }
+
+    /// The WebRTC monitor (status, tests).
+    pub fn webrtc(&self) -> Option<&robodr_ros2_pipeline::webrtc::WebRtcMonitor> {
+        self.webrtc.as_ref()
     }
 
     /// The robot-side observer (status, tests).

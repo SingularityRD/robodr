@@ -166,6 +166,51 @@ pub fn render(cfg: &GatewayConfig, source: &str) -> String {
              $IPT -D FORWARD -m physdev --physdev-in \"$ROBOT\" -j ROBODR_GW_OBS 2>/dev/null || true\n",
         );
     }
+    if let Some(w) = &cfg.webrtc {
+        s.push_str(
+            "\n# 6. Go2 WebRTC (`webrtc`): controller-side signalling and unqueued UDP to\n\
+             #    the robot copied to NFLOG (never queued, never dropped); robot-side\n\
+             #    signalling answers copied too; quarantine sets and, with\n\
+             #    block_unlisted, unlisted signalling dropped in the bridge.\n\
+             $IPT -N ROBODR_GW_RTC 2>/dev/null || true\n$IPT -F ROBODR_GW_RTC\n",
+        );
+        let g = w.nflog_group;
+        let nflog = format!("-j NFLOG --nflog-group {g} --nflog-size 65535 --nflog-threshold 1");
+        for ip in w.robots().unwrap_or_default() {
+            for p in &w.signalling_ports {
+                s.push_str(&format!(
+                    "$IPT -A ROBODR_GW_RTC -p tcp -d {ip} --dport {p} {nflog}\n"
+                ));
+                s.push_str(&format!(
+                    "$IPT -A ROBODR_GW_OBS -p tcp -s {ip} --sport {p} {nflog}\n"
+                ));
+            }
+        }
+        for (lo, hi) in cfg.rtps_port_ranges() {
+            s.push_str(&format!(
+                "$IPT -A ROBODR_GW_RTC -p udp --dport {lo}:{hi} -j RETURN\n"
+            ));
+        }
+        for p in cfg.legacy_ports() {
+            s.push_str(&format!(
+                "$IPT -A ROBODR_GW_RTC -p udp --dport {p} -j RETURN\n"
+            ));
+        }
+        for ip in w.robots().unwrap_or_default() {
+            s.push_str(&format!("$IPT -A ROBODR_GW_RTC -p udp -d {ip} {nflog}\n"));
+        }
+        s.push_str(
+            "$IPT -C FORWARD -m physdev --physdev-in \"$CTRL\" -j ROBODR_GW_RTC 2>/dev/null ||\n\
+             \x20 $IPT -I FORWARD 1 -m physdev --physdev-in \"$CTRL\" -j ROBODR_GW_RTC\n",
+        );
+        s.push_str(&crate::webrtc::render_nft(w));
+    } else {
+        s.push_str(
+            "\n# 6. webrtc not configured: no WebRTC copies, no quarantine table.\n\
+             $IPT -D FORWARD -m physdev --physdev-in \"$CTRL\" -j ROBODR_GW_RTC 2>/dev/null || true\n\
+             nft delete table bridge robodr_gw_rtc 2>/dev/null || true\n",
+        );
+    }
     s
 }
 
@@ -234,5 +279,64 @@ mod tests {
         let s = render(&c, "test.json");
         assert!(s.contains("--queue-num 7 --queue-bypass\n"));
         assert!(s.contains("UNCHECKED"));
+    }
+
+    #[test]
+    fn renders_the_webrtc_section() {
+        let base = r#"{"mode":"enforce","profile":"/p","firewall":"/f",
+                "queue":{"num":7,"controller_port":"c0","robot_port":"r0"},
+                "rtps":{"domain_ids":[0]},
+                "channels":[{"firewall_channel":"/lowcmd","codec":"unitree_go_lowcmd"}]"#;
+        let c = GatewayConfig::from_json(&format!(
+            "{base},\"webrtc\":{{\"action\":\"block_unlisted\",\"controllers\":[{{\"ip\":\"192.168.123.20\"}}]}}}}"
+        ))
+        .unwrap();
+        c.validate().unwrap();
+        let s = render(&c, "t");
+        assert!(s.contains(
+            "-A ROBODR_GW_RTC -p tcp -d 192.168.123.161 --dport 9991 -j NFLOG --nflog-group 4175"
+        ));
+        assert!(s.contains("-A ROBODR_GW_OBS -p tcp -s 192.168.123.161 --sport 8081 -j NFLOG"));
+        // Queued DDS ports are not copied a second time.
+        let ret = s.find("--dport 7400:7649 -j RETURN").unwrap();
+        let copy = s
+            .find("-A ROBODR_GW_RTC -p udp -d 192.168.123.161")
+            .unwrap();
+        assert!(ret < copy);
+        assert!(s.contains("set blocked_flows { type ipv4_addr . inet_service . ipv4_addr . inet_service; flags timeout; }"));
+        assert!(s.contains(
+            "iifname \"$CTRL\" ip daddr { 192.168.123.161 } tcp dport { 8081, 9991 } ip saddr != { 192.168.123.20 } counter drop"
+        ));
+        // The copy chain never drops or queues.
+        assert!(s
+            .lines()
+            .filter(|l| l.contains("ROBODR_GW_RTC") && l.contains("-A "))
+            .all(|l| !l.contains("DROP") && !l.contains("NFQUEUE")));
+        // Observe only: no signalling drop, quarantine sets still there.
+        let o = GatewayConfig::from_json(&format!("{base},\"webrtc\":{{}}}}")).unwrap();
+        o.validate().unwrap();
+        let s = render(&o, "t");
+        assert!(!s.contains("tcp dport {"));
+        assert!(s.contains("@blocked_peers"));
+        // Without the section the table is removed.
+        let n = GatewayConfig::from_json(&format!("{base}}}")).unwrap();
+        assert!(render(&n, "t").contains("nft delete table bridge robodr_gw_rtc"));
+        // Refusals.
+        for bad in [
+            r#""webrtc":{"action":"block_unlisted"}"#,
+            r#""webrtc":{"nflog_group":4174}"#,
+            r#""webrtc":{"controllers":[{"ip":"192.168.123.161"}]}"#,
+            r#""webrtc":{"controllers":[{"ip":"x"}]}"#,
+            r#""webrtc":{"deny_windows":["25:00-01:00"]}"#,
+            r#""webrtc":{"signalling_ports":[]}"#,
+            r#""webrtc":{"max_sessions":0}"#,
+            r#""webrtc":{"controllers":[{"ip":"10.0.0.1","mac":"zz"}]}"#,
+        ] {
+            let r = GatewayConfig::from_json(&format!("{base},{bad}}}")).and_then(|c| c.validate());
+            assert!(r.is_err(), "{bad}");
+        }
+        let mut off = o.clone();
+        off.observe.enabled = false;
+        assert!(off.validate().is_err());
     }
 }
