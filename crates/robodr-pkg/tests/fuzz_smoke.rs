@@ -20,6 +20,8 @@
 mod pkg_bundle;
 #[path = "../../../fuzz/harness/pkg_deployment.rs"]
 mod pkg_deployment;
+#[path = "../../../fuzz/harness/pkg_entry.rs"]
+mod pkg_entry;
 #[path = "../../../fuzz/harness/pkg_parity.rs"]
 mod pkg_parity;
 #[path = "../../../fuzz/harness/pkg_rpk.rs"]
@@ -35,12 +37,13 @@ const SITE: &str = "site-f";
 
 type Seeds = fn() -> Vec<(&'static str, Vec<u8>)>;
 
-const TARGETS: [(&str, Seeds); 5] = [
+const TARGETS: [(&str, Seeds); 6] = [
     ("pkg_rpk", pkg_rpk::seeds),
     ("pkg_bundle", pkg_bundle::seeds),
     ("pkg_deployment", pkg_deployment::seeds),
     ("pkg_trust", pkg_trust::seeds),
     ("pkg_parity", pkg_parity::seeds),
+    ("pkg_entry", pkg_entry::seeds),
 ];
 
 #[test]
@@ -113,6 +116,16 @@ fn seeds_take_the_success_paths() {
     for d in smoke::corpus(DIR, "pkg_parity") {
         pkg_parity::run(&d);
     }
+    // Sprint 14a: the signed entry report verifies; the wire seeds parse.
+    let e = smoke::corpus(DIR, "pkg_entry");
+    let rep = e.iter().find(|d| d[0] == 0).unwrap();
+    let p = parts(&rep[1..]);
+    robodr_pkg::entry::verify_entry_report(p[0], p[1], &t, &pkg_entry::bundle(), now).unwrap();
+    assert!(e
+        .iter()
+        .filter(|d| d[0] == 2)
+        .all(|d| robodr_pkg::wire::parse_request(&d[1..]).is_ok()));
+    assert!(robodr_pkg::wire::parse_listing(&e.iter().find(|d| d[0] == 1).unwrap()[1..]).is_ok());
 }
 
 fn pkg_rpk_trust() -> robodr_pkg::trust::VerifiedTrust {
@@ -165,4 +178,10 @@ fn pkg_trust_smoke() {
 fn pkg_parity_smoke() {
     let seeds = smoke::corpus(DIR, "pkg_parity");
     smoke::run("pkg_parity", &seeds, 0x9e6_0005, &pkg_parity::run);
+}
+
+#[test]
+fn pkg_entry_smoke() {
+    let seeds = smoke::corpus(DIR, "pkg_entry");
+    smoke::run("pkg_entry", &seeds, 0x9e6_0006, &pkg_entry::run);
 }

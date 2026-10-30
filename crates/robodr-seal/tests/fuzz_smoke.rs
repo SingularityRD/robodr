@@ -9,6 +9,8 @@
 //! ephemeral key per wrap), so `seeds_take_the_success_paths` checks what
 //! the committed seeds reach rather than their bytes.
 
+#[path = "../../../fuzz/harness/seal_attest.rs"]
+mod seal_attest;
 #[path = "../../../fuzz/harness/seal_policy.rs"]
 mod seal_policy;
 #[path = "../../../fuzz/harness/seal_wrap.rs"]
@@ -20,9 +22,10 @@ const DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 type Seeds = fn() -> Vec<(&'static str, Vec<u8>)>;
 
-const TARGETS: [(&str, Seeds); 2] = [
+const TARGETS: [(&str, Seeds); 3] = [
     ("seal_policy", seal_policy::seeds),
     ("seal_wrap", seal_wrap::seeds),
+    ("seal_attest", seal_attest::seeds),
 ];
 
 #[test]
@@ -100,4 +103,40 @@ fn seal_policy_smoke() {
 fn seal_wrap_smoke() {
     let seeds = smoke::corpus(DIR, "seal_wrap");
     smoke::run("seal_wrap", &seeds, 0x5ea1_0002, &seal_wrap::run);
+}
+
+#[test]
+fn seal_attest_seeds_take_the_success_paths() {
+    let s = smoke::corpus(DIR, "seal_attest");
+    assert_eq!(s.len(), 5);
+    let by = |sel: u8| s.iter().find(|d| d[0] == sel).unwrap()[1..].to_vec();
+    robodr_seal::attest::parse_tpm2b_public(&by(0)).unwrap();
+    robodr_seal::attest::parse_attest(&by(1)).unwrap();
+    let r = robodr_seal::enrol::parse_request(&by(2)).unwrap();
+    let auth = seal_attest::authority().public();
+    robodr_seal::enrol::verify_request(
+        &r,
+        &robodr_seal::enrol::Expect {
+            authority: &auth,
+            lease_key: None,
+            nonce: &seal_attest::NONCE,
+        },
+    )
+    .unwrap();
+    let l = robodr_seal::lease::Lease::parse(&by(3)).unwrap();
+    let name = robodr_seal::policy::external_p256_name(&auth);
+    l.verify(
+        &seal_attest::lease_key().public(),
+        seal_attest::UNIT,
+        &name,
+        seal_attest::PLATFORM,
+    )
+    .unwrap();
+    robodr_seal::report::verify(&by(4), &seal_attest::identity().public()).unwrap();
+}
+
+#[test]
+fn seal_attest_smoke() {
+    let seeds = smoke::corpus(DIR, "seal_attest");
+    smoke::run("seal_attest", &seeds, 0x5ea1_0003, &seal_attest::run);
 }

@@ -280,3 +280,17 @@ path = "fuzz_targets/seal_wrap.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pkg_entry"
+path = "fuzz_targets/pkg_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seal_attest"
+path = "fuzz_targets/seal_attest.rs"
+test = false
+doc = false
+bench = false
