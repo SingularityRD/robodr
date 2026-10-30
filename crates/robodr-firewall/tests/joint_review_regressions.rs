@@ -277,7 +277,7 @@ fn f3_pd_torque_demand_is_bounded() {
 }
 
 #[test]
-fn f3_reference_is_cleared_by_damping_and_by_a_kp_zero_slot() {
+fn f3_reference_is_cleared_by_damping_not_by_a_kp_zero_slot() {
     let mut f = stepped(Some(0.1), None);
     assert!(f.fw.check_joint(&q_at(&f, T, 0.0), T).is_passed());
     // A CRC failure: the quadruped damps; the old target is no longer in force.
@@ -289,13 +289,72 @@ fn f3_reference_is_cleared_by_damping_and_by_a_kp_zero_slot() {
         .fw
         .check_joint(&q_at(&f, T + 2 * MS, 0.9), T + 2 * MS)
         .is_passed());
-    // A kp = 0 slot holds no position: no reference for the next frame.
-    let free = f.with_slot(T + 3 * MS, 0, MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, 1.0));
-    assert!(f.fw.check_joint(&free, T + 3 * MS).is_passed());
+    // A kp = 0 slot holds no position, but the reference stays (gateway
+    // review, finding 5: alternating kp = 0 frames used to clear it, so
+    // every other frame could jump anywhere in the range). A holding
+    // platform, so a rejection does not damp (which would clear it).
+    let mut f = stepped_on(holding_qp(), Some(0.1), None);
+    assert!(f.fw.check_joint(&q_at(&f, T, 0.0), T).is_passed());
+    let free = |f: &JFx, t| f.with_slot(t, 0, MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, 1.0));
+    assert!(f.fw.check_joint(&free(&f, T + MS), T + MS).is_passed());
+    let v = f.fw.check_joint(&q_at(&f, T + 2 * MS, -0.9), T + 2 * MS);
+    assert_eq!(reason(&v), RejectReason::JointStepOutOfEnvelope);
+    // It expires by time (`step_reference_ttl_ns`, default 500 ms after the
+    // frame that set it, at T).
     assert!(f
         .fw
-        .check_joint(&q_at(&f, T + 4 * MS, -0.9), T + 4 * MS)
+        .check_joint(&free(&f, T + 400 * MS), T + 400 * MS)
         .is_passed());
+    assert_eq!(
+        reason(
+            &f.fw
+                .check_joint(&q_at(&f, T + 450 * MS, -0.9), T + 450 * MS)
+        ),
+        RejectReason::JointStepOutOfEnvelope
+    );
+    assert!(f
+        .fw
+        .check_joint(&free(&f, T + 501 * MS), T + 501 * MS)
+        .is_passed());
+    assert!(f
+        .fw
+        .check_joint(&q_at(&f, T + 502 * MS, -0.9), T + 502 * MS)
+        .is_passed());
+}
+
+/// Gateway review, finding 5: the attack. Every other frame sets the slot
+/// to `kp = 0`; each position frame between them jumps by the largest step
+/// it can. Before the fix every jump was decided without a step bound.
+#[test]
+fn gw5_alternating_kp_zero_frames_do_not_lift_the_step_bound() {
+    let mut f = stepped_on(holding_qp(), Some(0.1), None);
+    assert!(f.fw.check_joint(&q_at(&f, T, 0.0), T).is_passed());
+    let mut target = 0.0;
+    let mut now = T;
+    for k in 0..20 {
+        now += MS;
+        let free = f.with_slot(now, 0, MotorCmd::enabled(0.0, 0.0, 0.0, 0.0, 1.0));
+        assert!(f.fw.check_joint(&free, now).is_passed());
+        now += MS;
+        // A far jump (hard reject: hold) or one within the hard factor
+        // (limited to one step).
+        let want = if k % 2 == 0 { 0.9 } else { target + 0.15 };
+        let v = f.fw.check_joint(&q_at(&f, now, want), now);
+        // Never more than one step from the previous position target.
+        // (A hold re-emits the last accepted frame: the kp = 0 one.)
+        if let Some(m) = v
+            .output()
+            .and_then(|o| o.frame.motor(0))
+            .filter(|m| m.kp > 0.0)
+        {
+            assert!(
+                (m.q - target).abs() <= 0.1 + 1e-9,
+                "k {k}: {} from {target}",
+                m.q
+            );
+            target = m.q;
+        }
+    }
 }
 
 #[test]

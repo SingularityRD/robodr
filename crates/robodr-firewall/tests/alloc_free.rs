@@ -316,19 +316,19 @@ fn exercise_joint(f: &mut JFx, rounds: u64) -> (usize, [bool; 64]) {
                 false,
                 17,
             ), // kind
-            // Step bounds. `free` (slot 0 holding no position) clears the
-            // slot's previous target whatever happened before (a damping
-            // substitute also clears it); the nominal frame then sets it to
-            // 0.2.
+            // Step bounds. `free` (slot 0 holding no position) keeps the
+            // slot's previous target (gateway review, finding 5: it expires
+            // by time only; a damping substitute clears it); the nominal
+            // frame then sets it to 0.2.
             (pin(f.with_slot(s, 0, free)), false, 18), // reset
             (pin(f.nominal(s)), false, 19),            // q_prev = 0.2
             (pin(f.with_slot(s, 0, stepped)), false, 20), // step / PD clamp
             (pin(f.with_slot(s, 0, pd_far)), false, 21), // PD reject
-            (pin(f.with_slot(s, 0, free)), false, 22), // reset
+            (pin(f.with_slot(s, 0, free)), false, 22), // keeps the reference
             (pin(f.nominal(s)), false, 23),            // q_prev = 0.2
             (pin(f.with_slot(s, 0, jump)), false, 24), // step reject
-            (pin(f.with_slot(s, 0, free)), false, 25), // reset
-            (pin(f.with_slot(s, 0, q_clamp)), false, 26), // q clamp, no step
+            (pin(f.with_slot(s, 0, free)), false, 25), // keeps the reference
+            (pin(f.with_slot(s, 0, q_clamp)), false, 26), // q clamp, reference expired (tight)
             (pin(f.with_slot(s, 0, free)), false, 27), // reset
             (pin(f.nominal(s)), false, 28),            // q_prev = 0.2
         ];
@@ -402,6 +402,11 @@ fn check_joint_never_allocates() {
                 if tight {
                     m.max_dq_step = Some(0.05);
                     m.tau_pd_max = Some(3.0);
+                    // The step reference expires 2.5 emission steps after
+                    // its frame (a kp = 0 frame no longer clears it): the
+                    // q-clamp row, 3 steps after the last reference, is
+                    // then decided on the range alone.
+                    s.step_reference_ttl_ns = 5 * STEP_NS / 2;
                 } else {
                     m.kp_min = 5.0;
                 }

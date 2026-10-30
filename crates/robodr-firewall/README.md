@@ -245,10 +245,15 @@ channels and `check` are unchanged.
     stands in for `q_meas`; the real tracking torque can be larger).
   - `allow_limp` (default `false`): humanoid only, see below.
 
-  There is no `q_prev` on the first frame, after a damping substitute (the
-  motors were released) or after a frame in which the slot held no position
-  (`kp = 0` or mode off); then only the absolute range applies. Like `q`
-  itself, the step bounds act only while `kp > 0`.
+  `q_prev` is the target of the last accepted frame in which the slot held
+  a position. A frame in which it holds none (`kp = 0` or mode off) keeps
+  it: it expires by **time**, `step_reference_ttl_ns` (default 500 ms, at
+  most 10 s) after that frame, not by frame (gateway review, finding 5:
+  alternating `kp = 0` frames used to clear it, lifting the step bound on
+  every other frame). There is no `q_prev` on the first frame, after a
+  damping substitute (the motors were released) or once it expired; then
+  only the absolute range applies. Like `q` itself, the step bounds act
+  only while `kp > 0`.
 - `require_crc` (default `true`), `rate { expected_hz, min_interval_ns,
   max_interval_ns }` (**required**; `0 < min ≤ period ≤ max`; `min_interval_ns`
   also bounds how often substitutes are emitted), `max_age_ns` (staleness

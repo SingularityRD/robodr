@@ -248,6 +248,14 @@ pub struct JointChannelSpec {
     /// `allow_limp`, `max_dq_step`, hold-only substitutes) still applies.
     /// The gateway accepts `false` only on its hand codecs.
     pub balance_critical: bool,
+    /// How long a slot's last position target (`q_prev`) stays the step
+    /// reference (`max_dq_step`, `tau_pd_max`) after the last accepted
+    /// frame in which the slot held a position, ns. Frames in which the slot
+    /// holds no position (`kp = 0`) do **not** clear it (they used to, so
+    /// alternating `kp = 0` frames removed the step bound); only time does.
+    /// `1..=MAX_TIME_WINDOW_NS`, default 500 ms (the twist channels'
+    /// `state_reset_after_ns`).
+    pub step_reference_ttl_ns: u64,
 }
 
 impl Default for JointChannelSpec {
@@ -264,6 +272,7 @@ impl Default for JointChannelSpec {
             pinned_mode_pr: None,
             pinned_mode_machine: None,
             balance_critical: true,
+            step_reference_ttl_ns: 500_000_000,
         }
     }
 }
@@ -311,6 +320,8 @@ pub(crate) struct CompiledJointChannel {
     pub any_enabled: bool,
     pub pinned_mode_pr: Option<u8>,
     pub pinned_mode_machine: Option<u8>,
+    /// See [`JointChannelSpec::step_reference_ttl_ns`].
+    pub step_reference_ttl_ns: u64,
 }
 
 fn motor_err(channel: &str, slot: usize, field: &'static str, why: &'static str) -> ConfigError {
@@ -503,6 +514,12 @@ pub(crate) fn compile_joint_channel(
             field: "max_age_ns",
         });
     }
+    if spec.step_reference_ttl_ns == 0 || spec.step_reference_ttl_ns > MAX_TIME_WINDOW_NS {
+        return Err(ConfigError::InvalidTiming {
+            channel: name.to_string(),
+            field: "step_reference_ttl_ns",
+        });
+    }
     for (field, v) in [
         ("max_age_ns", spec.max_age_ns),
         ("max_future_ns", spec.max_future_ns),
@@ -566,6 +583,7 @@ pub(crate) fn compile_joint_channel(
         any_enabled: motors.iter().any(|m| m.enabled),
         pinned_mode_pr: spec.pinned_mode_pr,
         pinned_mode_machine: spec.pinned_mode_machine,
+        step_reference_ttl_ns: spec.step_reference_ttl_ns,
     })
 }
 

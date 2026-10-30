@@ -161,11 +161,31 @@ fn ref_all_limp(f: &JointFrame, lims: &[Lim]) -> bool {
 }
 
 /// The modelled previous position targets after `out` was accepted.
-fn next_q_prev(out: &JointFrame) -> [f64; MAX_MOTORS] {
-    let mut q = [NO_Q; MAX_MOTORS];
-    for (dst, m) in q.iter_mut().zip(out.motors()) {
+/// The step reference's lifetime (`JointChannelSpec` default).
+const STEP_TTL: u64 = 500_000_000;
+
+/// Record the targets of the slots that hold a position in an accepted
+/// output; the others keep theirs (it expires by time: [`step_ref`]).
+fn next_q_prev(
+    out: &JointFrame,
+    at: u64,
+    store: &mut [f64; MAX_MOTORS],
+    when: &mut [u64; MAX_MOTORS],
+) {
+    for ((dst, t), m) in store.iter_mut().zip(when.iter_mut()).zip(out.motors()) {
         if m.mode == MotorMode::Enabled && m.kp > 0.0 {
             *dst = m.q;
+            *t = at;
+        }
+    }
+}
+
+/// The step reference in force at `at`.
+fn step_ref(store: &[f64; MAX_MOTORS], when: &[u64; MAX_MOTORS], at: u64) -> [f64; MAX_MOTORS] {
+    let mut q = [NO_Q; MAX_MOTORS];
+    for ((dst, v), t) in q.iter_mut().zip(store).zip(when) {
+        if at.saturating_sub(*t) <= STEP_TTL {
+            *dst = *v;
         }
     }
     q
@@ -422,7 +442,8 @@ fn run(seed: u64, locked: bool) -> [u64; 6] {
     let mut now = T0;
     let mut last_stamp = T0;
     let mut last_out: Option<(JointFrame, u64)> = None;
-    let mut q_prev = [NO_Q; MAX_MOTORS];
+    let mut q_store = [NO_Q; MAX_MOTORS];
+    let mut q_when = [0u64; MAX_MOTORS];
     let mut counts = [0u64; 6];
     for step in 0..STEPS {
         now += match r.below(100) {
@@ -443,6 +464,7 @@ fn run(seed: u64, locked: bool) -> [u64; 6] {
         };
         let cmd = JointCommand::new(src, low, stamp, rand_frame(&mut r, &s.lims));
         let at = if r.chance(0.002) { now - 1 } else { now }; // clock regression
+        let q_prev = step_ref(&q_store, &q_when, at);
         let v = fw.check_joint(&cmd, at);
         if !locked {
             // Bit-exact (Debug, because NaN != NaN).
@@ -465,7 +487,7 @@ fn run(seed: u64, locked: bool) -> [u64; 6] {
                 assert!(!(s.humanoid && ref_all_limp(&out.frame, &s.lims)), "{ctx}");
                 assert!(src == ctl && out.frame.crc_ok != Some(false), "{ctx}");
                 last_out = Some((out.frame, at));
-                q_prev = next_q_prev(&out.frame);
+                next_q_prev(&out.frame, at, &mut q_store, &mut q_when);
                 last_stamp = stamp;
                 counts[0] += 1;
             }
@@ -487,7 +509,7 @@ fn run(seed: u64, locked: bool) -> [u64; 6] {
                     "{ctx}"
                 );
                 last_out = Some((out.frame, at));
-                q_prev = next_q_prev(&out.frame);
+                next_q_prev(&out.frame, at, &mut q_store, &mut q_when);
                 last_stamp = stamp;
                 counts[1] += 1;
                 if reasons.contains(JointLimitReasons::STEP)
@@ -522,7 +544,7 @@ fn run(seed: u64, locked: bool) -> [u64; 6] {
                         assert!(!s.humanoid, "humanoid got a damping frame: {ctx}");
                         counts[3] += 1;
                         // The motors were released: no previous target.
-                        q_prev = [NO_Q; MAX_MOTORS];
+                        q_store = [NO_Q; MAX_MOTORS];
                         for (m, l) in sub.cmd.frame.motors().iter().zip(&s.lims) {
                             if l.enabled {
                                 assert_eq!(

@@ -44,9 +44,13 @@
 //! is never stiffer, faster or stronger than the input.
 //!
 //! `q_prev` is the slot's position target in the last **accepted** output
-//! while that slot held a position (mode on, `kp > 0`). It is unknown on the
-//! first frame, after a damping substitute and after a frame in which the
-//! slot held no position; then only the absolute range applies.
+//! in which that slot held a position (mode on, `kp > 0`). Accepted frames
+//! in which the slot holds no position (`kp = 0`) keep it: it expires by
+//! **time**, `step_reference_ttl_ns` after that frame, not by frame (gateway
+//! review, finding 5: alternating `kp = 0` frames used to clear it, so the
+//! next position frame could jump anywhere in the range). It is unknown on
+//! the first frame, after a damping substitute and once expired; then only
+//! the absolute range applies.
 //!
 //! ## Substitutes
 //! Every "yes" above is subject to the emission interval: no substitute is
@@ -103,9 +107,12 @@ pub(crate) struct JointChanState {
     last_foreign_sub_at: Option<u64>,
     /// When the last frame (accepted or substitute) was emitted.
     last_emit_at: Option<u64>,
-    /// Per slot: position target of the last accepted output while the slot
-    /// held a position, else [`NO_Q`].
+    /// Per slot: position target of the last accepted output in which the
+    /// slot held a position, else [`NO_Q`] ...
     q_prev: [f64; MAX_MOTORS],
+    /// ... and when it was accepted (it expires `step_reference_ttl_ns`
+    /// later, [`JointChanState::step_reference`]).
+    q_prev_at: [u64; MAX_MOTORS],
     /// A hold episode is running (hold substitutes since the last accepted
     /// frame).
     holding: bool,
@@ -119,9 +126,22 @@ impl JointChanState {
         last_foreign_sub_at: None,
         last_emit_at: None,
         q_prev: [NO_Q; MAX_MOTORS],
+        q_prev_at: [0; MAX_MOTORS],
         holding: false,
         hold_exceeded: false,
     };
+
+    /// The step reference in force at `now`: `q_prev` where it is younger
+    /// than `ttl`, else [`NO_Q`].
+    fn step_reference(&self, now: u64, ttl: u64) -> [f64; MAX_MOTORS] {
+        let mut out = [NO_Q; MAX_MOTORS];
+        for ((o, q), at) in out.iter_mut().zip(&self.q_prev).zip(&self.q_prev_at) {
+            if now.saturating_sub(*at) <= ttl {
+                *o = *q;
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -354,7 +374,11 @@ impl Firewall {
             Ok(acc) => {
                 let ok = self.policy.joint_index(cmd.channel).is_some_and(|j| {
                     match (self.policy.joint_channels.get(j), self.jchans.get(j)) {
-                        (Some(ch), Some(st)) => frame_ok(ch, &acc.out, &st.q_prev),
+                        (Some(ch), Some(st)) => frame_ok(
+                            ch,
+                            &acc.out,
+                            &st.step_reference(now, ch.step_reference_ttl_ns),
+                        ),
                         _ => false,
                     }
                 });
@@ -527,11 +551,12 @@ impl Firewall {
         let (mut position, mut velocity, mut torque, mut gain) =
             (NO_WORST, NO_WORST, NO_WORST, NO_WORST);
         let (mut step, mut pd_torque) = (NO_WORST, NO_WORST);
+        let q_ref = st.step_reference(now, ch.step_reference_ttl_ns);
         for (i, ((m, lim), q_prev)) in out
             .motors_mut()
             .iter_mut()
             .zip(ch.motors.iter())
-            .zip(st.q_prev.iter())
+            .zip(q_ref.iter())
             .enumerate()
         {
             let slot = slot_id(i);
@@ -742,8 +767,18 @@ impl Firewall {
             st.last_emit_at = Some(now);
             // The step reference is the enforced output (also in observe
             // mode, so the would-have verdicts stay those of enforcement).
-            for (q, m) in st.q_prev.iter_mut().zip(acc.out.motors()) {
-                *q = if holds_position(m) { m.q } else { NO_Q };
+            // A slot that holds no position keeps its reference (it
+            // expires by time, module docs).
+            for ((q, at), m) in st
+                .q_prev
+                .iter_mut()
+                .zip(st.q_prev_at.iter_mut())
+                .zip(acc.out.motors())
+            {
+                if holds_position(m) {
+                    *q = m.q;
+                    *at = now;
+                }
             }
             st.holding = false;
             st.hold_exceeded = false;
