@@ -811,7 +811,8 @@ ayrıştırıcısı Cyclone trafiğini zaten gerçek yakalamalarla doğrulanmı�
 | Yetenek | Bugün (2026-10-26) | Kalan |
 |---|---|---|
 | DDS grafiği, rogue participant / bilinmeyen yayıncı tespiti (`rt/lowcmd` vb.) | ✅ Canlı (agentd), sentetik Cyclone trafiğiyle uçtan uca test | Gerçek Go2/G1 yakalamaları |
-| Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama; Go1 sıkıştırılmış düşük seviye çerçeve |
+| Hareket içeriğini okuma (CDR) | ✅ Tüm SDK2 tipleri + eski UDP (Go1, **sıkıştırılmış 614 B `LowCmd` dahil**: düzen SDK kütüphanesinin `refineCmd` makine kodundan); A2/AS2 düşük seviye tipi `unitree_go` olarak **çıkarımsal** (profil onayıyla); bağımsız vektörlerle doğrulandı | Gerçek trafikle doğrulama (özellikle Go1 sıkıştırılmış çerçeve, A2/AS2 tipi); Go1 sıkıştırılmış `LowState` (807 B) |
+| Go2 uygulama kanalı (WebRTC) | ✅ Oturum tespiti/sınıflandırma (sinyalleşme 8081/9991, STUN/TURN, DTLS başlıkları), eş atfı, bulgular `robot.unitree.webrtc_*` (sözleşme 2.3 §3d); gateway'de listesiz sinyalleşmeyi düşürme ve akış/eş bazında karantina (nft set'leri). İçerik DTLS-SRTP ile şifreli: **çözülmez** | Gerçek Go2 ile doğrulama; agentd pasif yakalamasına bağlama (şu an yalnız gateway besliyor); firmware sinyalleşme değişiklikleri |
 | Motion Firewall zarfı | ✅ Eklem başına q/dq/tau/kp/kd, adım/PD tork, CRC, mod pin'leri; 1 kHz'te p99 ≈ 7–9 µs (VM) — pasif modda kayıt; ✅ **in-path inline köprü gateway'i** (`robodr-firewall-gw`, NFQUEUE; S8) | Gerçek robot ve hedef sensör kutusunda doğrulama / gecikme ölçümü |
 | Host izleme (Pulsar) | ✅ Kural paketi (`rules/robodr/unitree.toml`); JetPack 5/6 için statik `robodr-focal` paketi (agentd-only) | `robodr-pulsard` için BTF'li çekirdek + glibc 2.35 build; kapalı ana kontrolcü kapsanamaz |
 | Agentless mod | ✅ Sensör kutusu yapılandırması, systemd drop-in, networkd/nftables örnekleri, VLAN | Referans donanım imajı (S7), sahada deneme |
@@ -871,15 +872,32 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 >   **Yalnız sentetik trafik ve IDL'den türetilmiş bağımsız vektörlerle;
 >   gerçek bir Unitree yakalaması henüz yok.**
 >
+> - ✅ **Unitree kapsam boşlukları (2026-10-30, `wt/unitree`):** Go1 v3.8.6
+>   sıkıştırılmış `LowCmd` (614 B) çözülüyor — düzen başlıklarda yok, SDK'nın
+>   gönderilen statik kütüphanesindeki `refineCmd` makine kodundan okundu
+>   (motor başına 27 B; `tau`/`Kp`/`Kd` i16 sabit nokta ÷256/÷32/÷16), ofsetler
+>   testlerle sabitlendi; pasif yolda bildirilen çerçeveyle aynı kontroller,
+>   gateway'de `go1_low_cmd_compressed` kanalı (sınırlama güvenli tarafa
+>   yuvarlanır, i16 dışı değer bastırılır, tutma son kabul edilen 614 B
+>   çerçeveye yazılır). A2/AS2: kaynaklarda düşük seviye tip yok; sport
+>   durumu `unitree_go` olduğundan `unitree_go::LowCmd_` **çıkarımsal**
+>   (`inferred_idl`), `unitree_a2_lowcmd` yalnız profil robotun SEDP'sinden bu
+>   tipi kaydetmişse, `require_crc` ile ve `bypass` olmadan başlar. Go2 WebRTC:
+>   oturumlar tespit/atıf edilir, gateway'de karantinaya alınabilir; içerik
+>   çözülmez. Eski UDP'de `bms.off` (pil kapatma) artık reddediliyor. Sözleşme
+>   2.3.0'a Unitree bloğu (§3d, 7 kimlik). Hepsi yalnız sentetik çerçevelerle.
+>
 > **Kalan (dürüst durum):** firewall'ın **in-path gateway**'i artık var
 > (`robodr-firewall-gw`, S8 durumuna bakın) ama yalnız sentetik trafikle ve
 > ağ ad alanlarında test edildi; decoder'lar, kurallar
 > ve canlı yol **gerçek Go2/G1 trafiğiyle doğrulanmadı** (yalnız yayımlanmış
 > IDL, el yapımı ve bağımsız vektörler, sentetik yakalamalar); **A2 / AS2**
-> düşük seviye örneği olmadığı için motor sayısı / IDL ailesi ve modele özgü
-> kimlikler belirsiz; A1 / Aliengo / B1 çerçeve düzeni kaynaklarda yok;
-> Go1'in v3.8.6 sıkıştırılmış düşük seviye çerçevesi çözülemiyor (bulgu
-> olarak raporlanıyor); eski UDP'de gönderici kimliği yalnız IP (sahtelenebilir);
+> düşük seviye tipi çıkarımsal (gerçek robotta doğrulanmalı), motor sayısı ve
+> modele özgü kimlikler belirsiz; A1 / Aliengo / B1 çerçeve düzeni kaynaklarda yok;
+> Go1 sıkıştırılmış `LowCmd` düzeni gerçek yakalamayla doğrulanmadı,
+> sıkıştırılmış `LowState` çözülmüyor; Go2 WebRTC içeriği çözülemez (yalnız
+> oturum tespiti/karantina), WebRTC izleyicisi agentd pasif yakalamasına
+> bağlı değil; eski UDP'de gönderici kimliği yalnız IP (sahtelenebilir);
 > **ajansız sensör kutusu** referans imajı (S7) yok (örnek yapılandırma var);
 > Unitree döngü hızında **gecikme bütçesi ölçümü** yapılmadı;
 > Pulsar sensörü `robot_model` almıyor; `restrict_motion` sport API adaptörü yok.
@@ -915,7 +933,8 @@ katılımcısı / `rt/lowcmd`'ye yetkisiz yazıcı, imzalı kara kutu ile adli k
 - **S11:** Go2 ve G1 üzerinde 72 saat soak, UniPwn benzeri saldırı senaryolarıyla
   red-team (izole lab, yetkili cihazlarda).
 - **Kapsam dışı (GA):** Go1 (DDS değil, eski UDP SDK), Air/Pro üzerine ajan kurulumu,
-  insansıda otomatik güvenli duruş, Go2 uygulama kanalı (WebRTC) içeriğinin çözümü.
+  insansıda otomatik güvenli duruş, Go2 uygulama kanalı (WebRTC) içeriğinin çözümü
+  (şifreli; oturum tespiti ve karantina var, bkz. yukarı).
 
 ---
 

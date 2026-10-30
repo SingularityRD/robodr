@@ -200,6 +200,22 @@ pub fn run(
         None
     };
     let observe_unavailable = cfg.observe.enabled && log.is_none();
+    // Controller-side WebRTC copies (`crate::webrtc`), a group of their own
+    // so they never reach the robot-side discovery observer.
+    let mut rtc_log = match &cfg.webrtc {
+        Some(w) => match nflog::Log::open(w.nflog_group) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "robodr-firewall-gw: WARNING: NFLOG group {} ({e}): the WebRTC monitor sees \
+                     only the robot side of sessions",
+                    w.nflog_group
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let notifier = sys::Notifier::from_env();
     notifier.notify("READY=1\nSTATUS=deciding");
     let mut events = Events::open(cfg);
@@ -218,10 +234,12 @@ pub fn run(
         {
             break;
         }
-        drain_observed(&mut log, gw);
+        drain_observed(&mut log, gw, true);
+        drain_observed(&mut rtc_log, gw, false);
         let n = q.recv().map_err(|e| format!("NFQUEUE recv: {e}"))?;
         if n > 0 {
-            drain_observed(&mut log, gw);
+            drain_observed(&mut log, gw, true);
+            drain_observed(&mut rtc_log, gw, false);
             let t_batch = sys::monotonic_ns();
             let buf = std::mem::take(&mut q.buf);
             nfq::parse_packets(&buf[..n], |item| {
@@ -305,7 +323,9 @@ pub fn run(
 const MAX_OBSERVE_RECVS: usize = 64;
 
 /// Hand the pending robot-side copies to the gateway (never blocks).
-fn drain_observed(log: &mut Option<nflog::Log>, gw: &mut Gateway) {
+/// `robot_side`: the observe group (robot-side copies, also fed to the
+/// discovery / `rt/lowstate` observer); otherwise the WebRTC group.
+fn drain_observed(log: &mut Option<nflog::Log>, gw: &mut Gateway, robot_side: bool) {
     let Some(l) = log.as_mut() else {
         return;
     };
@@ -336,7 +356,17 @@ fn drain_observed(log: &mut Option<nflog::Log>, gw: &mut Gateway) {
                 instant: Instant::now(),
                 src_mac: None,
             };
-            gw.observe(p.payload, meta);
+            let wall = p
+                .timestamp
+                .and_then(|(s, us)| {
+                    s.checked_mul(1_000_000_000)?
+                        .checked_add(us.checked_mul(1_000)?)
+                })
+                .unwrap_or(real);
+            gw.observe_webrtc(p.payload, meta.now_ns, wall, p.hw_addr);
+            if robot_side {
+                gw.observe(p.payload, meta);
+            }
         });
         l.buf = buf;
     }
@@ -467,6 +497,11 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
         .into_iter()
         .map(|d| (d, None, 1))
         .collect();
+    out.extend(
+        gw.drain_webrtc()
+            .into_iter()
+            .map(|d| (d.with_mode(mode), Some("webrtc".to_string()), 1)),
+    );
     out.extend(
         gw.findings
             .drain(mode)

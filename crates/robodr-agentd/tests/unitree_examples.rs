@@ -601,3 +601,33 @@ fn sensor_box_example_command_sender_is_labelled() {
         assert!(s["label"].as_str().unwrap().contains("EXAMPLE"), "{s}");
     }
 }
+
+/// A2 / AS2 publish no low-level type; their `rt/lowcmd` is inferred to be
+/// `unitree_go` (`ModelInfo::inferred_idl`). A profile that learned a
+/// `unitree_hg` layout on such a robot (a model alias, or the wrong model
+/// configured) is refused, and the message says the layout is inferred; the
+/// go layout with a 20-slot joint firewall is accepted.
+#[test]
+fn a2_inferred_low_level_layout_is_checked() {
+    use robodr_agentd::config::check_profile_channels;
+    for m in [UnitreeModel::A2, UnitreeModel::As2] {
+        let hg = robodr_firewall::FirewallConfig::from_json(&example(
+            "firewall.unitree-g1.example.json",
+        ))
+        .unwrap();
+        let mut p = Profile::default();
+        p.motion_types
+            .insert("/lowcmd".into(), "unitree_hg::msg::dds_::LowCmd_".into());
+        let mut w = Vec::new();
+        let e = check_profile_channels(Some(m), &p, None, Some(&hg), &mut w).unwrap_err();
+        assert!(e.contains("inferred"), "{m:?}: {e}");
+        let go = robodr_firewall::FirewallConfig::from_json(&example(
+            "firewall.unitree-go2.example.json",
+        ))
+        .unwrap();
+        p.motion_types
+            .insert("/lowcmd".into(), "unitree_go::msg::dds_::LowCmd_".into());
+        check_profile_channels(Some(m), &p, None, Some(&go), &mut w)
+            .unwrap_or_else(|e| panic!("{m:?}: {e}"));
+    }
+}

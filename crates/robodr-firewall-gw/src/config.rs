@@ -214,6 +214,20 @@ pub enum Codec {
     Go1HighCmd,
     /// Legacy UDP uncompressed `LowCmd` (734 octets).
     Go1LowCmd,
+    /// Legacy UDP compressed `LowCmd` (614 octets, `LOW_CMD_LENGTH` of
+    /// `unitree_legged_sdk` v3.8.6: what a real Go1 client sends; layout
+    /// from the library's `refineCmd`, `robodr_cdr::unitree_legacy`).
+    Go1LowCmdCompressed,
+    /// RTPS DATA on an A2 / AS2 `rt/lowcmd`: **inferred** to be
+    /// `unitree_go::msg::dds_::LowCmd_` (20 slots, CRC over the body). The
+    /// SDK ships no A2 / AS2 low-level type or example; their sport state
+    /// is `unitree_go::msg::dds_::SportModeState_`. Decoded exactly as
+    /// `unitree_go_lowcmd`, with stricter rules: the firewall channel must
+    /// have `require_crc`, `allow_battery_off` and
+    /// `queue.on_gateway_down: bypass` are refused, and the profile must
+    /// record the channel's type (learned from the robot's own SEDP), so a
+    /// robot announcing another type never starts in enforce mode.
+    UnitreeA2Lowcmd,
     /// RTPS DATA, `unitree_api::msg::dds_::Request_` of a humanoid's
     /// locomotion client (`robot_model` g1 / h2 / r1: service `sport`,
     /// topic `rt/api/sport/request`, ids 7xxx; h1: service `loco`, topic
@@ -288,7 +302,10 @@ impl LocoModel {
 
 impl Codec {
     pub fn is_rtps(self) -> bool {
-        !matches!(self, Codec::Go1HighCmd | Codec::Go1LowCmd)
+        !matches!(
+            self,
+            Codec::Go1HighCmd | Codec::Go1LowCmd | Codec::Go1LowCmdCompressed
+        )
     }
 
     /// `true` for joint-frame channels (checked with `check_joint`).
@@ -296,8 +313,10 @@ impl Codec {
         matches!(
             self,
             Codec::UnitreeGoLowcmd
+                | Codec::UnitreeA2Lowcmd
                 | Codec::UnitreeHgLowcmd
                 | Codec::Go1LowCmd
+                | Codec::Go1LowCmdCompressed
                 | Codec::UnitreeHgArmSdk
                 | Codec::UnitreeGoArmSdk
                 | Codec::UnitreeDex3HandCmd
@@ -333,7 +352,11 @@ impl Codec {
     /// channel's count).
     pub fn slots(self) -> Option<usize> {
         match self {
-            Codec::UnitreeGoLowcmd | Codec::Go1LowCmd | Codec::UnitreeGoArmSdk => Some(20),
+            Codec::UnitreeGoLowcmd
+            | Codec::UnitreeA2Lowcmd
+            | Codec::Go1LowCmd
+            | Codec::Go1LowCmdCompressed
+            | Codec::UnitreeGoArmSdk => Some(20),
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => Some(35),
             _ => None,
         }
@@ -341,7 +364,9 @@ impl Codec {
 
     pub fn default_topic(self) -> Option<&'static str> {
         match self {
-            Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd => Some("rt/lowcmd"),
+            Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd | Codec::UnitreeA2Lowcmd => {
+                Some("rt/lowcmd")
+            }
             Codec::UnitreeSportRequest => Some("rt/api/sport/request"),
             Codec::UnitreeHgArmSdk | Codec::UnitreeGoArmSdk => Some("rt/arm_sdk"),
             Codec::UnitreeHandSdk => Some("rt/hand_sdk"),
@@ -355,7 +380,7 @@ impl Codec {
     pub fn default_ports(self) -> &'static [u16] {
         match self {
             Codec::Go1HighCmd => &[8082],
-            Codec::Go1LowCmd => &[8007],
+            Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => &[8007],
             _ => &[],
         }
     }
@@ -367,6 +392,8 @@ impl Codec {
             Codec::UnitreeSportRequest => "unitree_sport_request",
             Codec::Go1HighCmd => "go1_high_cmd",
             Codec::Go1LowCmd => "go1_low_cmd",
+            Codec::Go1LowCmdCompressed => "go1_low_cmd_compressed",
+            Codec::UnitreeA2Lowcmd => "unitree_a2_lowcmd",
             Codec::UnitreeLocoRequest => "unitree_loco_request",
             Codec::UnitreeHgArmSdk => "unitree_hg_arm_sdk",
             Codec::UnitreeGoArmSdk => "unitree_go_arm_sdk",
@@ -383,7 +410,9 @@ impl Codec {
     /// The DDS type name the codec decodes.
     pub fn dds_type_name(self) -> &'static str {
         match self {
-            Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk => "unitree_go::msg::dds_::LowCmd_",
+            Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk | Codec::UnitreeA2Lowcmd => {
+                "unitree_go::msg::dds_::LowCmd_"
+            }
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => "unitree_hg::msg::dds_::LowCmd_",
             Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest | Codec::UnitreeArmRequest => {
                 "unitree_api::msg::dds_::Request_"
@@ -393,7 +422,7 @@ impl Codec {
             Codec::Ros2Twist => "geometry_msgs::msg::dds_::Twist_",
             Codec::Ros2TwistStamped => "geometry_msgs::msg::dds_::TwistStamped_",
             Codec::Go1HighCmd => "unitree_legged_sdk::HighCmd",
-            Codec::Go1LowCmd => "unitree_legged_sdk::LowCmd",
+            Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => "unitree_legged_sdk::LowCmd",
             Codec::Ros2JointTrajectory => "trajectory_msgs::msg::dds_::JointTrajectory_",
             Codec::Ros2FollowJointTrajectoryGoal => {
                 "control_msgs::action::dds_::FollowJointTrajectory_SendGoal_Request_"
@@ -774,6 +803,19 @@ pub struct GatewayConfig {
     /// Default: none (no restriction can be applied).
     #[serde(default)]
     pub restriction_path: Option<PathBuf>,
+    /// Go2 WebRTC sessions (`crate::webrtc`): detection from NFLOG copies,
+    /// optional refusal of unlisted signalling, quarantine sets. Default:
+    /// none.
+    #[serde(default)]
+    pub webrtc: Option<crate::webrtc::WebRtcConfig>,
+    /// The robot behind the gateway (`robodr_cdr::unitree::UnitreeModel`
+    /// name: `go2`, `a2`, `as2`, `g1`, ...). Optional; when set, the
+    /// channels are cross-checked against it: an A2 / AS2 `rt/lowcmd` must
+    /// use `unitree_a2_lowcmd` (not `unitree_go_lowcmd`) and no channel may
+    /// `allow_battery_off`; `unitree_a2_lowcmd` is refused for any other
+    /// model.
+    #[serde(default)]
+    pub robot_model: Option<String>,
 }
 
 fn default_max_queue_delay() -> u64 {
@@ -826,6 +868,55 @@ impl GatewayConfig {
             return Err("channels: at least one channel is required".into());
         }
         self.profile_trust.validate()?;
+        if let Some(name) = &self.robot_model {
+            use robodr_cdr::unitree::UnitreeModel as M;
+            let m = M::from_name(name)
+                .ok_or_else(|| format!("robot_model {name:?} is not a Unitree model name"))?;
+            let a2 = matches!(m, M::A2 | M::As2);
+            for c in &self.channels {
+                let at = &c.firewall_channel;
+                let lowcmd = c.topic().is_some_and(|t| t == "rt/lowcmd");
+                if a2
+                    && lowcmd
+                    && matches!(c.codec, Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk)
+                {
+                    return Err(format!(
+                        "channel {at}: robot_model {name} must use codec unitree_a2_lowcmd on \
+                         rt/lowcmd (its low-level type is inferred, not published)"
+                    ));
+                }
+                if a2 && c.allow_battery_off {
+                    return Err(format!(
+                        "channel {at}: allow_battery_off is refused for robot_model {name}"
+                    ));
+                }
+                if !a2 && c.codec == Codec::UnitreeA2Lowcmd {
+                    return Err(format!(
+                        "channel {at}: codec unitree_a2_lowcmd is for robot_model a2 / as2, not \
+                         {name}"
+                    ));
+                }
+            }
+        }
+        if let Some(w) = &self.webrtc {
+            w.monitor_options()?;
+            if !self.observe.enabled {
+                return Err(
+                    "webrtc needs observe.enabled (the robot side of a session comes from the \
+                     observe copies)"
+                        .into(),
+                );
+            }
+            if w.nflog_group == self.observe.nflog_group {
+                return Err("webrtc.nflog_group must differ from observe.nflog_group".into());
+            }
+            let legacy = self.legacy_ports();
+            for p in &w.signalling_ports {
+                if legacy.contains(p) {
+                    return Err(format!("webrtc.signalling_ports: {p} is a legacy UDP port"));
+                }
+            }
+        }
         for (what, p) in [("profile", &self.profile), ("firewall", &self.firewall)] {
             if !p.is_absolute() {
                 return Err(format!("{what} must be an absolute path"));

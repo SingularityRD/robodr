@@ -34,8 +34,27 @@ RoboDR decodes two generations of Unitree traffic:
   Go2-W, B2, B2-W, A2, AS2, H1, H1-2, H2, G1, R1. The low-level loop is a DDS
   writer of `rt/lowcmd`; high-level control is the request/response API on
   `rt/api/<service>/request`.
-* **Legacy UDP** (`unitree_legged_sdk` v3.8.6): Go1 high-level frames.
-  A1, Aliengo and B1 are known by frame layout only.
+* **Legacy UDP** (`unitree_legged_sdk` v3.8.6): Go1 high-level frames and
+  low-level commands in both forms: the `comm.h` struct (734 bytes) and the
+  compressed form (614 bytes) that a v3.8.6 client actually sends. The
+  compressed layout was read from the shipped library. A1, Aliengo and B1
+  are known by frame layout only.
+
+**Coverage by model** (decode = content read; enforce = the inline
+gateway can limit / hold / remove it; detect = findings only):
+
+| Model | Low-level command | High-level / API | App channel (WebRTC) |
+|---|---|---|---|
+| Go2, Go2-W, B2, B2-W | decode + enforce (`unitree_go_lowcmd`) | decode + enforce (sport `Request_`, `/cmd_vel`) | Go2: detect + attribute + block unlisted signalling + quarantine by flow (inline gateway `webrtc`); content never decoded |
+| A2, AS2 | decode + enforce (`unitree_a2_lowcmd`) **only if** the robot announces the inferred `unitree_go` `LowCmd_` (type recorded in the profile); motor count unknown | decode + enforce (sport `Request_`) | not covered (no WebRTC information for these models) |
+| H1 | decode + enforce (`unitree_go_lowcmd`, `rt/arm_sdk`) | decode + enforce (`loco`) | — |
+| H1-2, H2, G1, R1 | decode + enforce (`unitree_hg_lowcmd`, `rt/arm_sdk`, hands) | decode + enforce (loco / arm) | — |
+| Go1 | decode + enforce, declared (`go1_low_cmd`) and compressed (`go1_low_cmd_compressed`) | decode + enforce (`go1_high_cmd`) | — |
+| A1, Aliengo, B1 | detect only (sender check by length; layout not in the sources) | detect only | — |
+
+All of it is built from the SDK sources, the shipped Go1 library and
+RFCs, and tested on synthetic frames; none of it has run against a real
+robot (see [Known limits](#known-limits)).
 
 What is decoded per model (IDL family, motor slots, morphology, topics and
 API services) is the model matrix in
@@ -417,7 +436,9 @@ In short:
 | `rt/lowcmd` (G1, H1-2) | `unitree_hg_lowcmd` | `check_joint` per frame: a valid frame passes byte-identical, an out-of-envelope one is limited in place (CRC recomputed), a rejected one is replaced **in the same sample** by the hold of the last accepted frame (never damping, never limp, on a humanoid) or removed if there is none yet |
 | `rt/lowcmd` (Go2, B2, H1) | `unitree_go_lowcmd` | as above; a quadruped may damp after the hold (`fail_behaviour`) |
 | `rt/api/sport/request` | `unitree_sport_request` | `Move` speed limited (parameter rewritten), a rejected `Move` replaced by the hold / zero; other calls only if `allowed_api_ids` lists them (`StopMove` always) |
-| Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; uncompressed `LowCmd` as `rt/lowcmd` (the compressed form cannot be decided) |
+| Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` or `go1_low_cmd_compressed` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; `LowCmd` as `rt/lowcmd`, in the declared (734 B) or, with `go1_low_cmd_compressed`, the compressed (614 B, what v3.8.6 clients send) form (fixed-point `tau` / `Kp` / `Kd` rounded to the safe side); a non-zero `bms.off` (battery off) is refused on both |
+| `rt/lowcmd` (A2, AS2) | `unitree_a2_lowcmd` | as `unitree_go_lowcmd`, for the **inferred** go `LowCmd_`: starts only with `require_crc`, the type recorded in the locked profile (learned on the robot) and without `bypass`; set the gateway's top-level `robot_model: a2` / `as2` so that a `unitree_go_lowcmd` or `allow_battery_off` configuration is refused |
+| Go2 WebRTC (TCP 8081 / 9991, ICE / DTLS) | `webrtc` section (not a codec) | sessions detected and attributed from NFLOG copies (findings `robot.unitree.webrtc_*`); `block_unlisted` drops signalling from non-controllers; `webrtc-block` quarantines a peer or flow; the encrypted content is never decoded or limited (section 5.2) |
 | `rt/api/sport/request` (G1, H2, R1: ids 7xxx), `rt/api/loco/request` (H1: ids 8xxx) | `unitree_loco_request` (`robot_model` required) | `SetVelocity` / `Move` limited and their duration capped (`max_velocity_duration_s`); every `SetFsmId` (`Damp`, `ZeroTorque`, posture changes, **and `Start`**) and the hand-over calls refused unless `allowed_fsm_ids` / `allowed_api_ids` list them; queries pass. A humanoid configured with `unitree_sport_request` is refused at start |
 | `rt/arm_sdk` (G1, H1-2, H2, R1 `hg`; H1 `go`) | `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` | every slot with gains or torque decided whatever its mode octet; the blend weight (`weight_slot`) bounded, step and rate limited, and its rise from 0 checked against the robot's `rt/lowstate` (below) |
 | `rt/dex3/{left,right}/cmd`, `rt/hand_sdk` | `unitree_dex3_hand_cmd` / `unitree_hand_sdk` | mode octets must be the SDK's, the hand-SDK weight bounded and step / rate limited; a frame the firewall passes is forwarded byte-identical, anything else is suppressed (no hand rewrite). The hand's firewall channel sets `balance_critical: false`, so `stopMotors` (`kp = kd = 0`) is allowed |
@@ -497,6 +518,45 @@ channels `config/firewall-gw.unitree-{g1,go2}.channels.example.json` and
 `config/firewall.unitree-{g1,go2}.channels.example.json` (G1: arm SDK,
 loco, both Dex3 hands, arm actions; Go2: sport, ROS 2 `/cmd_vel`; each
 channel carries a `note` explaining its values).
+
+### 5.2 Go2 WebRTC (app channel)
+
+The Go2 app (and community clients) control the robot over WebRTC. The
+content of a session is DTLS-SRTP encrypted and **cannot be read by a
+sensor that does not hold the keys**; RoboDR does not try. With a
+`webrtc` section in the inline gateway's configuration
+([`crates/robodr-firewall-gw/README.md`](../crates/robodr-firewall-gw/README.md),
+"Go2 WebRTC sessions") it:
+
+* detects and classifies sessions to the robot: signalling on the robot's
+  HTTP ports (8081 `POST /offer` with a plaintext SDP on older firmware;
+  9991 `con_notify` / `con_ing_*` with an encrypted SDP on newer firmware;
+  as used by community clients, not documented by Unitree), ICE (STUN)
+  checks, TURN relaying, the DTLS handshake, SRTP;
+* attributes the peer (IP, MAC where the copy has it) and reports, contract
+  2.3 §3d: `webrtc_unknown_controller` (High; Critical once established),
+  `webrtc_new_peer` (no list configured), `webrtc_controller_mac_mismatch`,
+  `webrtc_session_in_denied_window` (`deny_windows`, UTC),
+  `webrtc_concurrent_sessions` (`max_sessions`), `webrtc_relayed_session`
+  (TURN or a non-local peer: remote control via a cloud relay),
+  `webrtc_media_without_signalling` (signalled over Wi-Fi / another path);
+  each once per peer session (a peer that comes back is reported again),
+  non-Critical ones rate limited per minute with an aggregate count; the
+  MAC binding is checked on every packet the gateway copies;
+* from the plaintext legacy offer, keeps metadata only (ICE user fragment,
+  fingerprint hash, candidates, media kinds; the `token` by length);
+* blocks: `action: block_unlisted` drops signalling from hosts that are not
+  `controllers` and from a MAC-bound controller's IP with another MAC
+  (each drop logged first, so the refused host is still reported); a
+  running session is quarantined by peer or by flow
+  (`robodr-firewall-gw webrtc-block --peer ... --flow ...` prints the
+  `nft` command; the findings name the flows).
+
+On a passive sensor box the same monitor is a library
+(`robodr_ros2_pipeline::webrtc`); agentd's live capture does not feed it
+yet (UDP / RTPS-only capture). What the Go2 does when its controller's
+session is cut mid-motion is not published: test a quarantine with the
+robot at rest first.
 
 ## 6. Humanoid and quadruped safety rules
 
@@ -750,6 +810,7 @@ Findings use the `robodr.findings` contract, version **2.1.0**
 A consumer must accept contract 2.1 to validate the 2.1 rule entries; see
 the contract's section 5.
 
+
 ## Known limits
 
 * **No real-robot validation yet.** Decoders, rules, firewall examples and
@@ -775,20 +836,32 @@ the contract's section 5.
   controller.** They fire only where the provisioning service runs on the
   pulsard host (section 7); the controller itself is covered only by the
   network detections.
-* **Go2 app channel (WebRTC) is not decoded.** The mobile app's channel is
-  encrypted media/data over WebRTC; RoboDR does not see its content, and on
-  Wi-Fi or cellular it is not on the Ethernet link at all.
+* **Go2 app channel (WebRTC) content is not decoded, and cannot be.** The
+  channel is DTLS-SRTP encrypted; RoboDR detects, attributes and can
+  quarantine sessions on the Ethernet link at the inline gateway
+  (section 5.2), never what they command. On Wi-Fi or cellular it is not
+  on the Ethernet link at all (a cloud-relayed session shows as the
+  robot's flows to the relay). The signalling formats come from community
+  clients and may change with firmware. agentd's passive capture does not
+  run the WebRTC monitor yet.
 * **Telemetry over Wi-Fi or cellular** is not on the Ethernet link the
   sensor box watches, and agentd's capture analyses DDS (and legacy Unitree
   UDP) only, not general IP flows. The host rule sees outbound connections
   only on the EDU computer. Watch the site's Wi-Fi / firewall logs for the
   robot's own external traffic.
-* **Legacy Go1 "compressed" low-level frames** (`unitree_legged_sdk`
-  v3.8.6, 614 / 807 bytes) have no published layout and are reported as
-  undecodable; A1 / Aliengo / B1 layouts are not in the sources.
-* **A2 / AS2**: no low-level example is published, so their motor count,
-  IDL family and model-specific API ids are unknown; only the sport state
-  and sport client are covered.
+* **Legacy Go1 "compressed" frames** (`unitree_legged_sdk` v3.8.6): the
+  614-byte `LowCmd` is decoded and enforced using the layout read from the
+  shipped library's machine code (`refineCmd`), not a header. It has not
+  been compared with a capture from a real Go1, and a fleet using the
+  library's `encryptCRC` cannot be enforced. The 807-byte `LowState` is
+  still reported as not inspected. A1 / Aliengo / B1 layouts are not in
+  the sources.
+* **A2 / AS2**: no low-level type, example or topic is published. Their
+  low-level command is **inferred** to be `unitree_go` `LowCmd_` on
+  `rt/lowcmd`, because their sport state is a `unitree_go` type. It is
+  enforced (`unitree_a2_lowcmd`) only when the profile learned that type
+  from the robot itself. Their motor count and model-specific API ids are
+  unknown.
 * **The inline gateway (section 5.1) is new and not field-tested**: run
   on synthetic traffic through real network namespaces only; latency on the
   target sensor box, Unitree's `rt/lowcmd` QoS and the motor board's

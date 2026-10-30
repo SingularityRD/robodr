@@ -36,6 +36,7 @@ use robodr_firewall_gw::runtime::{self, RunOptions};
 use robodr_firewall_gw::{ruleset, sys, Gateway};
 
 const USAGE: &str = "usage: robodr-firewall-gw <run|check-config|ruleset> --config <path>
+       robodr-firewall-gw webrtc-block --peer <ipv4> [--flow <peer_port>,<robot_ipv4>,<robot_port>] [--timeout-s <1..86400>]
        robodr-firewall-gw --version";
 
 fn main() -> ExitCode {
@@ -54,6 +55,20 @@ fn main() -> ExitCode {
     if matches!(cmd, "-V" | "--version") && rest.is_empty() {
         println!("robodr-firewall-gw {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+    if cmd == "webrtc-block" {
+        // Prints the `nft` command that quarantines a WebRTC peer or flow
+        // in the `webrtc` table of the ruleset (run it as root).
+        return match robodr_firewall_gw::webrtc::BlockTarget::parse_args(rest) {
+            Ok(t) => {
+                println!("{}", t.nft_argv().join(" "));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("robodr-firewall-gw: {e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        };
     }
     let config = match rest {
         [flag, path] if flag == "--config" => PathBuf::from(path),

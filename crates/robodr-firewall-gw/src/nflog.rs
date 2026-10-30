@@ -80,6 +80,10 @@ pub struct Logged<'a> {
     /// Kernel receive time (seconds, microseconds; CLOCK_REALTIME), when
     /// the skb carried one.
     pub timestamp: Option<(u64, u64)>,
+    /// The link-layer source address (`NFULA_HWADDR`,
+    /// `struct nfulnl_msg_packet_hw { be16 hw_addrlen; u16 pad; u8
+    /// hw_addr[8]; }`), when it is a 6-byte (Ethernet) address.
+    pub hw_addr: Option<[u8; 6]>,
 }
 
 /// What [`parse_packets`] reports.
@@ -135,6 +139,7 @@ fn parse_one(msg: &[u8]) -> Item<'_> {
         payload: &[],
         physindev: None,
         timestamp: None,
+        hw_addr: None,
     };
     let mut have_hdr = false;
     let mut at = NLMSG_HDRLEN + NFGEN_LEN;
@@ -164,6 +169,12 @@ fn parse_one(msg: &[u8]) -> Item<'_> {
             NFULA_PAYLOAD => p.payload = v,
             NFULA_IFINDEX_PHYSINDEV => p.physindev = be_u32(v, 0),
             NFULA_TIMESTAMP => p.timestamp = be_u64(v, 0).zip(be_u64(v, 8)),
+            NFULA_HWADDR => {
+                p.hw_addr = match (v.get(..2), v.get(4..10)) {
+                    (Some([0, 6]), Some(mac)) => <[u8; 6]>::try_from(mac).ok(),
+                    _ => None,
+                }
+            }
             _ => {}
         }
         match align4(alen).and_then(|a| at.checked_add(a)) {
@@ -241,10 +252,27 @@ pub fn build_config(out: &mut Vec<u8>, seq: u32, group: u16, c: Config) {
 
 /// Test / fuzz helper: a packet message as the kernel sends it.
 pub fn build_packet_msg(out: &mut Vec<u8>, group: u16, payload: &[u8], physindev: Option<u32>) {
+    build_packet_msg_hw(out, group, payload, physindev, None);
+}
+
+/// [`build_packet_msg`] with an `NFULA_HWADDR` attribute.
+pub fn build_packet_msg_hw(
+    out: &mut Vec<u8>,
+    group: u16,
+    payload: &[u8],
+    physindev: Option<u32>,
+    hw: Option<[u8; 6]>,
+) {
     header(out, MSG_PACKET, 0, 0, group);
     put_attr(out, NFULA_PACKET_HDR, &[0x08, 0x00, 2, 0]);
     if let Some(i) = physindev {
         put_attr(out, NFULA_IFINDEX_PHYSINDEV, &i.to_be_bytes());
+    }
+    if let Some(m) = hw {
+        let mut v = vec![0, 6, 0, 0];
+        v.extend_from_slice(&m);
+        v.extend_from_slice(&[0, 0]);
+        put_attr(out, NFULA_HWADDR, &v);
     }
     put_attr(out, NFULA_PAYLOAD, payload);
     finish(out);
@@ -492,6 +520,36 @@ mod tests {
         assert_eq!(&c[24..28], &0xffffu32.to_be_bytes());
         assert_eq!(c[28], COPY_PACKET);
         assert_eq!(c.len() % 4, 0);
+    }
+
+    #[test]
+    fn hwaddr_is_parsed_only_for_ethernet() {
+        let mac = [2, 0, 0, 0, 0, 0x20];
+        let mut m = Vec::new();
+        build_packet_msg_hw(&mut m, 9, b"\x45abc", None, Some(mac));
+        let mut seen = Vec::new();
+        parse_packets(&m, |it| seen.push(it));
+        match seen[0] {
+            Item::Packet(p) => {
+                assert_eq!(p.hw_addr, Some(mac));
+                assert_eq!(p.payload, b"\x45abc");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Another address length: not a MAC.
+        let mut m = Vec::new();
+        header(&mut m, MSG_PACKET, 0, 0, 9);
+        put_attr(&mut m, NFULA_PACKET_HDR, &[0x08, 0x00, 2, 0]);
+        put_attr(&mut m, NFULA_HWADDR, &[0, 8, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        finish(&mut m);
+        let mut seen = Vec::new();
+        parse_packets(&m, |it| seen.push(it));
+        assert!(matches!(seen[0], Item::Packet(p) if p.hw_addr.is_none()));
+        let mut none = Vec::new();
+        build_packet_msg(&mut none, 9, b"x", None);
+        parse_packets(&none, |it| {
+            assert!(matches!(it, Item::Packet(p) if p.hw_addr.is_none()))
+        });
     }
 
     #[test]

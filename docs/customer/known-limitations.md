@@ -142,10 +142,13 @@
 - **The sensor box sees only what is mirrored to it** (or, inline, what
   crosses its bridge). It cannot see unicast between the robot's internal
   computers without a mirror, or traffic over Wi-Fi or cellular, or the
-  content of the Go2 app's WebRTC channel.
+  content of the Go2 app's WebRTC channel (encrypted; the inline gateway
+  detects, attributes and can quarantine such sessions, never reads them).
 - **Legacy Unitree UDP:** the sender identity is the IP address only,
   which can be spoofed. MAC binding can be spoofed on the same L2. Go1's
-  compressed low-level frames are undecodable.
+  compressed low-level command is decoded from a layout read from the
+  vendor library, not yet compared with a real capture; its compressed
+  state frames are not decoded.
 - **A contested GUID prefix fails closed.** An attacker who can send one
   SPDP message can make a profiled participant untrusted until it is
   pinned by IP in `participant_ips` ([`docs/OPERATIONS.md`](../OPERATIONS.md)).
