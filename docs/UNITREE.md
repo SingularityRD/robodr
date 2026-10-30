@@ -610,8 +610,17 @@ Rules for Unitree, all enforced in code:
     listed in `control_buses` or `motion_control_path`.
 * **What is never sent.** `safe_pause`, `request_safe_state` and
   `rollback_config` (damp, stand-down, controller restart) are never sent
-  by the executor on any model. `restrict_motion` is advisory only: there
-  is no sport-API adapter (Sprint 8).
+  through the Unitree SDK: there is no SDK adapter for them, and on a
+  humanoid (and, for `rollback_config`, a quadruped) they are refused
+  `fall_hazard` anyway. `restrict_motion` is advisory unless the executor
+  has a `motion` section (Sprint 8): then it goes through the in-path
+  gateway (`gateway` adapter: sport `Move` / loco `SetVelocity` caps on the
+  sensor box; `LowCmd_` is never restricted) and / or the sport API
+  (`unitree_sport` adapter: `SpeedLevel(-1)`, reverted to `SpeedLevel(0)`
+  at the TTL, not to the level before; Go2-family sport service only,
+  verified against a simulated robot only), each with the site's
+  `oem_validated`. On a quadruped a restriction factor is never below the
+  policy's `min_motion_factor`.
 * **Quarantine coverage.** Quarantine matches RTPS over UDP by GUID
   prefix. Traffic between processes on the same computer over shared
   memory is not covered.

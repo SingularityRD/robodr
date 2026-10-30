@@ -563,6 +563,38 @@ sprint, AC'leri karşılanmadan kapanmaz.
 > edilemez. ❌ AC: gerçek robotta `restrict_motion` ve TTL, hedef sensör
 > kutusunda p99 ölçümü, `safe_pause` adaptörleri (Nav2 / ros2_control /
 > PX4) yok.
+>
+> **Güncelleme (2026-10-30) — Sprint 8 kalanları kodda:** ✅ ROS 2
+> `JointTrajectory` / `FollowJointTrajectory` (send_goal) gateway kanalları
+> (`ros2_joint_trajectory`, `ros2_follow_joint_trajectory_goal`): katı CDR
+> çözümü (Jazzy Fast DDS ve Cyclone DDS lab kayıtlarındaki gerçek 40
+> noktalı, 6 eklemli yörüngeler katı çözülüyor), eklem başına konum / hız /
+> ivme / efor ve nokta sayısı / süre sınırları (yapılandırmadan; hız
+> profil zarfıyla sınırlı), eklem adı karışıklığı, NaN/Inf, zamanda geri
+> giden noktalar, türetilmiş hız ve ivmeler; ihlal → PAD (ikame yok,
+> datagram / SN üretilmez), `time_scale` modunda hız/ivme ihlali yerinde
+> yavaşlatma; DATA_FRAG bastırılır; referans karşılaştırmalı rastgele
+> test ve fuzz hedefi `firewall_gw_trajectory`. ✅ Gateway bulguları
+> (`robot.gateway.*`, bulgu sözleşmesi **2.3.0**) (kural, kanal) başına
+> toplanıp `findings_socket` ile agentd'nin `gateway_feed` girdisine,
+> oradan normal bulgu hattına (kara kutu, spool, responder, korelasyon)
+> akıyor. ✅ Yürütücü hareket adaptörleri (`motion` bölümü, varsayılan
+> kapalı): `restrict_motion` gateway kısıt dosyasıyla (gateway durumundan
+> geri okuma, TTL'de kendiliğinden düşer) ve Unitree sport `SpeedLevel`
+> ile; `safe_pause` Nav2 (tüm hedefleri iptal + sıfır twist), ros2_control
+> (STRICT controller switch) ve PX4 (MAVLink 2 hold); `request_safe_state`
+> (PX4 hold/RTL, Nav2, ros2_control) ve `rollback_config` (yalnız
+> `program`, saha programı) geri alınamaz (`applied`). Her adaptör
+> sahanın `oem_validated` bayrağı olmadan reddeder; iki kişilik aksiyonlar
+> imzalı gövdede iki onaylayıcı (`approved_by`, talep eden hariç) ister;
+> adaptörün izinli güvenlik durumları uygulama anında yeniden denetlenir
+> (varsayılan: `moving_fast` iken duraklatma yok). Protokoller (asgari
+> RTPS katılımcısı, CDR, MAVLink 2) yalnız süreç içi simüle eş'lere karşı
+> test edildi. ❌ AC hâlâ açık: gerçek robotta `restrict_motion` + TTL,
+> gerçek Nav2 / ros2_control / PX4 / Unitree ile birlikte çalışma, hedef
+> sensör kutusunda p99; `rmw_fastrtps` servis istek başlığı (yalnız
+> `rmw_cyclonedds`), MAVLink imzalama, birden çok DATA'ya bölünen
+> yörüngeler desteklenmiyor.
 
 ### Sprint 9 — Filo yaşam döngüsü: kayıt, anahtar, güncelleme
 

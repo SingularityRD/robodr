@@ -10,6 +10,44 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Added (Sprint 8: motion gateway channels and adapters)
+
+- `robodr-firewall-gw`: ROS 2 joint-trajectory channels
+  `ros2_joint_trajectory` (`trajectory_msgs/JointTrajectory`) and
+  `ros2_follow_joint_trajectory_goal` (`FollowJointTrajectory` send_goal):
+  strict CDR decode (verified on the Jazzy Fast DDS / Cyclone captures),
+  per-joint position / velocity / acceleration / effort and point-count /
+  duration bounds, passed, time-scaled in place (`on_velocity_violation:
+  time_scale`) or suppressed; fuzz target `firewall_gw_trajectory`.
+- `robodr-firewall-gw`: its own findings (`robot.gateway.*`) aggregated per
+  (rule, channel) and, with `findings_socket`, fed to agentd together
+  with the firewall's deviations; `restriction_path`: a `restrict_motion`
+  restriction written by the executor (twist caps, trajectory joint
+  speeds; expires on its own).
+- `robodr-agentd`: `gateway_feed` input; gateway findings become findings
+  of the normal pipeline. The control-plane body (and the revert body)
+  accept `approved_by`.
+- Findings contract **2.3.0**: `robot.gateway.trajectory_rejected`,
+  `trajectory_time_scaled`, `undecodable_command`, `fragmented_command`,
+  `writer_binding_conflict`, `sequence_jump`, `port_bypass_risk`,
+  `restriction_changed`, `findings_dropped` (`docs/contracts/robodr.findings.md`
+  §3b).
+- `robodr-executor`: motion adapters behind a `motion` section (off by
+  default): `restrict_motion` through the gateway and the Unitree sport
+  `SpeedLevel`; `safe_pause` through Nav2 (cancel every goal, zero
+  twist), ros2_control (controller switch) and PX4 (MAVLink hold);
+  `request_safe_state` (PX4 hold / RTL, Nav2, ros2_control) and
+  `rollback_config` (site program, `config: program` only), not
+  reversible (`applied`). Each adapter needs the site's `oem_validated`;
+  two-person actions need two approvers in the SOC-signed body; adapter
+  allowed states (no pause while `moving_fast` by default). New refusal
+  codes `no_adapter`, `adapter_not_validated`, `safety_state_not_allowed`,
+  `requires_idle`, `behaviour_unsupported` (control-plane contract §6a,
+  "Revision: motion adapters"). Protocols (RTPS participant, CDR,
+  MAVLink 2) tested against simulated peers only. The on-robot planner's
+  `limit_motion` becomes a `restrict_motion` order. **Upgrade the
+  executor before agentd** (new order target `motion`).
+
 ### Security
 
 - Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third

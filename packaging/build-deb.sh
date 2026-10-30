@@ -226,6 +226,11 @@ if install_bin robodr-executor usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-executor.conf.example" \
         "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-executor.conf.example"
     install -D -m 0644 "$root/config/executor.example.json" "$pkg/$ex/executor.example.json"
+    # Sprint 8 motion adapters: example configuration and unit drop-in.
+    install -D -m 0644 "$root/config/executor.motion.example.json" \
+        "$pkg/$ex/executor.motion.example.json"
+    install -D -m 0644 "$here/systemd/robodr-executor.service.d/40-motion.conf.example" \
+        "$pkg/usr/share/doc/robodr/examples/robodr-executor.service.d/40-motion.conf.example"
 fi
 # In-path Motion Firewall gateway (inline bridge on a sensor box,
 # crates/robodr-firewall-gw): the gateway and its ruleset unit, installed
@@ -234,6 +239,8 @@ if install_bin robodr-firewall-gw usr/sbin 0; then
     for u in robodr-firewall-gw.service robodr-firewall-gw-rules.service; do
         install -D -m 0644 "$unit_src/$u" "$pkg/$units/$u"
     done
+    install -D -m 0644 "$root/config/firewall-gw.ros2-arm.example.json" \
+        "$pkg/$ex/firewall-gw.ros2-arm.example.json"
 fi
 # Base-station side of the remote head anchor (not enabled by the package).
 if [[ "$variant" == standard ]] && install_bin robodr-anchor-receiver usr/bin 0; then

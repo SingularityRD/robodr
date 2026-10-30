@@ -655,3 +655,15 @@ fn gateway_matches_the_reference() {
         "{agree_pass} {agree_refuse} {strict_only}"
     );
 }
+
+/// The shipped trajectory example parses (structure; the gateway itself
+/// is built against its firewall configuration and profile on site).
+#[test]
+fn ros2_arm_example_parses() {
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/firewall-gw.ros2-arm.example.json");
+    let c = robodr_firewall_gw::GatewayConfig::load(&p).unwrap();
+    assert_eq!(c.channels.len(), 2);
+    assert!(c.channels.iter().all(|ch| ch.codec.is_trajectory()));
+    assert!(c.findings_socket.is_some() && c.restriction_path.is_some());
+}

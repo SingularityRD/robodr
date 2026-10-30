@@ -1,0 +1,111 @@
+{
+  "mode": "enforce",
+  "profile": "/etc/robodr/profile.json",
+  "profile_trust": {
+    "trusted_keys": "/etc/robodr/profile-trust.json",
+    "state_file": "/var/lib/robodr/profile-state/agentd.json"
+  },
+  "firewall": "/etc/robodr/firewall.json",
+  "queue": {
+    "num": 0,
+    "on_gateway_down": "fail_closed",
+    "max_len": 1024,
+    "controller_port": "enp2s0",
+    "robot_port": "enp3s0"
+  },
+  "rtps": {
+    "domain_ids": [
+      0
+    ],
+    "malformed_datagram": "drop",
+    "unknown_writers": "probe",
+    "state_file": "/var/lib/robodr/firewall-gw/writers.json"
+  },
+  "channels": [
+    {
+      "firewall_channel": "/arm_controller/joint_trajectory",
+      "codec": "ros2_joint_trajectory",
+      "topic": "rt/arm_controller/joint_trajectory",
+      "allowed_src_ips": [
+        "192.168.10.5"
+      ],
+      "trajectory": {
+        "joints": [
+          {
+            "name": "shoulder_pan_joint",
+            "min_position": -3.14,
+            "max_position": 3.14,
+            "max_velocity": 1.5,
+            "max_acceleration": 4.0,
+            "max_effort": 150.0
+          },
+          {
+            "name": "shoulder_lift_joint",
+            "min_position": -3.14,
+            "max_position": 3.14,
+            "max_velocity": 1.5,
+            "max_acceleration": 4.0,
+            "max_effort": 150.0
+          },
+          {
+            "name": "elbow_joint",
+            "min_position": -3.14,
+            "max_position": 3.14,
+            "max_velocity": 2.0,
+            "max_acceleration": 6.0,
+            "max_effort": 100.0
+          }
+        ],
+        "max_points": 256,
+        "max_duration_s": 60.0,
+        "on_velocity_violation": "time_scale",
+        "max_time_scale": 4.0
+      },
+      "note": "JointTrajectory topic of the arm's joint_trajectory_controller; firewall channel kind joints(3). A trajectory must fit one RTPS DATA (DATA_FRAG is suppressed): raise the DDS message size or bound max_points."
+    },
+    {
+      "firewall_channel": "/arm_controller/follow_joint_trajectory",
+      "codec": "ros2_follow_joint_trajectory_goal",
+      "topic": "rq/arm_controller/follow_joint_trajectory/_action/send_goalRequest",
+      "allowed_src_ips": [
+        "192.168.10.5"
+      ],
+      "trajectory": {
+        "joints": [
+          {
+            "name": "shoulder_pan_joint",
+            "min_position": -3.14,
+            "max_position": 3.14,
+            "max_velocity": 1.5,
+            "max_acceleration": 4.0,
+            "max_effort": 150.0
+          },
+          {
+            "name": "shoulder_lift_joint",
+            "min_position": -3.14,
+            "max_position": 3.14,
+            "max_velocity": 1.5,
+            "max_acceleration": 4.0,
+            "max_effort": 150.0
+          },
+          {
+            "name": "elbow_joint",
+            "min_position": -3.14,
+            "max_position": 3.14,
+            "max_velocity": 2.0,
+            "max_acceleration": 6.0,
+            "max_effort": 100.0
+          }
+        ],
+        "max_points": 256,
+        "max_duration_s": 60.0,
+        "request_header": "none"
+      },
+      "note": "FollowJointTrajectory send_goal (rmw_fastrtps: no request header in the payload; rmw_cyclonedds: request_header cyclone)."
+    }
+  ],
+  "events_path": "/var/log/robodr/firewall-gw-events.jsonl",
+  "status_path": "/run/robodr-firewall-gw/status.json",
+  "findings_socket": "/run/robodr-agentd/gateway-feed.sock",
+  "restriction_path": "/run/robodr-firewall-gw/restrict/restriction.json"
+}
