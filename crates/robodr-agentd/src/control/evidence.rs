@@ -696,6 +696,23 @@ impl Index {
     fn pos(&self, seq: u64) -> Option<usize> {
         self.records.binary_search_by_key(&seq, |r| r.seq).ok()
     }
+
+    /// Records `i` and `i + 1` both exist and have consecutive seqs.
+    fn adjacent(&self, i: usize) -> bool {
+        matches!(
+            (self.records.get(i), self.records.get(i + 1)),
+            (Some(p), Some(q)) if p.seq + 1 == q.seq
+        )
+    }
+}
+
+/// `(seq, next seq)` of every break in the seq order of `records`.
+fn seq_gaps(records: &[RecMeta]) -> impl Iterator<Item = (u64, u64)> + '_ {
+    records
+        .iter()
+        .zip(records.iter().skip(1))
+        .map(|(p, q)| (p.seq, q.seq))
+        .filter(|&(p, q)| q != p + 1)
 }
 
 /// Retained evidence per segment (the inventory).
@@ -731,11 +748,8 @@ pub fn inventory(ix: &Index, robot_id: &str) -> Value {
             }),
         }
     }
-    let gaps: Vec<Value> = ix
-        .records
-        .windows(2)
-        .filter(|w| w[1].seq != w[0].seq + 1)
-        .map(|w| serde_json::json!({"after_seq": w[0].seq, "next_seq": w[1].seq}))
+    let gaps: Vec<Value> = seq_gaps(&ix.records)
+        .map(|(after, next)| serde_json::json!({"after_seq": after, "next_seq": next}))
         .collect();
     let first = ix.records.first();
     let last = ix.records.last();
@@ -764,15 +778,14 @@ pub fn inventory(ix: &Index, robot_id: &str) -> Value {
 /// and the referenced records (finding selector).
 pub fn select(ix: &Index, sel: &Selector) -> Result<(usize, usize, Vec<RecordRef>), ApiError> {
     let n = ix.records.len();
-    if n == 0 {
+    let (Some(first), Some(last)) = (ix.records.first(), ix.records.last()) else {
         return Err(ApiError::new(
             404,
             "no_records",
             "the black box holds no records",
         ));
-    }
-    let first = ix.records[0].seq;
-    let last = ix.records[n - 1].seq;
+    };
+    let (first, last) = (first.seq, last.seq);
     let out_of_range = |what: String| {
         ApiError::new(
             416,
@@ -817,7 +830,7 @@ pub fn select(ix: &Index, sel: &Selector) -> Result<(usize, usize, Vec<RecordRef
         } => {
             let mut idx = Vec::new();
             for r in evidence {
-                let Some(i) = ix.pos(r.seq) else {
+                let Some((i, m)) = ix.pos(r.seq).and_then(|i| Some((i, ix.records.get(i)?))) else {
                     return Err(ApiError::new(
                         404,
                         "evidence_not_retained",
@@ -827,7 +840,6 @@ pub fn select(ix: &Index, sel: &Selector) -> Result<(usize, usize, Vec<RecordRef
                         ),
                     ));
                 };
-                let m = &ix.records[i];
                 if to_hex(&m.hash) != r.sha256 || m.segment != r.segment {
                     return Err(ApiError::new(
                         409,
@@ -848,21 +860,22 @@ pub fn select(ix: &Index, sel: &Selector) -> Result<(usize, usize, Vec<RecordRef
             // Context, but only as far as the seqs stay contiguous.
             let ctx = *context_records as usize;
             let mut lo = a;
-            while lo > 0 && a - lo < ctx && ix.records[lo - 1].seq + 1 == ix.records[lo].seq {
+            while lo > 0 && a - lo < ctx && ix.adjacent(lo - 1) {
                 lo -= 1;
             }
             let mut hi = b;
-            while hi + 1 < n && hi - b < ctx && ix.records[hi].seq + 1 == ix.records[hi + 1].seq {
+            while hi + 1 < n && hi - b < ctx && ix.adjacent(hi) {
                 hi += 1;
             }
             (lo, hi, evidence.clone())
         }
     };
-    if let Some(w) = ix.records[lo..=hi]
-        .windows(2)
-        .find(|w| w[1].seq != w[0].seq + 1)
-    {
-        return Err(gap_error(w[0].seq + 1, w[1].seq - 1));
+    // lo <= hi < n: positions of retained seqs, from <= to (parse_selector).
+    let Some(span) = ix.records.get(lo..=hi) else {
+        return Err(bad("invalid_selector", "empty selection"));
+    };
+    if let Some((after, next)) = seq_gaps(span).next() {
+        return Err(gap_error(after + 1, next - 1));
     }
     Ok((lo, hi, refs))
 }
@@ -975,11 +988,12 @@ impl<'a> ChunkHasher<'a> {
         let mut rest = data;
         while !rest.is_empty() {
             let room = (self.chunk_bytes - self.chunk_len) as usize;
-            let n = room.min(rest.len());
-            self.chunk.update(&rest[..n]);
+            let (now, later) = rest.split_at(room.min(rest.len()));
+            let n = now.len();
+            self.chunk.update(now);
             self.chunk_len += n as u64;
             self.bytes += n as u64;
-            rest = &rest[n..];
+            rest = later;
             if self.chunk_len == self.chunk_bytes {
                 self.end_chunk();
             }

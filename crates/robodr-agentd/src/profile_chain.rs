@@ -176,7 +176,11 @@ pub fn latest_accepted(dir: &Path, signer: &dyn Signer) -> Result<ChainScan, Str
     // once; two different records with one sequence number are a fork.
     seen.sort_by_key(|a| (a.seq, a.hash));
     seen.dedup_by(|b, a| a.seq == b.seq && a.hash == b.hash);
-    scan.linkage_breaks += seen.windows(2).filter(|w| w[0].seq == w[1].seq).count();
+    scan.linkage_breaks += seen
+        .iter()
+        .zip(seen.iter().skip(1))
+        .filter(|(a, b)| a.seq == b.seq)
+        .count();
     scan.latest = fold(&seen, &mut scan.drops);
     Ok(scan)
 }

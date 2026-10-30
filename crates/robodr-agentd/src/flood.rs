@@ -314,8 +314,8 @@ fn note_sample<T: PartialEq + Clone>(v: &mut Vec<(T, bool)>, x: &T, motion: bool
         if latest {
             let (y, m) = v.remove(i);
             v.push((y, m || motion));
-        } else {
-            v[i].1 |= motion;
+        } else if let Some((_, m)) = v.get_mut(i) {
+            *m |= motion;
         }
         return;
     }
@@ -647,7 +647,8 @@ fn report(key: &Key, a: &Agg, closing: bool) -> FloodReport {
         // The latest ones first.
         None => format!(
             "from many source addresses (latest sample sources: {})",
-            srcs[srcs.len() - n..]
+            srcs.get(srcs.len().saturating_sub(n)..)
+                .unwrap_or_default()
                 .iter()
                 .rev()
                 .copied()
@@ -709,11 +710,13 @@ fn report(key: &Key, a: &Agg, closing: bool) -> FloodReport {
         for n_src in (0..=srcs.len()).rev() {
             for n in (0..=samples.len()).rev() {
                 // Keep the latest samples of a "many sources" aggregate.
+                // n <= samples.len(), so both ranges are in bounds.
                 let kept = if key.0.is_none() {
-                    &samples[samples.len() - n..]
+                    samples.get(samples.len() - n..)
                 } else {
-                    &samples[..n]
-                };
+                    samples.get(..n)
+                }
+                .unwrap_or_default();
                 let d = compose(&rules, kept, n_src);
                 if fits(&d) {
                     detail = Some(d);

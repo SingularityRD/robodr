@@ -128,10 +128,11 @@ fn line_of(v: &impl Serialize) -> io::Result<Vec<u8>> {
 
 /// Parse one line (without its newline): `Some(json)` if the checksum holds.
 fn parse_line(line: &[u8]) -> Option<Value> {
-    if line.len() < 66 || line.len() > MAX_LINE || line[64] != b' ' {
+    if line.len() < 66 || line.len() > MAX_LINE {
         return None;
     }
-    let (sum, json) = (&line[..64], &line[65..]);
+    let (sum, rest) = line.split_at_checked(64)?;
+    let json = rest.strip_prefix(b" ")?;
     let want = to_hex(&sha256(json));
     if !robodr_blackbox::crypto::ct_eq(want.as_bytes(), sum) {
         return None;
@@ -227,7 +228,8 @@ impl Journal {
                 fragment = true;
                 break;
             }
-            match parse_line(&buf[..buf.len() - 1]) {
+            // `buf` ends with its newline (checked above).
+            match parse_line(buf.split_last().map_or(&[][..], |(_, line)| line)) {
                 Some(v) => {
                     damaged_lines += pending_bad;
                     pending_bad = 0;
