@@ -36,6 +36,7 @@
 //! | DATA addressed to a reader entity announced on a motion / feedback topic, from a writer **never announced via SEDP** (cannot be attributed, so cannot be checked against the profile) and still unannounced [`MotionOptions::unattributed_grace`] after its first sample (or at [`crate::Pipeline::finish`]) | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by writer + topic |
 //! | a decoded sample whose writer prefix is bound to other source IPs than the one it came from (binding table, [`crate::binding`]): somebody speaks for a profiled writer | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
 //! | a decoded sample whose writer prefix is **contested** (claimed by SPDP from two hosts, unpinned): no source is trusted for it | [`rules::MOTION_SAMPLE_SOURCE_MISMATCH`] | Critical on a command channel, High on a feedback topic |
+//! | a motion / feedback writer or reader **evicted** from its bounded table, or a new one **refused** because the table is full of protected motion endpoints (see "Trust and limits") | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High, dedup by endpoint + table |
 //! | a decoded sample whose writer was announced via SEDP but whose participant has **no binding** (no SPDP seen, not pinned, binding expired) or whose datagram source IP does not parse, while the binding check is on | [`rules::MOTION_UNATTRIBUTED_SAMPLE`] | High |
 //! | a decoded command whose speed cannot be bounded from the message (`JointTrajectory` with no velocities and fewer than two points with positions; `robodr_cdr::DecodeAnomaly::UnverifiableCommand`): no envelope can check it | [`rules::MOTION_UNVERIFIABLE_COMMAND`] | Medium, dedup by channel + writer |
 //! | a decoded sample with more bytes after the message than XCDR end padding explains (> 3, `robodr_cdr::DecodeAnomaly::ExcessTrailingBytes`): DDS readers ignore them, nothing standard sends them | [`rules::MOTION_DECODE_ANOMALY`] | Low, dedup by channel + writer + kind (byte count not in the dedup key) |
@@ -74,8 +75,19 @@
 //!   binding check disabled the verdict is
 //!   [`SampleAttribution::NotChecked`] (no finding, not trusted).
 //! * Removals (SEDP dispose) do **not** forget a writer: a spoofed dispose
-//!   must not blind the decoder. Entries are evicted only by the table bound
-//!   (least recently announced, non-motion entries first).
+//!   must not blind the decoder. Entries leave only through the table bound
+//!   ([`MotionOptions::max_writers`] / `max_readers`), in three ranks:
+//!   non-motion entries, then motion entries of participants that are
+//!   neither profiled nor bound (least recently announced first), O(log n)
+//!   per announcement. A motion entry whose GUID prefix is **profiled or
+//!   bound** ([`BindingTable`]) is never evicted, and no entry is evicted
+//!   for a newcomer of a lower rank: the newcomer is refused instead
+//!   (`MotionStats::writers_refused` / `readers_refused`). A flood of
+//!   fresh rogue writers on a motion topic therefore cannot push out the
+//!   robot's real (announced-once) writer. Every eviction of a motion
+//!   entry, and every refused motion newcomer, raises
+//!   [`rules::MOTION_UNATTRIBUTED_SAMPLE`] (High, naming the endpoint and
+//!   its channel): its later samples cannot be attributed.
 //! * A writer announced before the sensor started is unknown until its
 //!   participant re-announces it (SEDP is not periodic): its samples are not
 //!   decoded meanwhile, and samples to a known motion reader raise the
@@ -340,6 +352,10 @@ pub struct MotionStats {
     /// Table evictions (bounded tables).
     pub writers_evicted: u64,
     pub readers_evicted: u64,
+    /// New endpoints not learned because the table was full of entries of
+    /// a higher rank (motion entries of profiled / bound participants).
+    pub writers_refused: u64,
+    pub readers_refused: u64,
     /// User fragments refused / evicted on motion topics.
     pub fragments_refused: u64,
 }
@@ -363,22 +379,65 @@ struct Reading {
 struct Entry {
     readings: Vec<Reading>,
     last_seen: u64,
+    /// Eviction rank as last computed (its key in [`Table::order`]).
+    rank: Rank,
 }
 
 impl Entry {
     fn is_motion(&self) -> bool {
         self.readings.iter().any(|r| r.motion.is_some())
     }
+
+    fn motion_channel(&self) -> Option<&str> {
+        self.readings
+            .iter()
+            .find_map(|r| r.motion.as_ref())
+            .map(|(c, _)| c.as_str())
+    }
 }
 
-/// Bounded GUID → readings table. Eviction: least recently announced
-/// non-motion entry first, then least recently announced overall.
+/// Eviction rank of a table entry: lower ranks go first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// No reading on a motion / feedback topic.
+    Plain,
+    /// Motion entry of a participant neither profiled nor bound.
+    Motion,
+    /// Motion entry of a profiled or bound participant: never evicted.
+    Protected,
+}
+
+/// What [`Table::learn`] did besides recording the reading.
+#[derive(Debug)]
+enum Learned {
+    /// Recorded (new or refreshed), nothing evicted.
+    Kept,
+    /// Recorded; this entry was evicted to make room.
+    Evicted(Guid, Entry),
+    /// Not recorded: every entry outranks the newcomer (or is protected).
+    Refused,
+}
+
+/// Bounded GUID → readings table, see "Trust and limits" in the module docs.
+/// Every operation is O(log n) plus amortised re-ranking.
 #[derive(Debug, Default)]
 struct Table {
     map: HashMap<Guid, Entry>,
+    /// `(rank, last_seen, guid)` of every entry: the first element is the
+    /// next victim (if its rank is still current, see [`Table::learn`]).
+    order: BTreeSet<(Rank, u64, Guid)>,
     cap: usize,
     clock: u64,
     evicted: u64,
+    refused: u64,
+}
+
+fn rank_of(e: &Entry, protected: bool) -> Rank {
+    match (e.is_motion(), protected) {
+        (false, _) => Rank::Plain,
+        (true, false) => Rank::Motion,
+        (true, true) => Rank::Protected,
+    }
 }
 
 impl Table {
@@ -389,47 +448,141 @@ impl Table {
         }
     }
 
-    /// Record a reading; returns the GUID of an evicted entry, if any.
-    fn learn(&mut self, guid: Guid, reading: Reading) -> Option<(Guid, Entry)> {
+    /// Move `guid` to `rank` in the eviction order.
+    fn rerank(&mut self, guid: &Guid, rank: Rank) {
+        if let Some(e) = self.map.get_mut(guid) {
+            self.order.remove(&(e.rank, e.last_seen, *guid));
+            e.rank = rank;
+            self.order.insert((rank, e.last_seen, *guid));
+        }
+    }
+
+    /// Record a reading. `protected` says whether a GUID's participant is
+    /// profiled or bound *now* (it is re-evaluated, so a binding learned or
+    /// lost after the announcement is honoured at eviction time).
+    fn learn(
+        &mut self,
+        guid: Guid,
+        reading: Reading,
+        protected: impl Fn(&Guid) -> bool,
+    ) -> Learned {
         self.clock += 1;
         let clock = self.clock;
         if let Some(e) = self.map.get_mut(&guid) {
+            self.order.remove(&(e.rank, e.last_seen, guid));
             e.last_seen = clock;
-            if e.readings.contains(&reading) {
-                return None;
-            }
-            if e.readings.len() < MAX_READINGS_PER_ENDPOINT {
-                e.readings.push(reading);
-            } else if reading.motion.is_some() {
-                // Never let junk readings displace a motion reading; a
-                // motion reading may displace the newest non-motion one.
-                if let Some(slot) = e.readings.iter_mut().rfind(|r| r.motion.is_none()) {
-                    *slot = reading;
+            if !e.readings.contains(&reading) {
+                if e.readings.len() < MAX_READINGS_PER_ENDPOINT {
+                    e.readings.push(reading);
+                } else if reading.motion.is_some() {
+                    // Never let junk readings displace a motion reading; a
+                    // motion reading may displace the newest non-motion one.
+                    if let Some(slot) = e.readings.iter_mut().rfind(|r| r.motion.is_none()) {
+                        *slot = reading;
+                    }
                 }
             }
-            return None;
+            e.rank = rank_of(e, protected(&guid));
+            self.order.insert((e.rank, clock, guid));
+            return Learned::Kept;
         }
+        let entry = Entry {
+            readings: vec![reading],
+            last_seen: clock,
+            rank: Rank::Plain,
+        };
+        let rank = rank_of(&entry, protected(&guid));
         let mut evicted = None;
-        if self.map.len() >= self.cap {
-            let victim = self
-                .map
-                .iter()
-                .min_by_key(|(_, e)| (e.is_motion(), e.last_seen))
-                .map(|(g, _)| *g);
-            if let Some(g) = victim {
-                evicted = self.map.remove(&g).map(|e| (g, e));
-                self.evicted += 1;
+        while self.map.len() >= self.cap {
+            let Some(&(stored, _, victim)) = self.order.first() else {
+                break;
+            };
+            let Some(v) = self.map.get(&victim) else {
+                // Unreachable: `order` mirrors `map`. Heal it.
+                self.order.pop_first();
+                continue;
+            };
+            let current = rank_of(v, protected(&victim));
+            if current != stored {
+                // Bound / profiled (or not) since it was last ranked. Each
+                // entry is re-ranked at most once per call.
+                self.rerank(&victim, current);
+                continue;
             }
+            if current == Rank::Protected || current > rank {
+                self.refused += 1;
+                return Learned::Refused;
+            }
+            self.order.pop_first();
+            evicted = self.map.remove(&victim).map(|e| (victim, e));
+            self.evicted += 1;
         }
-        self.map.insert(
-            guid,
-            Entry {
-                readings: vec![reading],
-                last_seen: clock,
-            },
-        );
-        evicted
+        self.order.insert((rank, clock, guid));
+        self.map.insert(guid, Entry { rank, ..entry });
+        match evicted {
+            Some((g, e)) => Learned::Evicted(g, e),
+            None => Learned::Kept,
+        }
     }
+
+    #[cfg(test)]
+    fn check_invariants(&self) {
+        assert_eq!(self.order.len(), self.map.len());
+        for (g, e) in &self.map {
+            assert!(self.order.contains(&(e.rank, e.last_seen, *g)));
+        }
+        assert!(self.map.len() <= self.cap);
+    }
+}
+
+/// [`rules::MOTION_UNATTRIBUTED_SAMPLE`] for a motion endpoint the bounded
+/// table dropped (`evicted`) or could not take (`!evicted`).
+fn table_deviation(
+    kind: EndpointKind,
+    guid: &Guid,
+    e: &Entry,
+    cap: usize,
+    evicted: bool,
+) -> Deviation {
+    let role = match kind {
+        EndpointKind::Writer => "writer",
+        EndpointKind::Reader => "reader",
+    };
+    let channel = short(e.motion_channel().unwrap_or("?"));
+    let what = if evicted {
+        format!(
+            "was evicted from the {role} table ({cap} entries) to make room for a newer \
+             announcement (an endpoint flood?)"
+        )
+    } else {
+        format!(
+            "was not learned: the {role} table ({cap} entries) is full of motion endpoints of \
+             profiled or bound participants (an endpoint flood?)"
+        )
+    };
+    let effect = match kind {
+        EndpointKind::Writer => {
+            "its samples are no longer attributed or checked against the profile until it \
+             re-announces"
+        }
+        EndpointKind::Reader => {
+            "DATA addressed to it is no longer recognised as motion traffic until it re-announces"
+        }
+    };
+    Deviation::new(
+        rules::MOTION_UNATTRIBUTED_SAMPLE,
+        Severity::High,
+        format!(
+            "motion {role} {} on {channel} {what}: {effect}",
+            hex_guid(guid)
+        ),
+    )
+}
+
+fn prefix_of(guid: &Guid) -> GuidPrefix {
+    let mut prefix = [0u8; 12];
+    prefix.copy_from_slice(&guid[..12]);
+    prefix
 }
 
 /// State of the motion decode path. Owned by [`crate::Pipeline`].
@@ -567,6 +720,8 @@ impl MotionTracker {
         s.readers_known = self.readers.map.len() as u64;
         s.writers_evicted = self.writers.evicted;
         s.readers_evicted = self.readers.evicted;
+        s.writers_refused = self.writers.refused;
+        s.readers_refused = self.readers.refused;
         s
     }
 
@@ -602,13 +757,21 @@ impl MotionTracker {
     /// Learn writer / reader GUIDs from the SEDP announcements of `report`
     /// (every reading, alternates included).
     /// Returns the [`rules::MOTION_COMMAND_TYPE_MISMATCH`] findings of the
-    /// announcements (writers on profiled command channels only).
-    /// Each finding with the GUID prefix of the endpoint it is about.
+    /// announcements (writers on profiled command channels only) and the
+    /// table findings (a motion endpoint evicted or refused, see the module
+    /// docs). Each finding with the GUID prefix of the endpoint it is about.
+    /// `binding` says which participants are profiled or bound (their
+    /// motion endpoints are never evicted).
     pub(crate) fn learn(
         &mut self,
         profile: &Profile,
+        binding: &BindingTable,
         report: &DatagramReport,
     ) -> Vec<(Deviation, GuidPrefix)> {
+        let protected = |g: &Guid| {
+            let p = prefix_of(g);
+            binding.is_profiled(&p) || binding.is_bound(&p)
+        };
         let mut found = Vec::new();
         for ep in &report.endpoints {
             let mut readings: Vec<(Guid, String, String)> = Vec::new();
@@ -624,8 +787,7 @@ impl MotionTracker {
                 let motion = self.classify(profile, &topic);
                 if let (EndpointKind::Writer, Some((channel, Role::Command))) = (ep.kind, &motion) {
                     if let Some(why) = self.command_type_problem(profile, channel, &type_name) {
-                        let mut prefix = [0u8; 12];
-                        prefix.copy_from_slice(&guid[..12]);
+                        let prefix = prefix_of(&guid);
                         found.push((
                             Deviation::new(
                                 rules::MOTION_COMMAND_TYPE_MISMATCH,
@@ -649,21 +811,62 @@ impl MotionTracker {
                 };
                 match ep.kind {
                     EndpointKind::Writer => {
+                        let newcomer = (reading.motion.is_some()
+                            && !self.writers.map.contains_key(&guid))
+                        .then(|| Entry {
+                            readings: vec![reading.clone()],
+                            last_seen: 0,
+                            rank: Rank::Motion,
+                        });
+                        match self.writers.learn(guid, reading, protected) {
+                            Learned::Kept => {}
+                            Learned::Evicted(g, e) => {
+                                if e.is_motion() {
+                                    let cap = self.writers.cap;
+                                    let d = table_deviation(ep.kind, &g, &e, cap, true);
+                                    found.push((d, prefix_of(&g)));
+                                }
+                            }
+                            Learned::Refused => {
+                                if let Some(e) = newcomer {
+                                    let cap = self.writers.cap;
+                                    let d = table_deviation(ep.kind, &guid, &e, cap, false);
+                                    found.push((d, prefix_of(&guid)));
+                                }
+                                continue;
+                            }
+                        }
                         if self.pending_unattributed.remove(&guid).is_some() {
                             self.stats.announced_late += 1;
                         }
-                        self.writers.learn(guid, reading);
                     }
                     EndpointKind::Reader => {
                         let entity: EntityId = guid[12..].try_into().unwrap_or_default();
                         let was_motion = self.readers.map.get(&guid).is_some_and(Entry::is_motion);
-                        let evicted = self.readers.learn(guid, reading);
+                        let newcomer = (reading.motion.is_some()
+                            && !self.readers.map.contains_key(&guid))
+                        .then(|| Entry {
+                            readings: vec![reading.clone()],
+                            last_seen: 0,
+                            rank: Rank::Motion,
+                        });
+                        let learned = self.readers.learn(guid, reading, protected);
                         let is_motion = self.readers.map.get(&guid).is_some_and(Entry::is_motion);
                         if is_motion && !was_motion {
                             *self.motion_reader_entities.entry(entity).or_insert(0) += 1;
                         }
-                        if let Some((g, e)) = evicted {
+                        if let (Learned::Refused, Some(e)) = (&learned, newcomer) {
+                            let cap = self.readers.cap;
+                            let d = table_deviation(ep.kind, &guid, &e, cap, false);
+                            found.push((d, prefix_of(&guid)));
+                        }
+                        if let Learned::Evicted(g, e) = learned {
                             if e.is_motion() {
+                                let cap = self.readers.cap;
+                                found.push((
+                                    table_deviation(ep.kind, &g, &e, cap, true),
+                                    prefix_of(&g),
+                                ));
                                 let ent: EntityId = g[12..].try_into().unwrap_or_default();
                                 if let Some(n) = self.motion_reader_entities.get_mut(&ent) {
                                     *n = n.saturating_sub(1);
@@ -1121,38 +1324,130 @@ mod tests {
         [n; 16]
     }
 
+    fn none(_: &Guid) -> bool {
+        false
+    }
+
+    fn evicted(l: Learned) -> Option<Guid> {
+        match l {
+            Learned::Evicted(g, _) => Some(g),
+            _ => None,
+        }
+    }
+
     #[test]
     fn table_evicts_non_motion_entries_first_and_stays_bounded() {
         let mut t = Table::new(3);
-        t.learn(g(1), reading("cmd", true));
-        t.learn(g(2), reading("a", false));
-        t.learn(g(3), reading("b", false));
+        t.learn(g(1), reading("cmd", true), none);
+        t.learn(g(2), reading("a", false), none);
+        t.learn(g(3), reading("b", false), none);
         // Re-announcing refreshes; the oldest non-motion entry goes.
-        t.learn(g(2), reading("a", false));
-        let ev = t.learn(g(4), reading("c", false)).map(|(g, _)| g);
+        t.learn(g(2), reading("a", false), none);
+        let ev = evicted(t.learn(g(4), reading("c", false), none));
         assert_eq!(ev, Some(g(3)));
         for n in 5..50 {
-            t.learn(g(n), reading("x", false));
+            t.learn(g(n), reading("x", false), none);
             assert!(t.map.len() <= 3);
         }
         assert!(t.map.contains_key(&g(1)), "the motion writer survives");
         assert_eq!(t.evicted, 46);
+        t.check_invariants();
         assert_eq!(Table::new(0).cap, 1);
         assert_eq!(Table::new(usize::MAX).cap, MAX_MAX_ENDPOINTS);
+    }
+
+    thread_local! {
+        static VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Review: picking the victim scanned the whole map on every new GUID
+    /// once the table was full (O(cap) per announcement). Count how often
+    /// the protection predicate is consulted (once per candidate looked
+    /// at): it must stay O(1) per announcement.
+    #[test]
+    fn full_table_victim_choice_is_not_a_scan() {
+        let counting = |_: &Guid| {
+            VISITS.with(|v| v.set(v.get() + 1));
+            false
+        };
+        let cap = 4096;
+        let mut t = Table::new(cap);
+        let guid = |n: u32| {
+            let mut x = [0u8; 16];
+            x[..4].copy_from_slice(&n.to_be_bytes());
+            x
+        };
+        for n in 0..cap as u32 {
+            t.learn(guid(n), reading("x", n % 2 == 0), counting);
+        }
+        let before = VISITS.with(std::cell::Cell::get);
+        let extra = 4096u32;
+        for n in 0..extra {
+            t.learn(guid(1_000_000 + n), reading("y", n % 3 == 0), counting);
+        }
+        let visits = VISITS.with(std::cell::Cell::get) - before;
+        assert!(
+            visits <= 4 * u64::from(extra),
+            "{visits} candidate visits for {extra} announcements"
+        );
+        t.check_invariants();
+    }
+
+    /// Review: 4096 fresh rogue writers on a motion topic evicted the robot's
+    /// real writer. Motion entries of profiled / bound participants are
+    /// never evicted; a lower-ranked newcomer is refused instead.
+    #[test]
+    fn protected_motion_entries_are_never_evicted() {
+        let robot = |x: &Guid| x[0] == 1;
+        let mut t = Table::new(4);
+        t.learn(g(1), reading("cmd", true), robot);
+        // A rogue motion flood (unbound prefixes): they evict each other.
+        for n in 100..200 {
+            let l = t.learn(g(n), reading("cmd", true), robot);
+            if let Learned::Evicted(v, e) = l {
+                assert_ne!(v, g(1));
+                assert!(e.is_motion());
+            }
+        }
+        assert!(t.map.contains_key(&g(1)));
+        // Non-motion newcomers never evict motion entries.
+        assert!(matches!(
+            t.learn(g(2), reading("chatter", false), robot),
+            Learned::Refused
+        ));
+        // A table full of protected entries refuses even motion newcomers.
+        let all = |_: &Guid| true;
+        let mut t = Table::new(2);
+        t.learn(g(1), reading("cmd", true), all);
+        t.learn(g(2), reading("cmd", true), all);
+        assert!(matches!(
+            t.learn(g(3), reading("cmd", true), all),
+            Learned::Refused
+        ));
+        assert_eq!(t.refused, 1);
+        // Protection is re-evaluated: an entry bound after it was learned
+        // is promoted at eviction time instead of evicted.
+        let mut t = Table::new(2);
+        t.learn(g(1), reading("cmd", true), none);
+        t.learn(g(2), reading("cmd", true), none);
+        let v = evicted(t.learn(g(3), reading("cmd", true), robot));
+        assert_eq!(v, Some(g(2)));
+        assert!(t.map.contains_key(&g(1)));
+        t.check_invariants();
     }
 
     #[test]
     fn junk_readings_never_displace_a_motion_reading() {
         let mut t = Table::new(4);
-        t.learn(g(1), reading("cmd", true));
+        t.learn(g(1), reading("cmd", true), none);
         for i in 0..20 {
-            t.learn(g(1), reading(&format!("junk{i}"), false));
+            t.learn(g(1), reading(&format!("junk{i}"), false), none);
         }
         let e = &t.map[&g(1)];
         assert_eq!(e.readings.len(), MAX_READINGS_PER_ENDPOINT);
         assert!(e.is_motion());
         // A motion reading displaces a junk one when full.
-        t.learn(g(1), reading("cmd2", true));
+        t.learn(g(1), reading("cmd2", true), none);
         assert_eq!(
             t.map[&g(1)]
                 .readings

@@ -976,6 +976,12 @@ impl BindingTable {
         self.held.len()
     }
 
+    /// Is `prefix` a profiled participant (statically, or resolved at run
+    /// time via [`BindingTable::set_profiled`])?
+    pub fn is_profiled(&self, prefix: &GuidPrefix) -> bool {
+        self.profiled.contains(prefix)
+    }
+
     /// Is `prefix` currently bound (learned or pinned)?
     pub fn is_bound(&self, prefix: &GuidPrefix) -> bool {
         self.entries.contains_key(prefix) || self.opts.participant_ips.contains_key(prefix)

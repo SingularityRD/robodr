@@ -1085,7 +1085,7 @@ impl Pipeline {
         self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
-        for (dev, p) in self.motion.learn(&self.profile, &report) {
+        for (dev, p) in self.motion.learn(&self.profile, &self.binding, &report) {
             self.push_for(&mut out, dev, src_ip, Some(p));
         }
         let ctx = DatagramCtx {

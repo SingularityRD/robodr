@@ -50,7 +50,7 @@ is tested offline. The same code runs in three places:
 | `robot.sensor.findings_capped` | the most severe suppressed, at least Medium | one input produced more than `max_findings_per_datagram` new findings |
 | the profile's motion rules (`robot.motion.linear_over_envelope`, `angular_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) | a `MotionCommand` decoded from user DATA on a profiled motion channel (`motion.evaluate_commands`, default on) |
 | `robot.motion.undecodable_sample` | Medium, rate limited | a sample on a motion / feedback topic was not inspected: undecodable CDR, unknown type, wrong-role type, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap |
-| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP |
+| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP; also a motion writer / reader evicted from (or refused by) the bounded endpoint tables |
 | `robot.motion.sample_source_mismatch` | Critical (command topic) / High (feedback) | a decoded motion sample whose writer prefix is bound (SPDP / `participant_ips`) to other IPs than its source |
 | `robot.motion.command_type_mismatch` | High | a writer announced on a profiled command channel with a type other than the profile's `motion_types` entry, a type no decoder knows, or a feedback type; at the announcement, never rate limited |
 | `robot.unitree.legacy_unknown_sender` | Critical (command, decoded or compressed) / Medium (state, or no legacy length) | a Unitree legacy UDP frame from an IP not in `unitree_legacy.command_senders` (commands) / `robot_addresses` (state); the legacy protocol is unauthenticated. Not in the shared rate limiter: one finding per sender for the first 16 senders of a class |
@@ -172,7 +172,14 @@ joint firewall's clock).
   is re-announced; its samples are not decoded meanwhile (and samples to a
   known motion reader raise `unattributed_sample`).
 - A SEDP dispose does not forget a writer (a spoofed dispose must not blind
-  the decoder); the tables are bounded and evict non-motion entries first.
+  the decoder); the tables are bounded and evict non-motion entries first,
+  then motion entries of participants neither profiled nor bound (least
+  recently announced first, O(log n)). A motion writer / reader of a
+  profiled or bound participant is never evicted: a newcomer that would
+  need it gone is refused (`MotionStats::writers_refused` /
+  `readers_refused`), so a flood of fresh rogue `cmd_vel` writers cannot
+  push out the robot's real writer. Every evicted or refused motion
+  endpoint raises `robot.motion.unattributed_sample` (High) naming it.
 
 ## Go2 WebRTC sessions (`webrtc`)
 
