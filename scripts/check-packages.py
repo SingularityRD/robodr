@@ -34,6 +34,13 @@ Static checks (no package needed; CI job `scripts`):
      bounded CapabilityBoundingSet (RULES_CAPS), ProtectSystem=strict,
      ProtectHome=, PrivateTmp=, NoNewPrivileges=, a SystemCallFilter=.
 
+  10. release.yml: `prepare` and `publish` refuse a tag whose commit is
+     not on main (git merge-base --is-ancestor); every build job has an
+     independent rebuild job (the toolchain from
+     scripts/ci-install-pinned-toolchain.sh, never rustup) that `publish`
+     needs, and `publish` runs scripts/compare-rebuild.py before it writes
+     SHA256SUMS and signs.
+
   5a. Every unit (regular and focal) and every unit with each of its
      drop-in examples applied: with SecureBits=noroot / noroot-locked, a
      process of uid 0 gets capabilities on execve only through the ambient
@@ -249,7 +256,9 @@ def workflow_requires(text: str) -> list[tuple[int, str, set[str]]]:
     """(line, variant, programs) for every ROBODR_DEB_REQUIRE in a workflow.
 
     The variant is robodr-focal when the step's run script passes
-    `--variant focal`. A step is the text up to the next "- name:" line.
+    `--variant focal` (build-deb.sh) or runs `scripts/ci-rebuild.sh focal`
+    (release.yml's independent rebuild). A step is the text up to the next
+    "- name:" line.
     """
     lines = text.splitlines()
     out = []
@@ -265,7 +274,7 @@ def workflow_requires(text: str) -> list[tuple[int, str, set[str]]]:
         while end < len(lines) and not re.match(r"\s*- (name|uses):", lines[end]):
             end += 1
         step = "\n".join(lines[start:end])
-        variant = FOCAL if "--variant focal" in step else STD
+        variant = FOCAL if re.search(r"--variant focal|ci-rebuild\.sh focal\b", step) else STD
         out.append((i + 1, variant, set(m.group(1).split())))
     return out
 
@@ -519,6 +528,60 @@ def check_rules_unit(root: Path) -> list[str]:
     return errs
 
 
+def job_blocks(text: str) -> dict[str, str]:
+    """Top-level jobs of a workflow: name -> its text (by indentation)."""
+    out, name, buf, on = {}, None, [], False
+    for ln in text.splitlines():
+        if re.match(r"^jobs:\s*$", ln):
+            on = True
+            continue
+        if not on:
+            continue
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", ln)
+        if m:
+            if name:
+                out[name] = "\n".join(buf)
+            name, buf = m.group(1), []
+        elif name:
+            buf.append(ln)
+    if name:
+        out[name] = "\n".join(buf)
+    return out
+
+
+REBUILDS = {"build": "rebuild-deb", "build-rpm": "rebuild-rpm", "build-static": "rebuild-static"}
+
+
+def check_release_workflow_text(text: str) -> list[str]:
+    errs = []
+    jobs = job_blocks(text)
+    for j in ("prepare", "publish"):
+        if "merge-base --is-ancestor" not in jobs.get(j, "") or "origin/main" not in jobs.get(j, ""):
+            errs.append(f"release.yml: job {j} does not check that the tagged commit is on main")
+    pub = jobs.get("publish", "")
+    m = re.search(r"needs:\s*\[([^\]]*)\]", pub)
+    needs = {x.strip() for x in m.group(1).split(",")} if m else set()
+    for build, rebuild in REBUILDS.items():
+        rb = jobs.get(rebuild, "")
+        if not rb:
+            errs.append(f"release.yml: no independent rebuild job {rebuild} for {build}")
+            continue
+        if "ci-install-pinned-toolchain.sh" not in rb or "ci-install-rustup.sh" in rb or "rustup " in rb:
+            errs.append(f"release.yml: {rebuild} must install the toolchain from pinned artifacts, not rustup")
+        if "ci-rebuild.sh" not in rb:
+            errs.append(f"release.yml: {rebuild} does not run scripts/ci-rebuild.sh")
+        if rebuild not in needs:
+            errs.append(f"release.yml: publish does not need {rebuild}")
+    cmp_at, sums_at, sign_at = pub.find("python3 scripts/compare-rebuild.py"), pub.find("> SHA256SUMS"), pub.find("minisign -S")
+    if cmp_at < 0 or not (0 <= cmp_at < sums_at < sign_at):
+        errs.append("release.yml: publish must run scripts/compare-rebuild.py before writing SHA256SUMS and signing")
+    return errs
+
+
+def check_release_workflow(root: Path) -> list[str]:
+    return check_release_workflow_text((root / ".github" / "workflows" / "release.yml").read_text())
+
+
 def static_checks(root: Path) -> list[str]:
     return (
         check_classified(workspace_programs(root))
@@ -528,6 +591,7 @@ def static_checks(root: Path) -> list[str]:
         + check_units_caps(root)
         + check_identities(root)
         + check_rules_unit(root)
+        + check_release_workflow(root)
     )
 
 
@@ -812,6 +876,9 @@ def self_test() -> int:
     expect("workflow lists match", wf_errs(wf.format(std=std, foc=foc)), True)
     expect("focal list lacks seal", wf_errs(wf.format(std=std, foc=foc.replace("robodr-seal", ""))), False)
     expect("focal list names pulsard", wf_errs(wf.format(std=std, foc=foc + " robodr-pulsard")), False)
+    rebuild = wf.format(std=std, foc=foc).replace(
+        "packaging/build-deb.sh --variant focal --bin-dir x --arch amd64", "scripts/ci-rebuild.sh focal amd64 out")
+    expect("rebuild step is focal", [] if [v for _, v, _ in workflow_requires(rebuild)] == [STD, FOCAL] else ["v"], True)
     expect("unclassified program", check_classified(set(PROGRAMS) | {"robodr-new"}), False)
     expect("all classified", check_classified(set(PROGRAMS) | set(NEVER_PACKAGED)), True)
 
@@ -902,7 +969,16 @@ def self_test() -> int:
     expect("rules full caps", check_rules_unit_text("r", rules.replace(
         "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE", "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN")), False)
     expect("rules no ProtectSystem", check_rules_unit_text("r", rules.replace("ProtectSystem=strict", "")), False)
-    total = 47
+    # 10. The release workflow.
+    rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    expect("release workflow ok", check_release_workflow_text(rel), True)
+    expect("no main check", check_release_workflow_text(rel.replace("merge-base --is-ancestor", "true")), False)
+    expect("publish without rebuild", check_release_workflow_text(
+        rel.replace(", rebuild-deb, rebuild-rpm, rebuild-static]", "]")), False)
+    expect("rebuild with rustup", check_release_workflow_text(
+        rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
+    expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
+    total = 53
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

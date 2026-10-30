@@ -40,7 +40,7 @@ in the reported expression.
 Statically linked code that is not a crate of Cargo.lock is listed too
 (RUNTIME): the Rust standard library of the pinned toolchain
 (rust-toolchain.toml) in every program, and in robodr-focal's static musl
-builds musl libc and LLVM's libunwind as shipped in that toolchain's
+builds musl libc and LLVM's libunwind and crtbegin/crtend as shipped in that toolchain's
 *-unknown-linux-musl targets (MUSL_FOR_RUST pins the musl version per
 toolchain; a toolchain bump fails until it is updated).
 
@@ -398,9 +398,10 @@ def runtime_rows() -> list[tuple[str, str, str, list[tuple[str, str]]]]:
          f"robodr-focal only: statically linked into its *-unknown-linux-musl programs (the self-contained musl of "
          f"Rust {rust})",
          [(f"musl {musl} COPYRIGHT", (lic / f"musl-{musl}-COPYRIGHT").read_text())]),
-        (f"LLVM libunwind (Rust {rust}, *-unknown-linux-musl)",
+        (f"LLVM libunwind and compiler-rt crtbegin/crtend (Rust {rust}, *-unknown-linux-musl)",
          "Apache-2.0 WITH LLVM-exception",
-         "robodr-focal only: the unwinder Rust's musl targets link statically",
+         "robodr-focal only: the unwinder and C runtime start/end objects Rust's self-contained musl targets "
+         "link statically",
          [("Apache-2.0", apache), ("LLVM-exception", llvm)]),
     ]
 

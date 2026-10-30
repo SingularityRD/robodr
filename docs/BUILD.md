@@ -375,6 +375,26 @@ script then compares `target/<triple>/release/robodr-*`. Controlled:
 | Codegen non-determinism | `codegen-units = 1`, `incremental = false`, `CARGO_INCREMENTAL=0` |
 | Debug info / symbols | `debug = false`, `strip = true` (`[profile.release]`) |
 
+`ci-repro.sh` runs inside each release build job, with that job's
+toolchain installation: it catches path and ordering leaks, not a
+compromised build environment. `release.yml` therefore also has an
+**independent rebuild** per build job (`rebuild-deb`, `rebuild-rpm`,
+`rebuild-static`): another runner (ubuntu-22.04 hosts for the .deb / .rpm
+containers; a fresh ubuntu-24.04 VM for `robodr-focal`, whose pinned clang
+is noble's), the Rust toolchain installed without rustup from hash-pinned
+artifacts (`scripts/ci-install-pinned-toolchain.sh`: the channel manifest
+pinned by SHA-256, each component checked against it), a fresh
+`CARGO_HOME`, every program rebuilt (`robodr-pulsard` included) and every
+package and offline bundle rebuilt (`scripts/ci-rebuild.sh`). `publish`
+compares them with the release (`scripts/compare-rebuild.py`) before it
+signs anything: packages and programs must be identical, bundles too
+except their SBOM (cargo-cyclonedx output). `robodr-pulsard` is not
+claimed to be reproducible: the rebuilt packages carry the release's
+`robodr-pulsard`, so every other byte is compared, and whether the rebuilt
+one matched is recorded in the signed asset `REPRODUCIBILITY-<version>.txt`,
+which is also appended to the release notes. `publish` (and `prepare`)
+also refuse a tag whose commit is not on `main`.
+
 To verify a published release independently: follow
 [C toolchain](#c-toolchain), "Independent verification of a release"
 (the tag with submodules, Rust 1.98.1, the pinned clang,

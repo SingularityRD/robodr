@@ -13,12 +13,14 @@ Pushing a tag `v<VERSION>` runs `release.yml`:
 
 | Job | Runner | Does |
 |---|---|---|
-| `prepare` | ubuntu-24.04 | tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed. Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
+| `prepare` | ubuntu-24.04 | the tagged commit is on `main` (`git merge-base --is-ancestor`); tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed. Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
 | `build` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm (native), in an **Ubuntu 22.04 container** (digest-pinned) | pinned clang-14 for ring, clang-20 (apt.llvm.org, key fingerprint pinned) for Pulsar's eBPF, `scripts/ci-repro.sh` (two builds, two paths, must be bit-identical), release build (`scripts/ci-release-build.sh`: pure workspace, then the Pulsar-bound members incl. `robodr-pulsard`), released == reproduced, `Cargo.lock` unchanged, CycloneDX SBOM, `robodr_<debver>_<arch>.deb` (`Depends:` from `dpkg-shlibdeps`, libc6 floor <= 2.35 checked), offline bundle, SBOM tarball, `SHA256SUMS-<arch>` |
 | `build-rpm` (amd64, arm64) | the same runners, in a **Rocky Linux 9 container** (digest-pinned) | pinned AppStream clang for ring and eBPF, `ci-repro.sh`, release build, released == reproduced, `robodr-<rpmver>-1.<x86_64\|aarch64>.rpm` (`packaging/build-rpm.sh`; generated GLIBC requirement <= 2.34 checked), `SHA256SUMS-rpm-<arch>` |
 | `build-static` (amd64, arm64) | ubuntu-24.04 (both cross-linked with rust-lld) | musl repro + `scripts/build-static.sh`, built == reproduced, smoke run (qemu for arm64), SBOM, `robodr-focal_<debver>_<arch>.deb` + bundle, `SHA256SUMS-focal-<arch>` |
 | `smoke` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm | `scripts/check-packages.py` on the three packages of the architecture, then `scripts/pkg-smoke-matrix.sh`: each package installed with apt / dnf in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky Linux 9 and Fedora 42 containers |
-| `publish` | ubuntu-24.04, environment `release` | downloads the build jobs' workflow artifacts, re-checks every `SHA256SUMS-*`, writes `SHA256SUMS`, signs every asset with minisign, self-verifies with the public key variable, uploads assets, sums and signatures to the draft, publishes it |
+| `rebuild-deb`, `rebuild-rpm` (amd64, arm64) | ubuntu-22.04, ubuntu-22.04-arm, in the same digest-pinned containers | independent rebuild: Rust from hash-pinned artifacts (`scripts/ci-install-pinned-toolchain.sh`, no rustup), fresh `CARGO_HOME`, every program incl. `robodr-pulsard`, package and bundle (`scripts/ci-rebuild.sh`; packaged with the release's `robodr-pulsard`) |
+| `rebuild-static` (amd64, arm64) | a fresh ubuntu-24.04 VM | the same for `robodr-focal` |
+| `publish` | ubuntu-24.04, environment `release` | re-checks that the tagged commit is on `main`; downloads the build jobs' workflow artifacts and the rebuilds, compares them (`scripts/compare-rebuild.py`: packages and programs identical, bundles except their SBOM; `robodr-pulsard` recorded) into the signed `REPRODUCIBILITY-<version>.txt`, re-checks every `SHA256SUMS-*`, writes `SHA256SUMS`, signs every asset with minisign, self-verifies with the public key variable, uploads assets, sums and signatures to the draft, publishes it |
 
 The build jobs have `contents: read` only and hand their assets over as
 workflow artifacts; only `prepare` (creates the draft) and `publish`
@@ -117,11 +119,14 @@ repository.
 4. Tag and push: `git tag -s v<version> -m "RoboDR <version>"` then
    `git push origin v<version>`.
 5. Watch `prepare`, `build` x2, `build-rpm` x2, `build-static` x2,
-   `smoke` x2. Check in the logs: `repro: N binary(ies) reproducible` for
+   `smoke` x2, `rebuild-*` x6. Check in the logs: `repro: N binary(ies) reproducible` for
    each target, the `sha256sum -c` of released vs reproduced, the
    `check-glibc-floor` lines (`.deb` `Depends:`, RPM `GLIBC_` requirement),
    and the `pkg-smoke-matrix` summary (every row `ok`).
 6. Approve the `release` environment for `publish` (second maintainer).
+   It refuses to sign when a rebuild differs; read
+   `REPRODUCIBILITY-<version>.txt` in its log (whether `robodr-pulsard`
+   reproduced is recorded there and in the release notes).
 7. After publish: download the release on a clean machine, verify with the
    pinned release key as in `OPERATIONS.md` section 2, and run
    `scripts/deb-install-smoke.sh` on the four `.deb`s (systemd >= 250 for

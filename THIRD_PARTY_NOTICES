@@ -943,9 +943,9 @@ musl libc 1.2.5
     License: MIT
     Note:    robodr-focal only: statically linked into its *-unknown-linux-musl programs (the self-contained musl of Rust 1.98.1)
     See:     [T210]
-LLVM libunwind (Rust 1.98.1, *-unknown-linux-musl)
+LLVM libunwind and compiler-rt crtbegin/crtend (Rust 1.98.1, *-unknown-linux-musl)
     License: Apache-2.0 WITH LLVM-exception
-    Note:    robodr-focal only: the unwinder Rust's musl targets link statically
+    Note:    robodr-focal only: the unwinder and C runtime start/end objects Rust's self-contained musl targets link statically
     See:     [T21], [T209]
 
 License texts (210)
@@ -2407,7 +2407,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
 [T21] Apache-2.0
-Used by: aya-build 0.2.1, aya-ebpf-bindings 0.2.0, bpf-builder 0.11.0-alpha.1, bpf-common 0.11.0-alpha.1, bpf-feature-autodetect 0.11.0-alpha.1, bpf-features 0.11.0-alpha.1, bpf-features-macros 0.11.0-alpha.1, bpf-filtering 0.11.0-alpha.1, engine-api 0.11.0-alpha.1, file-system-monitor 0.11.0-alpha.1, network-monitor 0.11.0-alpha.1, process-monitor 0.11.0-alpha.1, pulsar 0.11.0-alpha.1, pulsar-core 0.11.0-alpha.1, rules-engine 0.11.0-alpha.1, threat-logger 0.11.0-alpha.1, validatron 0.11.0-alpha.1, validatron-derive 0.11.0-alpha.1, Rust standard library 1.98.1, LLVM libunwind
+Used by: aya-build 0.2.1, aya-ebpf-bindings 0.2.0, bpf-builder 0.11.0-alpha.1, bpf-common 0.11.0-alpha.1, bpf-feature-autodetect 0.11.0-alpha.1, bpf-features 0.11.0-alpha.1, bpf-features-macros 0.11.0-alpha.1, bpf-filtering 0.11.0-alpha.1, engine-api 0.11.0-alpha.1, file-system-monitor 0.11.0-alpha.1, network-monitor 0.11.0-alpha.1, process-monitor 0.11.0-alpha.1, pulsar 0.11.0-alpha.1, pulsar-core 0.11.0-alpha.1, rules-engine 0.11.0-alpha.1, threat-logger 0.11.0-alpha.1, validatron 0.11.0-alpha.1, validatron-derive 0.11.0-alpha.1, Rust standard library 1.98.1, LLVM libunwind and compiler-rt crtbegin/crtend
 ==============================================================================
 
                                  Apache License
@@ -12910,7 +12910,7 @@ authorization of the copyright holder.
 
 ==============================================================================
 [T209] LLVM-exception
-Used by: Rust standard library 1.98.1, LLVM libunwind
+Used by: Rust standard library 1.98.1, LLVM libunwind and compiler-rt crtbegin/crtend
 ==============================================================================
 
 ---- LLVM Exceptions to the Apache 2.0 License ----
