@@ -607,8 +607,8 @@ pub struct TpmNvCounterAnchor {
     dir: PathBuf,
     name: String,
     signer: Mutex<Box<dyn Signer>>,
-    /// Retired recorder keys: authenticate a sidecar written before a key
-    /// rotation ([`TpmNvCounterAnchor::with_previous_keys`]).
+    /// Retired recorder keys: only to name a sidecar left signed by one
+    /// ([`TpmNvCounterAnchor::with_previous_keys`]); it is never trusted.
     previous: Option<PreviousKeys>,
     min_interval: Duration,
     state: Mutex<State>,
@@ -689,13 +689,15 @@ impl TpmNvCounterAnchor {
         })
     }
 
-    /// Also accept a sidecar signed by one of `previous` (the recorder's
-    /// retired keys, the same set given to
-    /// [`crate::Recorder::open_with_keys`]), checked under the key the
-    /// sidecar names. Needed for the first open after
-    /// [`crate::Recorder::rotate_key`] ran without this anchor (e.g.
-    /// `robodr-blackbox rotate` with the daemon stopped): the next mark
-    /// rewrites the sidecar under the current key.
+    /// The recorder's retired keys (the set given to
+    /// [`crate::Recorder::open_with_keys`]), used **only** to explain a
+    /// sidecar still signed by one: such a sidecar is refused all the same.
+    /// A retired key is usually retired because it leaked, and the sidecar
+    /// names no position the rotation could bound, so its holder could
+    /// otherwise vouch for any head at the current count. After an offline
+    /// `robodr-blackbox rotate`, re-sign the sidecar under the new key
+    /// (`rotate --tpm-sidecar`, [`resign_sidecar`]); otherwise the first
+    /// open reports the anchor unreadable and the next mark rewrites it.
     pub fn with_previous_keys(mut self, previous: PreviousKeys) -> Self {
         self.previous = (!previous.is_empty()).then_some(previous);
         self
@@ -765,16 +767,19 @@ impl TpmNvCounterAnchor {
             .lock()
             .map_err(|_| "anchor signer lock poisoned".to_string())?;
         let own = j.key_id == signer.key_id() && signer.verify_own(&msg, &sig) == Some(true);
-        let retired = !own
-            && j.key_id != signer.key_id()
-            && self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.verify_as(&j.key_id, &msg, &sig));
-        if !own && !retired {
-            return Err(bad(
-                "signature does not verify under the recorder's key (or a previous key)",
-            ));
+        if !own {
+            let retired = j.key_id != signer.key_id()
+                && self
+                    .previous
+                    .as_ref()
+                    .is_some_and(|p| p.verify_as(&j.key_id, &msg, &sig));
+            return Err(bad(if retired {
+                "signed by a retired key, which is not trusted after its rotation (re-sign \
+                 it under the current key: robodr-blackbox rotate --tpm-sidecar; the next \
+                 mark also rewrites it)"
+            } else {
+                "signature does not verify under the recorder's key"
+            }));
         }
         Ok(Some(Sidecar {
             counter: j.counter,
@@ -783,6 +788,48 @@ impl TpmNvCounterAnchor {
             hash,
         }))
     }
+}
+
+/// Re-sign the sidecar at `path` (written under `old`, the key being
+/// retired) under `new`, keeping its counter and position: what an offline
+/// key rotation (`robodr-blackbox rotate --tpm-sidecar`) does so the
+/// anchor keeps bounding the head across the rotation. `Ok(false)`: no
+/// sidecar file. A sidecar already signed by `new` is left as is
+/// (`Ok(true)`); one that verifies under neither key is an error.
+pub fn resign_sidecar(path: &Path, old: &dyn Signer, new: &dyn Signer) -> Result<bool, Error> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Err(Error::Config(format!(
+            "TPM anchor sidecar {} has no directory or UTF-8 file name",
+            path.display()
+        )));
+    };
+    let bad = |why: &str| Error::Untrusted(format!("sidecar {}: {why}", path.display()));
+    let Some(s) = read_state(dir, name)? else {
+        return Ok(false);
+    };
+    let mut j: SidecarJson = serde_json::from_str(&s).map_err(|_| bad("unparseable"))?;
+    if j.format != SIDECAR_FORMAT {
+        return Err(bad("unknown format"));
+    }
+    let idx = parse_nv_index(&j.nv_index).map_err(|_| bad("malformed nv_index"))?;
+    let chain_id = hash_from_hex(&j.chain_id).ok_or_else(|| bad("malformed chain_id"))?;
+    let hash = hash_from_hex(&j.hash).ok_or_else(|| bad("malformed hash"))?;
+    let sig = from_hex(&j.sig)
+        .filter(|s| !s.is_empty() && s.len() <= MAX_SIG_LEN)
+        .ok_or_else(|| bad("malformed signature"))?;
+    let msg = sidecar_message(idx, j.counter, &chain_id, j.seq, &hash);
+    if j.key_id == new.key_id() && new.verify_own(&msg, &sig) == Some(true) {
+        return Ok(true);
+    }
+    if j.key_id != old.key_id() || old.verify_own(&msg, &sig) != Some(true) {
+        return Err(bad("signature does not verify under the old key"));
+    }
+    let nsig = new.sign(&msg).map_err(Error::Sign)?;
+    j.key_id = new.key_id().to_string();
+    j.sig = to_hex(&nsig);
+    let data = serde_json::to_vec(&j).map_err(|e| Error::Encode(e.to_string()))?;
+    atomic_write(dir, name, &data)?;
+    Ok(true)
 }
 
 impl HeadAnchor for TpmNvCounterAnchor {
@@ -1290,39 +1337,59 @@ mod tests {
         assert!(Tpm2Tools::new("/usr/bin", "a\nb", Duration::from_secs(1)).is_err());
     }
 
-    // Key rotation: a sidecar written under the retired key is authentic
-    // only with that key among the previous keys (named by the sidecar);
-    // the next mark rewrites it under the current key.
+    // Key rotation: a sidecar under the retired key is never trusted (its
+    // holder could vouch for any head at the current count); the rotation
+    // re-signs it under the new key, and the next mark rewrites it anyway.
     #[test]
-    fn sidecar_of_a_retired_key_verifies_with_previous_keys() {
+    fn sidecar_of_a_retired_key_is_refused_and_resigned_by_the_rotation() {
         let e = env("tpm-rotated", Duration::ZERO);
         e.anchor.advance(&mark(5)).unwrap();
         let new_key = || Box::new(HmacSha256Key::new("unit-b", &[8; 32]).unwrap());
+        let old_key = HmacSha256Key::new("unit", &[7; 32]).unwrap();
         let mut c = TpmAnchorConfig::new(0x0150_0020, &e.sidecar);
         c.min_increment_interval = Duration::ZERO;
-        let rotated =
-            TpmNvCounterAnchor::with_tools(&c, Box::new(e.fake.clone()), new_key()).unwrap();
-        let err = rotated.current().unwrap_err();
-        assert!(err.contains("previous key"), "{err}");
         let old = crate::keys::KeyFile::hmac_from_secret(&[7; 32], Some("unit")).unwrap();
         let prev = PreviousKeys::from_key_files(&[old], false).unwrap();
         let rotated = TpmNvCounterAnchor::with_tools(&c, Box::new(e.fake.clone()), new_key())
             .unwrap()
-            .with_previous_keys(prev);
+            .with_previous_keys(prev.clone());
+        let err = rotated.current().unwrap_err();
+        assert!(err.contains("retired key"), "{err}");
+
+        // Attack: the holder of the retired key forges a sidecar at the
+        // current count naming an older (truncated-to) head.
+        let t = e.fake.0.lock().unwrap().value;
+        let forged_seq = 2u64;
+        let msg = sidecar_message(0x0150_0020, t, &[1; 32], forged_seq, &[2; 32]);
+        let j = SidecarJson {
+            format: SIDECAR_FORMAT.into(),
+            nv_index: format_nv_index(0x0150_0020),
+            counter: t,
+            chain_id: to_hex(&[1; 32]),
+            seq: forged_seq,
+            hash: to_hex(&[2; 32]),
+            key_id: "unit".into(),
+            sig: to_hex(&old_key.sign(&msg).unwrap()),
+        };
+        std::fs::write(&e.sidecar, serde_json::to_vec(&j).unwrap()).unwrap();
+        assert!(
+            rotated.current().is_err(),
+            "a retired-key sidecar is trusted"
+        );
+
+        // The rotation's re-sign: the same position under the new key.
+        e.anchor.advance(&mark(5)).unwrap();
+        assert!(resign_sidecar(&e.sidecar, &old_key, &*new_key()).unwrap());
         assert_eq!(rotated.current().unwrap().map(|h| h.seq), Some(5));
+        // Idempotent; a sidecar under neither key is refused.
+        assert!(resign_sidecar(&e.sidecar, &old_key, &*new_key()).unwrap());
+        let other = HmacSha256Key::new("unit", &[9; 32]).unwrap();
+        let third = HmacSha256Key::new("unit-c", &[6; 32]).unwrap();
+        assert!(resign_sidecar(&e.sidecar, &other, &third).is_err());
         rotated.advance(&mark(6)).unwrap();
         let fresh =
             TpmNvCounterAnchor::with_tools(&c, Box::new(e.fake.clone()), new_key()).unwrap();
         assert_eq!(fresh.current().unwrap().map(|h| h.seq), Some(6));
-        // A wrong previous key does not authenticate the old sidecar.
-        let e2 = env("tpm-rotated-wrong", Duration::ZERO);
-        e2.anchor.advance(&mark(3)).unwrap();
-        let wrong = crate::keys::KeyFile::hmac_from_secret(&[9; 32], Some("unit")).unwrap();
-        let mut c2 = TpmAnchorConfig::new(0x0150_0020, &e2.sidecar);
-        c2.min_increment_interval = Duration::ZERO;
-        let r2 = TpmNvCounterAnchor::with_tools(&c2, Box::new(e2.fake.clone()), new_key())
-            .unwrap()
-            .with_previous_keys(PreviousKeys::from_key_files(&[wrong], false).unwrap());
-        assert!(r2.current().is_err());
+        assert!(!resign_sidecar(&e.sidecar.with_extension("none"), &old_key, &third).unwrap());
     }
 }

@@ -715,7 +715,9 @@ impl<'a> Daemon<'a> {
                         .map_err(bad)?;
                 let mut a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
                     .map_err(|e| bad(e.to_string()))?;
-                // A sidecar written before an in-place key rotation.
+                // Only to name a sidecar left under a retired key in the
+                // error: such a sidecar is refused (re-sign it with
+                // `robodr-blackbox rotate --tpm-sidecar`).
                 if let Some(p) = &r.previous_keys {
                     a = a.with_previous_keys(p.clone());
                 }

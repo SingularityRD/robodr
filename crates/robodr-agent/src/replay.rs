@@ -88,7 +88,8 @@ pub struct ReplayOptions {
     pub blackbox: PathBuf,
     /// Key bytes: an HMAC key (>= 32 bytes, the placeholder authenticator)
     /// or a 32-byte Ed25519 seed, per [`ReplayOptions::key_algorithm`].
-    pub key: Vec<u8>,
+    /// Wiped on drop.
+    pub key: zeroize::Zeroizing<Vec<u8>>,
     /// Key id; `None` derives one from the key.
     pub key_id: Option<String>,
     /// `"hmac-sha256"` (default, for compatibility) or `"ed25519"`.
@@ -146,7 +147,7 @@ impl ReplayOptions {
         profile: impl Into<PathBuf>,
         policy: impl Into<PathBuf>,
         blackbox: impl Into<PathBuf>,
-        key: Vec<u8>,
+        key: impl Into<zeroize::Zeroizing<Vec<u8>>>,
         robot_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -154,7 +155,7 @@ impl ReplayOptions {
             profile: profile.into(),
             policy: policy.into(),
             blackbox: blackbox.into(),
-            key,
+            key: key.into(),
             key_id: None,
             key_algorithm: robodr_blackbox::sign::HMAC_SHA256.into(),
             robot_id: robot_id.into(),
@@ -1059,7 +1060,7 @@ mod tests {
         assert!(matches!(build_agent(&o), Err(ReplayError::Config(m)) if m.contains("step")));
         // Short key.
         let mut o = demo_opts(&bb);
-        o.key = vec![1; 4];
+        o.key = vec![1; 4].into();
         assert!(matches!(build_agent(&o), Err(ReplayError::Config(_))));
         // Firewall without the Twist angular bound.
         let mut o = demo_opts(&bb);

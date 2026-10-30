@@ -859,3 +859,55 @@ fn rotate_refusals_and_the_hmac_migration() {
     assert!(o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("bb-h -> bb-e"), "{}", text(&o));
 }
+
+/// `rotate --previous-keys` gets robodr-agentd's `previous_keys` checks: a
+/// secret key file (the retired signing key left on disk), a key bound to
+/// another unit, or a group-writable trust file is refused; a public file
+/// of this unit works. `--tpm-sidecar` names a sidecar to re-sign (none
+/// here: reported, not an error).
+#[test]
+fn rotate_previous_keys_get_the_agentd_checks() {
+    let d = TestDir::new("cli-rotate-prev");
+    let ka = KeyFile::generate_ed25519(Some("bb-a")).unwrap();
+    let kb = KeyFile::generate_ed25519(Some("bb-b")).unwrap();
+    let kc = KeyFile::generate_ed25519(Some("bb-c")).unwrap();
+    let mut kf = KeyFile::generate_ed25519(Some("bb-f")).unwrap();
+    kf.device_id = Some("ugv-99".into());
+    let (sa, pa) = write_pair(&d, "a", &ka);
+    let (sb, _) = write_pair(&d, "b", &kb);
+    let (sc, _) = write_pair(&d, "c", &kc);
+    let (_, pf) = write_pair(&d, "f", &kf);
+    let dir = d.sub("log");
+    let mut r = Recorder::open(cfg(&dir, big()), ka.signer().unwrap(), clock()).unwrap();
+    recorded(r.append_note(&note(0), false).unwrap());
+    r.close().unwrap();
+    assert!(run(&rotate_args(&dir, &sa, &sb)).status.success());
+
+    let attempt = |prev: &Path| {
+        let mut a = rotate_args(&dir, &sb, &sc);
+        a.extend(["--previous-keys", s(prev)]);
+        run(&a)
+    };
+    let o = attempt(&sa);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("secret key file"), "{}", text(&o));
+    let mut a = rotate_args(&dir, &sb, &sc);
+    a.extend(["--previous-keys", s(&pa), "--previous-keys", s(&pf)]);
+    let o = run(&a);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("bound to device"), "{}", text(&o));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pa, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let o = attempt(&pa);
+        assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+        assert!(text(&o).contains("trust anchor"), "{}", text(&o));
+        std::fs::set_permissions(&pa, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let sidecar = d.sub("tpm-sidecar.json");
+    let mut a = rotate_args(&dir, &sb, &sc);
+    a.extend(["--previous-keys", s(&pa), "--tpm-sidecar", s(&sidecar)]);
+    let o = run(&a);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("no TPM anchor sidecar"), "{}", text(&o));
+}

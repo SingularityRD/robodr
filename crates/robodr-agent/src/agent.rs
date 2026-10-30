@@ -267,6 +267,12 @@ impl Signer for SharedSigner {
             .unwrap_or_else(PoisonError::into_inner)
             .verify_own(message, signature)
     }
+    fn public_fingerprint(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .public_fingerprint()
+    }
 }
 
 /// A verifier for the recorder's own key, shared between every recorder the
@@ -284,6 +290,9 @@ impl Verifier for SharedVerifier {
     }
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
         self.0.verify(message, signature)
+    }
+    fn key_fingerprint(&self, key_id: &str) -> Option<String> {
+        self.0.key_fingerprint(key_id)
     }
 }
 

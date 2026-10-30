@@ -56,7 +56,8 @@ robodr-blackbox verify     DIR|BUNDLE --keyring FILE [--keyring FILE]... [--chec
                            [--device ID] [--allow-hmac] [--allow-mixed-algorithms]
                            [--strict] [--json]
 robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
-                           [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+                           [--previous-keys FILE]... [--tpm-sidecar FILE]
+                           [--boot-id ID] [--reason TEXT]
                            [--allow-hmac]
 robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 ```
@@ -113,6 +114,24 @@ from the command line (argv is readable by every process via `/proc`).
   alone works. Verify a log, directory or bundle spanning a rotation with a
   keyring holding both keys (`verify DIR --keyring old.key.pub --keyring
   new.key.pub`). Rotation is also the HMAC-to-Ed25519 migration path.
+- **A retired key vouches only up to its rotation** (it is usually retired
+  because it leaked). The recorder checks every record under exactly the
+  key the chain names for it: the chain key or a `SegmentStart`'s
+  `signing_key`, changed only by a `KeyRotation` that is signed by its
+  `from` key. Across segments a key never changes without a rotation,
+  never switches back to an earlier key, and a rotation never targets a
+  key that already signed (refused at open for the head, quarantined as
+  critical damage for a closed segment; the verifier reports
+  `KeySwitchRefused`). State files that name no key (`head.json`,
+  `checkpoint.json`, the recovery pin) count under a retired key only for
+  positions at or before the `KeyRotation` that retired it; the export
+  cursor and the TPM sidecar only under the current key (`rotate_key`
+  re-signs the cursor; its seal rewrites checkpoint and head mark).
+  `KeyRotation` v2 carries `to_fingerprint` and a later `SegmentStart`
+  `signing_key_fingerprint` (`sign::key_fingerprint`: SHA-256 of the
+  public key); recorder and verifier check them against the key they hold
+  under that id (`KeyFingerprintMismatch`). v1 records without them stay
+  readable.
 - **`rotate`** does that rotation in place on a stopped log (the writer
   holds the directory lock otherwise): it opens `DIR` of unit `--device`
   with `--old-key` (the current secret key; keys retired by an earlier
@@ -122,13 +141,21 @@ from the command line (argv is readable by every process via `/proc`).
   It refuses a directory without segments (nothing to rotate), the wrong
   old key (`KeyMismatch`), and a log with records it cannot authenticate;
   re-running it after success reports "already rotated" (exit 0).
+  `--previous-keys` get `keys::load_previous_keys`, the checks
+  `robodr-agentd` applies to `blackbox.previous_keys` (public files only,
+  bound to `--device` if bound, HMAC only with `--allow-hmac`, neither the
+  old nor the new key id). `--tpm-sidecar FILE` re-signs the TPM anchor's
+  sidecar under the new key (`tpm_anchor::resign_sidecar`).
   `PreviousKeys` (`keys.rs`) is the `Send + Sync` set of retired keys a
   long-running writer passes to `Recorder::open_with_keys` on every
-  (re)open (`robodr-agentd`'s `blackbox.previous_keys`), and
-  `TpmNvCounterAnchor::with_previous_keys` accepts a sidecar written under
-  a retired key (checked under the key the sidecar names) until the next
-  mark rewrites it. `keys::load_key_files` loads a key or keyring file with
-  the permission rule.
+  (re)open (`robodr-agentd`'s `blackbox.previous_keys`).
+  `TpmNvCounterAnchor` refuses a sidecar signed by a retired key (it names
+  no position the rotation could bound); `with_previous_keys` only makes
+  the error say so, and the next mark rewrites the sidecar.
+  `keys::load_key_files` loads a key or keyring file with the permission
+  rule; files used as trust anchors (keyrings, previous keys, even
+  public-only) must be owned by root or the effective user and not
+  group/world-writable (`KeyFileError::UntrustedFile`).
 - **Limit:** `Keyring::verify` (used for records, which do not name their
   key) accepts a signature from *any* key in the ring. Keep one keyring per
   unit (or fleet trust domain). With HMAC every key file is a forging key on
