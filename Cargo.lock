@@ -2559,6 +2559,7 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
+ "socket2",
 ]
 
 [[package]]

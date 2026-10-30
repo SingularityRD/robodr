@@ -71,6 +71,82 @@ pub struct ServeCfg {
     /// Per-connection deadline, seconds.
     #[serde(default = "d_deadline")]
     pub deadline_s: u64,
+    /// Connection admission (red team 2026-10-30, W2-4;
+    /// `robodr_blackbox::admission`): `max_connections` slots before the
+    /// TLS handshake identified an enrolled unit (a full pool evicts its
+    /// least-progress connection for a newcomer) and as many after, which
+    /// only enrolled units occupy. Pre-authentication connections per
+    /// source address (default 4, 1..=1024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_source: Option<usize>,
+    /// Pre-authentication connections per IPv4 /24 or IPv6 /64 (default
+    /// `max_connections`: off; units share the site subnet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_subnet: Option<usize>,
+    /// Networks (CIDRs) with reserved pre-authentication slots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub priority_sources: Vec<String>,
+    /// Reserved slots of `priority_sources` (default 4, 1..=1024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_connections: Option<usize>,
+    /// New pre-authentication connections per second (default 0: off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_rate_per_s: Option<u32>,
+    /// The ClientHello must arrive within this, ms (default 1000,
+    /// 200..=5000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_hello_timeout_ms: Option<u64>,
+    /// Handshake progress floor after it, bytes/s (default 128, 16..=4096).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_min_bytes_per_s: Option<u32>,
+}
+
+impl ServeCfg {
+    /// The listener's admission rules (validated: [`Config::validate`]).
+    pub fn admission(&self) -> Result<robodr_blackbox::admission::AdmissionConfig, String> {
+        let max = self.max_connections.max(1);
+        let d = robodr_blackbox::admission::ProgressPolicy::default();
+        let progress = robodr_blackbox::admission::ProgressPolicy::validated(
+            self.handshake_hello_timeout_ms
+                .unwrap_or(d.hello_timeout.as_millis() as u64),
+            self.handshake_min_bytes_per_s.unwrap_or(d.min_bytes_per_s),
+            "serve.",
+        )?;
+        let in_range = |what: &str, v: Option<usize>| match v {
+            Some(n) if !(1..=1024).contains(&n) => Err(format!("serve.{what} 1..=1024")),
+            _ => Ok(()),
+        };
+        in_range(
+            "max_connections_per_source",
+            self.max_connections_per_source,
+        )?;
+        in_range(
+            "max_connections_per_subnet",
+            self.max_connections_per_subnet,
+        )?;
+        in_range("priority_connections", self.priority_connections)?;
+        if self.handshake_rate_per_s.is_some_and(|r| r > 100_000) {
+            return Err("serve.handshake_rate_per_s 0..=100000".into());
+        }
+        let priority_sources =
+            robodr_blackbox::admission::parse_priority_sources(&self.priority_sources, "serve.")?;
+        let per_src = self.max_connections_per_source.unwrap_or(4).clamp(1, max);
+        Ok(robodr_blackbox::admission::AdmissionConfig {
+            max_pre_auth: max,
+            max_per_source: per_src,
+            max_per_subnet: self.max_connections_per_subnet.unwrap_or(max).clamp(1, max),
+            max_priority: if priority_sources.is_empty() {
+                0
+            } else {
+                self.priority_connections.unwrap_or(4)
+            },
+            priority_sources,
+            max_authed: max,
+            max_authed_per_source: per_src,
+            rate_per_s: self.handshake_rate_per_s.unwrap_or(0),
+            progress,
+        })
+    }
 }
 
 fn d_conns() -> usize {
@@ -183,6 +259,7 @@ impl Config {
             }
             robodr_blackbox::tls::server_name(&s.server_name)
                 .map_err(|e| err(format!("config: serve.server_name: {e}")))?;
+            s.admission().map_err(|e| err(format!("config: {e}")))?;
         }
         if let Some(a) = &self.anchor {
             robodr_seal::unit::parse_handle(&a.index, 0x01)

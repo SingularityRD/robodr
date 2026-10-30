@@ -84,6 +84,7 @@
     )
 )]
 
+pub mod admission;
 pub mod crypto;
 pub mod export;
 pub mod keys;

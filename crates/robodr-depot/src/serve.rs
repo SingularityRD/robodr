@@ -10,6 +10,15 @@
 //! name, so one unit's connection can never fetch another unit's pack
 //! (client confusion), and a report must be signed by the same unit's
 //! identity key as the TLS client.
+//!
+//! Connection admission (red team 2026-10-30, W2-4;
+//! [`robodr_blackbox::admission`]): `max_connections` slots before the
+//! handshake identified an enrolled unit, where a newcomer evicts the
+//! connection with the least handshake progress instead of being refused
+//! and a ClientHello must arrive within the hello timeout (then keep a
+//! bytes/s floor), and as many slots after it, which only enrolled units
+//! occupy: trickling handshakes cannot keep units from fetching their
+//! packs.
 
 use crate::config::Config;
 use crate::depot::Depot;
@@ -19,7 +28,7 @@ use rustls::{ServerConnection, StreamOwned};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,25 +66,29 @@ pub fn serve(
         .clone()
         .ok_or_else(|| err("no serve configuration"))?;
     let tls = server_config(&cfg)?;
-    let (max, deadline) = (s.max_connections, Duration::from_secs(s.deadline_s));
+    let deadline = Duration::from_secs(s.deadline_s);
+    let admission = robodr_blackbox::admission::Admission::new(s.admission().map_err(err)?);
     listener
         .set_nonblocking(true)
         .map_err(|e| err(e.to_string()))?;
-    let live = Arc::new(AtomicUsize::new(0));
     let cfg = Arc::new(cfg);
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((sock, _)) => {
-                if live.load(Ordering::SeqCst) >= max {
+            Ok((sock, peer)) => {
+                let seen = {
+                    let mut b = [0u8; 2048];
+                    let _ = sock.set_nonblocking(true);
+                    sock.peek(&mut b).unwrap_or(0)
+                };
+                let Ok(mut ticket) = admission.admit_seen(peer.ip(), sock.try_clone().ok(), seen)
+                else {
                     drop(sock);
                     continue;
-                }
+                };
                 let _ = sock.set_nonblocking(false);
-                let (c, t, l, k) = (cfg.clone(), tls.clone(), live.clone(), clock.clone());
-                l.fetch_add(1, Ordering::SeqCst);
+                let (c, t, k) = (cfg.clone(), tls.clone(), clock.clone());
                 std::thread::spawn(move || {
-                    let _ = handle(sock, t, &c, deadline, &k);
-                    l.fetch_sub(1, Ordering::SeqCst);
+                    let _ = handle(sock, t, &c, deadline, &k, Some(&mut ticket));
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -91,28 +104,57 @@ pub fn serve(
 /// handshake, the request head, a report body): each read waits only for
 /// what is left, so trickling bytes does not extend it. Writes keep the
 /// socket's own per-write timeout.
+///
+/// With a progress tracker (a pre-authentication connection, W2-4) its
+/// deadline applies too, and bytes read and written are reported to it.
 pub struct Timed {
     sock: TcpStream,
     until: Instant,
+    progress: Option<Arc<robodr_blackbox::admission::Progress>>,
 }
 
 impl Read for Timed {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let rest = self
-            .until
-            .checked_duration_since(Instant::now())
+        let now = Instant::now();
+        let mut until = self.until;
+        if let Some(p) = &self.progress {
+            if let Some(d) = p.check(now)? {
+                until = until.min(d);
+            }
+        }
+        let rest = until
+            .checked_duration_since(now)
             .filter(|d| !d.is_zero())
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline passed")
             })?;
         self.sock.set_read_timeout(Some(rest))?;
-        self.sock.read(buf)
+        match self.sock.read(buf) {
+            Ok(n) => {
+                if let Some(p) = &self.progress {
+                    p.on_read(n);
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                if let Some(p) = &self.progress {
+                    p.check(Instant::now())?;
+                }
+                Err(e)
+            }
+        }
     }
 }
 
 impl Write for Timed {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.sock.write(buf)
+        let n = self.sock.write(buf)?;
+        if n > 0 {
+            if let Some(p) = &self.progress {
+                p.on_write();
+            }
+        }
+        Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.sock.flush()
@@ -129,19 +171,24 @@ fn error_body(e: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({"error": e})).unwrap_or_default()
 }
 
-/// One connection: handshake, identify the unit, one request.
+/// One connection: handshake, identify the unit, one request. With an
+/// admission `ticket` (the server's), the handshake runs under its
+/// progress deadline and an enrolled unit's connection moves to the
+/// authenticated pool.
 pub fn handle(
     sock: TcpStream,
     tls: Arc<rustls::ServerConfig>,
     cfg: &Config,
     deadline: Duration,
     clock: &Clock,
+    ticket: Option<&mut robodr_blackbox::admission::Ticket>,
 ) -> Result<(), DepotError> {
     let _ = sock.set_write_timeout(Some(deadline));
     let conn = ServerConnection::new(tls).map_err(|e| err(e.to_string()))?;
     let sock = Timed {
         sock,
         until: Instant::now() + deadline.min(REQUEST_DEADLINE),
+        progress: ticket.as_ref().map(|t| t.progress()),
     };
     let mut s = StreamOwned::new(conn, sock);
     // Drive the handshake.
@@ -160,6 +207,12 @@ pub fn handle(
         .ok_or_else(|| err("no client certificate"))?;
     let open = || Depot::open(cfg.clone(), clock());
     let unit = open()?.unit_of_spki(&spki);
+    // An enrolled unit's identity key: an authenticated slot, which no
+    // pre-authentication connection can take (full: it keeps its
+    // pre-authentication one, under the progress deadline).
+    if let (Some(t), Some(_)) = (ticket, &unit) {
+        t.promote();
+    }
     // Read the header block (bounded).
     let mut head = Vec::new();
     let mut b = [0u8; 1];

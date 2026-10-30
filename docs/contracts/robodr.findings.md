@@ -630,6 +630,29 @@ per reason, while a sealed item waits for a site lease. The executed erase
 reports `robot.seal.tamper` and `robot.seal.erased` as in §3c, with
 `robot.seal.erase_deferred` between them when the robot was moving.
 
+## 3f. Rule catalog 2.3: agentd control-plane handshake pressure
+
+<!-- 2.3 agent block: keep separate from the other 2.3 blocks. -->
+
+The 2.3 addition for agentd's control-plane listener (red team
+2026-10-30, W2-4), in a block of its own (`catalog_2_3_agent` in
+`robodr-ocsf`), as `robodr_ocsf::rule_info_for_contract` applies it to a
+message whose `contract_version` is 2.3.x (or later 2.x); a 2.2 validator,
+and a 2.3 validator given a 2.2 message, apply the generic entry. Data
+source `robodr_agent` (like the other `robot.agent.*` ids), no techniques,
+observe-only (self-health). Emitted by `robodr-agentd` when its TCP
+listener evicted pre-authentication connections for newcomers, cut them
+for lack of handshake progress, timed them out or refused them by the
+handshake rate limit; rate-limited by `daemon.health_report_ms`.
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.agent.control_plane_pressure` | Control-plane handshake pressure | Medium |
+
+Catalog sentence (`finding_info.desc`): The robot's control-plane listener evicted, cut for lack of progress, timed out or rate-limited connections that had not authenticated yet: a peer may be holding connection slots open to keep the SOC from reaching the robot. Observe-only; nothing was judged or executed.
+
+<!-- end of the 2.3 agent block -->
+
 ## 4. Ordering and partitioning
 
 * Partition = `toPositive(murmur2(utf8(robot_id))) % partitions` — Kafka's
@@ -991,6 +1014,15 @@ safely. Nothing here is specific to one product.
     agentd (`gateway_feed`, which now accepts the `robot.unitree.webrtc_*`
     ids besides `robot.gateway.*` / `robot.firewall.*`).
 <!-- end of the 2.3 Unitree block -->
+
+<!-- 2.3 agent block -->
+* **2.3.0** — rule-catalog entries only (minor). Agent block (red team
+  2026-10-30, W2-4; other 2.3 additions are listed as their own items):
+  - New entry (data source `robodr_agent`):
+    `robot.agent.control_plane_pressure` (§3f), emitted by
+    `robodr-agentd`. Consumers (AutoSecOps) map it like the other
+    `robot.agent.control_plane_*` ids.
+<!-- end of the 2.3 agent block -->
 
 * **2.3.0** — rule-catalog entries only (minor). Depot block, Sprints
   14a / 14b (other 2.3 additions are listed as their own items):

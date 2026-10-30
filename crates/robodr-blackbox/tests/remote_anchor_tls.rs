@@ -599,8 +599,9 @@ fn a_stalled_handshake_is_an_anchor_failure_not_a_silent_hang() {
     let _ = mitm.join();
 }
 
-/// Review F1 (second half): one source address cannot take every slot,
-/// before or after authenticating.
+/// Review F1 (second half), W2-4: one source address cannot take every
+/// slot; at its share, a newcomer from it evicts that source's own
+/// least-progress connection instead of being refused.
 #[test]
 fn one_source_cannot_hold_every_slot() {
     let pki = Pki::new();
@@ -620,17 +621,64 @@ fn one_source_cannot_hold_every_slot() {
     std::thread::sleep(Duration::from_millis(200));
     let third = TcpStream::connect(s.addr).unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    assert!(
-        !still_open(&third),
-        "a third connection from one source was served"
-    );
-    for h in &held {
-        assert!(still_open(h));
-    }
-    drop(held);
+    assert!(still_open(&third), "the newcomer was refused");
+    assert!(!still_open(&held[0]), "the oldest of the source was kept");
+    assert!(still_open(&held[1]));
+    drop((held, third));
     std::thread::sleep(Duration::from_millis(200));
     let a = anchor(&s.addr, Some(pki.client("ca.pem", None, None, &[])), false).unwrap();
     assert_eq!(round_trip(&a), Ok(Some(5)));
+}
+
+/// W2-4 (red team S3: 10 sources x 8 trickling handshakes filled all 64
+/// slots, units failed to anchor while it lasted): with every
+/// pre-authentication slot held by trickling handshakes, a unit with a
+/// client certificate still completes its exchange (it evicts the
+/// least-progress one), and the tricklers are cut at the hello timeout,
+/// long before `io_timeout`.
+#[test]
+fn trickling_handshakes_cannot_lock_out_a_unit() {
+    let pki = Pki::new();
+    let s = serve_with(
+        "127.0.0.1:0",
+        ServeOptions {
+            max_connections: 4,
+            max_connections_per_source: 4,
+            io_timeout: Duration::from_secs(5),
+            tls: Some(pki.server("server", Some("ca.pem"))),
+            ..ServeOptions::default()
+        },
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut probes = vec![];
+    let mut atk = vec![];
+    for _ in 0..4 {
+        let c = TcpStream::connect(s.addr).unwrap();
+        probes.push(c.try_clone().unwrap());
+        atk.push(trickle(c, Duration::from_millis(100), Arc::clone(&stop)));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let t0 = Instant::now();
+    let a = anchor(
+        &s.addr,
+        Some(pki.client("ca.pem", Some("client"), None, &[])),
+        false,
+    )
+    .unwrap();
+    assert_eq!(round_trip(&a), Ok(Some(5)));
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    // The hello timeout (1 s) cuts every trickler well before io_timeout.
+    std::thread::sleep(Duration::from_millis(1500));
+    for p in &probes {
+        assert!(
+            !still_open(p),
+            "a trickled handshake outlived the hello timeout"
+        );
+    }
+    stop.store(true, Ordering::SeqCst);
+    for t in atk {
+        let _ = t.join();
+    }
 }
 
 /// Review F5: key, CA and password files must be owned by root or the

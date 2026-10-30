@@ -564,6 +564,7 @@ pub fn describe(e: &io::Error) -> String {
 pub struct DeadlineTcp {
     pub tcp: TcpStream,
     deadline: Option<Instant>,
+    progress: Option<Arc<crate::admission::Progress>>,
 }
 
 impl DeadlineTcp {
@@ -572,7 +573,15 @@ impl DeadlineTcp {
         Self {
             tcp,
             deadline: None,
+            progress: None,
         }
+    }
+
+    /// Also enforce (on reads) and feed `p`, a pre-authentication
+    /// connection's progress deadline ([`crate::admission`], W2-4).
+    pub fn with_progress(mut self, p: Arc<crate::admission::Progress>) -> Self {
+        self.progress = Some(p);
+        self
     }
 
     /// Every read and write after this fails once `at` has passed.
@@ -585,8 +594,14 @@ impl DeadlineTcp {
     }
 
     fn arm(&self, write: bool) -> io::Result<()> {
-        let Some(at) = self.deadline else {
-            return Ok(());
+        let progress = match (&self.progress, write) {
+            (Some(p), false) => p.check(Instant::now())?,
+            _ => None,
+        };
+        let at = match (self.deadline, progress) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return Ok(()),
         };
         let left = at.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -603,14 +618,37 @@ impl DeadlineTcp {
 impl Read for DeadlineTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.arm(false)?;
-        self.tcp.read(buf).map_err(timed_out)
+        match self.tcp.read(buf) {
+            Ok(n) => {
+                if let Some(p) = &self.progress {
+                    p.on_read(n);
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                let e = timed_out(e);
+                if e.kind() == io::ErrorKind::TimedOut {
+                    // A cut by the progress deadline says so.
+                    if let Some(p) = &self.progress {
+                        p.check(Instant::now())?;
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 }
 
 impl Write for DeadlineTcp {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.arm(true)?;
-        self.tcp.write(buf).map_err(timed_out)
+        let n = self.tcp.write(buf).map_err(timed_out)?;
+        if n > 0 {
+            if let Some(p) = &self.progress {
+                p.on_write();
+            }
+        }
+        Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.tcp.flush()
@@ -655,8 +693,23 @@ pub fn accept_server(
     config: Arc<ServerConfig>,
     deadline: Instant,
 ) -> Result<StreamOwned<ServerConnection, DeadlineTcp>, String> {
+    accept_server_tracked(tcp, config, deadline, None)
+}
+
+/// [`accept_server`] for a pre-authentication connection whose progress
+/// deadline (`progress`, [`crate::admission`]) also applies; the stream
+/// keeps feeding it until the connection is promoted.
+pub fn accept_server_tracked(
+    tcp: TcpStream,
+    config: Arc<ServerConfig>,
+    deadline: Instant,
+    progress: Option<Arc<crate::admission::Progress>>,
+) -> Result<StreamOwned<ServerConnection, DeadlineTcp>, String> {
     let conn = ServerConnection::new(config).map_err(|e| format!("TLS: {e}"))?;
     let mut sock = DeadlineTcp::new(tcp);
+    if let Some(p) = progress {
+        sock = sock.with_progress(p);
+    }
     sock.set_deadline(deadline);
     let mut s = StreamOwned::new(conn, sock);
     while s.conn.is_handshaking() {

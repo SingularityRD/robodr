@@ -42,12 +42,25 @@ that as "not applied", never as success.
   too, so a peer that sends one byte at a time cannot stretch them.
 * **Connections.** The unix socket has its own slots (2), never shared with
   TCP. On TCP, up to `max_connections` (default 4, 1..=16) connections may
-  be in the TLS handshake or before their request authenticated, and
-  another `max_connections` authenticated ones; one source address holds at
-  most `max_connections_per_source` (default 2, 1..=16) of all of them.
-  Over a cap the connection is closed at accept (no answer;
-  `connections_rejected`); an authenticated request that finds no
-  authenticated slot is answered 503 `busy` (signed).
+  be pre-authentication (in the TLS handshake; on plain loopback TCP,
+  before their request authenticated), and another `max_connections`
+  authenticated ones (TLS: the handshake verified a SOC client
+  certificate), which pre-authentication connections never occupy; one
+  source address holds at most `max_connections_per_source` (default 2,
+  1..=16) in each pool, one IPv4 /24 or IPv6 /64 at most
+  `max_connections_per_subnet` (default 3) pre-authentication ones. A
+  newcomer over a pre-authentication cap is admitted and the connection
+  with the least handshake progress in that scope is closed (no answer;
+  `admission.evicted`); `priority_sources` (CIDRs) have
+  `priority_connections` (default 2) reserved pre-authentication slots.
+  The ClientHello must arrive within `handshake_hello_timeout_ms` (default
+  1000) and the handshake keep `handshake_min_bytes_per_s` (default 128)
+  after that, inside its 5 s. Over the handshake rate
+  (`handshake_rate_per_s`, default 100; per source half of it) a
+  connection is closed at accept (`connections_rejected`). An
+  authenticated request that finds no authenticated slot is answered 503
+  `busy` (signed). Robot-side only (red team 2026-10-30, W2-4; no wire
+  change); see `docs/OPERATIONS.md` §6.4.
 * Answers are JSON (`Content-Type: application/json`) except evidence chunks
   (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
 * **Listeners** (at least one):
@@ -702,7 +715,11 @@ self-health, rate limited by `daemon.health_report_ms`):
   authentication since the last report, TLS handshakes included (count,
   last reason and peer);
 * `robot.agent.control_plane_invalid` (Medium): authenticated requests
-  refused as invalid.
+  refused as invalid;
+* `robot.agent.control_plane_pressure` (Medium, findings 2.3): handshake
+  pressure on the TCP listener: pre-authentication connections evicted,
+  cut for lack of progress, timed out or refused by the rate limit (these
+  are not counted as failed authentications).
 
 `status.json` and every heartbeat carry `control_plane`: `api`, `listening`
 (`mtls:<addr>`, `tcp:<addr>`, `unix:<path>`), `executor`,
@@ -1114,10 +1131,14 @@ another robot), 13 (signed in the removed v1 domain); all 401
   the last complete frame is not exported yet; an export that races with
   cyclic retention is refused (retry).
 * A network attacker without the client certificate can still make the TLS
-  listener spend handshakes (bounded by `max_connections`, the per-source
-  cap and the 5 s deadline, which a byte-at-a-time peer cannot stretch) and
-  drop or delay requests and answers; from several source addresses it can
-  keep every TCP pre-authentication slot busy (never the unix socket's).
+  listener spend handshakes (bounded by the handshake rate limit) and drop
+  or delay requests and answers. It can no longer keep every slot busy by
+  trickling handshakes from several addresses (W2-4: eviction by progress,
+  subnet shares, the hello timeout and progress floor, separate
+  authenticated slots); a SOC in `priority_sources` keeps reserved slots.
+  An unlisted SOC can still lose some connections to an attacker with
+  many addresses that completes ClientHellos quickly or exhausts the
+  global handshake budget.
 * Tested with synthetic traffic, an in-process signing client and an
   OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
   not against a deployed SOC or across a real network.

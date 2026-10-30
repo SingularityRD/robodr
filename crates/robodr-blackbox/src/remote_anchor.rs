@@ -157,7 +157,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -778,9 +778,48 @@ pub struct ServeOptions {
     /// Serve plain TCP when `tls` is `None` (default `false`: refused).
     pub allow_plaintext: bool,
     /// Most connections open at once from one source address (default
-    /// [`DEFAULT_MAX_CONNECTIONS_PER_SOURCE`]): one host cannot take every
-    /// slot, before or after authenticating.
+    /// [`DEFAULT_MAX_CONNECTIONS_PER_SOURCE`]), in each pool: one host
+    /// cannot take every slot, before or after authenticating.
     pub max_connections_per_source: usize,
+    /// Most pre-authentication connections from one IPv4 /24 or IPv6 /64
+    /// (default `max_connections`: off; a fleet often sits in one subnet).
+    pub max_connections_per_subnet: usize,
+    /// Networks with `priority_connections` reserved pre-authentication
+    /// slots (e.g. the fleet's units); empty: none.
+    pub priority_sources: Vec<crate::admission::Cidr>,
+    pub priority_connections: usize,
+    /// New pre-authentication connections per second (0: no limit, the
+    /// default; see [`crate::admission`]).
+    pub handshake_rate_per_s: u32,
+    /// The handshake's progress deadline (ClientHello within
+    /// `hello_timeout`, then a bytes/s floor) on top of `io_timeout`.
+    pub progress: crate::admission::ProgressPolicy,
+}
+
+impl ServeOptions {
+    /// The listener's admission rules (W2-4): `max_connections`
+    /// pre-authentication slots (a full pool evicts its least-progress
+    /// connection for a newcomer) and as many authenticated ones, which
+    /// only connections past a mutual-TLS handshake occupy.
+    pub fn admission(&self) -> crate::admission::AdmissionConfig {
+        let max = self.max_connections.max(1);
+        let per_src = self.max_connections_per_source.clamp(1, max);
+        crate::admission::AdmissionConfig {
+            max_pre_auth: max,
+            max_per_source: per_src,
+            max_per_subnet: self.max_connections_per_subnet.clamp(1, max),
+            priority_sources: self.priority_sources.clone(),
+            max_priority: if self.priority_sources.is_empty() {
+                0
+            } else {
+                self.priority_connections
+            },
+            max_authed: max,
+            max_authed_per_source: per_src,
+            rate_per_s: self.handshake_rate_per_s,
+            progress: self.progress,
+        }
+    }
 }
 
 /// Default of [`ServeOptions::max_connections_per_source`].
@@ -794,6 +833,11 @@ impl Default for ServeOptions {
             tls: None,
             allow_plaintext: false,
             max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
+            max_connections_per_subnet: DEFAULT_MAX_CONNECTIONS,
+            priority_sources: Vec::new(),
+            priority_connections: 0,
+            handshake_rate_per_s: 0,
+            progress: crate::admission::ProgressPolicy::default(),
         }
     }
 }
@@ -1143,6 +1187,7 @@ impl AnchorReceiver {
         io_timeout: Duration,
         tls: Option<Arc<rustls::ServerConfig>>,
         peer: SocketAddr,
+        ticket: &mut crate::admission::Ticket,
     ) {
         let _ = s.set_nonblocking(false);
         let _ = s.set_nodelay(true);
@@ -1158,9 +1203,12 @@ impl AnchorReceiver {
             }
             Err(_) => None,
         };
+        let progress = ticket.progress();
         match tls {
             None => {
-                let mut s = DeadlineTcp::new(s);
+                // Plain TCP (lab): nothing authenticates the channel, the
+                // connection stays in the pre-authentication pool.
+                let mut s = DeadlineTcp::new(s).with_progress(progress);
                 s.set_deadline(deadline);
                 if let Some(a) = answer(read_frame(&mut s, deadline)) {
                     s.set_deadline(Instant::now() + io_timeout);
@@ -1169,9 +1217,20 @@ impl AnchorReceiver {
                 }
             }
             Some(cfg) => {
-                let mut t = match crate::tls::accept_server(s, cfg, deadline) {
+                let mut t = match crate::tls::accept_server_tracked(
+                    s,
+                    cfg,
+                    deadline,
+                    Some(progress.clone()),
+                ) {
                     Ok(t) => t,
                     Err(e) => {
+                        // Evicted for a newcomer or cut for lack of
+                        // progress: handshake pressure, counted by the
+                        // admission (W2-4), not a failed handshake.
+                        if progress.evicted() || progress.was_cut() {
+                            return;
+                        }
                         // A failed handshake (no / unknown client
                         // certificate, plain TCP, scanner) never reaches
                         // the request parser.
@@ -1184,6 +1243,12 @@ impl AnchorReceiver {
                         return;
                     }
                 };
+                // A client certificate the client CA accepts: an
+                // authenticated slot no pre-authentication connection can
+                // take (full: it keeps its pre-authentication one).
+                if t.conn.peer_certificates().is_some_and(|c| !c.is_empty()) {
+                    ticket.promote();
+                }
                 if let Some(a) = answer(read_frame(&mut t, deadline)) {
                     t.sock.set_deadline(Instant::now() + io_timeout);
                     let _ = t.write_all(&a);
@@ -1196,28 +1261,17 @@ impl AnchorReceiver {
     }
 
     /// Accept connections on `listener` until `stop` is set: one thread per
-    /// connection, at most `opts.max_connections` at a time (further ones
-    /// are closed at once), one request each.
+    /// connection, one request each, admitted by [`crate::admission`]
+    /// (W2-4): at most `opts.max_connections` before authentication (a
+    /// full pool evicts its least-progress connection for a newcomer; only
+    /// the optional rate limit closes one at accept) and as many after a
+    /// mutual-TLS handshake.
     pub fn serve(
         self: &Arc<Self>,
         listener: TcpListener,
         opts: &ServeOptions,
         stop: &AtomicBool,
     ) -> io::Result<()> {
-        type PerSource = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
-        struct Active(Arc<AtomicUsize>, PerSource, std::net::IpAddr);
-        impl Drop for Active {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-                let mut m = lock(&self.1);
-                if let Some(n) = m.get_mut(&self.2) {
-                    *n = n.saturating_sub(1);
-                    if *n == 0 {
-                        m.remove(&self.2);
-                    }
-                }
-            }
-        }
         if opts.tls.is_none() && !opts.allow_plaintext {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1225,47 +1279,30 @@ impl AnchorReceiver {
             ));
         }
         listener.set_nonblocking(true)?;
-        let active = Arc::new(AtomicUsize::new(0));
-        let per_source: PerSource = Arc::new(Mutex::new(HashMap::new()));
-        let max = opts.max_connections.max(1);
-        let max_src = opts.max_connections_per_source.max(1);
-        let mut warned_full = false;
+        let admission = crate::admission::Admission::new(opts.admission());
+        let mut reported = 0u64;
+        let mut reported_at: Option<Instant> = None;
         while !stop.load(Ordering::SeqCst) {
+            self.report_pressure(&admission, &mut reported, &mut reported_at);
             match listener.accept() {
                 Ok((s, peer)) => {
-                    if active.load(Ordering::SeqCst) >= max {
-                        if !warned_full {
-                            (self.log)(&format!(
-                                "robodr-anchor-receiver: {max} connections open; closing new \
-                                 ones (first: {peer})"
-                            ));
-                            warned_full = true;
-                        }
+                    let seen = {
+                        let mut b = [0u8; 2048];
+                        let _ = s.set_nonblocking(true);
+                        s.peek(&mut b).unwrap_or(0)
+                    };
+                    let Ok(mut ticket) = admission.admit_seen(peer.ip(), s.try_clone().ok(), seen)
+                    else {
                         drop(s);
                         continue;
-                    }
-                    warned_full = false;
-                    let src = peer.ip();
-                    {
-                        let mut m = lock(&per_source);
-                        let n = m.entry(src).or_insert(0);
-                        if *n >= max_src {
-                            drop(m);
-                            drop(s);
-                            continue;
-                        }
-                        *n += 1;
-                    }
-                    active.fetch_add(1, Ordering::SeqCst);
-                    let guard = Active(Arc::clone(&active), Arc::clone(&per_source), src);
+                    };
                     let me = Arc::clone(self);
                     let t = opts.io_timeout;
                     let tls = opts.tls.clone();
                     let r = std::thread::Builder::new()
                         .name("anchor-conn".into())
                         .spawn(move || {
-                            let _g = guard;
-                            me.connection(s, t, tls, peer);
+                            me.connection(s, t, tls, peer, &mut ticket);
                         });
                     if let Err(e) = r {
                         (self.log)(&format!("robodr-anchor-receiver: spawning: {e}"));
@@ -1284,7 +1321,40 @@ impl AnchorReceiver {
         }
         Ok(())
     }
+
+    /// Log handshake pressure (evictions, progress cuts, rate refusals)
+    /// when it rose, at most once a minute (W2-4).
+    fn report_pressure(
+        &self,
+        admission: &crate::admission::Admission,
+        reported: &mut u64,
+        at: &mut Option<Instant>,
+    ) {
+        if at.is_some_and(|t| t.elapsed() < PRESSURE_LOG_EVERY) {
+            return;
+        }
+        let st = admission.stats();
+        let p = st.pressure();
+        if p > *reported {
+            (self.log)(&format!(
+                "robodr-anchor-receiver: handshake pressure: {} pre-authentication \
+                 connection(s) evicted, {} cut for lack of progress, {} rate-limited so far \
+                 ({} authenticated; {} pre-authentication / {} authenticated open)",
+                st.evicted,
+                st.too_slow,
+                st.refused_rate,
+                st.promoted,
+                st.pre_auth_open + st.priority_open,
+                st.authenticated_open
+            ));
+            *reported = p;
+            *at = Some(Instant::now());
+        }
+    }
 }
+
+/// Handshake pressure is logged at most this often.
+pub const PRESSURE_LOG_EVERY: Duration = Duration::from_secs(60);
 
 fn unit_file(unit: &str) -> String {
     format!("{unit}.json")
@@ -1772,6 +1842,7 @@ mod tests {
     use super::*;
     use crate::sign::HmacSha256Key;
     use crate::sign_ed25519::Ed25519SigningKey;
+    use std::sync::atomic::AtomicUsize;
 
     struct TmpDir(PathBuf);
     impl TmpDir {

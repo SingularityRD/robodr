@@ -60,6 +60,10 @@ pub mod rules {
     /// Authenticated control-plane requests refused as invalid (unknown
     /// action, a parameter the class does not take, an override).
     pub const CONTROL_PLANE_INVALID: &str = "robot.agent.control_plane_invalid";
+    /// The control plane's TCP listener is under handshake pressure:
+    /// pre-authentication connections evicted, cut for lack of progress,
+    /// timed out or refused by the handshake rate limit (W2-4).
+    pub const CONTROL_PLANE_PRESSURE: &str = "robot.agent.control_plane_pressure";
 }
 
 /// Thresholds (milliseconds).

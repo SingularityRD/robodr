@@ -23,7 +23,10 @@
 //!
 //! mTLS authenticates the *channel*; every request must still carry a valid
 //! Ed25519 SOC signature ([`super::auth`]). A failed handshake is counted
-//! as an authentication failure (`robot.agent.control_plane_unauthenticated`).
+//! as an authentication failure (`robot.agent.control_plane_unauthenticated`)
+//! unless it ran out of time or was evicted (handshake pressure,
+//! `robot.agent.control_plane_pressure`) or was abandoned before a
+//! complete ClientHello.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -424,27 +427,53 @@ pub fn describe(e: &io::Error) -> String {
         };
     }
     match e.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "timed out".into(),
+        io::ErrorKind::TimedOut
+            if e.get_ref().is_some_and(|m| {
+                let m = m.to_string();
+                m == robodr_blackbox::admission::TOO_SLOW_HELLO
+                    || m == robodr_blackbox::admission::TOO_SLOW_FLOOR
+            }) =>
+        {
+            e.to_string()
+        }
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => TIMED_OUT.into(),
+        io::ErrorKind::UnexpectedEof => PEER_CLOSED.into(),
         _ => e.to_string(),
     }
 }
 
+/// What [`describe`] says for a peer that closed during the handshake.
+pub const PEER_CLOSED: &str = "closed by the peer";
+
+/// What [`describe`] / [`accept`] say for a handshake that hit its
+/// absolute deadline (a progress cut names itself).
+pub const TIMED_OUT: &str = "timed out";
+
 /// Run the server handshake on `tcp` before `deadline`. On success the
 /// stream and the client end-entity certificate's SPKI SHA-256 (hex).
+/// With `progress` (a pre-authentication slot, W2-4) the handshake must
+/// also keep up with its progress deadline
+/// ([`robodr_blackbox::admission::Progress`]); the stream keeps feeding it
+/// until the slot is promoted.
 pub fn accept(
     config: &Arc<ServerConfig>,
     tcp: TcpStream,
     deadline: Instant,
+    progress: Option<Arc<robodr_blackbox::admission::Progress>>,
 ) -> Result<(TlsStream, String), String> {
     let conn = ServerConnection::new(config.clone()).map_err(|e| format!("TLS: {e}"))?;
-    let mut s = StreamOwned::new(conn, super::http::DeadlineTcp::new(tcp));
+    let mut sock = super::http::DeadlineTcp::new(tcp);
+    if let Some(p) = progress {
+        sock = sock.with_progress(p);
+    }
+    let mut s = StreamOwned::new(conn, sock);
     // rustls' complete_io loops over many socket reads; the wrapper bounds
     // each one by the time left, so a peer dripping bytes cannot stretch
     // the handshake past `deadline` (review finding 1).
     s.sock.set_read_deadline_at(deadline);
     while s.conn.is_handshaking() {
         if Instant::now() >= deadline {
-            return Err("timed out".into());
+            return Err(TIMED_OUT.into());
         }
         if let Err(e) = s.conn.complete_io(&mut s.sock) {
             // Let the client see the alert rustls queued (best effort).
@@ -549,7 +578,7 @@ mod tests {
         });
         let (s, _) = l.accept().unwrap();
         let t0 = Instant::now();
-        let r = accept(&server(), s, t0 + Duration::from_secs(1));
+        let r = accept(&server(), s, t0 + Duration::from_secs(1), None);
         let took = t0.elapsed();
         assert!(r.is_err(), "a dripped handshake must fail");
         assert!(
@@ -592,7 +621,7 @@ mod tests {
         });
         let (s, _) = l.accept().unwrap();
         let (mut stream, _) =
-            accept(&server(), s, Instant::now() + Duration::from_secs(5)).unwrap();
+            accept(&server(), s, Instant::now() + Duration::from_secs(5), None).unwrap();
         let t0 = Instant::now();
         let r = super::super::http::read_request(&mut stream, t0 + Duration::from_secs(1));
         let took = t0.elapsed();
@@ -602,6 +631,155 @@ mod tests {
             "the request deadline (1 s) held for {took:?}"
         );
         drop(stream);
+        c.join().unwrap();
+    }
+
+    fn progress(hello_ms: u64, floor: u32) -> Arc<robodr_blackbox::admission::Progress> {
+        Arc::new(robodr_blackbox::admission::Progress::new(
+            robodr_blackbox::admission::ProgressPolicy {
+                hello_timeout: Duration::from_millis(hello_ms),
+                min_bytes_per_s: floor,
+            },
+            Instant::now(),
+        ))
+    }
+
+    /// W2-4: a ClientHello trickled a byte at a time is cut at the hello
+    /// timeout (1 s), not at the 5 s handshake deadline.
+    #[test]
+    fn a_trickled_client_hello_is_cut_at_the_hello_timeout() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = thread::spawn(move || {
+            let tcp = TcpStream::connect(addr).unwrap();
+            let mut hello = vec![
+                0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03,
+            ];
+            hello.extend([7u8; 32]);
+            drip(
+                tcp,
+                &hello,
+                Duration::from_millis(100),
+                Duration::from_secs(6),
+            );
+        });
+        let (s, _) = l.accept().unwrap();
+        let p = progress(1000, 128);
+        let t0 = Instant::now();
+        let r = accept(&server(), s, t0 + Duration::from_secs(5), Some(p.clone()));
+        let took = t0.elapsed();
+        let e = r.err().expect("a trickled handshake must fail");
+        assert_eq!(e, robodr_blackbox::admission::TOO_SLOW_HELLO, "{e}");
+        assert!(p.was_cut());
+        assert!(
+            took < Duration::from_millis(1800),
+            "cut after {took:?}, hello timeout 1 s"
+        );
+        c.join().unwrap();
+    }
+
+    /// W2-4: a client that sends its ClientHello at once and then trickles
+    /// its certificate flight is cut by the bytes/s floor, before the
+    /// absolute deadline.
+    #[test]
+    fn a_trickled_certificate_flight_is_cut_by_the_progress_floor() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = thread::spawn(move || {
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut conn = rustls::ClientConnection::new(
+                client(),
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+            )
+            .unwrap();
+            // ClientHello at once, then the server's flight.
+            conn.write_tls(&mut tcp).unwrap();
+            while !conn.wants_write() {
+                if conn.read_tls(&mut tcp).unwrap_or(0) == 0 {
+                    return;
+                }
+                if conn.process_new_packets().is_err() {
+                    return;
+                }
+            }
+            // The certificate flight, one byte every 200 ms.
+            let mut flight = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut flight).unwrap();
+            }
+            drip(
+                tcp,
+                &flight,
+                Duration::from_millis(200),
+                Duration::from_secs(8),
+            );
+        });
+        let (s, _) = l.accept().unwrap();
+        let p = progress(1000, 128);
+        let t0 = Instant::now();
+        let r = accept(&server(), s, t0 + Duration::from_secs(8), Some(p.clone()));
+        let took = t0.elapsed();
+        let e = r.err().expect("a trickled flight must fail");
+        assert_eq!(e, robodr_blackbox::admission::TOO_SLOW_FLOOR, "{e}");
+        // ClientHello (~200-300 B) at 128 B/s past the 1 s hello timeout.
+        assert!(
+            took > Duration::from_millis(1500) && took < Duration::from_millis(5000),
+            "cut after {took:?}"
+        );
+        c.join().unwrap();
+    }
+
+    /// W2-4, no regression on slow links: a client whose certificate flight
+    /// arrives 1.5 s after its ClientHello (a long round trip) completes
+    /// with the default progress policy, and the tracker sees its bytes.
+    #[test]
+    fn a_slow_link_client_completes_with_the_default_policy() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = thread::spawn(move || {
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut conn = rustls::ClientConnection::new(
+                client(),
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+            )
+            .unwrap();
+            // The ClientHello leaves after 300 ms (a slow first segment).
+            thread::sleep(Duration::from_millis(300));
+            while conn.wants_write() {
+                conn.write_tls(&mut tcp).unwrap();
+            }
+            // TLS 1.3: nothing to send until the server's Finished arrived
+            // (the client is then done; its own flight is queued).
+            while conn.is_handshaking() {
+                conn.read_tls(&mut tcp).unwrap();
+                conn.process_new_packets().unwrap();
+            }
+            thread::sleep(Duration::from_millis(1500));
+            // TLS 1.3: the client is done once it read the server's
+            // Finished; its certificate flight is still queued.
+            while conn.wants_write() {
+                conn.write_tls(&mut tcp).unwrap();
+            }
+            // Keep the socket open until the server is through.
+            let mut b = [0u8; 1];
+            let _ = std::io::Read::read(&mut tcp, &mut b);
+        });
+        let (s, _) = l.accept().unwrap();
+        let p = Arc::new(robodr_blackbox::admission::Progress::new(
+            robodr_blackbox::admission::ProgressPolicy::default(),
+            Instant::now(),
+        ));
+        let r = accept(
+            &server(),
+            s,
+            Instant::now() + Duration::from_secs(5),
+            Some(p.clone()),
+        );
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert!(!p.was_cut() && p.bytes_in() > 500, "{}", p.bytes_in());
+        drop(r);
         c.join().unwrap();
     }
 
@@ -625,7 +803,7 @@ mod tests {
             }
         });
         let (s, _) = l.accept().unwrap();
-        let r = accept(cfg, s, Instant::now() + Duration::from_secs(5)).map(|_| ());
+        let r = accept(cfg, s, Instant::now() + Duration::from_secs(5), None).map(|_| ());
         c.join().unwrap();
         r
     }

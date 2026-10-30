@@ -44,6 +44,10 @@ webpki = { workspace = true }
 robodr-capture = { workspace = true }
 # tests/gateway_feed.rs: the gateway's own feed writer against the daemon.
 robodr-firewall-gw = { workspace = true }
+# tests/control_plane.rs (W2-4): attacker connections bound to distinct
+# loopback source addresses (std has no bind-before-connect). Already in
+# Cargo.lock (tokio's), test-only.
+socket2 = "0.6"
 
 [[bin]]
 name = "robodr-agentd"
