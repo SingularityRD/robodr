@@ -768,9 +768,29 @@ sprint, AC'leri karşılanmadan kapanmaz.
 >   Bulunan 3 kusur düzeltildi (testler önce): gateway feed'de katalog
 >   dışı kural kimliği (W2-1), WebRTC flood özetinin gecikmesi (W2-2),
 >   sessiz gateway için `input_silent` yanlış alarmı (W2-3).
-> - 🟡 Açık: çok kaynaklı TLS slowloris kontrol düzlemine SOC erişimini
->   saldırı süresince kesiyor (W2-4, Orta; `IPAddressAllow=` ile
->   azaltılır, ürün düzeltmesi yok); bu hostta gateway paketlerin
+> - ✅ W2-4 düzeltildi (2026-10-30, testler önce): çok kaynaklı TLS
+>   slowloris artık SOC'u kilitlemiyor. Ortak bağlantı kabulü
+>   (`robodr_blackbox::admission`; agentd kontrol düzlemi, anchor
+>   receiver, depot): kimlik doğrulama öncesi ve sonrası ayrı havuzlar
+>   (mTLS'i geçen SOC'un slotunu doğrulanmamış bağlantı alamaz), dolu
+>   havuzda yeni geleni reddetmek yerine en az ilerleyen bağlantıyı
+>   tahliye, kaynak ve /24 (IPv6 /64) payları, ClientHello için 1 s ve
+>   ardından 128 B/s ilerleme tabanı (ayarlanabilir, güvenli sınırlarla),
+>   kaynak başına ve global el sıkışma hız sınırı (sessiz kaynak global
+>   bütçeyi aşabilir), isteğe bağlı `priority_sources` ayrılmış slotları;
+>   baskı `robot.agent.control_plane_pressure` (Orta, yeni 2.3 katalog
+>   girdisi; AutoSecOps eşlemesine eklenecek) ile raporlanıyor. Release
+>   ikilileriyle yeniden koşu: S2 8×2 ve 32×2 kaynakta SOC 20/20 (önce
+>   5/20 ve 1/20), S3 anchor receiver'da birim el sıkışması 20/20 (önce
+>   12/20). Kalan sınır: listede olmayan bir SOC, çok sayıda adresten
+>   hızlı tam ClientHello gönderen bir saldırgana karşı yalnızca
+>   olasılıksal korunuyor (32×2 hızlı ClientHello: 17/20, önce 0/20);
+>   garanti `priority_sources` ile (aynı saldırıda 20/20).
+> - ✅ W2-5 düzeltildi: gateway feed'de kural başına önem derecesi
+>   aralığı (katalogdaki üreticinin aralığına kırpılıyor) ve kural başına
+>   hız / toplama sınırı (20 anlık, 60/dk; feed için 600/dk; fazlası
+>   dakikada bir özet bulgu); güven sınırı belgelendi.
+> - 🟡 Açık: bu hostta gateway paketlerin
 >   %0.46'sını 5 ms'den geç okudu → `internal_fault` Critical gürültüsü
 >   (O1, gerçek donanımda yeniden ölçülmeli; kural adı / toplama ürün
 >   kararı).

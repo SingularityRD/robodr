@@ -55,7 +55,7 @@ level, and every path must be absolute.
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `gateway_feed` | Optional. Same keys as `host_threats`: the socket the in-path gateway writes its findings to. See "In-path gateway feed" below. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
-| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_crl` (PEM CRLs of the client CAs), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
+| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_crl` (PEM CRLs of the client CAs), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_connections_per_subnet` 3, `priority_sources` (CIDRs with reserved handshake slots) and `priority_connections` 2, `handshake_rate_per_s` 100, `handshake_hello_timeout_ms` 1000, `handshake_min_bytes_per_s` 128 (handshake admission, see "Control plane", Abuse), `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -322,8 +322,20 @@ counted — and becomes a finding of the normal pipeline
 (`Agent::handle_external`, source `gateway:<channel>`, subject topic the
 channel). An idle gateway writes a heartbeat line
 (`robodr-gateway-heartbeat/v1`, every 5 s): activity on the input, never a
-finding, so a quiet gateway is not reported silent. Status:
-`daemon.gateway_findings`, `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
+finding, so a quiet gateway is not reported silent.
+
+The feed is trusted by uid only (root and `allowed_uids`), and agentd bounds
+what such a peer can make it report (red team 2026-10-30, W2-5): each rule
+id keeps the severity range its emitter can produce
+(`gateway_feed::severity_range`; a line outside it is reported at the
+nearest bound and says what it claimed), and each rule id has a budget of
+20 lines at once and 60 a minute (600 a minute for the whole feed); lines
+over it are folded into one finding of that rule per minute at the worst
+severity folded, naming how many lines and which channels (also flushed at
+a stop). Mode, channel and detail stay the gateway's word. Status:
+`daemon.gateway_findings`, `daemon.gateway_heartbeats`,
+`daemon.gateway_folded`, `daemon.gateway_aggregates`,
+`daemon.gateway_severity_clamped`. Point the gateway's `findings_socket` at the
 same path; with `socket_mode: "0660"` give the gateway's user the daemon's
 group. Test: `tests/gateway_feed.rs` (the gateway's own writer against a
 running daemon).
@@ -440,13 +452,25 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   handshake and 5 s for the request, 30 s for the answer: deadlines that
   bound every socket read, so a byte-at-a-time peer cannot stretch them),
   separate connection slots per listener (the root-only unix socket can
-  never be locked out by TCP peers), TCP handshakes counted apart from
-  authenticated connections, at most `max_connections_per_source` per
-  source address, a bounded queue to the main loop (full: 503 `busy`). Failed
+  never be locked out by TCP peers), a bounded queue to the main loop
+  (full: 503 `busy`). TCP admission (W2-4, `robodr_blackbox::admission`):
+  a pre-authentication pool and an authenticated one (TLS: entered once
+  the handshake verified a SOC client certificate) of `max_connections`
+  each; a full pre-authentication pool, or a source's
+  (`max_connections_per_source`) or /24-/64's (`max_connections_per_subnet`)
+  share of it, evicts its least-progress connection for a newcomer instead
+  of refusing it; the ClientHello must arrive within
+  `handshake_hello_timeout_ms` and the handshake keep
+  `handshake_min_bytes_per_s` after that; new handshakes are rate-limited
+  per source and globally (`handshake_rate_per_s`; a quiet source passes
+  an exhausted global budget); `priority_sources` get
+  `priority_connections` reserved slots. Failed
   authentications raise `robot.agent.control_plane_unauthenticated` (High),
   authenticated invalid requests `robot.agent.control_plane_invalid`
-  (Medium); both observe-only self-health, rate-limited by
-  `health_report_ms`. The API is not an input: a quiet SOC never makes the
+  (Medium), handshake pressure (evictions, progress cuts, timeouts, rate
+  refusals; `status.json` `control_plane.admission`,
+  `handshake_pressure`) `robot.agent.control_plane_pressure` (Medium); all
+  observe-only self-health, rate-limited by `health_report_ms`. The API is not an input: a quiet SOC never makes the
   state `unknown`.
 - **Sockets.** Every unix socket of the daemon (events, safety feed, host
   threats, control plane) is bound inside a fresh 0700 directory, given its

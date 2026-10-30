@@ -288,7 +288,13 @@ and optionally
 TPM powered-on time,
 .BR reboots ),
 .B serve
-.RB ( listen ", " server_name ", " max_connections ", " deadline_s ),
+.RB ( listen ", " server_name ", " max_connections ", " deadline_s ;
+optional handshake admission:
+.BR max_connections_per_source " (default 4), " max_connections_per_subnet ,
+.BR priority_sources ", " priority_connections ", " handshake_rate_per_s ,
+.BR handshake_hello_timeout_ms " (default 1000), " handshake_min_bytes_per_s
+(default 128): a full pre\-authentication pool evicts its least\-progress
+connection, and enrolled units hold slots of their own),
 .B anchor
 (an NV counter of the depot's TPM:
 .BR tcti ", " index ", " work_dir ", " tools_dir )

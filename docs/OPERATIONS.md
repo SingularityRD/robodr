@@ -1171,21 +1171,74 @@ sudo systemctl restart robodr-agentd
   read, agentd refuses every new request id (503 `state_unavailable`,
   `state.refusing_new_request_ids`) until a restart with a readable black
   box: fix the black box (section 6.4, black-box upkeep) and restart.
-- **Connections.** TCP connections in the TLS handshake (or not yet
-  authenticated) and authenticated ones have separate slots of
-  `max_connections` (default 4) each; one source address holds at most
-  `max_connections_per_source` (default 2): raise it if several SOC
-  workers share one NAT address. The unix socket has its own 2 slots, so
-  an operator on the robot is never locked out by network peers. Rejected
-  connections count in `connections_rejected`.
+- **Connections.** TCP connections in the TLS handshake (on plain
+  loopback TCP: until their signature verified) and authenticated ones
+  (TLS: a completed handshake with a valid SOC client certificate, chain,
+  CRL and pin) have separate pools of `max_connections` (default 4) each;
+  a connection that has not authenticated can never take an authenticated
+  slot. One source address holds at most `max_connections_per_source`
+  (default 2) in each pool: raise it if several SOC workers share one NAT
+  address. The unix socket has its own 2 slots, so an operator on the
+  robot is never locked out by network peers.
+- **Handshake pressure (slowloris; red team 2026-10-30, W2-4).** When the
+  pre-authentication pool, or a source's or subnet's share of it, is full,
+  a new connection is **admitted** and the one with the least handshake
+  progress is cut (one whose ClientHello is not complete before one whose
+  is, then the lowest bytes/s since accept, the oldest on a tie): a peer
+  that trickles bytes is always cut before a client that completes its
+  handshake at once. Further bounds, all in `control_plane`:
+
+  | Key | Default | Bounds | Effect |
+  | --- | --- | --- | --- |
+  | `max_connections_per_subnet` | 3 | 1..=16 | pre-authentication connections from one IPv4 /24 or IPv6 /64; a spread of addresses in one subnet does not scale an attack |
+  | `handshake_hello_timeout_ms` | 1000 | 200..=5000 | the ClientHello must be complete (the robot answers) within this of accept, else the connection is cut |
+  | `handshake_min_bytes_per_s` | 128 | 16..=4096 | after the hello timeout the handshake must keep receiving this many bytes per second elapsed past it |
+  | `handshake_rate_per_s` | 100 | 1..=1000 | new pre-authentication connections per second (burst twice that); each source (IPv4 address, IPv6 /64) half of it (burst the rate). Over its own budget a connection is closed at accept; over the global one only if its source is not quiet (another connection from it was admitted in the last second) |
+  | `priority_sources` | `[]` | at most 32 CIDRs | e.g. the SOC network: its connections get reserved slots no other source can take, and a rate budget of their own |
+  | `priority_connections` | 2 | 1..=16 | the reserved pre-authentication slots of `priority_sources` |
+
+  On the plain loopback listener (no `tls`) the hello timeout covers the
+  whole request: the robot answers only once it is read. The 5 s
+  handshake deadline still bounds every handshake. The progress
+  floor is chosen so that a client on a slow or long link is not cut: a
+  rustls ClientHello is about 220 bytes (OpenSSL's 300 to 1500), so with
+  the defaults the certificate flight may arrive up to about 2.7 s after
+  accept (the hello timeout plus the ClientHello at 128 B/s); a client
+  whose second flight takes longer (a round trip above about 1.5 s) needs
+  a lower floor or a longer hello timeout. Raise the floor only for a SOC
+  on a LAN. Keep a source's rate budget (half of `handshake_rate_per_s`)
+  above the SOC's evidence chunk rate (`evidence.chunk_rate_per_minute`,
+  default 10/s).
+
+  **List the SOC network in `priority_sources`** (and keep the
+  `IPAddressAllow=` drop-in): that is the guarantee. An unlisted SOC
+  competes on progress; it wins against peers that trickle, but an
+  attacker with many addresses that completes ClientHellos quickly, or
+  reconnects fast enough to drain the global rate budget, can still make
+  some of its connections fail while it lasts (the attacker pays with
+  bandwidth and TLS handshakes; the robot's CPU stays bounded by the
+  rate limit).
+
+  Pressure is counted in `status.json` `control_plane.admission`
+  (`evicted`, `too_slow`, `refused_rate`, `admitted_quiet`,
+  `admitted_priority`, `promoted`, `promote_full`, the pools' occupancy),
+  `handshake_timeouts` and `handshake_pressure` (evictions, rate refusals
+  and timeouts or progress cuts together), and raised as
+  the observe-only finding `robot.agent.control_plane_pressure` (Medium,
+  rate-limited by `health_report_ms`). Evicted, slow and rate-limited
+  connections are not failed authentications (no
+  `control_plane_unauthenticated` for them); a connection closed by the
+  rate limit also counts in `connections_rejected`.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
-  `last_auth_failure`, `connections_rejected`, `recorded_not_executed`,
+  `last_auth_failure`, `connections_rejected`, `handshake_pressure`,
+  `admission`, `recorded_not_executed`,
   `refused`, `busy`, `rate_limited`, `journal_errors`, `replay_fence`,
   `state.refusing_new_request_ids`, `evidence`) and the
   findings `robot.agent.control_plane_unauthenticated` (High: someone
-  without the certificate or the key is trying) and
+  without the certificate or the key is trying),
   `robot.agent.control_plane_invalid` (Medium: the SOC sent something the
-  API never allows). Each decision is a `robodr.control_plane_request` note
+  API never allows) and `robot.agent.control_plane_pressure` (Medium:
+  pre-authentication connections evicted, too slow or rate-limited). Each decision is a `robodr.control_plane_request` note
   in the black box with the SOC's signature, which re-verifies offline.
 
 **Rotation (no downtime for the SOC).**
@@ -1394,8 +1447,20 @@ then at powers of two). `io_timeout_ms` bounds a whole connection, TLS
 handshake included (every read and write is re-armed with the time left,
 so a peer trickling bytes is cut), and the answer gets another one;
 `max_connections_per_source` (default 8, 1..=4096) caps the connections
-one address may hold, authenticated or not, so a single host cannot take
-every one of `max_connections`. Every TLS file (and the robot's and the
+one address may hold in each pool, so a single host cannot take every one
+of `max_connections`. Since W2-4 (red team S3: 10 sources x 8 trickling
+handshakes held all 64 slots) there are `max_connections` slots before the
+mutual-TLS handshake completes and as many after it, which only units with
+a client certificate take; a full pre-authentication pool evicts its
+least-progress connection for a newcomer instead of closing the newcomer,
+and a ClientHello must arrive within `handshake_hello_timeout_ms` (default
+1000) and the handshake keep `handshake_min_bytes_per_s` (default 128)
+after that. Optional: `max_connections_per_subnet` (IPv4 /24, IPv6 /64;
+default `max_connections`, i.e. off, since a fleet often shares a subnet),
+`priority_sources` (CIDRs) with `priority_connections` (default 4)
+reserved slots, `handshake_rate_per_s` (default 0, off). The receiver logs
+handshake pressure (evictions, progress cuts, rate refusals) at most once
+a minute. Every TLS file (and the robot's and the
 publisher's, below) must be owned by root or by the service's own user
 (`LoadCredential=` files are).
 
@@ -1887,6 +1952,22 @@ while the chain is flushed.
   (`robot.agent.input_silent` after `daemon.silence_ms`). Upgrade agentd
   before the gateway: an older agentd counts the heartbeat as a
   malformed line.
+* Trust boundary of the feed (red team 2026-10-30, W2-5): agentd trusts
+  the socket's peers (root, `allowed_uids`) to report that the gateway
+  decided something, not to choose how loud it is. Each rule id is kept
+  within the severity range its emitter produces (a Critical firewall
+  rule claimed `low` is reported Critical, a Low gateway rule claimed
+  `critical` Low; the detail says what was claimed;
+  `daemon.gateway_severity_clamped`), and each rule id is capped at 20
+  lines at once and 60 a minute (600 a minute for the whole feed): lines
+  over it are folded into one finding of that rule per minute at the
+  worst severity folded, with the number of lines, the gateway's
+  occurrence count and the channels (`daemon.gateway_folded`,
+  `daemon.gateway_aggregates`; pending aggregates are flushed at a stop).
+  A healthy gateway already folds per rule, channel and housekeeping
+  period and stays far below the cap. Keep `allowed_uids` to the
+  gateway's own user: a process with that uid can still report invented
+  catalogued findings within those bounds, or nothing.
 * `restrict_motion`: with `restriction_path`, `status.json` `restriction`
   is the restriction in force (`null`: none) and `restriction_error` why a
   file was ignored. Removing the file lifts it at the next housekeeping

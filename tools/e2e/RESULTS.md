@@ -415,8 +415,8 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
 | M2 / M3 | World-writable restriction file; a symlink | ignored, `restriction_error` names why | PASS |
 | R6f-R6h | Executor socket: forged `safe_pause` with approvers, forged `restrict_motion` naming the gateway, replayed envelope (same nonce) | closed unanswered / `refused soc_signature_invalid` / second refused; nothing applied | PASS |
 | S1 | TLS slowloris on the control plane, 1 source x 8 connections, 1 byte/s, 40 s | per-source cap holds: SOC 20/20 requests OK | PASS |
-| S2 | Same from 8 / 32 loopback sources x 2 | **SOC locked out**: 3/20 and 1/20 requests OK during the attack (ConnectionReset), all OK at once afterwards | ISSUE (W2-4) |
-| S3 | TLS slowloris on the anchor receiver, 10 sources x 8 (fills `max_connections` 64) | receiver logs "64 connections open; closing new ones"; agentd counts `anchor_failures: 2`, recording continues, held seq still advances | PASS (as designed) |
+| S2 | Same from 8 / 32 loopback sources x 2 | **SOC locked out**: 3/20 and 1/20 requests OK during the attack (ConnectionReset), all OK at once afterwards | ISSUE (W2-4) → FIXED, see "W2-4 / W2-5 fix" below: 20/20 and 20/20 |
+| S3 | TLS slowloris on the anchor receiver, 10 sources x 8 (fills `max_connections` 64) | receiver logs "64 connections open; closing new ones"; agentd counts `anchor_failures: 2`, recording continues, held seq still advances | PASS (as designed) → hardened, see below: unit handshakes 12/20 → 20/20 |
 | D1-D3 | Erase-trigger spoofing, deferred / executed erase, lease replay (delivery section above) | as above | PASS |
 
 ### Defects and issues
@@ -440,7 +440,8 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   70 s of an idle gateway, 14 heartbeats, no `input_silent` for it.
   Upgrade agentd before the gateway (an older agentd counts the
   heartbeat as malformed).
-- **W2-4 (Medium, not fixed, documented).** Control-plane connection
+- **W2-4 (Medium, fixed 2026-10-30, see "W2-4 / W2-5 fix" below).**
+  Control-plane connection
   slots: 4 pre-authentication slots, 2 per source, a 5 s handshake / read
   deadline. An unauthenticated peer with 3 or more source addresses that
   reopens TLS handshakes trickling a byte a second keeps every slot busy
@@ -450,7 +451,8 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   attacker must be on an allowed address. A product fix (evicting the
   oldest pre-authentication connection when a new one arrives, or a
   reserved slot for allow-listed client addresses) was not attempted.
-- **W2-5 (Low, design note).** The gateway feed is trusted by uid: a
+- **W2-5 (Low, fixed 2026-10-30, see below).** The gateway feed is
+  trusted by uid: a
   process running as root or as the gateway's user can claim any
   catalogued gateway / firewall finding and its severity (G7) and can
   flood agentd's spool with one finding per line (G8 / G9); agentd's
@@ -474,6 +476,111 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   fence, contract §2); the refused SOC request raises
   `robot.agent.control_plane_unauthenticated` (High) worded as if someone
   without a key tried: one false alarm per such start.
+
+### W2-4 / W2-5 fix (2026-10-30, re-run through the release binaries)
+
+**What changed.** A shared connection admission,
+`robodr_blackbox::admission`, now admits the TCP connections of agentd's
+control plane, `robodr-anchor-receiver` and `robodr-depot serve`:
+
+- two pools: `max_connections` pre-authentication slots and as many
+  authenticated ones, entered once the server authenticated the peer
+  (control plane: a completed handshake with a valid SOC client
+  certificate; receiver: a mutual-TLS handshake; depot: an enrolled
+  unit's identity key). A pre-authentication connection can never take an
+  authenticated slot;
+- eviction instead of refusal: a newcomer into a full pre-authentication
+  pool (or into its source's / its IPv4 /24 or IPv6 /64's share) is
+  admitted and the connection with the least handshake progress in that
+  scope is cut (ClientHello incomplete before complete, then the lowest
+  bytes/s since accept, with bytes already queued at accept counted; the
+  oldest on a tie);
+- a progress deadline next to the absolute one: the ClientHello within
+  `handshake_hello_timeout_ms` (1000), then `handshake_min_bytes_per_s`
+  (128) past it (bounds 200..=5000 ms and 16..=4096 B/s). With rustls's
+  220-byte ClientHello the certificate flight may come up to ~2.7 s after
+  accept; `control::tls` tests cover a client with a 1.5 s pause (passes)
+  and a trickled hello and certificate flight (cut at 1 s and ~2.7 s);
+- control plane: `max_connections_per_subnet` 3, a per-source (IPv4
+  address / IPv6 /64) and global handshake token bucket
+  (`handshake_rate_per_s` 100; a quiet source passes an exhausted global
+  budget), `priority_sources` with `priority_connections` reserved slots;
+  pressure counted (`control_plane.admission`, `handshake_pressure`) and
+  reported as `robot.agent.control_plane_pressure` (Medium, new catalog
+  entry 2.3: **AutoSecOps sync**: map it like the other
+  `robot.agent.control_plane_*` ids);
+- gateway feed (W2-5): each rule kept within its emitter's severity range,
+  20 lines at once / 60 a minute per rule (600 for the feed), the rest
+  folded into one finding per rule and minute.
+
+**Harness.** The full red-team target (netns, gateway, executor) is not
+needed for S2 / S3: `tools/e2e/redteam2-slowloris.sh setup|start|stop RUN`
+runs agentd (pcap replay kept running, control plane on mutual TLS
+127.0.0.1:8788, remote head anchor over mutual TLS) and the anchor receiver
+(127.0.0.1:7462, `max_connections` 64, 8 per source, `io_timeout` 5 s, as
+in `soak2-setup.sh`) on loopback, with `rate_per_minute` 120 so that 26
+probes in ~50 s stay below the per-key limit. `redteam2_tls.py` now also
+probes the receiver with a mutual-TLS handshake using the unit's client
+certificate (`unit_tls_ok`; agentd's anchor counters alone do not show
+whether a unit gets a slot), takes `RT_FAST_HELLO=1` (each attacker
+connection sends a complete ClientHello at once and then holds it: the
+strongest squatter) and `RT_SRC_BASE`. Same host as above (4 vCPU,
+6.18 kernel), 40 s per scenario, SOC probe every 2 s; "before" = the
+binaries of `b05b271`, "after" = this change, both release builds, same
+setup and config.
+
+| Scenario | Attack | Before (`b05b271`) | After |
+|---|---|---|---|
+| S2 | control plane, 8 sources x 2, ClientHello trickled 1 B/s, reopened when cut | SOC 5/20 (ConnectionReset; 492 attacker connections) | **SOC 20/20**, median 49 ms (295 connections: cut at the 1 s hello timeout or evicted) |
+| S2 | same, 32 sources x 2 | SOC 1/20 | **SOC 20/20**, median 48 ms |
+| S2-fast | 32 sources x 2, complete ClientHello at once, then held; reopened at once (~110k connections in 40 s) | SOC 0/20 | SOC 17/20 (16/20 in a run before the last ranking change), median 91 ms (unlisted SOC in the attackers' /24; 104k closed at accept by the rate limit, 6k evicted, 151 quiet-source admissions) |
+| S2-fast + priority | same, `priority_sources: ["127.0.0.1/32"]` | n/a | **SOC 20/20**, median 88 ms (reserved slots; `admitted_priority` 26) |
+| S2 + priority | 32 x 2 trickled, `priority_sources` | n/a | SOC 20/20 (run before the last ranking change) |
+| S3 | anchor receiver, 10 sources x 8 trickled (more than its 64 slots) | unit mTLS handshake 12/20 (ConnectionReset / EOF); "64 connections open; closing new ones"; agentd `anchor_failures` +1 | **unit handshake 20/20**; receiver logs "handshake pressure: 17 evicted, 1103 cut for lack of progress"; `anchor_failures` 0; held seq advances |
+
+Before and after each scenario the baseline and post-attack probes were
+all OK. During the four "after" runs agentd raised
+`robot.agent.control_plane_pressure` 16 times (rate-limited by
+`health_report_ms`; `handshake_pressure` 110625, `evicted` 6040,
+`too_slow` 71, `refused_rate` 104514) and no `control_plane_unauthenticated` for evicted,
+slow or rate-limited handshakes (`unauthenticated` 4: attacker connections
+that sent a complete ClientHello and closed when the run stopped).
+
+Regression tests (tests first: the S2 test fails on `b05b271` with the
+SOC answering 1/8): `tests/control_plane.rs`
+`s2_multi_source_tls_slowloris_does_not_lock_out_the_soc` (8 sources x 2
+trickling, SOC in the attackers' /24, 8/8 within the deadline; pressure
+finding; no unauthenticated count) and
+`priority_sources_keep_the_soc_served_under_a_fast_hello_flood` (32
+sources with full ClientHellos, SOC listed, 10/10 back to back);
+`admission` unit tests (eviction order, shutdown on eviction, source and
+subnet shares incl. IPv6 /64, priority slots, per-source / global rate with
+the quiet-source rule, promotion); `control::tls` progress tests (hello
+timeout, floor, slow link); `remote_anchor_tls.rs`
+`trickling_handshakes_cannot_lock_out_a_unit`; `adversarial_14a.rs` (24
+reconnecting tricklers, a unit still fetches its pack, swtpm); W2-5:
+`gateway_feed` unit tests (severity ranges against every emitter, clamping,
+folding, budgets) and `tests/gateway_feed.rs`
+`a_gateway_line_flood_is_capped_and_severities_kept_in_range` (602 lines:
+21 findings of the flooded rule, all Critical, one aggregate).
+
+**Remaining limits.**
+
+- An unlisted SOC competes on progress: an attacker with many addresses
+  that sends complete ClientHellos as fast as it can still costs it
+  connections (S2-fast: 17/20) and drains the global handshake budget;
+  only `priority_sources` is a guarantee (S2-fast + priority: 20/20). A
+  SOC that connects more than once a second (an evidence download) is not
+  "quiet" and is refused while the global budget is empty.
+- The per-subnet share also binds a SOC that shares the attacker's /24; a
+  per-source bucket counts an IPv6 /64 as one source.
+- A peer with a valid SOC client certificate (a stolen one) occupies
+  authenticated slots; the signature check still refuses its requests.
+- The receiver and the depot keep the subnet share and the rate limit off
+  by default (a fleet often shares a subnet); their admission is otherwise
+  the same.
+- Measured on loopback in one VM, not across a real network or with a
+  real SOC deployment.
 
 ### What was not covered (still unverified)
 
@@ -515,3 +622,17 @@ The red-team target is the same setup with `RID=rt-ugv-001 SUB=rt
 IFACE=rob-rt CPPORT=8788 APORT=7462 NOKAFKA=1` and `PFX=rk QNUM=12
 WEBRTC=1`, started with `redteam2.sh start RUN` (namespaces `rt-rob` /
 `rt-gen` hold the `rob-rt` / `gen-rt` link; see the scripts' headers).
+
+S2 / S3 alone (W2-4), on loopback without namespaces:
+
+```sh
+tools/e2e/redteam2-slowloris.sh setup RUN && tools/e2e/redteam2-slowloris.sh start RUN
+sleep 35   # the first start fences the replay store for max_clock_skew_s
+ASO_PY=/path/to/autosecops/.venv/bin/python   # soclib.py: the SOC client
+$ASO_PY tools/e2e/redteam2_tls.py RUN cp 8 2 40
+$ASO_PY tools/e2e/redteam2_tls.py RUN cp 32 2 40
+RT_FAST_HELLO=1 $ASO_PY tools/e2e/redteam2_tls.py RUN cp 32 2 40
+$ASO_PY tools/e2e/redteam2_tls.py RUN anchor 10 8 40
+tools/e2e/redteam2-slowloris.sh stop RUN
+# priority sources: CP_EXTRA='{"priority_sources":["127.0.0.1/32"]}' at setup
+```
