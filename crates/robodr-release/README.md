@@ -8,7 +8,7 @@ CLI.
 ```
 robodr-release keygen       --out SECRET_KEY_FILE [--key-id ID]
 robodr-release fingerprint  --key KEY_FILE
-robodr-release build rpk    --spec SPEC.json --payload DIR --out-dir DIR
+robodr-release build rpk    --spec SPEC.json --payload DIR --out-dir DIR [--seal-to DEPOT.pub]...
 robodr-release build bundle --programme P --seq N [--prev-bundle DIR | --prev-hash HEX]
                             --rpk DIR... TRUST
                             [--parity M [--parity-group K] [--shard-size BYTES]] --out DIR
@@ -21,6 +21,11 @@ robodr-release repair       --dir BUNDLE_DIR TRUST
 TRUST: --trust TRUST.json --root FPR... --site SITE (--trust-anchor ANCHOR.json | --no-trust-anchor)
 CHAIN: --genesis | --after SEQ:HASH | --state FILE [--genesis] [--commit]
 ```
+
+`--seal-to` (Sprint 13c) builds a **sealed** RPK: every payload file but
+the SBOM is encrypted under a fresh content key (`robodr-seal`) that is
+written only wrapped to the named depot keys (`docs/SECURE-DELIVERY.md`
+§7.9).
 
 `robodr-release --help` has the full usage. Exit codes: 0 ok, 1 refused
 or error (`refused (<code>): <detail>` on stderr), 2 usage.

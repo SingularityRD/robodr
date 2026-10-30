@@ -1,18 +1,28 @@
 # Secure delivery: air-gapped fleet distribution, updates and captured-unit protection
 
-> **Status: design; Sprints 13a and 13b implemented** (2026-10-26). The
+> **Status: design; Sprints 13a, 13b and 13c implemented** (13a/13b
+> 2026-10-26, 13c 2026-10-30). The
 > formats of §3 and release signing exist as `robodr-pkg` (pure parsers
 > and validators) and `robodr-release` (build, sign, verify, repair), with
 > the decisions of §3.5. The on-unit agent `robodr-deliverd` (13b, §10)
 > installs `files`, `config`, `deb` and `robodr-rules` RPKs from per-unit
 > media packs behind agentd's live safety-state gate, with a health gate,
 > automatic rollback, anti-rollback floors and black-box evidence; the
-> `robot.deliver.*` findings of §9 are catalogued (contract 2.2). The exit
-> criteria of both are demonstrated by tests (§10). Verified offline only:
-> on synthetic payloads in temporary directories (13b: the host's dpkg
-> against a separate dpkg root, a real agentd fed by the replay helper),
-> never on an air-gapped site, an entry station or a robot.
-> **Everything else in this document (13c onward) is not implemented.**
+> `robot.deliver.*` findings of §9 are catalogued (contract 2.2). Sealing
+> (13c) exists as `robodr-seal` (library and CLI): sealed RPKs
+> (XChaCha20-Poly1305 chunks, `robodr-release build rpk --seal-to`), a
+> TPM-resident unit wrapping key behind a signed PCR policy, a policy
+> floor and an erase epoch (`tpm2-tools`), the LUKS2 runtime volume and the
+> Clevis/Tang fallback; `robodr-deliverd` installs sealed RPKs and models
+> only into the runtime volume and crypto-erases; the `robot.seal.*`
+> findings are catalogued (contract 2.3). The exit criteria of all three
+> are demonstrated by tests (§10). Verified offline only: on synthetic
+> payloads in temporary directories (13b: the host's dpkg against a
+> separate dpkg root, a real agentd fed by the replay helper; 13c: a
+> software TPM (swtpm), a real Tang server, `cryptsetup` on LUKS2 image
+> files without device-mapper), never on a hardware TPM, an air-gapped
+> site, an entry station or a robot.
+> **Everything else in this document (14a onward) is not implemented.**
 > It expands ROADMAP Phase 3 ("Air-gapped deployment") and splits the
 > one-line Sprint 13 / Sprint 14 items in `docs/SPRINTS.md` with a
 > buildable plan. Every component named here that does not already exist
@@ -150,10 +160,10 @@ both directions.
 | Component | Kind | Role |
 |---|---|---|
 | `robodr-pkg` `[P]` | pure library | RPK, bundle, deployment and trust-file formats (§3): parse, validate, verify, hash. No I/O beyond reading bytes it is given. Fuzzed like `robodr-rtps`. Sprint 13a. |
-| `robodr-seal` `[ ]` | library | Key wrapping, payload encryption, TPM sealing via `tpm2-tools` (same approach as `robodr-blackbox/src/tpm_anchor.rs`), software fallback (§7). |
-| `robodr-release` `[P]` | CLI, connected side | Build RPKs from `.deb` / OCI / files / models, encrypt, sign (quorum), assemble bundles, add Reed-Solomon parity. Sprint 13a: builds every kind from a payload directory (kind shape and SBOM checked; a `.deb` or OCI archive is carried as a file, not inspected), quorum signing, chained bundles, parity, verify, repair; no encryption (13c). |
+| `robodr-seal` `[P]` | library + CLI | Key wrapping, payload encryption, TPM sealing via `tpm2-tools` (same approach as `robodr-blackbox/src/tpm_anchor.rs`), software fallback (§7). Sprint 13c: everything in this row, tested against swtpm; decisions in §7.9. |
+| `robodr-release` `[P]` | CLI, connected side | Build RPKs from `.deb` / OCI / files / models, encrypt, sign (quorum), assemble bundles, add Reed-Solomon parity. Sprint 13a: builds every kind from a payload directory (kind shape and SBOM checked; a `.deb` or OCI archive is carried as a file, not inspected), quorum signing, chained bundles, parity, verify, repair. 13c: sealed RPKs (`build rpk --seal-to`). |
 | `robodr-depot` `[ ]` | service, site | Single-box control plane: import bundles, inventory, deployments and rings, per-unit key wrapping, serve units, lease server. This is the air-gapped instance of the planned `robodr-fleet` (ROADMAP §2) and the "single-box control plane" of Sprint 14. |
-| `robodr-deliverd` `[P]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. Sprint 13b: from per-unit media packs, kinds `files`, `config`, `deb`, `robodr-rules`; no LAN, no sealing, no OS A/B. |
+| `robodr-deliverd` `[P]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. Sprint 13b: from per-unit media packs, kinds `files`, `config`, `deb`, `robodr-rules`; no LAN, no OS A/B. 13c: sealed `files` / `model` / `config` and every `model` into the runtime volume, `erase`. |
 
 ### 2.2 Reused, unchanged or extended
 
@@ -334,7 +344,8 @@ this is the list of decisions a reviewer should check against the design.
     timeout); unknown members inside a check are refused.
 14. `expires_at` is Unix seconds; an RPK is refused at and after it.
 15. `confidentiality: "sealed"` is refused (`unsupported`) until 13c
-    defines the key-wrap members.
+    defines the key-wrap members. *13c:* defined: the manifest member
+    `seal`, sealed only for `files`, `model`, `config` (§7.9).
 
 **Bundle (`robodr-bundle/1`)**
 
@@ -454,7 +465,8 @@ this is the list of decisions a reviewer should check against the design.
     floor. `deployment_seq` must increase (replay, equivocation); a gap is
     normal for one unit, which only sees deployments that target it, so
     gaps are not reported for deployments (bundles only).
-28. `wrapped_keys` is present and must be empty until 13c.
+28. `wrapped_keys` is present and must be empty until 13c. *13c:* a
+    list of `{unit, rpk_digest, wrap}` (§7.9).
 
 **Release tool**
 
@@ -933,6 +945,138 @@ Claims for this mode are in the last column of §7.8.
 | Other units, future releases | A captured unit holds only its own wraps; content keys of RPKs never assigned to it, and of future releases, are not on it. Erase or revoke the unit at the depot and it receives nothing more. | Same. |
 | Integrity (A, B) | Unaffected by capture: a captured unit cannot sign releases or deployments. Its unit key is revoked at the depot. | Same. |
 
+### 7.9 Decisions taken in Sprint 13c
+
+Where §7.1–§7.7 left room, 13c took these decisions (code:
+`crates/robodr-seal`, module docs; the formats in `robodr-pkg`).
+
+**Formats**
+
+1. **Sealed manifest.** `confidentiality: "sealed"` carries a member
+   `seal = {scheme: "robodr-seal/1", seal_id, ck_commit, depot_wraps}`.
+   Public manifests carry no `seal` member at all (not `null`), so every
+   13a/13b manifest keeps its bytes and digest. Sealing is allowed for
+   `files`, `model` and `config` only (the kinds installed into the
+   runtime volume); a `deb`, OCI image or OS image goes through installers
+   that write outside it.
+2. **What is encrypted.** Every content file except the SBOM: the SBOM
+   stays in clear so the entry station can scan it (§6.1) without a key.
+   Paths, modes and sizes stay visible in the signed manifest. A sealed
+   file's `sha256` member is a **keyed** digest (HMAC under a key derived
+   from `CK`): the plaintext SHA-256 would let anyone confirm a guessed
+   low-entropy file (a config) from the manifest alone.
+3. **Chunks** (§7.2): `nonce (24) || ciphertext || tag (16)`,
+   XChaCha20-Poly1305 under `HKDF-SHA256(CK, salt = seal_id,
+   "robodr-seal/chunk-key/v1")`. §7.2 says "nonce derived from the chunk
+   index, the RPK digest bound in as associated data". The RPK digest
+   cannot be bound (the manifest lists the ciphertext hashes, so the
+   digest depends on the ciphertext); a random 32-byte `seal_id` in the
+   signed manifest stands for the RPK instead. The associated data binds
+   `seal_id`, the file's index in `content[]`, the chunk's position and
+   the file's chunk count. The nonce is **synthetic**: HMAC of the
+   associated data and the plaintext's hash under a second derived key
+   (24 bytes), checked again on open; it is unique per (key, place,
+   plaintext), so a content key reused by mistake never encrypts two
+   different plaintexts under one nonce. A sealed chunk serves exactly one
+   position of one file (no deduplication inside sealed RPKs).
+4. **Key commitment.** `ck_commit` (HKDF output) is checked right after
+   every unwrap, so a wrap of another key (a confused or malicious depot)
+   is refused before any chunk is opened; Poly1305 alone does not commit
+   to its key.
+5. **Wraps.** Ephemeral-static ECDH, HKDF-SHA256, XChaCha20-Poly1305;
+   `0x01` X25519 (105 bytes) for depot keys and units without a TPM, `0x02`
+   P-256 (138 bytes) for TPM units (the TPM does `TPM2_ECDH_ZGen`; TPMs do
+   not do X25519). The KDF info and the associated data bind the
+   recipient's public key and the purpose: depot wrap (`seal_id`), unit
+   wrap (unit id + RPK digest), volume key (unit id). Low-order X25519
+   points are refused.
+6. **Release → depot.** The release wraps `CK` to each depot wrapping key
+   named with `build rpk --seal-to` (X25519, `robodr-seal keygen depot`)
+   into the signed manifest and forgets it. The depot keys are not in the
+   site trust file (it is root-signed and versioned; changing its format
+   again was not needed for 13c): the release operator pins them.
+7. **Depot → unit** (§7.3). Until `robodr-depot` (14a) exists,
+   `robodr-seal rewrap` is the depot's step: it recovers `CK` from the
+   manifest's depot wrap, checks the commitment and wraps it to the unit's
+   UWK from the unit's enrolment record; the deployment's
+   `wrapped_keys` lists `{unit, rpk_digest, wrap}` (sorted, an item of
+   the deployment, a targeted unit unless groups are targeted). A unit
+   keeps only its own entries (`store/wraps/<digest>`).
+
+**TPM**
+
+8. **UWK.** A P-256 ECDH key created inside the TPM under a persistent
+   SRK (`0x81000001`): `fixedtpm|fixedparent|sensitivedataorigin|decrypt|
+   noda`, no `userwithauth`, so its policy is the only way to use it.
+   Its authPolicy is `PolicyAuthorize(policy authority, policyRef =
+   H(platform)) AND PolicyNV(erase epoch == E)`. Unwrapping runs in a
+   salted policy session with parameter encryption (the shared secret does
+   not cross a discrete TPM's bus in clear) and the secret comes back on a
+   pipe, never in a file.
+9. **Signed PCR policy** (§7.4): `robodr-seal-policy/1`, ECDSA P-256 by
+   the **policy authority** over `TPM2_PolicyAuthorize`'s `aHash`; the
+   approved policy is `PolicyPCR(sha256 PCRs = signed values) AND
+   PolicyNV(floor: bit <version> clear)`, recomputed on the unit from the
+   document (every member is bound by the signature). The TPM checks the
+   signature itself (`TPM2_VerifySignature` ticket), so a unit's own code
+   cannot be talked into a policy the authority did not sign. **One key**:
+   `PolicyAuthorize` names one signer, so the TPM cannot enforce the
+   roots' quorum; the policy authority is a separate offline P-256 key of
+   the delivery roots (§11).
+10. **Policy rollback.** A signed policy stays valid forever under
+    `PolicyAuthorize` alone, so an older, still signed boot chain could be
+    booted again. Every approved policy therefore requires its version's
+    bit (0–63) of a `TPM_NT_BITS` NV index (the **policy floor**) to be
+    clear. `robodr-seal policy commit` sets the bits of every lower
+    version, and only after the policy in force has unsealed on this
+    boot (a probe unwrap), so a wrong policy never revokes the right one.
+    Bits are never cleared; undefining the index needs the owner
+    authorization, which provisioning sets and does not keep on the unit
+    (OPERATIONS §12.1). A counter was not used: its first value is the
+    TPM's highest counter value ever, which a signing station cannot know.
+11. **Erase epoch** (§7.6): a `TPM_NT_COUNTER` index; erase is one
+    increment (measured: a few TPM round trips with swtpm). A counter
+    that is undefined and defined again starts above every value it ever
+    had, so an erased epoch cannot be recreated. The UWK blobs and the
+    volume wrap are deleted too (hygiene; the counter is what makes them
+    useless).
+12. **Enrolment** (§8) in 13c is local: `robodr-seal enroll` creates the
+    UWK and prints the record (unit, platform, UWK public key, handles,
+    epoch, authority and its TPM name). The EK / AK certification and
+    credential activation that keep a depot from wrapping to a
+    software-emulated TPM are 14a; until then the depot trusts the
+    record's channel.
+
+**Runtime volume and fallback**
+
+13. **TPM units.** The LUKS2 volume's only keyslot is a random 256-bit key
+    stored only wrapped to the UWK (`volume.wrap`, purpose "volume"):
+    the same policy, floor and epoch as every content key. Keys reach
+    `cryptsetup` on stdin; PBKDF2 at 1000 iterations (the passphrase is a
+    uniform random key).
+14. **Units without a TPM** (§7.7). `robodr-seal volume format-tang`: a
+    random key, `clevis luks bind` to the site's Tang server (thumbprint
+    pinned), then the random key's keyslot killed, so the volume key is
+    never stored on the unit. The X25519 UWK is a file inside the volume.
+    Erase destroys that file and, with `--device`, wipes every LUKS2
+    keyslot (`cryptsetup erase`), which also defeats a later Tang
+    recovery of that header.
+15. **On the unit** (`robodr-deliverd`, `seal` configuration): a sealed
+    RPK and every `model` are installed only under
+    `<runtime_root>/<files|model|config>/`, which must be a mounted
+    dm-crypt mapping (`volume_check: dm_crypt`, the default: mountinfo
+    and `/sys/dev/block/*/dm/uuid`); otherwise the item waits. A chunk is
+    hash-checked, authenticated for its place and only then written; the
+    content key lives only while a version is staged. A package never
+    moves between sealed and public.
+16. **Findings.** `robot.seal.unseal_failed` (High) when the TPM refuses
+    (PCRs, floor, signature) or the unit was erased; a wrap that does not
+    authenticate is a delivery refusal (`robot.deliver.refused`,
+    `unauthentic_key`). `robodr-deliverd erase --trigger T` reports
+    `robot.seal.erased` (Critical), preceded by `robot.seal.tamper`
+    (Critical) for the trigger `tamper`. `robot.seal.lease_expired` is
+    catalogued for 14b.
+
 ---
 
 ## 8. Unit enrolment
@@ -983,7 +1127,11 @@ Medium after a configurable number of deferrals of one item; `stale` is
 Medium and High after a grace period; `refused` also reports a state file
 restored from the black box. `chain_gap` covers bundles only: deployment
 sequence replays and equivocations are `refused` (gaps are normal for a
-unit, §3.5 item 27). The `robot.seal.*` ids have no entry until 13c / 14b.
+unit, §3.5 item 27). 13c: the four `robot.seal.*` ids are catalogued in
+contract `robodr.findings` **2.3** (data source `robodr_delivery`, in a
+block of their own); `unseal_failed` (High), `erased` and `tamper`
+(Critical) are emitted by `robodr-deliverd` (§7.9 item 16),
+`lease_expired` (Medium) from 14b.
 
 ---
 
@@ -997,7 +1145,7 @@ nothing else renumbers.
 |---|---|---|
 | **13a — Formats and release signing** (implemented, see below) | `robodr-pkg` (RPK, bundle, deployment, trust file parsers, pure, fuzzed); `robodr-release build/sign/verify` with 2-of-N quorum; parity via `robodr-diode` fec. | A bundle built on one host verifies on another; every manifest mutation, missing signature, wrong quorum, revoked key and chain gap is refused in tests; fuzz targets in `fuzz/`. |
 | **13b — Unit agent, local** (implemented, see below) | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate, tested with recorded JSONL safety reports replayed into agentd's live `safety_feed` socket (a small replay helper is new work). | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
-| **13c — Sealing** | `robodr-seal`: XChaCha20-Poly1305 chunks; `UWK` in TPM via `tpm2-tools`; signed PCR policy; erase epoch; LUKS2 runtime volume; Clevis/Tang fallback. Tested against `swtpm`, like `TpmNvCounterAnchor`. | Disk image of an enrolled (swtpm) unit yields no plaintext; changed PCR → unseal refused; epoch increment → every sealed key dead; fallback unit cannot unlock without Tang. |
+| **13c — Sealing** (implemented, see below) | `robodr-seal`: XChaCha20-Poly1305 chunks; `UWK` in TPM via `tpm2-tools`; signed PCR policy; erase epoch; LUKS2 runtime volume; Clevis/Tang fallback. Tested against `swtpm`, like `TpmNvCounterAnchor`. | Disk image of an enrolled (swtpm) unit yields no plaintext; changed PCR → unseal refused; epoch increment → every sealed key dead; fallback unit cannot unlock without Tang. |
 | **14a — Depot and rollout** | `robodr-depot`: import with entry report, inventory, enrolment with credential activation, deployments with operator quorum, rings, per-unit re-wrapping, LAN serving (mTLS), media packs, halt-on-failure. | Demo on ≥ 3 units (VMs with swtpm acceptable): staged rollout lab → canary → ring-1; injected failing release halts at canary; captured-unit VM cannot decrypt a model assigned only to another unit. |
 | **14b — Lease, erase execution, evidence** | Lease tokens; crypto-erase as the first executed responder action; `robot.deliver.*` / `robot.seal.*` findings through the existing diode; floors moved to TPM NV counters. | Lease expiry blocks unseal after reboot; erase triggered by a simulated tamper input while state is `Idle`, deferred while `MovingFast`; SOC sees the full chain of findings. |
 | **14c — OS A/B and hardware** | `os-image` kind with one A/B updater (decision §11); first run on real TPM hardware (not swtpm) and a real robot computer. | A/B OS update with forced boot failure falls back; sealing survives an authorised OS update (new signed policy) and fails for an unauthorised one. |
@@ -1255,6 +1403,61 @@ Not in 13b: sealed RPKs and key wraps (13c), the depot and LAN delivery
 `robodr-profile`, `os-image` (refused), `ros2_node` health checks
 (refused: not evaluable on the unit). Nothing has run on a robot.
 
+**13c status (2026-10-30): implemented; exit criteria demonstrated by
+tests against a software TPM, offline.** `crates/robodr-seal` (library
+and binary `robodr-seal`, `#![forbid(unsafe_code)]`, no panicking calls
+outside tests), sealed RPKs in `robodr-pkg` / `robodr-release`, sealed
+installs and erase in `robodr-deliverd`, contract `robodr.findings` 2.3;
+the decisions are §7.9. What runs, and against what:
+
+| Exit criterion | Demonstrated by | Against |
+|---|---|---|
+| Disk image of an enrolled unit yields no plaintext | `robodr-seal/tests/exit_criteria.rs` `a_disk_image_of_an_enrolled_unit_yields_no_plaintext`: a sealed RPK (three files, one over two chunks) released, re-wrapped by the depot, unwrapped through the TPM and installed; the unit's storage (store, deployment wrap, seal directory, LUKS2 runtime-volume image formatted with the TPM-wrapped volume key) holds no plaintext, no content key (raw or hex) and no volume key; the seal directory copied to another machine (another provisioned TPM) unseals nothing; the unit booted with a changed PCR unseals nothing; after a power cycle with the legitimate boot it unseals again and the volume key opens the LUKS2 header. `robodr-deliverd/tests/sealed.rs`: the same through the agent (plaintext only below the runtime volume, none in its state, store, media, journal or spool) | swtpm 0.7 + tpm2-tools 5.6 (`ROBODR_SWTPM=1`); `cryptsetup` 2.7 on an image file |
+| Changed PCR: unseal refused | `a_changed_pcr_refuses_unseal`: each selected PCR extended refuses (`PolicyAuthorize`), an unselected one does not; a rogue authority's policy for the new values is refused at install and by the TPM; the authority's signed policy for them unseals again (authorised update) | swtpm |
+| Epoch increment: every sealed key dead | `an_epoch_increment_kills_every_sealed_key`: three content-key wraps and the volume key refused after one increment; the pre-erase blobs restored from a backup are refused **by the TPM** (its `PolicyNV` step, the unit's own pre-check bypassed); the epoch counter undefined and defined again starts above the erased value, still refused | swtpm |
+| Fallback unit cannot unlock without Tang | `a_fallback_unit_cannot_unlock_without_tang`: a LUKS2 image bound only to a real Tang server (bootstrap keyslot killed); unlocks while Tang is up, not when it is down, again when it is back; neither the passphrase nor the UWK is in the unit's storage; erase with the device wipes the keyslots so Tang no longer helps | tangd 14 + clevis 20 + cryptsetup on an image file (`ROBODR_TANG=1`) |
+
+Adversarial tests (`robodr-seal/tests/adversarial.rs`, unit tests in
+`src/chunk.rs`, `src/wrap.rs`, `src/rpk.rs`,
+`robodr-release/tests/sealed.rs`, `robodr-deliverd/tests/sealed.rs`):
+chunk reordering, truncation (by whole chunks and by bytes), moves to
+another file, position or RPK, swaps between two sealed copies (another
+unit's or release's) and every flipped byte; nonce reuse (a reused key
+gives other nonces for other plaintext; a valid chunk with a chosen nonce
+is refused); a wrap for another unit, another RPK, another purpose, a
+relabelled wrap of another RPK's key (key commitment), every flipped byte
+and truncation of a wrap, an X25519 wrap at a TPM unit, low-order X25519
+points; **policy rollback**: after a committed boot-chain update the older
+signed policy is refused at install and, written in place, by the TPM's
+floor check; a commit is refused while the policy in force does not
+unseal; the floor and the epoch cannot be undefined without the owner
+authorization; **epoch rollback** (restored blobs, redefined counter); a
+foreign policy authority refused by the TPM itself; missing policy, TPM
+or other handles fail closed; **Tang unreachable**; deliverd: missing,
+another unit's, relabelled and tampered wraps, no seal configuration, a
+runtime root that is not a mounted dm-crypt device (nothing written), a
+TPM unit refusing after a PCR change (`robot.seal.unseal_failed`) and
+erasing on `tamper` (`robot.seal.tamper`, `robot.seal.erased`), after
+which nothing unseals. Fuzzing: `seal_policy`, `seal_wrap` (std-only
+smoke runs; no libFuzzer campaign yet, `fuzz/README.md`).
+
+Found and fixed while testing: bundle listings capped chunk files at
+4 MiB, so a full sealed chunk (4 MiB + 40) could not be bundled.
+
+**Gated, not run here:** the dm-crypt path end to end
+(`plaintext_only_inside_the_mounted_runtime_volume_dm`,
+`ROBODR_SEAL_DM=1`: loop device, `cryptsetup open`, ext4, install, raw
+image searched): the test container has no device-mapper, so in every
+run above the runtime volume was a directory standing in for the mounted
+mapping (`volume_check: unchecked`), and LUKS2 was exercised on image
+files (format, keyslot test, Clevis bind / pass, erase), never opened.
+
+Not in 13c: EK / AK certification of the UWK and credential activation
+(14a, §8), the depot and LAN re-wrapping (14a), the lease (§7.5) and
+erase **triggers** executed by `robodr-responder` (14b; 13c erases on an
+operator's command), floors moved to TPM NV (14b), OS A/B and a hardware
+TPM (14c). No run on a hardware TPM, a robot or with device-mapper.
+
 ---
 
 ## 11. Open questions
@@ -1277,6 +1480,28 @@ Not in 13b: sealed RPKs and key wraps (13c), the depot and LAN delivery
    and revocation state without a network to the outside.
 7. **Signed-command source for remote erase**: the depot, the SOC through the
    control-plane API, or both, and with which quorum.
+
+What Sprint 13c settled or narrowed (§7.9):
+
+* (3) The algorithms are fixed and listed for the export classification:
+  XChaCha20-Poly1305, HKDF / HMAC-SHA256, X25519, ECDH and ECDSA on P-256
+  (no national algorithms; AES-256-GCM, §7.2's alternative, is not
+  implemented). The legal question stays open.
+* (4) Narrowed: the TPM commands used (`ECDH_ZGen`, `PolicyAuthorize`,
+  `PolicyNV`, `PolicyPCR`, NV counters and bit fields) exist on discrete
+  and firmware TPMs alike; parameter encryption protects the bus of a
+  discrete TPM. The claims per TPM type remain for 14c on hardware.
+* (7) Narrowed: the local mechanism exists (`robodr-deliverd erase`, an
+  operator on the unit); a signed remote command is 14b.
+* New: **policy authority quorum.** `TPM2_PolicyAuthorize` names one
+  signing key, so a PCR policy is signed by one offline P-256 key of the
+  delivery roots, not by their quorum. Options: a policy-of-policies
+  (`PolicyOR` of several authorities), or signing on an HSM that enforces
+  the quorum.
+* New: **depot wrapping keys in the trust file.** The release pins the
+  depots' X25519 keys itself (`--seal-to`); carrying them in the
+  root-signed trust file would let every station check them (a format
+  change).
 
 ---
 
