@@ -404,7 +404,10 @@ fn unitree_speed_level_is_set_and_reverted_at_ttl() {
         Some(e.payload())
     });
     let d = tmpdir("unitree");
+    // Review finding 3: on a quadruped an absolute cap is judged against
+    // the envelope (0.5 of 1.0 here).
     let motion = json!({"restrict_motion": ["unitree_sport"],
+        "envelope": {"max_linear_speed": 1.0},
         "unitree_sport": {"oem_validated": true, "ros2": ros2_peer(port)}});
     let t0 = now();
     let mut e = engine(
@@ -591,13 +594,20 @@ fn nav2_safe_pause_needs_two_people_and_a_validated_adapter() {
     );
     assert_eq!(*cancels.lock().unwrap(), 1);
     // The revert of a two-person action needs two approvers too.
-    let out = e.revert_request("p8", "done", Some(&revert_req("p8", &["alice"])), now());
+    let out = e.revert_request(
+        "p8",
+        "done",
+        Some(&revert_req("p8", &["alice"])),
+        &mut state(SafetyState::Idle),
+        now(),
+    );
     assert_eq!(code(&out), codes::APPROVAL_MISSING);
     assert_eq!(e.status("p8").status, Status::Verified);
     let out = e.revert_request(
         "p8",
         "done",
         Some(&revert_req("p8", &["alice", "bob"])),
+        &mut state(SafetyState::Idle),
         now(),
     );
     assert_eq!(out.status, Status::Reverted, "{out:?}");
@@ -651,6 +661,7 @@ fn ros2_control_switch_and_its_inverse() {
         "c1",
         "done",
         Some(&revert_req("c1", &["alice", "carol"])),
+        &mut state(SafetyState::Idle),
         now(),
     );
     assert_eq!(out.status, Status::Reverted, "{out:?}");
@@ -764,6 +775,7 @@ fn px4_hold_and_rtl_through_mavlink() {
         "h1",
         "done",
         Some(&revert_req("h1", &["alice", "bob"])),
+        &mut state(SafetyState::Idle),
         now(),
     );
     assert_eq!(out.status, Status::Reverted);
@@ -1240,6 +1252,7 @@ fn review_f10_service_replies_are_hard_to_forge() {
         "c1",
         "done",
         Some(&revert_req("c1", &["alice", "bob"])),
+        &mut state(SafetyState::Idle),
         now(),
     );
     assert_eq!(out.status, Status::Reverted, "{out:?}");
@@ -1344,6 +1357,10 @@ fn review_rollback_version_is_never_an_option() {
         assert_eq!(code(&out), codes::INVALID_ORDER, "{v}: {out:?}");
     }
     assert!(!log.exists());
+    if robodr_blackbox::keys::effective_uid() != 0 {
+        // Review finding 8: only a root-owned program runs.
+        return;
+    }
     let o = signed(
         "rb5",
         ActionId::RollbackConfig,
@@ -1360,5 +1377,434 @@ fn review_rollback_version_is_never_an_option() {
         argv,
         "--config program --to-version=1.2.0 --request-id rb5\n\
          --verify --config program --to-version=1.2.0\n"
+    );
+}
+
+// ------------------------------------------------ review of 2026-10-30
+
+fn engine_cfg(
+    dir: &std::path::Path,
+    motion: Value,
+    p: ResponsePolicy,
+    t: Now,
+    edit: impl FnOnce(&mut Value),
+) -> Engine {
+    let mut v: Value =
+        serde_json::from_str(&crate::tests::config_json(dir.to_str().unwrap())).unwrap();
+    v["motion"] = motion;
+    edit(&mut v);
+    let c = crate::ExecutorConfig::parse(&v.to_string())
+        .unwrap()
+        .validate()
+        .unwrap();
+    Engine::open(c, p, Box::new(FakeNft::default()), "b1", t).unwrap()
+}
+
+fn planner(mut o: Order) -> Order {
+    o.origin = Origin::Planner {
+        rule: "r".into(),
+        finding_id: None,
+    };
+    o.soc = None;
+    o.human_approved = false;
+    o
+}
+
+fn reverts(rec: &Rec) -> usize {
+    rec.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|x| x.starts_with("revert"))
+        .count()
+}
+
+fn pause_order(id: &str) -> Order {
+    signed(
+        id,
+        ActionId::SafePause,
+        Morphology::Arm,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    )
+}
+
+/// Review finding 1: a safe_pause that reached `safe_pause_ttl_s` was
+/// undone by the TTL housekeeping (re-activating the motion controllers
+/// with no human and no safety check, even in e_stop_active). Now its TTL
+/// is reported and the pause stays in force.
+#[test]
+fn review_finding_1_pause_ttl_is_reported_never_lifted() {
+    let d = tmpdir("rv1-ttl");
+    let rec = Rec::default();
+    let t0 = now();
+    let mut e = engine(
+        &d,
+        r2c_motion(9),
+        policy(PlatformFamily::Arm, Morphology::Arm),
+        t0,
+    )
+    .with_motion_ports(Box::new(rec.clone()));
+    let out = e.submit(&pause_order("p-ttl"), &mut state(SafetyState::Idle), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let late = |s: u64| Now {
+        wall_ms: t0.wall_ms + s * 1000,
+        boot_ms: t0.boot_ms.map(|b| b + s * 1000),
+    };
+    e.tick(late(3601));
+    e.tick(late(3700));
+    assert_eq!(reverts(&rec), 0, "the TTL lifted the pause");
+    assert_eq!(e.status("p-ttl").status, Status::Verified);
+    let expired: Vec<_> = e
+        .state()
+        .events
+        .iter()
+        .filter(|ev| ev.kind == crate::journal::EventKind::Expired)
+        .collect();
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert!(expired[0].detail.starts_with("HIGH:"), "{expired:?}");
+    // A plain (unsigned, internal) revert does not lift it either.
+    e.revert("p-ttl", "test", late(3800));
+    assert_eq!(reverts(&rec), 0);
+    assert_eq!(e.status("p-ttl").status, Status::Verified);
+    // A restart after the TTL: not undone at reconciliation (SystemPorts
+    // would be called there), back to active at the next tick.
+    drop(e);
+    let rec2 = Rec::default();
+    let mut e = engine(
+        &d,
+        r2c_motion(9),
+        policy(PlatformFamily::Arm, Morphology::Arm),
+        late(3900),
+    )
+    .with_motion_ports(Box::new(rec2.clone()));
+    e.tick(late(3901));
+    assert_eq!(reverts(&rec2), 0);
+    assert_eq!(e.status("p-ttl").status, Status::Verified);
+}
+
+/// Review finding 1: lifting a pause needs the two-person signed revert
+/// **and** a safety state now that is known, fresh, not engaged and
+/// allowed by the pause's adapters.
+#[test]
+fn review_finding_1_pause_lift_rechecks_the_safety_state() {
+    let d = tmpdir("rv1-lift");
+    let rec = Rec::default();
+    let mut e = engine(
+        &d,
+        r2c_motion(9),
+        policy(PlatformFamily::Arm, Morphology::Arm),
+        now(),
+    )
+    .with_motion_ports(Box::new(rec.clone()));
+    let out = e.submit(&pause_order("p-lift"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    for (s, want) in [
+        (SafetyState::EStopActive, codes::SAFETY_SYSTEM_ENGAGED),
+        (SafetyState::Unknown, codes::SAFETY_STATE_UNAVAILABLE),
+        (SafetyState::MovingFast, codes::SAFETY_STATE_NOT_ALLOWED),
+    ] {
+        let out = e.revert_request(
+            "p-lift",
+            "done",
+            Some(&revert_req("p-lift", &["alice", "bob"])),
+            &mut state(s),
+            now(),
+        );
+        assert_eq!(code(&out), want, "{s:?}: {out:?}");
+        assert_eq!(out.status, Status::Verified, "{s:?}");
+    }
+    let mut stale = FixedSafety(Current {
+        state: SafetyState::Idle,
+        age_ms: 60_000,
+    });
+    let out = e.revert_request(
+        "p-lift",
+        "done",
+        Some(&revert_req("p-lift", &["alice", "bob"])),
+        &mut stale,
+        now(),
+    );
+    assert_eq!(code(&out), codes::SAFETY_STATE_STALE, "{out:?}");
+    // Unsigned: refused before anything else.
+    let out = e.revert_request("p-lift", "x", None, &mut state(SafetyState::Idle), now());
+    assert_eq!(code(&out), codes::SOC_SIGNATURE_INVALID, "{out:?}");
+    assert_eq!(reverts(&rec), 0);
+    let out = e.revert_request(
+        "p-lift",
+        "done",
+        Some(&revert_req("p-lift", &["alice", "bob"])),
+        &mut state(SafetyState::Idle),
+        now(),
+    );
+    assert_eq!(out.status, Status::Reverted, "{out:?}");
+    assert_eq!(reverts(&rec), 1);
+}
+
+/// Review finding 1: an operator's emergency disable dropped every action
+/// and undid the pause with it. The pause is now left in force.
+#[test]
+fn review_finding_1_operator_disable_leaves_the_pause() {
+    let d = tmpdir("rv1-op");
+    let rec = Rec::default();
+    let nft = FakeNft::default();
+    let mut e = Engine::open(
+        config(&d, r2c_motion(9)),
+        policy(PlatformFamily::Arm, Morphology::Arm),
+        Box::new(nft.clone()),
+        "b1",
+        now(),
+    )
+    .unwrap()
+    .with_motion_ports(Box::new(rec.clone()));
+    let i = signed(
+        "i-op",
+        ActionId::IsolateNetwork,
+        Morphology::Arm,
+        Target::None,
+        Some(60),
+        &[],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&i, &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let out = e.submit(&pause_order("p-op"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    nft.0.lock().unwrap().table = None;
+    e.periodic_verify(wall_ms());
+    assert!(e.state().operator_disabled);
+    assert_eq!(reverts(&rec), 0, "the operator disable lifted the pause");
+}
+
+/// Review finding 3: an absolute cap was checked for finiteness only, so
+/// `max_joint_speed: 0.0001` (or a planner's absolute cap) could near-stop
+/// a balancing robot. On a robot that balances, an absolute cap must be
+/// at least `min_motion_factor` of the configured envelope; a planner
+/// order carries a factor only.
+#[test]
+fn review_finding_3_absolute_caps_have_a_floor() {
+    let unitree = |env: Option<Value>| {
+        let mut m = json!({"restrict_motion": ["unitree_sport"],
+            "unitree_sport": {"oem_validated": true, "ros2": ros2_peer(9)}});
+        if let Some(e) = env {
+            m["envelope"] = e;
+        }
+        m
+    };
+    let caps = |lin: Option<f64>, joint: Option<f64>| {
+        Target::Motion(MotionRequest {
+            max_linear_speed: lin,
+            max_joint_speed: joint,
+            ..Default::default()
+        })
+    };
+    let quad = policy(PlatformFamily::Other, Morphology::Quadruped);
+    let q = |id: &str, t: Target| {
+        signed(
+            id,
+            ActionId::RestrictMotion,
+            Morphology::Quadruped,
+            t,
+            Some(30),
+            &[],
+            SafetyState::Idle,
+        )
+    };
+    // No envelope: an absolute cap cannot be judged.
+    let rec = Rec::default();
+    let mut e = engine(&tmpdir("rv3-a"), unitree(None), quad.clone(), now())
+        .with_motion_ports(Box::new(rec.clone()));
+    let out = e.submit(
+        &q("c1", caps(None, Some(0.0001))),
+        &mut state(SafetyState::Idle),
+        now(),
+    );
+    assert_eq!(code(&out), codes::FALL_HAZARD, "{out:?}");
+    drop(e);
+    // With one: below the floor refused, above it applied.
+    let env = json!({"max_linear_speed": 1.0, "max_joint_speed": 2.0});
+    let mut e = engine(&tmpdir("rv3-b"), unitree(Some(env)), quad.clone(), now())
+        .with_motion_ports(Box::new(rec.clone()));
+    for (id, t) in [
+        ("c2", caps(None, Some(0.0001))),
+        ("c3", caps(Some(0.01), None)),
+        ("c4", caps(Some(0.9), Some(0.1))),
+    ] {
+        let out = e.submit(&q(id, t), &mut state(SafetyState::Idle), now());
+        assert_eq!(code(&out), codes::FALL_HAZARD, "{id}: {out:?}");
+    }
+    assert!(rec.0.lock().unwrap().is_empty());
+    let out = e.submit(
+        &q("c5", caps(Some(0.5), Some(1.0))),
+        &mut state(SafetyState::Idle),
+        now(),
+    );
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    drop(e);
+    // The planner: a factor only, on any robot.
+    let wheeled = policy(PlatformFamily::Ugv, Morphology::WheeledMobile);
+    let mut e = engine(&tmpdir("rv3-c"), unitree(None), wheeled, now())
+        .with_motion_ports(Box::new(Rec::default()));
+    let p = planner(signed(
+        "plan:c6",
+        ActionId::RestrictMotion,
+        Morphology::WheeledMobile,
+        caps(Some(0.0001), None),
+        Some(30),
+        &[],
+        SafetyState::Idle,
+    ));
+    let out = e.submit(&p, &mut state(SafetyState::Idle), now());
+    assert_eq!(code(&out), codes::INVALID_ORDER, "{out:?}");
+}
+
+/// Review finding 4: restrict_motion went to the motion planner before
+/// the approval rules, so a planner order on a humanoid (ADR-0012 rule 3)
+/// or on a site with `require_approval_for_all_containment` was executed
+/// without a human.
+#[test]
+fn review_finding_4_restrict_motion_needs_a_human_where_containment_does() {
+    let m = json!({"restrict_motion": ["unitree_sport"],
+        "unitree_sport": {"oem_validated": true, "ros2": ros2_peer(9)}});
+    let factor = || {
+        Target::Motion(MotionRequest {
+            factor: Some(0.5),
+            ..Default::default()
+        })
+    };
+    let rec = Rec::default();
+    let mut e = engine(
+        &tmpdir("rv4-a"),
+        m.clone(),
+        policy(PlatformFamily::Other, Morphology::Humanoid),
+        now(),
+    )
+    .with_motion_ports(Box::new(rec.clone()));
+    let p = planner(signed(
+        "plan:h1",
+        ActionId::RestrictMotion,
+        Morphology::Humanoid,
+        factor(),
+        Some(30),
+        &[],
+        SafetyState::Idle,
+    ));
+    let out = e.submit(&p, &mut state(SafetyState::Idle), now());
+    assert_eq!(code(&out), codes::NEEDS_APPROVAL, "{out:?}");
+    drop(e);
+    let mut e = engine_cfg(
+        &tmpdir("rv4-b"),
+        m,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        now(),
+        |v| v["require_approval_for_all_containment"] = json!(true),
+    )
+    .with_motion_ports(Box::new(rec.clone()));
+    let p = planner(signed(
+        "plan:w1",
+        ActionId::RestrictMotion,
+        Morphology::WheeledMobile,
+        factor(),
+        Some(30),
+        &[],
+        SafetyState::Idle,
+    ));
+    let out = e.submit(&p, &mut state(SafetyState::Idle), now());
+    assert_eq!(code(&out), codes::NEEDS_APPROVAL, "{out:?}");
+    assert!(rec.0.lock().unwrap().is_empty());
+}
+
+/// Review finding 7: the requester was not held to the approver grammar,
+/// so "alice" plus an invisible character (or a Cyrillic "а") passed as a
+/// requester different from the approvers alice and bob.
+#[test]
+fn review_finding_7_requester_is_a_name_too() {
+    use crate::motion::approvers_ok;
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let ab = s(&["alice", "bob"]);
+    for rb in ["alice\u{200b}", "\u{430}lice", " alice", "alice bob", ""] {
+        let r = approvers_ok(ActionId::SafePause, rb, &ab);
+        assert_eq!(
+            r.map_err(|r| r.code).unwrap_err(),
+            codes::APPROVAL_MISSING,
+            "{rb:?}"
+        );
+    }
+    assert!(approvers_ok(ActionId::SafePause, "carol", &ab).is_ok());
+}
+
+/// Review finding 8: the site rollback program ran with the executor's
+/// ambient CAP_NET_ADMIN, whoever could write it. A program that is not
+/// root-owned and protected (file and directory) is refused and never
+/// run; the child is started with its ambient capabilities cleared.
+#[test]
+fn review_finding_8_rollback_program_must_be_protected() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmpdir("rv8");
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = d.join("ran.log");
+    let prog = d.join("rollback.sh");
+    std::fs::write(
+        &prog,
+        format!(
+            "#!/bin/sh\ngrep CapAmb /proc/self/status >> '{}'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    let motion = json!({"rollback_config": "rollback",
+        "rollback": {"oem_validated": true, "program": prog}});
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        now(),
+    );
+    let rb = |id: &str| {
+        signed(
+            id,
+            ActionId::RollbackConfig,
+            Morphology::WheeledMobile,
+            Target::Motion(MotionRequest {
+                config: Some("program".into()),
+                to_version: Some("1.2.0".into()),
+                ..Default::default()
+            }),
+            None,
+            &["a", "b"],
+            SafetyState::Idle,
+        )
+    };
+    // Group-writable: refused, not run.
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let out = e.submit(&rb("rb8a"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Failed, "{out:?}");
+    assert!(
+        out.error.as_deref().unwrap_or("").contains("writable"),
+        "{out:?}"
+    );
+    assert!(!log.exists(), "a writable program was run");
+    // In a directory others can write: refused too.
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(crate::motion::adapters::program_ok(&prog).is_err());
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A symlink to it: refused.
+    let link = d.join("link.sh");
+    std::os::unix::fs::symlink(&prog, &link).unwrap();
+    assert!(crate::motion::adapters::program_ok(&link).is_err());
+    if robodr_blackbox::keys::effective_uid() != 0 {
+        // The positive case needs a root-owned file.
+        return;
+    }
+    let out = e.submit(&rb("rb8b"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Applied, "{out:?}");
+    let ran = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        ran.lines()
+            .all(|l| l.trim_end().ends_with("0000000000000000")),
+        "{ran}"
     );
 }

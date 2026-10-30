@@ -28,6 +28,15 @@
 //! reports `restriction_error`. The status file reports the restriction in
 //! force (`restriction.id`), which is what the executor reads back to
 //! verify that its order took effect.
+//!
+//! **Lower bound on a robot that balances** (humanoid, quadruped, other;
+//! review finding 3, ADR-0012 rule 4): a restriction that would scale any
+//! channel below [`MIN_FACTOR_BALANCING`] of its own limit is ignored the
+//! same way ([`Restriction::floor_check`]): a factor below it, an absolute
+//! cap below it times a twist channel's linear limit or a trajectory
+//! joint's velocity bound, or an absolute cap on a channel with no finite
+//! limit (it cannot be converted to a factor). A near-stop of the balance
+//! controller's commands makes such a robot fall.
 
 use std::path::Path;
 
@@ -37,6 +46,10 @@ use serde::Deserialize;
 pub const FORMAT: &str = "robodr-gw-restriction/v1";
 /// Largest restriction file read.
 pub const MAX_FILE: u64 = 4096;
+/// Lowest scale a restriction may impose on a robot that balances: the
+/// responder's hard floor for `min_motion_factor`
+/// (`robodr_responder::policy::MIN_MOTION_FACTOR_FLOOR`, ADR-0012 rule 4).
+pub const MIN_FACTOR_BALANCING: f64 = 0.05;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +91,41 @@ impl Restriction {
 
     pub fn expired(&self, now_unix_ms: u64) -> bool {
         now_unix_ms >= self.expires_unix_ms
+    }
+
+    /// On a robot that balances (review finding 3): every limit this
+    /// restriction would impose is at least [`MIN_FACTOR_BALANCING`] of the
+    /// limit it scales. `lin_bases`: the linear limits of the channels a
+    /// linear cap applies to; `joint_bases`: the velocity bounds of the
+    /// trajectory joints a joint cap applies to (`INFINITY` where there is
+    /// none: an absolute cap there cannot be judged and is refused).
+    pub fn floor_check(&self, lin_bases: &[f64], joint_bases: &[f64]) -> Result<(), String> {
+        if self.factor.is_some_and(|f| f < MIN_FACTOR_BALANCING) {
+            return Err(format!(
+                "restriction file: factor below {MIN_FACTOR_BALANCING} on a robot that balances"
+            ));
+        }
+        for (what, cap, bases) in [
+            ("max_linear_speed", self.max_linear_speed, lin_bases),
+            ("max_joint_speed", self.max_joint_speed, joint_bases),
+        ] {
+            let Some(cap) = cap else { continue };
+            for b in bases {
+                if !b.is_finite() {
+                    return Err(format!(
+                        "restriction file: {what} on a channel without a finite limit cannot \
+                         be checked against the floor on a robot that balances"
+                    ));
+                }
+                if cap < MIN_FACTOR_BALANCING * b {
+                    return Err(format!(
+                        "restriction file: {what} {cap} is below {MIN_FACTOR_BALANCING} of a \
+                         channel's limit {b} on a robot that balances"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -246,5 +294,40 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Review finding 3: any cap > 0 was accepted, so `max_joint_speed:
+    /// 0.0001` near-stopped a balancing robot's trajectories.
+    #[test]
+    fn review_finding_3_floor_on_a_balancing_robot() {
+        let r = |body: &str| {
+            parse(&format!(
+                r#"{{"format":"robodr-gw-restriction/v1","id":"a",{body},"expires_unix_ms":5}}"#
+            ))
+            .unwrap()
+        };
+        let (lin, joint) = ([1.0], [2.0, 4.0]);
+        for bad in [
+            r#""factor":0.01"#,
+            r#""max_joint_speed":0.0001"#,
+            r#""max_joint_speed":0.15"#,
+            r#""max_linear_speed":0.01"#,
+        ] {
+            assert!(r(bad).floor_check(&lin, &joint).is_err(), "{bad}");
+        }
+        for ok in [
+            r#""factor":0.05"#,
+            r#""max_joint_speed":0.2"#,
+            r#""max_linear_speed":0.05"#,
+        ] {
+            assert!(r(ok).floor_check(&lin, &joint).is_ok(), "{ok}");
+        }
+        // An unbounded channel: an absolute cap cannot be judged.
+        assert!(r(r#""max_linear_speed":0.5"#)
+            .floor_check(&[f64::INFINITY], &[])
+            .is_err());
+        assert!(r(r#""factor":0.5"#)
+            .floor_check(&[f64::INFINITY], &[f64::INFINITY])
+            .is_ok());
     }
 }

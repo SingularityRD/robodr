@@ -109,6 +109,10 @@ TasksMax=16
 # agentd can reach the 0660 socket in the 0750 runtime directory.
 User=robodr-exec
 Group=robodr
+# Ambient so the `nft` child keeps it across exec. The site rollback
+# program (motion.rollback) is started with its ambient set cleared
+# (prctl PR_CAP_AMBIENT_CLEAR_ALL) and must be root-owned and not group /
+# other-writable (executor review finding 8): it never gets CAP_NET_ADMIN.
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes

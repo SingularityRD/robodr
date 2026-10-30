@@ -617,6 +617,30 @@ pub fn precheck(
         ));
     }
     if let Some(m) = motion {
+        // Review finding 4: a motion restriction is containment too. On a
+        // robot that falls when de-energised it is the substitute
+        // containment that always waits for a human (ADR-0012 rule 3), and
+        // the site option asks for a human on every containment.
+        if order.action == ActionId::RestrictMotion
+            && !order.human_approved
+            && (own.falls_when_de_energised() || cfg.config.require_approval_for_all_containment)
+        {
+            return Err(Refusal::new(
+                codes::NEEDS_APPROVAL,
+                if own.falls_when_de_energised() {
+                    format!(
+                        "on a {} robot every containment, restrict_motion included, needs a \
+                         human's approval",
+                        own.as_str()
+                    )
+                } else {
+                    "this site requires a human's approval for every containment \
+                     (require_approval_for_all_containment): restrict_motion from the on-robot \
+                     planner is not executed"
+                        .to_string()
+                },
+            ));
+        }
         return crate::motion::plan(order, policy, m, &cfg.config.ttl);
     }
     if order.action == ActionId::RestrictMotion {

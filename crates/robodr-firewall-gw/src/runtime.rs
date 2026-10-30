@@ -442,10 +442,15 @@ pub fn apply_restriction(
 ) -> Option<String> {
     let err = match latest {
         None => previous_error,
-        Some(Ok(Some(r))) if !r.expired(now_unix_ms) => {
-            gw.set_restriction(Some(r));
-            None
-        }
+        Some(Ok(Some(r))) if !r.expired(now_unix_ms) => match gw.restriction_floor_ok(&r) {
+            Ok(()) => {
+                gw.set_restriction(Some(r));
+                None
+            }
+            // Review finding 3: below the floor on a robot that balances;
+            // ignored like a malformed file.
+            Err(e) => Some(e),
+        },
         Some(Ok(_)) => {
             gw.set_restriction(None);
             None

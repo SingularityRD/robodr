@@ -24,8 +24,10 @@
 //!
 //! `rearm` ends an operator's emergency disable (`nft delete table inet
 //! robodr`, after which every order is refused) and acknowledges a journal
-//! reset, through the running executor's socket (or the journal directly
-//! when none runs).
+//! reset. It works on the journal only, as root on the host, while the
+//! executor is **stopped** (`systemctl stop robodr-executor` first): the
+//! socket agentd uses has no re-arm (review finding 2: agentd holds its
+//! key, and must not be able to lift the operator's fence).
 
 // S10: this crate has no `unsafe` code and must stay that way.
 #![forbid(unsafe_code)]
@@ -463,41 +465,31 @@ fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
     }
 }
 
-/// `rearm`: through the running executor, or on the journal when none runs.
+/// `rearm`: on the journal, only while no executor serves the socket
+/// (review finding 2: the protocol socket, whose key agentd holds, has no
+/// re-arm).
 fn rearm(
     cfg: Resolved,
     policy: robodr_responder::ResponsePolicy,
     reason: Option<&str>,
 ) -> ExitCode {
     let reason = reason.unwrap_or("no reason given");
-    let key = match Key::load(&cfg.config.key_file) {
-        Ok(k) => Some(k),
-        Err(e) => {
-            eprintln!("robodr-executor: {e} (re-arming on the journal instead)");
-            None
+    match server::serving(&cfg.config.socket) {
+        Ok(false) => {}
+        Ok(true) => {
+            eprintln!(
+                "robodr-executor: rearm: the executor is running ({}): stop it first \
+                 (systemctl stop robodr-executor), re-arm, then start it",
+                cfg.config.socket.display()
+            );
+            return ExitCode::from(1);
         }
-    };
-    if let Some(key) = key {
-        let client = robodr_executor::client::Client::new(
-            cfg.config.socket.clone(),
-            key,
-            std::time::Duration::from_secs(10),
-        );
-        match client.rearm(reason) {
-            Ok(was) => {
-                println!(
-                    "robodr-executor: re-armed{}",
-                    if was { "" } else { " (it was not disabled)" }
-                );
-                return ExitCode::SUCCESS;
-            }
-            Err(e) if e.contains("executor socket") => {
-                eprintln!("robodr-executor: {e}: not running, re-arming on the journal");
-            }
-            Err(e) => {
-                eprintln!("robodr-executor: rearm: {e}");
-                return ExitCode::from(1);
-            }
+        Err(e) => {
+            eprintln!(
+                "robodr-executor: rearm: cannot tell whether the executor runs ({e}): run as \
+                 root with the executor stopped"
+            );
+            return ExitCode::from(1);
         }
     }
     let boot = robodr_executor::boot_id();

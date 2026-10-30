@@ -518,13 +518,87 @@ fn px4_mode(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
 
 // -------------------------------------------------------------- rollback
 
+/// The rollback program may be run (review finding 8): a regular file
+/// owned by root and not writable by group or others, in a directory that
+/// is owned by root and not writable by group or others either (whoever
+/// can replace it chooses what the executor runs).
+pub fn program_ok(program: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    // The program itself is never followed through a symlink; its
+    // directory may be reached through one (`/bin` → `/usr/bin`).
+    let check = |p: &Path, what: &str, follow: bool| -> Result<(), String> {
+        let md = if follow {
+            std::fs::metadata(p)
+        } else {
+            std::fs::symlink_metadata(p)
+        }
+        .map_err(|e| format!("{}: {e}", p.display()))?;
+        if !follow && !md.file_type().is_file() {
+            return Err(format!(
+                "{}: not a regular file (a symlink is refused)",
+                p.display()
+            ));
+        }
+        if md.uid() != 0 {
+            return Err(format!(
+                "{} ({what}) is owned by uid {}, not root",
+                p.display(),
+                md.uid()
+            ));
+        }
+        if md.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} ({what}) is writable by group or others",
+                p.display()
+            ));
+        }
+        Ok(())
+    };
+    check(program, "the rollback program", false)?;
+    if let Some(dir) = program.parent() {
+        check(dir, "its directory", true)?;
+    }
+    Ok(())
+}
+
+/// Clear the ambient capability set of the calling process
+/// (`PR_CAP_AMBIENT_CLEAR_ALL`): run in the child between `fork` and
+/// `exec`, so the rollback program does not inherit the executor's ambient
+/// CAP_NET_ADMIN (review finding 8; `nft` still needs it, so the
+/// executor keeps its own).
+#[allow(unsafe_code)]
+fn drop_ambient_caps(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    extern "C" {
+        fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+    const PR_CAP_AMBIENT: std::ffi::c_int = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: std::ffi::c_ulong = 4;
+    // SAFETY: the closure runs in the forked child before `exec`; it only
+    // makes one `prctl(2)` system call (async-signal-safe), with integer
+    // arguments, allocating nothing and touching no shared state. A failure
+    // fails the spawn (the program is not run with the capability).
+    unsafe {
+        cmd.pre_exec(|| {
+            let zero: std::ffi::c_ulong = 0;
+            if prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, zero, zero, zero) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn run(program: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
-    let mut child = std::process::Command::new(program)
-        .args(args)
+    program_ok(program)?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    drop_ambient_caps(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("{}: {e}", program.display()))?;
     let until = Instant::now() + timeout;
