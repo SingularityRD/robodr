@@ -1,11 +1,15 @@
-//! The three Kafka APIs this producer needs, in their classic
-//! (non-flexible) encodings:
+//! The Kafka APIs this producer needs, in their classic (non-flexible)
+//! encodings:
 //!
 //! | API | key | versions | notes |
 //! | --- | --- | --- | --- |
 //! | ApiVersions | 18 | 0 | always answered with a v0 header; discovers the others |
 //! | Metadata | 3 | 1–8 | v9+ are flexible (compact encodings), not implemented |
 //! | Produce | 0 | 3–8 | v3 is the first with RecordBatch v2; v9+ are flexible |
+//! | InitProducerId | 22 | 0–1 | idempotent producer only; v2+ are flexible (v3+ add epoch bumps, KIP-360, not used) |
+//!
+//! InitProducerId v1 is v0 with quota throttling; both are served by Kafka
+//! 0.11 to 4.1 (KIP-896 keeps every version a Kafka 2.1 client uses).
 //!
 //! Request header v1: `api_key int16, api_version int16, correlation_id
 //! int32, client_id NULLABLE_STRING`. Response header v0: `correlation_id
@@ -16,10 +20,12 @@ use super::wire::{derr, DecodeError, Reader, Writer};
 pub const API_PRODUCE: i16 = 0;
 pub const API_METADATA: i16 = 3;
 pub const API_VERSIONS: i16 = 18;
+pub const API_INIT_PRODUCER_ID: i16 = 22;
 
 /// Versions this client implements, per API.
 pub const PRODUCE_VERSIONS: (i16, i16) = (3, 8);
 pub const METADATA_VERSIONS: (i16, i16) = (1, 8);
+pub const INIT_PRODUCER_ID_VERSIONS: (i16, i16) = (0, 1);
 
 /// Build a size-prefixed request frame.
 pub fn frame_request(
@@ -442,9 +448,109 @@ pub fn encode_produce_response(version: i16, resp: &ProduceResponse) -> Vec<u8> 
     w.buf
 }
 
+// ------------------------------------------------------------- InitProducerId
+
+/// `transaction_timeout_ms` sent (ignored by the broker without a
+/// transactional id; the Java client's default).
+pub const INIT_PRODUCER_ID_TXN_TIMEOUT_MS: i32 = 60_000;
+
+/// InitProducerId v0–1 request: no transactional id (idempotence only).
+pub fn encode_init_producer_id_request(version: i16) -> Result<Vec<u8>, DecodeError> {
+    if !(INIT_PRODUCER_ID_VERSIONS.0..=INIT_PRODUCER_ID_VERSIONS.1).contains(&version) {
+        return derr(format!("init producer id v{version} not implemented"));
+    }
+    let mut w = Writer::new();
+    w.try_nullable_string(None)?;
+    w.i32(INIT_PRODUCER_ID_TXN_TIMEOUT_MS);
+    Ok(w.buf)
+}
+
+/// A decoded InitProducerId request (test broker): `(transactional_id,
+/// transaction_timeout_ms)`.
+pub fn decode_init_producer_id_request(
+    r: &mut Reader<'_>,
+) -> Result<(Option<String>, i32), DecodeError> {
+    let txn = r.nullable_string()?.map(str::to_string);
+    let timeout = r.i32()?;
+    if !r.is_empty() {
+        return derr("trailing bytes in init producer id request");
+    }
+    Ok((txn, timeout))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitProducerIdResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+}
+
+/// Decode an InitProducerId v0–1 response body (same layout).
+pub fn decode_init_producer_id_response(
+    body: &[u8],
+) -> Result<InitProducerIdResponse, DecodeError> {
+    let mut r = Reader::new(body);
+    let resp = InitProducerIdResponse {
+        throttle_time_ms: r.i32()?,
+        error_code: r.i16()?,
+        producer_id: r.i64()?,
+        producer_epoch: r.i16()?,
+    };
+    if !r.is_empty() {
+        return derr("trailing bytes in init producer id response");
+    }
+    Ok(resp)
+}
+
+/// Encode an InitProducerId v0–1 response (test broker).
+pub fn encode_init_producer_id_response(resp: &InitProducerIdResponse) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.i32(resp.throttle_time_ms)
+        .i16(resp.error_code)
+        .i64(resp.producer_id)
+        .i16(resp.producer_epoch);
+    w.buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte layout from the protocol guide (InitProducerId Request/Response
+    /// v0-v1).
+    #[test]
+    fn init_producer_id_layout() {
+        for v in 0..=1 {
+            let b = encode_init_producer_id_request(v).unwrap();
+            assert_eq!(b, [0xff, 0xff, 0, 0, 0xea, 0x60], "null id, 60000 ms");
+            let mut r = Reader::new(&b);
+            assert_eq!(
+                decode_init_producer_id_request(&mut r).unwrap(),
+                (None, 60_000)
+            );
+        }
+        assert!(encode_init_producer_id_request(2).is_err());
+        let resp = InitProducerIdResponse {
+            throttle_time_ms: 0,
+            error_code: 0,
+            producer_id: 4242,
+            producer_epoch: 0,
+        };
+        let b = encode_init_producer_id_response(&resp);
+        assert_eq!(
+            b,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x92, 0, 0],
+            "throttle, error, id 4242, epoch 0"
+        );
+        assert_eq!(decode_init_producer_id_response(&b).unwrap(), resp);
+        for n in 0..b.len() {
+            assert!(decode_init_producer_id_response(&b[..n]).is_err());
+        }
+        let mut long = b.clone();
+        long.push(0);
+        assert!(decode_init_producer_id_response(&long).is_err());
+    }
 
     #[test]
     fn request_frame_layout() {

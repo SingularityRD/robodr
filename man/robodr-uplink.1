@@ -43,6 +43,12 @@ robodr\-uplink \- send RoboDR findings to the SOC ingest API over TLS
 .IR N ]
 .RB [ \-\-dead\-letter\-keep
 .IR N ]
+.RB [ \-\-dead\-letter\-max\-age\-s
+.IR N ]
+.RB [ \-\-done\-max\-age\-s
+.IR N ]
+.RB [ \-\-done\-max\-count
+.IR N ]
 .RB [ \-\-upgrade\-data\-source
 .IR LABEL ]
 .RB [ \-\-upgrade\-topic
@@ -287,7 +293,24 @@ bytes (default 67108864, at least 65536; 0 = never rotate), keeping
 .I N
 rotated files
 .RB ( dead\-letter.jsonl.1
-newest; default 4). Deduplication reads the rotated files too.
+newest; default 4). Deduplication reads the rotated files too. Rotation only
+renames; after each successful run a rotated file beyond
+.I keep
+is deleted once none of its entries is still needed for deduplication (its
+diode batch is done or left the importer output, its spool file left
+.IR ready/ ,
+its re\-injected generation is done); otherwise it is held for a later run.
+Deleted dead letters can no longer be re\-injected.
+.TP
+.BI \-\-dead\-letter\-max\-age\-s " N"
+Also delete rotated dead\-letter files older than N seconds, by the same rule
+(0 or absent = no age bound).
+.TP
+.BI \-\-done\-max\-age\-s " N\fR, " \-\-done\-max\-count " N"
+Delete
+.B done/
+markers older than N seconds (default 2592000, 30 days; 0 = keep) or beyond
+the N newest, but never while their batch is still in the importer output.
 .TP
 .BI \-\-upgrade\-data\-source " LABEL\fR, " \-\-upgrade\-topic " TOPIC"
 An unsigned contract 1.x record is upgraded to contract 2.0 with this

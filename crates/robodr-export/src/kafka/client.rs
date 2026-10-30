@@ -18,13 +18,16 @@
 //!   would make the next request fail.
 //! * On every new connection: ApiVersions v0, then the highest common
 //!   version of Metadata (1–8) and Produce (3–8) is used.
-//! * `acks = -1` (all in-sync replicas), idempotence **off** (producer id
-//!   -1), compression NONE, one request in flight per call (requests are
-//!   sent one at a time and awaited), so per-partition order is preserved
-//!   within a [`Producer::send`] call and between calls.
-//! * Delivery is **at-least-once**: a request whose response is lost (time
-//!   out, disconnect) is re-sent, and the broker may then hold it twice.
-//!   Consumers deduplicate on `event-uid` (contract §2).
+//! * `acks = -1` (all in-sync replicas), compression NONE, **one request
+//!   in flight** (requests are sent one at a time and awaited; Kafka's
+//!   `max.in.flight.requests.per.connection` is effectively 1, within the
+//!   idempotent producer's limit of 5), so per-partition order is
+//!   preserved within a [`Producer::send`] call and between calls.
+//! * **Idempotent** by default ([`ProducerConfig::idempotence`], see
+//!   "Idempotence" below). With it off (producer id -1) delivery is
+//!   at-least-once: a request whose response is lost (time out,
+//!   disconnect) is re-sent, and the broker may then hold it twice.
+//!   Consumers deduplicate on `event-uid` (contract §2) either way.
 //! * Retriable errors (leader moves, timeouts, not enough replicas, I/O)
 //!   are retried with exponential backoff, refreshing metadata when the
 //!   error says leadership may have changed; a call that makes no progress
@@ -57,15 +60,60 @@
 //!   [`MAX_RESOLVER_THREADS`] such threads may be outstanding at once, so a
 //!   dead DNS server cannot pile up threads. On an air-gapped SOC network,
 //!   prefer IP literals (and advertised listeners that are IP literals).
+//!
+//! # Idempotence
+//!
+//! Before the first Produce request the producer asks a broker for a
+//! producer id (InitProducerId v0–1, no transactional id) and then sends
+//! every batch with that id, its epoch and a per-partition base sequence
+//! (0, 1, ... per record, wrapping at `i32::MAX` as Kafka does). The broker
+//! appends a batch only if its sequence follows the last one it wrote for
+//! that id and partition, and recognises a re-send of one of its last five
+//! batches. A batch whose acknowledgement was lost is therefore **re-sent
+//! exactly as it was** (same records, same base sequence; also to a new
+//! leader): the broker either appends it (it never had it) or answers
+//! success for the copy it holds. It is never written twice. Errors:
+//!
+//! * `DUPLICATE_SEQUENCE_NUMBER`: the broker already holds the batch:
+//!   **success** (offset -1 if the broker does not say).
+//! * `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID`,
+//!   `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED`: the broker's state for
+//!   this producer id disagrees with ours (lost in an unclean leader
+//!   election, or another process uses the same persisted id); the batch
+//!   was not appended. The producer **resets**: a new producer id, every
+//!   sequence back to 0, the undecided records re-sent under it (counted
+//!   in [`ProducerStats::producer_id_resets`]). A batch of another
+//!   partition that was in doubt at that moment (its response lost) may
+//!   then be written twice: at-least-once, never a loss.
+//! * InitProducerId `CLUSTER_AUTHORIZATION_FAILED` is fatal and says why:
+//!   brokers before Kafka 3.0 require the `IDEMPOTENT_WRITE` cluster ACL
+//!   (3.0+ imply it from `WRITE` on a topic); grant it, or turn
+//!   idempotence off. A broker without InitProducerId v0–1 is refused the
+//!   same way.
+//!
+//! **Across restarts** ([`Producer::send_journaled`]): before each Produce
+//! request that carries a newly numbered batch, the producer hands the
+//! caller its [`IdempotentState`] (producer id, epoch, next sequence of
+//! every partition, already counting the batches about to be sent) and a
+//! [`SendJournal`] (this call's batches: acknowledged with their offset,
+//! or in doubt) to store durably. A restarted caller restores the state
+//! ([`Producer::restore_idempotent_state`]) and passes the journal back
+//! with the same records: acknowledged batches are reported delivered
+//! without a request, the batch in doubt is re-sent as it was, and the
+//! broker deduplicates it. That holds while the broker remembers the
+//! producer id (`producer.id.expiration.ms`, default one day after its
+//! last write); after that a broker accepts the id again with any
+//! sequence, so the in-doubt batch may be written twice.
 
-use super::batch::{encode_batch, ProduceRecord, BATCH_OVERHEAD};
+use super::batch::{encode_batch_idempotent, ProduceRecord, ProducerFields, BATCH_OVERHEAD};
 use super::errors::{self, classify, ErrorClass};
 use super::proto::{self, ApiRange};
 use super::sasl::{self, SaslConfig, ScramClient};
 use super::wire::DecodeError;
 use robodr_blackbox::tls::{ClientTls, DeadlineTcp};
 use rustls::{ClientConnection, StreamOwned};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -113,6 +161,10 @@ pub struct ProducerConfig {
     pub sasl: Option<SaslConfig>,
     /// Plain TCP when `tls` is `None` (default `false`: refused).
     pub allow_plaintext: bool,
+    /// Idempotent producer (default `true`, see the module docs). Turn it
+    /// off for brokers that refuse InitProducerId to this principal
+    /// (`IDEMPOTENT_WRITE` / cluster authorisation) or do not offer it.
+    pub idempotence: bool,
 }
 
 impl ProducerConfig {
@@ -135,6 +187,7 @@ impl ProducerConfig {
             tls: None,
             sasl: None,
             allow_plaintext: false,
+            idempotence: true,
         }
     }
 
@@ -213,6 +266,9 @@ pub enum ProduceError {
     Unsupported(String),
     RetriesExhausted(String),
     Timeout(String),
+    /// The caller could not store the idempotence journal
+    /// ([`Producer::send_journaled`]); that request was not sent.
+    Journal(String),
 }
 
 impl fmt::Display for ProduceError {
@@ -229,6 +285,7 @@ impl fmt::Display for ProduceError {
             Self::Unsupported(m) => write!(f, "unsupported broker: {m}"),
             Self::RetriesExhausted(m) => write!(f, "retries exhausted: {m}"),
             Self::Timeout(m) => write!(f, "delivery timeout: {m}"),
+            Self::Journal(m) => write!(f, "idempotence journal not saved (not sent): {m}"),
         }
     }
 }
@@ -245,7 +302,100 @@ pub struct ProducerStats {
     pub io_errors: u64,
     pub delivered: u64,
     pub rejected: u64,
+    /// Producer ids obtained (InitProducerId).
+    pub producer_ids: u64,
+    /// Producer id resets after a sequence / epoch / unknown-id error.
+    pub producer_id_resets: u64,
+    /// Batches the broker reported as already written (re-sends).
+    pub duplicates: u64,
+    /// Batches reported delivered from a resumed journal, without a request.
+    pub journal_acked: u64,
 }
+
+/// The idempotent producer's identity and sequences (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotentState {
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    /// Topic -> partition -> sequence number of its next record.
+    pub sequences: BTreeMap<String, BTreeMap<i32, i32>>,
+}
+
+impl IdempotentState {
+    fn new(producer_id: i64, producer_epoch: i16) -> Self {
+        Self {
+            producer_id,
+            producer_epoch,
+            sequences: BTreeMap::new(),
+        }
+    }
+
+    /// Next sequence of `topic`/`partition` (0 if never written).
+    pub fn next(&self, topic: &str, partition: i32) -> i32 {
+        self.sequences
+            .get(topic)
+            .and_then(|m| m.get(&partition))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set(&mut self, topic: &str, partition: i32, seq: i32) {
+        self.sequences
+            .entry(topic.to_string())
+            .or_default()
+            .insert(partition, seq);
+    }
+
+    /// Plausible (e.g. as read back from a file): non-negative id, epoch,
+    /// partitions and sequences.
+    pub fn is_valid(&self) -> bool {
+        self.producer_id >= 0
+            && self.producer_epoch >= 0
+            && self
+                .sequences
+                .values()
+                .all(|m| m.iter().all(|(p, s)| *p >= 0 && *s >= 0))
+    }
+}
+
+/// `seq + n` the way Kafka increments sequence numbers (wrapping from
+/// `i32::MAX` to 0). `n` is at most the records of one batch.
+pub fn increment_sequence(seq: i32, n: i32) -> i32 {
+    if seq > i32::MAX - n {
+        n - (i32::MAX - seq) - 1
+    } else {
+        seq + n
+    }
+}
+
+/// One idempotent batch of a [`Producer::send_journaled`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalBatch {
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub partition: i32,
+    pub base_sequence: i32,
+    /// Indices of its records in the call's `records`, in order.
+    pub records: Vec<u32>,
+    /// Base offset once acknowledged (-1 when the broker did not say);
+    /// `None`: sent, outcome unknown.
+    pub offset: Option<i64>,
+}
+
+/// The batches of one [`Producer::send_journaled`] call (see the module
+/// docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendJournal {
+    pub topic: String,
+    pub batches: Vec<JournalBatch>,
+}
+
+/// Stores the idempotence state and journal durably before a request is
+/// sent (`Err`: the request is not sent).
+pub type PersistFn<'a> = dyn FnMut(&IdempotentState, &SendJournal) -> Result<(), String> + 'a;
 
 /// Connection-level failure: retried on another round.
 #[derive(Debug)]
@@ -343,6 +493,8 @@ struct Conn {
     stream: Stream,
     produce_v: i16,
     metadata_v: i16,
+    /// InitProducerId version, if the broker offers one we implement.
+    init_pid_v: Option<i16>,
     /// No request after the ApiVersions handshake has completed yet. A
     /// SASL listener answers ApiVersions (allowed before authentication)
     /// and then closes the connection on the first other request.
@@ -632,6 +784,7 @@ impl Conn {
             stream,
             produce_v: 0,
             metadata_v: 0,
+            init_pid_v: None,
             fresh: true,
             last_used: Instant::now(),
             expires: None,
@@ -664,6 +817,11 @@ impl Conn {
             proto::METADATA_VERSIONS,
             "Metadata",
         )?;
+        c.init_pid_v = proto::negotiate(
+            &av.apis,
+            proto::API_INIT_PRODUCER_ID,
+            proto::INIT_PRODUCER_ID_VERSIONS,
+        );
         if let Some(s) = &cfg.sasl {
             let hv = pick(
                 &av.apis,
@@ -783,6 +941,9 @@ pub struct Producer {
     topics: HashMap<String, TopicState>,
     stale: bool,
     stats: ProducerStats,
+    /// Idempotent producer id and sequences (`None`: idempotence off, or
+    /// no id yet / reset).
+    idem: Option<IdempotentState>,
 }
 
 enum Retry {
@@ -803,7 +964,23 @@ impl Producer {
             topics: HashMap::new(),
             stale: true,
             stats: ProducerStats::default(),
+            idem: None,
         })
+    }
+
+    /// The idempotent producer's id and sequences (`None`: idempotence off,
+    /// or no producer id yet).
+    pub fn idempotent_state(&self) -> Option<&IdempotentState> {
+        self.idem.as_ref()
+    }
+
+    /// Continue with a persisted id and sequences (see the module docs).
+    /// Ignored with idempotence off, or when `s` is not
+    /// [valid](IdempotentState::is_valid).
+    pub fn restore_idempotent_state(&mut self, s: IdempotentState) {
+        if self.cfg.idempotence && s.is_valid() {
+            self.idem = Some(s);
+        }
     }
 
     pub fn stats(&self) -> ProducerStats {
@@ -1064,20 +1241,133 @@ impl Producer {
         }
     }
 
+    /// Obtain a producer id (InitProducerId) from broker `node` unless
+    /// idempotence is off or one is held.
+    fn ensure_producer_id(&mut self, node: i32) -> Result<(), Retry> {
+        if !self.cfg.idempotence || self.idem.is_some() {
+            return Ok(());
+        }
+        let v = match self.conn_for(node) {
+            Ok(c) => c.init_pid_v,
+            Err(e) => {
+                if let Some(f) = e.fatal() {
+                    return Err(Retry::Fatal(f));
+                }
+                self.stats.io_errors += 1;
+                self.stale = true;
+                return Err(Retry::Again(format!("connect to broker {node}: {e}")));
+            }
+        };
+        let Some(v) = v else {
+            return Err(Retry::Fatal(ProduceError::Unsupported(format!(
+                "broker {node} offers no InitProducerId v{}-{} (needed by the idempotent \
+                 producer): upgrade the broker, or turn idempotence off",
+                proto::INIT_PRODUCER_ID_VERSIONS.0,
+                proto::INIT_PRODUCER_ID_VERSIONS.1
+            ))));
+        };
+        let body = proto::encode_init_producer_id_request(v)
+            .map_err(|e| Retry::Fatal(ProduceError::Config(e.0)))?;
+        self.stats.requests += 1;
+        let Self {
+            conns, cfg, corr, ..
+        } = self;
+        let Some(conn) = conns.get_mut(&node) else {
+            return Err(Retry::Again(format!("broker {node}: connection lost")));
+        };
+        let resp = conn
+            .exchange(cfg, corr, proto::API_INIT_PRODUCER_ID, v, &body)
+            .and_then(|b| proto::decode_init_producer_id_response(&b).map_err(NetError::from));
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                self.conns.remove(&node);
+                self.stats.io_errors += 1;
+                self.stale = true;
+                return Err(Retry::Again(format!(
+                    "init producer id on broker {node}: {e}"
+                )));
+            }
+        };
+        match (resp.error_code, classify(resp.error_code)) {
+            (_, ErrorClass::None) => {
+                if resp.producer_id < 0 || resp.producer_epoch < 0 {
+                    return Err(Retry::Again(format!(
+                        "broker {node} answered InitProducerId with id {} epoch {}",
+                        resp.producer_id, resp.producer_epoch
+                    )));
+                }
+                self.idem = Some(IdempotentState::new(resp.producer_id, resp.producer_epoch));
+                self.stats.producer_ids += 1;
+                Ok(())
+            }
+            (errors::CLUSTER_AUTHORIZATION_FAILED, _) => Err(Retry::Fatal(ProduceError::Fatal {
+                code: resp.error_code,
+                context: format!(
+                    "InitProducerId on broker {node}: this principal may not produce \
+                     idempotently (brokers before Kafka 3.0 need the IDEMPOTENT_WRITE ACL on \
+                     the cluster; 3.0+ imply it from WRITE on a topic): grant it, or turn \
+                     idempotence off"
+                ),
+            })),
+            (_, ErrorClass::Retriable { refresh }) => {
+                self.stale |= refresh;
+                Err(Retry::Again(format!(
+                    "init producer id on broker {node}: {}",
+                    errors::name(resp.error_code)
+                )))
+            }
+            _ => Err(Retry::Fatal(ProduceError::Fatal {
+                code: resp.error_code,
+                context: format!("InitProducerId on broker {node}"),
+            })),
+        }
+    }
+
     /// Produce `records` (`(partition, record)`) to `topic` with
     /// `acks=all`, preserving the order of the records of each partition.
     ///
     /// Returns one [`Outcome`] per input record (same order). On `Err`,
     /// some records may have been delivered; none is reported as such, so a
-    /// caller that retries the whole call delivers at-least-once.
+    /// caller that retries the whole call delivers at-least-once (with
+    /// idempotence, the broker drops the batches it already holds while it
+    /// remembers them; [`Producer::send_journaled`] carries that across
+    /// restarts).
     pub fn send(
         &mut self,
         topic: &str,
         records: &[(i32, ProduceRecord)],
     ) -> Result<Vec<Outcome>, ProduceError> {
+        self.send_journaled(topic, records, None, &mut |_, _| Ok(()))
+    }
+
+    /// [`Producer::send`] for a caller that persists the idempotence state
+    /// (see the module docs): `persist` is called before every request that
+    /// carries a newly numbered batch and must store both arguments
+    /// durably; `resume` is the journal last stored for **the same
+    /// `records`** (same order and partitions) by a call that did not
+    /// finish. A journal that does not fit `records` (index out of range,
+    /// another partition or topic) is ignored: its records are sent as new
+    /// ones (a possible duplicate, never a loss). With idempotence off,
+    /// `persist` is never called and `resume` is ignored.
+    pub fn send_journaled(
+        &mut self,
+        topic: &str,
+        records: &[(i32, ProduceRecord)],
+        resume: Option<&SendJournal>,
+        persist: &mut PersistFn<'_>,
+    ) -> Result<Vec<Outcome>, ProduceError> {
         let deadline = Instant::now() + self.cfg.delivery_timeout;
-        let mut out: Vec<Option<Outcome>> = vec![None; records.len()];
-        let mut queues: BTreeMap<i32, VecDeque<usize>> = BTreeMap::new();
+        let mut call = Call {
+            topic,
+            records,
+            out: vec![None; records.len()],
+            queues: BTreeMap::new(),
+            limits: BTreeMap::new(),
+            fixed: BTreeMap::new(),
+            acked: Vec::new(),
+            persist,
+        };
         let overhead = self.request_overhead(topic);
         let single_cap = self
             .cfg
@@ -1088,7 +1378,7 @@ impl Producer {
                 return Err(ProduceError::Config(format!("negative partition {p}")));
             }
             if r.size_bound() > single_cap {
-                out[i] = Some(Outcome::Rejected {
+                call.out[i] = Some(Outcome::Rejected {
                     code: errors::MESSAGE_TOO_LARGE,
                     reason: format!(
                         "record needs up to {} bytes, more than fits in max_request_bytes {}",
@@ -1098,14 +1388,14 @@ impl Producer {
                 });
                 self.stats.rejected += 1;
             } else {
-                queues.entry(*p).or_default().push_back(i);
+                call.queues.entry(*p).or_default().push_back(i);
             }
         }
-        // Per-partition cap on records per batch, set by record-level errors
-        // (see `produce_round`).
-        let mut limits: BTreeMap<i32, usize> = BTreeMap::new();
+        if let Some(j) = resume {
+            self.resume_journal(&mut call, j);
+        }
         let mut attempt: u32 = 0;
-        while !queues.is_empty() {
+        while !call.queues.is_empty() {
             let mut trouble: Option<String> = None;
             let mut progress = false;
             if let Err(r) = self.ensure_metadata(topic) {
@@ -1121,7 +1411,7 @@ impl Producer {
                     .map(|t| t.leaders.clone())
                     .unwrap_or_default();
                 let mut by_leader: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
-                for &p in queues.keys() {
+                for &p in call.queues.keys() {
                     match leaders.get(p as usize) {
                         Some(Some(l)) => by_leader.entry(*l).or_default().push(p),
                         Some(None) => {
@@ -1140,16 +1430,18 @@ impl Producer {
                         }
                     }
                 }
+                if let Some(&node) = by_leader.keys().next() {
+                    match self.ensure_producer_id(node) {
+                        Ok(()) => {}
+                        Err(Retry::Fatal(e)) => return Err(e),
+                        Err(Retry::Again(m)) => {
+                            trouble = Some(m);
+                            by_leader.clear();
+                        }
+                    }
+                }
                 for (leader, parts) in by_leader {
-                    let pr = self.produce_round(
-                        topic,
-                        leader,
-                        &parts,
-                        records,
-                        &mut queues,
-                        &mut limits,
-                        &mut out,
-                    )?;
+                    let pr = self.produce_round(&mut call, leader, &parts)?;
                     progress |= pr.progress;
                     if let Some(t) = pr.trouble {
                         trouble = Some(t);
@@ -1170,11 +1462,12 @@ impl Producer {
                     return Err(ProduceError::Timeout(t));
                 }
                 self.sleep_until_or(self.backoff(attempt), deadline);
-            } else if Instant::now() >= deadline && !queues.is_empty() {
+            } else if Instant::now() >= deadline && !call.queues.is_empty() {
                 return Err(ProduceError::Timeout("records still pending".into()));
             }
         }
-        Ok(out
+        Ok(call
+            .out
             .into_iter()
             .map(|o| {
                 o.unwrap_or(Outcome::Rejected {
@@ -1185,32 +1478,123 @@ impl Producer {
             .collect())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Apply a resumed journal (see [`Producer::send_journaled`]):
+    /// acknowledged batches become outcomes, the batch in doubt of each
+    /// partition (current producer id only) is re-sent as it was.
+    fn resume_journal(&mut self, call: &mut Call<'_, '_>, j: &SendJournal) {
+        if !self.cfg.idempotence || j.topic != call.topic {
+            return;
+        }
+        // Validate everything first: a journal that does not fit is
+        // ignored as a whole.
+        let mut seen = BTreeSet::new();
+        for b in &j.batches {
+            if b.records.is_empty() {
+                return;
+            }
+            for &i in &b.records {
+                let i = i as usize;
+                let fits = call.records.get(i).is_some_and(|(p, _)| *p == b.partition)
+                    && call.out.get(i).is_some_and(Option::is_none)
+                    && seen.insert(i);
+                if !fits {
+                    return;
+                }
+            }
+        }
+        let current = self
+            .idem
+            .as_ref()
+            .map(|s| (s.producer_id, s.producer_epoch));
+        for b in &j.batches {
+            match b.offset {
+                Some(off) => {
+                    call.decide_delivered(b, off);
+                    self.stats.delivered += b.records.len() as u64;
+                    self.stats.journal_acked += 1;
+                    call.acked.push(b.clone());
+                }
+                None if current == Some((b.producer_id, b.producer_epoch))
+                    && !call.fixed.contains_key(&b.partition) =>
+                {
+                    call.fixed.insert(b.partition, b.clone());
+                }
+                // In doubt under an earlier producer id: sent again as new
+                // records (a possible duplicate).
+                None => {}
+            }
+        }
+    }
+
     fn produce_round(
         &mut self,
-        topic: &str,
+        call: &mut Call<'_, '_>,
         leader: i32,
         parts: &[i32],
-        records: &[(i32, ProduceRecord)],
-        queues: &mut BTreeMap<i32, VecDeque<usize>>,
-        limits: &mut BTreeMap<i32, usize>,
-        out: &mut [Option<Outcome>],
     ) -> Result<RoundResult, ProduceError> {
         let mut res = RoundResult::default();
-        // Fill the request in partition order within the size budget.
+        let topic = call.topic;
+        let records = call.records;
+        let idem_on = self.cfg.idempotence;
+        // Fill the request in partition order within the size budget. A
+        // batch in doubt (idempotence) is re-sent exactly as it was.
         let mut budget = self
             .cfg
             .max_request_bytes
             .saturating_sub(self.request_overhead(topic));
-        let mut plan: Vec<(i32, Vec<usize>)> = Vec::new();
+        let mut plan: Vec<(i32, Vec<usize>, ProducerFields)> = Vec::new();
+        let mut numbered: Vec<i32> = Vec::new();
         for &p in parts {
             if budget < Self::PART_OVERHEAD {
                 break;
             }
             let mut room = budget - Self::PART_OVERHEAD;
+            if let Some(f) = call.fixed.get(&p) {
+                let need: usize = f
+                    .records
+                    .iter()
+                    .map(|&i| records[i as usize].1.size_bound())
+                    .sum();
+                if need <= room {
+                    budget = room - need;
+                    plan.push((
+                        p,
+                        f.records.iter().map(|&i| i as usize).collect(),
+                        ProducerFields {
+                            producer_id: f.producer_id,
+                            producer_epoch: f.producer_epoch,
+                            base_sequence: f.base_sequence,
+                        },
+                    ));
+                    continue;
+                }
+                if !plan.is_empty() {
+                    // Next request.
+                    continue;
+                }
+                // Does not fit even alone (a resumed journal written with a
+                // larger max_request_bytes): give up re-sending it as is.
+                // Its sequences stay used, so the broker answers the next
+                // batch with OUT_OF_ORDER_SEQUENCE_NUMBER and we reset.
+                call.fixed.remove(&p);
+            }
+            let fields = if idem_on {
+                match &self.idem {
+                    Some(s) => ProducerFields {
+                        producer_id: s.producer_id,
+                        producer_epoch: s.producer_epoch,
+                        base_sequence: s.next(topic, p),
+                    },
+                    // Reset in this round: numbered after the next
+                    // InitProducerId.
+                    None => continue,
+                }
+            } else {
+                ProducerFields::NONE
+            };
             let mut take = Vec::new();
-            let limit = limits.get(&p).copied().unwrap_or(usize::MAX);
-            for &i in queues.get(&p).into_iter().flatten() {
+            let limit = call.limits.get(&p).copied().unwrap_or(usize::MAX);
+            for &i in call.queues.get(&p).into_iter().flatten() {
                 let need = records[i].1.size_bound();
                 if need > room || take.len() >= limit {
                     break;
@@ -1222,15 +1606,47 @@ impl Producer {
                 continue;
             }
             budget = room;
-            plan.push((p, take));
+            if let Some(s) = self.idem.as_mut().filter(|_| idem_on) {
+                let n = i32::try_from(take.len()).unwrap_or(i32::MAX);
+                s.set(topic, p, increment_sequence(fields.base_sequence, n));
+                call.fixed.insert(
+                    p,
+                    JournalBatch {
+                        producer_id: fields.producer_id,
+                        producer_epoch: fields.producer_epoch,
+                        partition: p,
+                        base_sequence: fields.base_sequence,
+                        records: take.iter().map(|&i| i as u32).collect(),
+                        offset: None,
+                    },
+                );
+                numbered.push(p);
+            }
+            plan.push((p, take, fields));
         }
         if plan.is_empty() {
             return Ok(res);
         }
+        // Persist the newly numbered batches before they can reach a broker.
+        if !numbered.is_empty() {
+            if let Some(s) = self.idem.clone() {
+                let journal = call.journal();
+                if let Err(m) = (call.persist)(&s, &journal) {
+                    for p in &numbered {
+                        if let Some(f) = call.fixed.remove(p) {
+                            if let Some(st) = self.idem.as_mut() {
+                                st.set(topic, *p, f.base_sequence);
+                            }
+                        }
+                    }
+                    return Err(ProduceError::Journal(m));
+                }
+            }
+        }
         let mut batches = Vec::with_capacity(plan.len());
-        for (p, idx) in &plan {
+        for (p, idx, fields) in &plan {
             let recs: Vec<ProduceRecord> = idx.iter().map(|&i| records[i].1.clone()).collect();
-            let b = encode_batch(&recs)
+            let b = encode_batch_idempotent(&recs, *fields)
                 .map_err(|e| ProduceError::Config(format!("encoding batch: {e:?}")))?;
             batches.push((*p, b));
         }
@@ -1268,7 +1684,8 @@ impl Producer {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                // Connection state unknown: drop it.
+                // Connection state unknown: drop it. The batches stay in
+                // doubt and are re-sent as they are.
                 self.conns.remove(&leader);
                 self.stats.io_errors += 1;
                 self.stale = true;
@@ -1276,7 +1693,7 @@ impl Producer {
                 return Ok(res);
             }
         };
-        for (p, idx) in plan {
+        for (p, idx, fields) in plan {
             let pr = resp
                 .topics
                 .iter()
@@ -1287,24 +1704,31 @@ impl Producer {
                 res.trouble = Some(format!("broker {leader} omitted partition {p}"));
                 continue;
             };
-            match classify(pr.error_code) {
-                ErrorClass::None => {
-                    // `plan` is built from `queues`; skip (the records stay
-                    // undecided and are retried) rather than abort.
-                    let Some(q) = queues.get_mut(&p) else {
-                        res.trouble = Some(format!("partition {p}: no queue for planned records"));
-                        continue;
+            let class = classify(pr.error_code);
+            match class {
+                ErrorClass::None | ErrorClass::Duplicate => {
+                    // A duplicate may not say where the original is.
+                    let base = if pr.base_offset < 0 {
+                        -1
+                    } else {
+                        pr.base_offset
                     };
-                    for (k, &i) in idx.iter().enumerate() {
-                        q.pop_front();
-                        out[i] = Some(Outcome::Delivered {
-                            partition: p,
-                            offset: pr.base_offset.saturating_add(k as i64),
-                        });
-                        self.stats.delivered += 1;
+                    let b = JournalBatch {
+                        producer_id: fields.producer_id,
+                        producer_epoch: fields.producer_epoch,
+                        partition: p,
+                        base_sequence: fields.base_sequence,
+                        records: idx.iter().map(|&i| i as u32).collect(),
+                        offset: Some(base),
+                    };
+                    call.decide_delivered(&b, base);
+                    self.stats.delivered += idx.len() as u64;
+                    if class == ErrorClass::Duplicate {
+                        self.stats.duplicates += 1;
                     }
-                    if q.is_empty() {
-                        queues.remove(&p);
+                    if idem_on {
+                        call.fixed.remove(&p);
+                        call.acked.push(b);
                     }
                     res.progress = true;
                 }
@@ -1314,22 +1738,16 @@ impl Producer {
                     // that is only too large as a whole (the topic's
                     // `max.message.bytes` below `max_request_bytes`) settles
                     // on a size that fits instead of one record per request.
-                    limits.insert(p, idx.len() / 2);
+                    // Nothing was appended: its sequences are free again.
+                    call.limits.insert(p, idx.len() / 2);
+                    self.unnumber(call, p, fields);
                     res.progress = true;
                 }
                 ErrorClass::Record => {
-                    // `plan` is built from `queues`; skip (the records stay
-                    // undecided and are retried) rather than abort.
-                    let Some(q) = queues.get_mut(&p) else {
-                        res.trouble = Some(format!("partition {p}: no queue for planned records"));
-                        continue;
-                    };
-                    q.pop_front();
-                    if q.is_empty() {
-                        queues.remove(&p);
-                    }
-                    limits.remove(&p);
-                    out[idx[0]] = Some(Outcome::Rejected {
+                    self.unnumber(call, p, fields);
+                    call.remove_from_queue(p, &idx);
+                    call.limits.remove(&p);
+                    call.out[idx[0]] = Some(Outcome::Rejected {
                         code: pr.error_code,
                         reason: format!(
                             "{}{}",
@@ -1350,7 +1768,21 @@ impl Producer {
                         errors::name(pr.error_code)
                     ));
                 }
-                ErrorClass::Fatal => {
+                ErrorClass::Sequence if idem_on => {
+                    // Reset (see the module docs): a new producer id is
+                    // obtained before the next request, every undecided
+                    // record is numbered again under it.
+                    if self.idem.take().is_some() {
+                        self.stats.producer_id_resets += 1;
+                    }
+                    call.fixed.clear();
+                    res.trouble = Some(format!(
+                        "partition {p} on broker {leader}: {} (producer id {} reset)",
+                        errors::name(pr.error_code),
+                        fields.producer_id
+                    ));
+                }
+                ErrorClass::Sequence | ErrorClass::Fatal => {
                     return Err(ProduceError::Fatal {
                         code: pr.error_code,
                         context: format!("produce to {topic}/{p} on broker {leader}"),
@@ -1359,6 +1791,88 @@ impl Producer {
             }
         }
         Ok(res)
+    }
+
+    /// The batch planned for `p` with `fields` was refused as a whole
+    /// (nothing appended): free its sequences, unless a reset or another
+    /// batch intervened.
+    fn unnumber(&mut self, call: &mut Call<'_, '_>, p: i32, fields: ProducerFields) {
+        let ours = call.fixed.get(&p).is_some_and(|f| {
+            (f.producer_id, f.producer_epoch, f.base_sequence)
+                == (
+                    fields.producer_id,
+                    fields.producer_epoch,
+                    fields.base_sequence,
+                )
+        });
+        if !ours {
+            return;
+        }
+        call.fixed.remove(&p);
+        if let Some(s) = self.idem.as_mut().filter(|s| {
+            (s.producer_id, s.producer_epoch) == (fields.producer_id, fields.producer_epoch)
+        }) {
+            s.set(call.topic, p, fields.base_sequence);
+        }
+    }
+}
+
+/// One [`Producer::send_journaled`] call in progress.
+struct Call<'a, 'p> {
+    topic: &'a str,
+    records: &'a [(i32, ProduceRecord)],
+    out: Vec<Option<Outcome>>,
+    /// Undecided records of each partition, in order.
+    queues: BTreeMap<i32, VecDeque<usize>>,
+    /// Per-partition cap on records per batch, set by record-level errors.
+    limits: BTreeMap<i32, usize>,
+    /// Idempotence: the numbered batch of a partition whose outcome is not
+    /// known; re-sent exactly as it is.
+    fixed: BTreeMap<i32, JournalBatch>,
+    /// Idempotence: this call's acknowledged batches.
+    acked: Vec<JournalBatch>,
+    persist: &'p mut PersistFn<'p>,
+}
+
+impl Call<'_, '_> {
+    fn journal(&self) -> SendJournal {
+        SendJournal {
+            topic: self.topic.to_string(),
+            batches: self
+                .acked
+                .iter()
+                .chain(self.fixed.values())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn remove_from_queue(&mut self, p: i32, idx: &[usize]) {
+        if let Some(q) = self.queues.get_mut(&p) {
+            q.retain(|i| !idx.contains(i));
+            if q.is_empty() {
+                self.queues.remove(&p);
+            }
+        }
+    }
+
+    /// `b`'s records are delivered at `base` (consecutive offsets; -1 stays
+    /// -1).
+    fn decide_delivered(&mut self, b: &JournalBatch, base: i64) {
+        let idx: Vec<usize> = b.records.iter().map(|&i| i as usize).collect();
+        for (k, &i) in idx.iter().enumerate() {
+            if let Some(o) = self.out.get_mut(i) {
+                *o = Some(Outcome::Delivered {
+                    partition: b.partition,
+                    offset: if base < 0 {
+                        -1
+                    } else {
+                        base.saturating_add(k as i64)
+                    },
+                });
+            }
+        }
+        self.remove_from_queue(b.partition, &idx);
     }
 }
 

@@ -34,6 +34,12 @@ robodr\-spool\-export \- move robodr\-agentd findings from its spool into signed
 .IR LABEL ]
 .RB [ \-\-upgrade\-topic
 .IR TOPIC ]
+.RB [ \-\-rejected\-max\-age\-s
+.IR N ]
+.RB [ \-\-rejected\-max\-count
+.IR N ]
+.RB [ \-\-rejected\-max\-bytes
+.IR N ]
 .SH DESCRIPTION
 Robot\-side (low side) exporter. It takes the records in
 .IB DIR /ready/
@@ -51,7 +57,10 @@ file makes every crash point recoverable without loss or re\-packing. Records
 leave
 .I ready/
 only by rename, never by deletion: an invalid record is moved to the rejected
-directory with a reason file.
+directory with a reason file. The rejected directory is kept in full unless
+bounded with the
+.B \-\-rejected\-max\-*
+options.
 .PP
 Without
 .B \-\-once
@@ -105,6 +114,16 @@ Batch limits, as for
 .TP
 .BI \-\-rejected\-dir " DIR"
 Where invalid records go (default \fIspool\fB/rejected/\fR).
+.TP
+.BI \-\-rejected\-max\-age\-s " N\fR, " \-\-rejected\-max\-count " N\fR, " \-\-rejected\-max\-bytes " N"
+After each run, delete the oldest rejected records (each with its
+.B .reason.json
+file) older than N seconds, beyond the N newest, or beyond N bytes in all
+(0 or absent = no such bound; default: keep everything). A rejected record is
+never packed and never read again, so only its forensic copy is lost; a name
+that is in
+.I ready/
+is never touched.
 .TP
 .BI \-\-interval\-ms " N"
 Loop interval, > 0 (default 5000).

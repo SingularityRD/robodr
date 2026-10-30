@@ -60,6 +60,19 @@
 //! was processed); a single-line `413` stops. Any other `4xx` (`400`, `401`,
 //! `409`, `415`, ...) stops the run without acknowledging anything; the
 //! caller retries later with the same pending batch.
+//!
+//! # Retention
+//!
+//! After every successful run ([`crate::retention`]): a `done/` marker over
+//! [`UplinkConfig::done_retention`] is deleted only once its batch has left
+//! `out/`; a rotated dead-letter file past the rotation's `keep` or over
+//! [`UplinkConfig::dead_letter_retention`] is deleted only when none of its
+//! entries can still be needed for deduplication: a diode entry while its
+//! batch is in `out/` without a `done/` marker, a spool entry while its
+//! file is in `ready/`, a re-injected entry while its generation is not
+//! done (see [`crate::deadletter`]). What is held is reported and looked at
+//! again on the next run. Deleted dead letters can no longer be
+//! re-injected (`reinject` reads the files present).
 
 pub mod http;
 pub mod reinject;
@@ -72,6 +85,7 @@ use crate::publish::{
     check_record, list_diode_batches, list_ready, read_spool_item, LineReader, OpenRecordsError,
     Source, MAX_IN_FLIGHT,
 };
+use crate::retention::{PruneReport, Retention};
 use http::{HttpRequest, Transport};
 use robodr_blackbox::crypto::{sha256, to_hex};
 use robodr_blackbox::sign_ed25519::{derive_key_id, Ed25519SigningKey};
@@ -96,12 +110,9 @@ pub const LOCK_FILE: &str = "uplink.lock";
 pub const REINJECT_DIR: &str = "reinject";
 /// Smallest dead-letter rotation size (a single larger entry is still
 /// written whole: rotation happens before an append, never inside one).
-pub const MIN_DEAD_LETTER_BYTES: u64 = 64 * 1024;
+pub const MIN_DEAD_LETTER_BYTES: u64 = crate::deadletter::MIN_ROTATION_BYTES;
 /// Default dead-letter rotation: 64 MiB per file, 4 rotated files kept.
-pub const DEFAULT_DEAD_LETTER_ROTATION: Rotation = Rotation {
-    max_bytes: 64 * 1024 * 1024,
-    keep: 4,
-};
+pub const DEFAULT_DEAD_LETTER_ROTATION: Rotation = crate::deadletter::DEFAULT_ROTATION;
 /// Dead-letter code of a record refused by the local validation.
 pub const LOCAL_CODE: &str = "local";
 /// Smallest `max_body_bytes`: a single maximal line (64 KiB value, every
@@ -199,6 +210,12 @@ pub struct UplinkConfig {
     pub retry: RetryPolicy,
     /// Dead-letter rotation (`None`: one growing file).
     pub dead_letter_rotation: Option<Rotation>,
+    /// Further bounds on rotated dead-letter files (default none beyond
+    /// the rotation's `keep`); see "Retention" in the module docs.
+    pub dead_letter_retention: Retention,
+    /// Bounds on `done/` markers (default
+    /// [`crate::publish::DEFAULT_DONE_RETENTION`]: 30 days).
+    pub done_retention: Retention,
     /// Test hook: fail with [`UplinkError::Injected`] at this point (once).
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
@@ -216,6 +233,8 @@ impl UplinkConfig {
             upgrade_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
             retry: RetryPolicy::default(),
             dead_letter_rotation: Some(DEFAULT_DEAD_LETTER_ROTATION),
+            dead_letter_retention: Retention::UNBOUNDED,
+            done_retention: crate::publish::DEFAULT_DONE_RETENTION,
             fail_point: None,
         }
     }
@@ -579,12 +598,21 @@ pub struct UplinkReport {
     /// Malformed lines found in the dead-letter files when they were loaded
     /// in this run (torn fragments, edits; [`crate::deadletter`]).
     pub dead_letter_malformed: u64,
+    /// `done/` markers deleted by retention (held: batch still in `out/`).
+    pub pruned_done: PruneReport,
+    /// Rotated dead-letter files deleted by retention (held: entries still
+    /// needed for deduplication).
+    pub pruned_dead_letters: PruneReport,
 }
 
 impl UplinkReport {
-    /// Whether anything happened (for logging).
+    /// Whether anything happened (for logging). Files merely held by
+    /// retention (a standing condition) do not count.
     pub fn is_empty(&self) -> bool {
-        self == &Self::default()
+        let mut s = self.clone();
+        s.pruned_done.held = 0;
+        s.pruned_dead_letters.held = 0;
+        s == Self::default()
     }
 }
 
@@ -1463,7 +1491,55 @@ impl<T: Transport> Uplink<T> {
         let mut report = UplinkReport::default();
         let r = self.run_inner(&mut report);
         report.dead_letter_malformed = std::mem::take(&mut self.dead_malformed_unreported);
-        r.map(|()| report)
+        r?;
+        self.prune(&mut report)?;
+        Ok(report)
+    }
+
+    /// Whether a dead letter `(source, position)` may still be needed for
+    /// deduplication: its record can be processed again (module docs,
+    /// "Retention").
+    fn dead_letter_needed(&self, source: &str, pos: u64) -> io::Result<bool> {
+        use crate::publish::{exists, valid_batch_name};
+        if let Some(g) = source.strip_prefix(reinject::SOURCE_PREFIX) {
+            let dir = self.cfg.state_dir.join(REINJECT_DIR).join(g);
+            return Ok(reinject::is_valid_generation(g)
+                && exists(&dir)?
+                && !exists(&dir.join(reinject::DONE_FILE))?);
+        }
+        match &self.cfg.source {
+            Source::DiodeOut(out) => {
+                if !valid_batch_name(source) {
+                    return Ok(false);
+                }
+                let done = self.cfg.state_dir.join(DONE_DIR).join(source);
+                Ok(exists(&out.join(source))? && !exists(&done)?)
+            }
+            Source::Spool(root) => Ok(source == root.display().to_string()
+                && exists(&root.join("ready").join(spool_file(pos)))?),
+        }
+    }
+
+    /// Retention (module docs).
+    fn prune(&mut self, report: &mut UplinkReport) -> Result<(), UplinkError> {
+        let now = std::time::SystemTime::now();
+        if let Source::DiodeOut(out) = &self.cfg.source {
+            report.pruned_done = crate::retention::prune_done_markers(
+                &self.cfg.state_dir.join(DONE_DIR),
+                out,
+                &self.cfg.done_retention,
+                now,
+            )?;
+        }
+        let r = self.cfg.dead_letter_retention;
+        let mut dead = std::mem::replace(
+            &mut self.dead,
+            DeadLetters::new(&self.cfg.state_dir, DEAD_LETTER_FILE, None),
+        );
+        let res = dead.prune(&r, now, |s, p| self.dead_letter_needed(s, p));
+        self.dead = dead;
+        report.pruned_dead_letters = res?;
+        Ok(())
     }
 
     fn run_inner(&mut self, report: &mut UplinkReport) -> Result<(), UplinkError> {

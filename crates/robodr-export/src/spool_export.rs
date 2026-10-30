@@ -61,6 +61,16 @@
 //! `ready/` is never deleted from; records leave it only by rename (to
 //! `acked/` after publication, or to `rejected/`).
 //!
+//! # Retention
+//!
+//! The rejected directory is kept in full by default. With
+//! [`ExportConfig::rejected_retention`] (age, count, bytes;
+//! [`crate::retention`]) the oldest rejected records beyond the bounds are
+//! deleted after each run, each with its `.reason.json`. A rejected record
+//! is never published and never read again by the exporter (it left
+//! `ready/` for good), so deleting it loses only its forensic copy; a name
+//! that is (again) in `ready/` is never touched.
+//!
 //! # Planner limits
 //!
 //! The exporter cuts each step with the packer's planner rule, so the
@@ -85,6 +95,7 @@
 //! * Black-box bundles and `checkpoint.json` are not exported by this tool.
 
 use crate::fsutil::{self, ReadError};
+use crate::retention::{self, file_meta, Candidate, PruneReport, Retention};
 use robodr_agentd::spool::{SpoolRecord, SPOOL_SCHEMA};
 use robodr_diode::manifest::{
     batch_dir_name, file_sha256, parity_len, FileKind, Manifest, FINDINGS_FILE, MANIFEST_FILE,
@@ -141,6 +152,9 @@ pub struct ExportConfig {
     /// Topic (`ocsf.metadata.log_name`) an upgraded 1.x record gets
     /// (default [`robodr_ocsf::DEFAULT_TOPIC`]).
     pub upgrade_topic: String,
+    /// Bounds on the rejected directory (default: unbounded, keep every
+    /// rejected record), see "Retention" in the module docs.
+    pub rejected_retention: Retention,
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
 }
@@ -160,6 +174,7 @@ impl ExportConfig {
             shard_size: robodr_diode::pack::DEFAULT_SHARD_SIZE,
             upgrade_data_source: robodr_ocsf::DEFAULT_DATA_SOURCE.into(),
             upgrade_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
+            rejected_retention: Retention::UNBOUNDED,
             fail_point: None,
         }
     }
@@ -304,6 +319,8 @@ pub struct ExportReport {
     /// published), `"partial"` (some could not be proven and stay in
     /// `ready/`) or `"dropped"` (nothing had been committed).
     pub recovered: Option<String>,
+    /// Rejected records deleted by retention.
+    pub pruned_rejected: PruneReport,
 }
 
 /// See the module docs.
@@ -806,8 +823,67 @@ impl Exporter {
             report.exported += intent.spool_seqs.len() as u64;
             report.batches.extend(published);
         }
+        report.pruned_rejected = prune_rejected(
+            &self.cfg.rejected_dir,
+            &self.ready,
+            &self.cfg.rejected_retention,
+            std::time::SystemTime::now(),
+        )?;
         Ok(report)
     }
+}
+
+/// Retention of the rejected directory (see "Retention" in the module
+/// docs): each `<seq>.json` with its `<seq>.json.reason.json` is one item
+/// (age: the reason file's time, i.e. when it was rejected; else the
+/// record's), deleted together. A name still in `ready/` is never touched.
+pub fn prune_rejected(
+    dir: &Path,
+    ready: &Path,
+    r: &Retention,
+    now: std::time::SystemTime,
+) -> io::Result<PruneReport> {
+    if r.is_unbounded() {
+        return Ok(PruneReport::default());
+    }
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(PruneReport::default()),
+        Err(e) => return Err(e),
+    };
+    let mut seqs = std::collections::BTreeSet::new();
+    for e in rd {
+        let e = e?;
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let rec = name.strip_suffix(".reason.json").unwrap_or(&name);
+        if let Some(seq) = record_seq(rec) {
+            seqs.insert(seq);
+        }
+    }
+    let mut items = Vec::new();
+    for seq in seqs {
+        let name = record_name(seq);
+        let rec = dir.join(&name);
+        let why = dir.join(format!("{name}.reason.json"));
+        let (m_rec, m_why) = (file_meta(&rec)?, file_meta(&why)?);
+        let Some(modified) = m_why.or(m_rec).map(|m| m.0) else {
+            continue;
+        };
+        let bytes = m_rec.map_or(0, |m| m.1) + m_why.map_or(0, |m| m.1);
+        items.push(Candidate {
+            name,
+            // The record first: a crash in between leaves an orphan reason
+            // file, which the next pass deletes.
+            paths: vec![rec, why],
+            modified,
+            bytes,
+        });
+    }
+    retention::prune(dir, &items, r, now, |c| {
+        Ok(fs::symlink_metadata(ready.join(&c.name)).is_err())
+    })
 }
 
 #[cfg(test)]
@@ -820,5 +896,43 @@ mod tests {
         assert_eq!(record_seq("42.json"), None);
         assert_eq!(record_seq("00000000000000000042.json.tmp"), None);
         assert_eq!(record_name(42), "00000000000000000042.json");
+    }
+
+    #[test]
+    fn rejected_retention_deletes_pairs_and_spares_ready() {
+        let d = std::env::temp_dir().join(format!("robodr-rej-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let (rej, ready) = (d.join("rejected"), d.join("ready"));
+        fsutil::mkdir(&rej).unwrap();
+        fsutil::mkdir(&ready).unwrap();
+        for seq in 1..=4u64 {
+            fs::write(rej.join(record_name(seq)), b"{}").unwrap();
+            fs::write(rej.join(format!("{}.reason.json", record_name(seq))), b"{}").unwrap();
+        }
+        // An orphan reason file (crash between the two deletions), a name
+        // also in ready/ (never touched), an unrelated file.
+        fs::write(rej.join(format!("{}.reason.json", record_name(9))), b"{}").unwrap();
+        fs::write(rej.join(record_name(7)), b"{}").unwrap();
+        fs::write(ready.join(record_name(7)), b"{}").unwrap();
+        fs::write(rej.join("notes.txt"), b"x").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+        let none = prune_rejected(&rej, &ready, &Retention::UNBOUNDED, later).unwrap();
+        assert_eq!(none, PruneReport::default());
+        let r = Retention {
+            max_count: Some(2),
+            ..Default::default()
+        };
+        let rep = prune_rejected(&rej, &ready, &r, std::time::SystemTime::now()).unwrap();
+        assert_eq!(rep.removed + rep.held, 4, "{rep:?}");
+        let r = Retention::max_age(std::time::Duration::from_secs(3600));
+        let rep = prune_rejected(&rej, &ready, &r, later).unwrap();
+        assert_eq!(rep.held, 1, "seq 7 is in ready/");
+        let mut left: Vec<String> = fs::read_dir(&rej)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![record_name(7), "notes.txt".to_string()]);
+        let _ = fs::remove_dir_all(&d);
     }
 }

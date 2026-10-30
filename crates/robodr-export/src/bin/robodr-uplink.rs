@@ -26,6 +26,7 @@ const USAGE: &str = "usage: robodr-uplink --url https://HOST[:PORT][/API-ROOT] -
 [--max-lines N] [--max-body-bytes N] [--connect-timeout-ms N] [--request-timeout-ms N] \
 [--max-attempts N] [--backoff-base-ms N] [--backoff-max-ms N] [--refused-backoff-max-s N] \
 [--exit-when-stuck-s N] [--dead-letter-max-bytes N] [--dead-letter-keep N] \
+[--dead-letter-max-age-s N] [--done-max-age-s N] [--done-max-count N] \
 [--upgrade-data-source LABEL] [--upgrade-topic TOPIC] [--interval-ms N] [--once]\n\
        robodr-uplink reinject --state-dir DIR (--spool DIR | --diode-out DIR) \
 --dead-letter FILE [--dead-letter FILE ...] [--codes CODE,CODE,...] [--dry-run]\n\
@@ -38,6 +39,10 @@ Status: <state-dir>/uplink-status.json and sd_notify STATUS=. One process per --
 reinject: re-queue dead-lettered records (default codes: unknown_robot, robot_mismatch, \
 site_mismatch, missing_finding_signature, bad_finding_signature) under new batch ids; \
 stop the service first.\n\
+Retention: rotated dead-letter files past --dead-letter-keep or older than --dead-letter-max-age-s, \
+and done/ markers older than --done-max-age-s (default 2592000 = 30 days, 0 = keep) or beyond \
+--done-max-count, are deleted once nothing in them is needed any more (records that may still be \
+processed again; batches still in out/).\n\
 Exit: 0 done (--once, reinject), 1 runtime or configuration error, 2 usage, \
 3 failing longer than --exit-when-stuck-s.";
 
@@ -60,6 +65,9 @@ const SERVICE_FLAGS: &[&str] = &[
     "exit-when-stuck-s",
     "dead-letter-max-bytes",
     "dead-letter-keep",
+    "dead-letter-max-age-s",
+    "done-max-age-s",
+    "done-max-count",
     "upgrade-data-source",
     "upgrade-topic",
     "interval-ms",
@@ -183,6 +191,18 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if cfg.dead_letter_rotation.is_some() {
         cfg.dead_letter_rotation = Some(Rotation { ..rot });
     }
+    cfg.dead_letter_retention = robodr_export::retention::with_flags(
+        cfg.dead_letter_retention,
+        a.num("dead-letter-max-age-s")?,
+        None,
+        None,
+    );
+    cfg.done_retention = robodr_export::retention::with_flags(
+        cfg.done_retention,
+        a.num("done-max-age-s")?,
+        a.num("done-max-count")?,
+        None,
+    );
     let interval = ms(a, "interval-ms")?.unwrap_or(Duration::from_secs(2));
     let service = ServiceConfig {
         interval,

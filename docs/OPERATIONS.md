@@ -2235,7 +2235,11 @@ packs one diode batch per step with `robodr-diode-pack`'s format (Ed25519
 key file, section 4.4; `--allow-hmac` only for legacy keys) and moves the
 records to `acked/` only once the batch is durably in the outbox; an intent
 journal makes every crash point recoverable without loss or re-packing.
-Invalid records go to `<spool>/rejected/` with a reason file, never deleted.
+Invalid records go to `<spool>/rejected/` with a reason file, kept by
+default; `--rejected-max-age-s`, `--rejected-max-count` and
+`--rejected-max-bytes` (0 = no bound) delete the oldest ones beyond the
+bounds after each run, each with its reason file (a rejected record is never
+packed again, so only its forensic copy goes).
 Without `--once` it loops every `--interval-ms` (default 5000).
 
 `robodr-kafka-publish` re-validates every record, re-derives key, headers
@@ -2245,9 +2249,34 @@ with, `findings.topic`, and records relabelled to `--topic` are counted),
 upgrades unsigned contract 1.x records to 2.0 and dead-letters signed
 ones (section 7), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
-broker-rejected records go to a dead-letter file. **Idempotence off**
-(at-least-once: consumers drop duplicates on `event-uid`). Without
-`--once` it loops every `--interval-ms` (default 2000).
+broker-rejected records go to a dead-letter file. The producer is
+**idempotent** by default: it takes a producer id (InitProducerId) and
+numbers every batch, a batch re-sent after a lost acknowledgement is dropped
+by the broker, and the producer id, sequences and the batches of the chunk
+in flight are saved in `progress.json` before each request, so a chunk
+re-sent after a crash or restart is not duplicated (while the broker
+remembers the producer id: `producer.id.expiration.ms`, default one day).
+A broker that refuses it (`CLUSTER_AUTHORIZATION_FAILED` on InitProducerId:
+before Kafka 3.0 the principal needs the `IDEMPOTENT_WRITE` cluster ACL,
+3.0+ imply it from `WRITE` on a topic) stops the publisher with an error
+naming the ACL: grant it, or run with `--no-idempotence` (at-least-once:
+consumers drop duplicates on `event-uid`). Without `--once` it loops every
+`--interval-ms` (default 2000).
+
+**Retention of the state directory** (`robodr-kafka-publish` and
+`robodr-uplink`, after each run). `done/` markers older than
+`--done-max-age-s` (default 2592000 = 30 days; 0 = keep) or beyond
+`--done-max-count` are deleted, but never while their batch is still in
+the importer's `out/` (the marker is what stops it being published again):
+prune `out/` and the markers follow. `dead-letter.jsonl` rotates at
+`--dead-letter-max-bytes` (default 64 MiB; 0 = one growing file) keeping
+`--dead-letter-keep` rotated files (default 4), optionally also bounded by
+`--dead-letter-max-age-s`; a rotated file over the bounds is deleted only
+when none of its entries is still needed for deduplication (diode batch not
+done, spool file still in `ready/`, re-injected generation not done) and is
+otherwise held and reported (`pruned_dead_letters.held` in the JSON
+report). Copy dead letters off the host before they age out if you need
+them for longer; deleted dead letters can no longer be re-injected.
 
 **TLS, mutual TLS, SASL/SCRAM.** TLS is required: `--tls-ca FILE` (PEM,
 the only trust anchors) makes every broker connection TLS and verifies
@@ -2461,7 +2490,9 @@ after the next fix. `unavailable` in the report lists records whose
 original and dead-letter copy are both gone.
 
 Dead letters: `dead-letter.jsonl` rotates at 64 MiB, keeping 4 rotated
-files (`--dead-letter-max-bytes`, `--dead-letter-keep`); a line torn by a
+files (`--dead-letter-max-bytes`, `--dead-letter-keep`; older rotated files
+are deleted once nothing in them is needed for deduplication, see
+"Retention of the state directory" above); a line torn by a
 power loss is closed and counted (`dead_letter_malformed`), never merged
 with the next entry.
 

@@ -36,6 +36,17 @@ robodr\-kafka\-publish \- publish RoboDR findings to the robot\-edr.findings Kaf
 .RB [ \-\-once ]
 .RB [ \-\-upgrade\-data\-source
 .IR LABEL ]
+.RB [ \-\-no\-idempotence ]
+.RB [ \-\-dead\-letter\-max\-bytes
+.IR N ]
+.RB [ \-\-dead\-letter\-keep
+.IR N ]
+.RB [ \-\-dead\-letter\-max\-age\-s
+.IR N ]
+.RB [ \-\-done\-max\-age\-s
+.IR N ]
+.RB [ \-\-done\-max\-count
+.IR N ]
 .RB ( \-\-tls\-ca
 .I FILE
 .RB [ \-\-tls\-cert
@@ -74,10 +85,16 @@ verbatim, for the consumer to verify. Invalid or broker\-rejected records go to
 a dead\-letter file; progress (committed line count per batch, done markers)
 is replaced atomically after each acknowledged chunk.
 .PP
-Producer settings: acks=all, idempotence off (at\-least\-once delivery:
-consumers drop duplicates on
-.BR event\-uid ),
-one request in flight, no compression.
+Producer settings: acks=all, idempotent (InitProducerId, a producer id and
+per\-partition sequence numbers: a batch re\-sent after a lost acknowledgement
+is dropped by the broker; the producer id, sequences and the chunk's batch
+journal are saved in the progress file before each request, so a chunk
+re\-sent after a crash is not duplicated while the broker remembers the
+producer id, by default one day), one request in flight, no compression.
+With
+.B \-\-no\-idempotence
+delivery is at\-least\-once; consumers drop duplicates on
+.BR event\-uid .
 TLS is required: every broker connection, bootstrap and advertised, is TLS
 and the broker certificate is verified against
 .B \-\-tls\-ca
@@ -133,6 +150,29 @@ Loop interval, > 0 (default 2000).
 .TP
 .B \-\-once
 One pass, then exit.
+.TP
+.B \-\-no\-idempotence
+Producer id \-1, no sequence numbers: for brokers that refuse InitProducerId
+to this principal (before Kafka 3.0, the IDEMPOTENT_WRITE cluster ACL is
+needed; 3.0 and later imply it from WRITE on a topic). Without this flag
+such a refusal is a fatal error that names the ACL.
+.TP
+.BI \-\-dead\-letter\-max\-bytes " N\fR, " \-\-dead\-letter\-keep " N"
+Rotate the dead\-letter file at N bytes (default 64 MiB, at least 64 KiB, 0 =
+never) and keep N rotated files (default 4). A rotated file beyond them is
+deleted only when none of its entries is still needed for deduplication (its
+diode batch has a done marker or left the importer output; its spool file
+left ready/).
+.TP
+.BI \-\-dead\-letter\-max\-age\-s " N"
+Also delete rotated dead\-letter files older than N seconds (same rule; 0 or
+absent = no age bound).
+.TP
+.BI \-\-done\-max\-age\-s " N\fR, " \-\-done\-max\-count " N"
+Delete done markers older than N seconds (default 2592000, 30 days; 0 = keep)
+or beyond the N newest (default no bound), after each run. A marker is never
+deleted while its batch is still in the importer output (it would be
+published again): prune that output and the markers follow.
 .TP
 .BI \-\-tls\-ca " FILE"
 PEM CA bundle: the only trust anchors for the brokers' certificates (no

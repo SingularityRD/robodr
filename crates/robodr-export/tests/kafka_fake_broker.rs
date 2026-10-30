@@ -6,7 +6,9 @@ mod common;
 
 use common::*;
 use robodr_export::kafka::proto;
-use robodr_export::kafka::{Outcome, ProduceError, ProduceRecord, Producer, ProducerConfig};
+use robodr_export::kafka::{
+    IdempotentState, Outcome, ProduceError, ProduceRecord, Producer, ProducerConfig, SendJournal,
+};
 use std::time::Duration;
 
 fn cfg(c: &Cluster) -> ProducerConfig {
@@ -164,12 +166,14 @@ fn stale_leader_answers_not_leader_then_new_leader_succeeds() {
 }
 
 #[test]
-fn disconnect_mid_request_is_at_least_once() {
+fn disconnect_mid_request_is_at_least_once_without_idempotence() {
     // Broker appends, then drops the connection before answering: the
     // client cannot know, re-sends, and the log holds a duplicate.
     let c = Cluster::start(1, 1);
     c.script([Action::DisconnectAfterAppend]);
-    let mut p = Producer::new(cfg(&c)).unwrap();
+    let mut cf = cfg(&c);
+    cf.idempotence = false;
+    let mut p = Producer::new(cf).unwrap();
     let out = p.send(TOPIC, &recs(3, 1)).unwrap();
     assert_eq!(delivered(&out), 3);
     assert_eq!(order(&c, 0), vec![0, 1, 2, 0, 1, 2]);
@@ -429,4 +433,324 @@ fn idle_connections_are_closed_before_the_broker_does() {
     assert_eq!((st.io_errors, st.retries), (0, 0), "{st:?}");
     assert!(st.connects >= 3, "{st:?}");
     assert_eq!(c.total(), 4);
+}
+
+// ------------------------------------------------------------ idempotence
+
+/// `(partition, producer id, epoch, base sequence, records)` appended.
+fn appended(c: &Cluster) -> Vec<(i32, i64, i16, i32, i32)> {
+    c.state.lock().unwrap().appended.clone()
+}
+
+#[test]
+fn idempotent_lost_ack_is_not_written_twice() {
+    for dup_code in [false, true] {
+        // The broker appends, then drops the connection: the client
+        // re-sends the same batch (same sequence) and the broker answers
+        // it as a duplicate (success with the original offset, or
+        // DUPLICATE_SEQUENCE_NUMBER).
+        let c = Cluster::start(1, 1);
+        c.state.lock().unwrap().dup_error_code = dup_code;
+        c.script([Action::DisconnectAfterAppend]);
+        let mut p = Producer::new(cfg(&c)).unwrap();
+        let out = p.send(TOPIC, &recs(3, 1)).unwrap();
+        assert_eq!(delivered(&out), 3);
+        assert_eq!(order(&c, 0), vec![0, 1, 2], "dup_code {dup_code}");
+        assert_eq!(c.state.lock().unwrap().duplicates, 1);
+        if dup_code {
+            assert_eq!(p.stats().duplicates, 1);
+            assert!(matches!(out[0], Outcome::Delivered { offset: -1, .. }));
+        } else {
+            assert_eq!(
+                out[2],
+                Outcome::Delivered {
+                    partition: 0,
+                    offset: 2
+                }
+            );
+        }
+        assert_eq!(appended(&c), vec![(0, 1000, 0, 0, 3)]);
+        assert_eq!(c.init_pid_requests(), 1);
+        // The next call continues the sequence.
+        p.send(TOPIC, &recs(2, 1)).unwrap();
+        assert_eq!(appended(&c)[1], (0, 1000, 0, 3, 2));
+        assert_eq!(c.init_pid_requests(), 1, "one producer id per producer");
+        assert_eq!(p.idempotent_state().unwrap().next(TOPIC, 0), 5);
+    }
+}
+
+#[test]
+fn sequences_are_per_partition_and_survive_leader_moves() {
+    let c = Cluster::start(2, 3);
+    c.script([Action::Ok, Action::MoveLeader(2)]);
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    assert_eq!(delivered(&p.send(TOPIC, &recs(30, 3)).unwrap()), 30);
+    // Refused by the old leader (nothing appended), re-sent to the new one
+    // with the same sequences.
+    assert_eq!(delivered(&p.send(TOPIC, &recs(6, 3)).unwrap()), 6);
+    assert_eq!(c.total(), 36);
+    let a = appended(&c);
+    for part in 0..3 {
+        let seqs: Vec<(i32, i32)> = a
+            .iter()
+            .filter(|x| x.0 == part)
+            .map(|x| (x.3, x.4))
+            .collect();
+        assert_eq!(seqs, vec![(0, 10), (10, 2)], "partition {part}");
+    }
+    assert!(a.iter().all(|x| x.1 == 1000 && x.2 == 0));
+}
+
+#[test]
+fn sequence_errors_reset_the_producer_id() {
+    for code in [45i16, 59, 47, 90] {
+        let c = Cluster::start(1, 1);
+        let mut p = Producer::new(cfg(&c)).unwrap();
+        p.send(TOPIC, &recs(2, 1)).unwrap();
+        c.script([Action::Error(code)]);
+        let out = p.send(TOPIC, &recs(3, 1)).unwrap();
+        assert_eq!(delivered(&out), 3, "code {code}");
+        assert_eq!(c.total(), 5, "nothing twice, nothing lost (code {code})");
+        assert_eq!(p.stats().producer_id_resets, 1);
+        assert_eq!(c.init_pid_requests(), 2);
+        // The new producer id starts at sequence 0.
+        assert_eq!(appended(&c)[1], (0, 1001, 0, 0, 3));
+    }
+}
+
+/// A broker that forgot the producer (`producer.id.expiration.ms`)
+/// accepts its next batch with any sequence: no reset needed.
+#[test]
+fn expired_producer_continues() {
+    let c = Cluster::start(1, 1);
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    p.send(TOPIC, &recs(2, 1)).unwrap();
+    c.forget_producers();
+    p.send(TOPIC, &recs(2, 1)).unwrap();
+    assert_eq!(c.total(), 4);
+    assert_eq!(p.stats().producer_id_resets, 0);
+    assert_eq!(appended(&c)[1], (0, 1000, 0, 2, 2));
+}
+
+#[test]
+fn init_producer_id_refusals() {
+    // No IDEMPOTENT_WRITE: fatal, with the remedy; nothing sent.
+    let c = Cluster::start(1, 1);
+    c.state.lock().unwrap().init_pid_error = Some(31);
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let e = p.send(TOPIC, &recs(1, 1)).unwrap_err();
+    assert!(matches!(e, ProduceError::Fatal { code: 31, .. }), "{e}");
+    let m = e.to_string();
+    assert!(
+        m.contains("IDEMPOTENT_WRITE") && m.contains("idempotence off"),
+        "{m}"
+    );
+    assert_eq!(c.total(), 0);
+    // Idempotence off: works, never asks for a producer id.
+    let mut cf = cfg(&c);
+    cf.idempotence = false;
+    let mut p = Producer::new(cf).unwrap();
+    assert_eq!(delivered(&p.send(TOPIC, &recs(2, 1)).unwrap()), 2);
+    assert!(p.idempotent_state().is_none());
+    assert_eq!(
+        c.state.lock().unwrap().idempotent_batches,
+        0,
+        "producer id -1"
+    );
+
+    // A broker without InitProducerId: refused with the remedy.
+    let c = Cluster::start(1, 1);
+    c.state.lock().unwrap().init_pid_supported = false;
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let e = p.send(TOPIC, &recs(1, 1)).unwrap_err();
+    assert!(matches!(e, ProduceError::Unsupported(_)), "{e}");
+    assert!(e.to_string().contains("idempotence off"), "{e}");
+
+    // A coordinator that is not ready yet: retried.
+    let c = Cluster::start(1, 1);
+    c.state.lock().unwrap().init_pid_error = Some(15);
+    let c2 = c.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        c2.state.lock().unwrap().init_pid_error = None;
+    });
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    assert_eq!(delivered(&p.send(TOPIC, &recs(1, 1)).unwrap()), 1);
+    t.join().unwrap();
+    assert!(c.init_pid_requests() >= 2);
+}
+
+/// A batch too large as a whole is halved: the refused batch frees its
+/// sequences, so the broker sees no gap and no reset happens.
+#[test]
+fn halving_reuses_the_refused_sequences() {
+    let c = Cluster::start(1, 1);
+    c.state.lock().unwrap().max_batch_bytes = 8 * 1100;
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let input: Vec<_> = (0..40).map(|i| (0, rec(i, 1000))).collect();
+    assert_eq!(delivered(&p.send(TOPIC, &input).unwrap()), 40);
+    assert_eq!(order(&c, 0), (0..40).collect::<Vec<_>>());
+    assert_eq!(p.stats().producer_id_resets, 0);
+    let mut next = 0;
+    for (_, _, _, seq, n) in appended(&c) {
+        assert_eq!(seq, next);
+        next += n;
+    }
+    assert_eq!(next, 40);
+}
+
+type Saved = std::sync::Arc<std::sync::Mutex<Vec<(IdempotentState, SendJournal)>>>;
+
+fn saver(saved: &Saved) -> impl FnMut(&IdempotentState, &SendJournal) -> Result<(), String> + '_ {
+    move |s, j| {
+        saved.lock().unwrap().push((s.clone(), j.clone()));
+        Ok(())
+    }
+}
+
+/// A crash after the broker appended a batch but before its
+/// acknowledgement arrived: the restarted producer restores the persisted
+/// state and journal, re-sends the batch in doubt as it was, and the broker
+/// drops the copy.
+#[test]
+fn restart_with_the_journal_does_not_duplicate() {
+    let c = Cluster::start(1, 2);
+    c.script([Action::DisconnectAfterAppend]);
+    let mut cf = cfg(&c);
+    cf.retries = 0;
+    let input = recs(6, 2);
+    let saved: Saved = Default::default();
+    let mut p = Producer::new(cf).unwrap();
+    let e = p
+        .send_journaled(TOPIC, &input, None, &mut saver(&saved))
+        .unwrap_err();
+    assert!(matches!(e, ProduceError::RetriesExhausted(_)), "{e}");
+    drop(p);
+    assert_eq!(c.total(), 6, "appended, not acknowledged");
+    let (state, journal) = saved.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(journal.batches.len(), 2);
+    assert!(journal.batches.iter().all(|b| b.offset.is_none()));
+    assert_eq!(state.next(TOPIC, 0), 3);
+
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    p.restore_idempotent_state(state);
+    let out = p
+        .send_journaled(TOPIC, &input, Some(&journal), &mut saver(&saved))
+        .unwrap();
+    assert_eq!(delivered(&out), 6);
+    assert_eq!(c.total(), 6, "the broker dropped both copies");
+    assert_eq!(c.state.lock().unwrap().duplicates, 2);
+    assert_eq!(
+        c.init_pid_requests(),
+        1,
+        "the persisted producer id is reused"
+    );
+    assert_eq!(
+        out[1],
+        Outcome::Delivered {
+            partition: 1,
+            offset: 0
+        }
+    );
+
+    // Without the journal the same records would be new ones: written
+    // twice (what the journal prevents).
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    p.restore_idempotent_state(saved.lock().unwrap().last().unwrap().0.clone());
+    p.send(TOPIC, &input).unwrap();
+    assert_eq!(c.total(), 12);
+}
+
+/// More than five batches per partition in one call (the broker only
+/// remembers five): the journal marks the acknowledged ones, which a
+/// restart reports without sending; only the last one is re-sent.
+#[test]
+fn restart_skips_acknowledged_batches() {
+    let c = Cluster::start(1, 1);
+    let mut cf = cfg(&c);
+    cf.max_request_bytes = 8192;
+    let input: Vec<_> = (0..40).map(|i| (0, rec(i, 1000))).collect();
+    let saved: Saved = Default::default();
+    let mut p = Producer::new(cf.clone()).unwrap();
+    let out = p
+        .send_journaled(TOPIC, &input, None, &mut saver(&saved))
+        .unwrap();
+    assert_eq!(delivered(&out), 40);
+    let n = c.state.lock().unwrap().produce_requests;
+    assert!(n > 5, "{n} requests");
+    // The last journal stored: all but the last batch acknowledged.
+    let (state, journal) = saved.lock().unwrap().last().cloned().unwrap();
+    let in_doubt = journal
+        .batches
+        .iter()
+        .filter(|b| b.offset.is_none())
+        .count();
+    assert_eq!((journal.batches.len() as u64, in_doubt), (n, 1));
+
+    // "Crash" before the caller committed: replay with the journal.
+    let mut p = Producer::new(cf).unwrap();
+    p.restore_idempotent_state(state);
+    let again = p
+        .send_journaled(TOPIC, &input, Some(&journal), &mut saver(&saved))
+        .unwrap();
+    assert_eq!(again, out, "same outcomes, same offsets");
+    assert_eq!(c.total(), 40);
+    assert_eq!(p.stats().journal_acked, n - 1);
+    assert_eq!(c.state.lock().unwrap().produce_requests, n + 1);
+}
+
+#[test]
+fn unfitting_journals_are_ignored() {
+    let c = Cluster::start(1, 2);
+    let input = recs(4, 2);
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let saved: Saved = Default::default();
+    p.send_journaled(TOPIC, &input, None, &mut saver(&saved))
+        .unwrap();
+    let (_, j) = saved.lock().unwrap().last().cloned().unwrap();
+    // Another topic, an index out of range, another partition: the
+    // records are sent as new ones (never lost).
+    let mut other = j.clone();
+    other.topic = "other".into();
+    let mut range = j.clone();
+    range.batches[0].records.push(99);
+    let mut part = j.clone();
+    part.batches[0].partition = 1 - part.batches[0].partition;
+    for bad in [other, range, part] {
+        let before = c.total();
+        let out = p
+            .send_journaled(TOPIC, &input, Some(&bad), &mut saver(&saved))
+            .unwrap();
+        assert_eq!(delivered(&out), 4);
+        assert_eq!(c.total(), before + 4);
+    }
+    assert_eq!(p.stats().journal_acked, 0);
+}
+
+#[test]
+fn a_journal_that_cannot_be_saved_stops_before_sending() {
+    let c = Cluster::start(1, 1);
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let e = p
+        .send_journaled(TOPIC, &recs(2, 1), None, &mut |_, _| {
+            Err("disk full".to_string())
+        })
+        .unwrap_err();
+    assert!(matches!(e, ProduceError::Journal(_)), "{e}");
+    assert!(e.to_string().contains("disk full"));
+    assert_eq!(c.state.lock().unwrap().produce_requests, 0);
+    // The sequences were not used up: the next batch starts at 0.
+    p.send(TOPIC, &recs(2, 1)).unwrap();
+    assert_eq!(appended(&c), vec![(0, 1000, 0, 0, 2)]);
+}
+
+#[test]
+fn sequence_numbers_wrap_like_kafka() {
+    use robodr_export::kafka::client::increment_sequence;
+    assert_eq!(increment_sequence(0, 5), 5);
+    assert_eq!(increment_sequence(i32::MAX - 2, 2), i32::MAX);
+    assert_eq!(increment_sequence(i32::MAX - 2, 3), 0);
+    assert_eq!(increment_sequence(i32::MAX, 1), 0);
+    assert_eq!(increment_sequence(i32::MAX, 10), 9);
+    assert_eq!(inc_seq(i32::MAX, 10), 9);
 }

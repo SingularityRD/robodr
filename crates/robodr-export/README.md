@@ -50,7 +50,11 @@ half-finished batch).
    name), `topic` (= the value's `ocsf.metadata.log_name`), `key` (= finding
    id) and re-validate the value with
    `robodr_ocsf::parse_and_validate`. A failing record is **moved** to
-   `<spool>/rejected/` (with `<name>.reason.json`), never deleted.
+   `<spool>/rejected/` (with `<name>.reason.json`); kept unless
+   `--rejected-max-age-s` / `--rejected-max-count` / `--rejected-max-bytes`
+   bound it (then the oldest records beyond the bounds are deleted after a
+   run, each with its reason file; a rejected record never comes back to
+   `ready/`, so nothing needed is lost but its forensic copy).
 2. Cut the batch exactly as the packer's planner would (data bytes and
    finding count, parity included), so that one `Packer::pack` call writes
    **one** diode batch. (`--max-batch-bytes` / `--max-findings` set both
@@ -131,18 +135,54 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   entry and is skipped from then on; entries of batches gone from `out/`
   are pruned, and the map is capped at 1024 entries (beyond that the entry
   with the fewest committed lines is dropped: that batch is re-sent, never
-  lost). After a crash each batch resumes after its last committed line: at
-  most one chunk per interrupted batch (plus whatever a lost Produce
-  response covered) is sent twice. A version-1 file (`{batch,
-  lines_committed}`) is migrated on open. For a spool source the commit is
-  the rename to `acked/`.
+  lost). After a crash each batch resumes after its last committed line. A
+  version-1 file (`{batch, lines_committed}`) is migrated on open. For a
+  spool source the commit is the rename to `acked/`.
+* **Idempotent producer** (default; `--no-idempotence` turns it off).
+  The producer gets a producer id (InitProducerId v0–1) and numbers every
+  batch per partition; a batch whose acknowledgement was lost is re-sent
+  exactly as it was and the broker drops the copy. `progress.json` also
+  holds `producer: {state: {producer_id, producer_epoch, sequences},
+  chunk: {context, positions, journal}}`, replaced **before** every
+  Produce request that carries a newly numbered batch. A publisher
+  restarted after a crash re-reads the same chunk, restores the producer id
+  and sequences, reports the journal's acknowledged batches without sending
+  them and re-sends the batch in doubt with its sequence: **no duplicate**
+  (`pipeline.rs`, `publisher_crash_after_send_is_deduplicated_by_the_broker`).
+  Errors: `DUPLICATE_SEQUENCE_NUMBER` = success;
+  `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID`,
+  `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED` = the batch was not written:
+  new producer id, sequences from 0, re-send (`producer_id_resets`; a batch
+  of another partition in doubt at that moment may then be written twice);
+  InitProducerId `CLUSTER_AUTHORIZATION_FAILED` = fatal, naming the
+  `IDEMPOTENT_WRITE` ACL (needed before Kafka 3.0; implied by topic `WRITE`
+  since) and `--no-idempotence`. Limits: the broker remembers a producer id
+  for `producer.id.expiration.ms` (default one day) after its last write; a
+  restart after that, or a chunk that no longer matches its journal (input
+  or `--chunk` changed), may write the batch in doubt twice. With
+  `--no-idempotence`, at most one chunk per interrupted batch (plus
+  whatever a lost Produce response covered) is sent twice, as before.
+* **Retention.** After every run: `done/` markers older than
+  `--done-max-age-s` (default 30 days; 0 = keep) or beyond
+  `--done-max-count` are deleted, but **never while the batch is still in
+  `out/`** (the marker is what keeps it from being published again);
+  prune `out/` and the markers follow. `dead-letter.jsonl` rotates at
+  `--dead-letter-max-bytes` (default 64 MiB, 0 = one growing file) keeping
+  `--dead-letter-keep` rotated files (default 4), optionally also bounded
+  by `--dead-letter-max-age-s`; a rotated file over the bounds is deleted
+  only when none of its entries can still be needed for deduplication
+  (diode: its batch is in `out/` without a `done/` marker; spool: its file
+  is still in `ready/`), otherwise it is held and reported
+  (`pruned_dead_letters.held`). Deletions are single `unlink`s plus a
+  directory fsync: crash-safe at any point.
 * **Dead letters.** A record that fails validation, or that Kafka rejects
   as a record (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`, ...), is appended to
   `<state>/dead-letter.jsonl` (`{source, position, reason, record, at_ms}`)
   and skipped (spool source: moved to `<spool>/rejected/`). Entries are
   deduplicated on `(source, position)`, so a chunk re-processed after a
   crash does not append its dead letters again (the index is read from the
-  file on the first dead letter of a run; 16 bytes per entry). Any other
+  current and rotated files on the first dead letter of a run; 16 bytes per
+  entry). Any other
   Kafka error stops the run without committing; the next run retries.
 
 ## `robodr-uplink` (ingest API, connected site or SOC side)
@@ -153,7 +193,8 @@ robodr-uplink --url https://soc.example.org/api --key-file /etc/robodr/keys/upli
   (--spool /var/lib/robodr/spool/agentd | --diode-out /srv/diode/out) [--max-lines N] [--max-body-bytes N] \
   [--connect-timeout-ms N] [--request-timeout-ms N] [--max-attempts N] [--backoff-base-ms N] \
   [--backoff-max-ms N] [--refused-backoff-max-s 900] [--exit-when-stuck-s N] \
-  [--dead-letter-max-bytes 67108864] [--dead-letter-keep 4] [--upgrade-data-source L] \
+  [--dead-letter-max-bytes 67108864] [--dead-letter-keep 4] [--dead-letter-max-age-s N] \
+  [--done-max-age-s 2592000] [--done-max-count N] [--upgrade-data-source L] \
   [--upgrade-topic T] [--interval-ms 2000] [--once]
 robodr-uplink reinject --state-dir DIR (--spool DIR | --diode-out DIR) --dead-letter FILE [...] \
   [--codes unknown_robot,robot_mismatch,site_mismatch,missing_finding_signature,bad_finding_signature] \
@@ -277,6 +318,14 @@ later record. The loop makes that visible and keeps it cheap:
   `reinject`; a second process exits 1 with a clear message.
 * **Dead-letter rotation**: at `--dead-letter-max-bytes` (64 MiB; ≥ 64 KiB;
   0 = never), keeping `--dead-letter-keep` files (`.1` newest, default 4).
+  Rotation only renames; after each successful run, rotated files past
+  `keep` or older than `--dead-letter-max-age-s` are deleted once none of
+  their entries can still be needed for deduplication (diode batch not
+  done, spool file still in `ready/`, re-injected generation not done);
+  deleted dead letters can no longer be re-injected.
+* **`done/` retention**: markers older than `--done-max-age-s` (default 30
+  days, 0 = keep) or beyond `--done-max-count`, never while their batch is
+  still in `out/`.
 
 ### Re-injection (`src/uplink/reinject.rs`)
 
@@ -382,13 +431,31 @@ client-side; the broker's channel muting paces the producer (checked with a
   key/value and negative timestamp deltas; every single-bit flip in the
   CRC-covered region detected; every truncation of every response type an
   error, never a panic; version negotiation.
+* Idempotence (`tests/kafka_fake_broker.rs`): a lost acknowledgement
+  re-sent and dropped by the broker (as success with the original offset
+  and as `DUPLICATE_SEQUENCE_NUMBER`), sequences per partition across calls
+  and a leader move, resets on `OUT_OF_ORDER_SEQUENCE_NUMBER` /
+  `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` / `PRODUCER_FENCED`
+  without loss or duplicate, an expired producer, InitProducerId refused
+  (`CLUSTER_AUTHORIZATION_FAILED`, not offered, coordinator not ready),
+  halving that reuses the refused sequences, a restart with the persisted
+  state and journal (in-doubt batch deduplicated; more than five batches
+  per partition: acknowledged ones skipped), journals that do not fit, a
+  journal that cannot be saved (nothing sent), sequence wrap-around.
+  Retention: `tests/retention.rs`, `deadletter.rs` and `retention.rs` unit
+  tests (markers held while the batch is in `out/`, rotated files held
+  while an entry is needed, current file never deleted), `spool_export.rs`
+  (rejected pairs, names in `ready/` spared).
 * `tests/kafka_fake_broker.rs`: a fake cluster (std `TcpListener`, one
-  thread per connection) implementing ApiVersions/Metadata/Produce,
-  decoding every RecordBatch (CRC checked) into a per-partition log. Cases:
-  success (order, offsets, headers, `acks=-1`, producer id -1, negotiated
-  versions), Produce v3 negotiation, unsupported broker, retriable errors
+  thread per connection) implementing ApiVersions/Metadata/Produce/
+  InitProducerId, decoding every RecordBatch (CRC checked) into a
+  per-partition log and enforcing a broker's idempotent-producer checks
+  (sequence continuity per producer id and partition, epochs, duplicates of
+  the last five batches). Cases: success (order, offsets, headers,
+  `acks=-1`, negotiated versions), Produce v3 negotiation, unsupported broker, retriable errors
   without duplicates, leader change (`MoveLeader`) and leadership moved
-  between calls, disconnect after append (duplicate = at-least-once),
+  between calls, disconnect after append (duplicate with
+  `idempotence = false`; deduplicated by the broker otherwise),
   disconnect before append and half frames (exactly once), garbage frame
   and a broker that never answers (timeout), broker `MESSAGE_TOO_LARGE`
   isolated to one record with order kept around it, client-side oversize,
@@ -545,11 +612,15 @@ partitioner all agreed with the real brokers.
   (`--allow-plaintext`), the advertised listeners seen by this client must
   point at the local proxy ports (one per broker), otherwise it bypasses
   the proxy.
-* **Idempotence off**, contrary to the contract's producer settings (§4,
-  `enable.idempotence=true`): delivery is at-least-once. Ordering per
-  partition still holds (one request in flight), but a lost response
-  duplicates a request's records. Consumers must drop duplicates on
-  `event-uid` (contract §2 already allows it).
+* **Idempotence** is on by default (contract §4, `enable.idempotence=true`)
+  and verified against the fake broker (sequence numbers, epochs,
+  five-batch duplicate window); `scripts/kafka-it.sh` has not yet been run
+  against real brokers with it. With `--no-idempotence` (brokers that
+  refuse InitProducerId to this principal) delivery is at-least-once: a
+  lost response duplicates a request's records. Either way consumers may
+  drop duplicates on `event-uid` (contract §2); an epoch bump (KIP-360,
+  InitProducerId v3+) is not implemented: a sequence error takes a new
+  producer id instead.
 * **DNS.** Host names (bootstrap and advertised listeners) go through the
   system resolver on a helper thread; a lookup that outlives
   `connect_timeout` fails the attempt and its thread is abandoned (at most
@@ -575,10 +646,10 @@ partitioner all agreed with the real brokers.
   (`--max-attempts`); the binary then backs off between runs, so a `401`
   (key not registered, clock off by more than 300 s) is retried slowly
   forever with the batch kept, never dropped. No HTTP proxy support (the
-  sites are air-gapped or direct). `done/` markers and `dead-letter.jsonl`
-  grow like the publisher's.
-* The publisher's `done/` markers (one empty file per batch) and
-  `dead-letter.jsonl` grow without bound; prune them together with the
-  importer's `out/`. No signal handling: both tools are crash-safe by
+  sites are air-gapped or direct).
+* `done/` markers are bounded only once the importer's `out/` is pruned
+  (a marker is kept while its batch is there); the reinject ledger
+  (`<state>/reinject/`) and the publisher's/uplink's spool `rejected/`
+  are not pruned. No signal handling: both tools are crash-safe by
   design, so SIGTERM/SIGKILL at any point is covered by the recovery rules
   above.

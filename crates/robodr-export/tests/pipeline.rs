@@ -396,39 +396,71 @@ fn mismatched_planner_limits_are_reported() {
     assert_eq!(r.outbox_batches().len(), 3);
 }
 
+fn producer_with(c: &Cluster, idempotence: bool) -> Producer {
+    let mut p = ProducerConfig::new(c.bootstrap());
+    p.allow_plaintext = true;
+    p.retry_backoff = Duration::from_millis(5);
+    p.idempotence = idempotence;
+    Producer::new(p).unwrap()
+}
+
+/// A crash after Kafka acknowledged chunk 2 but before its progress was
+/// saved. Idempotent (the default): the restarted publisher re-sends the
+/// chunk with its journal and the broker drops the copy: exactly once.
+/// Without idempotence: that one chunk is duplicated.
 #[test]
-fn publisher_crash_after_send_duplicates_at_most_one_chunk() {
-    let r = Robot::new("pub-crash");
-    r.spool_findings(0, 10);
-    r.exporter(None).run_once(NOW).unwrap();
-    r.transfer_and_import();
-    let c = Cluster::start(1, 2);
-    let out = r.high.join("out");
-    let mut cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &r.soc_state);
-    cfg.chunk_records = 3;
-    cfg.fail_after_send = Some(2);
-    let mut p = Publisher::open(cfg, producer(&c)).unwrap();
-    assert!(p.run_once().is_err());
-    drop(p);
-    assert_eq!(c.total(), 6, "two chunks acknowledged by Kafka");
-    let mut cfg = PublishConfig::new(Source::DiodeOut(out), &r.soc_state);
-    cfg.chunk_records = 3;
-    let mut p = Publisher::open(cfg, producer(&c)).unwrap();
-    let batch = Robot::names(&r.high.join("out")).pop().unwrap();
-    assert_eq!(p.progress().lines_committed(&batch), 3);
-    let rep = p.run_once().unwrap();
-    assert_eq!(rep.resumed_after, 3);
-    assert_eq!(rep.published, 7);
-    // 10 findings, chunk 2 (lines 4-6) sent twice.
-    assert_eq!(c.total(), 13);
-    let mut keys: Vec<Vec<u8>> = c
-        .all_records()
-        .into_iter()
-        .map(|(_, r)| r.key.unwrap())
-        .collect();
-    keys.sort();
-    keys.dedup();
-    assert_eq!(keys.len(), 10, "every finding delivered");
+fn publisher_crash_after_send_is_deduplicated_by_the_broker() {
+    for idempotence in [true, false] {
+        let r = Robot::new(if idempotence {
+            "pub-crash-idem"
+        } else {
+            "pub-crash"
+        });
+        r.spool_findings(0, 10);
+        r.exporter(None).run_once(NOW).unwrap();
+        r.transfer_and_import();
+        let c = Cluster::start(1, 2);
+        let out = r.high.join("out");
+        let mut cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &r.soc_state);
+        cfg.chunk_records = 3;
+        cfg.fail_after_send = Some(2);
+        let mut p = Publisher::open(cfg, producer_with(&c, idempotence)).unwrap();
+        assert!(p.run_once().is_err());
+        drop(p);
+        assert_eq!(c.total(), 6, "two chunks acknowledged by Kafka");
+        let mut cfg = PublishConfig::new(Source::DiodeOut(out), &r.soc_state);
+        cfg.chunk_records = 3;
+        let mut p = Publisher::open(cfg, producer_with(&c, idempotence)).unwrap();
+        let batch = Robot::names(&r.high.join("out")).pop().unwrap();
+        assert_eq!(p.progress().lines_committed(&batch), 3);
+        assert_eq!(p.progress().producer.is_some(), idempotence);
+        let rep = p.run_once().unwrap();
+        assert_eq!(rep.resumed_after, 3);
+        assert_eq!(rep.published, 7);
+        let mut keys: Vec<Vec<u8>> = c
+            .all_records()
+            .into_iter()
+            .map(|(_, r)| r.key.unwrap())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 10, "every finding delivered");
+        if idempotence {
+            assert_eq!(c.total(), 10, "exactly once");
+            assert!(c.state.lock().unwrap().duplicates >= 1);
+            assert_eq!(
+                c.init_pid_requests(),
+                1,
+                "producer id kept across the restart"
+            );
+            let pp = p.progress().producer.clone().unwrap();
+            assert!(pp.chunk.is_none(), "journal cleared with the commit");
+        } else {
+            // 10 findings, chunk 2 (lines 4-6) sent twice.
+            assert_eq!(c.total(), 13);
+            assert!(p.progress().producer.is_none());
+        }
+    }
 }
 
 #[test]
