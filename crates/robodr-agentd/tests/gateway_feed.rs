@@ -194,3 +194,98 @@ fn gateway_heartbeats_keep_a_quiet_feed_alive() {
         "{st}"
     );
 }
+
+/// Red team 2026-10-30 W2-5 (G7 - G9): a root / gateway-user process wrote
+/// any severity and one finding per line into the spool. Severities are
+/// now kept within each rule's range, and a flood of one rule is folded
+/// into its burst plus one aggregate (reported at the latest at a stop).
+#[test]
+fn a_gateway_line_flood_is_capped_and_severities_kept_in_range() {
+    let s = setup("gw-flood", &robot_profile(true));
+    let run = s.dir.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = run.join("gateway-feed.sock");
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "unix_socket", "path": run.join("events.sock")}]),
+        serde_json::json!({}),
+    );
+    cfg["gateway_feed"] = serde_json::json!({
+        "socket_path": sock,
+        "allowed_uids": [robodr_agentd::config::effective_uid()],
+    });
+    let r = s.resolve(&cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    let h = std::thread::spawn(move || {
+        let mut log = Vec::new();
+        let res = robodr_agentd::run(&r, &|| s2.load(Ordering::SeqCst), &mut log)
+            .map_err(|e| e.to_string());
+        (res, String::from_utf8_lossy(&log).into_owned())
+    });
+    wait_for(10, "socket", || sock.exists().then_some(()));
+    let rule = "robot.firewall.rejected_unknown_source"; // Critical
+    let mut c = UnixStream::connect(&sock).unwrap();
+    // G7: a Critical rule claimed low; then a Low gateway rule claimed
+    // critical.
+    let low = Deviation::new(rule, Severity::Low, "claimed low");
+    writeln!(c, "{}", feed::line(&low, Some("/cmd_vel"), 1).unwrap()).unwrap();
+    let up = Deviation::new(
+        rules::RESTRICTION_CHANGED,
+        Severity::Critical,
+        "claimed critical",
+    );
+    writeln!(c, "{}", feed::line(&up, None, 1).unwrap()).unwrap();
+    // G9: 600 more lines of the Critical rule, as fast as possible.
+    for i in 0..600 {
+        let d = Deviation::new(rule, Severity::Critical, format!("flood {i}"));
+        writeln!(
+            c,
+            "{}",
+            feed::line(&d, Some(&format!("/c{}", i % 3)), 2).unwrap()
+        )
+        .unwrap();
+    }
+    c.flush().unwrap();
+    let st = wait_for(15, "lines taken", || {
+        let st = status(&s.spool)?;
+        let d = &st["daemon"];
+        (d["gateway_findings"].as_u64()? + d["gateway_folded"].as_u64()? >= 602).then_some(st)
+    });
+    let d = &st["daemon"];
+    assert_eq!(d["gateway_severity_clamped"], 2, "{d}");
+    assert_eq!(d["gateway_findings"], 21, "{d}"); // 20 + the restriction
+    stop.store(true, Ordering::SeqCst);
+    let (res, log) = h.join().unwrap();
+    res.unwrap_or_else(|e| panic!("{e}\n{log}"));
+    let found = spooled(&s.spool);
+    let of = |id: &str| -> Vec<_> {
+        found
+            .iter()
+            .filter(|(_, e)| e.entity_context.rule_id == id)
+            .map(|(_, e)| e)
+            .collect()
+    };
+    let flood = of(rule);
+    // The burst plus one aggregate (flushed at the stop), all Critical.
+    assert_eq!(flood.len(), 21, "{log}");
+    assert!(flood.iter().all(|e| e.severity == Severity::Critical));
+    assert!(flood[0]
+        .entity_context
+        .detail
+        .value
+        .contains("severity claimed Low"));
+    let agg = flood
+        .iter()
+        .find(|e| e.entity_context.detail.value.contains("folded by agentd"))
+        .expect("aggregate");
+    assert!(
+        agg.entity_context.detail.value.contains("581 further line"),
+        "{}",
+        agg.entity_context.detail.value
+    );
+    let restr = of(rules::RESTRICTION_CHANGED);
+    assert_eq!(restr.len(), 1);
+    assert_eq!(restr[0].severity, Severity::Low);
+}
