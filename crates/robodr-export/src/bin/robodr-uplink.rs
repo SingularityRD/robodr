@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const USAGE: &str = "usage: robodr-uplink --url https://HOST[:PORT][/API-ROOT] --key-file FILE \
---ca-bundle PEM [--spki-sha256 HEX ...] --state-dir DIR (--spool DIR | --diode-out DIR) \
+--ca-bundle PEM [--spki-sha256 HEX ...] [--crl-file CRL ...] --state-dir DIR (--spool DIR | --diode-out DIR) \
 [--max-lines N] [--max-body-bytes N] [--connect-timeout-ms N] [--request-timeout-ms N] \
 [--max-attempts N] [--backoff-base-ms N] [--backoff-max-ms N] [--refused-backoff-max-s N] \
 [--exit-when-stuck-s N] [--dead-letter-max-bytes N] [--dead-letter-keep N] \
@@ -32,7 +32,9 @@ const USAGE: &str = "usage: robodr-uplink --url https://HOST[:PORT][/API-ROOT] -
        robodr-uplink --version\n\
 POSTs findings to {url}/robot-edr/v2/ingest (contract robodr.ingest v1), signed with the \
 Ed25519 key file (registered on the server as an `uplink` or `relay` key).\n\
-TLS is mandatory (CA bundle; optional SHA-256 SPKI pins: the server key must match one); plain http:// \
+TLS is mandatory (CA bundle; optional SHA-256 SPKI pins: the server key must match one; optional CRLs \
+of the server's CAs, PEM or DER: a revoked server is refused, an issuer without a CRL or an expired \
+or unusable CRL refuses every server, the files are reloaded when they change); plain http:// \
 only to a loopback IP literal, without --ca-bundle.\n\
 Status: <state-dir>/uplink-status.json and sd_notify STATUS=. One process per --state-dir (flock).\n\
 reinject: re-queue dead-lettered records (default codes: unknown_robot, robot_mismatch, \
@@ -46,6 +48,7 @@ const SERVICE_FLAGS: &[&str] = &[
     "key-file",
     "ca-bundle",
     "spki-sha256",
+    "crl-file",
     "state-dir",
     "spool",
     "diode-out",
@@ -79,6 +82,7 @@ struct Opts {
     key_file: String,
     ca_bundle: Option<String>,
     pins: Vec<[u8; 32]>,
+    crl_files: Vec<PathBuf>,
     timeouts: Timeouts,
     cfg: UplinkConfig,
     service: ServiceConfig,
@@ -111,11 +115,16 @@ fn source(a: &Args) -> Result<Source, String> {
 
 /// How the uplink authenticates the server, for the start line: plain
 /// `http://` (loopback only) has no CA bundle and no pin (RESULTS D2).
-fn transport_label(tls: bool, pinned: bool) -> &'static str {
-    match (tls, pinned) {
-        (false, _) => "plain HTTP to loopback, no TLS",
+fn transport_label(tls: bool, pinned: bool, crl: bool) -> String {
+    let base = match (tls, pinned) {
+        (false, _) => return "plain HTTP to loopback, no TLS".into(),
         (true, false) => "CA bundle",
         (true, true) => "CA bundle + SPKI pin",
+    };
+    if crl {
+        format!("{base} + CRL")
+    } else {
+        base.into()
     }
 }
 
@@ -136,6 +145,10 @@ fn opts(a: &Args) -> Result<Opts, String> {
     }
     if !url.tls && !pins.is_empty() {
         return Err("--spki-sha256 is meaningless for plain http://".into());
+    }
+    let crl_files: Vec<PathBuf> = a.all("crl-file").into_iter().map(Into::into).collect();
+    if !url.tls && !crl_files.is_empty() {
+        return Err("--crl-file is meaningless for plain http://".into());
     }
     let mut timeouts = Timeouts::default();
     if let Some(d) = ms(a, "connect-timeout-ms")? {
@@ -197,6 +210,7 @@ fn opts(a: &Args) -> Result<Opts, String> {
         key_file: a.req("key-file")?.to_string(),
         ca_bundle,
         pins,
+        crl_files,
         timeouts,
         cfg,
         service,
@@ -214,7 +228,7 @@ fn load(o: &Opts) -> Result<Loaded, String> {
     let tls = match &o.ca_bundle {
         Some(p) => {
             let roots = http::load_ca_bundle(std::path::Path::new(p))?;
-            Some(http::client_config(roots, &o.pins)?)
+            Some(http::client_config_with_crls(roots, &o.pins, &o.crl_files)?.0)
         }
         None => None,
     };
@@ -345,7 +359,7 @@ fn main() -> ExitCode {
         "robodr-uplink: {} as {} ({})",
         o.url,
         loaded.key_id(),
-        transport_label(o.url.tls, !o.pins.is_empty())
+        transport_label(o.url.tls, !o.pins.is_empty(), !o.crl_files.is_empty())
     );
     let notifier = Notifier::from_env();
     let open = || {
@@ -384,10 +398,11 @@ mod tests {
     #[test]
     fn plain_http_is_not_labelled_as_a_ca_bundle() {
         assert_eq!(
-            transport_label(false, false),
+            transport_label(false, false, false),
             "plain HTTP to loopback, no TLS"
         );
-        assert_eq!(transport_label(true, false), "CA bundle");
-        assert_eq!(transport_label(true, true), "CA bundle + SPKI pin");
+        assert_eq!(transport_label(true, false, false), "CA bundle");
+        assert_eq!(transport_label(true, true, false), "CA bundle + SPKI pin");
+        assert_eq!(transport_label(true, false, true), "CA bundle + CRL");
     }
 }

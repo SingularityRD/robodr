@@ -230,6 +230,11 @@ the SOC's CA certificate(s), the only TLS trust anchor.
 .TP
 .BI \-\-spki\-sha256 " HEX"
 pin the SOC server key (repeatable).
+CRLs of the SOC's CAs are configured in
+.I fleet.json
+.BR soc.crl_files :
+a revoked SOC certificate is refused, and so is every SOC server while a
+CRL is missing for its CA, expired or unusable.
 .TP
 .BI \-\-token\-file " FILE"
 the enrollment token, in a file owned by root, mode 0600.

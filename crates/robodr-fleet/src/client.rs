@@ -8,7 +8,7 @@
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::Ed25519SigningKey;
 use robodr_export::uplink::http::{self, Endpoint, HttpRequest, HttpsTransport, Timeouts};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::wire;
 
@@ -42,6 +42,17 @@ impl Https {
     /// `url` is the API root (`https://soc.example.org/api`); `ca_bundle` the
     /// PEM trust anchors; `pins` optional SHA-256 SPKI pins (64 hex).
     pub fn new(url: &str, ca_bundle: Option<&Path>, pins: &[String]) -> Result<Self, String> {
+        Self::with_crls(url, ca_bundle, pins, &[])
+    }
+
+    /// As [`Https::new`], the server's chain also checked against
+    /// `crl_files` (`robodr_blackbox::crl`; empty: no revocation check).
+    pub fn with_crls(
+        url: &str,
+        ca_bundle: Option<&Path>,
+        pins: &[String],
+        crl_files: &[PathBuf],
+    ) -> Result<Self, String> {
         let ep = Endpoint::parse_with_path(url, "")?;
         let pins = pins
             .iter()
@@ -49,7 +60,9 @@ impl Https {
             .collect::<Result<Vec<_>, _>>()?;
         let tls = if ep.tls {
             let ca = ca_bundle.ok_or("an https:// SOC URL needs a CA bundle (--ca-bundle)")?;
-            Some(http::client_config(http::load_ca_bundle(ca)?, &pins)?)
+            Some(http::client_config_with_crls(http::load_ca_bundle(ca)?, &pins, crl_files)?.0)
+        } else if !crl_files.is_empty() {
+            return Err("CRL files are meaningless for plain http:// (loopback only)".into());
         } else {
             None
         };

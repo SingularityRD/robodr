@@ -39,6 +39,9 @@ pub fn server_config(cfg: &Config) -> Result<Arc<rustls::ServerConfig>, DepotErr
         cert_chain: t.join("server.pem"),
         key_file: t.join("server.key"),
         client_ca: Some(t.join("ca.pem")),
+        // Revocation is per unit (an enrolled, non-revoked identity key,
+        // checked on every request), not by CRL.
+        crl_files: Vec::new(),
     })
     .map_err(err)
 }

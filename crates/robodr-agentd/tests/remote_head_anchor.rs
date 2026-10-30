@@ -79,6 +79,7 @@ fn pki(s: &Setup) -> PathBuf {
         "client.key",
         "wrong-host.pem",
         "wrong-host.key",
+        "crl-ca.crl.pem",
     ] {
         std::fs::copy(src.join(n), d.join(n)).unwrap();
         let mode = if n.ends_with(".key") { 0o600 } else { 0o644 };
@@ -197,6 +198,19 @@ fn remote_anchor_config_is_checked() {
         "server name",
     );
     tls_refused(&|a| a["tls"]["bogus"] = 1.into(), "bogus");
+    // crl_files: absolute, and each must hold a CRL.
+    tls_refused(
+        &|a| a["tls"]["crl_files"] = serde_json::json!(["ca.crl"]),
+        "crl_files",
+    );
+    tls_refused(
+        &|a| a["tls"]["crl_files"] = serde_json::json!([p.join("ca.pem")]),
+        "no X509 CRL",
+    );
+    let mut with_crl = tls.clone();
+    with_crl["blackbox"]["head_anchor"]["tls"]["crl_files"] =
+        serde_json::json!([p.join("crl-ca.crl.pem")]);
+    assert!(robodr_agentd::load(&s.write_config(&with_crl)).is_ok());
     std::fs::set_permissions(p.join("client.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
     tls_refused(&|_| {}, "mode 644");
     std::fs::set_permissions(p.join("client.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -298,6 +312,7 @@ fn daemon_anchors_over_mutual_tls_and_refuses_a_wrong_host() {
             cert_chain: p.join(format!("{leaf}.pem")),
             key_file: p.join(format!("{leaf}.key")),
             client_ca: Some(p.join("ca.pem")),
+            crl_files: Vec::new(),
         })
         .unwrap()
     };

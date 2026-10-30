@@ -1126,7 +1126,7 @@ sudoedit /etc/systemd/system/robodr-agentd.service.d/30-control-plane.conf   # I
 #     "tls": { "cert_chain": "/etc/robodr/control-plane/robot.pem",
 #              "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
 #              "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
-#              "client_crl": "/etc/robodr/control-plane/soc-ca.crl.pem",   # optional
+#              "crl_files": ["/etc/robodr/control-plane/soc-ca.crl.pem"],  # optional
 #              "client_spki_sha256": ["<pin from step 2>"] },
 #     "unix_socket": "/run/robodr-agentd/control.sock",
 #     "state_dir": "/var/lib/robodr/control-plane/agentd",
@@ -1196,16 +1196,47 @@ sudo systemctl restart robodr-agentd
 | SOC client certificate, same CA | issue the new certificate; with pins, add the new pin to `client_spki_sha256` first (both listed), restart; switch the SOC; remove the old pin |
 | SOC client CA | append the new CA certificate to `client_ca` (PEM bundle with both), restart; reissue the SOC certificate; remove the old CA, restart |
 | Robot TLS certificate / key | install the new `robot.pem` and key (same paths), restart agentd; if the SOC pins the robot's SPKI, give it the new pin first (`openssl x509 -pubkey ...` as above) |
-| SOC client CRL | install the new CRL file (same path, `client_crl`), restart agentd |
+| SOC client CRL | write the new CRL next to the old one and `mv` it over the `crl_files` path: the next handshake uses it, no restart |
 | Finding key (answers, manifests) | section 4.3; give the SOC the new `.pub` before the restart |
 
-TLS material and keys are read at start only: every change takes a
-restart, which keeps the request state. To cut off a client certificate,
-revoke it in the client CA's CRL and install that as `tls.client_crl`
-(PEM, X.509 v2; `openssl ca -gencrl`), or remove its pin or its CA, and
-restart. With `client_crl` every client CA needs a CRL in the file (a
-certificate whose issuer has none is refused); its `nextUpdate` is not
-enforced, so refresh it on your own schedule. There is no OCSP.
+TLS certificates, keys, CAs and pins are read at start only: changing
+them takes a restart, which keeps the request state. **CRLs are reloaded
+without a restart.** To cut off a client certificate, revoke it in the
+client CA's CRL (`openssl ca -revoke`, `openssl ca -gencrl`) and install
+it at a `tls.crl_files` path (PEM or DER X.509 v2 CRLs, up to 16 files;
+the older `client_crl` is one more entry). The files are `stat`ed before
+every handshake and re-read when they change; replace them atomically
+(write, then `mv`). Rules (fail closed, not configurable):
+
+- every CA in the chain (each client CA, any intermediate) needs a CRL in
+  the files: a certificate whose issuer has none is refused;
+- `nextUpdate` is enforced: once a CRL is past it, every client of that CA
+  is refused until a fresh CRL is installed, so publish CRLs well before
+  `nextUpdate` (agentd itself keeps running);
+- a replacement that is unreadable, not a CRL or has bad permissions
+  refuses every client until fixed (`status.json`
+  `control_plane.tls.crl.error`).
+
+`status.json` `control_plane.tls.crl` counts `reloads`,
+`revoked_rejections` (with `last_revoked_spki_sha256`),
+`expired_crl_rejections` and `unknown_status_rejections`; a refused
+revoked client is also a failed authentication
+(`robot.agent.control_plane_unauthenticated`, reason `Revoked`).
+
+The same `crl_files` exists on every other TLS path: the remote head
+anchor (`blackbox.head_anchor.tls.crl_files` on the robot, `tls.crl_files`
+of `robodr-anchor-receiver` for unit certificates), `robodr-kafka-publish
+--tls-crl-file`, `robodr-uplink --crl-file` and `robodr-enroll`
+(`soc.crl_files` in `fleet.json`). TLS clients with CRLs never resume a
+session, so a server revoked after the first connection is refused on the
+next one. The site depot's LAN serving needs none: a unit is revoked by
+its identity key (`robodr-depot`), checked on every request.
+
+**No OCSP.** Robots run air-gapped or behind a data diode and cannot reach
+an OCSP responder; a soft-fail OCSP check would protect nothing and a
+hard-fail one would cut the robot off. A CRL is a signed file that travels
+over the same configuration channel as the CA bundle, so it is the only
+revocation mechanism.
 
 **Evidence export (`control_plane.evidence`).** The SOC lists the retained
 evidence (`GET .../evidence`), asks for an export of a finding's evidence
@@ -1495,8 +1526,11 @@ the window is the newest marks that have not reached the receiver. With
 `allow_plaintext`, marks (hashes, sequence numbers) are visible on the
 wire. Mutual TLS authenticates the robot's host, not its unit id: any
 certificate `client_ca` accepts may send marks for any configured robot
-(each still has to verify under that robot's key). No CRL / OCSP check:
-revoke by replacing the CA or the receiver certificate.
+(each still has to verify under that robot's key). Revocation by CRL:
+`blackbox.head_anchor.tls.crl_files` on the robot (a revoked receiver
+certificate) and `tls.crl_files` of the receiver (a revoked unit
+certificate), reloaded when the files change, fail closed (the same rules
+as the control plane's `crl_files`, section 6.4); no OCSP.
 
 ### 6.5 Executor v1 (`robodr-executor`, reversible actions)
 

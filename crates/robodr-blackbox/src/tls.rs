@@ -314,7 +314,7 @@ pub fn load_client(f: &ClientTlsFiles) -> Result<ClientTls, String> {
             inner,
             pins: pins.clone(),
         }));
-    let (config, client_auth) = match (&f.cert_chain, &f.key_file) {
+    let (mut config, client_auth) = match (&f.cert_chain, &f.key_file) {
         (None, None) => (b.with_no_client_auth(), false),
         (Some(c), Some(k)) => {
             let chain = certs("cert_chain", c)?;
@@ -331,6 +331,7 @@ pub fn load_client(f: &ClientTlsFiles) -> Result<ClientTls, String> {
             )
         }
     };
+    no_resumption_with_crls(&mut config, &crl);
     Ok(ClientTls {
         config: Arc::new(config),
         server_name: name,
@@ -379,12 +380,13 @@ pub fn load_client_with_signer(
     )?;
     let key: Arc<dyn rustls::sign::SigningKey> = Arc::new(ExternalP256 { sign });
     let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, key));
-    let config = ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("TLS: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinningVerifier { inner, pins }))
         .with_client_cert_resolver(Arc::new(FixedClientCert(certified)));
+    no_resumption_with_crls(&mut config, &crl);
     Ok(ClientTls {
         config: Arc::new(config),
         server_name: base.server_name,
@@ -392,6 +394,15 @@ pub fn load_client_with_signer(
         pins: base.pins,
         crl,
     })
+}
+
+/// With CRLs, every connection is a full handshake: a resumed session
+/// skips certificate verification, so a server revoked after the first
+/// connection would otherwise still be accepted.
+pub fn no_resumption_with_crls(config: &mut ClientConfig, crl: &Option<Arc<crate::crl::CrlStats>>) {
+    if crl.is_some() {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
 }
 
 #[derive(Debug)]

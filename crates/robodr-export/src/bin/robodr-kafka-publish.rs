@@ -14,14 +14,16 @@ const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootst
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
 [--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
 [--interval-ms N] [--once] [--upgrade-data-source LABEL] \
-(--tls-ca FILE [--tls-cert FILE --tls-key FILE] [--tls-server-name NAME] [--tls-spki-sha256 HEX]... \
+(--tls-ca FILE [--tls-cert FILE --tls-key FILE] [--tls-server-name NAME] [--tls-spki-sha256 HEX]... [--tls-crl-file FILE]... \
 [--sasl-mechanism SCRAM-SHA-256|SCRAM-SHA-512 --sasl-username U --sasl-password-file FILE] \
 | --allow-plaintext)\n\
 Unsigned contract 1.x records are upgraded to contract 2.0 (data_source --upgrade-data-source, \
 default robodr; topic --topic); signed ones are dead-lettered \
 (\"legacy 1.x signed record: re-sign required\").\n\
 TLS is required: every broker certificate is verified against --tls-ca (and the broker's \
-host name, or --tls-server-name); --tls-cert/--tls-key add a client certificate (mutual TLS). \
+host name, or --tls-server-name); --tls-cert/--tls-key add a client certificate (mutual TLS); \
+--tls-crl-file (PEM or DER CRLs of the broker CAs) refuses a revoked broker certificate (an issuer \
+without a CRL, an expired or unusable CRL refuse every broker; reloaded when the files change). \
 Plain TCP only with an explicit --allow-plaintext (isolated network or a local TLS proxy).";
 
 struct Opts {
@@ -100,6 +102,7 @@ fn security(a: &Args, p: &mut ProducerConfig) -> Result<(), String> {
         .into_iter()
         .map(str::to_string)
         .collect();
+    let crls: Vec<std::path::PathBuf> = a.all("tls-crl-file").into_iter().map(Into::into).collect();
     match ca {
         Some(ca) => {
             if p.allow_plaintext {
@@ -111,14 +114,20 @@ fn security(a: &Args, p: &mut ProducerConfig) -> Result<(), String> {
                 key_file: key.map(Into::into),
                 server_name: name.map(str::to_string),
                 spki_sha256: pins,
+                crl_files: crls,
             })
             .map_err(|e| format!("TLS: {e}"))?;
             p.tls = Some(t);
         }
-        None if cert.is_some() || key.is_some() || name.is_some() || !pins.is_empty() => {
+        None if cert.is_some()
+            || key.is_some()
+            || name.is_some()
+            || !pins.is_empty()
+            || !crls.is_empty() =>
+        {
             return Err(
-                "--tls-cert / --tls-key / --tls-server-name / --tls-spki-sha256 need \
-                        --tls-ca"
+                "--tls-cert / --tls-key / --tls-server-name / --tls-spki-sha256 / \
+                        --tls-crl-file need --tls-ca"
                     .into(),
             )
         }
@@ -197,6 +206,7 @@ fn main() -> ExitCode {
             "tls-key",
             "tls-server-name",
             "tls-spki-sha256",
+            "tls-crl-file",
             "sasl-mechanism",
             "sasl-username",
             "sasl-password-file",

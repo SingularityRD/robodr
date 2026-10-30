@@ -44,6 +44,7 @@ fn connect(d: &DepotCfg, sealing: &Sealing) -> Result<Tls, String> {
             key_file: None,
             server_name: Some(d.server_name.clone()),
             spki_sha256: Vec::new(),
+            crl_files: Vec::new(),
         },
         sign,
     )?;

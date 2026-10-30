@@ -130,6 +130,7 @@ impl Unit {
             soc_url: None,
             ca_bundle: etc.join("soc-ca.pem"),
             spki_sha256: Vec::new(),
+            crl_files: Vec::new(),
             soc_keys: vec![etc.join("fleet-soc.pub")],
             approval_keys: vec![etc.join("fleet-approval.pub")],
             workspace: Some(WORKSPACE.into()),

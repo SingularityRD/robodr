@@ -344,13 +344,16 @@ impl<V: ?Sized> Reloading<V> {
     }
 }
 
+/// A verifier and its revocation counters (`None` without CRLs).
+pub type Verifier<V> = (Arc<V>, Option<Arc<CrlStats>>);
+
 /// A server-certificate verifier (for a TLS client): WebPKI, plus the CRLs
 /// of `crls` if any (module docs). The stats are `None` without CRLs.
 pub fn server_verifier(
     roots: Arc<RootCertStore>,
     provider: Arc<rustls::crypto::CryptoProvider>,
     crls: Option<CrlFiles>,
-) -> Result<(Arc<dyn ServerCertVerifier>, Option<Arc<CrlStats>>), String> {
+) -> Result<Verifier<dyn ServerCertVerifier>, String> {
     let Some(files) = crls else {
         let v: Arc<dyn ServerCertVerifier> =
             WebPkiServerVerifier::builder_with_provider(roots, provider)
@@ -379,7 +382,7 @@ pub fn client_verifier(
     roots: Arc<RootCertStore>,
     provider: Arc<rustls::crypto::CryptoProvider>,
     crls: Option<CrlFiles>,
-) -> Result<(Arc<dyn ClientCertVerifier>, Option<Arc<CrlStats>>), String> {
+) -> Result<Verifier<dyn ClientCertVerifier>, String> {
     let Some(files) = crls else {
         let v = WebPkiClientVerifier::builder_with_provider(roots, provider)
             .build()
