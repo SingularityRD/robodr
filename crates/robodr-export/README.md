@@ -50,7 +50,12 @@ half-finished batch).
    name), `topic` (= the value's `ocsf.metadata.log_name`), `key` (= finding
    id) and re-validate the value with
    `robodr_ocsf::parse_and_validate`. A failing record is **moved** to
-   `<spool>/rejected/` (with `<name>.reason.json`); kept unless
+   `<spool>/rejected/` (with `<name>.reason.json`, written durably
+   **before** the move, so a crash never leaves a record without its
+   reason; a record found without one is dated when noticed, never by its
+   spool time). A file that cannot be read (I/O error such as `EACCES` /
+   `EIO`, 3 attempts) is quarantined there the same way with the error as
+   reason (`quarantined_unreadable`) instead of failing every run. Kept unless
    `--rejected-max-age-s` / `--rejected-max-count` / `--rejected-max-bytes`
    bound it (then the oldest records beyond the bounds are deleted after a
    run, each with its reason file; a rejected record never comes back to
@@ -154,6 +159,10 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED` = the batch was not written:
   new producer id, sequences from 0, re-send (`producer_id_resets`; a batch
   of another partition in doubt at that moment may then be written twice);
+  a record-level error on a batch being **re-sent** after a lost reply
+  also resets the producer id instead of freeing its sequences (the first
+  copy may be in the log; a later batch reusing them would be answered as
+  a duplicate, reported delivered and never written);
   InitProducerId `CLUSTER_AUTHORIZATION_FAILED` = fatal, naming the
   `IDEMPOTENT_WRITE` ACL (needed before Kafka 3.0; implied by topic `WRITE`
   since) and `--no-idempotence`. Limits: the broker remembers a producer id
@@ -166,19 +175,31 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   `--done-max-age-s` (default 30 days; 0 = keep) or beyond
   `--done-max-count` are deleted, but **never while the batch is still in
   `out/`** (the marker is what keeps it from being published again);
-  prune `out/` and the markers follow. `dead-letter.jsonl` rotates at
-  `--dead-letter-max-bytes` (default 64 MiB, 0 = one growing file) keeping
-  `--dead-letter-keep` rotated files (default 4), optionally also bounded
-  by `--dead-letter-max-age-s`; a rotated file over the bounds is deleted
-  only when none of its entries can still be needed for deduplication
-  (diode: its batch is in `out/` without a `done/` marker; spool: its file
-  is still in `ready/`), otherwise it is held and reported
-  (`pruned_dead_letters.held`). Deletions are single `unlink`s plus a
-  directory fsync: crash-safe at any point.
+  prune `out/` and the markers follow. `dead-letter.jsonl` is **one
+  growing file by default and is never deleted**: a dead letter may be
+  the only copy of a finding Kafka refused (monitor its size). Rotation is
+  opt-in: `--dead-letter-max-bytes N` (≥ 64 KiB; 0 = never, the default)
+  keeping `--dead-letter-keep` rotated files (default 4; needs
+  `--dead-letter-max-bytes`), optionally also bounded by
+  `--dead-letter-max-age-s`; a rotated file over the bounds is then
+  **deleted** once none of its entries can still be needed for
+  deduplication (diode: its batch is in `out/` without a `done/` marker;
+  spool: its file is still in `ready/`), otherwise it is held and reported
+  (`pruned_dead_letters.held`). Every deletion of a file holding entries
+  is logged on stderr with the count (`pruned_dead_letters.removed_entries`).
+  Deletions are single `unlink`s plus a directory fsync: crash-safe at any
+  point.
 * **Dead letters.** A record that fails validation, or that Kafka rejects
-  as a record (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`, ...), is appended to
-  `<state>/dead-letter.jsonl` (`{source, position, reason, record, at_ms}`)
-  and skipped (spool source: moved to `<spool>/rejected/`). Entries are
+  as a record (`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`,
+  `INVALID_RECORD`), is appended to `<state>/dead-letter.jsonl`
+  (`{source, position, reason, record, at_ms}`) and skipped (spool source:
+  moved to `<spool>/rejected/`). A spool file that cannot be read (I/O
+  error, 3 attempts) is dead-lettered with the error and moved there too
+  (`quarantined_unreadable`; the file is kept, move it back to `ready/` to
+  re-drive). `INVALID_TIMESTAMP` is **not** a record error: the publisher
+  stamps every record with its own clock, so it means that clock is off
+  (Kafka 4.0 refuses CreateTime more than 1 h ahead by default); the run
+  fails with "check the clock" and is retried, nothing is dead-lettered. Entries are
   deduplicated on `(source, position)`, so a chunk re-processed after a
   crash does not append its dead letters again (the index is read from the
   current and rotated files on the first dead letter of a run; 16 bytes per
@@ -214,7 +235,9 @@ with `robodr-kafka-publish`), binary `src/bin/robodr-uplink.rs`.
   `publish.rs`: `check_record`, the spool and `records.jsonl` readers): the
   value is re-validated, key / topic / headers must be what the value
   derives, unsigned contract 1.x is upgraded, signed 1.x is refused. A
-  record that fails is dead-lettered with code `local` and never sent.
+  record that fails is dead-lettered with code `local` and never sent; so
+  is a spool file that cannot be read (I/O error, 3 attempts; moved to
+  `rejected/`, `quarantined_unreadable`) instead of failing every run.
 * **Per-finding signatures.** A spool record's `robodr-finding-sig` header
   (agentd `finding_signing`, contract `robodr.findings` §2a) becomes the
   line's `sig` (shape-checked, re-serialised in the header's own compact
@@ -306,8 +329,9 @@ later record. The loop makes that visible and keeps it cheap:
   `stuck_since_ms` (kept across restarts while the same batch is pending),
   `pending_batch_id`, `pending_source`, `pending_lines`,
   `pending_failed_runs`, `backlog` {`spool_ready` | `diode_batches`,
-  `reinject_generations`}, `next_attempt_at_ms`, `dead_letter_malformed`
-  and the delivery totals.
+  `reinject_generations`}, `next_attempt_at_ms`, `dead_letter_malformed`,
+  `quarantined_unreadable` (spool files this process could not read) and
+  the delivery totals.
 * **`sd_notify` `STATUS=`** with the same summary (the units set
   `NotifyAccess=main`; `systemctl status robodr-uplink`), and a log line
   per failed run.
@@ -322,7 +346,8 @@ later record. The loop makes that visible and keeps it cheap:
   `keep` or older than `--dead-letter-max-age-s` are deleted once none of
   their entries can still be needed for deduplication (diode batch not
   done, spool file still in `ready/`, re-injected generation not done);
-  deleted dead letters can no longer be re-injected.
+  deleted dead letters can no longer be re-injected (each deletion of a
+  file holding entries is logged with the count).
 * **`done/` retention**: markers older than `--done-max-age-s` (default 30
   days, 0 = keep) or beyond `--done-max-count`, never while their batch is
   still in `out/`.
@@ -409,10 +434,13 @@ Error handling: `NOT_LEADER_OR_FOLLOWER`, `LEADER_NOT_AVAILABLE`,
 `UNKNOWN_TOPIC_OR_PARTITION`, `NETWORK_EXCEPTION`, `KAFKA_STORAGE_ERROR`,
 fenced/unknown leader epoch → refresh metadata and retry;
 `REQUEST_TIMED_OUT`, `NOT_ENOUGH_REPLICAS(_AFTER_APPEND)`,
-`CORRUPT_MESSAGE`, `UNKNOWN_SERVER_ERROR`, throttling → retry;
-`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`, `INVALID_RECORD`,
-`INVALID_TIMESTAMP` → halve the batch until it is accepted or holds one
-record, then reject that record; anything else (authorisation,
+`CORRUPT_MESSAGE` (a CRC mismatch: damaged in transit), `UNKNOWN_SERVER_ERROR`,
+throttling → retry; `INVALID_TIMESTAMP` → retry, then fail naming the
+clock (the CreateTime is this host's clock; never blamed on a record);
+`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`, `INVALID_RECORD` → halve the
+batch until it is accepted or holds one record, then reject that record (a
+batch being re-sent after a lost reply resets the producer id rather than
+freeing its sequences); anything else (authorisation,
 `UNSUPPORTED_VERSION`, invalid topic, ...) → fatal. I/O errors, timeouts,
 short or garbage frames and correlation mismatches drop the connection and
 retry. A TLS listener (it answers the plaintext ApiVersions with a TLS
@@ -438,7 +466,10 @@ client-side; the broker's channel muting paces the producer (checked with a
   `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` / `PRODUCER_FENCED`
   without loss or duplicate, an expired producer, InitProducerId refused
   (`CLUSTER_AUTHORIZATION_FAILED`, not offered, coordinator not ready),
-  halving that reuses the refused sequences, a restart with the persisted
+  halving that reuses the refused sequences, a record-level error on a
+  re-sent batch (producer id reset: the next record is really written),
+  `INVALID_TIMESTAMP` retried and reported, never a rejected record (the
+  fake broker checks CreateTime against a skewed clock), a restart with the persisted
   state and journal (in-doubt batch deduplicated; more than five batches
   per partition: acknowledged ones skipped), journals that do not fit, a
   journal that cannot be saved (nothing sent), sequence wrap-around.

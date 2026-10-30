@@ -584,6 +584,10 @@ pub struct UplinkReport {
     pub retries: u64,
     /// Records refused by the local validation (dead-lettered, not sent).
     pub dead_lettered_local: u64,
+    /// Spool files that could not be read (I/O error after
+    /// [`fsutil::READ_ATTEMPTS`] attempts): dead-lettered with the error and
+    /// moved to `<spool>/rejected/` (included in `dead_lettered_local`).
+    pub quarantined_unreadable: u64,
     /// `413`s that halved the line cap.
     pub split_413: u64,
     /// A pending batch from an earlier run was re-sent / finished.
@@ -1069,6 +1073,13 @@ impl<T: Transport> Uplink<T> {
             };
             match encoded {
                 Err(reason) => {
+                    if reason.starts_with(fsutil::UNREADABLE) {
+                        report.quarantined_unreadable += 1;
+                        (self.log)(&format!(
+                            "WARNING: {context}: spool record {} quarantined: {reason}",
+                            item.pos
+                        ));
+                    }
                     let raw = item.raw.as_deref().unwrap_or(&[]).to_vec();
                     self.dead_letter(&context, item.pos, LOCAL_CODE, &reason, None, &raw)?;
                     report.dead_lettered_local += 1;

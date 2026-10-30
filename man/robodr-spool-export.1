@@ -57,7 +57,9 @@ file makes every crash point recoverable without loss or re\-packing. Records
 leave
 .I ready/
 only by rename, never by deletion: an invalid record is moved to the rejected
-directory with a reason file. The rejected directory is kept in full unless
+directory with a reason file (written, durably, before the move). A spool file
+that cannot be read (I/O error such as EACCES or EIO, 3 attempts) is moved
+there too, with the error as its reason, instead of failing every run. The rejected directory is kept in full unless
 bounded with the
 .B \-\-rejected\-max\-*
 options.
@@ -119,7 +121,8 @@ Where invalid records go (default \fIspool\fB/rejected/\fR).
 After each run, delete the oldest rejected records (each with its
 .B .reason.json
 file) older than N seconds, beyond the N newest, or beyond N bytes in all
-(0 or absent = no such bound; default: keep everything). A rejected record is
+(0 or absent = no such bound; default: keep everything). Age is that of the
+reason file; a record found without one gets one and is dated then. A rejected record is
 never packed and never read again, so only its forensic copy is lost; a name
 that is in
 .I ready/
