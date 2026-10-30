@@ -219,6 +219,63 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Security
 
+- **Control-plane slowloris (red team 2026-10-30, W2-4).** An
+  unauthenticated peer with three or more source addresses that reopened
+  TLS handshakes trickling a byte a second kept all four
+  pre-authentication slots of agentd's control plane busy: the SOC got 1
+  to 5 of 20 requests through during the attack (S2). New shared
+  connection admission `robodr_blackbox::admission`, used by agentd's
+  control plane, `robodr-anchor-receiver` and `robodr-depot serve`:
+  - a pre-authentication pool and an authenticated pool (agentd: a
+    completed handshake with a valid SOC client certificate, chain, CRL and
+    pin; receiver: a mutual-TLS handshake; depot: an enrolled unit's
+    identity key) of `max_connections` each; pre-authentication
+    connections never occupy authenticated slots;
+  - a full pre-authentication pool, or a source's or IPv4 /24 / IPv6 /64's
+    share of it (agentd `max_connections_per_subnet`, default 3), admits
+    the newcomer and evicts the connection with the least handshake
+    progress (ClientHello not complete before complete, then the lowest
+    bytes/s since accept, bytes already queued at accept counted; the
+    oldest on a tie) instead of refusing it;
+  - a progress deadline besides the absolute one: the ClientHello within
+    `handshake_hello_timeout_ms` (default 1000, 200..=5000), then
+    `handshake_min_bytes_per_s` (default 128, 16..=4096) past it; a
+    client whose certificate flight arrives up to about 2.7 s after
+    accept is unaffected with the defaults;
+  - a new-handshake token bucket per source (IPv4 address, IPv6 /64) and
+    global (agentd `handshake_rate_per_s`, default 100); a quiet source
+    (no connection in the last second) passes an exhausted global budget;
+  - optional `priority_sources` (CIDRs, e.g. the SOC network) with
+    `priority_connections` reserved pre-authentication slots and a rate
+    budget of their own.
+  Pressure is counted (`status.json` `control_plane.admission`,
+  `handshake_timeouts`, `handshake_pressure`) and reported as the new
+  observe-only finding `robot.agent.control_plane_pressure` (Medium,
+  findings contract 2.3 catalog entry, `catalog_2_3_agent`; AutoSecOps
+  sync: map it like the other `robot.agent.control_plane_*` ids). Evicted,
+  timed-out and slow handshakes, and handshakes abandoned before a
+  complete ClientHello, no longer count as failed authentications
+  (`control_plane_unauthenticated`). Re-run through the release binaries
+  (`tools/e2e/RESULTS.md`, 2026-10-30 W2-4 subsection): S2 8 x 2 and
+  32 x 2 sources: 20 / 20 SOC requests during the attack (were 5 / 20 and
+  1 / 20); 32 x 2 sources sending complete ClientHellos as fast as they
+  can: 17 / 20 for an unlisted SOC, 20 / 20 with `priority_sources` (was
+  0 / 20); S3 on the anchor receiver: 20 / 20 unit handshakes (were
+  12 / 20). Config: the receiver's and the depot's new keys are optional
+  (subnet share and rate limit off by default there); the depot now
+  holds at most 4 pre-authentication connections per address by
+  default.
+- **Gateway feed bounds (red team 2026-10-30, W2-5).** A root or
+  gateway-user process could claim any severity for a catalogued gateway
+  or firewall rule and flood the spool with one finding per line. agentd
+  now keeps each rule id within its emitter's severity range
+  (`gateway_feed::severity_range`; out-of-range lines are reported at the
+  nearest bound, saying what they claimed) and caps each rule id at 20
+  lines at once and 60 a minute (600 a minute for the feed); the rest is
+  folded into one finding per rule and minute (worst severity, line and
+  occurrence counts, channels; flushed at a stop). New `daemon` counters
+  `gateway_folded`, `gateway_aggregates`, `gateway_severity_clamped`.
+  The feed's trust boundary is documented (module docs, OPERATIONS §6.6).
 - Wave-2 soak and red team (2026-10-30, `tools/e2e/RESULTS.md`): agentd's
   `gateway_feed` accepts only rule ids of the findings catalog
   (`robodr_ocsf::builder::rule_known`); before, a line naming

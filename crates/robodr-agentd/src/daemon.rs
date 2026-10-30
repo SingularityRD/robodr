@@ -186,9 +186,11 @@
 //! Failed authentications and authenticated invalid requests become the
 //! observe-only self-health findings
 //! `robot.agent.control_plane_unauthenticated` (High) and
-//! `robot.agent.control_plane_invalid` (Medium), rate-limited by
-//! `health_report_ms`. The control plane is not an input: a quiet SOC never
-//! makes the state `unknown`.
+//! `robot.agent.control_plane_invalid` (Medium), and handshake pressure on
+//! the TCP listener (evictions, progress cuts, timeouts, rate refusals;
+//! W2-4) the observe-only `robot.agent.control_plane_pressure` (Medium),
+//! each rate-limited by `health_report_ms`. The control plane is not an
+//! input: a quiet SOC never makes the state `unknown`.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -296,6 +298,14 @@ pub struct DaemonStats {
     pub host_threats: u64,
     /// In-path gateway findings taken from the gateway feed.
     pub gateway_findings: u64,
+    /// Gateway lines over their rule's or the feed's budget, folded into
+    /// aggregates (W2-5, [`crate::gateway_feed::GatewayLimiter`]).
+    pub gateway_folded: u64,
+    /// Aggregate findings reported for folded gateway lines.
+    pub gateway_aggregates: u64,
+    /// Gateway lines whose severity was outside their rule's range
+    /// (reported at the nearest bound).
+    pub gateway_severity_clamped: u64,
     /// Forwarder heartbeats received.
     pub host_heartbeats: u64,
     /// In-path gateway feed heartbeats received.
@@ -522,12 +532,14 @@ struct Daemon<'a> {
     /// Per input: the forwarder's cumulative `dropped` at its last
     /// heartbeat (host-threat inputs only).
     host_upstream_seen: Vec<u64>,
+    /// The gateway feed's per-rule rate and aggregation cap (W2-5).
+    gateway_limiter: crate::gateway_feed::GatewayLimiter,
     /// The control-plane API (`None` = off).
     control: Option<ControlPlane>,
     /// Control-plane counters at their last finding, and when it was raised
-    /// (unauthenticated, invalid).
-    control_reported: [u64; 2],
-    control_reported_at_ms: [Option<u64>; 2],
+    /// (unauthenticated, invalid, handshake pressure).
+    control_reported: [u64; 3],
+    control_reported_at_ms: [Option<u64>; 3],
     /// executor v1: the link to robodr-executor (`None` = off).
     executor: Option<crate::executor_link::ExecutorLink>,
     /// The packet timeline of a pcap replay (`None` for a live capture:
@@ -1166,9 +1178,10 @@ impl<'a> Daemon<'a> {
             correlation_pressure_at_ms: None,
             incidents_reported: None,
             host_upstream_seen: Vec::new(),
+            gateway_limiter: crate::gateway_feed::GatewayLimiter::new(0),
             control,
-            control_reported: [0; 2],
-            control_reported_at_ms: [None; 2],
+            control_reported: [0; 3],
+            control_reported_at_ms: [None; 3],
             executor,
             replay: r
                 .sensor
@@ -1463,7 +1476,15 @@ impl<'a> Daemon<'a> {
                 self.host_heartbeat(m.input, hb);
             }
             Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
-            Payload::Gateway(g) => self.gateway_finding(&g),
+            Payload::Gateway(g) => {
+                let now_ms = self.now_ms();
+                let admitted = self.gateway_limiter.admit(&g, now_ms);
+                self.stats.gateway_folded = self.gateway_limiter.folded;
+                self.stats.gateway_severity_clamped = self.gateway_limiter.clamped;
+                if let crate::gateway_feed::Admitted::Report { line, .. } = admitted {
+                    self.gateway_finding(&line);
+                }
+            }
             Payload::GatewayHeartbeat(hb) => {
                 // Activity on the input (it is not silent); the gateway's
                 // own drops count as upstream drops, as a forwarder's.
@@ -1826,6 +1847,16 @@ impl<'a> Daemon<'a> {
                 i.stats.upstream_dropped.fetch_add(delta, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Report the gateway feed's folded lines whose window ended (all of
+    /// them with `flush`, at shutdown): one finding per rule.
+    fn gateway_aggregates(&mut self, flush: bool) {
+        let now_ms = self.now_ms();
+        for line in self.gateway_limiter.drain(now_ms, flush) {
+            self.gateway_finding(&line);
+        }
+        self.stats.gateway_aggregates = self.gateway_limiter.aggregates;
     }
 
     /// An in-path gateway finding (`crate::gateway_feed`): agent (black
@@ -2297,6 +2328,7 @@ impl<'a> Daemon<'a> {
             self.recovery_note(&r);
         }
         self.correlation_tick();
+        self.gateway_aggregates(false);
         self.control_findings();
         self.evidence_incidents();
         self.mark_head();
@@ -2360,7 +2392,10 @@ impl<'a> Daemon<'a> {
         let counts = [
             cp.counters().unauthenticated.load(Ordering::Relaxed),
             cp.engine.stats.invalid,
+            cp.handshake_pressure(),
         ];
+        let adm = cp.admission().unwrap_or_default();
+        let timeouts = cp.counters().handshake_timeouts.load(Ordering::Relaxed);
         let last = cp.counters().last_auth_failure();
         let now_ms = self.now_ms();
         let every = self.r.config.daemon.health_report_ms;
@@ -2385,6 +2420,25 @@ impl<'a> Daemon<'a> {
                          {}",
                         count,
                         last.as_deref().unwrap_or("-")
+                    ),
+                )
+            } else if i == 2 {
+                robodr_events::Deviation::new(
+                    health_rules::CONTROL_PLANE_PRESSURE,
+                    robodr_events::Severity::Medium,
+                    format!(
+                        "the control-plane API is under handshake pressure: {delta} \
+                         pre-authentication connection(s) evicted for a newcomer, cut for lack \
+                         of progress, timed out or refused by the handshake rate limit ({count} \
+                         in total: {} evicted, {} timed out or too slow, {} rate-limited; {} \
+                         authenticated connections served): a peer may be holding connection \
+                         slots open (slowloris); a SOC outside control_plane.priority_sources \
+                         may be slow to reach the robot while it lasts; nothing was judged or \
+                         executed",
+                        adm.evicted,
+                        timeouts.max(adm.too_slow),
+                        adm.refused_rate,
+                        adm.promoted
                     ),
                 )
             } else {
@@ -2580,6 +2634,8 @@ impl<'a> Daemon<'a> {
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }
+        // Folded gateway lines are reported, not lost, at a stop.
+        self.gateway_aggregates(true);
         let mut found = Vec::new();
         if let Some(h) = self.capture_health.latest() {
             found.extend(self.pipeline.capture_findings(&h));

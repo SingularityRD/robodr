@@ -140,6 +140,12 @@ claims are:
   certificate that chains to the configured SOC CA, is valid now and, if
   pins are configured, has a pinned public key. No session resumption.
   Failed handshakes are counted and reported like failed signatures.
+  Connections that have not completed that handshake have their own,
+  bounded slots and are evicted by handshake progress, so they cannot
+  starve a SOC that completes mutual TLS (slowloris, red team W2-4);
+  the SOC network can be given reserved slots (`priority_sources`).
+  Handshake pressure is reported (`robot.agent.control_plane_pressure`,
+  Medium, observe-only).
 - **No request without a SOC key.** On every listener, every request must
   also carry an Ed25519 signature by a configured SOC public key over the
   method, the exact target, this robot's id, the key id, a timestamp, a

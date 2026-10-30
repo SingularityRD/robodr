@@ -81,8 +81,17 @@ certificate chaining to it (mutual TLS). Without \fBtls\fR, \fBserve\fR exits
 2 unless \fB"allow_plaintext": true\fR is set (lab or private link only);
 both together are refused. \fBio_timeout_ms\fR bounds a whole connection,
 TLS handshake included; \fBmax_connections_per_source\fR (default 8) caps the
-connections one address may hold. Key, certificate and CA files must be owned
-by root or the service user.
+connections one address may hold in each pool. Connections that have not
+completed the mutual\-TLS handshake have \fBmax_connections\fR slots of
+their own (a full pool evicts its least\-progress connection for a newcomer
+instead of closing the newcomer) and units past it as many again; the
+ClientHello must arrive within \fBhandshake_hello_timeout_ms\fR (default
+1000) and the handshake keep \fBhandshake_min_bytes_per_s\fR (default 128)
+after that. Optional: \fBmax_connections_per_subnet\fR (IPv4 /24, IPv6 /64;
+default off), \fBpriority_sources\fR (CIDRs) with \fBpriority_connections\fR
+(default 4) reserved slots, \fBhandshake_rate_per_s\fR (default 0, off).
+Handshake pressure is logged at most once a minute. Key, certificate and CA
+files must be owned by root or the service user.
 .SH EXIT STATUS
 .TP
 .B 0

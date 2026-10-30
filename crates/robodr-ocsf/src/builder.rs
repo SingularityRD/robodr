@@ -1071,6 +1071,29 @@ fn catalog_2_3(rule: &str) -> Option<RuleInfo> {
         .or_else(|| catalog_2_3_gateway(rule))
         .or_else(|| catalog_2_3_unitree(rule))
         .or_else(|| catalog_2_3_depot(rule))
+        .or_else(|| catalog_2_3_agent(rule))
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: agentd control-plane handshake pressure (red team
+// 2026-10-30, W2-4), data source `robodr_agent`.
+// ---------------------------------------------------------------------------
+
+/// `robot.agent.control_plane_pressure`: agentd's control-plane TCP
+/// listener evicted, cut, timed out or rate-limited pre-authentication
+/// connections. Not in 2.2 or earlier: a 2.2 validator applies the generic
+/// entry to this id, and so does a 2.3 validator to a 2.2 message
+/// ([`rule_info_for_contract`]).
+fn catalog_2_3_agent(rule: &str) -> Option<RuleInfo> {
+    Some(match rule {
+        "robot.agent.control_plane_pressure" => RuleInfo {
+            title: "Control-plane handshake pressure",
+            desc: "The robot's control-plane listener evicted, cut for lack of progress, timed out or rate-limited connections that had not authenticated yet: a peer may be holding connection slots open to keep the SOC from reaching the robot. Observe-only; nothing was judged or executed.",
+            data_source: "robodr_agent",
+            techniques: &[],
+        },
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------

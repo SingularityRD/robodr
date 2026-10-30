@@ -64,7 +64,14 @@
 //! * **Abuse.** Bounded parsing, a read deadline, a connection cap, per-key
 //!   rate limits (one for chunk downloads) and a bounded queue to the main
 //!   loop: a flood costs the control plane's availability (503 / 429),
-//!   never the detection loop's. Failed authentications (TLS handshakes
+//!   never the detection loop's. TCP admission (red team 2026-10-30, W2-4;
+//!   [`robodr_blackbox::admission`]): pre-authentication and authenticated
+//!   pools, eviction of the least-progress handshake instead of refusing a
+//!   newcomer, source and subnet shares, a ClientHello deadline and a
+//!   bytes/s floor, a handshake rate limit and optional reserved slots for
+//!   `priority_sources`, so a peer that has not authenticated cannot starve
+//!   one that completes mutual TLS; handshake pressure is reported as
+//!   `robot.agent.control_plane_pressure` (Medium). Failed authentications (TLS handshakes
 //!   included) are counted and reported as the observe-only finding
 //!   `robot.agent.control_plane_unauthenticated` (High, rate-limited),
 //!   authenticated invalid requests as `robot.agent.control_plane_invalid`
@@ -131,6 +138,21 @@ fn default_connections() -> usize {
 fn default_connections_per_source() -> usize {
     2
 }
+fn default_connections_per_subnet() -> usize {
+    3
+}
+fn default_priority_connections() -> usize {
+    2
+}
+fn default_handshake_rate() -> u32 {
+    100
+}
+fn default_hello_timeout_ms() -> u64 {
+    robodr_blackbox::admission::DEFAULT_HELLO_TIMEOUT.as_millis() as u64
+}
+fn default_min_bytes_per_s() -> u32 {
+    robodr_blackbox::admission::DEFAULT_MIN_BYTES_PER_S
+}
 fn default_requests() -> usize {
     1024
 }
@@ -185,15 +207,51 @@ pub struct ControlPlaneSection {
     #[serde(default = "default_burst")]
     pub burst: u32,
     /// Concurrent TCP connections, 1..=16, counted twice over: up to this
-    /// many still in the TLS handshake / unauthenticated request read, and
-    /// up to this many authenticated. The unix socket has its own slots
-    /// ([`UNIX_CONNECTIONS`]), so TCP peers cannot lock it out.
+    /// many pre-authentication ones (TLS handshake; on plain loopback TCP
+    /// the request until its signature verified) and up to this many
+    /// authenticated (TLS: a completed handshake with a valid SOC client
+    /// certificate), which pre-authentication connections never occupy.
+    /// A full pre-authentication pool evicts its least-progress connection
+    /// for a newcomer (W2-4, [`robodr_blackbox::admission`]). The unix
+    /// socket has its own slots ([`UNIX_CONNECTIONS`]), so TCP peers cannot
+    /// lock it out.
     #[serde(default = "default_connections")]
     pub max_connections: usize,
-    /// Concurrent TCP connections from one source address, 1..=16 (at
-    /// most `max_connections` take effect).
+    /// Concurrent TCP connections from one source address in each pool,
+    /// 1..=16 (at most `max_connections` take effect).
     #[serde(default = "default_connections_per_source")]
     pub max_connections_per_source: usize,
+    /// Pre-authentication connections from one IPv4 /24 or IPv6 /64,
+    /// 1..=16 (at most `max_connections` take effect; default 3).
+    #[serde(default = "default_connections_per_subnet")]
+    pub max_connections_per_subnet: usize,
+    /// Networks (CIDR, at most 32; e.g. the SOC's) whose connections get
+    /// `priority_connections` reserved pre-authentication slots that no
+    /// other source can occupy, and their own handshake rate budget.
+    #[serde(default)]
+    pub priority_sources: Vec<String>,
+    /// Reserved pre-authentication slots of `priority_sources`, 1..=16
+    /// (default 2; unused without `priority_sources`).
+    #[serde(default = "default_priority_connections")]
+    pub priority_connections: usize,
+    /// New pre-authentication connections per second, 1..=1000 (default
+    /// 100, burst twice that; priority sources have their own budget).
+    /// Each source (IPv4 address, IPv6 /64) has half of it (burst the
+    /// rate): over its own budget a connection is closed at accept; over
+    /// the global one only if its source is not quiet (a connection
+    /// admitted within the last second). Keep a source's half above the
+    /// SOC's evidence chunk rate (default 10/s).
+    #[serde(default = "default_handshake_rate")]
+    pub handshake_rate_per_s: u32,
+    /// The ClientHello must be complete (the robot answers) within this
+    /// many ms of accept, 200..=5000 (default 1000).
+    #[serde(default = "default_hello_timeout_ms")]
+    pub handshake_hello_timeout_ms: u64,
+    /// After `handshake_hello_timeout_ms`, the handshake must keep
+    /// receiving at least this many bytes per second elapsed past it,
+    /// 16..=4096 (default 128).
+    #[serde(default = "default_min_bytes_per_s")]
+    pub handshake_min_bytes_per_s: u32,
     /// Requests kept for GET / revert / idempotency, 16..=65536.
     #[serde(default = "default_requests")]
     pub max_requests: usize,
@@ -219,6 +277,9 @@ pub struct ControlPlaneSpec {
     pub burst: u32,
     pub max_connections: usize,
     pub max_connections_per_source: usize,
+    /// The TCP listener's admission rules (pools, shares, priority
+    /// sources, rate, progress deadline).
+    pub admission: robodr_blackbox::admission::AdmissionConfig,
     pub max_requests: usize,
     pub answer_timeout: Duration,
     pub evidence: Option<evidence::EvidenceSection>,
@@ -313,6 +374,38 @@ impl ControlPlaneSection {
             1,
             16,
         )?;
+        range(
+            "max_connections_per_subnet",
+            self.max_connections_per_subnet as u64,
+            1,
+            16,
+        )?;
+        range(
+            "priority_connections",
+            self.priority_connections as u64,
+            1,
+            16,
+        )?;
+        range(
+            "handshake_rate_per_s",
+            u64::from(self.handshake_rate_per_s),
+            1,
+            1000,
+        )?;
+        let progress = robodr_blackbox::admission::ProgressPolicy::validated(
+            self.handshake_hello_timeout_ms,
+            self.handshake_min_bytes_per_s,
+            "control_plane.",
+        )?;
+        let priority_sources = robodr_blackbox::admission::parse_priority_sources(
+            &self.priority_sources,
+            "control_plane.",
+        )?;
+        if !priority_sources.is_empty() && tcp.is_none() {
+            return Err(
+                "control_plane.priority_sources applies to listen_tcp, which is not set".into(),
+            );
+        }
         range("max_requests", self.max_requests as u64, 16, 65_536)?;
         range("answer_timeout_ms", self.answer_timeout_ms, 100, 30_000)?;
         if let Some(e) = &self.evidence {
@@ -361,6 +454,21 @@ impl ControlPlaneSection {
             burst: self.burst,
             max_connections: self.max_connections,
             max_connections_per_source: self.max_connections_per_source.min(self.max_connections),
+            admission: robodr_blackbox::admission::AdmissionConfig {
+                max_pre_auth: self.max_connections,
+                max_per_source: self.max_connections_per_source.min(self.max_connections),
+                max_per_subnet: self.max_connections_per_subnet.min(self.max_connections),
+                max_priority: if priority_sources.is_empty() {
+                    0
+                } else {
+                    self.priority_connections
+                },
+                priority_sources,
+                max_authed: self.max_connections,
+                max_authed_per_source: self.max_connections_per_source.min(self.max_connections),
+                rate_per_s: self.handshake_rate_per_s,
+                progress,
+            },
             max_requests: self.max_requests,
             answer_timeout: Duration::from_millis(self.answer_timeout_ms),
             evidence: self.evidence.clone(),
@@ -466,8 +574,14 @@ pub struct Counters {
     pub malformed: AtomicU64,
     /// Failed authentications, TLS handshakes included.
     pub unauthenticated: AtomicU64,
-    /// TLS handshakes that failed (also in `unauthenticated`).
+    /// TLS handshakes that failed (evicted ones excepted). Those that
+    /// presented something wrong are also in `unauthenticated`; those
+    /// that ran out of time are in `handshake_timeouts`.
     pub tls_failures: AtomicU64,
+    /// Pre-authentication connections that hit a deadline: the absolute
+    /// [`READ_DEADLINE`] or the progress deadline (handshake pressure,
+    /// W2-4; never counted as failed authentications).
+    pub handshake_timeouts: AtomicU64,
     pub authenticated: AtomicU64,
     pub rate_limited: AtomicU64,
     /// Answered 503 because the main loop did not take or answer in time.
@@ -537,6 +651,13 @@ pub struct ControlStatus {
     pub malformed: u64,
     pub unauthenticated: u64,
     pub tls_failures: u64,
+    pub handshake_timeouts: u64,
+    /// The TCP listener's pools and admission counters (W2-4): evictions,
+    /// progress cuts, rate refusals, promotions, occupancy.
+    pub admission: Option<robodr_blackbox::admission::AdmissionSnapshot>,
+    /// Evictions + progress cuts + rate refusals + handshake timeouts:
+    /// what `robot.agent.control_plane_pressure` reports.
+    pub handshake_pressure: u64,
     pub authenticated: u64,
     pub rate_limited: u64,
     pub busy: u64,
@@ -574,7 +695,7 @@ struct Shared {
     calls: SyncSender<CallMsg>,
     answer_signer: Mutex<Box<dyn robodr_blackbox::Signer>>,
     answer_timeout: Duration,
-    tcp_slots: TcpSlots,
+    tcp_admission: robodr_blackbox::admission::Admission,
     unix_active: AtomicUsize,
     stop: Arc<AtomicBool>,
     evidence: Option<Arc<evidence::Service>>,
@@ -592,6 +713,8 @@ pub struct ControlPlane {
     state: StateStatus,
     evidence: Option<Arc<evidence::Service>>,
     stop: Arc<AtomicBool>,
+    /// The TCP listener's admission (`None` without `listen_tcp`).
+    admission: Option<robodr_blackbox::admission::Admission>,
 }
 
 impl std::fmt::Debug for ControlPlane {
@@ -737,7 +860,7 @@ impl ControlPlane {
             calls: tx,
             answer_signer: Mutex::new(answer_signer),
             answer_timeout: spec.answer_timeout,
-            tcp_slots: TcpSlots::new(spec.max_connections, spec.max_connections_per_source),
+            tcp_admission: robodr_blackbox::admission::Admission::new(spec.admission.clone()),
             unix_active: AtomicUsize::new(0),
             stop: stop.clone(),
             evidence: evidence.clone(),
@@ -820,6 +943,7 @@ impl ControlPlane {
             counters,
             replay,
             threads,
+            admission: spec.tcp.map(|_| shared.tcp_admission.clone()),
             listening,
             tls: spec.tls.as_ref().map(|t| {
                 json!({
@@ -859,8 +983,29 @@ impl ControlPlane {
         &self.state
     }
 
+    /// Evictions, progress cuts, rate refusals and handshake timeouts so
+    /// far (cumulative): the control plane's handshake pressure (W2-4).
+    pub fn handshake_pressure(&self) -> u64 {
+        let adm = self
+            .admission
+            .as_ref()
+            .map(|a| a.stats())
+            .unwrap_or_default();
+        // A progress cut is a handshake timeout too: count it once.
+        let timeouts = self.counters.handshake_timeouts.load(Ordering::Relaxed);
+        adm.evicted
+            .saturating_add(adm.refused_rate)
+            .saturating_add(timeouts.max(adm.too_slow))
+    }
+
+    /// The admission snapshot of the TCP listener (`None` without one).
+    pub fn admission(&self) -> Option<robodr_blackbox::admission::AdmissionSnapshot> {
+        self.admission.as_ref().map(|a| a.stats())
+    }
+
     pub fn status(&self) -> ControlStatus {
         let c = &self.counters;
+        let admission = self.admission();
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let (replay_entries, replay_store_errors, replay_fence) = {
             let r = self.replay.lock().unwrap_or_else(PoisonError::into_inner);
@@ -888,6 +1033,9 @@ impl ControlPlane {
             malformed: g(&c.malformed),
             unauthenticated: g(&c.unauthenticated),
             tls_failures: g(&c.tls_failures),
+            handshake_timeouts: g(&c.handshake_timeouts),
+            admission,
+            handshake_pressure: self.handshake_pressure(),
             authenticated: g(&c.authenticated),
             rate_limited: g(&c.rate_limited),
             busy: g(&c.busy),
@@ -943,18 +1091,32 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
         match l.accept() {
             Ok((s, addr)) => {
                 conns.retain(|h| !h.is_finished());
+                // What the peer already sent (its ClientHello, usually):
+                // it ranks the connection before its thread reads it.
+                let seen = queued_bytes(&s);
                 if s.set_nonblocking(false).is_err()
                     || s.set_write_timeout(Some(READ_DEADLINE)).is_err()
                 {
                     continue;
                 }
-                let Some(slot) = sh.tcp_slots.enter(addr.ip()) else {
-                    sh.counters
-                        .connections_rejected
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
+                // W2-4: a full pre-authentication pool evicts its
+                // least-progress connection (shut down through this
+                // handle) rather than refusing the newcomer; only the
+                // handshake rate limit closes a connection at accept.
+                let ticket = match sh
+                    .tcp_admission
+                    .admit_seen(addr.ip(), s.try_clone().ok(), seen)
+                {
+                    Ok(t) => t,
+                    Err(_) => {
+                        sh.counters
+                            .connections_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
-                let slot = Slot::Tcp(slot);
+                let progress = ticket.progress();
+                let slot = Slot::Tcp(ticket);
                 match &tls {
                     None => spawn_conn(
                         &sh,
@@ -962,7 +1124,8 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
                         slot,
                         format!("tcp:{addr}"),
                         move |sh, slot, peer| {
-                            serve::<http::DeadlineTcp>(http::DeadlineTcp::new(s), peer, sh, slot)
+                            let s = http::DeadlineTcp::new(s).with_progress(progress);
+                            serve::<http::DeadlineTcp>(s, peer, sh, slot)
                         },
                     ),
                     Some(cfg) => {
@@ -976,20 +1139,24 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
                                 &cfg,
                                 s,
                                 Instant::now() + READ_DEADLINE,
+                                Some(progress.clone()),
                             ) {
-                                Ok((stream, spki)) => serve::<tls::TlsStream>(
-                                    stream,
-                                    format!("{peer};client_spki_sha256={spki}"),
-                                    sh,
-                                    slot,
-                                ),
-                                Err(why) => {
-                                    sh.counters.tls_failures.fetch_add(1, Ordering::Relaxed);
-                                    sh.counters.note_auth_failure(format!(
-                                        "tls_handshake_failed ({}) from {peer}",
-                                        robodr_ros2_pipeline::sanitize(&why)
-                                    ));
+                                Ok((stream, spki)) => {
+                                    // A completed handshake with a valid SOC
+                                    // client certificate (chain, CRL, pin):
+                                    // an authenticated slot, which no
+                                    // pre-authentication connection can take.
+                                    // Full: it keeps its pre-authentication
+                                    // slot until its signature is verified.
+                                    slot.authenticate();
+                                    serve::<tls::TlsStream>(
+                                        stream,
+                                        format!("{peer};client_spki_sha256={spki}"),
+                                        sh,
+                                        slot,
+                                    )
                                 }
+                                Err(why) => handshake_failed(sh, &progress, &why, &peer),
                             },
                         )
                     }
@@ -1004,6 +1171,46 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
     for h in conns {
         let _ = h.join();
     }
+}
+
+/// Bytes already queued on a just-accepted socket (non-blocking peek of
+/// at most 2 KiB; 0 on any error).
+fn queued_bytes(s: &std::net::TcpStream) -> usize {
+    let mut b = [0u8; 2048];
+    if s.set_nonblocking(true).is_err() {
+        return 0;
+    }
+    s.peek(&mut b).unwrap_or(0)
+}
+
+/// Count a failed TLS handshake: evicted (pressure only), out of time
+/// (pressure: [`Counters::handshake_timeouts`]), abandoned before its
+/// ClientHello was complete (a port scan, an attacker going away: a TLS
+/// failure, nothing presented) or a failed authentication (no / bad client
+/// certificate, not TLS at all).
+fn handshake_failed(
+    sh: &Shared,
+    progress: &robodr_blackbox::admission::Progress,
+    why: &str,
+    peer: &str,
+) {
+    if progress.evicted() {
+        return;
+    }
+    sh.counters.tls_failures.fetch_add(1, Ordering::Relaxed);
+    if progress.was_cut() || why == tls::TIMED_OUT {
+        sh.counters
+            .handshake_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if why == tls::PEER_CLOSED && !progress.answered() {
+        return;
+    }
+    sh.counters.note_auth_failure(format!(
+        "tls_handshake_failed ({}) from {peer}",
+        robodr_ros2_pipeline::sanitize(why)
+    ));
 }
 
 fn run_unix(sock: crate::input::EventSocket, sh: Arc<Shared>) {
@@ -1045,118 +1252,33 @@ fn run_unix(sock: crate::input::EventSocket, sh: Arc<Shared>) {
     sock.remove_if_ours();
 }
 
-/// The TCP listener's connection slots (review finding 2): `pre_auth`
-/// counts connections still in the TLS handshake or before their request
-/// authenticated, `authed` the authenticated ones (each up to `max`), and
-/// `per_source` bounds what one source address holds in all. The unix
-/// socket never uses these.
-#[derive(Debug)]
-pub struct TcpSlots {
-    max: usize,
-    max_per_source: usize,
-    inner: Arc<Mutex<SlotCounts>>,
-}
-
-#[derive(Debug, Default)]
-struct SlotCounts {
-    pre_auth: usize,
-    authed: usize,
-    per_source: BTreeMap<std::net::IpAddr, usize>,
-}
-
-/// A TCP connection's hold on [`TcpSlots`]; released on drop.
-#[derive(Debug)]
-pub struct TcpSlot {
-    inner: Arc<Mutex<SlotCounts>>,
-    max: usize,
-    ip: std::net::IpAddr,
-    authed: bool,
-}
-
-fn lock_counts(m: &Mutex<SlotCounts>) -> std::sync::MutexGuard<'_, SlotCounts> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-impl TcpSlots {
-    pub fn new(max: usize, max_per_source: usize) -> Self {
-        Self {
-            max,
-            max_per_source: max_per_source.min(max),
-            inner: Arc::new(Mutex::new(SlotCounts::default())),
-        }
-    }
-
-    /// A pre-authentication slot for a connection from `ip`, or `None`
-    /// (closed at once).
-    pub fn enter(&self, ip: std::net::IpAddr) -> Option<TcpSlot> {
-        let mut g = lock_counts(&self.inner);
-        let from_ip = g.per_source.get(&ip).copied().unwrap_or(0);
-        if g.pre_auth >= self.max || from_ip >= self.max_per_source {
-            return None;
-        }
-        g.pre_auth += 1;
-        g.per_source.insert(ip, from_ip + 1);
-        Some(TcpSlot {
-            inner: self.inner.clone(),
-            max: self.max,
-            ip,
-            authed: false,
-        })
-    }
-
-    /// (pre-authentication, authenticated) connections now.
-    pub fn counts(&self) -> (usize, usize) {
-        let g = lock_counts(&self.inner);
-        (g.pre_auth, g.authed)
-    }
-}
-
-impl TcpSlot {
-    /// Move to an authenticated slot; `false` when they are all taken.
-    pub fn authenticate(&mut self) -> bool {
-        if self.authed {
-            return true;
-        }
-        let mut g = lock_counts(&self.inner);
-        if g.authed >= self.max {
-            return false;
-        }
-        g.authed += 1;
-        g.pre_auth = g.pre_auth.saturating_sub(1);
-        self.authed = true;
-        true
-    }
-}
-
-impl Drop for TcpSlot {
-    fn drop(&mut self) {
-        let mut g = lock_counts(&self.inner);
-        if self.authed {
-            g.authed = g.authed.saturating_sub(1);
-        } else {
-            g.pre_auth = g.pre_auth.saturating_sub(1);
-        }
-        if let Some(n) = g.per_source.get_mut(&self.ip) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                g.per_source.remove(&self.ip);
-            }
-        }
-    }
-}
-
-/// What a connection thread holds: a unix slot or a TCP slot.
+/// What a connection thread holds: a unix slot or a TCP admission ticket
+/// (review finding 2, W2-4: pre-authentication and authenticated pools,
+/// [`robodr_blackbox::admission`]).
 enum Slot {
     Unix(Arc<Shared>),
-    Tcp(TcpSlot),
+    Tcp(robodr_blackbox::admission::Ticket),
 }
 
 impl Slot {
+    /// Move to an authenticated slot; `false` when they are all taken
+    /// (or the source's share of them).
     fn authenticate(&mut self) -> bool {
         match self {
             Slot::Unix(_) => true,
-            Slot::Tcp(t) => t.authenticate(),
+            Slot::Tcp(t) => t.promote(),
         }
+    }
+
+    /// A TCP connection still in the pre-authentication pool.
+    fn pre_auth(&self) -> bool {
+        matches!(self, Slot::Tcp(t) if !t.is_authenticated())
+    }
+
+    /// A TCP connection the pool evicted for a newcomer (its socket is
+    /// shut down; nothing to answer or count but the eviction).
+    fn evicted(&self) -> bool {
+        matches!(self, Slot::Tcp(t) if t.evicted())
     }
 }
 
@@ -1385,8 +1507,12 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared, slot: &mut Slot) 
     let c = &sh.counters;
     let req = match http::read_request(&mut s, Instant::now() + READ_DEADLINE) {
         Ok(r) => r,
+        Err(_) if slot.evicted() => return,
         Err(e) => {
             c.malformed.fetch_add(1, Ordering::Relaxed);
+            if e.code == "timeout" && slot.pre_auth() {
+                c.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
             send(&mut s, e.status, &api::error_body(e.code, &e.message), &[]);
             return;
         }
@@ -1872,37 +1998,42 @@ mod tests {
         assert_eq!(pct_decode("%G0"), None);
     }
 
-    /// Review finding 2: per-source and pre-/post-authentication slots.
+    /// Review finding 2, W2-4: per-source shares, pre-/post-authentication
+    /// pools, eviction instead of refusal, through the spec the section
+    /// resolves to.
     #[test]
-    fn tcp_slots_are_bounded_per_source_and_per_phase() {
-        let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
-        let slots = TcpSlots::new(3, 2);
-        let a1 = slots.enter(ip(1)).unwrap();
-        let mut a2 = slots.enter(ip(1)).unwrap();
-        assert!(slots.enter(ip(1)).is_none(), "per-source cap");
-        let b1 = slots.enter(ip(2)).unwrap();
-        assert!(slots.enter(ip(3)).is_none(), "pre-auth slots full");
+    fn tcp_admission_from_the_section() {
+        use robodr_blackbox::admission::Admission;
+        let ip = |c: u8, n: u8| std::net::IpAddr::from([10, 0, c, n]);
+        let mut adm = robodr_blackbox::admission::AdmissionConfig::simple(3, 2);
+        adm.max_per_subnet = 3;
+        let slots = Admission::new(adm);
+        let a1 = slots.admit(ip(0, 1), None).unwrap();
+        let mut a2 = slots.admit(ip(0, 1), None).unwrap();
+        // Per-source share: the third from one address evicts its own.
+        let a3 = slots.admit(ip(0, 1), None).unwrap();
+        assert!(a1.evicted() && !a3.evicted());
+        let b1 = slots.admit(ip(1, 2), None).unwrap();
         // Authenticating frees a pre-auth slot (handshakes are counted
         // apart from authenticated connections).
-        assert!(a2.authenticate());
-        assert_eq!(slots.counts(), (2, 1));
-        let mut c1 = slots.enter(ip(3)).unwrap();
-        assert!(c1.authenticate());
-        drop(a1);
-        drop(b1);
-        assert_eq!(slots.counts(), (0, 2));
-        // The source cap still counts the authenticated connection.
-        let a3 = slots.enter(ip(1)).unwrap();
-        assert!(slots.enter(ip(1)).is_none());
-        drop((a2, a3, c1));
-        assert_eq!(slots.counts(), (0, 0));
-        assert!(slots.inner.lock().unwrap().per_source.is_empty());
-        // Authenticated slots full: authenticate() says no.
-        let slots = TcpSlots::new(1, 1);
-        let mut x = slots.enter(ip(1)).unwrap();
-        assert!(x.authenticate());
-        let mut y = slots.enter(ip(2)).unwrap();
-        assert!(!y.authenticate());
+        assert!(a2.promote());
+        let st = slots.stats();
+        assert_eq!((st.pre_auth_open, st.authenticated_open), (2, 1));
+        // The pre-auth pool full: a newcomer evicts, the authenticated
+        // connection is never touched.
+        let c1 = slots.admit(ip(2, 3), None).unwrap();
+        let c2 = slots.admit(ip(3, 3), None).unwrap();
+        assert!(!a2.evicted() && a2.is_authenticated());
+        assert_eq!(slots.stats().pre_auth_open, 3);
+        drop((a1, a2, a3, b1, c1, c2));
+        let st = slots.stats();
+        assert_eq!((st.pre_auth_open, st.authenticated_open), (0, 0));
+        // Authenticated slots full: promote() says no.
+        let slots = Admission::new(robodr_blackbox::admission::AdmissionConfig::simple(1, 1));
+        let mut x = slots.admit(ip(0, 1), None).unwrap();
+        assert!(x.promote());
+        let mut y = slots.admit(ip(0, 2), None).unwrap();
+        assert!(!y.promote());
     }
 
     #[test]
@@ -2085,6 +2216,73 @@ mod tests {
             "tls": {"cert_chain": "/a", "key_file": "/b", "client_ca": "/c", "verify": false}
         }))
         .is_err());
+        // W2-4 admission keys: bounds, CIDRs, and where they apply.
+        for (k, v, why) in [
+            (
+                "max_connections_per_subnet",
+                json!(0),
+                "max_connections_per_subnet",
+            ),
+            (
+                "max_connections_per_subnet",
+                json!(17),
+                "max_connections_per_subnet",
+            ),
+            ("priority_connections", json!(0), "priority_connections"),
+            ("handshake_rate_per_s", json!(0), "handshake_rate_per_s"),
+            ("handshake_rate_per_s", json!(1001), "handshake_rate_per_s"),
+            (
+                "handshake_hello_timeout_ms",
+                json!(199),
+                "handshake_hello_timeout_ms",
+            ),
+            (
+                "handshake_hello_timeout_ms",
+                json!(5001),
+                "handshake_hello_timeout_ms",
+            ),
+            (
+                "handshake_min_bytes_per_s",
+                json!(15),
+                "handshake_min_bytes_per_s",
+            ),
+            (
+                "handshake_min_bytes_per_s",
+                json!(4097),
+                "handshake_min_bytes_per_s",
+            ),
+            ("priority_sources", json!(["10.0.0.1/24"]), "host bits"),
+            (
+                "priority_sources",
+                json!(["soc.example"]),
+                "not an IP network",
+            ),
+        ] {
+            let mut extra = json!({"listen_tcp": "127.0.0.1:1"});
+            extra[k] = v.clone();
+            let s = base(extra).unwrap();
+            let e = s.resolve("r", &[]).unwrap_err();
+            assert!(e.contains(why), "{k}={v}: {e}");
+        }
+        let s = base(json!({"unix_socket": "/run/x/c.sock", "priority_sources": ["10.0.0.0/8"]}))
+            .unwrap();
+        assert!(s
+            .resolve("r", &[])
+            .unwrap_err()
+            .contains("applies to listen_tcp"));
+        // Defaults (the soc_keys check comes after every bound).
+        let s = base(json!({"listen_tcp": "127.0.0.1:1"})).unwrap();
+        assert_eq!(
+            (
+                s.max_connections_per_subnet,
+                s.priority_connections,
+                s.handshake_rate_per_s,
+                s.handshake_hello_timeout_ms,
+                s.handshake_min_bytes_per_s
+            ),
+            (3, 2, 100, 1000, 128)
+        );
+        assert!(s.priority_sources.is_empty());
     }
 
     fn tmp(tag: &str) -> PathBuf {

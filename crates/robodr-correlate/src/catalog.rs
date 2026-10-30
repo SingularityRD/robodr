@@ -171,6 +171,8 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // robodr-agentd control-plane API (observe-only self-health)
     "robot.agent.control_plane_unauthenticated",
     "robot.agent.control_plane_invalid",
+    // (contract 2.3, W2-4: handshake pressure on the TCP listener)
+    "robot.agent.control_plane_pressure",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",

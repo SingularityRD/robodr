@@ -52,6 +52,7 @@
     "unix_socket": "/run/robodr-agentd/control.sock",
     "state_dir": "/var/lib/robodr/control-plane/agentd",
     "soc_keys": ["/etc/robodr/soc/soc.pub"],
+    "priority_sources": ["10.20.0.0/24"],
     "evidence": {}
   },
   "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }

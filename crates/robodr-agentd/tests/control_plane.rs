@@ -1393,7 +1393,7 @@ fn idle_tcp_peers_cannot_lock_out_the_unix_socket() {
     let r = unix_try(&control, &req).expect("the unix socket must still answer");
     assert_eq!(r.status, 200, "{}", r.body);
     check_answer(&req, &r);
-    // The per-source cap: some of the eight were closed at once.
+    // The per-source cap: six of the eight were cut.
     let mut closed_early = 0;
     for mut c in idle {
         c.set_read_timeout(Some(std::time::Duration::from_millis(200)))
@@ -1403,10 +1403,12 @@ fn idle_tcp_peers_cannot_lock_out_the_unix_socket() {
             closed_early += 1;
         }
     }
-    assert!(closed_early >= 6, "closed at accept: {closed_early}");
+    assert!(closed_early >= 6, "closed early: {closed_early}");
+    // W2-4: the per-source share evicts the source's own oldest
+    // pre-authentication connections instead of refusing the newcomer.
     let st = status(&s.spool).unwrap();
     assert!(
-        st["control_plane"]["connections_rejected"]
+        st["control_plane"]["admission"]["evicted"]
             .as_u64()
             .unwrap()
             >= 6,
@@ -1499,4 +1501,250 @@ fn request_journal_tail_damage_is_rebuilt_from_the_black_box() {
         3,
         "no request was judged twice"
     );
+}
+
+// --- W2-4: TLS slowloris on the control plane (red team 2026-10-30, S2) ---
+
+/// A TCP connection to `127.0.0.1:port` from the loopback address `src`.
+fn connect_from(src: std::net::Ipv4Addr, port: u16) -> std::io::Result<TcpStream> {
+    use socket2::{Domain, Socket, Type};
+    let s = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+    s.bind(&std::net::SocketAddr::from((src, 0)).into())?;
+    s.connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)).into(),
+        std::time::Duration::from_secs(2),
+    )?;
+    Ok(s.into())
+}
+
+/// The red team's S2 attacker: from `src`, a TLS ClientHello prefix one
+/// byte every `gap`, reopened at once whenever cut, until `stop`. With
+/// `fast_hello`, a complete ClientHello (rustls, no client certificate) at
+/// once and then nothing: the strongest pre-authentication squatter that
+/// costs no crypto on the attacker's side. Returns the connections opened.
+fn squatter(
+    src: std::net::Ipv4Addr,
+    port: u16,
+    gap: std::time::Duration,
+    fast_hello: bool,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || {
+        let mut prefix = vec![
+            0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03,
+        ];
+        prefix.extend([0x5a; 32]);
+        let mut opened = 0u64;
+        while !stop.load(Ordering::SeqCst) {
+            let Ok(mut tcp) = connect_from(src, port) else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            };
+            opened += 1;
+            let bytes = if fast_hello {
+                let mut conn = rustls::ClientConnection::new(
+                    tls_client(None),
+                    ServerName::try_from("127.0.0.1").unwrap(),
+                )
+                .unwrap();
+                let mut hello = Vec::new();
+                conn.write_tls(&mut hello).unwrap();
+                if tcp.write_all(&hello).is_err() {
+                    continue;
+                }
+                Vec::new()
+            } else {
+                prefix.clone()
+            };
+            let t0 = std::time::Instant::now();
+            // Trickle (or, after a full hello, keep the connection open)
+            // until cut or 30 s.
+            let mut i = 0;
+            loop {
+                if stop.load(Ordering::SeqCst) || t0.elapsed().as_secs() > 30 {
+                    break;
+                }
+                let r = if bytes.is_empty() {
+                    tcp.set_read_timeout(Some(gap)).unwrap();
+                    let mut b = [0u8; 4096];
+                    match tcp.read(&mut b) {
+                        Ok(0) => Err(()),
+                        Ok(_) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                        Err(_) => Err(()),
+                    }
+                } else {
+                    let r = tcp
+                        .write_all(&bytes[i % bytes.len()..][..1])
+                        .map_err(|_| ());
+                    i += 1;
+                    std::thread::sleep(gap);
+                    // A cut connection shows on the next write or as EOF.
+                    tcp.set_nonblocking(true).unwrap();
+                    let mut b = [0u8; 64];
+                    let eof = matches!(tcp.read(&mut b), Ok(0));
+                    tcp.set_nonblocking(false).unwrap();
+                    if eof {
+                        Err(())
+                    } else {
+                        r
+                    }
+                };
+                if r.is_err() {
+                    break;
+                }
+            }
+        }
+        opened
+    })
+}
+
+/// SOC probes every `every`: (answered 200 within the read deadline, all
+/// probes, slowest successful round trip).
+fn soc_probes(port: u16, n: usize, every: std::time::Duration) -> (usize, usize, u128) {
+    let base = format!("/api/v2/robots/{ROBOT}");
+    let mut ok = 0;
+    let mut slowest = 0;
+    for _ in 0..n {
+        std::thread::sleep(every);
+        let t0 = std::time::Instant::now();
+        let r = mtls(port, Some("soc"), &signed("GET", &base, b""));
+        let ms = t0.elapsed().as_millis();
+        if matches!(&r, Ok(r) if r.status == 200) && ms < 5000 {
+            ok += 1;
+            slowest = slowest.max(ms);
+        } else {
+            eprintln!("SOC probe failed after {ms} ms: {:?}", r.map(|r| r.status));
+        }
+    }
+    (ok, n, slowest)
+}
+
+fn slowloris_config(s: &Setup, events: &Path, port: u16, extra: Value) -> Value {
+    let mut cfg = base_config(s, events);
+    cfg["control_plane"] = json!({
+        "listen_tcp": format!("127.0.0.1:{port}"),
+        "tls": tls_section(&s.dir, &[]),
+        "state_dir": state_dir(s),
+        "soc_keys": [write_soc_pub(&s.dir)],
+        "rate_per_minute": 600,
+        "burst": 100,
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        cfg["control_plane"][k] = v.clone();
+    }
+    cfg
+}
+
+/// Red team 2026-10-30 S2 (W2-4): 8 loopback sources x 2 connections
+/// trickling TLS ClientHellos and reopening at once used to hold all four
+/// pre-authentication slots: the SOC got 1-3 of 20 requests through. With
+/// eviction by progress, the subnet share and the hello timeout, a SOC in
+/// the attackers' own /24 (127.0.0.1) and outside `priority_sources` is
+/// still served within its deadline; the attack is reported as handshake
+/// pressure, not as failed authentication.
+#[test]
+fn s2_multi_source_tls_slowloris_does_not_lock_out_the_soc() {
+    let s = setup("cp-s2", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let port = free_port();
+    let cfg = slowloris_config(&s, &events, port, json!({}));
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let base = format!("/api/v2/robots/{ROBOT}");
+    wait_for(5, "mTLS listener", || {
+        mtls(port, Some("soc"), &signed("GET", &base, b"")).ok()
+    });
+    let halt = Arc::new(AtomicBool::new(false));
+    let attackers: Vec<_> = (0..8u8)
+        .flat_map(|i| [i, i])
+        .map(|i| {
+            squatter(
+                std::net::Ipv4Addr::new(127, 0, 0, 10 + i),
+                port,
+                std::time::Duration::from_millis(200),
+                false,
+                halt.clone(),
+            )
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // A SOC that asks now and then (every 1.1 s, like the red team's 2 s).
+    let (ok, n, slowest) = soc_probes(port, 8, std::time::Duration::from_millis(1100));
+    halt.store(true, Ordering::SeqCst);
+    let opened: u64 = attackers.into_iter().map(|t| t.join().unwrap()).sum();
+    assert_eq!(
+        ok, n,
+        "SOC answered {ok}/{n} during the attack (slowest {slowest} ms)"
+    );
+    assert!(opened >= 16, "attacker connections: {opened}");
+    let st = wait_for(10, "pressure counted", || {
+        let st = status(&s.spool)?;
+        (st["control_plane"]["handshake_pressure"].as_u64()? > 0).then_some(st)
+    });
+    let cp = &st["control_plane"];
+    let adm = &cp["admission"];
+    assert!(
+        adm["evicted"].as_u64().unwrap() + adm["too_slow"].as_u64().unwrap() > 0,
+        "{cp}"
+    );
+    assert!(adm["promoted"].as_u64().unwrap() >= n as u64, "{cp}");
+    // A trickled handshake is pressure, not a failed authentication.
+    assert_eq!(cp["unauthenticated"], 0, "{cp}");
+    wait_for(10, "pressure finding", || {
+        rules(&spooled(&s.spool))
+            .iter()
+            .any(|r| r == "robot.agent.control_plane_pressure")
+            .then_some(())
+    });
+    finish(stop, h);
+}
+
+/// W2-4: `priority_sources` reserve pre-authentication slots: 32 sources
+/// that send complete ClientHellos at once (the strongest squatters: they
+/// rank as progressing until the floor cuts them) and the SOC, listed,
+/// still gets every request through; its connections are counted as
+/// priority admissions.
+#[test]
+fn priority_sources_keep_the_soc_served_under_a_fast_hello_flood() {
+    let s = setup("cp-prio", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let port = free_port();
+    let cfg = slowloris_config(
+        &s,
+        &events,
+        port,
+        json!({"priority_sources": ["127.0.0.1/32"], "priority_connections": 2}),
+    );
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let base = format!("/api/v2/robots/{ROBOT}");
+    wait_for(5, "mTLS listener", || {
+        mtls(port, Some("soc"), &signed("GET", &base, b"")).ok()
+    });
+    let halt = Arc::new(AtomicBool::new(false));
+    let attackers: Vec<_> = (0..32u8)
+        .map(|i| {
+            squatter(
+                std::net::Ipv4Addr::new(127, 0, 1, 10 + i),
+                port,
+                std::time::Duration::from_millis(200),
+                true,
+                halt.clone(),
+            )
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Even a SOC that asks back to back (never quiet).
+    let (ok, n, slowest) = soc_probes(port, 10, std::time::Duration::from_millis(100));
+    halt.store(true, Ordering::SeqCst);
+    for t in attackers {
+        t.join().unwrap();
+    }
+    assert_eq!(ok, n, "SOC answered {ok}/{n} (slowest {slowest} ms)");
+    let st = status(&s.spool).unwrap();
+    let adm = &st["control_plane"]["admission"];
+    assert!(
+        adm["admitted_priority"].as_u64().unwrap() > n as u64,
+        "{adm}"
+    );
+    finish(stop, h);
 }

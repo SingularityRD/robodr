@@ -207,6 +207,37 @@ signed with the finding key. Failed authentications (TLS handshakes
 included) raise the High, observe\-only finding
 .BR robot.agent.control_plane_unauthenticated ;
 each decision, revert and export is a black\-box note.
+.PP
+TCP admission (slowloris defence): a connection starts in a pool of
+.B max_connections
+pre\-authentication slots and moves, once its TLS handshake verified a SOC
+client certificate, to as many authenticated slots that no
+pre\-authentication connection can take. A full pre\-authentication pool,
+or the share of one source address
+.RB ( max_connections_per_source ,
+default 2) or of one IPv4 /24 or IPv6 /64
+.RB ( max_connections_per_subnet ,
+default 3), evicts its connection with the least handshake progress
+instead of refusing the newcomer. The ClientHello must arrive within
+.B handshake_hello_timeout_ms
+(default 1000, 200\(en5000) and the handshake keep
+.B handshake_min_bytes_per_s
+(default 128, 16\(en4096) after that, within the 5\~s handshake deadline.
+.B handshake_rate_per_s
+(default 100, 1\(en1000) limits new handshakes per source (half of it) and
+globally; a source with no connection in the last second passes an
+exhausted global budget.
+.B priority_sources
+(CIDRs, e.g. the SOC network) get
+.B priority_connections
+(default 2) reserved slots. Pressure raises the Medium, observe\-only
+finding
+.BR robot.agent.control_plane_pressure .
+.PP
+.B gateway_feed
+lines are kept within each rule's severity range and capped per rule id
+(20 at once, 60 a minute; 600 a minute for the feed); the rest is folded
+into one finding per rule and minute.
 .SH SIGNALS
 .B SIGTERM
 and

@@ -13,7 +13,10 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use robodr_blackbox::admission::Progress;
 
 /// Longest request head (request line + headers + the blank line).
 pub const MAX_HEAD_BYTES: usize = 8192;
@@ -48,11 +51,17 @@ pub const ANSWER_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 /// that loops over many reads (rustls' `complete_io`, used by the TLS
 /// handshake and by `StreamOwned::read`) therefore cannot be held past the
 /// deadline by a peer that drips one byte per timeout.
+///
+/// With a progress tracker ([`DeadlineTcp::with_progress`], W2-4) the
+/// earlier of the read deadline and the tracker's progress deadline
+/// applies (the ClientHello within the hello timeout, then the bytes/s
+/// floor), and every byte read and the first write are reported to it.
 #[derive(Debug)]
 pub struct DeadlineTcp {
     pub tcp: TcpStream,
     read_deadline: std::cell::Cell<Option<Instant>>,
     write_deadline: std::cell::Cell<Option<Instant>>,
+    progress: Option<Arc<Progress>>,
 }
 
 impl DeadlineTcp {
@@ -61,7 +70,14 @@ impl DeadlineTcp {
             tcp,
             read_deadline: std::cell::Cell::new(None),
             write_deadline: std::cell::Cell::new(None),
+            progress: None,
         }
+    }
+
+    /// Enforce and feed `p` (a pre-authentication connection).
+    pub fn with_progress(mut self, p: Arc<Progress>) -> Self {
+        self.progress = Some(p);
+        self
     }
 
     /// Every read after this fails once `at` has passed.
@@ -72,8 +88,17 @@ impl DeadlineTcp {
 
 impl Read for DeadlineTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(at) = self.read_deadline.get() {
-            let left = at.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let progress = match &self.progress {
+            Some(p) => p.check(now)?,
+            None => None,
+        };
+        let until = match (self.read_deadline.get(), progress) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(at) = until {
+            let left = at.saturating_duration_since(now);
             if left.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -82,7 +107,26 @@ impl Read for DeadlineTcp {
             }
             self.tcp.set_read_timeout(Some(left))?;
         }
-        self.tcp.read(buf)
+        match self.tcp.read(buf) {
+            Ok(n) => {
+                if let Some(p) = &self.progress {
+                    p.on_read(n);
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                // A timeout caused by the progress deadline says so.
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) {
+                    if let Some(p) = &self.progress {
+                        p.check(Instant::now())?;
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -98,7 +142,13 @@ impl Write for DeadlineTcp {
             }
             self.tcp.set_write_timeout(Some(left))?;
         }
-        self.tcp.write(buf)
+        let n = self.tcp.write(buf)?;
+        if n > 0 {
+            if let Some(p) = &self.progress {
+                p.on_write();
+            }
+        }
+        Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.tcp.flush()

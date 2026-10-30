@@ -1776,6 +1776,19 @@ that failed before it:
   bounds each read by `depot.deadline_s`, not the whole exchange (the
   depot is authenticated). A pack being streamed holds a connection slot
   for as long as an authenticated unit keeps reading.
+* Red team 2026-10-30 (W2-4, applied to the depot): trickling handshakes
+  from a few addresses could still hold every one of the
+  `max_connections` slots for the 30 s request deadline. The depot now
+  admits connections with `robodr_blackbox::admission`: `max_connections`
+  slots before the handshake identified an enrolled unit (a full pool
+  evicts its least-progress connection for a newcomer; at most
+  `max_connections_per_source`, default 4, per address; the ClientHello
+  within `handshake_hello_timeout_ms`, default 1000, then a
+  `handshake_min_bytes_per_s` floor, default 128) and as many after it,
+  which only enrolled units take; optional `max_connections_per_subnet`,
+  `priority_sources` / `priority_connections`, `handshake_rate_per_s`
+  (`adversarial_14a.rs`: 24 reconnecting tricklers, a unit still fetches
+  its pack).
 
 Fuzzing: `pkg_entry` (entry reports, pack listings, request and response
 heads) and `seal_attest` (TPM public areas, attestations, enrolment

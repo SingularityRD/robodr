@@ -457,7 +457,34 @@ fn mtls_client_confusion_wrong_quorum_ring_skipping_and_report_replay() {
             "{closed_after:?}"
         );
     }
-    // ugv-08's identity: its own pack only.
+    // W2-4 (red team 2026-10-30): trickling handshakes that fill every
+    // slot (and reopen at once when cut) used to keep units from fetching
+    // their packs for as long as they lasted. A unit's handshake now evicts
+    // the least-progress one and, once identified, holds a slot of its
+    // own; each trickler is cut at the hello timeout.
+    let halt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tricklers: Vec<_> = (0..24)
+        .map(|_| {
+            let (halt, port) = (halt.clone(), s.port);
+            std::thread::spawn(move || {
+                while !halt.load(std::sync::atomic::Ordering::SeqCst) {
+                    let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+                        continue;
+                    };
+                    for b in [0x16u8, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00] {
+                        if halt.load(std::sync::atomic::Ordering::SeqCst)
+                            || c.write_all(&[b]).is_err()
+                        {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // ugv-08's identity: its own pack only (fetched under the flood).
     let (st8, body8) = tls(
         s.port,
         &ca,
@@ -468,6 +495,10 @@ fn mtls_client_confusion_wrong_quorum_ring_skipping_and_report_replay() {
     .unwrap();
     assert_eq!(st8, 200);
     assert!(String::from_utf8_lossy(&body8).contains("deployment.json"));
+    halt.store(true, std::sync::atomic::Ordering::SeqCst);
+    for t in tricklers {
+        t.join().unwrap();
+    }
     // ugv-07 has no active deployment yet: 404, never another unit's.
     let (st7, _) = tls(
         s.port,

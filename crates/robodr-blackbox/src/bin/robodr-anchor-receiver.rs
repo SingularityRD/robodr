@@ -31,6 +31,7 @@
 //!  "units": [{"unit": "ugv-07",
 //!             "public_key": "/etc/robodr-anchor-receiver/units/ugv-07-blackbox.key.pub"}],
 //!  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
+//!  "priority_sources": ["10.20.0.0/16"],
 //!  "tls": {"cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
 //!          "key_file": "/etc/robodr-anchor-receiver/tls/receiver.key",
 //!          "client_ca": "/etc/robodr-anchor-receiver/tls/units-ca.pem"}}
@@ -44,6 +45,22 @@
 //! `robodr_blackbox::remote_anchor`, "Transport"). `tls` and
 //! `allow_plaintext` together are refused (ambiguous). Key file: no access
 //! for others, no group write (0600 / 0640).
+//!
+//! Connection admission (red team 2026-10-30, W2-4;
+//! `robodr_blackbox::admission`): `max_connections` slots before
+//! authentication, in which a newcomer evicts the connection with the least
+//! handshake progress rather than being refused, and as many after a
+//! mutual-TLS handshake, which pre-authentication connections never take;
+//! `max_connections_per_source` (default 8) and `max_connections_per_subnet`
+//! (IPv4 /24, IPv6 /64; default `max_connections`, i.e. off: a fleet often
+//! shares a subnet) bound one host's and one subnet's share. The ClientHello
+//! must arrive within `handshake_hello_timeout_ms` (default 1000,
+//! 200..=5000) and the handshake keep `handshake_min_bytes_per_s` (default
+//! 128, 16..=4096) after that, within `io_timeout_ms` overall.
+//! `priority_sources` (CIDRs) get `priority_connections` (default 4)
+//! reserved slots; `handshake_rate_per_s` (default 0, off) limits new
+//! handshakes. Pressure (evictions, cuts, rate refusals) is logged at most
+//! once a minute.
 //!
 //! `key_file` is the receiver's own Ed25519 secret key file
 //! (`robodr-blackbox keygen`; 0600, refused otherwise); the units are
@@ -92,6 +109,25 @@ struct Config {
     io_timeout_ms: Option<u64>,
     #[serde(default)]
     max_connections_per_source: Option<usize>,
+    /// W2-4 (see `robodr_blackbox::admission`): pre-authentication
+    /// connections per IPv4 /24 or IPv6 /64 (default `max_connections`).
+    #[serde(default)]
+    max_connections_per_subnet: Option<usize>,
+    /// Networks with reserved pre-authentication slots (CIDRs).
+    #[serde(default)]
+    priority_sources: Vec<String>,
+    /// Reserved slots of `priority_sources` (default 4).
+    #[serde(default)]
+    priority_connections: Option<usize>,
+    /// New pre-authentication connections per second (default 0: off).
+    #[serde(default)]
+    handshake_rate_per_s: Option<u32>,
+    /// ClientHello deadline, ms (default 1000).
+    #[serde(default)]
+    handshake_hello_timeout_ms: Option<u64>,
+    /// Progress floor after it, bytes per second (default 128).
+    #[serde(default)]
+    handshake_min_bytes_per_s: Option<u32>,
     #[serde(default)]
     tls: Option<TlsConfig>,
     #[serde(default)]
@@ -234,6 +270,21 @@ fn load_config(path: &Path) -> Result<Config, String> {
     {
         return Err("io_timeout_ms must be 100..=60000".into());
     }
+    if c.max_connections_per_subnet
+        .is_some_and(|n| !(1..=4096).contains(&n))
+    {
+        return Err("max_connections_per_subnet must be 1..=4096".into());
+    }
+    if c.priority_connections
+        .is_some_and(|n| !(1..=4096).contains(&n))
+    {
+        return Err("priority_connections must be 1..=4096".into());
+    }
+    if c.handshake_rate_per_s.is_some_and(|n| n > 100_000) {
+        return Err("handshake_rate_per_s must be 0..=100000".into());
+    }
+    robodr_blackbox::admission::parse_priority_sources(&c.priority_sources, "")?;
+    progress_policy(&c)?;
     if let Some(t) = &c.tls {
         abs("tls.cert_chain", &t.cert_chain)?;
         abs("tls.key_file", &t.key_file)?;
@@ -292,6 +343,16 @@ fn open_receiver(c: &Config) -> Result<AnchorReceiver, String> {
     AnchorReceiver::open(&c.state_dir, units, Box::new(signer), None)
 }
 
+fn progress_policy(c: &Config) -> Result<robodr_blackbox::admission::ProgressPolicy, String> {
+    let d = robodr_blackbox::admission::ProgressPolicy::default();
+    robodr_blackbox::admission::ProgressPolicy::validated(
+        c.handshake_hello_timeout_ms
+            .unwrap_or(d.hello_timeout.as_millis() as u64),
+        c.handshake_min_bytes_per_s.unwrap_or(d.min_bytes_per_s),
+        "",
+    )
+}
+
 fn serve(raw: &[String]) -> Result<(), Fail> {
     let (cfg_path, rest) = split_args(raw)?;
     if !rest.is_empty() {
@@ -342,6 +403,17 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
         max_connections_per_source: c
             .max_connections_per_source
             .unwrap_or(remote_anchor::DEFAULT_MAX_CONNECTIONS_PER_SOURCE),
+        max_connections_per_subnet: c
+            .max_connections_per_subnet
+            .or(c.max_connections)
+            .unwrap_or(remote_anchor::DEFAULT_MAX_CONNECTIONS),
+        priority_sources: robodr_blackbox::admission::parse_priority_sources(
+            &c.priority_sources,
+            "",
+        )?,
+        priority_connections: c.priority_connections.unwrap_or(4),
+        handshake_rate_per_s: c.handshake_rate_per_s.unwrap_or(0),
+        progress: progress_policy(&c)?,
     };
     {
         let mut out = std::io::stdout().lock();

@@ -10,9 +10,19 @@ Each attacker connection comes from its own loopback source address
 (127.0.0.10 + i), sends the first bytes of a TLS ClientHello one byte per
 second and reopens when cut. Meanwhile the legitimate client is measured
 every 2 s: for `cp` a SOC-signed GET over mutual TLS; for `anchor`
-agentd's anchor counters (status.json) and the receiver's held seq.
+agentd's anchor counters (status.json), the receiver's held seq and a
+mutual-TLS handshake with the unit's client certificate
+(RUN/tls/anchor/client.pem, as agentd's head anchor uses; added
+2026-10-30 for W2-4: the counters alone do not show whether a unit gets a
+slot).
+
+Environment: RT_SRC_BASE (first attacker source, default 127.0.0.10);
+RT_FAST_HELLO=1: each attacker connection sends a complete ClientHello at
+once (Python ssl, no client certificate) and then nothing, instead of
+trickling (the strongest pre-authentication squatter: it ranks as
+progressing until the server's progress floor or deadline cuts it).
 """
-import asyncio, json, os, socket, subprocess, sys, threading, time
+import asyncio, json, os, socket, ssl, subprocess, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,6 +33,36 @@ HELLO = bytes.fromhex("160301020001" "0001fc0303") + os.urandom(32)
 stop = threading.Event()
 stats = {"opened": 0, "refused": 0, "cut": 0, "bytes": 0}
 lock = threading.Lock()
+
+
+FAST = os.environ.get("RT_FAST_HELLO") == "1"
+
+
+def client_hello():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    out = ssl.MemoryBIO()
+    obj = ctx.wrap_bio(ssl.MemoryBIO(), out)
+    try:
+        obj.do_handshake()
+    except ssl.SSLWantReadError:
+        pass
+    return out.read()
+
+
+def hold(s):
+    """Send a full ClientHello, then read until the server cuts us."""
+    s.sendall(client_hello())
+    with lock:
+        stats["bytes"] += 1
+    s.settimeout(1.0)
+    while not stop.is_set():
+        try:
+            if not s.recv(4096):
+                raise OSError("closed")
+        except socket.timeout:
+            continue
 
 
 def attacker(src):
@@ -37,7 +77,9 @@ def attacker(src):
         with lock:
             stats["opened"] += 1
         try:
-            for b in HELLO:
+            if FAST:
+                hold(s)
+            for b in ([] if FAST else HELLO):
                 if stop.is_set():
                     break
                 s.send(bytes([b]))
@@ -50,8 +92,26 @@ def attacker(src):
         s.close()
 
 
-threads = [threading.Thread(target=attacker, args=(f"127.0.0.{10 + i}",), daemon=True)
+base = os.environ.get("RT_SRC_BASE", "127.0.0.10").rsplit(".", 1)
+src = lambda i: f"{base[0]}.{int(base[1]) + i}"  # noqa: E731 (stays below .255)
+threads = [threading.Thread(target=attacker, args=(src(i),), daemon=True)
            for i in range(nsrc) for _ in range(per)]
+
+
+def unit_handshake():
+    """A mutual-TLS handshake with the unit's certificate (the slot a head
+    anchor exchange needs); ok within 5 s."""
+    t = time.monotonic()
+    ctx = ssl.create_default_context(cafile=f"{run}/tls/anchor/ca.pem")
+    ctx.load_cert_chain(f"{run}/tls/anchor/client.pem", f"{run}/tls/anchor/client.key")
+    ctx.check_hostname = False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            with ctx.wrap_socket(s) as t2:
+                t2.do_handshake()
+        return {"tls_ok": True, "ms": round((time.monotonic() - t) * 1000)}
+    except (OSError, ssl.SSLError) as e:
+        return {"tls_ok": False, "error": type(e).__name__, "ms": round((time.monotonic() - t) * 1000)}
 
 
 def anchor_view():
@@ -86,7 +146,9 @@ async def main():
                 return {"ok": st == 200, "status": st, "ms": round((time.monotonic() - t) * 1000)}
             except Exception as e:  # noqa: BLE001
                 return {"ok": False, "error": type(e).__name__, "ms": round((time.monotonic() - t) * 1000)}
-        return anchor_view()
+        a = anchor_view()
+        a.update(unit_handshake())
+        return a
 
     base = [await probe() for _ in range(3)]
     for t in threads:
@@ -107,8 +169,13 @@ async def main():
                          "errors": sorted({s.get("error") or str(s.get("status")) for s in samples if not s.get("ok")})}
     else:
         out["during_first_last"] = [samples[0], samples[-1]] if samples else []
+        ok = [s for s in samples if s.get("tls_ok")]
+        out["during"] = {"probes": len(samples), "unit_tls_ok": len(ok),
+                         "errors": sorted({s.get("error") for s in samples if not s.get("tls_ok")})}
     print(json.dumps(out))
-    json.dump(out, open(f"{run}/redteam2_tls_{target}_{nsrc}x{per}.json", "w"), indent=1)
+    out["fast_hello"] = FAST
+    tag = "_fast" if FAST else ""
+    json.dump(out, open(f"{run}/redteam2_tls_{target}_{nsrc}x{per}{tag}.json", "w"), indent=1)
 
 
 asyncio.run(main())

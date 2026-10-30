@@ -15,7 +15,8 @@
 //!   the sealing ids (`robot.seal.*`, data source `robodr_delivery`,
 //!   `docs/SECURE-DELIVERY.md` §7, §9, Sprint 13c), the site depot ids
 //!   (`robot.depot.*`) and `robot.seal.erase_deferred` (Sprints 14a / 14b,
-//!   data source `robodr_delivery`).
+//!   data source `robodr_delivery`) and agentd's
+//!   `robot.agent.control_plane_pressure` (W2-4, data source `robodr_agent`).
 
 mod common;
 
@@ -421,6 +422,42 @@ fn unitree_entries_added_after_2_2_are_not_in_2_2_or_earlier() {
 #[test]
 fn a_2_2_unitree_message_validates_with_its_own_catalog() {
     for id in IDS_2_3_UNITREE {
+        let v23 = build(id);
+        robodr_ocsf::parse_and_validate(&v23).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let v22 = seal_as_2_2(&v23, id);
+        assert_ne!(v22, v23);
+        robodr_ocsf::parse_and_validate(&v22).unwrap_or_else(|e| panic!("{id} 2.2: {e:?}"));
+        let up = v22.replace(
+            "\"contract_version\":\"2.2.0\"",
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+        );
+        assert!(robodr_ocsf::parse_and_validate(&up).is_err(), "{id}");
+    }
+}
+
+/// agentd's control-plane handshake pressure id (2.3, `catalog_2_3_agent`,
+/// red team 2026-10-30 W2-4).
+const IDS_2_3_AGENT: &[&str] = &["robot.agent.control_plane_pressure"];
+
+#[test]
+fn agent_entries_added_after_2_2_are_not_in_2_2_or_earlier() {
+    let g = generic();
+    for id in IDS_2_3_AGENT {
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert_eq!(full.data_source, "robodr_agent", "{id}");
+        for v in ["1.0.0", "1.3.0", "2.0.0", "2.1.0", "2.2.0", "2.2.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.3.0", "2.3.4", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        assert!(
+            !IDS_2_3_SEAL.contains(id)
+                && !IDS_2_3_GATEWAY.contains(id)
+                && !IDS_2_3_DEPOT.contains(id)
+                && !IDS_2_3_UNITREE.contains(id)
+        );
         let v23 = build(id);
         robodr_ocsf::parse_and_validate(&v23).unwrap_or_else(|e| panic!("{id}: {e:?}"));
         let v22 = seal_as_2_2(&v23, id);
