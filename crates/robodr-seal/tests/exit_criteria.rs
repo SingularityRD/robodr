@@ -322,7 +322,7 @@ fn an_epoch_increment_kills_every_sealed_key() {
     let w = tpm.work().unwrap();
     let eph = wrap::p256_public_bytes(&wrap::p256_random().unwrap().public_key());
     let err = tpm
-        .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph)
+        .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph, None)
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Erased, "{err}");
     // Epoch rollback by the strongest attacker, one who holds the owner
@@ -344,7 +344,7 @@ fn an_epoch_increment_kills_every_sealed_key() {
         t.epoch
     );
     let err = tpm
-        .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph)
+        .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph, None)
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Erased, "{err}");
     // And the unit stays erased.

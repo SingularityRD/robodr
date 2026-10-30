@@ -110,6 +110,9 @@ impl Default for RolloutParams {
     }
 }
 
+/// DER certificates.
+type DerCerts = Vec<Vec<u8>>;
+
 /// The site depot.
 pub struct Depot {
     pub cfg: Config,
@@ -539,7 +542,8 @@ impl Depot {
         Ok(nonce)
     }
 
-    fn ek_cas(&self) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), DepotError> {
+    /// (EK CA certificates, intermediates), DER.
+    fn ek_cas(&self) -> Result<(DerCerts, DerCerts), DepotError> {
         let read_dir = |d: &Path| -> Result<Vec<Vec<u8>>, DepotError> {
             let mut out = Vec::new();
             let rd = std::fs::read_dir(d).map_err(|e| err(format!("{}: {e}", d.display())))?;

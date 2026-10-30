@@ -154,7 +154,7 @@ fn staged_rollout_halt_at_canary_and_captured_unit() {
     // Release 2: v2, healthy on the lab unit, failing on the canary (its
     // health check's file is gone by the time the canary installs it).
     let v2 = site.files_rpk("nav-stack", 2);
-    let b2 = site.bundle(2, Some(bundle_hash(&b1)), &[v2.clone()]);
+    let b2 = site.bundle(2, Some(bundle_hash(&b1)), std::slice::from_ref(&v2));
     let r2 = site.entry_report(&b2);
     served.with(|d| d.import(&b2, &r2, now())).unwrap();
     let seq = served

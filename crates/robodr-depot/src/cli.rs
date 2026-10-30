@@ -174,7 +174,7 @@ fn signers(a: &Args) -> Result<Vec<Box<dyn robodr_blackbox::Signer>>, Cmd> {
     a.all("key").into_iter().map(signer).collect()
 }
 
-fn sub2<'a>(rest: &'a [String]) -> Result<(&'a str, Vec<String>), Cmd> {
+fn sub2(rest: &[String]) -> Result<(&str, Vec<String>), Cmd> {
     let (s, r) = rest
         .split_first()
         .ok_or_else(|| Cmd::Usage("missing subcommand".into()))?;

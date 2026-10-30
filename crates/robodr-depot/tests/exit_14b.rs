@@ -34,8 +34,8 @@ fn through_diode(spool: &Path, unit: &str, root: &Path) -> Vec<String> {
     std::fs::create_dir_all(root.join("outbox")).unwrap();
     let pc = PackConfig::new(unit);
     let packer = Packer::open(
-        &root.join("outbox"),
-        &root.join("pack-state.json"),
+        root.join("outbox"),
+        root.join("pack-state.json"),
         pc.clone(),
         key(),
     )

@@ -482,7 +482,10 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "dpkg-deb --fsys-tarfile {} | tar -xOf - ./usr/lib/sysusers.d/robodr.conf",
         deb.display()
     ))));
-    assert!(sysu.lines().any(|l| l.starts_with("u      robodr-depot ")), "{sysu}");
+    assert!(
+        sysu.lines().any(|l| l.starts_with("u      robodr-depot ")),
+        "{sysu}"
+    );
     // The offline bundle around it verifies.
     let o = Command::new("bash")
         .arg(repo().join("packaging/make-bundle.sh"))

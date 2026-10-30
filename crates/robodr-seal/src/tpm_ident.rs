@@ -24,6 +24,9 @@ use crate::{invalid, io_err, ErrorKind, SealError};
 use std::fs;
 use zeroize::Zeroizing;
 
+/// PCR index and SHA-256 value pairs, in index order.
+pub type PcrValues = Vec<(u8, [u8; 32])>;
+
 /// NV index of the RSA 2048 EK certificate (TCG EK Credential Profile).
 pub const EK_CERT_NV_RSA: u32 = 0x01c0_0002;
 /// `tpm2_create -a` of the UIK.
@@ -303,7 +306,7 @@ impl Tpm {
         ak: (&[u8], &[u8]),
         pcrs: &[u8],
         nonce: &[u8],
-    ) -> Result<(Signed, Vec<(u8, [u8; 32])>), SealError> {
+    ) -> Result<(Signed, PcrValues), SealError> {
         if pcrs.is_empty() || nonce.is_empty() || nonce.len() > 64 {
             return Err(invalid("quote: PCRs and a 1..=64 byte nonce"));
         }

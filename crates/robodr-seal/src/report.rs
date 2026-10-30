@@ -22,6 +22,9 @@ use robodr_pkg::common::{is_hex64, is_label, is_pkg_name, parse_canonical, to_ca
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Signs a SHA-256 digest with the unit identity key (DER ECDSA).
+pub type DigestSigner<'a> = dyn Fn(&[u8; 32]) -> Result<Vec<u8>, SealError> + 'a;
+
 pub const REPORT_FORMAT: &str = "robodr-unit-report/1";
 pub const REPORT_SIG_DOMAIN: &[u8] = b"robodr-unit-report/v1\0";
 pub const MAX_REPORT_BYTES: usize = 256 * 1024;
@@ -142,10 +145,7 @@ impl UnitReport {
     }
 
     /// Sign with `sign` (the unit identity key over a SHA-256 digest).
-    pub fn sign(
-        &self,
-        sign: &dyn Fn(&[u8; 32]) -> Result<Vec<u8>, SealError>,
-    ) -> Result<Vec<u8>, SealError> {
+    pub fn sign(&self, sign: &DigestSigner<'_>) -> Result<Vec<u8>, SealError> {
         self.validate()?;
         let body = to_canonical(self).map_err(|e| invalid(e.to_string()))?;
         let sig = sign(&digest(&body))?;

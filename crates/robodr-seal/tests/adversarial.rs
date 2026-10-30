@@ -289,7 +289,7 @@ fn the_tpm_refuses_a_foreign_authority() {
     let w = tpm.work().unwrap();
     let eph = wrap::p256_public_bytes(&wrap::p256_random().unwrap().public_key());
     let e = tpm
-        .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph)
+        .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph, None)
         .unwrap_err();
     assert_eq!(e.kind, ErrorKind::PolicyRefused, "{e}");
     // With the rogue key presented as the authority, its TPM name differs
@@ -297,7 +297,17 @@ fn the_tpm_refuses_a_foreign_authority() {
     let rname = tpm.external_key_name(&w, &rogue.public()).unwrap();
     assert_ne!(rname, name);
     let e = tpm
-        .ecdh(&w, &pu, &pr, &pol, &rogue.public(), &name, t.epoch, &eph)
+        .ecdh(
+            &w,
+            &pu,
+            &pr,
+            &pol,
+            &rogue.public(),
+            &name,
+            t.epoch,
+            &eph,
+            None,
+        )
         .unwrap_err();
     assert_eq!(e.kind, ErrorKind::PolicyRefused, "{e}");
     // And a valid policy for another platform is refused at install.
