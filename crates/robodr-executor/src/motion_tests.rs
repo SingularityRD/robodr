@@ -1362,3 +1362,118 @@ fn review_rollback_version_is_never_an_option() {
          --verify --config program --to-version=1.2.0\n"
     );
 }
+
+// ------------------------------------- review of the sealed journal (11)
+
+/// Motion ports whose undo fails.
+#[derive(Clone, Default)]
+struct FailUndo(Arc<Mutex<Vec<String>>>);
+
+impl crate::motion::MotionPorts for FailUndo {
+    fn apply(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        s: &crate::motion::MotionSpec,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().push(format!("apply {}", s.id));
+        Ok("ok".into())
+    }
+    fn revert(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        s: &crate::motion::MotionSpec,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().push(format!("revert {}", s.id));
+        Err("controller manager unreachable".into())
+    }
+    fn verify(
+        &mut self,
+        _m: &crate::motion::MotionSection,
+        _s: &crate::motion::MotionSpec,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn paused(
+    d: &std::path::Path,
+    id: &str,
+    ports: Box<dyn crate::motion::MotionPorts + Send>,
+) -> Engine {
+    let mut e = engine(
+        d,
+        r2c_motion(9),
+        policy(PlatformFamily::Arm, Morphology::Arm),
+        now(),
+    )
+    .with_motion_ports(ports);
+    let o = signed(
+        id,
+        ActionId::SafePause,
+        Morphology::Arm,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    e
+}
+
+/// Review finding 11: `revert-all` and `stop-cleanup` undo motion actions
+/// through their adapters (a paused controller, a gateway restriction is
+/// not lifted by deleting the nft table); an undo that fails leaves the
+/// action `reverting`, never reported reverted.
+#[test]
+fn review_11_revert_all_and_abandon_undo_motion_actions() {
+    // revert-all, undo succeeds.
+    let d = tmpdir("rv11-ra");
+    let rec = Rec::default();
+    let mut e = paused(&d, "p-ra", Box::new(rec.clone()));
+    assert_eq!(e.revert_all("operator", now()).unwrap(), 1);
+    assert!(rec.0.lock().unwrap().contains(&"revert p-ra".to_string()));
+    assert_eq!(e.status("p-ra").status, Status::Reverted);
+    // revert-all, undo fails: still reverting.
+    let d = tmpdir("rv11-ra-fail");
+    let fail = FailUndo::default();
+    let mut e = paused(&d, "p-raf", Box::new(fail.clone()));
+    assert!(e.revert_all("operator", now()).is_err());
+    assert!(fail.0.lock().unwrap().contains(&"revert p-raf".to_string()));
+    assert_eq!(e.status("p-raf").status, Status::Reverting);
+    // stop-cleanup (abandon), undo succeeds.
+    let d = tmpdir("rv11-ab");
+    drop(paused(&d, "p-ab", Box::new(Rec::default())));
+    let c = config(&d, r2c_motion(9));
+    let mut nft = FakeNft::default();
+    let mut rec = Rec::default();
+    let n =
+        crate::engine::abandon(Some(&c), &mut nft, "stopped", wall_ms(), None, &mut rec).unwrap();
+    assert_eq!(n, 1);
+    assert!(rec.0.lock().unwrap().contains(&"revert p-ab".to_string()));
+    match crate::journal::Journal::new(&d).load() {
+        crate::journal::Loaded::State(s) => {
+            assert!(s.entries.is_empty());
+            assert_eq!(
+                s.finished("p-ab").map(|f| f.result),
+                Some(crate::journal::Final::Reverted)
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // stop-cleanup, undo fails: kept `reverting` for the next start.
+    let d = tmpdir("rv11-ab-fail");
+    drop(paused(&d, "p-abf", Box::new(Rec::default())));
+    let c = config(&d, r2c_motion(9));
+    let mut fail = FailUndo::default();
+    let n =
+        crate::engine::abandon(Some(&c), &mut nft, "stopped", wall_ms(), None, &mut fail).unwrap();
+    assert_eq!(n, 0);
+    match crate::journal::Journal::new(&d).load() {
+        crate::journal::Loaded::State(s) => {
+            assert_eq!(s.entries.len(), 1);
+            assert_eq!(s.entries[0].phase, crate::journal::Phase::Reverting);
+        }
+        other => panic!("{other:?}"),
+    }
+}

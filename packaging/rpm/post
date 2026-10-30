@@ -16,6 +16,12 @@ set -e
 
 systemd-sysusers /usr/lib/sysusers.d/robodr.conf
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
+# First install: the executor's first-start marker (see packaging/deb/postinst).
+exec_state=/var/lib/robodr/executor
+if [ "${1:-1}" -lt 2 ] && [ -d "$exec_state" ] && [ ! -L "$exec_state" ] \
+    && [ ! -e "$exec_state/journal.json" ] && [ ! -e "$exec_state/sealed" ]; then
+    install -m 0600 -o robodr-exec -g robodr /dev/null "$exec_state/first-start"
+fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || :
     if [ "${1:-1}" -ge 2 ]; then

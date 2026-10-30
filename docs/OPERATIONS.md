@@ -1268,9 +1268,30 @@ sudo systemctl restart robodr-agentd
   black box: it adopts them once, rewrites them sealed, reconciles with the
   black box, fences the replay store and records a
   `robodr.control_plane_state_upgraded` note. No operator step. Once a head
-  note exists, a v1 file in `state_dir` is a downgrade: refused as damage
+  note exists, or once `state_dir/sealed.marker` exists (written at every
+  sealed start), a v1 file in `state_dir` is a downgrade: refused as damage
   (Critical). Downgrading agentd below the sealing release is not
   supported without emptying `state_dir` (first-start fence).
+- **Head notes in a cyclic black box.** The head notes are recorded again
+  whenever the black box moved to a new segment (checked every
+  heartbeat), so the newest segments always hold one. If the black box
+  dropped segments and holds no head note at start (e.g. more than
+  `max_segments` rotated within one heartbeat, or a wiped store), both
+  journals are treated as unanchored: the replay store is fenced and the
+  requests are reconciled with the black box (`state.anchor_lost`).
+- **Notes that do not verify.** Only black-box notes whose record hash and
+  signature verify under the black-box key settle a decision or restore a
+  request; the others are ignored and counted (`state.notes_rejected`, in
+  the `control_plane_state_untrusted` finding).
+- **Unreconciled requests.** When the journal held entries no authentic
+  note backs (an adopted v1 file, a rolled-back copy, lines failing their
+  seal), they are dropped and their request ids refused
+  (`state.dropped_unbacked`, `state.lost_request_ids`). Those ids, and a
+  "refuse every new id" state when the black box could not be read, are
+  kept in the sealed `state_dir/unreconciled` marker: every start
+  reconciles again and keeps refusing them, also after the journal was
+  rewritten clean. It is removed once nothing is left; deleting it by hand
+  ends the refusals (do so only after checking the black box).
 - **Connections.** TCP connections in the TLS handshake (or not yet
   authenticated) and authenticated ones have separate slots of
   `max_connections` (default 4) each; one source address holds at most
@@ -1868,8 +1889,40 @@ force. Without it the executor does not trust
 the old journal at start: table deleted (every action lifted), a
 `journal_reset`, orders refused until `rearm`. The unsealed SOC replay
 store just fences once. A replaced link key has the same effect as an
-edit (the seal names another key). The seal detects edits, not an older
-sealed copy put back (the executor has no black box to anchor to).
+edit (the seal names another key). `seal-journal` is refused once the
+executor has written its journal sealed (`state_dir/sealed`): an unsealed
+file appearing later is a plant, not an upgrade. The actions it adopts are
+held after it (re-validated and re-armed only with a fresh safety state).
+
+**Older copies, deleted journals (anchor).** The seal alone does not tell
+an older sealed copy from the current one; agentd does. Every journal has
+a random epoch; agentd records the executor's journal head (epoch, next
+event) in its black box (`robodr.executor_journal_head`) and sends it back
+with every event poll. A journal behind it, or of another epoch, is reset
+by the executor (`journal_reset`, orders refused until `rearm`), and agentd
+raises `robot.agent.executor_journal_reset`. Within a boot, an active
+action whose rules are no longer in the table at start is held (re-
+validated, re-armed only with a fresh safety state), never re-installed
+blindly.
+
+**First start (`first-start` marker).** A missing sealed journal is not a
+first start: unless `state_dir/first-start` exists, the executor treats it
+as deleted (table deleted, SOC replay store fenced, `journal_reset`, orders
+refused until `rearm`). The packages create the marker on first install
+(`packaging/deb/postinst`, `packaging/rpm/post`) when no journal exists;
+the first start consumes it. For a manual install, or after deliberately
+emptying the state directory, create it as the unit's user before the
+first start:
+
+```sh
+sudo -u robodr-exec install -m 0600 /dev/null /var/lib/robodr/executor/first-start
+```
+
+**`revert-all` and `stop-cleanup`** undo motion actions through their
+adapters too; one whose undo fails stays `reverting` (retried, a
+`revert_failed`) rather than being reported reverted. `stop-cleanup` reads
+the sealed journal with the link key (the unit's credential); without it
+the table is still deleted but the journal is not marked.
 
 **Motion adapters (Sprint 8).** Off unless `executor.json` has a `motion`
 section (example `config/executor.motion.example.json`; contract §6a,

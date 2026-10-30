@@ -393,7 +393,7 @@ impl ReplayGuard {
             wrong_key: loaded.wrong_key,
             upgraded_from_v1: loaded.upgraded_from_v1,
             legacy_refused: loaded.legacy_refused,
-            anchor: loaded.anchor,
+            anchor: sealing.qualify(loaded.anchor),
             ..ReplayLoad::default()
         };
         let untrusted_store = load.upgraded_from_v1

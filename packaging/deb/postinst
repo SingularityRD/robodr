@@ -98,6 +98,15 @@ configure)
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
     fi
+    # First install: the executor's first-start marker. Without it a
+    # missing sealed journal is taken for a deleted one (reset, orders
+    # refused until `rearm`); the first start consumes it. Never on an
+    # upgrade.
+    exec_state=/var/lib/robodr/executor
+    if [ -z "$2" ] && [ -d "$exec_state" ] && [ ! -L "$exec_state" ] \
+        && [ ! -e "$exec_state/journal.json" ] && [ ! -e "$exec_state/sealed" ]; then
+        install -m 0600 -o robodr-exec -g robodr /dev/null "$exec_state/first-start"
+    fi
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
         # What the migration stopped starts again on the new binaries.

@@ -300,6 +300,13 @@ pub struct Engine {
     /// The last reason held actions could not be re-armed (one event per
     /// change).
     last_hold_reason: Option<String>,
+    /// `next_seq` of the journal as loaded at start (`None`: none was
+    /// loaded), and the highest `next_seq` this process reported to agentd.
+    /// An anchor above the latter comes from an earlier run and is compared
+    /// with the journal as loaded: the events this start's reconciliation
+    /// added must not carry an older copy past it.
+    loaded_seq: Option<u64>,
+    answered_seq: u64,
     /// Journal writes that failed (reported in status).
     pub journal_errors: u64,
     /// The executor's own SOC replay store (trust boundary M1).
@@ -388,11 +395,16 @@ impl Engine {
             None => Journal::new(&cfg.config.state_dir),
             Some(k) => Journal::sealed(&cfg.config.state_dir, k.clone()),
         };
+        // Review finding 2: a sealed journal that is missing without the
+        // first-start marker was deleted, not never written: the SOC replay
+        // store is not trusted either.
+        let journal_lost =
+            journal.is_sealed() && !journal.path().exists() && !journal.init_marker();
         let soc_replay = crate::soc::ReplayStore::open_sealed(
             &cfg.config.state_dir,
             now.wall_ms / 1000,
             cfg.config.soc.max_clock_skew_s,
-            journal.path().exists(),
+            journal.path().exists() || journal_lost,
             seal,
         );
         let mut e = Engine {
@@ -406,6 +418,8 @@ impl Engine {
             reload: None,
             unjournalled: BTreeSet::new(),
             last_hold_reason: None,
+            loaded_seq: None,
+            answered_seq: 0,
             journal_errors: 0,
             soc_replay,
             motion: Box::new(crate::motion::SystemPorts),
@@ -437,8 +451,38 @@ impl Engine {
     }
 
     fn open_inner(&mut self, now: Now) -> Result<(), String> {
+        let mut first_start = false;
         match self.journal.load() {
+            Loaded::Fresh if self.journal.is_sealed() && !self.journal.init_marker() => {
+                // Review finding 2: deleting the journal (and the replay
+                // store) must not pass for a first start that forgets an
+                // emergency disable, the actions in force and the SOC
+                // requests already presented. Without the first-start
+                // marker a missing journal is a reset.
+                nft::delete_table(self.nft.as_mut())?;
+                self.state.journal_reset_ms = Some(now.wall_ms);
+                let skew = self.cfg.config.soc.max_clock_skew_s;
+                self.soc_replay.fence_now(
+                    now.wall_ms / 1000,
+                    skew,
+                    "the executor's journal is missing (no first-start marker)".into(),
+                );
+                self.state.event(
+                    now.wall_ms,
+                    EventKind::JournalReset,
+                    None,
+                    None,
+                    format!(
+                        "HIGH: the journal is missing and no first-start marker ({}) exists: \
+                         deleted, not a first start; table inet robodr deleted, history lost, \
+                         SOC requests signed before now are refused (replay store fenced), \
+                         orders are refused until `robodr-executor rearm`",
+                        crate::journal::INIT_MARKER
+                    ),
+                );
+            }
             Loaded::Fresh => {
+                first_start = true;
                 let leftover = nft::table_exists(self.nft.as_mut())?;
                 if leftover {
                     nft::delete_table(self.nft.as_mut())?;
@@ -485,11 +529,119 @@ impl Engine {
             }
             Loaded::State(s) => {
                 self.state = s;
+                self.loaded_seq = Some(self.state.next_seq);
+                if self.state.epoch.is_empty() {
+                    // Written before epochs existed.
+                    self.state.epoch = crate::journal::random_hex16();
+                }
                 self.reconcile(now)?;
             }
         }
         self.state.boot_id = self.boot_id.clone();
-        self.journal.save(&self.state)
+        self.journal.save(&self.state)?;
+        self.journal.mark_sealed();
+        if first_start {
+            self.journal.consume_init_marker();
+        }
+        Ok(())
+    }
+
+    /// The journal head for an `events` answer (agentd anchors it); what
+    /// this process reported is remembered for [`Engine::check_anchor`].
+    pub fn answer_head(&mut self) -> crate::journal::JournalHead {
+        self.answered_seq = self.answered_seq.max(self.state.next_seq);
+        self.state.head()
+    }
+
+    /// Review of gap 1 (findings 1 and 2): compare the journal with the
+    /// newest head agentd anchored in its black box (sent with every
+    /// `events` request). The same epoch with `next_seq` behind the anchor,
+    /// or an epoch that is neither the anchored one nor its successor, is
+    /// an older journal put back (or one deleted): it is reset like a
+    /// journal that fails its seal (every action lifted, table deleted,
+    /// orders refused until `rearm`, a new epoch). A journal reset that
+    /// nobody has acknowledged and that holds nothing is merely adopted as
+    /// the anchor's successor (agentd learns the new epoch from the answer).
+    /// Returns whether the journal was reset.
+    pub fn check_anchor(
+        &mut self,
+        anchor: &crate::journal::JournalHead,
+        now: impl Into<Now>,
+    ) -> bool {
+        let now = now.into();
+        let st = &self.state;
+        // An anchor this process reported itself is never behind. One from
+        // an earlier run is compared with the journal as loaded: the events
+        // this start's reconciliation added must not carry an older copy
+        // past it.
+        let ours = if anchor.next_seq <= self.answered_seq {
+            st.next_seq
+        } else {
+            self.loaded_seq.map_or(st.next_seq, |l| l.min(st.next_seq))
+        };
+        let why = if anchor.epoch == st.epoch {
+            if anchor.next_seq <= ours {
+                return false;
+            }
+            format!(
+                "the journal is behind agentd's anchored head (event {} < {} of epoch {}): an \
+                 older copy was put back",
+                ours,
+                anchor.next_seq,
+                crate::net::clip(&st.epoch)
+            )
+        } else if st.prev_epoch.as_deref() == Some(anchor.epoch.as_str()) {
+            return false;
+        } else if st.journal_reset_ms.is_some() && st.entries.is_empty() {
+            // A reset agentd has not seen yet: nothing to lift.
+            self.state.prev_epoch = Some(anchor.epoch.clone());
+            let _ = self.save();
+            return false;
+        } else {
+            format!(
+                "the journal's epoch {} is not the one agentd anchored ({}) nor its successor: \
+                 an older or foreign copy was put back",
+                crate::net::clip(&st.epoch),
+                crate::net::clip(&anchor.epoch)
+            )
+        };
+        self.reset_untrusted(now, &why);
+        true
+    }
+
+    /// Lift everything and start a new epoch (the journal cannot be
+    /// trusted): motion actions are undone (best effort), the table is
+    /// deleted, every entry is finished as reverted, orders are refused
+    /// until `rearm`.
+    fn reset_untrusted(&mut self, now: Now, why: &str) {
+        let entries = std::mem::take(&mut self.state.entries);
+        for en in &entries {
+            self.motion_best_effort(en, now.wall_ms, "journal reset");
+            self.finish(en, Final::Reverted, now.wall_ms, why);
+        }
+        let del = nft::delete_table(self.nft.as_mut());
+        let skew = self.cfg.config.soc.max_clock_skew_s;
+        self.soc_replay
+            .fence_now(now.wall_ms / 1000, skew, format!("journal reset: {why}"));
+        self.state.journal_reset_ms = Some(now.wall_ms);
+        let old = std::mem::replace(&mut self.state.epoch, crate::journal::random_hex16());
+        self.state.prev_epoch = Some(old);
+        self.state.event(
+            now.wall_ms,
+            EventKind::JournalReset,
+            None,
+            None,
+            format!(
+                "HIGH: {why}: not trusted; {} action(s) lifted, table inet robodr {}; orders \
+                 are refused until `robodr-executor rearm`",
+                entries.len(),
+                match &del {
+                    Ok(()) => "deleted".to_string(),
+                    Err(e) => format!("could not be deleted ({e})"),
+                }
+            ),
+        );
+        let _ = self.save();
     }
 
     /// Re-read the configuration file (and the policy it names) before every
@@ -529,6 +681,24 @@ impl Engine {
     fn reconcile(&mut self, now: Now) -> Result<(), String> {
         let same_boot = self.state.boot_id == self.boot_id;
         let mut summary = Vec::new();
+        // Review finding 2: within the same boot an active entry is
+        // re-installed as it is only if its rules are still in the table
+        // (a restart of the process leaves them there). One the live table
+        // lacks was lifted since (an older journal copy put back): it is
+        // re-validated and held for a fresh safety check like after a
+        // reboot. An absent table is the operator's emergency disable
+        // (below).
+        let live: Option<std::collections::BTreeSet<String>> = if same_boot {
+            nft::read_table(self.nft.as_mut())?
+                .as_deref()
+                .map(nft::rule_comments)
+        } else {
+            None
+        };
+        let not_in_table = |en: &Entry| match (&live, nft::entry_comment(&en.id, &en.effect)) {
+            (Some(l), Some(c)) => !l.contains(&c),
+            _ => false,
+        };
         let entries = std::mem::take(&mut self.state.entries);
         let mut keep = Vec::new();
         let mut held = Vec::new();
@@ -607,6 +777,14 @@ impl Engine {
                         "reverted at restart: TTL expired",
                     );
                     summary.push(format!("{} expired", en.id));
+                }
+                Phase::Active if same_boot && not_in_table(&en) => {
+                    summary.push(format!(
+                        "{} not in the live table (lifted since this journal was written): \
+                         re-validated and held",
+                        en.id
+                    ));
+                    held.push(en);
                 }
                 Phase::Active if same_boot => keep.push(en),
                 Phase::Active | Phase::Held => held.push(en),
@@ -1648,11 +1826,29 @@ impl Engine {
     /// Remove every action (operator `revert-all`, a failed start).
     pub fn revert_all(&mut self, reason: &str, now: impl Into<Now>) -> Result<usize, String> {
         let now_ms = now.into().wall_ms;
+        // Review finding 11: a motion action is undone through its adapter
+        // first (while the journal still holds every entry); one whose undo
+        // failed stays `reverting` (retried every tick, and at the next
+        // start) instead of being reported reverted while the restriction
+        // is still in force.
+        let mut stuck = BTreeSet::new();
+        for en in self.state.entries.clone() {
+            if self.motion_undo(&en, reason, now_ms).is_err() {
+                stuck.insert(en.id.clone());
+            }
+        }
         let entries = std::mem::take(&mut self.state.entries);
         let del = nft::delete_table(self.nft.as_mut())
             .and_then(|()| self.read_verify(&Rendered { chains: None }));
-        for en in &entries {
-            self.finish(en, Final::Reverted, now_ms, reason);
+        let mut reverted = 0;
+        for mut en in entries {
+            if stuck.contains(&en.id) {
+                en.phase = Phase::Reverting;
+                self.state.entries.push(en);
+                continue;
+            }
+            reverted += 1;
+            self.finish(&en, Final::Reverted, now_ms, reason);
             self.state.event(
                 now_ms,
                 EventKind::Reverted,
@@ -1663,7 +1859,14 @@ impl Engine {
         }
         del?;
         self.save()?;
-        Ok(entries.len())
+        if !stuck.is_empty() {
+            return Err(format!(
+                "{reverted} action(s) reverted; the adapter undo of {} motion action(s) failed: \
+                 they stay `reverting` and are retried",
+                stuck.len()
+            ));
+        }
+        Ok(reverted)
     }
 
     /// The state of action `id`.
@@ -1742,18 +1945,60 @@ mod motion_exec;
 /// journal write is best effort (the disk may be full): a later start in
 /// the same boot then finds the table gone and treats it as an emergency
 /// disable (re-arm needed), never re-installing anything blindly.
+///
+/// `seal` is the state-seal key the daemon writes the journal under
+/// (review finding 10: without it a sealed journal reads as untrusted and
+/// nothing would be marked); `None` reads and writes an unsealed journal
+/// (tests and tools). Motion actions are undone through `motion` (review
+/// finding 11); one whose undo fails stays `reverting`, so the next start
+/// retries it. Returns the number of actions reverted.
 pub fn abandon(
     cfg: Option<&Resolved>,
     nft: &mut dyn Nft,
     why: &str,
     now_ms: u64,
+    seal: Option<Arc<robodr_blackbox::StateSealKey>>,
+    motion: &mut dyn crate::motion::MotionPorts,
 ) -> Result<usize, String> {
     let del = nft::delete_table(nft);
     let mut n = 0;
     if let Some(cfg) = cfg {
-        let j = Journal::new(&cfg.config.state_dir);
+        let j = match seal {
+            None => Journal::new(&cfg.config.state_dir),
+            Some(k) => Journal::sealed(&cfg.config.state_dir, k),
+        };
         if let Loaded::State(mut s) = j.load() {
-            let entries = std::mem::take(&mut s.entries);
+            let m = cfg.config.motion.clone().unwrap_or_default();
+            let all = std::mem::take(&mut s.entries);
+            let mut entries = Vec::new();
+            for mut en in all {
+                if let Effect::Motion(spec) = &en.effect {
+                    match motion.revert(&m, spec) {
+                        Ok(note) => s.event(
+                            now_ms,
+                            EventKind::Reverted,
+                            Some(&en.id),
+                            Some(en.action),
+                            format!("{why}: adapter undo: {note}"),
+                        ),
+                        Err(e) => {
+                            s.event(
+                                now_ms,
+                                EventKind::RevertFailed,
+                                Some(&en.id),
+                                Some(en.action),
+                                format!(
+                                    "{why}: adapter undo failed ({e}); retried at the next start"
+                                ),
+                            );
+                            en.phase = Phase::Reverting;
+                            s.entries.push(en);
+                            continue;
+                        }
+                    }
+                }
+                entries.push(en);
+            }
             n = entries.len();
             for en in &entries {
                 s.finish(Finished {
@@ -1773,7 +2018,7 @@ pub fn abandon(
                     why.to_string(),
                 );
             }
-            if n > 0 {
+            if n > 0 || !s.entries.is_empty() {
                 let _ = j.save(&s);
             }
         }

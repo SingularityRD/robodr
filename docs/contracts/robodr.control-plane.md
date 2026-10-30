@@ -623,6 +623,19 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   `journal_error`) is a `robodr.executor_event` note. `revert_failed`,
   `drift`, `removed_externally` and `journal_reset` are critical
   (fsynced). `status.json` carries `executor` counters.
+* **Executor journal anchor.** Every events answer of the executor carries
+  its journal head (a random `epoch` replaced by every reset, and
+  `next_seq`); agentd records it as a critical
+  `robodr.executor_journal_head` note (`robot_id`, `reason`, `epoch`,
+  `next_seq`) when it first sees it, when the epoch changes or the
+  sequence goes back, and on heartbeats when it moved or the black box
+  started a new segment, and sends the newest one back with every poll. An
+  executor journal behind that anchor (an older copy put back) or of
+  another epoch is reset by the executor (`journal_reset`). A new epoch or
+  a sequence going back raises `robot.agent.executor_journal_reset` (High)
+  and agentd reads the new sequence from its start, so no event of the new
+  journal is missed. An executor that reports no head (older) is polled as
+  before.
 * **Reboot.** After a reboot of the robot an action in force is held
   (not installed) until the executor re-validated it and agentd supplied
   a fresh safety state; it turns `reverted` if it is not re-armed before
@@ -761,8 +774,16 @@ at start, on heartbeat and at a clean stop; an older or shorter file is a
 rollback. Damage or rollback raises
 `robot.agent.control_plane_state_untrusted` (High; Critical for a
 rollback). A v1 (checksummed) journal is adopted once, only while the black
-box has no end-point note, and that upgrade is recorded; afterwards a v1
-file is refused as a downgrade. The black box stays the record.
+box has no end-point note and the state directory has no `sealed.marker`
+(written once both journals are sealed), and that upgrade is recorded;
+afterwards a v1 file is refused as a downgrade, even if the black box no
+longer holds an end-point note. The end-point note is recorded again
+whenever the black box moved to a new segment, so a cyclic black box keeps
+one; a black box that has dropped segments but holds no end-point note
+counts as "anchor lost" (fence and reconciliation, as after a crash). Only
+notes whose record hash and signature verify under the black-box key are
+believed (end points, decisions, requests, reverts); the others are counted
+in the finding. The black box stays the record.
 
 **After damage** agentd falls back to the record:
 
@@ -778,6 +799,14 @@ file is refused as a downgrade. The black box stays the record.
   (503 `state_unavailable`; stored requests still answer) until a restart
   reconciles the journal. Requests older than the black box's retention
   are gone either way (as after eviction).
+  When the journal may hold entries nobody decided (an adopted v1 file, a
+  rolled-back copy, lines failing their seal), a journal entry is kept only
+  when an authentic request note with the same request and evidence
+  reference backs it (an adopted v1 entry takes the note's state); the
+  others are dropped and their `request_id` is refused. Refused ids and the
+  "refuse every new id" state are persisted in the sealed
+  `state_dir/unreconciled` marker: every later start reconciles again and
+  keeps refusing them; the marker is removed once nothing is left.
 
 **Decisions** are journaled around the black-box note:
 

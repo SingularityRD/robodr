@@ -18,8 +18,8 @@
 //! ```text
 //! agentd → submit{order}      executor → confirm{id}        (asks for the safety state now)
 //! agentd → safety{state,age}  executor → outcome{...}
-//! agentd → events{since}      [executor → confirm{"rearm"} → agentd safety{..}, only while
-//!                              actions are held after a reboot]   executor → event_list
+//! agentd → events{since,anchor?} [executor → confirm{"rearm"} → agentd safety{..}, only while
+//!                              actions are held after a reboot]   executor → event_list{events,head}
 //! agentd → revert{id,reason,soc?} / status / ping   executor → outcome / pong
 //! operator (CLI) → rearm{reason}    executor → rearmed{was_disabled}
 //! ```
@@ -39,7 +39,7 @@ use robodr_responder::SafetyState;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Outcome;
-use crate::journal::Event;
+use crate::journal::{Event, JournalHead};
 use crate::order::Order;
 
 pub const VERSION: &str = "robodr-executor/1";
@@ -82,6 +82,12 @@ pub enum Msg {
     },
     Events {
         since: u64,
+        /// The newest executor journal head agentd anchored in its black
+        /// box ([`crate::engine::Engine::check_anchor`]; review of gap 1).
+        /// Sent only once agentd has seen a head, so never to an executor
+        /// that does not report one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<JournalHead>,
     },
     Ping,
     /// The operator re-arms the executor after an emergency disable.
@@ -97,6 +103,10 @@ pub enum Msg {
     },
     EventList {
         events: Vec<Event>,
+        /// The journal's epoch and next sequence number (review of gap 1;
+        /// absent from older executors).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<JournalHead>,
     },
     Pong {
         active: usize,

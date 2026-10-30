@@ -537,6 +537,21 @@ pub struct StateStatus {
     /// to reconcile it: every new request id is refused until a restart
     /// reconciles (fail closed).
     pub refusing_new_request_ids: Option<String>,
+    /// Review of gap 1: black-box notes (decision, request, revert) whose
+    /// hash or signature did not verify, ignored (finding 6).
+    pub notes_rejected: usize,
+    /// Journal entries dropped for want of an authentic note (finding 4).
+    pub dropped_unbacked: usize,
+    /// The unreconciled-requests marker of an earlier start was found
+    /// (finding 5): the journal was reconciled again.
+    pub unreconciled_restored: bool,
+    /// It exists but could not be read or failed its seal (every new
+    /// request id is refused until a start reconciles).
+    pub unreconciled_unreadable: Option<String>,
+    /// The black box holds no head note but dropped segments (finding 3).
+    pub anchor_lost: bool,
+    /// A v1 journal was refused because the sealed marker exists.
+    pub sealed_marker: bool,
     pub replay: auth::ReplayLoad,
     /// Evidence exports kept / discarded at start.
     pub exports_restored: usize,
@@ -624,8 +639,10 @@ impl std::fmt::Debug for ControlPlane {
 }
 
 /// Settles dangling journal decisions: given decision ids, the black-box
-/// references of the notes that carry them.
-pub type Reconcile<'a> = &'a dyn Fn(&[String]) -> std::io::Result<BTreeMap<String, String>>;
+/// references of the authentic notes that carry them (and how many
+/// candidate notes failed their hash or signature check).
+pub type Reconcile<'a> =
+    &'a dyn Fn(&[String]) -> std::io::Result<evidence::NotesFound<BTreeMap<String, String>>>;
 
 impl ControlPlane {
     /// Open the persistent state, bind the listeners and start their
@@ -633,7 +650,9 @@ impl ControlPlane {
     /// authenticated request and every evidence manifest. `blackbox_dir`
     /// is read (only) by the evidence API; `reconcile` settles decisions a
     /// crash left half-journaled. `seal_key` seals both journals and
-    /// `anchors` is the black box's newest head note ([`anchor::latest`]).
+    /// `anchors` is the black box's newest head note ([`anchor::latest`]);
+    /// `blackbox_signer` verifies the notes the state is reconciled with.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         spec: &ControlPlaneSpec,
         robot_id: &str,
@@ -642,13 +661,19 @@ impl ControlPlane {
         reconcile: Reconcile<'_>,
         seal_key: Arc<robodr_blackbox::StateSealKey>,
         anchors: &anchor::Found,
+        blackbox_signer: &dyn robodr_blackbox::Signer,
     ) -> Result<Self, String> {
         let now_s = wall_s().ok_or("control plane: the wall clock is unavailable")?;
         let euid = crate::config::effective_uid();
         let dir = &spec.state_dir;
         fsutil::check_private_dir(dir, euid)
             .map_err(|e| format!("control_plane.state_dir: {e}"))?;
-        let sealing = anchors.sealing(seal_key);
+        // Review of gap 1, finding 3: once the journals were sealed, a v1
+        // journal is never adopted, even if the black box aged out every
+        // head note.
+        let (sealing, sealed_marker) = anchor::sealing_for(dir, anchors, seal_key);
+        // Finding 5: requests an earlier start could not reconcile.
+        let unreconciled = anchor::read_unreconciled(dir, &sealing.key);
         // The request journal (and the decisions a crash left dangling).
         let (mut journal, mut restored) =
             state::open(dir, spec.max_requests, &sealing).map_err(|e| {
@@ -671,6 +696,8 @@ impl ControlPlane {
             journal_anchor: restored.anchor.clone(),
             anchor_clean: anchors.heads.as_ref().map(|_| anchors.clean),
             anchor_notes_unverified: anchors.unverified,
+            anchor_lost: sealing.anchor_lost,
+            sealed_marker,
             ..StateStatus::default()
         };
         if !restored.pending.is_empty() || !restored.pending_reverts.is_empty() {
@@ -683,10 +710,29 @@ impl ControlPlane {
             let found = reconcile(&ids).map_err(|e| {
                 format!("control plane: reading the black box to settle the request journal: {e}")
             })?;
-            let (c, a) = state::resolve(&mut journal, &mut restored, &found, spec.max_requests)
-                .map_err(|e| format!("control plane: request journal: {e}"))?;
+            st.notes_rejected += found.rejected;
+            let (c, a) =
+                state::resolve(&mut journal, &mut restored, &found.found, spec.max_requests)
+                    .map_err(|e| format!("control plane: request journal: {e}"))?;
             st.resolved_committed = c;
             st.resolved_aborted = a;
+        }
+        // Finding 5: an earlier start left requests unreconciled: reconcile
+        // again (the journal it rewrote may look clean) and keep refusing
+        // the ids it lost.
+        let mut carried: Vec<String> = Vec::new();
+        let mut must_reconcile = false;
+        match &unreconciled {
+            Ok(None) => {}
+            Ok(Some(u)) => {
+                st.unreconciled_restored = true;
+                carried.clone_from(&u.lost_ids);
+                must_reconcile = true;
+            }
+            Err(e) => {
+                st.unreconciled_unreadable = Some(robodr_ros2_pipeline::sanitize(e));
+                must_reconcile = true;
+            }
         }
         // Damage (not a torn tail) may have taken committed requests with
         // it: the black box is the record, rebuild from it (review finding
@@ -694,18 +740,23 @@ impl ControlPlane {
         // cut after the black box's newest head (gap 1). If it cannot be
         // read, refuse every new request id rather than judge (and maybe
         // execute) a known one again.
-        let mut lost: Vec<String> = Vec::new();
-        if restored.untrusted() {
+        let mut lost: Vec<String> = carried;
+        if restored.untrusted() || must_reconcile {
             match evidence::find_request_notes(
                 &evidence::DirSource(blackbox_dir.to_path_buf()),
                 robot_id,
+                blackbox_signer,
             ) {
                 Ok(notes) => {
-                    let rb = state::rebuild(&mut restored, &notes, spec.max_requests);
+                    st.notes_rejected += notes.rejected;
+                    let rb = state::rebuild(&mut restored, &notes.found, spec.max_requests);
                     st.rebuilt_from_blackbox = rb.requests;
                     st.rebuilt_reverts = rb.reverts;
-                    st.lost_request_ids = rb.unreadable.len();
-                    lost = rb.unreadable;
+                    st.dropped_unbacked = rb.dropped.len();
+                    lost.extend(rb.unreadable);
+                    lost.extend(rb.dropped);
+                    lost.retain(|id| !restored.stored.iter().any(|s| &s.request.request_id == id));
+                    st.lost_request_ids = lost.len();
                 }
                 Err(e) => {
                     st.refusing_new_request_ids = Some(format!(
@@ -715,6 +766,25 @@ impl ControlPlane {
                 }
             }
         }
+        // Persist what is still unreconciled (finding 5); a start that
+        // reconciled everything removes the marker. Fail closed: if it
+        // cannot be written, the control plane does not start. (A marker
+        // that could not be trusted was reconciled again above and is
+        // replaced; the finding reports it.)
+        anchor::write_unreconciled(
+            dir,
+            &sealing.key,
+            &anchor::Unreconciled {
+                lost_ids: lost.clone(),
+                refuse_new: st.refusing_new_request_ids.clone(),
+            },
+        )
+        .map_err(|e| {
+            format!(
+                "control_plane.state_dir: {}: {e}",
+                dir.join(anchor::UNRECONCILED_MARKER).display()
+            )
+        })?;
         st.journal_damaged = restored.damaged;
         st.restored = restored.stored.len();
         let mut engine = api::Engine::with_journal(
@@ -739,6 +809,14 @@ impl ControlPlane {
                 },
             )?;
         st.replay = rload;
+        // Finding 3: both journals are sealed now; from here on a v1
+        // journal is a downgrade even without a head note in the black box.
+        anchor::write_sealed_marker(dir, &sealing.key).map_err(|e| {
+            format!(
+                "control_plane.state_dir: {}: {e}",
+                dir.join(anchor::SEALED_MARKER).display()
+            )
+        })?;
         // Evidence exports.
         let evidence = match &spec.evidence {
             None => None,

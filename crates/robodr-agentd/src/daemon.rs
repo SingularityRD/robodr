@@ -531,6 +531,15 @@ struct Daemon<'a> {
     /// The control-plane journals' heads last recorded in the black box
     /// (gap 1: [`crate::control::anchor`]).
     state_heads_recorded: Option<crate::control::anchor::StateHeads>,
+    /// The black-box segment that holds the newest head note, and the one
+    /// the latest heartbeat went to (review of gap 1, finding 3: a head
+    /// note is re-recorded whenever the black box moved to a new segment,
+    /// so a cyclic store never ages every one of them out).
+    state_heads_segment: Option<u64>,
+    last_note_segment: Option<u64>,
+    /// The executor journal head last recorded, and its segment (findings
+    /// 1 and 2).
+    executor_head_recorded: Option<(robodr_executor::journal::JournalHead, u64)>,
     /// executor v1: requests whose failed revert was reported (one finding
     /// per request until a revert of it succeeds).
     revert_failed_reported: std::collections::BTreeSet<String>,
@@ -811,9 +820,34 @@ impl<'a> Daemon<'a> {
         let executor = match &r.executor {
             None => None,
             Some(spec) => {
-                let link = crate::executor_link::ExecutorLink::start(
+                // Review of gap 1 (findings 1 and 2): the newest executor
+                // journal head the black box holds goes back to the
+                // executor with every event poll (an older journal put back
+                // is reset there).
+                let bb_signer =
+                    crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+                        .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
+                let (anchor, unverified) = crate::control::anchor::latest_executor_head(
+                    &crate::control::evidence::DirSource(agent.blackbox_dir().to_path_buf()),
+                    &cfg.robot.id,
+                    bb_signer.as_ref(),
+                )
+                .map_err(|e| {
+                    DaemonError::Io(format!(
+                        "executor: reading the black box for the executor's journal head: {e}"
+                    ))
+                })?;
+                if unverified > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: executor: {unverified} executor journal head note(s) in \
+                         the black box do not verify under the current key: ignored"
+                    );
+                }
+                let link = crate::executor_link::ExecutorLink::start_anchored(
                     spec,
                     crate::executor_link::SafetyCell::default(),
+                    anchor,
                 )
                 .map_err(DaemonError::Io)?;
                 if link.planner_orders {
@@ -863,13 +897,6 @@ impl<'a> Daemon<'a> {
                 .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
                 let bb_dir = agent.blackbox_dir().to_path_buf();
                 let robot = cfg.robot.id.clone();
-                let reconcile = |ids: &[String]| {
-                    crate::control::evidence::find_decision_notes(
-                        &crate::control::evidence::DirSource(bb_dir.clone()),
-                        &robot,
-                        ids,
-                    )
-                };
                 // Gap 1: the journals are sealed under a key derived from
                 // the black-box key and compared with the newest head the
                 // black box holds for them.
@@ -878,6 +905,16 @@ impl<'a> Daemon<'a> {
                 let bb_signer =
                     crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
                         .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
+                // Review of gap 1, finding 6: only authentic notes settle a
+                // decision.
+                let reconcile = |ids: &[String]| {
+                    crate::control::evidence::find_decision_notes(
+                        &crate::control::evidence::DirSource(bb_dir.clone()),
+                        &robot,
+                        ids,
+                        bb_signer.as_ref(),
+                    )
+                };
                 let anchors = crate::control::anchor::latest(
                     &crate::control::evidence::DirSource(bb_dir.clone()),
                     &robot,
@@ -904,6 +941,7 @@ impl<'a> Daemon<'a> {
                     &reconcile,
                     seal_key,
                     &anchors,
+                    bb_signer.as_ref(),
                 )
                 .map_err(DaemonError::Io)?;
                 // executor v1: accepted requests go to robodr-executor; the
@@ -1234,6 +1272,9 @@ impl<'a> Daemon<'a> {
             control_reported: [0; 2],
             control_reported_at_ms: [None; 2],
             state_heads_recorded: None,
+            state_heads_segment: None,
+            last_note_segment: None,
+            executor_head_recorded: None,
             revert_failed_reported: std::collections::BTreeSet::new(),
             executor,
             replay: r
@@ -1412,6 +1453,7 @@ impl<'a> Daemon<'a> {
                 if now >= next_heartbeat {
                     self.heartbeat("robodr.agentd_heartbeat");
                     self.record_state_heads("heartbeat");
+                    self.record_executor_head("heartbeat", false);
                     next_heartbeat = now + heartbeat;
                 }
                 if self.r.config.daemon.exit_when_inputs_end
@@ -2141,7 +2183,16 @@ impl<'a> Daemon<'a> {
             return;
         };
         let heads = cp.state_heads();
-        if reason == "heartbeat" && self.state_heads_recorded.as_ref() == Some(&heads) {
+        // Review of gap 1, finding 3: unchanged heads are recorded again
+        // once the black box moved to another segment, so the newest
+        // segments always hold one (a cyclic store drops the oldest).
+        if reason == "heartbeat"
+            && !crate::control::anchor::head_note_due(
+                self.state_heads_recorded.as_ref() != Some(&heads),
+                self.state_heads_segment,
+                self.last_note_segment,
+            )
+        {
             return;
         }
         let note = crate::control::anchor::head_note(
@@ -2155,12 +2206,59 @@ impl<'a> Daemon<'a> {
             .agent
             .record_note(now, "control-plane state head", &note, true)
         {
-            Ok(_) => self.state_heads_recorded = Some(heads),
+            Ok(r) => {
+                self.state_heads_recorded = Some(heads);
+                self.state_heads_segment = Some(r.segment);
+                self.last_note_segment = Some(r.segment);
+            }
             Err(e) => {
                 self.stats.note_errors += 1;
                 let _ = writeln!(
                     self.log,
                     "robodr-agentd: control-plane state head not recorded: {e:?}"
+                );
+            }
+        }
+    }
+
+    /// Review of gap 1 (findings 1 and 2): record the executor's journal
+    /// head as a signed black-box note (`robodr.executor_journal_head`)
+    /// when it changed, or when the black box moved to another segment
+    /// since the last one (`heartbeat`), and at once when its epoch
+    /// changed or it went backwards (`force`). At the next start agentd
+    /// sends the newest one back as the anchor.
+    fn record_executor_head(&mut self, reason: &str, force: bool) {
+        let Some(head) = self.executor.as_ref().and_then(|l| l.journal_head()) else {
+            return;
+        };
+        if !force {
+            if let Some((h, seg)) = &self.executor_head_recorded {
+                if !crate::control::anchor::head_note_due(
+                    *h != head,
+                    Some(*seg),
+                    self.last_note_segment,
+                ) {
+                    return;
+                }
+            }
+        }
+        let note =
+            crate::control::anchor::executor_head_note(&self.r.config.robot.id, reason, &head);
+        let now = self.clock.now();
+        match self
+            .agent
+            .record_note(now, "executor journal head", &note, true)
+        {
+            Ok(r) => {
+                self.executor_head_recorded = Some((head, r.segment));
+                self.last_note_segment = Some(r.segment);
+            }
+            Err(e) => {
+                self.stats.note_errors += 1;
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: executor journal head not recorded: {}",
+                    sanitize(&e.join("; "))
                 );
             }
         }
@@ -2710,13 +2808,16 @@ impl<'a> Daemon<'a> {
         // Serialise first: `hb` borrows self immutably.
         let value = serde_json::to_value(&hb).unwrap_or(serde_json::Value::Null);
         let now = self.clock.now();
-        if let Err(e) = self.agent.record_note(now, "heartbeat", &value, false) {
-            self.stats.note_errors += 1;
-            let _ = writeln!(
-                self.log,
-                "robodr-agentd: heartbeat not recorded: {}",
-                sanitize(&e.join("; "))
-            );
+        match self.agent.record_note(now, "heartbeat", &value, false) {
+            Ok(r) => self.last_note_segment = Some(r.segment),
+            Err(e) => {
+                self.stats.note_errors += 1;
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: heartbeat not recorded: {}",
+                    sanitize(&e.join("; "))
+                );
+            }
         }
     }
 
@@ -2754,6 +2855,7 @@ impl<'a> Daemon<'a> {
         // Gap 1: the listeners are joined and the queue drained, so nothing
         // is appended after this head: the next start may verify it exactly.
         self.record_state_heads("stop");
+        self.record_executor_head("stop", false);
         self.heartbeat("robodr.agentd_stop");
         self.write_status(false);
         let pipeline = *self.pipeline.stats();
@@ -3002,7 +3104,23 @@ impl Daemon<'_> {
             );
             self.executor_event_finding(&ev);
         }
+        let alarms = link.take_head_alarms();
         self.executor = Some(link);
+        // Review of gap 1 (findings 1 and 2): an executor journal that was
+        // reset, replaced or rolled back is recorded at once and reported.
+        for (_, alarm) in alarms {
+            self.record_executor_head("changed", true);
+            let dev = robodr_events::Deviation::new(
+                health_rules::EXECUTOR_JOURNAL_RESET,
+                robodr_events::Severity::High,
+                alarm,
+            );
+            self.self_health("agentd:executor", dev);
+        }
+        if self.executor_head_recorded.is_none() {
+            // The first head agentd learns is anchored at once.
+            self.record_executor_head("first", false);
+        }
     }
 
     /// S5 / gap 2: an executor event that leaves the robot in an unknown
