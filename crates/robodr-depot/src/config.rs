@@ -68,6 +68,10 @@ pub struct ServeCfg {
     pub server_name: String,
     #[serde(default = "d_conns")]
     pub max_connections: usize,
+    /// Most connections open at once from one source address (before or
+    /// after authenticating): one host cannot take every slot.
+    #[serde(default = "d_conns_per_source")]
+    pub max_connections_per_source: usize,
     /// Per-connection deadline, seconds.
     #[serde(default = "d_deadline")]
     pub deadline_s: u64,
@@ -75,6 +79,9 @@ pub struct ServeCfg {
 
 fn d_conns() -> usize {
     16
+}
+fn d_conns_per_source() -> usize {
+    4
 }
 fn d_deadline() -> u64 {
     600
@@ -176,9 +183,15 @@ impl Config {
             }
         }
         if let Some(s) = &self.serve {
-            if s.max_connections == 0 || s.max_connections > 1024 || s.deadline_s == 0 {
+            if s.max_connections == 0
+                || s.max_connections > 1024
+                || s.max_connections_per_source == 0
+                || s.max_connections_per_source > 1024
+                || s.deadline_s == 0
+            {
                 return Err(err(
-                    "config: serve.max_connections 1..=1024, deadline_s > 0",
+                    "config: serve.max_connections and max_connections_per_source 1..=1024, \
+                     deadline_s > 0",
                 ));
             }
             robodr_blackbox::tls::server_name(&s.server_name)
@@ -228,6 +241,7 @@ mod tests {
         bad(&|v| v["roots"] = serde_json::json!([]));
         bad(&|v| v["anchor"]["index"] = "0x81000001".into());
         bad(&|v| v["serve"]["max_connections"] = 0.into());
+        bad(&|v| v["serve"]["max_connections_per_source"] = 0.into());
         bad(&|v| v["unknown"] = 1.into());
         bad(&|v| v["format"] = "robodr-depot-config/2".into());
     }

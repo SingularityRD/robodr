@@ -424,7 +424,12 @@ Optional sections of Sprints 14a and 14b:
 .B depot
 .RB ( address ", " server_name ", " ca_file ", " cert_file ,
 .BR deadline_s ", " max_pack_mb )
-for LAN delivery;
+for LAN delivery
+.RB ( deadline_s
+bounds the connect, TLS handshake, request and answer head together; a
+pack body gets
+.B deadline_s
+more plus one second per MiB);
 .B erase
 .RB ( trigger_socket ", " feeder_uids ", " feeder_gids )
 for executed crypto-erase;

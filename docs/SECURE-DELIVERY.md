@@ -1772,10 +1772,12 @@ that failed before it:
   serves a unit whose report said it was erased.
 * Documented, not fixed: the NV anchor detects a **restored older**
   record; root holding the black-box key (it is on the unit) can still
-  write a new record with lower floors, as in 13b. The unit's LAN client
-  bounds each read by `depot.deadline_s`, not the whole exchange (the
-  depot is authenticated). A pack being streamed holds a connection slot
-  for as long as an authenticated unit keeps reading.
+  write a new record with lower floors, as in 13b. A pack being streamed
+  holds a connection slot for as long as an authenticated unit keeps
+  reading. (Since the TLS review of 2026-10-30, the unit's LAN client
+  bounds the whole exchange by one deadline, `depot.deadline_s` plus one
+  second per MiB of pack body, and the depot caps connections per source
+  address and cuts an unfinished TLS handshake after 10 s.)
 
 Fuzzing: `pkg_entry` (entry reports, pack listings, request and response
 heads) and `seal_attest` (TPM public areas, attestations, enrolment

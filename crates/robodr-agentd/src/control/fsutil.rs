@@ -39,11 +39,21 @@ pub fn create_new_private(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// `O_NONBLOCK` (Linux: the same value on x86_64 and aarch64; the BSDs
+/// and macOS: 0x4).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const O_NONBLOCK: i32 = 0o4000;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const O_NONBLOCK: i32 = 0x4;
+
 /// Open an existing regular file for reading, never through a symlink.
+/// `O_NONBLOCK`: a FIFO (or a device) swapped in never blocks the open
+/// (it is refused by the check on the opened descriptor); on a regular
+/// file the flag changes nothing.
 pub fn open_read_nofollow(path: &Path) -> io::Result<File> {
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(path)?;
     if !f.metadata()?.is_file() {
         return Err(io::Error::new(
@@ -106,7 +116,11 @@ pub fn check_private_dir(dir: &Path, euid: u32) -> Result<(), String> {
 /// Read a whole file that must be a regular file (no symlink) of at most
 /// `max` bytes.
 pub fn read_capped_nofollow(path: &Path, max: u64) -> io::Result<Vec<u8>> {
-    let f = open_read_nofollow(path)?;
+    read_capped_file(open_read_nofollow(path)?, path, max)
+}
+
+/// Read all of an opened file of at most `max` bytes (`path`: messages).
+pub fn read_capped_file(f: File, path: &Path, max: u64) -> io::Result<Vec<u8>> {
     let len = f.metadata()?.len();
     if len > max {
         return Err(io::Error::new(
@@ -187,5 +201,44 @@ pub(crate) mod fault {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review (TLS, finding 6): a FIFO swapped in for a CRL / PEM file
+    /// used to block the open (with the CRL reload lock held) until a
+    /// writer appeared; it is now refused at once.
+    #[test]
+    fn a_fifo_never_blocks_the_open() {
+        let d = std::env::temp_dir().join(format!("robodr-fsutil-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let fifo = d.join("ca.crl");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f2 = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_capped_nofollow(&f2, 1024).map(|_| ()));
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if r.is_err() {
+            // Unblock the reader thread before failing.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        let e = r.expect("the open blocked on a FIFO").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        // A symlink is still refused, a regular file still read.
+        std::fs::write(d.join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        assert!(read_capped_nofollow(&d.join("link"), 16).is_err());
+        assert_eq!(read_capped_nofollow(&d.join("real"), 16).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

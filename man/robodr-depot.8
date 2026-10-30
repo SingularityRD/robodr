@@ -288,7 +288,9 @@ and optionally
 TPM powered-on time,
 .BR reboots ),
 .B serve
-.RB ( listen ", " server_name ", " max_connections ", " deadline_s ),
+.RB ( listen ", " server_name ", " max_connections ,
+.BR max_connections_per_source " (default 4), " deadline_s ;
+a peer must complete the TLS handshake within 10 s),
 .B anchor
 (an NV counter of the depot's TPM:
 .BR tcti ", " index ", " work_dir ", " tools_dir )

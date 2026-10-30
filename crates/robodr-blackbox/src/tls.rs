@@ -483,6 +483,15 @@ pub fn load_server(f: &ServerTlsFiles) -> Result<Arc<ServerConfig>, String> {
 
 /// As [`load_server`], with the revocation counters.
 pub fn load_server_tls(f: &ServerTlsFiles) -> Result<ServerTls, String> {
+    load_server_tls_with_crl_state(f, None)
+}
+
+/// As [`load_server_tls`]; with `crl_state`, the CRL high-water marks are
+/// kept in that file too ([`crate::crl::CrlFiles::with_state_file`]).
+pub fn load_server_tls_with_crl_state(
+    f: &ServerTlsFiles,
+    crl_state: Option<&Path>,
+) -> Result<ServerTls, String> {
     let chain = certs("cert_chain", &f.cert_chain)?;
     let key = private_key("key_file", &f.key_file)?;
     let provider = provider();
@@ -498,7 +507,10 @@ pub fn load_server_tls(f: &ServerTlsFiles) -> Result<ServerTls, String> {
             let (v, crl) = crate::crl::client_verifier(
                 Arc::new(roots("client_ca", ca)?),
                 provider,
-                crate::crl::CrlFiles::new("crl_files", &f.crl_files)?,
+                crate::crl::CrlFiles::new("crl_files", &f.crl_files)?.map(|c| match crl_state {
+                    Some(p) => c.with_state_file(p),
+                    None => c,
+                }),
             )
             .map_err(|e| format!("client_ca {}: {e}", ca.display()))?;
             (b.with_client_cert_verifier(v), crl)

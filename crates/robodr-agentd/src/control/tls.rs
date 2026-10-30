@@ -18,7 +18,12 @@
 //!   refused until a fresh CRL is installed. The files are checked for a
 //!   change before every handshake and reloaded **without a restart**
 //!   (replace them with an atomic `rename`); a reload that fails refuses
-//!   every client until fixed. `status.json` reports the counters
+//!   every client until fixed. A CRL must carry a CRL number; of several
+//!   CRLs of one CA the highest number is used, and an older CRL put back
+//!   (lower number) is refused, fail closed. The high-water marks are kept
+//!   in `<control_plane.state_dir>/crl-high-water.json` (when that
+//!   directory exists), so this also holds across restarts.
+//!   `status.json` reports the counters and the CRL in use per CA
 //!   (`control_plane.tls.crl`), a refused revoked client is an
 //!   authentication failure (`robot.agent.control_plane_unauthenticated`,
 //!   reason `Revoked`).
@@ -147,7 +152,10 @@ pub fn spki_sha256(cert: &CertificateDer<'_>) -> Result<[u8; 32], String> {
 
 /// Read a PEM file: absolute, regular (no symlink), owned by `euid` or
 /// root, at most [`MAX_PEM_BYTES`]; `secret`: no group/other bits at all,
-/// else not group/other-writable.
+/// else not group/other-writable. The file is opened first
+/// (`O_NOFOLLOW | O_NONBLOCK`: a symlink fails, a FIFO never blocks) and
+/// every check is made on the opened descriptor, then read from it: no
+/// file swapped in between a check and the read is ever used.
 fn read_pem(what: &str, path: &Path, euid: u32, secret: bool) -> Result<Vec<u8>, String> {
     let shown = path.display();
     if !path.is_absolute() {
@@ -155,13 +163,18 @@ fn read_pem(what: &str, path: &Path, euid: u32, secret: bool) -> Result<Vec<u8>,
             "control_plane.tls.{what} {shown}: must be absolute"
         ));
     }
-    let lmeta = std::fs::symlink_metadata(path)
+    let f = super::fsutil::open_read_nofollow(path).map_err(|e| {
+        if e.raw_os_error() == Some(ELOOP) {
+            format!("control_plane.tls.{what} {shown}: not a regular file (symlinks are refused)")
+        } else if e.kind() == io::ErrorKind::InvalidInput {
+            format!("control_plane.tls.{what} {shown}: not a regular file")
+        } else {
+            format!("control_plane.tls.{what} {shown}: {e}")
+        }
+    })?;
+    let lmeta = f
+        .metadata()
         .map_err(|e| format!("control_plane.tls.{what} {shown}: {e}"))?;
-    if !lmeta.file_type().is_file() {
-        return Err(format!(
-            "control_plane.tls.{what} {shown}: not a regular file (symlinks are refused)"
-        ));
-    }
     let mode = lmeta.permissions().mode() & 0o777;
     if secret && mode & 0o077 != 0 {
         return Err(format!(
@@ -181,10 +194,13 @@ fn read_pem(what: &str, path: &Path, euid: u32, secret: bool) -> Result<Vec<u8>,
             lmeta.uid()
         ));
     }
-    let bytes = super::fsutil::read_capped_nofollow(path, MAX_PEM_BYTES)
+    let bytes = super::fsutil::read_capped_file(f, path, MAX_PEM_BYTES)
         .map_err(|e| format!("control_plane.tls.{what} {shown}: {e}"))?;
     Ok(bytes)
 }
+
+/// `ELOOP` (Linux; `O_NOFOLLOW` on a symlink).
+const ELOOP: i32 = 40;
 
 fn certs(what: &str, path: &Path, pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
     let mut out = Vec::new();
@@ -203,6 +219,17 @@ fn certs(what: &str, path: &Path, pem: &[u8]) -> Result<Vec<CertificateDer<'stat
 impl TlsSection {
     /// Load and check everything; build the rustls server configuration.
     pub fn resolve(&self, euid: u32) -> Result<TlsSpec, String> {
+        self.resolve_with_crl_state(euid, None)
+    }
+
+    /// As [`TlsSection::resolve`]; with `crl_state`, the CRL high-water
+    /// marks are kept in that file too
+    /// ([`robodr_blackbox::crl::CrlFiles::with_state_file`]).
+    pub fn resolve_with_crl_state(
+        &self,
+        euid: u32,
+        crl_state: Option<&Path>,
+    ) -> Result<TlsSpec, String> {
         let chain_pem = read_pem("cert_chain", &self.cert_chain, euid, false)?;
         let chain = certs("cert_chain", &self.cert_chain, &chain_pem)?;
         let key_pem = read_pem("key_file", &self.key_file, euid, true)?;
@@ -256,7 +283,11 @@ impl TlsSection {
             "control_plane.tls.crl_files",
             &files,
             Arc::new(move |p: &Path| read_pem("crl_files", p, euid, false)),
-        )?;
+        )?
+        .map(|c| match crl_state {
+            Some(p) => c.with_state_file(p),
+            None => c,
+        });
         let (config, crl) = server_config(chain, key, roots, &pins, crls)?;
         let client_crls = crl.as_ref().map_or(0, |c| c.status().crls as usize);
         Ok(TlsSpec {
@@ -785,6 +816,82 @@ mod tests {
             assert!(e.contains("ExpiredRevocationList"), "{c}: {e}");
         }
         assert_eq!(spec.crl.unwrap().status().expired_crl_rejections, 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review (TLS, finding 6): `read_pem` checks the opened descriptor:
+    /// a FIFO is refused without blocking, a symlink still refused.
+    #[test]
+    fn read_pem_checks_what_it_opened() {
+        let d = std::env::temp_dir().join(format!("robodr-tls-fd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let euid = crate::config::effective_uid();
+        let fifo = d.join("soc-ca.crl");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f2 = fifo.clone();
+        thread::spawn(move || {
+            let _ = tx.send(read_pem("crl_files", &f2, euid, false));
+        });
+        let r = rx.recv_timeout(Duration::from_secs(5));
+        if r.is_err() {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        let e = r.expect("read_pem blocked on a FIFO").unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        std::fs::copy(data("fx/crl-ca.crl.pem"), d.join("real.crl")).unwrap();
+        std::fs::set_permissions(d.join("real.crl"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::os::unix::fs::symlink(d.join("real.crl"), d.join("link.crl")).unwrap();
+        let e = read_pem("crl_files", &d.join("link.crl"), euid, false).unwrap_err();
+        assert!(e.contains("symlinks are refused"), "{e}");
+        assert!(read_pem("crl_files", &d.join("real.crl"), euid, false).is_ok());
+        std::fs::set_permissions(d.join("real.crl"), std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        let e = read_pem("crl_files", &d.join("real.crl"), euid, false).unwrap_err();
+        assert!(e.contains("chmod 644"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review (TLS, finding 1): with a state file, an older CRL put back
+    /// is refused after a restart too.
+    #[test]
+    fn crl_high_water_survives_a_restart() {
+        let d = std::env::temp_dir().join(format!("robodr-tls-crlhw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let put = |from: &str, to: &str, mode: u32| {
+            let tmp = d.join(format!(".{to}"));
+            std::fs::copy(data(from), &tmp).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).unwrap();
+            std::fs::rename(&tmp, d.join(to)).unwrap();
+        };
+        put("robot.pem", "robot.pem", 0o644);
+        put("robot.key", "robot.key", 0o600);
+        put("fx/crl-ca.pem", "soc-ca.pem", 0o644);
+        put("fx/crl-ca.crl.pem", "soc-ca.crl", 0o644);
+        let sec = TlsSection {
+            cert_chain: d.join("robot.pem"),
+            key_file: d.join("robot.key"),
+            client_ca: d.join("soc-ca.pem"),
+            client_crl: None,
+            crl_files: vec![d.join("soc-ca.crl")],
+            client_spki_sha256: Vec::new(),
+        };
+        let state = d.join(robodr_blackbox::crl::STATE_FILE);
+        let euid = crate::config::effective_uid();
+        let spec = sec.resolve_with_crl_state(euid, Some(&state)).unwrap();
+        let st = spec.crl.unwrap().status();
+        assert_eq!(st.in_use.len(), 1);
+        assert!(state.exists());
+        put("fx/crl-ca-empty.crl.pem", "soc-ca.crl", 0o644);
+        let e = sec.resolve_with_crl_state(euid, Some(&state)).unwrap_err();
+        assert!(e.contains("goes back"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

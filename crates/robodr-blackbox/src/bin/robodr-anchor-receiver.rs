@@ -29,7 +29,8 @@
 //!  "state_dir": "/var/lib/robodr-anchor-receiver",
 //!  "key_file": "/etc/robodr-anchor-receiver/receiver.key",
 //!  "units": [{"unit": "ugv-07",
-//!             "public_key": "/etc/robodr-anchor-receiver/units/ugv-07-blackbox.key.pub"}],
+//!             "public_key": "/etc/robodr-anchor-receiver/units/ugv-07-blackbox.key.pub",
+//!             "client_spki_sha256": ["<64 hex digits>"]}],
 //!  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
 //!  "tls": {"cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
 //!          "key_file": "/etc/robodr-anchor-receiver/tls/receiver.key",
@@ -41,7 +42,14 @@
 //! with `client_ca`, every unit must present a client certificate that
 //! chains to it: mutual TLS; with `crl_files`, that certificate is also
 //! checked against the CRLs, reloaded when the files change, an expired or
-//! unusable CRL refusing every unit: `robodr_blackbox::crl`). Without `tls` it refuses to start unless
+//! unusable CRL refusing every unit: `robodr_blackbox::crl`; the CRL
+//! high-water marks are kept in `<state_dir>/crl-high-water.json`, so an
+//! older CRL put back is refused across restarts too). A unit's
+//! `client_spki_sha256` (SHA-256 of its TLS client certificate's
+//! SubjectPublicKeyInfo; needs `client_ca`) binds `current` queries: only
+//! that certificate reads the unit's head, and it reads no other unit's.
+//! A unit without it can be queried by any accepted client certificate
+//! (logged at start). Without `tls` it refuses to start unless
 //! `"allow_plaintext": true` is set explicitly (lab / private link only;
 //! the marks stay Ed25519-authenticated either way, see
 //! `robodr_blackbox::remote_anchor`, "Transport"). `tls` and
@@ -118,6 +126,9 @@ struct TlsConfig {
 struct UnitConfig {
     unit: String,
     public_key: PathBuf,
+    /// TLS client certificate keys allowed to query this unit's head.
+    #[serde(default)]
+    client_spki_sha256: Vec<String>,
 }
 
 enum Fail {
@@ -222,6 +233,25 @@ fn load_config(path: &Path) -> Result<Config, String> {
     }
     for u in &c.units {
         abs(&format!("units[{}].public_key", u.unit), &u.public_key)?;
+        if u.client_spki_sha256.len() > robodr_blackbox::tls::MAX_PINS {
+            return Err(format!(
+                "units[{}].client_spki_sha256: at most {} keys",
+                u.unit,
+                robodr_blackbox::tls::MAX_PINS
+            ));
+        }
+        for k in &u.client_spki_sha256 {
+            robodr_blackbox::tls::parse_pin(k)
+                .map_err(|e| format!("units[{}].client_spki_sha256: {e}", u.unit))?;
+        }
+    }
+    let bound = c.units.iter().any(|u| !u.client_spki_sha256.is_empty());
+    if bound && c.tls.as_ref().and_then(|t| t.client_ca.as_ref()).is_none() {
+        return Err(
+            "units[].client_spki_sha256 binds client certificates: it needs tls.client_ca \
+             (mutual TLS)"
+                .into(),
+        );
     }
     if let Some(l) = &c.listen {
         l.parse::<std::net::SocketAddr>()
@@ -298,7 +328,15 @@ fn open_receiver(c: &Config) -> Result<AnchorReceiver, String> {
             c.key_file.display()
         )
     })?;
-    AnchorReceiver::open(&c.state_dir, units, Box::new(signer), None)
+    let mut r = AnchorReceiver::open(&c.state_dir, units, Box::new(signer), None)?;
+    let mut bindings = Vec::new();
+    for u in &c.units {
+        for k in &u.client_spki_sha256 {
+            bindings.push((u.unit.clone(), robodr_blackbox::tls::parse_pin(k)?));
+        }
+    }
+    r.set_client_bindings(&bindings)?;
+    Ok(r)
 }
 
 fn serve(raw: &[String]) -> Result<(), Fail> {
@@ -311,16 +349,24 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
         .listen
         .clone()
         .ok_or_else(|| "serve needs \"listen\" in the config".to_string())?;
+    // The receiver first (state directory, lock): the CRL high-water marks
+    // live in its state directory.
+    let r = Arc::new(open_receiver(&c)?);
+    let crl_state = c.state_dir.join(robodr_blackbox::crl::STATE_FILE);
     let (tls, mode) = match &c.tls {
         Some(t) => (
             Some(
-                robodr_blackbox::tls::load_server(&robodr_blackbox::tls::ServerTlsFiles {
-                    cert_chain: t.cert_chain.clone(),
-                    key_file: t.key_file.clone(),
-                    client_ca: t.client_ca.clone(),
-                    crl_files: t.crl_files.clone(),
-                })
-                .map_err(|e| format!("tls: {e}"))?,
+                robodr_blackbox::tls::load_server_tls_with_crl_state(
+                    &robodr_blackbox::tls::ServerTlsFiles {
+                        cert_chain: t.cert_chain.clone(),
+                        key_file: t.key_file.clone(),
+                        client_ca: t.client_ca.clone(),
+                        crl_files: t.crl_files.clone(),
+                    },
+                    Some(&crl_state),
+                )
+                .map_err(|e| format!("tls: {e}"))?
+                .config,
             ),
             if t.client_ca.is_some() {
                 "mutual TLS"
@@ -335,7 +381,16 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
                 .into())
         }
     };
-    let r = Arc::new(open_receiver(&c)?);
+    if c.tls.as_ref().is_some_and(|t| t.client_ca.is_some()) {
+        let unbound = r.unbound_units();
+        if !unbound.is_empty() {
+            eprintln!(
+                "robodr-anchor-receiver: units without client_spki_sha256 (any accepted client \
+                 certificate may query their head): {}",
+                unbound.join(", ")
+            );
+        }
+    }
     let l = TcpListener::bind(&listen).map_err(|e| format!("binding {listen}: {e}"))?;
     let bound = l
         .local_addr()

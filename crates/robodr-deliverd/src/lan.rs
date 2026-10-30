@@ -14,21 +14,33 @@
 //! * **Report**: the unit's signed report goes to the depot; the answer
 //!   may carry a site lease, which the seal directory verifies and
 //!   installs (Sprint 14b).
+//! * **Deadlines**: every read and write re-arms the socket timeout with
+//!   the time left on one deadline (`robodr_blackbox::tls::DeadlineTcp`),
+//!   so a depot (or anything in its place) that trickles bytes cannot hold
+//!   the unit. The connect, the handshake, the request, the answer head and
+//!   the pack listing (or the whole report exchange) share
+//!   `depot.deadline_s`; a pack body then gets `deadline_s` more plus one
+//!   second per MiB listed (a floor rate of 1 MiB/s).
 
 use crate::config::{Config, DepotCfg};
 use crate::engine::Engine;
 use crate::sealing::Sealing;
+use robodr_blackbox::tls::{ClientTls, DeadlineTcp};
 use robodr_pkg::wire::{self, Request};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The media entry the LAN pack lands in.
 pub const LAN_PACK: &str = "depot-lan";
 
-type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+type Tls = rustls::StreamOwned<rustls::ClientConnection, DeadlineTcp>;
+
+/// A pack body may take this many bytes per second at the least (on top of
+/// `deadline_s`).
+const MIN_BODY_RATE: u64 = 1024 * 1024;
 
 fn connect(d: &DepotCfg, sealing: &Sealing) -> Result<Tls, String> {
     let s = sealing.clone();
@@ -48,21 +60,28 @@ fn connect(d: &DepotCfg, sealing: &Sealing) -> Result<Tls, String> {
         },
         sign,
     )?;
+    open(d, &tls)
+}
+
+/// Connect and run the handshake, all within `d.deadline_s` (kept for the
+/// request and the answer head; see the module docs).
+fn open(d: &DepotCfg, tls: &ClientTls) -> Result<Tls, String> {
+    let deadline = Instant::now() + Duration::from_secs(d.deadline_s);
     let addr = d
         .address
         .to_socket_addrs()
         .map_err(|e| format!("{}: {e}", d.address))?
         .next()
         .ok_or_else(|| format!("{}: no address", d.address))?;
-    let deadline = Duration::from_secs(d.deadline_s);
-    let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!("{}: timed out", d.address));
+    }
+    let sock = TcpStream::connect_timeout(&addr, left.min(Duration::from_secs(30)))
         .map_err(|e| format!("{}: {e}", d.address))?;
-    let _ = sock.set_read_timeout(Some(deadline));
-    let _ = sock.set_write_timeout(Some(deadline));
     let name = tls.name_for(&d.server_name)?;
-    let conn =
-        rustls::ClientConnection::new(tls.config.clone(), name).map_err(|e| e.to_string())?;
-    Ok(rustls::StreamOwned::new(conn, sock))
+    robodr_blackbox::tls::connect_client(sock, tls, name, deadline)
+        .map_err(|e| format!("{}: {e}", d.address))
 }
 
 fn read_head(s: &mut Tls) -> Result<(u16, u64), String> {
@@ -152,6 +171,10 @@ fn pull_with(cfg: &Config, skip_same: bool) -> Result<Option<PathBuf>, String> {
     if len != line.len() as u64 + 1 + total {
         return Err("pack stream length does not match its listing".into());
     }
+    // The body: `deadline_s` more, plus one second per MiB listed.
+    s.sock.set_deadline(
+        Instant::now() + Duration::from_secs(d.deadline_s.saturating_add(total / MIN_BODY_RATE)),
+    );
     let stage = cfg.media_dir.join(format!(
         ".lan-{}-{}",
         std::process::id(),
@@ -261,4 +284,64 @@ pub fn lease_from_pack(engine: &mut Engine, pack: &Path) -> Result<bool, String>
     }
     engine.install_lease(&b).map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Review (TLS, finding 5): the LAN client had per-operation timeouts
+    /// only, so a peer trickling one byte at a time (within each timeout)
+    /// held the unit's agent loop for ever. Now one deadline bounds the
+    /// handshake and the exchange.
+    #[test]
+    fn a_trickling_depot_is_cut_at_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut c, _)) = l.accept() else { return };
+            // A TLS record header announcing a large handshake record,
+            // then one byte every 200 ms.
+            if c.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
+                return;
+            }
+            for _ in 0..600 {
+                std::thread::sleep(Duration::from_millis(200));
+                if c.write_all(&[0x02]).is_err() {
+                    return;
+                }
+            }
+        });
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tls");
+        let d = DepotCfg {
+            address: format!("127.0.0.1:{port}"),
+            server_name: "localhost".into(),
+            ca_file: fx.join("ca.pem"),
+            cert_file: fx.join("client.pem"),
+            deadline_s: 1,
+            max_pack_mb: 1,
+        };
+        let tls = robodr_blackbox::tls::load_client(&robodr_blackbox::tls::ClientTlsFiles {
+            ca_file: d.ca_file.clone(),
+            server_name: Some(d.server_name.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            let r = open(&d, &tls).and_then(|mut s| {
+                s.write_all(&wire::encode_request(Request::Pack, "localhost"))
+                    .map_err(|e| e.to_string())?;
+                read_head(&mut s)
+            });
+            let _ = tx.send(r.map(|_| ()));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the LAN client hung on a trickling peer");
+        assert!(r.is_err());
+        assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    }
 }

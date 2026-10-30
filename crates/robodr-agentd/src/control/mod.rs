@@ -348,7 +348,16 @@ impl ControlPlaneSection {
         }
         let tls = match &self.tls {
             None => None,
-            Some(t) => Some(t.resolve(crate::config::effective_uid())?),
+            Some(t) => {
+                // The CRL high-water marks survive a restart in the state
+                // directory (once it exists: it is created at start).
+                let crl_state = std::fs::symlink_metadata(&self.state_dir)
+                    .is_ok_and(|m| m.is_dir())
+                    .then(|| self.state_dir.join(robodr_blackbox::crl::STATE_FILE));
+                Some(
+                    t.resolve_with_crl_state(crate::config::effective_uid(), crl_state.as_deref())?,
+                )
+            }
         };
         Ok(ControlPlaneSpec {
             tcp,

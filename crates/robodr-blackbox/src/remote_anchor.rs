@@ -142,9 +142,17 @@
 //! - With `allow_plaintext` there is no transport confidentiality: marks
 //!   (hashes, seqs) are visible on the wire. They reveal no evidence
 //!   content.
-//! - Mutual TLS authenticates the host, not the unit: any client
-//!   certificate the receiver's `client_ca` accepts may send marks for any
-//!   configured unit; they still have to verify under that unit's key.
+//! - Mutual TLS authenticates the host. A `current` query is bound to
+//!   the client certificate when the unit has bindings
+//!   ([`AnchorReceiver::set_client_bindings`]; the receiver's per-unit
+//!   `client_spki_sha256`): then only a client whose certificate key is
+//!   bound to that unit gets its head, and a client bound to some unit
+//!   gets no other unit's head (refused, `not bound`). Without bindings
+//!   any client certificate the `client_ca` accepts may query any
+//!   configured unit (the answer reveals hashes and seqs, no evidence),
+//!   and the receiver says so at start. `advance` keeps the signature
+//!   model: any client may send marks for any unit; they still have to
+//!   verify under that unit's key.
 
 use crate::crypto::{fill_random, from_hex, hash_from_hex, to_hex};
 use crate::export::Checkpoint;
@@ -698,11 +706,18 @@ impl fmt::Debug for UnitKey {
 pub enum Refusal {
     UnknownUnit(String),
     BadSignature(String),
-    Lower { held: u64, offered: u64 },
-    Fork { seq: u64 },
+    Lower {
+        held: u64,
+        offered: u64,
+    },
+    Fork {
+        seq: u64,
+    },
     Broken(String),
     Storage(String),
     BadRequest(String),
+    /// A `current` query from a client certificate not bound to the unit.
+    NotBound(String),
 }
 
 impl fmt::Display for Refusal {
@@ -717,6 +732,10 @@ impl fmt::Display for Refusal {
             Refusal::Broken(e) => write!(f, "unit state unusable, operator action needed: {e}"),
             Refusal::Storage(e) => write!(f, "storage: {e}"),
             Refusal::BadRequest(e) => write!(f, "bad request: {e}"),
+            Refusal::NotBound(u) => write!(
+                f,
+                "not bound: this client certificate may not query unit {u:?}"
+            ),
         }
     }
 }
@@ -810,6 +829,8 @@ pub struct AnchorReceiver {
     log: LogFn,
     /// Failed TLS handshakes (logged: the first 16, then at powers of two).
     tls_failures: std::sync::atomic::AtomicU64,
+    /// Client certificate SPKI SHA-256 -> the units it may query.
+    bindings: HashMap<[u8; 32], Vec<String>>,
     _lock: File,
 }
 
@@ -902,12 +923,54 @@ impl AnchorReceiver {
             alerts_lock: Mutex::new(alerts_len),
             log,
             tls_failures: std::sync::atomic::AtomicU64::new(0),
+            bindings: HashMap::new(),
             _lock: lock_f,
         };
         for (unit, e) in broken {
             r.write_alert(&unit, "state_unusable", &e, None, None);
         }
         Ok(r)
+    }
+
+    /// Bind `current` queries to client certificates (module docs,
+    /// "Limits"): each `(unit, SPKI SHA-256)` lets a client certificate
+    /// with that key query that unit. A unit with bindings answers only
+    /// its bound clients; a client bound to any unit queries only its
+    /// units. Replaces earlier bindings.
+    pub fn set_client_bindings(&mut self, b: &[(String, [u8; 32])]) -> Result<(), String> {
+        let mut m: HashMap<[u8; 32], Vec<String>> = HashMap::new();
+        for (unit, spki) in b {
+            if !self.units.contains_key(unit) {
+                return Err(format!("client binding for unknown unit {unit:?}"));
+            }
+            let v = m.entry(*spki).or_default();
+            if !v.contains(unit) {
+                v.push(unit.clone());
+            }
+        }
+        self.bindings = m;
+        Ok(())
+    }
+
+    /// Units with no client binding (any client may query them).
+    pub fn unbound_units(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self
+            .units
+            .keys()
+            .filter(|u| !self.bindings.values().any(|b| b.contains(u)))
+            .map(String::as_str)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// May the client with certificate key `client` (`None`: plain TCP or
+    /// no client certificate) query `unit`?
+    fn may_query(&self, client: Option<&[u8; 32]>, unit: &str) -> bool {
+        if let Some(units) = client.and_then(|c| self.bindings.get(c)) {
+            return units.iter().any(|u| u == unit);
+        }
+        !self.bindings.values().any(|b| b.iter().any(|u| u == unit))
     }
 
     /// TLS handshakes that failed since start (no, unknown or expired
@@ -1113,8 +1176,15 @@ impl AnchorReceiver {
         })
     }
 
-    /// Answer one request line (the answer line ends with a newline).
+    /// Answer one request line (the answer line ends with a newline), from
+    /// a client without a certificate (plain TCP, ingest).
     pub fn handle(&self, line: &[u8]) -> Vec<u8> {
+        self.handle_from(line, None)
+    }
+
+    /// As [`AnchorReceiver::handle`], from the client whose certificate
+    /// key has SPKI SHA-256 `client`.
+    pub fn handle_from(&self, line: &[u8], client: Option<&[u8; 32]>) -> Vec<u8> {
         let req = match parse_request(line) {
             Ok(r) => r,
             Err(e) => return error_line(&Refusal::BadRequest(e).to_string()),
@@ -1127,7 +1197,13 @@ impl AnchorReceiver {
                 held_seq: self.held(&m.unit).map(|h| h.seq),
                 ..Default::default()
             }),
-            Request::Current { unit, nonce } => self.current_reply(&unit, &nonce),
+            Request::Current { unit, nonce } => {
+                if self.may_query(client, &unit) {
+                    self.current_reply(&unit, &nonce)
+                } else {
+                    Err(Refusal::NotBound(unit))
+                }
+            }
         };
         match res {
             Ok(r) => {
@@ -1153,8 +1229,8 @@ impl AnchorReceiver {
         // timeout with the time left, so a trickling peer is cut. Writing
         // the answer gets its own `io_timeout`.
         let deadline = Instant::now() + io_timeout;
-        let answer = |r: Result<Vec<u8>, FrameError>| match r {
-            Ok(line) => Some(self.handle(&line)),
+        let answer = |r: Result<Vec<u8>, FrameError>, client: Option<&[u8; 32]>| match r {
+            Ok(line) => Some(self.handle_from(&line, client)),
             Err(FrameError::TooLarge) => {
                 Some(error_line(&format!("request exceeds {MAX_FRAME} bytes")))
             }
@@ -1164,7 +1240,7 @@ impl AnchorReceiver {
             None => {
                 let mut s = DeadlineTcp::new(s);
                 s.set_deadline(deadline);
-                if let Some(a) = answer(read_frame(&mut s, deadline)) {
+                if let Some(a) = answer(read_frame(&mut s, deadline), None) {
                     s.set_deadline(Instant::now() + io_timeout);
                     let _ = s.write_all(&a);
                     let _ = s.flush();
@@ -1186,7 +1262,12 @@ impl AnchorReceiver {
                         return;
                     }
                 };
-                if let Some(a) = answer(read_frame(&mut t, deadline)) {
+                let client = t
+                    .conn
+                    .peer_certificates()
+                    .and_then(|c| c.first())
+                    .and_then(|c| crate::tls::spki_sha256(c).ok());
+                if let Some(a) = answer(read_frame(&mut t, deadline), client.as_ref()) {
                     t.sock.set_deadline(Instant::now() + io_timeout);
                     let _ = t.write_all(&a);
                     let _ = t.flush();
@@ -1990,6 +2071,45 @@ mod tests {
             .broken("ugv-07")
             .unwrap()
             .contains("unparseable"));
+    }
+
+    /// Review (TLS, finding 3): `current` bound to client certificates.
+    #[test]
+    fn current_queries_follow_the_client_bindings() {
+        let d = TmpDir::new("bind");
+        let unit = |u: &str| UnitKey {
+            unit: u.into(),
+            verifier: Box::new(unit_key().verifying_key()),
+        };
+        let mut r = AnchorReceiver::open(
+            &d.0,
+            vec![unit("ugv-07"), unit("ugv-08")],
+            Box::new(receiver_key()),
+            quiet(),
+        )
+        .unwrap();
+        let (a, b, stranger) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let ok = |r: &AnchorReceiver, u: &str, c: Option<&[u8; 32]>| {
+            let ans = r.handle_from(current_request_line(u, &[5; NONCE_LEN]).as_bytes(), c);
+            let v: serde_json::Value = serde_json::from_slice(ans.trim_ascii_end()).unwrap();
+            v["ok"] == true
+        };
+        // No bindings: any client, as before (reported as unbound).
+        assert!(ok(&r, "ugv-08", Some(&a)));
+        assert_eq!(r.unbound_units(), vec!["ugv-07", "ugv-08"]);
+        r.set_client_bindings(&[("ugv-07".into(), a), ("ugv-08".into(), b)])
+            .unwrap();
+        assert!(ok(&r, "ugv-07", Some(&a)));
+        assert!(!ok(&r, "ugv-08", Some(&a)));
+        assert!(ok(&r, "ugv-08", Some(&b)));
+        assert!(!ok(&r, "ugv-07", Some(&stranger)));
+        assert!(!ok(&r, "ugv-07", None));
+        // Only ugv-07 bound: a client bound to it cannot read ugv-08; an
+        // unbound one can.
+        r.set_client_bindings(&[("ugv-07".into(), a)]).unwrap();
+        assert!(!ok(&r, "ugv-08", Some(&a)));
+        assert!(ok(&r, "ugv-08", Some(&stranger)));
+        assert!(r.set_client_bindings(&[("ugv-99".into(), a)]).is_err());
     }
 
     fn client_parts() -> (Ed25519SigningKey, Ed25519SigningKey) {

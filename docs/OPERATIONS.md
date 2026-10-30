@@ -1305,8 +1305,11 @@ without a restart.** To cut off a client certificate, revoke it in the
 client CA's CRL (`openssl ca -revoke`, `openssl ca -gencrl`) and install
 it at a `tls.crl_files` path (PEM or DER X.509 v2 CRLs, up to 16 files;
 the older `client_crl` is one more entry). The files are `stat`ed before
-every handshake and re-read when they change; replace them atomically
-(write, then `mv`). Rules (fail closed, not configurable):
+every handshake and re-read when they change; **replace them by
+rename** (write the new file next to the old one, then `mv` it over): an
+in-place rewrite can be read half-written (a file whose `stat` changes
+during the read is read once more, then the load fails closed). Rules
+(fail closed, not configurable):
 
 - every CA in the chain (each client CA, any intermediate) needs a CRL in
   the files: a certificate whose issuer has none is refused;
@@ -1315,10 +1318,35 @@ every handshake and re-read when they change; replace them atomically
   `nextUpdate` (agentd itself keeps running);
 - a replacement that is unreadable, not a CRL or has bad permissions
   refuses every client until fixed (`status.json`
-  `control_plane.tls.crl.error`).
+  `control_plane.tls.crl.error`);
+- every CRL must carry a **CRL number** (`crlnumber` in the `openssl ca`
+  configuration); one without is refused;
+- **one CRL per CA is used**: when the files hold several CRLs of one
+  issuer (an old CRL left in a bundle next to the new one), the highest
+  CRL number wins and the others are ignored; two different CRLs with the
+  same number are a configuration error. `status.json`
+  `control_plane.tls.crl.in_use` names, per issuer, the CRL number,
+  `thisUpdate` and file in use;
+- **no going back**: an older genuine CRL put back in place (a lower CRL
+  number or an older `thisUpdate` than one already loaded) would
+  un-revoke certificates, so it is refused, fail closed
+  (`rollback_refusals`), until the current CRL is back. agentd keeps these
+  high-water marks in `<control_plane.state_dir>/crl-high-water.json`
+  (and the anchor receiver in `<state_dir>/crl-high-water.json`), so a
+  restart does not reset them: an older CRL then refuses start. Only the
+  marks of CRLs whose signature was verified at load against a trust
+  anchor are written there (a CRL of an intermediate CA is checked at the
+  handshake; its mark lasts for the process). The TLS clients without a
+  state directory (the robot's anchor client, `robodr-uplink`,
+  `robodr-enroll`, `robodr-kafka-publish`) keep the marks per process.
+  Remove the state file only to accept an older CRL on purpose (a CA that
+  was re-keyed and restarted its numbering);
+- a CRL claiming a trust anchor as issuer whose signature does not verify
+  under it is a configuration error at load.
 
 `status.json` `control_plane.tls.crl` counts `reloads`,
-`revoked_rejections` (with `last_revoked_spki_sha256`),
+`reload_failures`, `rollback_refusals`, `revoked_rejections` (with
+`last_revoked_spki_sha256`),
 `expired_crl_rejections` and `unknown_status_rejections`; a refused
 revoked client is also a failed authentication
 (`robot.agent.control_plane_unauthenticated`, reason `Revoked`).
@@ -1330,7 +1358,13 @@ of `robodr-anchor-receiver` for unit certificates), `robodr-kafka-publish
 (`soc.crl_files` in `fleet.json`). TLS clients with CRLs never resume a
 session, so a server revoked after the first connection is refused on the
 next one. The site depot's LAN serving needs none: a unit is revoked by
-its identity key (`robodr-depot`), checked on every request.
+its identity key (`robodr-depot`), checked on every request. It admits at
+most `serve.max_connections` connections, `serve.max_connections_per_source`
+(default 4) from one address, and cuts a peer that has not completed the
+TLS handshake after 10 s. The unit's LAN client (`robodr-deliverd`) bounds
+the connect, handshake, request and answer head by one deadline
+(`depot.deadline_s`; a pack body gets `deadline_s` more plus one second
+per MiB), so a peer trickling bytes cannot hold it.
 
 **No OCSP.** Robots run air-gapped or behind a data diode and cannot reach
 an OCSP responder; a soft-fail OCSP check would protect nothing and a
@@ -1627,9 +1661,17 @@ Limits: tested over loopback with a real receiver process, not across a
 real network. Rollback and truncation become detectable, not prevented;
 the window is the newest marks that have not reached the receiver. With
 `allow_plaintext`, marks (hashes, sequence numbers) are visible on the
-wire. Mutual TLS authenticates the robot's host, not its unit id: any
-certificate `client_ca` accepts may send marks for any configured robot
-(each still has to verify under that robot's key). Revocation by CRL:
+wire. Mutual TLS authenticates the robot's host. Bind each unit's
+`current` queries to its TLS client certificate with
+`units[].client_spki_sha256` (the SHA-256 of the certificate's
+SubjectPublicKeyInfo, `openssl x509 -pubkey -noout | openssl pkey -pubin
+-outform DER | sha256sum`): then only that certificate reads the unit's
+head, and a certificate bound to one unit reads no other (refused `not
+bound`). A unit without it can be queried by any certificate `client_ca`
+accepts (the receiver lists such units at start). Marks keep their
+signature model: any accepted certificate may send marks for any
+configured robot (each still has to verify under that robot's key).
+Revocation by CRL:
 `blackbox.head_anchor.tls.crl_files` on the robot (a revoked receiver
 certificate) and `tls.crl_files` of the receiver (a revoked unit
 certificate), reloaded when the files change, fail closed (the same rules

@@ -10,17 +10,25 @@
 //! name, so one unit's connection can never fetch another unit's pack
 //! (client confusion), and a report must be signed by the same unit's
 //! identity key as the TLS client.
+//!
+//! Slots: at most `serve.max_connections` connections at once, and at most
+//! `serve.max_connections_per_source` from one source address (default 4),
+//! so one host cannot take every slot before authenticating. The TLS
+//! handshake must complete within [`HANDSHAKE_DEADLINE`] (or `deadline_s`,
+//! if shorter); the request head and a report body within
+//! [`REQUEST_DEADLINE`] of the accept.
 
 use crate::config::Config;
 use crate::depot::Depot;
 use crate::{err, DepotError};
 use robodr_pkg::wire::{self, PackListing, Request, StreamFile, PACK_STREAM_FORMAT};
 use rustls::{ServerConnection, StreamOwned};
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The handshake, the request head and a report body must arrive within
@@ -28,6 +36,81 @@ use std::time::{Duration, Instant};
 /// trickles bytes cannot hold one of the `max_connections` slots for
 /// longer. Streaming a pack is bounded by `deadline_s` per write.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The TLS handshake (before the client is known) must complete within
+/// this (or `serve.deadline_s`, if shorter): an unauthenticated peer holds
+/// a slot for at most this long.
+pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Connection slots: at most `max` at once, `per_source` from one address.
+#[derive(Clone)]
+pub struct Slots {
+    inner: Arc<Mutex<SlotCounts>>,
+    max: usize,
+    per_source: usize,
+}
+
+#[derive(Default)]
+struct SlotCounts {
+    live: usize,
+    by_source: HashMap<IpAddr, usize>,
+}
+
+/// A taken slot; released when dropped.
+pub struct Slot {
+    slots: Slots,
+    source: IpAddr,
+}
+
+impl Slots {
+    pub fn new(max: usize, per_source: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SlotCounts::default())),
+            max: max.max(1),
+            per_source: per_source.max(1),
+        }
+    }
+
+    /// A slot for a connection from `source`, if one is free.
+    pub fn take(&self, source: IpAddr) -> Option<Slot> {
+        let mut c = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = c.by_source.get(&source).copied().unwrap_or(0);
+        if c.live >= self.max || from >= self.per_source {
+            return None;
+        }
+        c.live += 1;
+        c.by_source.insert(source, from + 1);
+        Some(Slot {
+            slots: self.clone(),
+            source,
+        })
+    }
+
+    /// Connections open now.
+    pub fn live(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .live
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut c = self
+            .slots
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        c.live = c.live.saturating_sub(1);
+        if let Some(n) = c.by_source.get_mut(&self.source) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                c.by_source.remove(&self.source);
+            }
+        }
+    }
+}
 
 /// The clock the server judges reports and leases on.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -60,25 +143,24 @@ pub fn serve(
         .clone()
         .ok_or_else(|| err("no serve configuration"))?;
     let tls = server_config(&cfg)?;
-    let (max, deadline) = (s.max_connections, Duration::from_secs(s.deadline_s));
+    let deadline = Duration::from_secs(s.deadline_s);
     listener
         .set_nonblocking(true)
         .map_err(|e| err(e.to_string()))?;
-    let live = Arc::new(AtomicUsize::new(0));
+    let slots = Slots::new(s.max_connections, s.max_connections_per_source);
     let cfg = Arc::new(cfg);
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((sock, _)) => {
-                if live.load(Ordering::SeqCst) >= max {
+            Ok((sock, peer)) => {
+                let Some(slot) = slots.take(peer.ip()) else {
                     drop(sock);
                     continue;
-                }
+                };
                 let _ = sock.set_nonblocking(false);
-                let (c, t, l, k) = (cfg.clone(), tls.clone(), live.clone(), clock.clone());
-                l.fetch_add(1, Ordering::SeqCst);
+                let (c, t, k) = (cfg.clone(), tls.clone(), clock.clone());
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     let _ = handle(sock, t, &c, deadline, &k);
-                    l.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -140,19 +222,22 @@ pub fn handle(
     deadline: Duration,
     clock: &Clock,
 ) -> Result<(), DepotError> {
-    let _ = sock.set_write_timeout(Some(deadline));
+    let _ = sock.set_write_timeout(Some(deadline.min(HANDSHAKE_DEADLINE)));
     let conn = ServerConnection::new(tls).map_err(|e| err(e.to_string()))?;
+    let start = Instant::now();
     let sock = Timed {
         sock,
-        until: Instant::now() + deadline.min(REQUEST_DEADLINE),
+        until: start + deadline.min(HANDSHAKE_DEADLINE),
     };
     let mut s = StreamOwned::new(conn, sock);
-    // Drive the handshake.
+    // Drive the handshake (short deadline: the client is not known yet).
     while s.conn.is_handshaking() {
         s.conn
             .complete_io(&mut s.sock)
             .map_err(|e| err(format!("TLS handshake: {e}")))?;
     }
+    s.sock.until = start + deadline.min(REQUEST_DEADLINE);
+    let _ = s.sock.sock.set_write_timeout(Some(deadline));
     let spki = s
         .conn
         .peer_certificates()
@@ -253,4 +338,108 @@ fn stream_pack(s: &mut impl Write, files: &[(String, PathBuf)]) -> Result<(), De
         }
     }
     s.flush().map_err(|e| err(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn idle(port: u16) -> TcpStream {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        c
+    }
+
+    /// `true` once the server closed `c` (EOF / reset), `false` if it is
+    /// still open after `wait`.
+    fn closed_within(c: &mut TcpStream, wait: Duration) -> bool {
+        let t0 = Instant::now();
+        let mut b = [0u8; 16];
+        while t0.elapsed() < wait {
+            match c.read(&mut b) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// Review (TLS, finding 4): one source address cannot take every slot
+    /// before authenticating (per-source cap), and a peer that never
+    /// completes the handshake is cut at the short handshake deadline, not
+    /// at the request deadline.
+    #[test]
+    fn one_source_cannot_hold_every_slot_before_the_handshake() {
+        let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tls");
+        let d = std::env::temp_dir().join(format!("robodr-depot-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("tls")).unwrap();
+        for (from, mode) in [
+            ("server.pem", 0o644),
+            ("server.key", 0o600),
+            ("ca.pem", 0o644),
+        ] {
+            let to = d.join("tls").join(from);
+            std::fs::copy(fx.join(from), &to).unwrap();
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let mut v: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../config/depot.example.json")).unwrap();
+        v["state_dir"] = d.to_str().unwrap().into();
+        v["serve"]["deadline_s"] = 600.into();
+        v["serve"]["max_connections"] = 16.into();
+        v["serve"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_connections_per_source");
+        let cfg = Config::parse(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let th = std::thread::spawn(move || serve(cfg, l, s2, Arc::new(|| 0)));
+        // The default per-source cap (4) is taken by idle peers ...
+        let mut held: Vec<TcpStream> = (0..4).map(|_| idle(port)).collect();
+        std::thread::sleep(Duration::from_millis(300));
+        // ... so a fifth connection from the same address is closed at once.
+        let mut fifth = idle(port);
+        assert!(closed_within(&mut fifth, Duration::from_secs(3)));
+        // The held ones are cut at the handshake deadline (10 s), well
+        // before the 30 s request deadline.
+        let t0 = Instant::now();
+        let first = held.first_mut().unwrap();
+        assert!(closed_within(first, Duration::from_secs(20)));
+        let after = t0.elapsed();
+        assert!(
+            after < HANDSHAKE_DEADLINE + Duration::from_secs(3),
+            "{after:?}"
+        );
+        stop.store(true, Ordering::SeqCst);
+        th.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn slots_are_bounded_in_all_and_per_source() {
+        let s = Slots::new(3, 2);
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let a1 = s.take(a).unwrap();
+        let _a2 = s.take(a).unwrap();
+        assert!(s.take(a).is_none());
+        let _b1 = s.take(b).unwrap();
+        assert!(s.take(b).is_none(), "all slots taken");
+        drop(a1);
+        assert_eq!(s.live(), 2);
+        assert!(s.take(a).is_some());
+    }
 }

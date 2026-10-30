@@ -62,7 +62,8 @@ JSON, unknown fields refused, paths absolute:
  "state_dir": "/var/lib/robodr\-anchor\-receiver",
  "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver.key",
  "units": [{"unit": "ugv\-07",
-            "public_key": "/etc/robodr\-anchor\-receiver/units/ugv\-07.pub"}],
+            "public_key": "/etc/robodr\-anchor\-receiver/units/ugv\-07.pub",
+            "client_spki_sha256": ["<64 hex digits>"]}],
  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
  "tls": {"cert_chain": "/etc/robodr\-anchor\-receiver/tls/receiver.pem",
          "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver\-tls.key",
@@ -73,7 +74,13 @@ JSON, unknown fields refused, paths absolute:
 \fBkey_file\fR is an Ed25519 secret key file (\fBrobodr\-blackbox keygen\fR,
 mode 0600); the robots get its \fB.pub\fR. \fBunit\fR is the robot id;
 \fBpublic_key\fR the robot's black\-box public key file (a key bound to a
-device must name that robot).
+device must name that robot). \fBclient_spki_sha256\fR (optional, needs
+\fBtls.client_ca\fR) lists the SHA\-256 of the robot's TLS client
+certificate SubjectPublicKeyInfo: only such a certificate may query the
+robot's head (\fBcurrent\fR), and it may query no other robot's (refused
+\fBnot bound\fR). Robots without it can be queried by any accepted client
+certificate; \fBserve\fR lists them at start. Marks (\fBadvance\fR) are
+accepted from any client and must verify under the robot's key.
 .PP
 \fBserve\fR speaks TLS: \fBtls.cert_chain\fR and \fBtls.key_file\fR are the
 receiver's certificate chain and key (key: no access for others, no group
@@ -81,6 +88,10 @@ write); with \fBtls.client_ca\fR every robot must present a client
 certificate chaining to it (mutual TLS); with \fBtls.crl_files\fR (PEM or
 DER CRLs of that CA, re\-read when they change) a revoked robot certificate
 is refused, and so is every robot while a CRL is expired or unusable.
+Every CRL needs a CRL number; of several CRLs of one CA the highest number
+is used; an older CRL put back (lower number) is refused, fail closed, also
+across restarts (\fIstate_dir\fR\fB/crl\-high\-water.json\fR). Replace CRL
+files by rename.
 Without \fBtls\fR, \fBserve\fR exits
 2 unless \fB"allow_plaintext": true\fR is set (lab or private link only);
 both together are refused. \fBio_timeout_ms\fR bounds a whole connection,
@@ -102,7 +113,8 @@ Marks and answers are authenticated with Ed25519 whatever the transport; TLS
 adds confidentiality and, with \fBclient_ca\fR, keeps unknown hosts out. A
 network attacker can drop marks or answers (the robot counts anchor
 failures) but cannot make the receiver go back or a robot accept a lower
-mark. Mutual TLS authenticates hosts, not unit ids; no CRL or OCSP check.
+mark. Mutual TLS authenticates hosts; \fBclient_spki_sha256\fR binds a
+robot's head queries to its certificate. Revocation by CRL only, no OCSP.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-blackbox (1)
