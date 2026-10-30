@@ -264,18 +264,11 @@ pub fn run(
                     // a backlog the gateway drains after a scheduling stall
                     // must keep the sender's spacing, or its frames would be
                     // refused as "too early". Never decreasing.
-                    let mono = sys::monotonic_ns();
-                    let real = sys::realtime_ns();
-                    let delay = p.timestamp.and_then(|(s, us)| {
-                        let t = s
-                            .checked_mul(1_000_000_000)?
-                            .checked_add(us.checked_mul(1_000)?)?;
-                        real.checked_sub(t)
-                    });
+                    let (arrival, delay) =
+                        queue_timing(sys::monotonic_ns(), sys::realtime_ns(), p.timestamp);
                     if delay.is_some() {
                         stamped += 1;
                     }
-                    let arrival = delay.map_or(mono, |d| mono.saturating_sub(d));
                     let now = arrival.max(last_now);
                     last_now = now;
                     let meta = PacketMeta {
@@ -430,20 +423,54 @@ impl Events {
     }
 }
 
+/// The packet's arrival on `CLOCK_MONOTONIC` and its queue delay, from
+/// the clocks read now (`mono`, `real`, ns) and the kernel's receive
+/// timestamp (`CLOCK_REALTIME` seconds, microseconds). A timestamp **after**
+/// `real` (the wall clock was stepped back while the packet waited, or a
+/// bogus stamp) has no meaningful delay: it is reported as late
+/// (`u64::MAX`, the firewall's fault verdict) rather than as "no timestamp"
+/// (gateway review, finding 8), and the arrival is `mono`.
+pub fn queue_timing(mono: u64, real: u64, stamp: Option<(u64, u64)>) -> (u64, Option<u64>) {
+    let t = stamp.and_then(|(s, us)| {
+        s.checked_mul(1_000_000_000)?
+            .checked_add(us.checked_mul(1_000)?)
+    });
+    match t {
+        None if stamp.is_some() => (mono, Some(u64::MAX)),
+        None => (mono, None),
+        Some(t) => match real.checked_sub(t) {
+            Some(d) => (mono.saturating_sub(d), Some(d)),
+            None => (mono, Some(u64::MAX)),
+        },
+    }
+}
+
 /// Apply the restriction watcher's latest read (`latest`, `None`: nothing
 /// new) to the gateway; an expired restriction is lifted whatever was
 /// read (the gateway enforces the TTL itself). Returns the read error to
 /// report, or the previous one when nothing new arrived.
+///
+/// Gateway review, finding 8: the file's `expires_unix_ms` is wall clock;
+/// it is converted **once**, when a restriction is applied, into a
+/// deadline on the monotonic clock (`now_mono_ms` + the time left), and
+/// that deadline alone lifts it. A wall-clock step (NTP, an operator, a
+/// forged time source) neither ends a restriction early nor extends it;
+/// re-reading the same file does not move the deadline.
 pub fn apply_restriction(
     gw: &mut Gateway,
     latest: Option<Result<Option<crate::restrict::Restriction>, String>>,
     previous_error: Option<String>,
     now_unix_ms: u64,
+    now_mono_ms: u64,
 ) -> Option<String> {
     let err = match latest {
         None => previous_error,
+        // The one in force, read again: its monotonic deadline rules.
+        Some(Ok(Some(r))) if gw.restriction() == Some(&r) => None,
         Some(Ok(Some(r))) if !r.expired(now_unix_ms) => {
+            let left = r.expires_unix_ms.saturating_sub(now_unix_ms);
             gw.set_restriction(Some(r));
+            gw.set_restriction_deadline_ms(Some(now_mono_ms.saturating_add(left)));
             None
         }
         Some(Ok(_)) => {
@@ -454,8 +481,19 @@ pub fn apply_restriction(
         // its own expiry, and the status says why.
         Some(Err(e)) => Some(e),
     };
-    if gw.restriction().is_some_and(|r| r.expired(now_unix_ms)) {
-        gw.set_restriction(None);
+    if let Some(r) = gw.restriction() {
+        let deadline = match gw.restriction_deadline_ms() {
+            Some(d) => d,
+            None => {
+                // Applied without one (directly): convert now.
+                let d = now_mono_ms.saturating_add(r.expires_unix_ms.saturating_sub(now_unix_ms));
+                gw.set_restriction_deadline_ms(Some(d));
+                d
+            }
+        };
+        if now_mono_ms >= deadline {
+            gw.set_restriction(None);
+        }
     }
     err
 }
@@ -467,6 +505,7 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
         latest,
         events.restriction_error.clone(),
         sys::realtime_ns() / 1_000_000,
+        sys::monotonic_ns() / 1_000_000,
     );
     if err.is_some() && err != events.restriction_error {
         eprintln!(

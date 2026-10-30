@@ -660,8 +660,12 @@ commands decided after it; a trajectory the controller already accepted
 keeps executing at its accepted speeds (review F9; `safe_pause` stops
 it). Low-level joint channels (`LowCmd_`, arm SDK, hands) are
 **not** restricted (scaling a balance controller's targets is not a speed
-limit). The gateway lifts it at `expires_unix_ms` itself (wall clock), so
-a restriction ends at its TTL even with the executor down; a malformed,
+limit). The gateway lifts it at its TTL itself, so a restriction ends even
+with the executor down: `expires_unix_ms` (wall clock) is converted once,
+when the restriction is applied, into a deadline on the monotonic clock,
+and only that deadline ends it (gateway review, finding 8: a wall-clock
+step forward used to lift it at once; re-reading the same file does not
+move the deadline); a malformed,
 symlinked, non-regular, wrongly owned or group / world-writable file is ignored with a warning and status
 `restriction_error` (the restriction in force keeps its own expiry). The
 status file's `restriction.id` is what the executor reads back to verify.
@@ -787,7 +791,10 @@ spacing (otherwise its frames would be refused as "too early"). Without a
 timestamp the processing time is used. A sender's own timestamps
 (`INFO_TS`) are never used. A packet read more than `max_queue_delay_ns`
 (default 5 ms) after its arrival gets the firewall's **fault verdict**
-(`fault_policy`; a humanoid holds) instead of a check.
+(`fault_policy`; a humanoid holds) instead of a check. So does a packet
+whose receive timestamp lies after the wall clock (the clock was stepped
+back while it waited): its delay is unknown, so it counts as late
+(gateway review, finding 8; it used to count as "no timestamp").
 
 ## Values: `f64` decisions on an `f32` wire
 

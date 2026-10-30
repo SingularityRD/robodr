@@ -441,6 +441,9 @@ pub struct Gateway {
     pub findings: GatewayFindings,
     /// The `restrict_motion` restriction in force (`crate::restrict`).
     restriction: Option<Restriction>,
+    /// When the restriction in force ends, on the monotonic clock (ms;
+    /// `crate::runtime::apply_restriction`, gateway review finding 8).
+    restriction_deadline_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -780,6 +783,7 @@ impl Gateway {
             stats: GatewayStats::default(),
             findings: GatewayFindings::default(),
             restriction: None,
+            restriction_deadline_ms: None,
         })
     }
 
@@ -829,6 +833,20 @@ impl Gateway {
                 ..Detail::reason(reason)
             });
         self.restriction = r;
+        self.restriction_deadline_ms = None;
+    }
+
+    /// The monotonic deadline (ms) of the restriction in force, if set.
+    pub fn restriction_deadline_ms(&self) -> Option<u64> {
+        self.restriction_deadline_ms
+    }
+
+    /// Set the monotonic deadline of the restriction in force (ignored
+    /// without one).
+    pub fn set_restriction_deadline_ms(&mut self, d: Option<u64>) {
+        if self.restriction.is_some() {
+            self.restriction_deadline_ms = d;
+        }
     }
 
     /// Note a gateway finding on channel `ci` (`crate::findings`).
