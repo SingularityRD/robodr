@@ -233,3 +233,20 @@ fn firewall_gw_packet_smoke() {
         &firewall_gw_packet::run,
     );
 }
+
+/// libFuzzer find (CI fuzz smoke): flags 0b101 selects the G1 channels
+/// fixture (bit 2 overrides bit 0), which has no Go1 legacy channels, so a
+/// datagram to the Go1 `HighCmd` port is an unconfigured port and is
+/// forwarded untouched. The harness used to arm the "forwarded Go1 frame
+/// has a valid CRC" invariant from bit 0 alone. The full libFuzzer input is
+/// committed as `fuzz/corpus/firewall_gw_packet/regress-channels-go1-port.bin`.
+#[test]
+fn channels_fixture_does_not_arm_the_go1_invariant() {
+    firewall_gw_packet::run(&[0b101, 0, 0, 2]);
+    firewall_gw_packet::run(&[0b101, 4, 0, 3, 1, 2, 3, 4]);
+    let full = std::fs::read(
+        smoke::corpus_dir(DIR, "firewall_gw_packet").join("regress-channels-go1-port.bin"),
+    )
+    .unwrap();
+    firewall_gw_packet::run(&full);
+}

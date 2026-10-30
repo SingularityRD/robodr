@@ -181,9 +181,9 @@ pub fn p256_random() -> Result<p256::SecretKey, SealError> {
 
 /// SEC1 uncompressed bytes of a P-256 public key.
 pub fn p256_public_bytes(k: &p256::PublicKey) -> [u8; P256_PUBLIC_LEN] {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     let mut out = [0u8; P256_PUBLIC_LEN];
-    let p = k.to_encoded_point(false);
+    let p = k.to_sec1_point(false);
     out.copy_from_slice(p.as_bytes());
     out
 }

@@ -1781,10 +1781,14 @@ fn review_finding_8_rollback_program_must_be_protected() {
     std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o775)).unwrap();
     let out = e.submit(&rb("rb8a"), &mut state(SafetyState::Idle), now());
     assert_eq!(out.status, Status::Failed, "{out:?}");
-    assert!(
-        out.error.as_deref().unwrap_or("").contains("writable"),
-        "{out:?}"
-    );
+    // Not root (a CI runner): the file is the test user's, so the ownership
+    // check refuses it before the mode check is reached.
+    let why = if robodr_blackbox::keys::effective_uid() == 0 {
+        "writable"
+    } else {
+        "not root"
+    };
+    assert!(out.error.as_deref().unwrap_or("").contains(why), "{out:?}");
     assert!(!log.exists(), "a writable program was run");
     // In a directory others can write: refused too.
     std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();

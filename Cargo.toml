@@ -140,7 +140,7 @@ x25519-dalek = { version = "2", default-features = false, features = ["static_se
 # - P-256: ECDH to a unit's TPM-resident UWK (the TPM side is
 #   `tpm2_ecdhzgen`) and ECDSA for the signed PCR policy
 #   (`TPM2_PolicyAuthorize` verifies it in the TPM; TPMs do not do Ed25519).
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
 # TLS for robodr-uplink (crates/robodr-export, ingest API client). rustls with
 # the `ring` provider only: no aws-lc-rs (CMake + a large C library), no
 # `logging` (no `log` output of handshake details), TLS 1.3 and 1.2 (rustls
