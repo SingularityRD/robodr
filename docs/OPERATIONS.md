@@ -1344,9 +1344,19 @@ sudo systemctl restart robodr-agentd
   `max_connections_per_source` (default 2): raise it if several SOC
   workers share one NAT address. The unix socket has its own 2 slots, so
   an operator on the robot is never locked out by network peers. Rejected
-  connections count in `connections_rejected`.
+  connections count in `connections_rejected`. When the pre-authentication
+  slots are full, a new connection cuts the oldest handshake older than
+  `pre_auth_evict_after_ms` (default 100; raise it if the SOC's link has
+  long round trips), counted in `connections_evicted`. **Set
+  `soc_sources`** to the SOC's egress networks (e.g.
+  `["203.0.113.0/28"]`): they get `reserved_connections` (default 1) slots
+  of their own and cut any unlisted handshake when they need room, so a
+  TLS slowloris from other addresses cannot lock the SOC out (W2-4). Keep
+  the `IPAddressAllow=` drop-in (§6.4) as well: it stops unlisted peers
+  before agentd sees them.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
-  `last_auth_failure`, `connections_rejected`, `recorded_not_executed`,
+  `last_auth_failure`, `connections_rejected`, `connections_evicted`,
+  `recorded_not_executed`,
   `refused`, `busy`, `rate_limited`, `journal_errors`, `replay_fence`,
   `state.refusing_new_request_ids`, `evidence`) and the
   findings `robot.agent.control_plane_unauthenticated` (High: someone

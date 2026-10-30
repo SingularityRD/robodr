@@ -1508,3 +1508,143 @@ fn request_journal_tail_damage_is_rebuilt_from_the_black_box() {
         "no request was judged twice"
     );
 }
+
+// ---------------------------------------------------------------------
+// W2-4 / T39: TLS slowloris against the control plane's pre-auth slots.
+// ---------------------------------------------------------------------
+
+/// A local IPv4 address that is not loopback (the SOC's source address in
+/// the slowloris test: the attacker uses 127.0.0.1). A UDP `connect` sends
+/// nothing; it only picks the route's source address.
+fn second_local_ipv4() -> Option<std::net::Ipv4Addr> {
+    [
+        "192.0.2.1:9",
+        "10.255.255.1:9",
+        "198.51.100.1:9",
+        "8.8.8.8:9",
+    ]
+    .into_iter()
+    .find_map(|dst| {
+        let u = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        u.connect(dst).ok()?;
+        match u.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(v) if !v.is_loopback() && !v.is_unspecified() => Some(v),
+            _ => None,
+        }
+    })
+}
+
+fn mtls_at(ip: std::net::Ipv4Addr, port: u16, client: &str, r: &Req) -> Result<Resp, String> {
+    let tcp = TcpStream::connect((ip, port)).map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let conn = rustls::ClientConnection::new(
+        tls_client(Some(client)),
+        ServerName::try_from("127.0.0.1").unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+    exchange_raw(rustls::StreamOwned::new(conn, tcp), &request_bytes(r))
+}
+
+/// RESULTS.md S2 (W2-4): an unauthenticated peer that keeps reopening TLS
+/// handshakes and trickles their bytes kept every pre-authentication slot
+/// busy, and the SOC got 3/20 and 1/20 requests through during the attack.
+/// With `soc_sources`, the SOC's address has a reserved slot and cuts an
+/// attacker's handshake when it needs one: 20/20 while the attack runs.
+#[test]
+fn slowloris_cannot_lock_the_listed_soc_out() {
+    let Some(soc_ip) = second_local_ipv4() else {
+        eprintln!("skipped: this host has no non-loopback IPv4 address for the SOC");
+        return;
+    };
+    let s = setup("cp-slowloris", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let soc_pub = write_soc_pub(&s.dir);
+    let port = free_port();
+    let mut cfg = base_config(&s, &events);
+    cfg["control_plane"] = json!({
+        "listen_tcp": format!("0.0.0.0:{port}"),
+        "tls": tls_section(&s.dir, &[&spki_pin("soc")]),
+        "state_dir": state_dir(&s),
+        "soc_keys": [soc_pub],
+        "rate_per_minute": 600,
+        "burst": 100,
+        // One attacker address may fill every general slot (the same as
+        // S2's many addresses holding two each).
+        "max_connections": 4,
+        "max_connections_per_source": 4,
+        "soc_sources": [soc_ip.to_string()],
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let base = format!("/api/v2/robots/{ROBOT}");
+    let req = signed("GET", &base, b"");
+    let r = wait_for(5, "mTLS listener", || {
+        mtls_at(soc_ip, port, "soc", &req).ok()
+    });
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    // The attacker: 8 connections from 127.0.0.1, each sending a TLS
+    // ClientHello's first bytes one every 100 ms, reopened when cut.
+    let attack = Arc::new(AtomicBool::new(true));
+    let opened = Arc::new(AtomicU64::new(0));
+    let hello: Vec<u8> = [
+        0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03,
+    ]
+    .into_iter()
+    .chain(std::iter::repeat_n(0x42, 32))
+    .collect();
+    let attackers: Vec<_> = (0..8)
+        .map(|_| {
+            let (attack, opened, hello) = (attack.clone(), opened.clone(), hello.clone());
+            std::thread::spawn(move || {
+                while attack.load(Ordering::Relaxed) {
+                    let Ok(mut c) = TcpStream::connect(("127.0.0.1", port)) else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    };
+                    opened.fetch_add(1, Ordering::Relaxed);
+                    for b in &hello {
+                        if !attack.load(Ordering::Relaxed) || c.write_all(&[*b]).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+        })
+        .collect();
+    // Let the attack take every general slot.
+    wait_for(10, "attack under way", || {
+        let st = status(&s.spool)?;
+        let cp = &st["control_plane"];
+        (opened.load(Ordering::Relaxed) >= 8
+            && cp["connections_rejected"].as_u64()? + cp["connections_evicted"].as_u64()? > 0)
+            .then_some(())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let mut ok = 0;
+    let mut failures = Vec::new();
+    for _ in 0..20 {
+        let req = signed("GET", &base, b"");
+        match mtls_at(soc_ip, port, "soc", &req) {
+            Ok(r) if r.status == 200 => {
+                check_answer(&req, &r);
+                ok += 1;
+            }
+            other => failures.push(format!("{other:?}")),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    attack.store(false, Ordering::Relaxed);
+    for a in attackers {
+        a.join().unwrap();
+    }
+    let st = status(&s.spool).unwrap();
+    finish(stop, h);
+    assert_eq!(ok, 20, "SOC requests during the attack: {failures:?}");
+    let cp = &st["control_plane"];
+    assert!(
+        cp["connections_evicted"].as_u64().unwrap() > 0,
+        "the attacker's stale handshakes were cut: {cp}"
+    );
+}

@@ -45,9 +45,20 @@ that as "not applied", never as success.
   be in the TLS handshake or before their request authenticated, and
   another `max_connections` authenticated ones; one source address holds at
   most `max_connections_per_source` (default 2, 1..=16) of all of them.
-  Over a cap the connection is closed at accept (no answer;
-  `connections_rejected`); an authenticated request that finds no
-  authenticated slot is answered 503 `busy` (signed).
+  When every pre-authentication slot a new connection may use is busy, it
+  cuts the **oldest** pre-authentication connection that has spent
+  `pre_auth_evict_after_ms` (default 100, 100..=5000) in its handshake or
+  request read (`connections_evicted`; the cut peer sees the connection
+  close); a source at its per-source share only cuts one of its own.
+  `soc_sources` (up to 16 networks, `"10.20.0.0/24"` or an address) gets
+  `reserved_connections` (default 1, 1..=4) extra pre-authentication
+  slots nobody else may take, and a connection from a listed address cuts
+  an unlisted peer's handshake at once; an unlisted connection never cuts a
+  listed one, and authenticated connections are never cut. `soc_sources`
+  is about availability only: a listed address still needs the client
+  certificate and a SOC key. Otherwise over a cap the connection is closed
+  at accept (no answer; `connections_rejected`); an authenticated request
+  that finds no authenticated slot is answered 503 `busy` (signed).
 * Answers are JSON (`Content-Type: application/json`) except evidence chunks
   (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
 * **Listeners** (at least one):
@@ -1166,8 +1177,13 @@ another robot), 13 (signed in the removed v1 domain); all 401
 * A network attacker without the client certificate can still make the TLS
   listener spend handshakes (bounded by `max_connections`, the per-source
   cap and the 5 s deadline, which a byte-at-a-time peer cannot stretch) and
-  drop or delay requests and answers; from several source addresses it can
-  keep every TCP pre-authentication slot busy (never the unix socket's).
+  drop or delay requests and answers. From several source addresses,
+  reopening handshakes faster than `pre_auth_evict_after_ms`, it can still
+  keep the general TCP pre-authentication slots busy (never the unix
+  socket's); the SOC's own addresses, configured as `soc_sources`, keep a
+  reserved slot and cut the attacker's handshakes (W2-4: 20/20 SOC requests
+  during the attack, `slowloris_cannot_lock_the_listed_soc_out`). Without
+  `soc_sources` the SOC competes with the attacker for the general slots.
 * Tested with synthetic traffic, an in-process signing client and an
   OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
   not against a deployed SOC or across a real network.
