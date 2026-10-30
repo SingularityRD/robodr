@@ -1648,3 +1648,109 @@ fn slowloris_cannot_lock_the_listed_soc_out() {
         "the attacker's stale handshakes were cut: {cp}"
     );
 }
+
+// ---------------------------------------------------------------------
+// T67 (GAP-07 scopes): per-SOC-key actions and TTL limit.
+// ---------------------------------------------------------------------
+
+/// Every configured SOC key could request every action with any TTL. A
+/// scoped `soc_keys` entry now bounds both: outside them the request is
+/// refused 403 (signed, recorded in the black box, reported as
+/// `control_plane_invalid`) and never judged.
+#[test]
+fn a_scoped_soc_key_is_held_to_its_actions_and_ttl() {
+    let s = setup("cp-scope", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let control = s.dir.join("control.sock");
+    let soc_pub = write_soc_pub(&s.dir);
+    let mut cfg = base_config(&s, &events);
+    cfg["control_plane"] = json!({
+        "unix_socket": control,
+        "state_dir": state_dir(&s),
+        "soc_keys": [{
+            "path": soc_pub,
+            "allowed_actions": ["record_evidence", "isolate_network"],
+            "max_ttl_seconds": 300,
+        }],
+        "rate_per_minute": 600,
+        "burst": 100,
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(5, "control socket", || UnixStream::connect(&control).ok());
+    let base = format!("/api/v2/robots/{ROBOT}");
+    let requests = format!("{base}/action-requests");
+
+    // The snapshot tells the SOC what this key may ask for.
+    let req = signed("GET", &base, b"");
+    let r = unix(&control, &req);
+    assert_eq!(r.status, 200, "{}", r.body);
+    check_answer(&req, &r);
+    assert_eq!(
+        r.body["key_scope"],
+        json!({"key_id": SOC_ID, "allowed_actions": ["isolate_network", "record_evidence"],
+               "max_ttl_seconds": 300})
+    );
+
+    let post = |id: &str, action: &str, params: Value, ttl: Option<u64>| {
+        let req = signed("POST", &requests, &submit_body(id, action, params, ttl));
+        let r = unix(&control, &req);
+        check_answer(&req, &r);
+        r
+    };
+    // Outside the key's actions.
+    let r = post(
+        "robot_restrict_motion:ugv-007:00000000000000a1",
+        "restrict_motion",
+        json!({"max_linear_speed": 0.5}),
+        Some(60),
+    );
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_str()),
+        (403, Some("action_not_permitted")),
+        "{}",
+        r.body
+    );
+    // Above the key's TTL limit (within the protocol's 86400).
+    let r = post(
+        "robot_isolate_network:ugv-007:00000000000000a2",
+        "isolate_network",
+        json!({}),
+        Some(301),
+    );
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_str()),
+        (403, Some("ttl_above_key_limit")),
+        "{}",
+        r.body
+    );
+    // In scope: judged and recorded as before.
+    let r = post(
+        "robot_isolate_network:ugv-007:00000000000000a3",
+        "isolate_network",
+        json!({}),
+        Some(300),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = post(
+        "robot_record_evidence:ugv-007:00000000000000a4",
+        "record_evidence",
+        json!({}),
+        None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    // Reported like an invalid body.
+    wait_for(10, "control_plane_invalid finding", || {
+        rules(&spooled(&s.spool))
+            .iter()
+            .any(|r| r == "robot.agent.control_plane_invalid")
+            .then_some(())
+    });
+    finish(stop, h);
+    let rejected = notes(&s.blackbox, "robodr.control_plane_rejected");
+    let codes: Vec<&str> = rejected
+        .iter()
+        .filter_map(|n| n["error"]["code"].as_str())
+        .collect();
+    assert_eq!(codes, ["action_not_permitted", "ttl_above_key_limit"]);
+    assert_eq!(notes(&s.blackbox, "robodr.control_plane_request").len(), 2);
+}

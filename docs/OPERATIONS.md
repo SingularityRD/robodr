@@ -1268,7 +1268,15 @@ sudo systemctl restart robodr-agentd
 - The SOC key file must be a public Ed25519 key file owned by root (or
   `robodr`), not writable by group or others, not a symlink; a `device_id`
   in it must be this robot. Never list the robot's own black-box or finding
-  key (refused). The TLS key file must have no group/other bits (the
+  key (refused). **Scope SOC keys** that do not need every action: a
+  `soc_keys` entry `{"path": "/etc/robodr/soc/tier1.pub",
+  "allowed_actions": ["record_evidence", "isolate_network"],
+  "max_ttl_seconds": 900}` lets that key request (and revert) only those
+  actions, with at most that TTL; anything else is answered 403 and
+  reported as `robot.agent.control_plane_invalid` (contract §4.2). Keep
+  the unscoped key (all seven actions) with the people who may ask for
+  `safe_pause` / `request_safe_state`. The executor does not apply these
+  scopes yet (contract §4.2). The TLS key file must have no group/other bits (the
   systemd credential copy has none); certificate files must not be
   group/other-writable.
 - The SOC signs every request (contract §2) and needs a clock within

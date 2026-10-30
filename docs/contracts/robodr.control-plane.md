@@ -234,8 +234,15 @@ A method a path does not take is 405 `method_not_allowed`; an unknown path
  "mode": "enforce", "health": "ok", "executor": "recording", "executes_actions": false,
  "morphology": "wheeled_mobile",
  "actions": ["restrict_motion", "quarantine_node", "isolate_network", "record_evidence",
-             "safe_pause", "request_safe_state", "rollback_config"]}
+             "safe_pause", "request_safe_state", "rollback_config"],
+ "key_scope": {"key_id": "soc:soc-a:1",
+               "allowed_actions": ["isolate_network", "record_evidence"],
+               "max_ttl_seconds": 900}}
 ```
+
+`key_scope` is the asking key's scope (§4.2): the actions it may request
+and revert and the longest `ttl_seconds` it may give (all seven and
+86400 for an unscoped key). Additive since the T67 revision.
 
 `morphology` is the response policy's (`unspecified` when it declares
 none). `actions` lists only what this robot may be asked for: an action
@@ -308,6 +315,42 @@ Body errors are answered with an HTTP error (§7) and recorded
 `invalid_parameter`, `ttl_required`, `ttl_out_of_range`, `ttl_not_allowed`,
 `authority_not_allowed`, `invalid_request_id`, `invalid_field`,
 `invalid_request`.
+
+### 4.2 Per-key scopes (`control_plane.soc_keys`)
+
+A `soc_keys` entry is either a key file path (the key may request every
+action with any valid `ttl_seconds`) or a scoped key:
+
+```json
+"soc_keys": [
+  "/etc/robodr/soc/soc-ir-lead.pub",
+  {"path": "/etc/robodr/soc/soc-tier1.pub",
+   "allowed_actions": ["record_evidence", "isolate_network"],
+   "max_ttl_seconds": 900}
+]
+```
+
+`allowed_actions`: 1..=7 distinct catalog names (absent: every action);
+`max_ttl_seconds`: 1..=86400 (absent: 86400). agentd checks the scope of
+the key that signed the request **before** anything else about it (before
+the `request_id` is looked up, so an out-of-scope request learns nothing
+about other requests): a submission whose action is not allowed is
+refused **403 `action_not_permitted`**, one whose `ttl_seconds` is above
+the key's limit **403 `ttl_above_key_limit`**. A revert is refused
+`action_not_permitted` when the stored request's action is not in the
+reverting key's scope (a key lifts only what it may ask for; an unknown
+id is still 404). Both are answered signed, recorded as
+`robodr.control_plane_rejected` (§8) and reported as
+`robot.agent.control_plane_invalid` (Medium), never judged. GET, the
+snapshot (`key_scope`, §3.1) and the evidence API are not scoped.
+
+Limits: the scope is enforced by agentd. robodr-executor verifies the
+SOC signature on every order itself (§6a) but does not yet apply these
+scopes (planned with the executor's own key configuration), so a
+compromised agentd process could still pass it an out-of-scope request
+that a configured SOC key signed. The robot still cannot verify the SOC's
+internal approval process (the two-person names are asserted by the SOC,
+§4).
 
 ### 4.1 Judgment (Cyber-Jidoka)
 
@@ -682,6 +725,8 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * 401: `missing_credentials`, `malformed_credentials`, `unknown_key`,
   `bad_signature`, `stale_timestamp` (also: the replay fence, §2),
   `replayed_nonce`;
+* 403 (signed; the request authenticated, its key is not allowed it,
+  §4.2): `action_not_permitted`, `ttl_above_key_limit`;
 * 404: `not_found`, `unknown_robot`, `unknown_request`, `unknown_export`,
   `unknown_chunk`, `evidence_disabled`, `no_records`,
   `evidence_not_retained`;
@@ -1368,3 +1413,21 @@ Additive, no version change (`robodr-control-plane/v2`); with
   answer carries them back with `containment`. **Upgrade the executor
   first** (as for R2-7): an older executor does not understand an order
   with these fields, and agentd answers the request `failed`.
+
+### Revision: per-key scopes and slowloris slots (T67, T39 / W2-4, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`).
+
+* **Per-key scopes** (§4.2): a `soc_keys` entry may be
+  `{"path", "allowed_actions", "max_ttl_seconds"}`. Requests outside the
+  signing key's scope are answered **403** `action_not_permitted` /
+  `ttl_above_key_limit` (signed, recorded, reported as
+  `control_plane_invalid`); a revert needs the stored action in the
+  reverting key's scope. Plain path entries keep the old behaviour. New
+  in the snapshot (§3.1): `key_scope`. A SOC client should treat 403 as
+  final, like a 400.
+* **Pre-authentication slots** (§1, §13): the oldest stale handshake is
+  cut when the slots are full (`pre_auth_evict_after_ms`,
+  `connections_evicted`), and `soc_sources` get `reserved_connections`
+  slots of their own. A SOC client may see a connection closed during
+  its TLS handshake under load (it retries, as for a refused connect).

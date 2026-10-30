@@ -54,7 +54,10 @@
 //!   parameters, TTL rules (`safe_pause` / `request_safe_state` are refused
 //!   on a humanoid: it would fall); no motion command, no override. A
 //!   valid signature does not widen this: an authenticated but invalid
-//!   body is refused (400) and recorded. Evidence: read-only exports of
+//!   body is refused (400) and recorded. A scoped key ([`SocKeyEntry`],
+//!   [`auth::KeyScope`]) may request and revert only its
+//!   `allowed_actions`, with at most its `max_ttl_seconds`; outside them
+//!   it is refused (403) and recorded the same way. Evidence: read-only exports of
 //!   black-box frames, never key material.
 //! * **What happens.** Nothing reaches the robot: the request is judged and
 //!   recorded. A refusal is final (never retried here).
@@ -179,8 +182,10 @@ pub struct ControlPlaneSection {
     /// Private directory of the persistent state: request journal, replay
     /// store, evidence exports (absolute; mode 0700, owned by the daemon).
     pub state_dir: PathBuf,
-    /// SOC public key files (`robodr-blackbox keygen` `.pub`, Ed25519).
-    pub soc_keys: Vec<PathBuf>,
+    /// SOC public key files (`robodr-blackbox keygen` `.pub`, Ed25519):
+    /// a path (every action), or `{"path", "allowed_actions",
+    /// "max_ttl_seconds"}` to scope the key ([`SocKeyEntry`]).
+    pub soc_keys: Vec<SocKeyEntry>,
     /// Allowed |robot clock - request timestamp|, 1..=300 s.
     #[serde(default = "default_skew")]
     pub max_clock_skew_s: u64,
@@ -233,6 +238,115 @@ pub struct ControlPlaneSection {
     pub evidence: Option<evidence::EvidenceSection>,
 }
 
+/// One entry of `control_plane.soc_keys` (T67): a key file path, which may
+/// request every action with any valid `ttl_seconds`, or a scoped key:
+///
+/// ```json
+/// {"path": "/etc/robodr/soc/tier1.pub",
+///  "allowed_actions": ["record_evidence", "restrict_motion"],
+///  "max_ttl_seconds": 900}
+/// ```
+///
+/// `allowed_actions` (1..=7 distinct catalog names; absent: every action)
+/// bounds what the key may request **and revert**; `max_ttl_seconds`
+/// (1..=86400; absent: 86400) bounds the TTL it may give.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Value")]
+pub struct SocKeyEntry {
+    pub path: PathBuf,
+    pub allowed_actions: Option<Vec<String>>,
+    pub max_ttl_seconds: Option<u64>,
+}
+
+impl TryFrom<Value> for SocKeyEntry {
+    type Error = String;
+
+    fn try_from(v: Value) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Scoped {
+            path: PathBuf,
+            #[serde(default)]
+            allowed_actions: Option<Vec<String>>,
+            #[serde(default)]
+            max_ttl_seconds: Option<u64>,
+        }
+        match v {
+            Value::String(p) => Ok(Self {
+                path: PathBuf::from(p),
+                allowed_actions: None,
+                max_ttl_seconds: None,
+            }),
+            Value::Object(_) => {
+                let s: Scoped = serde_json::from_value(v).map_err(|e| {
+                    format!(
+                        "control_plane.soc_keys entry: {e} (fields: path, allowed_actions, \
+                         max_ttl_seconds)"
+                    )
+                })?;
+                Ok(Self {
+                    path: s.path,
+                    allowed_actions: s.allowed_actions,
+                    max_ttl_seconds: s.max_ttl_seconds,
+                })
+            }
+            _ => Err(
+                "control_plane.soc_keys entry: a key file path or {\"path\", \
+                 \"allowed_actions\", \"max_ttl_seconds\"}"
+                    .into(),
+            ),
+        }
+    }
+}
+
+impl SocKeyEntry {
+    /// Validate the scope (the key itself is loaded by [`load_soc_key`]).
+    pub fn scope(&self) -> Result<auth::KeyScope, String> {
+        let shown = self.path.display();
+        let allowed_actions = match &self.allowed_actions {
+            None => None,
+            Some(names) => {
+                if names.is_empty() {
+                    return Err(format!(
+                        "control_plane.soc_keys {shown}: allowed_actions is empty (remove the \
+                         key instead, or omit the field for every action)"
+                    ));
+                }
+                let mut set = std::collections::BTreeSet::new();
+                for n in names {
+                    let a = api::ActionKind::parse(n).ok_or_else(|| {
+                        format!(
+                            "control_plane.soc_keys {shown}: allowed_actions {:?} is not a \
+                             catalog action ({})",
+                            robodr_ros2_pipeline::sanitize(n),
+                            api::ActionKind::ALL.map(api::ActionKind::as_str).join(", ")
+                        )
+                    })?;
+                    if !set.insert(a) {
+                        return Err(format!(
+                            "control_plane.soc_keys {shown}: allowed_actions lists {} twice",
+                            a.as_str()
+                        ));
+                    }
+                }
+                Some(set)
+            }
+        };
+        let max_ttl_seconds = self.max_ttl_seconds.unwrap_or(api::MAX_TTL_SECONDS);
+        if !(1..=api::MAX_TTL_SECONDS).contains(&max_ttl_seconds) {
+            return Err(format!(
+                "control_plane.soc_keys {shown}: max_ttl_seconds = {max_ttl_seconds}: must be \
+                 1..={}",
+                api::MAX_TTL_SECONDS
+            ));
+        }
+        Ok(auth::KeyScope {
+            allowed_actions,
+            max_ttl_seconds,
+        })
+    }
+}
+
 /// A validated [`ControlPlaneSection`] with its keys and TLS loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneSpec {
@@ -242,6 +356,8 @@ pub struct ControlPlaneSpec {
     pub unix_mode: u32,
     pub state_dir: PathBuf,
     pub keys: Vec<SocKey>,
+    /// Each key's scope (T67), by key id.
+    pub scopes: BTreeMap<String, auth::KeyScope>,
     pub skew_s: u64,
     pub rate_per_minute: u32,
     pub burst: u32,
@@ -393,7 +509,10 @@ impl ControlPlaneSection {
             ));
         }
         let mut keys: Vec<SocKey> = Vec::new();
-        for p in &self.soc_keys {
+        let mut scopes: BTreeMap<String, auth::KeyScope> = BTreeMap::new();
+        for e in &self.soc_keys {
+            let p = &e.path;
+            let scope = e.scope()?;
             let k = load_soc_key(p, robot_id)?;
             if keys.iter().any(|o| o.key_id == k.key_id) {
                 return Err(format!(
@@ -409,6 +528,7 @@ impl ControlPlaneSection {
                     robodr_ros2_pipeline::sanitize(&k.key_id)
                 ));
             }
+            scopes.insert(k.key_id.clone(), scope);
             keys.push(k);
         }
         let tls = match &self.tls {
@@ -431,6 +551,7 @@ impl ControlPlaneSection {
             unix_mode,
             state_dir: self.state_dir.clone(),
             keys,
+            scopes,
             skew_s: self.max_clock_skew_s,
             rate_per_minute: self.rate_per_minute,
             burst: self.burst,
@@ -450,7 +571,7 @@ impl ControlPlaneSection {
     pub fn paths(&self) -> Vec<&Path> {
         let mut v: Vec<&Path> = vec![self.state_dir.as_path()];
         v.extend(self.unix_socket.as_deref());
-        v.extend(self.soc_keys.iter().map(PathBuf::as_path));
+        v.extend(self.soc_keys.iter().map(|e| e.path.as_path()));
         if let Some(t) = &self.tls {
             v.extend([
                 t.cert_chain.as_path(),
@@ -879,6 +1000,7 @@ impl ControlPlane {
         engine.stats.resolved_aborted = st.resolved_aborted as u64;
         engine.stats.journal_damaged = st.journal_damaged as u64;
         engine.refuse_ids(lost, st.refusing_new_request_ids.clone());
+        engine.set_key_scopes(spec.scopes.clone());
         // The replay store: fenced if it cannot be trusted.
         let (replay, rload) =
             ReplayGuard::persistent(dir, spec.skew_s, auth::MAX_NONCES, now_s, &sealing).map_err(
@@ -2745,6 +2867,128 @@ mod tests {
             .unwrap_err()
             .contains("own"));
         assert_eq!(s.resolve("ugv-007", &[]).unwrap().keys.len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// T39: `soc_sources`, `reserved_connections`, `pre_auth_evict_after_ms`.
+    #[test]
+    fn soc_sources_config_is_checked() {
+        let s = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "listen_tcp": "127.0.0.1:1", "state_dir": "/var/lib/x", "soc_keys": []
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            section(v).unwrap().resolve("r", &[]).unwrap_err()
+        };
+        // Valid settings get as far as the (missing) keys.
+        for ok in [
+            serde_json::json!({"soc_sources": ["10.0.0.0/8", "192.0.2.7"]}),
+            serde_json::json!({"soc_sources": ["10.0.0.0/8"], "reserved_connections": 4}),
+            serde_json::json!({"pre_auth_evict_after_ms": 5000}),
+        ] {
+            assert!(s(ok.clone()).contains("at least one"), "{ok}");
+        }
+        assert!(s(serde_json::json!({"soc_sources": ["10.0.0.1/8"]})).contains("host bits"));
+        assert!(s(serde_json::json!({"soc_sources": ["soc.example"]})).contains("soc_sources"));
+        let many: Vec<String> = (0..17).map(|i| format!("10.0.{i}.0/24")).collect();
+        assert!(s(serde_json::json!({"soc_sources": many})).contains("at most 16"));
+        assert!(s(serde_json::json!({"reserved_connections": 1})).contains("which is not set"));
+        assert!(
+            s(serde_json::json!({"soc_sources": ["10.0.0.0/8"], "reserved_connections": 5}))
+                .contains("reserved_connections")
+        );
+        assert!(
+            s(serde_json::json!({"soc_sources": ["10.0.0.0/8"], "reserved_connections": 0}))
+                .contains("reserved_connections")
+        );
+        assert!(s(serde_json::json!({"pre_auth_evict_after_ms": 99}))
+            .contains("pre_auth_evict_after_ms"));
+        assert!(s(serde_json::json!({"pre_auth_evict_after_ms": 5001}))
+            .contains("pre_auth_evict_after_ms"));
+        // Unix socket only: nothing to reserve.
+        let v = serde_json::json!({
+            "unix_socket": "/run/x/c.sock", "state_dir": "/var/lib/x", "soc_keys": [],
+            "soc_sources": ["10.0.0.0/8"]
+        });
+        assert!(section(v)
+            .unwrap()
+            .resolve("r", &[])
+            .unwrap_err()
+            .contains("applies to listen_tcp"));
+    }
+
+    /// T67: `soc_keys` entries may scope a key.
+    #[test]
+    fn soc_key_scopes_are_parsed_and_checked() {
+        let d = tmp("scopes");
+        let k = robodr_blackbox::KeyFile::ed25519_from_seed(&[7; 32], Some("soc-t1")).unwrap();
+        let p = d.join("t1.pub");
+        k.to_public().unwrap().write_new(&p).unwrap();
+        let k2 = robodr_blackbox::KeyFile::ed25519_from_seed(&[8; 32], Some("soc-all")).unwrap();
+        let p2 = d.join("all.pub");
+        k2.to_public().unwrap().write_new(&p2).unwrap();
+        let resolve = |keys: serde_json::Value| {
+            section(serde_json::json!({
+                "listen_tcp": "127.0.0.1:1", "state_dir": "/var/lib/x", "soc_keys": keys
+            }))
+            .map_err(|e| e.to_string())
+            .and_then(|s| s.resolve("ugv-007", &[]))
+        };
+        let spec = resolve(serde_json::json!([
+            {"path": p, "allowed_actions": ["record_evidence", "isolate_network"],
+             "max_ttl_seconds": 900},
+            p2,
+        ]))
+        .unwrap();
+        assert_eq!(spec.keys.len(), 2);
+        let t1 = &spec.scopes["soc-t1"];
+        assert_eq!(t1.actions(), ["isolate_network", "record_evidence"]);
+        assert_eq!(t1.max_ttl_seconds, 900);
+        assert_eq!(spec.scopes["soc-all"], auth::KeyScope::unrestricted());
+        // Only max_ttl_seconds: every action, the shorter TTL.
+        let spec = resolve(serde_json::json!([{"path": p, "max_ttl_seconds": 60}])).unwrap();
+        assert_eq!(spec.scopes["soc-t1"].actions().len(), 7);
+        assert_eq!(spec.scopes["soc-t1"].max_ttl_seconds, 60);
+        for (bad, why) in [
+            (
+                serde_json::json!([{"path": p, "allowed_actions": []}]),
+                "empty",
+            ),
+            (
+                serde_json::json!([{"path": p, "allowed_actions": ["fly_away"]}]),
+                "not a catalog action",
+            ),
+            (
+                serde_json::json!([{"path": p, "allowed_actions": ["robot_safe_pause"]}]),
+                "not a catalog action",
+            ),
+            (
+                serde_json::json!([{"path": p, "allowed_actions": ["safe_pause", "safe_pause"]}]),
+                "twice",
+            ),
+            (
+                serde_json::json!([{"path": p, "max_ttl_seconds": 0}]),
+                "max_ttl_seconds",
+            ),
+            (
+                serde_json::json!([{"path": p, "max_ttl_seconds": 86401}]),
+                "max_ttl_seconds",
+            ),
+            (
+                serde_json::json!([{"path": p, "scopes": ["all"]}]),
+                "unknown field",
+            ),
+            (
+                serde_json::json!([{"allowed_actions": ["safe_pause"]}]),
+                "missing field",
+            ),
+            (serde_json::json!([42]), "a key file path"),
+        ] {
+            let e = resolve(bad.clone()).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
