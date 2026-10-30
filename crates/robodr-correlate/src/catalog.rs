@@ -123,6 +123,12 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.deliver.refused",
     "robot.deliver.stale",
     "robot.deliver.chain_gap",
+    // robodr-deliverd sealing (captured-unit protection, Sprint 13c,
+    // contract 2.3): spooled directly by the delivery agent as above.
+    "robot.seal.unseal_failed",
+    "robot.seal.lease_expired",
+    "robot.seal.erased",
+    "robot.seal.tamper",
     // robodr-agentd self-health (always observe-only downstream)
     "robot.agent.input_silent",
     "robot.agent.input_ended",
