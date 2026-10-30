@@ -883,15 +883,24 @@ impl Gateway {
 
     /// Feed one NFLOG copy (either side) to the WebRTC monitor
     /// (`crate::webrtc`). `mono_ns` is the decision clock, `wall_ns` Unix
-    /// time (deny windows). Never changes or drops anything.
-    pub fn observe_webrtc(&mut self, pkt: &[u8], mono_ns: u64, wall_ns: u64) {
-        use robodr_ros2_pipeline::webrtc::{decode_ipv4, FlowPacket};
+    /// time (deny windows), `src_mac` the copy's link-layer source
+    /// (`NFULA_HWADDR`; checked against a controller's MAC binding). Never
+    /// changes or drops anything.
+    pub fn observe_webrtc(
+        &mut self,
+        pkt: &[u8],
+        mono_ns: u64,
+        wall_ns: u64,
+        src_mac: Option<[u8; 6]>,
+    ) {
+        use robodr_ros2_pipeline::webrtc::{decode_ipv4, tcp_flags, FlowPacket};
         let Some(m) = self.webrtc.as_mut() else {
             return;
         };
         let Some((l4, src, src_port, dst, dst_port, payload)) = decode_ipv4(pkt) else {
             return;
         };
+        let tcp_flags = tcp_flags(pkt).unwrap_or(0);
         let found = m.process(&FlowPacket {
             wall_ns,
             mono_ns,
@@ -900,7 +909,8 @@ impl Gateway {
             src_port,
             dst: dst.into(),
             dst_port,
-            src_mac: None,
+            src_mac,
+            tcp_flags,
             payload,
         });
         for d in found {

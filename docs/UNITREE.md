@@ -437,7 +437,7 @@ In short:
 | `rt/lowcmd` (Go2, B2, H1) | `unitree_go_lowcmd` | as above; a quadruped may damp after the hold (`fail_behaviour`) |
 | `rt/api/sport/request` | `unitree_sport_request` | `Move` speed limited (parameter rewritten), a rejected `Move` replaced by the hold / zero; other calls only if `allowed_api_ids` lists them (`StopMove` always) |
 | Go1 UDP 8082 / 8007 | `go1_high_cmd` / `go1_low_cmd` or `go1_low_cmd_compressed` | `HighCmd` velocity limited / held, other modes by `allowed_high_modes`; `LowCmd` as `rt/lowcmd`, in the declared (734 B) or, with `go1_low_cmd_compressed`, the compressed (614 B, what v3.8.6 clients send) form (fixed-point `tau` / `Kp` / `Kd` rounded to the safe side); a non-zero `bms.off` (battery off) is refused on both |
-| `rt/lowcmd` (A2, AS2) | `unitree_a2_lowcmd` | as `unitree_go_lowcmd`, for the **inferred** go `LowCmd_`: starts only with `require_crc`, the type recorded in the locked profile (learned on the robot) and without `bypass` |
+| `rt/lowcmd` (A2, AS2) | `unitree_a2_lowcmd` | as `unitree_go_lowcmd`, for the **inferred** go `LowCmd_`: starts only with `require_crc`, the type recorded in the locked profile (learned on the robot) and without `bypass`; set the gateway's top-level `robot_model: a2` / `as2` so that a `unitree_go_lowcmd` or `allow_battery_off` configuration is refused |
 | Go2 WebRTC (TCP 8081 / 9991, ICE / DTLS) | `webrtc` section (not a codec) | sessions detected and attributed from NFLOG copies (findings `robot.unitree.webrtc_*`); `block_unlisted` drops signalling from non-controllers; `webrtc-block` quarantines a peer or flow; the encrypted content is never decoded or limited (section 5.2) |
 | `rt/api/sport/request` (G1, H2, R1: ids 7xxx), `rt/api/loco/request` (H1: ids 8xxx) | `unitree_loco_request` (`robot_model` required) | `SetVelocity` / `Move` limited and their duration capped (`max_velocity_duration_s`); every `SetFsmId` (`Damp`, `ZeroTorque`, posture changes, **and `Start`**) and the hand-over calls refused unless `allowed_fsm_ids` / `allowed_api_ids` list them; queries pass. A humanoid configured with `unitree_sport_request` is refused at start |
 | `rt/arm_sdk` (G1, H1-2, H2, R1 `hg`; H1 `go`) | `unitree_hg_arm_sdk` / `unitree_go_arm_sdk` | every slot with gains or torque decided whatever its mode octet; the blend weight (`weight_slot`) bounded, step and rate limited, and its rise from 0 checked against the robot's `rt/lowstate` (below) |
@@ -540,10 +540,15 @@ sensor that does not hold the keys**; RoboDR does not try. With a
   `webrtc_concurrent_sessions` (`max_sessions`), `webrtc_relayed_session`
   (TURN or a non-local peer: remote control via a cloud relay),
   `webrtc_media_without_signalling` (signalled over Wi-Fi / another path);
+  each once per peer session (a peer that comes back is reported again),
+  non-Critical ones rate limited per minute with an aggregate count; the
+  MAC binding is checked on every packet the gateway copies;
 * from the plaintext legacy offer, keeps metadata only (ICE user fragment,
   fingerprint hash, candidates, media kinds; the `token` by length);
 * blocks: `action: block_unlisted` drops signalling from hosts that are not
-  `controllers`; a running session is quarantined by peer or by flow
+  `controllers` and from a MAC-bound controller's IP with another MAC
+  (each drop logged first, so the refused host is still reported); a
+  running session is quarantined by peer or by flow
   (`robodr-firewall-gw webrtc-block --peer ... --flow ...` prints the
   `nft` command; the findings name the flows).
 

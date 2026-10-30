@@ -363,7 +363,7 @@ fn drain_observed(log: &mut Option<nflog::Log>, gw: &mut Gateway, robot_side: bo
                         .checked_add(us.checked_mul(1_000)?)
                 })
                 .unwrap_or(real);
-            gw.observe_webrtc(p.payload, meta.now_ns, wall);
+            gw.observe_webrtc(p.payload, meta.now_ns, wall, p.hw_addr);
             if robot_side {
                 gw.observe(p.payload, meta);
             }

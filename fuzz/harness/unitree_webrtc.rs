@@ -82,6 +82,7 @@ pub fn run(data: &[u8]) {
             dst,
             dst_port: dp,
             src_mac: None,
+            tcp_flags: 0,
             payload: rec,
         }) {
             assert!(d.rule_str().starts_with("robot.unitree.webrtc_"));

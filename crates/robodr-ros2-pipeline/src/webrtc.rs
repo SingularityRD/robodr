@@ -43,6 +43,18 @@
 //! what the inline gateway needs to block the session by flow
 //! (`robodr-firewall-gw`, `webrtc` section).
 //!
+//! **Deduplication and floods.** A finding is reported once per peer
+//! **session**: its keys are forgotten when the session ends (idle for
+//! `session_idle_ns`) or its record is evicted, so a peer that comes back
+//! (for example after a quarantine expired) is reported again. At most
+//! [`MAX_FINDINGS_PER_WINDOW`] non-Critical findings are reported per
+//! [`FINDING_WINDOW_NS`]; the rest are counted per rule and reported in
+//! aggregate when the next window starts. The Critical finding (an
+//! unlisted controller's **established** session) is never rate limited.
+//! When the peer table is full, a peer that is not established and has
+//! sent a single packet (a spoofed source) is evicted first; an
+//! established session last.
+//!
 //! # Limits (be honest)
 //!
 //! * No command inside a WebRTC session is ever seen: a session from an
@@ -127,9 +139,20 @@ pub const DEFAULT_SIGNALLING_PORTS: [u16; 2] = [8081, 9991];
 pub const DEFAULT_MAX_PEERS: usize = 64;
 /// Most flows remembered per peer.
 pub const MAX_FLOWS_PER_PEER: usize = 8;
-/// Most (rule, key) pairs remembered for "report once"; beyond that a new
-/// finding is counted in [`WebRtcStats::findings_suppressed`].
-pub const MAX_REPORTED: usize = 1024;
+/// Most findings remembered per peer session for "report once" (the keys
+/// are forgotten with the session, so a peer that comes back is reported
+/// again).
+pub const MAX_REPORTED: usize = 32;
+/// Most peers remembered as "known" for [`rules::NEW_PEER`] (oldest
+/// forgotten first).
+pub const MAX_KNOWN: usize = 1024;
+/// Length of a rate-limit window (ns).
+pub const FINDING_WINDOW_NS: u64 = 60_000_000_000;
+/// Most non-Critical findings reported one by one per window; beyond that
+/// they are counted per rule and reported in aggregate at the start of the
+/// next window ("N further ... suppressed"). Critical findings (an
+/// unlisted controller's **established** session) are never suppressed.
+pub const MAX_FINDINGS_PER_WINDOW: u32 = 32;
 /// Largest HTTP header section read (bytes).
 pub const MAX_HTTP_HEADER: usize = 8192;
 /// Largest signalling body inspected for SDP metadata (bytes).
@@ -506,6 +529,9 @@ pub enum SignallingKind {
     WebSocket,
     /// Any other HTTP request on a signalling port.
     OtherHttp,
+    /// A TCP connection attempt (SYN) to a signalling port: what the inline
+    /// gateway logs for signalling it drops (`block_unlisted`).
+    TcpConnect,
 }
 
 /// Metadata of a plaintext SDP (never the session keys: SDP has none, the
@@ -680,7 +706,24 @@ pub struct FlowPacket<'a> {
     pub dst_port: u16,
     /// The link-layer source, when the capture has it.
     pub src_mac: Option<[u8; 6]>,
+    /// TCP flags ([`TCP_SYN`], ...); 0 for UDP.
+    pub tcp_flags: u8,
     pub payload: &'a [u8],
+}
+
+/// TCP SYN flag.
+pub const TCP_SYN: u8 = 0x02;
+/// TCP ACK flag.
+pub const TCP_ACK: u8 = 0x10;
+
+/// The TCP flags byte of an IPv4 / TCP packet (`None` for anything else
+/// or a fragment).
+pub fn tcp_flags(p: &[u8]) -> Option<u8> {
+    let ihl = usize::from(*p.first()? & 0x0f) * 4;
+    if *p.first()? >> 4 != 4 || *p.get(9)? != 6 || be16(p, 6)? & 0x3fff != 0 {
+        return None;
+    }
+    p.get(ihl.checked_add(13)?).copied()
 }
 
 /// `(transport, source, source port, destination, destination port,
@@ -922,6 +965,12 @@ pub struct PeerSession {
     /// TURN methods or ChannelData seen (a relay).
     pub relayed: bool,
     pub listed: bool,
+    /// Packets seen (eviction prefers peers with one packet: spoofed
+    /// single-packet sources).
+    pub packets: u64,
+    /// Findings already reported for this session (forgotten with it).
+    #[serde(skip)]
+    reported: BTreeSet<String>,
 }
 
 impl PeerSession {
@@ -964,10 +1013,16 @@ pub struct WebRtcStats {
 pub struct WebRtcMonitor {
     opts: WebRtcOptions,
     peers: BTreeMap<IpAddr, PeerSession>,
-    /// Peers ever seen with a session (for [`rules::NEW_PEER`]), bounded
-    /// like `reported`.
+    /// Peers ever seen with a session (for [`rules::NEW_PEER`]), at most
+    /// [`MAX_KNOWN`], oldest forgotten first.
     known: BTreeSet<IpAddr>,
-    reported: BTreeSet<(&'static str, String)>,
+    known_order: std::collections::VecDeque<IpAddr>,
+    /// Rate limit: start of the current window, findings reported in it,
+    /// and per rule the findings suppressed in it (count, worst severity,
+    /// latest peer).
+    window_start: Option<u64>,
+    window_count: u32,
+    suppressed: BTreeMap<&'static str, (u64, Severity, IpAddr)>,
     pub stats: WebRtcStats,
 }
 
@@ -984,7 +1039,10 @@ impl WebRtcMonitor {
             opts,
             peers: BTreeMap::new(),
             known: BTreeSet::new(),
-            reported: BTreeSet::new(),
+            known_order: std::collections::VecDeque::new(),
+            window_start: None,
+            window_count: 0,
+            suppressed: BTreeMap::new(),
             stats: WebRtcStats::default(),
         }
     }
@@ -1003,23 +1061,78 @@ impl WebRtcMonitor {
         self.peers.get(peer)
     }
 
+    /// Report `rule` for `peer`'s session once per `key`, under the
+    /// window rate limit (Critical findings bypass it).
     fn report(
         &mut self,
         out: &mut Vec<Deviation>,
+        peer: IpAddr,
         rule: &'static str,
         key: String,
         sev: Severity,
         detail: String,
     ) {
-        if self.reported.contains(&(rule, key.clone())) {
+        let full_key = format!("{rule}/{key}");
+        let Some(s) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        if s.reported.contains(&full_key) {
             return;
         }
-        if self.reported.len() >= MAX_REPORTED {
+        if s.reported.len() >= MAX_REPORTED {
             self.stats.findings_suppressed += 1;
             return;
         }
-        self.reported.insert((rule, key));
+        s.reported.insert(full_key);
+        if sev != Severity::Critical {
+            if self.window_count >= MAX_FINDINGS_PER_WINDOW {
+                self.stats.findings_suppressed += 1;
+                let e = self.suppressed.entry(rule).or_insert((0, sev, peer));
+                e.0 += 1;
+                e.1 = e.1.max(sev);
+                e.2 = peer;
+                return;
+            }
+            self.window_count += 1;
+        }
         out.push(Deviation::new(rule, sev, detail));
+    }
+
+    /// Start a new rate-limit window when the current one is over, and
+    /// report what the previous one suppressed (one finding per rule).
+    fn roll_window(&mut self, out: &mut Vec<Deviation>, mono_ns: u64) {
+        let start = *self.window_start.get_or_insert(mono_ns);
+        if mono_ns.saturating_sub(start) < FINDING_WINDOW_NS {
+            return;
+        }
+        self.window_start = Some(mono_ns);
+        self.window_count = 0;
+        for (rule, (n, sev, latest)) in std::mem::take(&mut self.suppressed) {
+            out.push(Deviation::new(
+                rule,
+                sev,
+                format!(
+                    "{n} further {rule} findings suppressed in the last {} s (more than \
+                     {MAX_FINDINGS_PER_WINDOW} WebRTC findings per window: a spoofed-source \
+                     flood or a scan of the robot?); latest peer {latest}",
+                    FINDING_WINDOW_NS / 1_000_000_000
+                ),
+            ));
+        }
+    }
+
+    fn remember_known(&mut self, peer: IpAddr) -> bool {
+        if self.known.contains(&peer) {
+            return false;
+        }
+        if self.known_order.len() >= MAX_KNOWN {
+            if let Some(old) = self.known_order.pop_front() {
+                self.known.remove(&old);
+            }
+        }
+        self.known.insert(peer);
+        self.known_order.push_back(peer);
+        true
     }
 
     /// End the sessions of peers idle for longer than `session_idle_ns`.
@@ -1047,6 +1160,7 @@ impl WebRtcMonitor {
         };
         self.stats.packets += 1;
         self.expire(p.mono_ns);
+        self.roll_window(&mut out, p.mono_ns);
         // What this packet is, before touching state.
         let mut sig: Option<SignallingMeta> = None;
         let mut answered = false;
@@ -1057,6 +1171,18 @@ impl WebRtcMonitor {
                     if let Some(r) = parse_http_request(p.payload) {
                         self.stats.signalling_requests += 1;
                         sig = Some(classify_signalling(&r));
+                    } else if p.payload.is_empty()
+                        && p.tcp_flags & TCP_SYN != 0
+                        && p.tcp_flags & TCP_ACK == 0
+                    {
+                        // A connection attempt (the inline gateway logs
+                        // the SYN of signalling it drops).
+                        sig = Some(SignallingMeta {
+                            kind: SignallingKind::TcpConnect,
+                            body_len: 0,
+                            sdp: None,
+                            token_len: None,
+                        });
                     }
                 } else if let Some(r) = parse_http_response(p.payload) {
                     self.stats.signalling_responses += 1;
@@ -1096,11 +1222,19 @@ impl WebRtcMonitor {
                 return out;
             }
             if self.peers.len() >= self.opts.max_peers {
-                // Evict the least recently active peer.
+                // Evict a peer that is not established, with the fewest
+                // packets (spoofed single-packet sources first), least
+                // recently active; an established session goes last.
                 if let Some(old) = self
                     .peers
                     .values()
-                    .min_by_key(|s| s.last_mono_ns)
+                    .min_by_key(|s| {
+                        (
+                            s.state == SessionState::Established,
+                            s.packets.min(2),
+                            s.last_mono_ns,
+                        )
+                    })
                     .map(|s| s.peer)
                 {
                     self.peers.remove(&old);
@@ -1130,6 +1264,8 @@ impl WebRtcMonitor {
                     srtp_packets: 0,
                     relayed: false,
                     listed,
+                    packets: 0,
+                    reported: BTreeSet::new(),
                 },
             );
         }
@@ -1139,6 +1275,7 @@ impl WebRtcMonitor {
         let was = s.state;
         let was_established = s.established();
         s.last_mono_ns = p.mono_ns;
+        s.packets = s.packets.saturating_add(1);
         if inbound {
             if let Some(m) = p.src_mac {
                 if s.mac.is_none() {
@@ -1202,12 +1339,47 @@ impl WebRtcMonitor {
         }
         let new_activity = snap.state != was || sig.is_some() || now_established;
         if !new_activity && was != SessionState::Signalling {
-            // Steady state: only the deny window is re-checked (per day).
+            // Steady state: only the MAC binding (every packet) and the
+            // deny window (per day) are re-checked.
+            self.check_mac(&mut out, &snap, p, inbound);
             self.check_window(&mut out, &snap, p.wall_ns);
             return out;
         }
         self.findings(&mut out, &snap, p, inbound, sig.as_ref(), now_established);
         out
+    }
+
+    /// A listed controller bound to a MAC, seen (inbound) with another one.
+    fn check_mac(
+        &mut self,
+        out: &mut Vec<Deviation>,
+        s: &PeerSession,
+        p: &FlowPacket<'_>,
+        inbound: bool,
+    ) {
+        let peer = s.peer;
+        let Some(Some(want)) = self.opts.controllers.get(&peer).copied() else {
+            return;
+        };
+        let (true, Some(got)) = (inbound, p.src_mac) else {
+            return;
+        };
+        if want == got {
+            return;
+        }
+        self.report(
+            out,
+            peer,
+            rules::CONTROLLER_MAC_MISMATCH,
+            mac_text(&got),
+            Severity::High,
+            format!(
+                "Go2 WebRTC traffic from listed controller {peer} with link-layer source {}, \
+                 not the bound {}: another host may be using its address",
+                mac_text(&got),
+                mac_text(&want)
+            ),
+        );
     }
 
     fn check_window(&mut self, out: &mut Vec<Deviation>, s: &PeerSession, wall_ns: u64) {
@@ -1220,6 +1392,7 @@ impl WebRtcMonitor {
             let day = wall_ns / 86_400_000_000_000;
             self.report(
                 out,
+                s.peer,
                 rules::SESSION_IN_DENIED_WINDOW,
                 format!("{}/{i}/{day}", s.peer),
                 Severity::High,
@@ -1251,12 +1424,10 @@ impl WebRtcMonitor {
         };
         // Who.
         if self.opts.controllers.is_empty() {
-            if !self.known.contains(&peer) {
-                if self.known.len() < MAX_REPORTED {
-                    self.known.insert(peer);
-                }
+            if self.remember_known(peer) {
                 self.report(
                     out,
+                    s.peer,
                     rules::NEW_PEER,
                     peer.to_string(),
                     Severity::Medium,
@@ -1275,6 +1446,7 @@ impl WebRtcMonitor {
             };
             self.report(
                 out,
+                s.peer,
                 rules::UNKNOWN_CONTROLLER,
                 format!("{peer}/{stage}"),
                 sev,
@@ -1284,24 +1456,8 @@ impl WebRtcMonitor {
                     s.flows_text()
                 ),
             );
-        } else if let (true, Some(Some(want)), Some(got)) =
-            (inbound, self.opts.controllers.get(&peer), p.src_mac)
-        {
-            if *want != got {
-                self.report(
-                    out,
-                    rules::CONTROLLER_MAC_MISMATCH,
-                    format!("{peer}/{}", mac_text(&got)),
-                    Severity::High,
-                    format!(
-                        "Go2 WebRTC traffic from listed controller {peer} with link-layer \
-                         source {}, not the bound {}: another host may be using its address",
-                        mac_text(&got),
-                        mac_text(want)
-                    ),
-                );
-            }
         }
+        self.check_mac(out, s, p, inbound);
         // When.
         self.check_window(out, s, p.wall_ns);
         // How.
@@ -1321,6 +1477,7 @@ impl WebRtcMonitor {
                     .collect();
                 self.report(
                     out,
+                    s.peer,
                     rules::CONCURRENT_SESSIONS,
                     format!("{peer}"),
                     Severity::High,
@@ -1336,6 +1493,7 @@ impl WebRtcMonitor {
             if s.signalling.is_empty() {
                 self.report(
                     out,
+                    s.peer,
                     rules::MEDIA_WITHOUT_SIGNALLING,
                     peer.to_string(),
                     Severity::Medium,
@@ -1355,6 +1513,7 @@ impl WebRtcMonitor {
         {
             self.report(
                 out,
+                s.peer,
                 rules::RELAYED_SESSION,
                 peer.to_string(),
                 Severity::Medium,

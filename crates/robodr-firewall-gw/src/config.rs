@@ -808,6 +808,14 @@ pub struct GatewayConfig {
     /// none.
     #[serde(default)]
     pub webrtc: Option<crate::webrtc::WebRtcConfig>,
+    /// The robot behind the gateway (`robodr_cdr::unitree::UnitreeModel`
+    /// name: `go2`, `a2`, `as2`, `g1`, ...). Optional; when set, the
+    /// channels are cross-checked against it: an A2 / AS2 `rt/lowcmd` must
+    /// use `unitree_a2_lowcmd` (not `unitree_go_lowcmd`) and no channel may
+    /// `allow_battery_off`; `unitree_a2_lowcmd` is refused for any other
+    /// model.
+    #[serde(default)]
+    pub robot_model: Option<String>,
 }
 
 fn default_max_queue_delay() -> u64 {
@@ -860,6 +868,36 @@ impl GatewayConfig {
             return Err("channels: at least one channel is required".into());
         }
         self.profile_trust.validate()?;
+        if let Some(name) = &self.robot_model {
+            use robodr_cdr::unitree::UnitreeModel as M;
+            let m = M::from_name(name)
+                .ok_or_else(|| format!("robot_model {name:?} is not a Unitree model name"))?;
+            let a2 = matches!(m, M::A2 | M::As2);
+            for c in &self.channels {
+                let at = &c.firewall_channel;
+                let lowcmd = c.topic().is_some_and(|t| t == "rt/lowcmd");
+                if a2
+                    && lowcmd
+                    && matches!(c.codec, Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk)
+                {
+                    return Err(format!(
+                        "channel {at}: robot_model {name} must use codec unitree_a2_lowcmd on \
+                         rt/lowcmd (its low-level type is inferred, not published)"
+                    ));
+                }
+                if a2 && c.allow_battery_off {
+                    return Err(format!(
+                        "channel {at}: allow_battery_off is refused for robot_model {name}"
+                    ));
+                }
+                if !a2 && c.codec == Codec::UnitreeA2Lowcmd {
+                    return Err(format!(
+                        "channel {at}: codec unitree_a2_lowcmd is for robot_model a2 / as2, not \
+                         {name}"
+                    ));
+                }
+            }
+        }
         if let Some(w) = &self.webrtc {
             w.monitor_options()?;
             if !self.observe.enabled {

@@ -82,8 +82,10 @@ impl GatewayLine {
 fn rule_ok(r: &str) -> bool {
     (r.starts_with("robot.gateway.")
         || r.starts_with("robot.firewall.")
-        || r.strip_prefix("robot.unitree.")
-            .is_some_and(|x| x.starts_with("webrtc_")))
+        // The gateway's WebRTC monitor: exactly its own ids.
+        || robodr_ros2_pipeline::webrtc::rules::ALL
+            .iter()
+            .any(|(id, _)| *id == r))
         && r.len() <= MAX_RULE
         && r.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
@@ -97,9 +99,7 @@ pub fn parse_gateway_line(t: &str) -> Result<Payload, String> {
         return Err(format!("format must be {FORMAT}"));
     }
     if !rule_ok(&l.rule) {
-        return Err(
-            "rule must be a robot.gateway.*, robot.firewall.* or robot.unitree.webrtc_* id".into(),
-        );
+        return Err("rule must be a robot.gateway.*, robot.firewall.* or WebRTC monitor id".into());
     }
     if l.detail.chars().count() > MAX_DETAIL
         || l.channel.as_deref().is_some_and(|c| {
@@ -127,7 +127,11 @@ mod tests {
                 r#"{{"format":"robodr-gateway-finding/v1","rule":"{r}","severity":"critical","detail":"x","mode":"enforce","channel":"webrtc","count":1}}"#
             )
         };
-        assert!(parse_gateway_line(&line("robot.unitree.webrtc_unknown_controller")).is_ok());
+        for (id, _) in robodr_ros2_pipeline::webrtc::rules::ALL {
+            assert!(parse_gateway_line(&line(id)).is_ok(), "{id}");
+        }
+        let fake = ["robot", "unitree", "webrtc_anything"].join(".");
+        assert!(parse_gateway_line(&line(&fake)).is_err());
         assert!(parse_gateway_line(&line("robot.unitree.legacy_unknown_sender")).is_err());
         assert!(parse_gateway_line(&line(&["robot", "unitree", "webrtc"].join("."))).is_err());
     }

@@ -476,9 +476,9 @@ fn webrtc_sessions_are_detected_from_the_copies_and_never_touched() {
     let peer = ATTACKER_IP;
     let inb = |p: &[u8]| build_ipv4_udp(peer, ROBOT_IP, 50_000, 40_000, p);
     let outb = |p: &[u8]| build_ipv4_udp(ROBOT_IP, peer, 40_000, 50_000, p);
-    gw.observe_webrtc(&inb(&stun_binding()), t, wall);
-    gw.observe_webrtc(&inb(&dtls_hello(1)), t + MS, wall);
-    gw.observe_webrtc(&outb(&dtls_hello(2)), t + 2 * MS, wall);
+    gw.observe_webrtc(&inb(&stun_binding()), t, wall, None);
+    gw.observe_webrtc(&inb(&dtls_hello(1)), t + MS, wall, None);
+    gw.observe_webrtc(&outb(&dtls_hello(2)), t + 2 * MS, wall, None);
     let f = gw.drain_webrtc();
     let rules: Vec<(&str, robodr_events::Severity)> =
         f.iter().map(|d| (d.rule_str(), d.severity)).collect();
@@ -511,11 +511,11 @@ fn webrtc_sessions_are_detected_from_the_copies_and_never_touched() {
     assert_eq!(s.flows.len(), 1);
     // The listed controller: quiet.
     let ok = build_ipv4_udp(CONTROLLER_IP, ROBOT_IP, 50_001, 40_001, &stun_binding());
-    gw.observe_webrtc(&ok, t + 3 * MS, wall);
+    gw.observe_webrtc(&ok, t + 3 * MS, wall, None);
     assert!(gw.drain_webrtc().is_empty());
     // Not configured: nothing tracked.
     let mut plain = gateway(Fixture::Go2);
-    plain.observe_webrtc(&inb(&stun_binding()), t, wall);
+    plain.observe_webrtc(&inb(&stun_binding()), t, wall, None);
     assert!(plain.webrtc().is_none() && plain.drain_webrtc().is_empty());
 }
 
@@ -552,4 +552,86 @@ fn webrtc_block_targets_are_strict() {
     ] {
         assert!(BlockTarget::parse_args(&a(bad)).is_err(), "{bad:?}");
     }
+}
+
+// ------------------------------------------------- review fixes (F3, F4, F5)
+
+/// F3: the copy's link-layer source reaches the monitor: a MAC-bound
+/// controller's IP from another MAC is reported.
+#[test]
+fn webrtc_mac_binding_is_checked_at_the_gateway() {
+    use robodr_firewall_gw::ip::build_ipv4_udp;
+    let v = serde_json::json!({
+        "controllers": [{"ip": CONTROLLER_IP.to_string(), "mac": "02:00:00:00:00:20"}]
+    });
+    let mut c = gateway_config(Fixture::Go2);
+    c.webrtc = Some(serde_json::from_value(v).unwrap());
+    let mut gw = Gateway::new(&c, &profile(Fixture::Go2), &firewall(Fixture::Go2)).unwrap();
+    let p = build_ipv4_udp(CONTROLLER_IP, ROBOT_IP, 50_000, 40_000, &stun_binding());
+    gw.observe_webrtc(&p, MS, 0, Some([2, 0, 0, 0, 0, 0x20]));
+    assert!(gw.drain_webrtc().is_empty());
+    gw.observe_webrtc(&p, 2 * MS, 0, Some([2, 0, 0, 0, 0, 0x66]));
+    let f = gw.drain_webrtc();
+    assert!(
+        f.iter()
+            .any(|d| d.rule_str() == "robot.unitree.webrtc_controller_mac_mismatch"),
+        "{f:?}"
+    );
+}
+
+/// F5: the SYN of signalling the bridge drops (logged by `log group`)
+/// is reported as an attempt of the refused host.
+#[test]
+fn webrtc_dropped_signalling_syn_is_reported() {
+    let mut gw = webrtc_gateway("");
+    // IPv4 / TCP SYN, 20-byte headers, no payload.
+    let mut p = vec![0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0];
+    p.extend_from_slice(&ATTACKER_IP.octets());
+    p.extend_from_slice(&ROBOT_IP.octets());
+    p.extend_from_slice(&51000u16.to_be_bytes());
+    p.extend_from_slice(&9991u16.to_be_bytes());
+    p.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+    gw.observe_webrtc(&p, MS, 0, None);
+    let f = gw.drain_webrtc();
+    assert!(
+        f.iter().any(
+            |d| d.rule_str() == "robot.unitree.webrtc_unknown_controller"
+                && d.detail.contains("TcpConnect")
+        ),
+        "{f:?}"
+    );
+}
+
+/// F4: with a top-level robot_model, an A2 / AS2 cannot be configured as
+/// `unitree_go_lowcmd` or with `allow_battery_off`, and
+/// `unitree_a2_lowcmd` is refused for other models.
+#[test]
+fn robot_model_cross_checks_the_a2_channel() {
+    for m in ["a2", "AS2"] {
+        let mut c = gateway_config(Fixture::Go2);
+        c.robot_model = Some(m.into());
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("unitree_a2_lowcmd"), "{m}: {e}");
+        let mut c = a2_config();
+        c.robot_model = Some(m.into());
+        c.validate().unwrap();
+    }
+    let mut c = a2_config();
+    c.robot_model = Some("go2".into());
+    assert!(c.validate().unwrap_err().contains("a2 / as2"));
+    let mut c = gateway_config(Fixture::Go2);
+    c.robot_model = Some("go2".into());
+    c.validate().unwrap();
+    c.robot_model = Some("nonsense".into());
+    assert!(c.validate().is_err());
+    // allow_battery_off on a non-lowcmd go channel of an A2 is refused too.
+    let v = serde_json::json!({
+        "mode": "enforce", "profile": "/p", "firewall": "/f", "robot_model": "a2",
+        "queue": { "num": 0, "controller_port": "c", "robot_port": "r" },
+        "rtps": { "domain_ids": [0] },
+        "channels": [{ "firewall_channel": "/arm", "codec": "unitree_go_arm_sdk",
+                       "topic": "rt/arm_sdk", "weight_slot": 9, "allow_battery_off": true }],
+    });
+    let r = GatewayConfig::from_json(&v.to_string()).and_then(|c| c.validate());
+    assert!(r.unwrap_err().contains("allow_battery_off"));
 }

@@ -159,6 +159,7 @@ fn pkt<'a>(
         dst: to.0,
         dst_port: to.1,
         src_mac: mac,
+        tcp_flags: 0,
         payload,
     }
 }
@@ -659,7 +660,7 @@ fn memory_is_bounded_under_a_spoofed_peer_flood() {
         }
     }
     assert!(m.sessions().count() <= DEFAULT_MAX_PEERS);
-    assert!(n <= MAX_REPORTED);
+    assert!(n <= MAX_FINDINGS_PER_WINDOW as usize);
     assert!(m.stats.findings_suppressed > 0 && m.stats.peers_evicted > 0);
 }
 
@@ -695,4 +696,159 @@ fn parsers_never_panic_on_noise() {
         let l4 = if i % 2 == 0 { L4::Udp } else { L4::Tcp };
         let _ = m.process(&pkt(i as u64, l4, (INTRUDER, 1), (ROBOT, 8081), None, &d));
     }
+}
+
+// ---- review findings (F1, F2, F5): regression tests -------------------
+
+fn bare_stun() -> Vec<u8> {
+    let mut m = vec![0x00, 0x01, 0x00, 0x00];
+    m.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+    m.extend_from_slice(&[7u8; 12]);
+    m
+}
+
+/// A DTLS-only session (no signalling): STUN, client hello, server hello.
+fn dtls_session(m: &mut WebRtcMonitor, peer: IpAddr, t: u64) -> Vec<Deviation> {
+    let (s, ch, sh) = (bare_stun(), client_hello(), server_hello());
+    let mut out = m.process(&pkt(t, L4::Udp, (peer, 50000), (ROBOT, 40000), None, &s));
+    out.extend(m.process(&pkt(
+        t + 1,
+        L4::Udp,
+        (peer, 50000),
+        (ROBOT, 40000),
+        None,
+        &ch,
+    )));
+    out.extend(m.process(&pkt(
+        t + 2,
+        L4::Udp,
+        (ROBOT, 40000),
+        (peer, 50000),
+        None,
+        &sh,
+    )));
+    out
+}
+
+fn listed_opts() -> WebRtcOptions {
+    let mut o = enabled();
+    o.controllers.insert(OPERATOR, None);
+    o
+}
+
+/// F1: a spoofed-source flood of bare STUN requests must not silence a
+/// later real intruder: the Critical (established) finding is never
+/// suppressed, and the flood itself is reported in aggregate.
+#[test]
+fn spoofed_flood_never_silences_a_real_intruder() {
+    let mut m = WebRtcMonitor::new(listed_opts());
+    let s = bare_stun();
+    let mut flood = Vec::new();
+    let mut i = 0u64;
+    for a in 0..=40u8 {
+        for b in 1..=254u8 {
+            let src = IpAddr::V4(Ipv4Addr::new(10, 66, a, b));
+            flood.extend(m.process(&pkt(i * 1000, L4::Udp, (src, 1), (ROBOT, 2), None, &s)));
+            i += 1;
+        }
+    }
+    assert!(m.stats.findings_suppressed > 0, "the flood is rate limited");
+    let f = dtls_session(&mut m, INTRUDER, 20 * S);
+    let r = rules_of(&f);
+    assert!(
+        r.contains(&(rules::UNKNOWN_CONTROLLER.into(), Severity::Critical)),
+        "real intruder silenced after the flood: {r:?}"
+    );
+    // Later windows report the suppressed count in aggregate.
+    let later = m.process(&pkt(
+        200 * S,
+        L4::Udp,
+        (INTRUDER, 50000),
+        (ROBOT, 40000),
+        None,
+        &s,
+    ));
+    let agg: Vec<&Deviation> = flood
+        .iter()
+        .chain(f.iter())
+        .chain(later.iter())
+        .filter(|d| d.detail.contains("suppressed"))
+        .collect();
+    assert!(!agg.is_empty(), "no aggregate flood finding");
+    assert!(m.sessions().count() <= DEFAULT_MAX_PEERS);
+}
+
+/// F1: a flood of new peers does not evict an established session.
+#[test]
+fn a_new_peer_flood_does_not_evict_established_sessions() {
+    let mut m = WebRtcMonitor::new(listed_opts());
+    let _ = dtls_session(&mut m, OPERATOR, 0);
+    assert_eq!(
+        m.session(&OPERATOR).unwrap().state,
+        SessionState::Established
+    );
+    let s = bare_stun();
+    for i in 0..5000u32 {
+        let src = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i));
+        let _ = m.process(&pkt(
+            10 + u64::from(i),
+            L4::Udp,
+            (src, 1),
+            (ROBOT, 2),
+            None,
+            &s,
+        ));
+    }
+    assert!(
+        m.session(&OPERATOR).is_some(),
+        "established session evicted by a flood"
+    );
+}
+
+/// F2: an intruder that returns after its session ended (e.g. after a
+/// quarantine timed out) is reported again.
+#[test]
+fn a_returning_intruder_is_reported_again() {
+    let mut m = WebRtcMonitor::new(listed_opts());
+    let first = dtls_session(&mut m, INTRUDER, 0);
+    assert!(rules_of(&first).contains(&(rules::UNKNOWN_CONTROLLER.into(), Severity::Critical)));
+    let second = dtls_session(&mut m, INTRUDER, 3_600 * S);
+    assert!(
+        rules_of(&second).contains(&(rules::UNKNOWN_CONTROLLER.into(), Severity::Critical)),
+        "returning intruder silent: {:?}",
+        rules_of(&second)
+    );
+    // Within one session: still deduplicated.
+    let again = dtls_session(&mut m, INTRUDER, 3_600 * S + 10);
+    assert!(again.is_empty(), "{:?}", rules_of(&again));
+}
+
+/// F5: a bare TCP SYN to a signalling port (what the gateway logs for
+/// signalling it drops) is a signalling attempt of the peer.
+#[test]
+fn a_dropped_signalling_syn_is_an_attempt() {
+    let mut m = WebRtcMonitor::new(listed_opts());
+    let mut p = pkt(0, L4::Tcp, (INTRUDER, 51000), (ROBOT, 9991), None, &[]);
+    p.tcp_flags = TCP_SYN;
+    let r = rules_of(&m.process(&p));
+    assert_eq!(
+        r,
+        vec![(rules::UNKNOWN_CONTROLLER.into(), Severity::High)],
+        "{r:?}"
+    );
+    assert_eq!(
+        m.session(&INTRUDER).unwrap().signalling,
+        vec![SignallingKind::TcpConnect]
+    );
+    // A bare ACK from an unknown peer starts nothing.
+    let mut a = pkt(
+        1,
+        L4::Tcp,
+        (IpAddr::V4(Ipv4Addr::new(192, 168, 123, 77)), 1),
+        (ROBOT, 9991),
+        None,
+        &[],
+    );
+    a.tcp_flags = 0x10;
+    assert!(m.process(&a).is_empty());
 }

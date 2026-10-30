@@ -303,8 +303,13 @@ and does not try. With a `webrtc` section it:
   findings (contract 2.3, §3d) go to the events file and agentd's feed
   (channel `webrtc`). The copies are never queued or dropped;
 - with `action: block_unlisted`, drops TCP to the signalling ports from
-  any source that is not in `controllers` (nft table `bridge
-  robodr_gw_rtc`);
+  any source that is not in `controllers`, and from a MAC-bound
+  controller's IP with another source MAC (nft table `bridge
+  robodr_gw_rtc`, `ip saddr` and `ether saddr . ip saddr` sets). Each drop
+  is first logged to the WebRTC NFLOG group (`log group`), so the refused
+  host is still reported: its SYN is a `TcpConnect` attempt;
+- checks a controller's MAC binding on every copied packet: the NFLOG
+  copy's `NFULA_HWADDR` is the source MAC the monitor compares;
 - always creates the quarantine sets `blocked_peers` (an address; both
   directions) and `blocked_flows` (`peer . peer port . robot . robot
   port`, UDP, both directions), with timeouts.
@@ -323,8 +328,20 @@ and does not try. With a `webrtc` section it:
 }
 ```
 
-`observe.enabled` is required. The nft table was loaded and its set
-elements added in a network namespace; the full session path is tested on
+Findings are reported once per peer session (forgotten when it ends or is
+evicted, so a returning peer is reported again), at most 32 non-Critical
+findings per minute with the rest aggregated per rule; an unlisted
+controller's established session (Critical) is never rate limited.
+
+A top-level `robot_model` (optional) cross-checks the channels: an A2 /
+AS2 `rt/lowcmd` must use `unitree_a2_lowcmd`, `allow_battery_off` is
+refused on it, and `unitree_a2_lowcmd` is refused for any other model.
+
+`observe.enabled` is required. The nft table (with the MAC and `log
+group` rules) was loaded and its set elements added in a network
+namespace; whether the kernel fills `NFULA_HWADDR` for every bridged copy
+and delivers bridge-family `log group` packets to the gateway was not
+exercised on a real bridge; the full session path is tested on
 synthetic frames only. What a quarantine does to a robot mid-motion (its
 reaction to a lost controller) is not published by Unitree.
 

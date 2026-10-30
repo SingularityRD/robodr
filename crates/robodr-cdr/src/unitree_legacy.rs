@@ -451,6 +451,13 @@ impl LegacyLowCmd {
 /// the three fields are decoded as `i16`. A `Kp` / `Kd` beyond the 16-bit
 /// range wraps on the sender; what the robot receives is what is decoded
 /// here.
+///
+/// The sender's conversion depends on its CPU for `|value × scale| ≥ 2^31`
+/// or NaN: amd64 `cvttss2si` gives `0x80000000` (low half 0), arm64
+/// `fcvtzs` saturates (`0x7FFFFFFF` → low half -1, `0x80000000` → 0; NaN →
+/// 0). Only the amd64 object was disassembled. This changes what a sender
+/// puts on the wire, not how it is decoded: the decoder (and the gateway)
+/// read the wire value, so there is no safety impact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LegacyMotorCmdCompressed {
     /// Servo `0x0A`, damping `0x00` (`comm.h`).

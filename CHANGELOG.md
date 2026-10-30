@@ -41,6 +41,21 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `webrtc_concurrent_sessions`, `webrtc_relayed_session`,
   `webrtc_media_without_signalling`. agentd's `gateway_feed` accepts them.
 - Fuzz targets `go1_compressed_lowcmd` and `unitree_webrtc`.
+- Review fixes, WebRTC monitor:
+  - Findings are deduplicated per peer session, so a returning peer is
+    reported again.
+  - Non-Critical findings are rate limited per minute with an aggregate
+    count. The Critical established-session finding is never suppressed.
+  - Eviction prefers single-packet, non-established peers.
+- Review fixes, gateway:
+  - It passes `NFULA_HWADDR` to the monitor, so the MAC binding of
+    controllers is now checked.
+  - `block_unlisted` also refuses a MAC-bound controller's IP from
+    another MAC, and logs every drop so the refused host is still
+    reported as a `TcpConnect` attempt.
+  - A top-level `robot_model` cross-checks the A2 / AS2 channel.
+- Review fixes, agentd: the feed accepts exactly the monitor's WebRTC
+  ids.
 
 ### Changed
 

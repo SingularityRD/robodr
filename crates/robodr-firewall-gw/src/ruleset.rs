@@ -305,7 +305,25 @@ mod tests {
         assert!(ret < copy);
         assert!(s.contains("set blocked_flows { type ipv4_addr . inet_service . ipv4_addr . inet_service; flags timeout; }"));
         assert!(s.contains(
-            "iifname \"$CTRL\" ip daddr { 192.168.123.161 } tcp dport { 8081, 9991 } ip saddr != { 192.168.123.20 } counter drop"
+            "iifname \"$CTRL\" ip daddr { 192.168.123.161 } tcp dport { 8081, 9991 } ip saddr != { 192.168.123.20 } counter log group 4175 drop"
+        ));
+        // F5: every drop is logged first; no MAC rule without a binding.
+        assert!(s
+            .lines()
+            .filter(|l| l.contains(" drop"))
+            .all(|l| !l.contains("tcp dport") || l.contains("log group 4175 drop")));
+        assert!(!s.contains("ether saddr"));
+        // F3: a MAC-bound controller's IP from another MAC is refused.
+        let m = GatewayConfig::from_json(&format!(
+            "{base},\"webrtc\":{{\"action\":\"block_unlisted\",\"controllers\":[{{\"ip\":\"192.168.123.20\",\"mac\":\"02:00:00:00:00:2A\"}},{{\"ip\":\"192.168.123.21\"}}]}}}}"
+        ))
+        .unwrap();
+        let s = render(&m, "t");
+        assert!(s.contains(
+            "iifname \"$CTRL\" ip daddr { 192.168.123.161 } tcp dport { 8081, 9991 } ip saddr { 192.168.123.20 } ether saddr . ip saddr != { 02:00:00:00:00:2a . 192.168.123.20 } counter log group 4175 drop"
+        ), "{s}");
+        assert!(s.contains(
+            "ip saddr != { 192.168.123.20, 192.168.123.21 } counter log group 4175 drop"
         ));
         // The copy chain never drops or queues.
         assert!(s

@@ -15,9 +15,12 @@
 //!   dropped: a stopped gateway changes nothing on this path.
 //! * **Refuse unlisted signalling** (`action: block_unlisted`): TCP to the
 //!   robot's signalling ports from a source IP that is not a listed
-//!   controller is dropped in the bridge (`nft`, table `bridge
-//!   robodr_gw_rtc`), so an unlisted host cannot start a local session by
-//!   the known methods. ICE / DTLS from an unlisted peer that was signalled
+//!   controller, or from a MAC-bound controller's IP with another source
+//!   MAC, is dropped in the bridge (`nft`, table `bridge robodr_gw_rtc`),
+//!   so an unlisted host cannot start a local session by the known
+//!   methods. Each dropped packet is first logged to the WebRTC NFLOG group
+//!   (`log group`), so the refused host is still reported (its SYN is a
+//!   `TcpConnect` signalling attempt). ICE / DTLS from an unlisted peer that was signalled
 //!   another way (Wi-Fi, a relay) is detected, not blocked by this rule.
 //! * **Quarantine by flow** (any action): the table has two timeout sets,
 //!   `blocked_peers` (an IPv4 address: every packet between it and the
@@ -205,10 +208,37 @@ pub fn render_nft(w: &WebRtcConfig) -> String {
          \x20   iifname \"$ROBOT\" ip daddr . udp dport . ip saddr . udp sport @blocked_flows counter drop\n"
     ));
     if w.action == WebRtcAction::BlockUnlisted {
+        // Each drop is logged to the WebRTC NFLOG group first, so the
+        // monitor still reports the refused host (the drop happens in the
+        // bridge before the iptables copy chain would see the packet).
+        let g = w.nflog_group;
         let ctrl = set_of(&w.controller_ips().unwrap_or_default());
         s.push_str(&format!(
-            "    iifname \"$CTRL\" ip daddr {robots} tcp dport {ports} ip saddr != {ctrl} counter drop\n"
+            "    iifname \"$CTRL\" ip daddr {robots} tcp dport {ports} ip saddr != {ctrl} counter log group {g} drop\n"
         ));
+        // MAC-bound controllers: their IP from another MAC is refused too.
+        let bound: Vec<(Ipv4Addr, String)> = w
+            .controllers
+            .iter()
+            .filter_map(|c| {
+                let ip = c.ip.parse::<Ipv4Addr>().ok()?;
+                let mac = crate::gateway::parse_mac(c.mac.as_deref()?)?;
+                let m: Vec<String> = mac.iter().map(|b| format!("{b:02x}")).collect();
+                Some((ip, m.join(":")))
+            })
+            .collect();
+        if !bound.is_empty() {
+            let ips = set_of(&bound.iter().map(|(ip, _)| *ip).collect::<Vec<_>>());
+            let pairs = set_of(
+                &bound
+                    .iter()
+                    .map(|(ip, m)| format!("{m} . {ip}"))
+                    .collect::<Vec<_>>(),
+            );
+            s.push_str(&format!(
+                "    iifname \"$CTRL\" ip daddr {robots} tcp dport {ports} ip saddr {ips} ether saddr . ip saddr != {pairs} counter log group {g} drop\n"
+            ));
+        }
     }
     s.push_str("  }\n}\nEOF\n");
     s
