@@ -162,11 +162,27 @@ impl Engine {
         crate::fsx::ensure_dir(&cfg.state_dir, 0o700)
             .map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
         let had_records = Journal::has_records(&cfg.blackbox.dir);
-        let hw_key = robodr_blackbox::KeyFile::load_secret(&cfg.blackbox.key)
-            .and_then(|k| k.signer())
+        let allow_hmac = cfg.blackbox.allow_hmac;
+        let hw_kf =
+            crate::journal::load_blackbox_key(&cfg.blackbox.key, allow_hmac, "black-box key")?;
+        if hw_kf.is_symmetric() {
+            eprintln!(
+                "robodr-deliverd: warning: black-box key {} is a legacy hmac-sha256 key \
+                 (allowed by blackbox.allow_hmac; whoever can verify can also forge): \
+                 migrate to ed25519 (OPERATIONS 4.3)",
+                cfg.blackbox.key.display()
+            );
+        }
+        let hw_key = hw_kf
+            .signer()
             .map_err(|e| format!("black-box key {}: {e}", cfg.blackbox.key.display()))?;
         let history = Journal::history(&cfg.blackbox.dir, hw_key.as_ref());
-        let journal = Journal::open(&cfg.blackbox.dir, &cfg.unit.id, &cfg.blackbox.key)?;
+        let journal = Journal::open_with(
+            &cfg.blackbox.dir,
+            &cfg.unit.id,
+            &cfg.blackbox.key,
+            allow_hmac,
+        )?;
         let signer = match &cfg.findings.finding_key {
             Some(p) => Some(
                 robodr_blackbox::KeyFile::load_secret(p)

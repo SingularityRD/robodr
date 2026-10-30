@@ -38,8 +38,8 @@ use std::path::{Path, PathBuf};
 /// The note that closes the old journal.
 pub const KEY_RETIRED: &str = "robodr.deliver.key_retired";
 
-fn load(p: &Path, what: &str) -> Result<KeyFile, String> {
-    KeyFile::load_secret(p).map_err(|e| format!("{what} {}: {e}", p.display()))
+fn load(p: &Path, what: &str, allow_hmac: bool) -> Result<KeyFile, String> {
+    crate::journal::load_blackbox_key(p, allow_hmac, what)
 }
 
 fn sibling(dir: &Path, suffix: &str) -> Result<PathBuf, String> {
@@ -65,8 +65,11 @@ fn sync_parent(dir: &Path) -> Result<(), String> {
 pub fn rekey(cfg: &Config, old_key: &Path, new_key: &Path) -> Result<Value, String> {
     let dir = &cfg.blackbox.dir;
     let staging = sibling(dir, "rekey-new")?;
-    let old_kf = load(old_key, "old key")?;
-    let new_kf = load(new_key, "new key")?;
+    // A legacy HMAC key (old: the migration off HMAC) needs
+    // blackbox.allow_hmac, like every other load of the black-box key.
+    let allow_hmac = cfg.blackbox.allow_hmac;
+    let old_kf = load(old_key, "old key", allow_hmac)?;
+    let new_kf = load(new_key, "new key", allow_hmac)?;
     let old = old_kf.signer().map_err(|e| format!("old key: {e}"))?;
     let new = new_kf.signer().map_err(|e| format!("new key: {e}"))?;
     if old.key_id() == new.key_id() {
@@ -151,7 +154,7 @@ pub fn rekey(cfg: &Config, old_key: &Path, new_key: &Path) -> Result<Value, Stri
     // 2. Close the old journal with the hand-over (this also takes its
     // single-writer lock: a running agent makes this fail).
     if has_records {
-        let mut j = Journal::open(dir, &cfg.unit.id, old_key)
+        let mut j = Journal::open_with(dir, &cfg.unit.id, old_key, allow_hmac)
             .map_err(|e| format!("{e} (stop robodr-deliverd first)"))?;
         j.note(
             KEY_RETIRED,
@@ -163,7 +166,7 @@ pub fn rekey(cfg: &Config, old_key: &Path, new_key: &Path) -> Result<Value, Stri
     // 3. The new generation, beside it.
     crate::fsx::remove_any(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
     let res = (|| -> Result<(), String> {
-        let mut j = Journal::open(&staging, &cfg.unit.id, new_key)?;
+        let mut j = Journal::open_with(&staging, &cfg.unit.id, new_key, allow_hmac)?;
         j.note(
             kinds::REKEYED,
             json!({"generation": doc.generation, "trust_version": history.trust_version,

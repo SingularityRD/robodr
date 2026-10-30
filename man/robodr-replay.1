@@ -29,6 +29,7 @@ robodr\-replay \- offline RoboDR decision chain (event \(-> deviation \(-> plan 
 .IR ID ]
 .RB [ \-\-findings
 .IR findings.jsonl ]
+.RB [ \-\-allow\-hmac ]
 .SH DESCRIPTION
 .B robodr\-replay
 runs RobotEvent JSON Lines through the RoboDR decision chain offline, records
@@ -51,8 +52,14 @@ Black\-box directory. Must be absent or empty (a replay starts a fresh chain).
 .BI \-\-key\-file " FILE"
 The black\-box key (required): a key file as written by
 .BR "robodr\-blackbox keygen \-\-out" " \fIFILE\fR"
-(Ed25519 by default; legacy HMAC\-SHA256 key files are accepted with a
-warning). A
+(Ed25519 by default). A legacy HMAC\-SHA256 key file (symmetric: whoever
+can verify can also forge) is refused by
+.B run
+and
+.B verify
+unless
+.B \-\-allow\-hmac
+is given; then it is used with a warning. A
 .B run
 needs the secret key file, which is refused if it is a symlink or not a
 regular file, if its mode gives group or others any access (it must be

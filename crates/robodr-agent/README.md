@@ -216,7 +216,7 @@ limiting. Use `--step-ms 6000` to see each one graded on its own.
 - Keys: `--key-file FILE` only, a robodr-blackbox key file
   (`robodr-blackbox keygen --out FILE [--key-id ID]`: Ed25519 secret `FILE`,
   `robodr-blackbox-key/v2`, plus public `FILE.pub`; legacy HMAC v1 files
-  still load with a warning). `run` needs the secret file
+  are refused unless `--allow-hmac`, then load with a warning). `run` needs the secret file
   (`KeyFile::load_secret`: a symlink, a non-regular file or a mode with
   group/other bits is refused); `verify` also accepts `FILE.pub` at any mode.
   The key id is the file's. `--key-hex` and `--key-id`
@@ -332,7 +332,8 @@ firewall limits, zero partitions and unusable labels are refused.
 - Policy matrix, monitor thresholds and firewall limits are unvalidated
   defaults. `policy-oem-validated.json` is a simulated sign-off for the demo.
 - The black box signs with an Ed25519 key file (`robodr-blackbox keygen`,
-  default) or, legacy, HMAC (a shared key, so the verifier can forge; warned).
+  default) or, legacy, HMAC (a shared key, so the verifier can forge; only with
+  `--allow-hmac`, warned).
   The Ed25519 seed is a file, not a TPM-held key (the arithmetic is the
   audited `ed25519-dalek` crate). No external checkpoint store exists. The replay verifies against the checkpoint it just produced.
 - Findings were not checked against an OCSF schema server or a running SOC

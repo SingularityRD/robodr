@@ -242,7 +242,10 @@ verify with the old key (re-anchor with
 first). Stop the service first; both key files as for
 .BR \-\-key .
 Run it again to finish an interrupted run. Never delete the black-box
-directory instead.
+directory instead. Moving off a legacy HMAC key (old key HMAC, new key
+Ed25519) needs
+.B blackbox.allow_hmac
+until it is done.
 .TP
 .B status
 Print the state: installed versions, kept rollback targets, floors, the
@@ -499,6 +502,18 @@ network, no access to
 .IR /etc/robodr/keys ;
 the black-box key arrives as
 .IR /run/credentials/robodr\-deliverd.service/blackbox.key .
+It must be an Ed25519 key: a legacy HMAC\-SHA256 key file is refused (at
+start, by
+.B reanchor
+and by
+.BR rekey )
+unless the configuration sets
+.B blackbox.allow_hmac
+to
+.B true
+(default
+.BR false ;
+then a warning is printed).
 Enable after commissioning and
 .BR init\-anchor .
 LAN delivery and the erase trigger socket need the drop-in example

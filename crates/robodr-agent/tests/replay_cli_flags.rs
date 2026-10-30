@@ -92,6 +92,7 @@ const SWITCHES: &[&str] = &[
     "record-all-events",
     "log-plans",
     "no-operator",
+    "allow-hmac",
     "help",
 ];
 
@@ -378,9 +379,12 @@ fn key_sources_are_validated() {
         let o = bin().args(&common).args(&args).output().unwrap();
         assert_usage_error(&o, &bb, &needle, &format!("{args:?}"));
     }
-    // A good key file (mode 0600, explicit key id) is accepted, and the key
-    // id from the file is the one the chain is bound to.
-    let good_file = k("good.key", &good, 0o600);
+    // A good key file (Ed25519, mode 0600, explicit key id) is accepted, and
+    // the key id from the file is the one the chain is bound to.
+    let good_ed = robodr_blackbox::KeyFile::ed25519_from_seed(&[0x5b; 32], Some("site-key-1"))
+        .unwrap()
+        .to_json();
+    let good_file = k("good.key", &good_ed, 0o600);
     let o = bin()
         .args(&common)
         .args(["--key-file".into(), s(&good_file)])
@@ -398,6 +402,50 @@ fn key_sources_are_validated() {
         ])
         .output()
         .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("hmac"), "{}", stderr(&o));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A legacy HMAC key file is refused by `run` and `verify` unless
+/// `--allow-hmac` is given; with it, it works and is warned about.
+#[test]
+fn legacy_hmac_key_needs_allow_hmac() {
+    let dir = tmpdir("flags-hmac");
+    let bb = dir.join("bb");
+    let hmac = hmac_key_file();
+    let args = |extra: &[&str]| {
+        let mut a = base(&bb)
+            .into_iter()
+            .filter(|a| a != "--key-file" && a != &key_arg())
+            .collect::<Vec<_>>();
+        a.extend(["--key-file".into(), hmac.to_string_lossy().into_owned()]);
+        a.extend(extra.iter().map(|s| s.to_string()));
+        a
+    };
+    // Refused: usage error naming the opt-in, nothing written.
+    let o = bin().args(args(&[])).output().unwrap();
+    assert_usage_error(&o, &bb, "--allow-hmac", "run without --allow-hmac");
+    assert!(stderr(&o).contains("legacy hmac-sha256"), "{}", stderr(&o));
+    // Allowed: the run works, with a warning.
+    let o = bin().args(args(&["--allow-hmac"])).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stderr(&o).contains("warning"), "{}", stderr(&o));
+    // verify: refused without the flag, verified with it.
+    let verify = |extra: &[&str]| {
+        bin()
+            .args(["verify", "--blackbox"])
+            .arg(&bb)
+            .arg("--key-file")
+            .arg(&hmac)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = verify(&[]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("--allow-hmac"), "{}", stderr(&o));
+    let o = verify(&["--allow-hmac"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     std::fs::remove_dir_all(&dir).unwrap();
 }
