@@ -335,7 +335,8 @@ impl Installer<'_> {
             }
             let mut cur = dir.to_path_buf();
             let parts: Vec<&str> = f.path.split('/').collect();
-            for p in &parts[..parts.len().saturating_sub(1)] {
+            let dirs = parts.split_last().map_or(&[][..], |(_, dirs)| dirs);
+            for p in dirs {
                 cur.push(p);
                 match fs::symlink_metadata(&cur) {
                     Ok(md) if md.file_type().is_dir() => {}
@@ -836,7 +837,7 @@ impl Installer<'_> {
             .filter(|l| !l.trim().is_empty())
             // `<9 check characters> <attribute> <path>`; attribute `c`:
             // a conffile.
-            .filter(|l| !(l.len() > 11 && l.as_bytes()[10] == b'c' && l.as_bytes()[9] == b' '))
+            .filter(|l| !(l.len() > 11 && l.as_bytes().get(9..11) == Some(b" c")))
             .map(robodr_pkg::common::trunc)
             .collect();
         if r.truncated {

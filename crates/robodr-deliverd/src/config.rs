@@ -654,7 +654,7 @@ fn check_argv(what: &str, argv: &[String]) -> Result<(), String> {
     if argv.is_empty() || argv.len() > 32 {
         return Err(format!("{what}: 1..=32 arguments"));
     }
-    if !is_clean_abs(Path::new(&argv[0])) {
+    if !argv.first().is_some_and(|p| is_clean_abs(Path::new(p))) {
         return Err(format!("{what}: the program must be an absolute path"));
     }
     if argv.iter().any(|a| a.len() > 1024 || a.contains('\0')) {

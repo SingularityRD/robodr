@@ -922,15 +922,16 @@ impl Engine {
         let now = self.eff_now(sys);
         if now >= dep.expires_at {
             let mut changed = false;
-            for i in 0..dep.items.len() {
-                if dep.items[i].status == ItemStatus::Pending {
-                    if let Some(d) = self.state.deployment.as_mut() {
-                        d.items[i].status = ItemStatus::Refused;
+            for (i, item) in dep.items.iter().enumerate() {
+                if item.status == ItemStatus::Pending {
+                    let live = self.state.deployment.as_mut();
+                    if let Some(x) = live.and_then(|d| d.items.get_mut(i)) {
+                        x.status = ItemStatus::Refused;
                         changed = true;
                     }
                     let ev = self.journal.note(
                         kinds::REFUSED,
-                        json!({"stage": "install", "name": dep.items[i].name, "serial": dep.items[i].serial,
+                        json!({"stage": "install", "name": item.name, "serial": item.serial,
                                "code": "expired", "detail": "the deployment expired before the item was installed"}),
                     )?;
                     self.finding(
@@ -938,7 +939,7 @@ impl Engine {
                         Severity::High,
                         format!(
                             "expired: {} {}: the deployment expired before it was installed",
-                            dep.items[i].name, dep.items[i].serial
+                            item.name, item.serial
                         ),
                         Some(ev),
                     );
@@ -949,8 +950,12 @@ impl Engine {
             }
             return Ok(());
         }
-        let pending: Vec<usize> = (0..dep.items.len())
-            .filter(|i| dep.items[*i].status == ItemStatus::Pending)
+        let pending: Vec<usize> = dep
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.status == ItemStatus::Pending)
+            .map(|(i, _)| i)
             .collect();
         let Some(&idx) = pending.first() else {
             return Ok(());
@@ -959,13 +964,17 @@ impl Engine {
         // item of this deployment waits for it.
         let mut order = pending.clone();
         let deps_pending = |i: usize, e: &Self| -> bool {
-            let Some(m) = e.store.manifest(&dep.items[i].digest).ok() else {
+            let Some(m) = dep
+                .items
+                .get(i)
+                .and_then(|item| e.store.manifest(&item.digest).ok())
+            else {
                 return false;
             };
             m.requires.iter().any(|r| {
                 pending
                     .iter()
-                    .any(|j| *j != i && dep.items[*j].name == r.name)
+                    .any(|j| *j != i && dep.items.get(*j).is_some_and(|x| x.name == r.name))
             })
         };
         order.sort_by_key(|i| deps_pending(*i, self));
@@ -1272,7 +1281,10 @@ impl Engine {
         )?;
         let v = self.erase_with(&p.trigger, None, false)?;
         // Read back: the epoch moved on (TPM), or the keyslots are gone.
-        let destroyed = v["destroyed"].as_array().map_or(0, Vec::len);
+        let destroyed = v
+            .get("destroyed")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
         if destroyed == 0 {
             return Err(EngineError("erase destroyed nothing".into()));
         }
@@ -2198,7 +2210,7 @@ impl Engine {
         let mut dropped: Vec<Ver> = Vec::new();
         let mut i = 0;
         while i < k.len() {
-            if k[i].serial < floor || i >= keep {
+            if i >= keep || k.get(i).is_some_and(|v| v.serial < floor) {
                 dropped.push(k.remove(i));
             } else {
                 i += 1;

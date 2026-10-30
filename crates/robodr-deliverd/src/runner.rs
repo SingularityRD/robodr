@@ -404,7 +404,7 @@ fn reader(mut r: impl Read + Send + 'static, max: usize) -> mpsc::Receiver<(Vec<
                 Ok(n) => {
                     total += n as u64;
                     let room = max.saturating_sub(kept.len());
-                    kept.extend_from_slice(&buf[..n.min(room)]);
+                    kept.extend_from_slice(buf.get(..n.min(room)).unwrap_or_default());
                 }
             }
         }
@@ -439,7 +439,7 @@ pub fn run_reader<T>(
         return Err("argv[0] is not an absolute path".into());
     }
     let mut cmd = Command::new(prog);
-    cmd.args(&argv[1..])
+    cmd.args(argv.get(1..).unwrap_or_default())
         .env_clear()
         .env("PATH", FIXED_PATH)
         .env("LC_ALL", "C")
@@ -535,7 +535,7 @@ fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits
         return res;
     }
     let mut cmd = Command::new(prog);
-    cmd.args(&argv[1..])
+    cmd.args(argv.get(1..).unwrap_or_default())
         .env_clear()
         .env("PATH", FIXED_PATH)
         .env("LC_ALL", "C")
@@ -627,7 +627,7 @@ fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits
                     res.truncated = true;
                 }
                 let room = limits.max_output.saturating_sub(kept.len());
-                kept.extend_from_slice(&b[..b.len().min(room)]);
+                kept.extend_from_slice(b.get(..room).unwrap_or(&b));
             }
             None => res.pipes_held = true,
         }

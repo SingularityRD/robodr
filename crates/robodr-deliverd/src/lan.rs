@@ -174,9 +174,10 @@ fn pull_with(cfg: &Config, skip_same: bool) -> Result<Option<PathBuf>, String> {
             let mut buf = vec![0u8; 64 * 1024];
             while left > 0 {
                 let n = (left as usize).min(buf.len());
-                s.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
-                h.update(&buf[..n]);
-                out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                let chunk = buf.get_mut(..n).unwrap_or_default();
+                s.read_exact(chunk).map_err(|e| e.to_string())?;
+                h.update(chunk);
+                out.write_all(chunk).map_err(|e| e.to_string())?;
                 left -= n as u64;
             }
             if robodr_blackbox::crypto::to_hex(&h.finalize()) != f.sha256 {

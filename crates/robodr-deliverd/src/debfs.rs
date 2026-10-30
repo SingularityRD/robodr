@@ -59,10 +59,10 @@ pub struct Entry {
 }
 
 fn octal(field: &[u8]) -> Result<u64, String> {
-    if field.first().is_some_and(|b| b & 0x80 != 0) {
+    if let Some((&first, tail)) = field.split_first().filter(|(b, _)| *b & 0x80 != 0) {
         // GNU base-256.
-        let mut v: u64 = u64::from(field[0] & 0x7f);
-        for b in &field[1..] {
+        let mut v: u64 = u64::from(first & 0x7f);
+        for b in tail {
             v = v
                 .checked_mul(256)
                 .and_then(|v| v.checked_add(u64::from(*b)))
@@ -84,14 +84,13 @@ fn octal(field: &[u8]) -> Result<u64, String> {
 }
 
 fn cstr(b: &[u8]) -> &[u8] {
-    let n = b.iter().position(|c| *c == 0).unwrap_or(b.len());
-    &b[..n]
+    b.split(|c| *c == 0).next().unwrap_or(b)
 }
 
 fn read_block(r: &mut dyn Read, buf: &mut [u8; 512]) -> Result<bool, String> {
     let mut got = 0;
     while got < 512 {
-        match r.read(&mut buf[got..]) {
+        match r.read(buf.get_mut(got..).unwrap_or_default()) {
             Ok(0) if got == 0 => return Ok(false),
             Ok(0) => return Err("tar: truncated block".into()),
             Ok(n) => got += n,
@@ -137,21 +136,26 @@ fn pax_path(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
             .iter()
             .position(|b| *b == b' ')
             .ok_or("tar: bad pax record")?;
-        let len: usize = std::str::from_utf8(&rest[..sp])
-            .ok()
+        let len: usize = rest
+            .get(..sp)
+            .and_then(|d| std::str::from_utf8(d).ok())
             .and_then(|s| s.parse().ok())
-            .filter(|l| *l > sp + 1 && *l <= rest.len())
+            .filter(|l| *l > sp + 1)
             .ok_or("tar: bad pax record length")?;
-        let rec = &rest[sp + 1..len];
+        let (record, next) = rest
+            .split_at_checked(len)
+            .ok_or("tar: bad pax record length")?;
+        let rec = record.get(sp + 1..).ok_or("tar: bad pax record")?;
         let rec = rec.strip_suffix(b"\n").ok_or("tar: bad pax record")?;
         let eq = rec
             .iter()
             .position(|b| *b == b'=')
             .ok_or("tar: bad pax record")?;
-        if &rec[..eq] == b"path" {
-            path = Some(rec[eq + 1..].to_vec());
+        let (key, value) = rec.split_at_checked(eq).ok_or("tar: bad pax record")?;
+        if key == b"path" {
+            path = Some(value.get(1..).unwrap_or_default().to_vec());
         }
-        rest = &rest[len..];
+        rest = next;
     }
     Ok(path)
 }
