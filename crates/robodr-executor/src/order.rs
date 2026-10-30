@@ -94,6 +94,11 @@ pub enum Target {
     },
     /// A ROS 2 node by name (not resolvable by executor v1: refused).
     Node { name: String },
+    /// Motion actions (Sprint 8, `crate::motion`): the restriction's
+    /// parameters (the control plane's caps, or the planner's
+    /// `limit_motion` factor) or the rollback's target. A control-plane
+    /// order's must equal the signed body's parameters (`order_mismatch`).
+    Motion(crate::motion::MotionRequest),
     /// A process (never executed by executor v1: refused).
     Process { name: String },
 }
@@ -227,6 +232,18 @@ impl Order {
             Target::Node { name } | Target::Process { name } => {
                 if name.is_empty() || !text_ok(name) {
                     return Err("target name empty, too long or with control characters".into());
+                }
+            }
+            Target::Motion(m) => {
+                let bad_num = [m.factor, m.max_linear_speed, m.max_joint_speed]
+                    .iter()
+                    .flatten()
+                    .any(|x| !x.is_finite());
+                let bad_text = [&m.workspace_zone, &m.config, &m.to_version]
+                    .iter()
+                    .any(|t| t.as_deref().is_some_and(|t| t.is_empty() || !text_ok(t)));
+                if bad_num || bad_text {
+                    return Err("motion parameters not finite, or text empty / invalid".into());
                 }
             }
         }

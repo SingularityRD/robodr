@@ -29,7 +29,12 @@
 //!    and the order's id, action, target and TTL equal the signed body's
 //!    `request_id`, `action`, `parameters` (`participant_guid` / `node`)
 //!    and `ttl_seconds`; the origin's key id and `requested_by` equal the
-//!    signed ones (`order_mismatch`);
+//!    signed ones (`order_mismatch`); since Sprint 8 a `restrict_motion` /
+//!    `rollback_config` order's motion target equals the signed
+//!    parameters (`max_linear_speed`, `max_joint_speed`, `workspace_zone`;
+//!    `config`, `to_version`), and the signed `approved_by` (at most 4
+//!    names) is returned for the two-person check of the motion actions
+//!    (`crate::motion::approvers_ok`);
 //! 6. the approval evidence the contract requires is present in the signed
 //!    body: `authority: "request"`, a `requested_by` (1..=100 characters,
 //!    no control characters), a `source` (`[a-z0-9_-]{1,32}`) and a
@@ -331,6 +336,9 @@ struct SignedBody {
     requested_by: String,
     source: String,
     authority: String,
+    /// The approvers on the SOC side (contract §4, two-person actions).
+    #[serde(default)]
+    approved_by: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -371,8 +379,24 @@ fn pct_decode(s: &str) -> Option<String> {
 
 /// The target of the order an executable request is submitted with.
 fn signed_target(action: &str, p: &SignedParams) -> Target {
-    if action != "quarantine_node" {
-        return Target::None;
+    match action {
+        "restrict_motion" => {
+            return Target::Motion(crate::motion::MotionRequest {
+                max_linear_speed: p.max_linear_speed,
+                max_joint_speed: p.max_joint_speed,
+                workspace_zone: p.workspace_zone.clone(),
+                ..Default::default()
+            })
+        }
+        "rollback_config" => {
+            return Target::Motion(crate::motion::MotionRequest {
+                config: Some(p.config.clone().unwrap_or_else(|| "profile".into())),
+                to_version: p.to_version.clone(),
+                ..Default::default()
+            })
+        }
+        "quarantine_node" => {}
+        _ => return Target::None,
     }
     // Exactly as agentd derives it (`executor_link::order_for`).
     match (&p.participant_guid, &p.node) {
@@ -399,6 +423,10 @@ fn same_target(order: &Target, signed: &Target) -> bool {
             Target::Participant { guid_prefix: a, .. },
             Target::Participant { guid_prefix: b, .. },
         ) => a == b,
+        // An order without motion parameters (an executor v1 agentd) stands
+        // for no restriction at all: advisory without a `motion` section,
+        // refused (`invalid_order`) with one. It can never loosen anything.
+        (Target::None, Target::Motion(_)) => true,
         (a, b) => a == b,
     }
 }
@@ -416,8 +444,13 @@ fn refuse(code: &'static str, why: impl Into<String>) -> Refusal {
 }
 
 /// Verify a control-plane order's SOC request (rules 1-6 of the module
-/// docs). `Ok` means a human approved exactly this order.
-pub fn verify(order: &Order, cx: &Context<'_>, replay: &mut ReplayStore) -> Result<(), Refusal> {
+/// docs). `Ok` means a human approved exactly this order; it carries the
+/// approvers the signed body names (`approved_by`, two-person actions).
+pub fn verify(
+    order: &Order,
+    cx: &Context<'_>,
+    replay: &mut ReplayStore,
+) -> Result<Vec<String>, Refusal> {
     let Origin::ControlPlane {
         key_id,
         requested_by,
@@ -546,13 +579,17 @@ pub fn verify(order: &Order, cx: &Context<'_>, replay: &mut ReplayStore) -> Resu
         ));
     }
     let params = body.parameters.unwrap_or_default();
-    let _ = (
-        params.max_linear_speed,
-        params.max_joint_speed,
-        &params.workspace_zone,
-        &params.config,
-        &params.to_version,
-    );
+    let approved_by = body.approved_by.unwrap_or_default();
+    if approved_by.len() > MAX_APPROVERS
+        || approved_by
+            .iter()
+            .any(|a| a.is_empty() || a.chars().count() > 100 || a.chars().any(char::is_control))
+    {
+        return Err(refuse(
+            codes::APPROVAL_MISSING,
+            format!("approved_by: at most {MAX_APPROVERS} names of 1..=100 characters"),
+        ));
+    }
     let mismatch = if body.request_id != order.id {
         Some("request_id")
     } else if body.action != order.action.as_str() {
@@ -570,8 +607,11 @@ pub fn verify(order: &Order, cx: &Context<'_>, replay: &mut ReplayStore) -> Resu
             format!("the order's {field} differs from the signed request's: not executed"),
         ));
     }
-    Ok(())
+    Ok(approved_by)
 }
+
+/// Most approvers a signed body may name.
+pub const MAX_APPROVERS: usize = 4;
 
 /// The strict revert body (contract §6: `{"reason"?, "requested_by"}`).
 #[derive(Debug, Deserialize)]
@@ -580,16 +620,21 @@ struct SignedRevert {
     #[serde(default)]
     reason: Option<String>,
     requested_by: String,
+    /// The approvers of the revert (a two-person action's revert needs
+    /// two, like the action).
+    #[serde(default)]
+    approved_by: Option<Vec<String>>,
 }
 
 /// Verify the SOC's signed revert request for action `id` (module docs,
-/// F3). `Ok` means a SOC key holder asked for exactly this revert.
+/// F3). `Ok` means a SOC key holder asked for exactly this revert; it
+/// carries `(requested_by, approved_by)` of the signed body.
 pub fn verify_revert(
     id: &str,
     soc: Option<&SocRequest>,
     cx: &Context<'_>,
     replay: &mut ReplayStore,
-) -> Result<(), Refusal> {
+) -> Result<(String, Vec<String>), Refusal> {
     let Some(soc) = soc else {
         return Err(refuse(
             codes::SOC_SIGNATURE_INVALID,
@@ -678,8 +723,20 @@ pub fn verify_revert(
              invalid reason",
         ));
     }
+    let approved_by = body.approved_by.unwrap_or_default();
+    if approved_by.len() > MAX_APPROVERS
+        || approved_by
+            .iter()
+            .any(|a| a.is_empty() || a.chars().count() > 100 || a.chars().any(char::is_control))
+    {
+        return Err(refuse(
+            codes::APPROVAL_MISSING,
+            format!("approved_by: at most {MAX_APPROVERS} names of 1..=100 characters"),
+        ));
+    }
     // Last, so a refused request does not burn its nonce.
-    replay.check(&soc.key_id, &soc.nonce, soc.timestamp, now_s, cx.max_skew_s)
+    replay.check(&soc.key_id, &soc.nonce, soc.timestamp, now_s, cx.max_skew_s)?;
+    Ok((body.requested_by, approved_by))
 }
 
 /// One persisted (key, nonce) pair.
@@ -918,9 +975,14 @@ pub mod testing {
             Target::Node { name } => {
                 params.insert("node".into(), name.clone().into());
             }
+            Target::Motion(m) => {
+                if let Ok(serde_json::Value::Object(o)) = serde_json::to_value(m) {
+                    params.extend(o);
+                }
+            }
             _ => {}
         }
-        if order.action == robodr_responder::ActionId::RestrictMotion {
+        if order.action == robodr_responder::ActionId::RestrictMotion && params.is_empty() {
             params.insert("max_linear_speed".into(), 0.5.into());
         }
         let mut v = serde_json::json!({

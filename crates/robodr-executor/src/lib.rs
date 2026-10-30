@@ -56,6 +56,7 @@ pub mod evidence;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
 pub mod journal;
+pub mod motion;
 pub mod net;
 pub mod nft;
 pub mod nftmodel;
@@ -82,5 +83,7 @@ pub fn boot_id() -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+mod motion_tests;
 #[cfg(test)]
 mod tests;

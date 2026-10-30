@@ -153,9 +153,21 @@ pub mod codes {
     /// An action held after a reboot was approved with a SOC key that is no
     /// longer configured: not re-armed.
     pub const APPROVAL_KEY_REMOVED: &str = "approval_key_removed";
+    // --- Motion adapters (Sprint 8, `crate::motion`) -------------------------
+    /// No platform adapter is configured for the action (`motion`).
+    pub const NO_ADAPTER: &str = "no_adapter";
+    /// The adapter's site flag `oem_validated` is not set.
+    pub const ADAPTER_NOT_VALIDATED: &str = "adapter_not_validated";
+    /// The safety state is not one the adapter allows (a pause while
+    /// moving fast, by default).
+    pub const SAFETY_STATE_NOT_ALLOWED: &str = "safety_state_not_allowed";
+    /// `rollback_config` outside `idle`.
+    pub const REQUIRES_IDLE: &str = "requires_idle";
+    /// The policy's safe behaviour is not one the adapter can carry out.
+    pub const BEHAVIOUR_UNSUPPORTED: &str = "behaviour_unsupported";
 
     /// Every code, for mapping a wire string back to a static one.
-    pub const ALL: [&str; 30] = [
+    pub const ALL: [&str; 35] = [
         INVALID_ORDER,
         REPLAY,
         NOT_EXECUTOR_ACTION,
@@ -186,6 +198,11 @@ pub mod codes {
         LOCATOR_OUT_OF_SCOPE,
         SOC_KEYS_UNAVAILABLE,
         APPROVAL_KEY_REMOVED,
+        NO_ADAPTER,
+        ADAPTER_NOT_VALIDATED,
+        SAFETY_STATE_NOT_ALLOWED,
+        REQUIRES_IDLE,
+        BEHAVIOUR_UNSUPPORTED,
     ];
 
     /// The static code for a wire string.
@@ -344,7 +361,7 @@ pub fn merge_ranges(mut v: Vec<PortRange>) -> Vec<PortRange> {
 }
 
 /// What an accepted order does.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Effect {
     Isolate(IsolationSpec),
@@ -356,10 +373,12 @@ pub enum Effect {
     Advisory {
         note: String,
     },
+    /// A motion action through platform adapters (`crate::motion`).
+    Motion(crate::motion::MotionSpec),
 }
 
 /// An order that passed [`precheck`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Planned {
     pub effect: Effect,
     /// Seconds; `None` for evidence and advisory.
@@ -534,7 +553,19 @@ pub fn precheck(
         ));
     }
     let spec = order.action.spec();
-    if spec.ga_execution != GaExecution::Executor || spec.may_de_energise {
+    // Sprint 8: with a `motion` section the motion actions go to their
+    // platform adapters (`crate::motion::plan`, after the common rules
+    // below); without one, nothing changes from executor v1.
+    let motion = cfg.config.motion.as_ref().filter(|_| {
+        matches!(
+            order.action,
+            ActionId::RestrictMotion
+                | ActionId::SafePause
+                | ActionId::RequestSafeState
+                | ActionId::RollbackConfig
+        )
+    });
+    if motion.is_none() && (spec.ga_execution != GaExecution::Executor || spec.may_de_energise) {
         let why = match spec.ga_execution {
             GaExecution::PlatformAdapter => "runs only through an OEM-validated platform adapter",
             GaExecution::PlanOnly => "is plan-only (irreversible)",
@@ -584,6 +615,9 @@ pub fn precheck(
             codes::SAFETY_STATE_UNAVAILABLE,
             "the action was judged without a known safety state: nothing is executed",
         ));
+    }
+    if let Some(m) = motion {
+        return crate::motion::plan(order, policy, m, &cfg.config.ttl);
     }
     if order.action == ActionId::RestrictMotion {
         return Ok(Planned {

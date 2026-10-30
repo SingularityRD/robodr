@@ -2460,8 +2460,11 @@ name = "robodr-executor"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-cdr",
  "robodr-executor",
+ "robodr-firewall-gw",
  "robodr-responder",
+ "robodr-rtps",
  "serde",
  "serde_json",
 ]
