@@ -760,6 +760,32 @@ impl Gateway {
         self.restriction.as_ref()
     }
 
+    /// Whether `r` may be applied here: on a robot that balances (humanoid,
+    /// quadruped, other) no limit it imposes is below
+    /// [`crate::restrict::MIN_FACTOR_BALANCING`] of the channel's own
+    /// (review finding 3; [`Restriction::floor_check`]).
+    pub fn restriction_floor_ok(&self, r: &Restriction) -> Result<(), String> {
+        if matches!(
+            self.fw.policy().platform().morphology,
+            Morphology::Wheeled | Morphology::Arm
+        ) {
+            return Ok(());
+        }
+        let lin: Vec<f64> = self
+            .channels
+            .iter()
+            .filter(|c| !c.codec.is_joint() && !c.codec.is_trajectory())
+            .map(|c| c.base_lin)
+            .collect();
+        let joint: Vec<f64> = self
+            .channels
+            .iter()
+            .filter_map(|c| c.traj.as_ref())
+            .flat_map(|(t, _)| t.joints.iter().map(|j| j.max_velocity))
+            .collect();
+        r.floor_check(&lin, &joint)
+    }
+
     /// Apply (`Some`) or lift (`None`) a restriction (`crate::restrict`);
     /// a change is a `robot.gateway.restriction_changed` finding.
     pub fn set_restriction(&mut self, r: Option<Restriction>) {

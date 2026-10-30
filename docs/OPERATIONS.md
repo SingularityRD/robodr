@@ -1786,11 +1786,20 @@ The executor detects the missing table before its next transaction (a
 new order, a revert, a TTL expiry) or within `verify_interval_s`. It drops
 every action as `removed_externally`, re-installs nothing, also not after a
 restart within the same boot, and **refuses every order**
-(`operator_disabled`) until you re-arm it:
+(`operator_disabled`) until you re-arm it, as root, with the executor
+stopped (the socket agentd uses has no re-arm: agentd holds its key, and
+a compromised agentd must not be able to lift your fence; `rearm` refuses
+while an executor serves the socket):
 
 ```sh
+systemctl stop robodr-executor
 robodr-executor rearm --config /etc/robodr/executor.json --reason "<why>"
+systemctl start robodr-executor
 ```
+
+A `safe_pause` in force is **not** undone by the emergency disable (nor by
+anything else but a two-person signed revert, below): the robot stays
+paused; restore it on the platform once it is safe to move.
 
 To keep it from acting at all:
 
@@ -1908,14 +1917,39 @@ To enable:
    both `unitree_sport` and `gateway` for `restrict_motion`, list
    `unitree_sport` first (enforced).
 
-What to expect: `restrict_motion` and `safe_pause` answer `verified` and
-are lifted at their TTL (`motion.safe_pause_ttl_s` for a pause) or by
-revert; lifting a pause **releases** it and never resumes a mission
-(Nav2 goals are not restored, PX4 stays in hold); `request_safe_state` and
-`rollback_config` answer `applied` and are not reversible. A pause or safe
-state is refused while `moving_fast` unless the adapter lists it in
-`allowed_states`. Watch the executor's events: an adapter undo that fails
-(`revert_failed`) is retried every tick; check the platform by hand.
+7. On a robot that balances (humanoid, quadruped, unspecified), set
+   `motion.envelope` (`max_linear_speed`, `max_joint_speed`: the profile
+   envelope's) if the SOC sends absolute caps: a cap is accepted only when
+   it is at least the policy's `min_motion_factor` of it, and refused
+   (`fall_hazard`) without an envelope. The planner's `limit_motion` is a
+   factor; a planner order with an absolute cap is refused
+   (`invalid_order`). The gateway applies the same floor on its own (0.05
+   of each channel's limit; a restriction file below it is ignored and
+   reported as `restriction_error`).
+8. `rollback.program` must be a regular file owned by root and not
+   writable by group or others, in a directory with the same properties
+   (otherwise the rollback fails and nothing runs). It runs without the
+   executor's ambient `CAP_NET_ADMIN`.
+
+What to expect: `restrict_motion` answers `verified` and is lifted at its
+TTL or by revert. On a humanoid (or unspecified body), and on every robot
+with `require_approval_for_all_containment`, a `restrict_motion` needs
+a human's approval: the planner's is refused (`needs_approval`).
+`safe_pause` answers `verified` and is **never lifted automatically**
+(ADR-0006): when it reaches `motion.safe_pause_ttl_s` the executor reports
+it (event `expired`, detail `HIGH: ...`) and leaves the robot paused; a
+restart, an emergency disable, a failed apply or re-arm leave it paused
+too. It is lifted only by the SOC's signed revert with two approvers, and
+only when agentd's safety state at that moment is known, fresh, not
+engaged and one the adapter allows (otherwise the revert is refused and
+the pause stays). Lifting a pause **releases** it and never resumes a
+mission (Nav2 goals are not restored, PX4 stays in hold);
+`request_safe_state` and `rollback_config` answer `applied` and are not
+reversible. A pause or safe state is refused while `moving_fast` unless
+the adapter lists it in `allowed_states`. Watch the executor's events: an
+adapter undo that fails (`revert_failed`) is retried every tick (a pause's
+failed lift is not retried: it stays in force until the next signed
+revert); check the platform by hand.
 
 ### 6.6 Inline Motion Firewall gateway (`robodr-firewall-gw`)
 

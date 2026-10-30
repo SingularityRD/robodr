@@ -29,8 +29,11 @@
 //!
 //! See `README.md` for the safety argument and the limits.
 
-// S10: this crate has no `unsafe` code and must stay that way.
-#![forbid(unsafe_code)]
+// S10: no `unsafe` code, except one FFI call (`prctl(2)`, a symbol std
+// already links) with a local `#[allow(unsafe_code)]` and a SAFETY note:
+// the rollback program is started without the executor's ambient
+// CAP_NET_ADMIN (`motion::adapters`, review finding 8).
+#![deny(unsafe_code)]
 // S10 (R9): release builds use `panic = "abort"`, so any panic kills the
 // executor (systemd restarts it and its ExecStopPost removes the table;
 // docs/OPERATIONS.md, "Crashes and restarts"). Non-test code has no
