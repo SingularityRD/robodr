@@ -492,11 +492,7 @@ impl Tpm {
     /// Create the UWK under the SRK with `auth_policy`; returns the public
     /// and private blobs (as `tpm2_create -u / -r` write them) and the
     /// SEC1 public point.
-    pub fn create_uwk(
-        &self,
-        w: &WorkDir,
-        auth_policy: &[u8; 32],
-    ) -> Result<UwkBlobs, SealError> {
+    pub fn create_uwk(&self, w: &WorkDir, auth_policy: &[u8; 32]) -> Result<UwkBlobs, SealError> {
         let pol = w.write("uwk.policy", auth_policy)?;
         let (pu, pr) = (w.path("uwk.pub"), w.path("uwk.priv"));
         self.must(

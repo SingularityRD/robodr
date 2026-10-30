@@ -254,7 +254,6 @@ fn policy_sign(args: Vec<String>) -> Result<(), Cmd> {
         &["key", "platform", "version", "pcr", "floor-nv", "out"],
         false,
     )?;
-    let key = keys::policy_load(&path(&a, "key")?)?;
     let version: u32 = a
         .num("version")
         .map_err(Cmd::Usage)?
@@ -268,8 +267,10 @@ fn policy_sign(args: Vec<String>) -> Result<(), Cmd> {
         Some(s) => parse_handle(s, 0x01).map_err(|e| Cmd::Usage(e.detail))?,
         None => crate::tpm::DEFAULT_FLOOR_NV,
     };
-    let b = policy::sign(&key, req(&a, "platform")?, version, &pcrs, floor)?;
     let out = path(&a, "out")?;
+    let platform = req(&a, "platform")?;
+    let key = keys::policy_load(&path(&a, "key")?)?;
+    let b = policy::sign(&key, platform, version, &pcrs, floor)?;
     if std::fs::symlink_metadata(&out).is_ok() {
         return Err(Cmd::Fail(crate::invalid(format!(
             "{}: already exists",
@@ -348,14 +349,20 @@ fn enroll_fallback(args: Vec<String>) -> Result<(), Cmd> {
 }
 
 fn open_unit(a: &Args) -> Result<Unit, Cmd> {
+    // TPM flags are checked before any file is read.
+    let flagged = if has_tpm_flags(a) {
+        Some(tpm(a)?)
+    } else {
+        None
+    };
     let dir = path(a, "seal-dir")?;
     let rec = UnitRecord::parse(
         &std::fs::read(dir.join(crate::unit::UNIT_FILE)).map_err(|e| crate::io_err(&dir, e))?,
     )?;
-    let t = if rec.mode == crate::unit::Mode::Tpm || has_tpm_flags(a) {
-        Some(tpm(a)?)
-    } else {
-        None
+    let t = match (flagged, rec.mode) {
+        (Some(t), _) => Some(t),
+        (None, crate::unit::Mode::Tpm) => Some(tpm(a)?),
+        (None, crate::unit::Mode::Fallback) => None,
     };
     Ok(Unit::open(&dir, t)?)
 }

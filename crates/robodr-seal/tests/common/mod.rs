@@ -89,14 +89,29 @@ pub struct SwTpm {
 impl SwTpm {
     pub fn start(state: &Path) -> Self {
         std::fs::create_dir_all(state).unwrap();
-        let port = port();
-        let child = Self::spawn(state, port);
-        wait_port(port, "swtpm");
-        Self {
-            child,
-            port,
-            state: state.to_path_buf(),
+        // A port may be taken by another process: swtpm then exits at
+        // once, and the next pair of ports is tried.
+        for _ in 0..8 {
+            let port = port();
+            let mut child = Self::spawn(state, port);
+            let t0 = Instant::now();
+            loop {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Self {
+                        child,
+                        port,
+                        state: state.to_path_buf(),
+                    };
+                }
+                if child.try_wait().unwrap().is_some() || t0.elapsed() > Duration::from_secs(10) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
         }
+        panic!("swtpm did not start");
     }
 
     fn spawn(state: &Path, port: u16) -> Child {

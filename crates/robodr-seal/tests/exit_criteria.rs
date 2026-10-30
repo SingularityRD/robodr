@@ -409,3 +409,90 @@ fn a_fallback_unit_cannot_unlock_without_tang() {
     assert!(luks.tang_pass(&img, 1).is_err());
     assert!(!luks.test_key(&img, &pass).unwrap());
 }
+
+fn sh(prog: &str, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(prog)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The full §7.4 path with device-mapper: the runtime volume is a real
+/// dm-crypt mapping of a LUKS2 image on a loop device, opened with the
+/// TPM-unwrapped volume key, an ext4 file system mounted, the sealed RPK
+/// installed into it, everything closed, and then the raw image (the
+/// bytes a captured unit's disk holds) searched for plaintext.
+/// `ROBODR_SEAL_DM=1` (root, loop devices, dm-crypt) in addition to
+/// `ROBODR_SWTPM=1`; not runnable in containers without device-mapper.
+#[test]
+fn plaintext_only_inside_the_mounted_runtime_volume_dm() {
+    if !swtpm_enabled("runtime_volume_dm") {
+        return;
+    }
+    if std::env::var("ROBODR_SEAL_DM").as_deref() != Ok("1") {
+        eprintln!("runtime_volume_dm: skipped: set ROBODR_SEAL_DM=1 (needs root, loop devices and dm-crypt)");
+        return;
+    }
+    let e = enrolled("runtime-dm");
+    let luks = Luks::system();
+    let img = e.dir.join("runtime.img");
+    std::fs::File::create(&img)
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    let vk = e.unit.create_volume_key().unwrap();
+    luks.format(&img, &vk[..], "robodr-sealed").unwrap();
+    let lo = sh("losetup", &["-f", "--show", img.to_str().unwrap()]);
+    assert!(
+        lo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lo.stderr)
+    );
+    let lo = String::from_utf8_lossy(&lo.stdout).trim().to_string();
+    let name = format!("robodr-sealed-it-{}", std::process::id() % 100000);
+    let mnt = e.dir.join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        luks.open(
+            std::path::Path::new(&lo),
+            &name,
+            &e.unit.volume_key().unwrap()[..],
+        )
+        .unwrap();
+        let dev = format!("/dev/mapper/{name}");
+        assert!(sh("mkfs.ext4", &["-q", &dev]).status.success());
+        assert!(sh("mount", &[&dev, mnt.to_str().unwrap()]).status.success());
+        let depot = X25519Secret::generate().unwrap();
+        let (rpk, m, digest) = sealed_rpk(
+            &e.dir.join("rel"),
+            "nav-model",
+            PLATFORM,
+            &payload()[..2],
+            &[depot.public()],
+        );
+        let wk = robodr_seal::rpk::rewrap_for_unit(&depot, &m, &digest, e.unit.record()).unwrap();
+        let ck = e
+            .unit
+            .unwrap_content_key(
+                &robodr_seal::from_hex(&wk.wrap).unwrap(),
+                &digest,
+                m.seal.as_ref().unwrap(),
+            )
+            .unwrap();
+        install_plaintext(&ck, &m, &rpk, &mnt.join("model")).unwrap();
+        assert!(!files_containing(&[&mnt], MARKERS[0]).is_empty());
+    }));
+    let _ = sh("umount", &[mnt.to_str().unwrap()]);
+    let _ = luks.close(&name);
+    let _ = sh("losetup", &["-d", &lo]);
+    if let Err(p) = res {
+        std::panic::resume_unwind(p);
+    }
+    let raw = std::fs::read(&img).unwrap();
+    for mk in &MARKERS[..2] {
+        assert!(
+            !raw.windows(mk.len()).any(|w| w == *mk),
+            "plaintext in the raw image"
+        );
+    }
+}
