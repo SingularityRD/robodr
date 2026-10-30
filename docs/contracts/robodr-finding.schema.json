@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.singularityrd.com/robodr/findings/2.4.0",
-  "title": "RoboDR robodr.findings message (contract 2.4.0; also validates 2.0.x, 2.1.x, 2.2.x and 2.3.x)",
+  "$id": "https://schemas.singularityrd.com/robodr/findings/2.5.0",
+  "title": "RoboDR robodr.findings message (contract 2.5.0; also validates 2.0.x, 2.1.x, 2.2.x, 2.3.x and 2.4.x)",
   "description": "One findings message (Kafka value on the configured topic, default robodr.findings; one NDJSON line on other transports): vendor-neutral envelope + OCSF 1.1 Detection Finding (class_uid 2004). data_source (default robodr) and ocsf.metadata.log_name (the topic, default robodr.findings) are deployment labels. Contract 1.x messages (robot-edr.findings) are described by legacy/robot-edr-finding.schema.json. Maintained alongside crates/robodr-ocsf/src/model.rs; the crate's tests check that produced findings contain every required key here and no undeclared key. Strings carrying attacker-controlled data are objects of type TaintedName/TaintedText or OCSF resources labelled taint:adversary. SR-TAINT: every string has a pattern; every string is printable ASCII (U+0020-U+007E) without < > or backtick, and tainted values are restricted to the allow-list of their escaping scheme (see robodr.findings.md section 3), so raw bidi/format/newline characters and Markdown/HTML markup are rejected by a schema-only consumer. A finding may carry a detached Ed25519 signature in the Kafka header robodr-finding-sig (NOT in this value); its header value is described by $defs/FindingSignatureHeader and is signed over the exact bytes of this value (robodr.findings.md section 2a).",
   "type": "object",
   "additionalProperties": false,
@@ -172,7 +172,128 @@
         },
         "bus_message_id": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
         "occurrence_count": { "type": "integer", "minimum": 1 },
-        "detail": { "$ref": "#/$defs/TaintedText" }
+        "detail": { "$ref": "#/$defs/TaintedText" },
+        "agent_health": { "$ref": "#/$defs/AgentHealth" }
+      }
+    },
+    "HealthName": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -;=?-_a-~]*$" },
+    "AgentHealth": {
+      "description": "Since 2.5: the agent's periodic health record, present exactly on robot.agent.health findings (robodr.findings.md section 3g). Sensor-authored (agentd's own counters and configuration), never tainted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "reasons", "interval_ms", "uptime_ms", "seq", "versions", "inputs",
+        "counters", "blackbox", "reachability", "credentials", "clock", "disks"
+      ],
+      "properties": {
+        "state": { "enum": ["ok", "degraded", "unknown"] },
+        "reasons": {
+          "type": "array", "maxItems": 16,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[ -;=?-_a-~]*$" }
+        },
+        "interval_ms": { "type": "integer", "minimum": 0 },
+        "uptime_ms": { "type": "integer", "minimum": 0 },
+        "seq": { "type": "integer", "minimum": 1 },
+        "versions": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["component", "version"],
+            "properties": {
+              "component": { "$ref": "#/$defs/HealthName" },
+              "version": { "$ref": "#/$defs/HealthName" }
+            }
+          }
+        },
+        "inputs": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "received", "dropped", "malformed", "ended"],
+            "properties": {
+              "name": { "$ref": "#/$defs/HealthName" },
+              "last_rx_age_ms": { "type": "integer", "minimum": 0 },
+              "received": { "type": "integer", "minimum": 0 },
+              "dropped": { "type": "integer", "minimum": 0 },
+              "malformed": { "type": "integer", "minimum": 0 },
+              "ended": { "type": "boolean" }
+            }
+          }
+        },
+        "counters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["findings_spooled", "finding_errors", "health_findings", "spool_dropped", "spool_write_errors", "note_errors"],
+          "properties": {
+            "findings_spooled": { "type": "integer", "minimum": 0 },
+            "finding_errors": { "type": "integer", "minimum": 0 },
+            "health_findings": { "type": "integer", "minimum": 0 },
+            "spool_dropped": { "type": "integer", "minimum": 0 },
+            "spool_write_errors": { "type": "integer", "minimum": 0 },
+            "note_errors": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "blackbox": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["degraded", "anchored", "anchor_failures"],
+          "properties": {
+            "degraded": { "type": "boolean" },
+            "anchored": { "type": "boolean" },
+            "anchor_failures": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "reachability": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["component", "state"],
+            "properties": {
+              "component": { "$ref": "#/$defs/HealthName" },
+              "state": { "enum": ["reachable", "unreachable", "unknown", "not_configured"] },
+              "last_ok_age_ms": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "credentials": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "expires_ms", "days_to_expiry"],
+            "properties": {
+              "name": { "$ref": "#/$defs/HealthName" },
+              "expires_ms": { "type": "integer", "minimum": 0 },
+              "days_to_expiry": { "type": "integer" }
+            }
+          }
+        },
+        "clock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wall_jumps"],
+          "properties": {
+            "synchronized": { "type": "boolean" },
+            "max_error_ms": { "type": "integer", "minimum": 0 },
+            "wall_jumps": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "disks": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "free_bytes", "total_bytes"],
+            "properties": {
+              "name": { "$ref": "#/$defs/HealthName" },
+              "free_bytes": { "type": "integer", "minimum": 0 },
+              "total_bytes": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
       }
     },
     "DetectionFinding": {

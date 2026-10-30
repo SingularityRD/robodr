@@ -455,6 +455,33 @@ fn minimal_and_maximal_findings_match_schema() {
     }
 }
 
+/// Contract 2.5: a `robot.agent.health` finding with its record matches the
+/// schema, and an undeclared key inside the record is caught.
+#[test]
+fn agent_health_finding_matches_schema() {
+    use robodr_events::{Deviation, Severity};
+    let ctx = common::ctx();
+    let dev = Deviation::new(robodr_ocsf::AGENT_HEALTH_RULE, Severity::Low, "health");
+    let mut h = common::health::sample();
+    h.credentials[0].days_to_expiry = -2;
+    let f = robodr_ocsf::FindingBuilder::from_deviation(&dev, &ctx)
+        .agent_health(h)
+        .seen(common::T0, common::T0)
+        .build()
+        .unwrap();
+    let mut inst = serde_json::to_value(&f).unwrap();
+    let errs = schema_errors(&inst);
+    assert!(errs.is_empty(), "schema violations:\n{}", errs.join("\n"));
+    inst["entity_context"]["agent_health"]["clock"]["surprise"] = 1.into();
+    inst["entity_context"]["agent_health"]["state"] = "fine".into();
+    let errs = schema_errors(&inst);
+    assert!(errs.iter().any(|e| e.contains("surprise")), "{errs:?}");
+    assert!(
+        errs.iter().any(|e| e.contains("agent_health/state")),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn schema_checker_detects_missing_and_undeclared_keys() {
     let f = common::example_finding();

@@ -52,6 +52,7 @@
 
 pub mod builder;
 pub mod hash;
+pub mod host_rules;
 pub mod kafka;
 pub mod model;
 pub mod sig;
@@ -63,6 +64,7 @@ pub use builder::{
     effective_mode, finding_uid, ocsf_severity_id, ocsf_severity_name, rule_info,
     rule_info_for_contract, FindingBuilder, RobotContext, RuleInfo, Subject,
 };
+pub use host_rules::{host_rule_id, HOST_RULES, HOST_THREAT_FALLBACK};
 pub use kafka::{dedup_key, headers, partition_for, record, record_key, to_json, Record};
 pub use model::*;
 pub use sig::{

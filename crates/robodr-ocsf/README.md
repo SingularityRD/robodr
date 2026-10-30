@@ -146,6 +146,11 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 | `robot.host.pulsar_threat` | Host runtime-security detection (Pulsar rule), data source `host_runtime`; the Pulsar rule name and process are in the detail | — |
 | *since contract 2.1 (among others):* | | |
 | `robot.ros2.discovery_flood` | Discovery flood: unknown participants aggregated (agentd folds a flooding source's per-participant discovery findings into it) | T0848 |
+| *since contract 2.5:* | | |
+| `robot.agent.health` | Agent health record; the only rule that carries `entity_context.agent_health` (`AgentHealth`, `FindingBuilder::agent_health`) | — |
+| `robot.agent.{credential_expiring, clock_unsynced, clock_jump, disk_low, executor_unreachable, control_plane_request_fenced, selftest}` | (own titles, data source `robodr_agent`) | — |
+| `robot.gateway.overload` | In-path gateway overloaded (data source `ros2_motion_commands`) | — |
+| `robot.host.<rule>` | one per shipped Pulsar rule (`HOST_RULES`, `host_rule_id`; title = the rule name), data source `host_runtime`; `robot.host.pulsar_threat` stays the fallback | — |
 | anything else | RoboDR model-profile deviation | — |
 
 The validator applies the catalog of the message's own `contract_version`

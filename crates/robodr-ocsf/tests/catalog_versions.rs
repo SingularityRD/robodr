@@ -181,15 +181,15 @@ fn a_2_2_message_validates_with_its_own_catalog() {
 }
 
 #[test]
-fn current_contract_is_2_4() {
-    assert_eq!(CONTRACT_VERSION, "2.4.0");
+fn current_contract_is_2_5() {
+    assert_eq!(CONTRACT_VERSION, "2.5.0");
     let schema: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/contracts/robodr-finding.schema.json"
     ))
     .unwrap();
     assert_eq!(
         schema["$id"],
-        "https://schemas.singularityrd.com/robodr/findings/2.4.0"
+        "https://schemas.singularityrd.com/robodr/findings/2.5.0"
     );
 }
 
@@ -212,7 +212,7 @@ fn entries_added_in_2_4_are_not_in_2_3_or_earlier() {
         for v in ["1.3.0", "2.0.0", "2.2.0", "2.3.0", "2.3.9"] {
             assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
         }
-        for v in ["2.4.0", "2.4.1", "2.9.0"] {
+        for v in ["2.4.0", "2.4.1", "2.5.0", "2.9.0"] {
             assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
         }
         // A 2.4 finding validates; relabelled as 2.3 it does not (its
@@ -471,5 +471,67 @@ fn a_2_2_unitree_message_validates_with_its_own_catalog() {
             &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
         );
         assert!(robodr_ocsf::parse_and_validate(&up).is_err(), "{id}");
+    }
+}
+
+/// The 2.5 agent entries (sales-readiness WP2: T5 health record, T6
+/// credential expiry, T7 clock, T40 disk, T41 executor reachability; ids
+/// reserved for T81 control-plane fencing and T13 self-test).
+const IDS_2_5_AGENT: &[&str] = &[
+    "robot.agent.health",
+    "robot.agent.credential_expiring",
+    "robot.agent.clock_unsynced",
+    "robot.agent.clock_jump",
+    "robot.agent.disk_low",
+    "robot.agent.executor_unreachable",
+    "robot.agent.control_plane_request_fenced",
+    "robot.agent.selftest",
+];
+
+#[test]
+fn entries_added_in_2_5_are_not_in_2_4_or_earlier() {
+    let g = generic();
+    let host: Vec<&str> = robodr_ocsf::HOST_RULES.iter().map(|(_, id)| *id).collect();
+    let all = IDS_2_5_AGENT
+        .iter()
+        .map(|id| (*id, "robodr_agent"))
+        .chain(std::iter::once((
+            "robot.gateway.overload",
+            "ros2_motion_commands",
+        )))
+        .chain(host.iter().map(|id| (*id, "host_runtime")));
+    let mut n = 0;
+    for (id, source) in all {
+        n += 1;
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert!(robodr_ocsf::builder::rule_known(id), "{id}");
+        assert_eq!(full.data_source, source, "{id}");
+        assert!(full.techniques.is_empty(), "{id}");
+        for v in ["1.3.0", "2.0.0", "2.3.0", "2.4.0", "2.4.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.5.0", "2.5.1", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        if id == robodr_ocsf::AGENT_HEALTH_RULE {
+            continue; // needs its record: tests/agent_health.rs
+        }
+        let v25 = build(id);
+        robodr_ocsf::parse_and_validate(&v25).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let down = v25.replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.4.0\"",
+        );
+        assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
+    }
+    assert_eq!(n, IDS_2_5_AGENT.len() + 1 + host.len());
+    // Everything older is unchanged in 2.5, the fallback host id included.
+    for id in IDS_2_4.iter().chain(IDS_1_3).chain(IDS_2_2) {
+        assert_eq!(
+            rule_info_for_contract(id, "2.5.0"),
+            rule_info_for_contract(id, "2.4.0"),
+            "{id}"
+        );
     }
 }
