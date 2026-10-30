@@ -1972,7 +1972,7 @@ sudo sh /usr/lib/robodr/install-bundle.sh list       # versions kept on this rob
 sudo sh /usr/lib/robodr/install-bundle.sh rollback 0.1.0~alpha.1-1
 ```
 
-Rollback reinstalls the kept `.deb` after re-checking its hashes. The
+Rollback reinstalls the kept `.deb` (or `.rpm`) after re-checking its hashes. The
 version must be one `list` shows (a version string, never a path). Evidence
 written by the newer version stays in place.
 
@@ -2012,6 +2012,23 @@ a refused rollback across a simulated format change, a refused downgrade,
 the security floor, unknown frames, a fleet-journal segment, a signed install from a tampered
 extracted directory refused, a tampered kept release) in
 `crates/robodr-fleet/tests/packaging.rs`; not yet on a robot.
+
+**RPM hosts** (RHEL / Rocky / Alma 9, Fedora). The release ships
+`robodr-<version>-<arch>-rpm-offline.tar.gz` next to the `.deb` bundle,
+with the same `install-bundle.sh`: verify the tarball's minisign signature
+on the entry station as in section 2, then `install-bundle.sh install
+--pubkey ... --tarball ...` as in section 3. Everything above (private
+extraction, checksums, downgrade refusal, security floor, format gate,
+kept releases, `list`, `rollback`) is the same; the package is installed
+with `rpm -U` (not `dnf`: an air-gapped host has no repository to resolve
+from), versions compare in rpm's order, an RPM with an epoch is refused,
+and a bundle of one format is refused where robodr was installed through
+the other. Tested against the real `rpm` in a separate rpm root (stub
+packages: install, upgrade, rollback, downgrade refusal, security floor, a
+refused rollback across a format change, a tampered kept release, the
+epoch refusal, a signed install of a `make-bundle.sh --rpm` tarball and a
+tampered one refused) in `crates/robodr-fleet/tests/packaging.rs`; not yet
+on an RPM host.
 
 **Ring information.** When `robodr-enroll ring` has recorded the SOC's
 update-ring information (8.6), `install-bundle.sh install` prints the ring
@@ -3269,3 +3286,100 @@ reach.
   unit is served nothing more and gets no new wraps.
 * The depot's keys and database are the site's crown jewels: back up the
   keys offline; a database backup restored later locks the depot (above).
+
+---
+
+## 14. Backup and restore
+
+RoboDR keeps three kinds of state, and they are backed up differently:
+
+1. **Configuration and keys** (`/etc/robodr*`): back up, restore.
+2. **Evidence** (black boxes, exports, spools, archive): back up by
+   *exporting* (signed bundles, section 8), never by restoring an old copy
+   into the live directory.
+3. **Monotonic and device-bound state** (anti-rollback floors, replay
+   stores, security floor, TPM-bound material): **never restore**. These
+   files exist to notice that the unit was put back into an earlier state.
+   Restoring an older copy *is* that attack: it lowers a floor that was
+   raised for a reason (a revoked profile, a vulnerable release, a revoked
+   key, a replayed SOC request), or makes the unit accept something it has
+   already seen. Where a TPM NV counter or the remote head anchor backs the
+   state, a restored copy is detected and locks the component (sections
+   6.4, 11.3, 12.9, 13.6); without them it is silently accepted. Re-create
+   such state on the rebuilt unit instead (its own procedure, below).
+
+The paths come from the package (`/usr/lib/tmpfiles.d/robodr.conf`, the
+units' `StateDirectory=` / `ReadWritePaths=`) and the example
+configurations; if you moved a path in a configuration file, use yours.
+
+### 14.1 What to back up, and what not to restore
+
+| Path | What | Back up | Restore |
+|---|---|---|---|
+| `/etc/robodr/` (`agentd.json`, `executor.json`, `deliverd.json`, `pulsar.toml`, `firewall-gw*.json`, `control-plane/`, `soc/`, `depot/`, drop-ins under `/etc/systemd/system/robodr-*.service.d/`) | configuration, trust files, certificates | yes | yes (step 2) |
+| `/etc/robodr/keys/` (0700 root) | private keys: black-box, finding, diode, uplink, control-plane TLS, profile trust | yes, **encrypted, offline**, two-person custody | yes, or rotate instead (4.3) if the backup medium may have been exposed |
+| `/etc/robodr-depot/` (depot box) | depot configuration and keys | yes, encrypted, offline | yes |
+| `/etc/robodr-anchor-receiver/` (base station) | receiver configuration, key, robots' public keys | yes | yes |
+| `/var/lib/robodr/blackbox/{agentd,pulsard,deliverd}/`, `/var/lib/robodr/fleet/journal/` | black-box chains (evidence) | **export** a copy (8.2, interim procedure; verify it with `robodr-blackbox verify`) and keep it | **no**: archive (section 7) and let the unit start a new chain; an older chain is a rollback of the evidence head (the remote anchor reports it as `lower`) |
+| `/var/lib/robodr/archive/`, `/var/lib/robodr/export/` (outboxes), `/var/lib/robodr/control-plane/agentd/exports/` | exported and archived evidence | yes | to an archive host, not back onto the unit |
+| `/var/lib/robodr/spool/agentd/`, `/var/lib/robodr/spool/pulsard/` | findings not yet exported | yes (to keep findings that never left) | only `ready/` records, and only on a unit that never exported them (the exporters are at-least-once: duplicates are possible) |
+| `/var/lib/robodr/export/{spool-export,kafka-publish,uplink}/` | exporter state (sequence numbers, pack state) | yes | **no** if the SOC / high side has seen later batches: a lower sequence is refused or treated as a gap; start the exporter fresh and accept the gap on the high side (8.3) |
+| `/var/lib/robodr/control-plane/agentd/` (request journal, replay store) | anti-replay of SOC requests | no | **no**: an older replay store forgets requests seen since; with none, agentd fences every request signed before its start (troubleshooting, `stale_timestamp`) |
+| `/var/lib/robodr/executor/` (`journal.json`) | executor actions in force and their deadlines | no | **no**: it describes network state of the moment it was written; a rebuilt unit has no such rules |
+| `/var/lib/robodr/firewall-gw/` (`writers.json` = `rtps.state_file`, `events.jsonl`, `status.json`) | gateway's learned writers, events | `events.jsonl` as evidence | **no** for `writers.json`: let the gateway learn the writers again (restart the ROS 2 graph behind it, 6.6); an old file can vouch for writers that no longer exist |
+| `/var/lib/robodr/profile-state/`, `/var/lib/robodr/profile-state-pulsard/` | profile anti-rollback floors | no | **no** (section 5.1): re-install the current signed profile |
+| `/var/lib/robodr/releases/` (`security-floor`, kept packages) | release floor, rollback copies | no | **no**: a restored `security-floor` lowers the floor; the next bundle install re-creates both |
+| `/var/lib/robodr/fleet/` (except `journal/`) | enrollment, rotation journals, ring information | no | **no**: re-enrol (8.6); ring information is re-fetched from the SOC |
+| `/var/lib/robodr/deliverd/` | delivery anti-rollback floors, store, trust anchor | no | **no**: re-enrol with the depot and `reanchor` (11.3); a restored record locks the agent with an NV counter (12.9) |
+| `/var/lib/robodr-seal/`, `/var/lib/robodr/anchor/` | TPM-sealed blobs, PCR policy, lease, NV sidecar | no | **no**: bound to that unit's TPM (useless on another one) and to NV counters an older copy no longer matches; re-provision (12.1-12.3) |
+| `/var/lib/robodr/depot/` (depot box) | depot database, store, unit CA state | yes (for forensics) | **no** with `anchor`: an older database locks the depot (13.6); restore only after deciding to `reanchor` above every sequence a unit has seen |
+| `/var/lib/robodr-anchor-receiver/` (base station) | robots' last anchored heads, alerts | yes, often | yes, then re-ingest every robot's anchors since the backup: an older copy only weakens detection until then |
+| `/opt/robodr-delivered`, `/etc/robodr-delivered*` | content installed by robodr-deliverd | no | no: delivered again by the depot |
+
+### 14.2 Backup
+
+```sh
+# On the unit, as root. Evidence first: a copy of every chain (8.2,
+# interim procedure), to be verified on the far side.
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+tar -C /var/lib/robodr -czf /var/lib/robodr/export/blackbox-$ts.tar.gz blackbox fleet/journal
+# Configuration (keys separately, encrypted, to offline media):
+tar -C / -czf robodr-config-$(hostname)-$(date +%F).tar.gz \
+    --exclude=etc/robodr/keys etc/robodr etc/systemd/system/robodr-*.service.d
+tar -C / -cf - etc/robodr/keys | age -r <custodian key> > robodr-keys-$(hostname)-$(date +%F).tar.age
+# Findings not yet exported, and the exported evidence:
+tar -C / -czf robodr-evidence-$(hostname)-$(date +%F).tar.gz \
+    var/lib/robodr/spool var/lib/robodr/export var/lib/robodr/archive
+```
+
+Any encryption tool the site approves can replace `age`. A full disk
+image of a unit is **not** a backup to restore: it carries every file of
+section 14.1 that must not come back.
+
+### 14.3 Restore (rebuilt or replaced unit)
+
+The order matters: configuration before the services start, monotonic
+state re-created by its own procedure, never copied.
+
+1. Install the package from the current bundle (section 3), at or above
+   the security floor the fleet runs; this creates the directories and
+   `/var/lib/robodr/releases/security-floor` from the bundle.
+2. Restore `/etc/robodr` (and the drop-ins) from the configuration
+   backup, then the keys; `systemd-tmpfiles --create` resets owners and
+   modes. A replaced unit with a new TPM keeps the old keys only if the
+   site decides so; otherwise rotate (4.3).
+3. Do **not** copy any "no" row of 14.1. Re-create instead: seal
+   provisioning and enrolment (12.1-12.3) and the anchor sidecar (6.4),
+   fleet enrollment (8.6), delivery anchor (11.3), depot enrolment (13.3).
+4. Commission or re-install the current signed profile (section 5); the
+   profile floor starts at it.
+5. Start the services (section 6). The black boxes start new chains; the
+   SOC and the anchor receiver see a new head (record the rebuild in the
+   site log, so the gap is explained).
+6. Hand restored `ready/` findings and the evidence archive to the export
+   path (section 8); accept the exporter sequence gap on the high side.
+
+Status: this procedure follows from the code's checks (anti-rollback,
+replay, security floor, TPM and NV bindings) and the package layout; the
+complete restore has not yet been run on a robot. The package parts
+(steps 1 and the floor) are covered by `crates/robodr-fleet/tests/packaging.rs`.

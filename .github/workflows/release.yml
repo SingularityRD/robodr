@@ -26,6 +26,8 @@
 #   robodr-<rpmver>-1.<x86_64|aarch64>.rpm      RPM, built in Rocky Linux 9
 #                                               (glibc 2.34): RHEL / Rocky / Alma 9,
 #                                               Fedora
+#   robodr-<ver>-<arch>-rpm-offline.tar.gz      its air-gapped install bundle
+#                                               (same install-bundle.sh, rpm -U)
 #   SHA256SUMS-rpm-<arch>                       per-arch hashes (build-rpm job)
 #   robodr-focal_<debver>_<arch>.deb            static (musl) build for systemd
 #                                               245 / glibc 2.31 hosts (JetPack 5,
@@ -42,6 +44,10 @@
 #   secret   MINISIGN_PASSWORD     its password (empty for a -W key)
 #   variable ROBODR_MINISIGN_PUBKEY the public key string (RW...), used to
 #            self-verify before publishing
+#   variable ROBODR_MAINTAINER     "Name <address>" of the package maintainer
+#            (.deb Maintainer:, RPM Packager:); the build jobs run with
+#            ROBODR_RELEASE=1, so an unset or placeholder value (.invalid,
+#            example.*, localhost) fails them (packaging/release-maintainer.sh)
 #   environment "release" holding the secrets, with required reviewers.
 # TODO(cosign): add keyless cosign signatures / SLSA provenance as a second,
 # online-verifiable layer. That needs sigstore/cosign-installer: pin it by
@@ -212,6 +218,9 @@ jobs:
         env:
           # A release must never ship without the daemons and their tools.
           ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal robodr-depot
+          # Release build: the maintainer must be real (packaging/release-maintainer.sh).
+          ROBODR_RELEASE: "1"
+          DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/release)
@@ -292,12 +301,17 @@ jobs:
       - name: RPM package (generated GLIBC requirement checked)
         env:
           ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal robodr-depot
+          # Release build: the maintainer must be real (packaging/release-maintainer.sh).
+          ROBODR_RELEASE: "1"
+          DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           rpm=$(packaging/build-rpm.sh --bin-dir target/release --arch "$ARCH" --out dist/release)
           scripts/check-glibc-floor.sh "$rpm"
           python3 scripts/check-packages.py --rpm "$rpm"
-          (cd dist/release && sha256sum robodr-*.rpm > "SHA256SUMS-rpm-$ARCH")
+          # Offline bundle for RPM hosts (install-bundle.sh drives rpm -U).
+          packaging/make-bundle.sh --rpm "$rpm" --out dist/release
+          (cd dist/release && sha256sum robodr-*.rpm robodr-*-rpm-offline.tar.gz > "SHA256SUMS-rpm-$ARCH")
           cat "dist/release/SHA256SUMS-rpm-$ARCH"
       - name: Hand the assets to smoke and publish
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -382,6 +396,8 @@ jobs:
       - name: robodr-focal package and offline bundle
         env:
           ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot
+          ROBODR_RELEASE: "1"
+          DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/release)

@@ -431,6 +431,28 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         .unwrap();
     ok(&o);
     let deb = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+    // A release build (ROBODR_RELEASE=1) refuses the development
+    // placeholder maintainer, and an unset one.
+    for m in [
+        None,
+        Some("RoboDR maintainers <robodr-maintainers@invalid>"),
+    ] {
+        let mut c = Command::new("bash");
+        c.arg(repo().join("packaging/build-deb.sh"))
+            .args(["--bin-dir"])
+            .arg(&bins)
+            .args(["--arch", arch, "--out"])
+            .arg(dir.join("release"))
+            .env("ROBODR_RELEASE", "1")
+            .env("SOURCE_DATE_EPOCH", "1790000000");
+        match m {
+            Some(v) => c.env("DEB_MAINTAINER", v),
+            None => c.env_remove("DEB_MAINTAINER"),
+        };
+        let o = c.output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{m:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("ROBODR_RELEASE=1"), "{}", stderr(&o));
+    }
     let list = ok(&sh(Command::new("dpkg-deb").arg("-c").arg(&deb)));
     for want in [
         "./usr/sbin/robodr-enroll",
@@ -438,6 +460,9 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "./usr/share/man/man8/robodr-enroll.8.gz",
         "./usr/share/doc/robodr/examples/fleet.example.json",
         "./usr/lib/robodr/install-bundle.sh",
+        // Third-party notices and the eBPF source offer (S12).
+        "./usr/share/doc/robodr/THIRD_PARTY_NOTICES",
+        "./usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER",
         // The other units and tools of the package sit next to it.
         "./usr/bin/robodr-uplink",
         "./usr/lib/systemd/system/robodr-uplink.service",
@@ -1048,4 +1073,369 @@ fn rollback_version_and_blackbox_dirs_are_neither_paths_nor_patterns() {
     ]));
     let o = run(&["install", "--blackbox-dir", bbx1.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+}
+
+// ------------------------------------------------------- RPM bundles ---
+//
+// The same install-bundle.sh drives `rpm -U` for an RPM bundle (RHEL /
+// Rocky / Alma 9, Fedora): tested against the real rpm of this host, in a
+// separate rpm root (`ROBODR_ROOT`, `rpm --root DIR --initdb`), with stub
+// packages built by rpmbuild. Needs root, rpm, rpmbuild and rpm2archive (or
+// rpm2cpio + cpio); skipped otherwise unless `ROBODR_REQUIRE_RPM_TEST=1`.
+
+/// Whether the rpm tests can run here.
+fn rpm_available(test: &str) -> bool {
+    let ok = is_root()
+        && have("rpm")
+        && have("rpmbuild")
+        && (have("rpm2archive") || (have("rpm2cpio") && have("cpio")));
+    if !ok {
+        assert!(
+            std::env::var("ROBODR_REQUIRE_RPM_TEST").as_deref() != Ok("1"),
+            "{test}: needs root, rpm, rpmbuild and rpm2archive (ROBODR_REQUIRE_RPM_TEST=1)"
+        );
+        eprintln!("SKIPPED {test}: needs root, rpm, rpmbuild and rpm2archive");
+    }
+    ok
+}
+
+/// A stub `robodr` RPM of `version` ("<version>-<release>", the form
+/// install-bundle.sh compares), noarch; `formats` as [`stub_deb`];
+/// `epoch` adds an RPM epoch (refused by install-bundle.sh).
+fn stub_rpm(
+    dir: &Path,
+    version: &str,
+    formats: Option<(&str, &str)>,
+    marker: &str,
+    epoch: Option<u32>,
+) -> PathBuf {
+    let (ver, rel) = version.rsplit_once('-').unwrap();
+    let out = dir.join(format!("rpm-{marker}-{version}"));
+    let payload = out.join("payload");
+    std::fs::create_dir_all(payload.join("usr/lib/robodr")).unwrap();
+    std::fs::write(
+        payload.join("usr/lib/robodr/stub-version"),
+        format!("{version} {marker}"),
+    )
+    .unwrap();
+    let mut files = String::from("/usr/lib/robodr/stub-version\n");
+    if let Some((w, r)) = formats {
+        std::fs::create_dir_all(payload.join("usr/share/robodr")).unwrap();
+        std::fs::write(
+            payload.join("usr/share/robodr/formats"),
+            format!("blackbox_write={w}\nblackbox_read={r}\n"),
+        )
+        .unwrap();
+        files.push_str("/usr/share/robodr/formats\n");
+    }
+    let top = out.join("top");
+    std::fs::create_dir_all(top.join("SPECS")).unwrap();
+    let spec = top.join("SPECS/robodr.spec");
+    std::fs::write(
+        &spec,
+        format!(
+            "Name: robodr\nVersion: {ver}\nRelease: {rel}\n{}Summary: stub\nLicense: none\n\
+             BuildArch: noarch\n%description\nstub robodr package for the install-bundle test\n\
+             %install\ncp -a {}/. %{{buildroot}}/\n%files\n{files}",
+            epoch.map(|e| format!("Epoch: {e}\n")).unwrap_or_default(),
+            payload.display()
+        ),
+    )
+    .unwrap();
+    ok(&sh(Command::new("rpmbuild")
+        .args(["-bb", "--define"])
+        .arg(format!("_topdir {}", top.display()))
+        .arg(&spec)));
+    let rpm = top.join(format!("RPMS/noarch/robodr-{ver}-{rel}.noarch.rpm"));
+    assert!(rpm.exists(), "{} not built", rpm.display());
+    rpm
+}
+
+/// A fresh rpm root (its own rpm database).
+fn rpm_root(dir: &Path) -> PathBuf {
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    ok(&sh(Command::new("rpm")
+        .arg("--root")
+        .arg(&root)
+        .arg("--initdb")));
+    root
+}
+
+fn rpm_installed(root: &Path) -> String {
+    let o = sh(Command::new("rpm").arg("--root").arg(root).args([
+        "-q",
+        "--qf",
+        "%{VERSION}-%{RELEASE}",
+        "robodr",
+    ]));
+    if o.status.success() {
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    } else {
+        String::new()
+    }
+}
+
+#[test]
+fn rpm_bundle_install_upgrade_rollback_downgrade_floor_and_format_gate() {
+    if !rpm_available("rpm_bundle") {
+        return;
+    }
+    let dir = TempDir::new("rpm");
+    let root = rpm_root(&dir);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let f = Some(("RBF1:1", "RBF1:1"));
+    // v1: legacy (no formats file); v2 current; v3 writes format 2 and
+    // carries the security floor v2 in its bundle.
+    let (v1, v2, v3) = ("0.1.0~alpha.1-1", "0.1.0-1", "0.2.0-1");
+    let b1 = bundle(&dir, &stub_rpm(&dir, v1, None, "genuine", None));
+    let b2 = bundle(&dir, &stub_rpm(&dir, v2, f, "genuine", None));
+    let b3 = bundle_named(
+        &dir,
+        &stub_rpm(&dir, v3, Some(("RBF1:2", "RBF1:1,RBF1:2")), "genuine", None),
+        "b3",
+        Some(v2),
+    );
+    let run = |b: &Path, args: &[&str]| {
+        run_bundle_with(&root, &b.join("install-bundle.sh"), args, true, &tmp)
+    };
+
+    // Unsigned install refused without the lab override.
+    let o = run_bundle_with(
+        &root,
+        &b1.join("install-bundle.sh"),
+        &["install"],
+        false,
+        &tmp,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(rpm_installed(&root), "");
+
+    // Install v1 (rpm), the agent writes its black box; upgrade to v2.
+    let t = ok(&run(&b1, &["install"]));
+    assert!(t.contains("(rpm;"), "{t}");
+    assert_eq!(rpm_installed(&root), v1);
+    let bb = root.join("var/lib/robodr/blackbox/agentd");
+    std::fs::create_dir_all(bb.parent().unwrap()).unwrap();
+    record_black_box(&bb);
+    let t = ok(&run(&b2, &["install"]));
+    assert!(t.contains("black-box formats OK for 0.1.0-1"), "{t}");
+    assert_eq!(rpm_installed(&root), v2);
+    let kept = root.join("var/lib/robodr/releases").join(v2);
+    assert!(kept.join("formats").exists());
+    assert!(kept.join("robodr-0.1.0-1.noarch.rpm").exists());
+
+    // rpm's version order: the pre-release v1 is older, so `install` of b1
+    // is a downgrade, refused; rollback to the kept v1 works.
+    let o = run(&b1, &["install"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("downgrade"), "{}", stderr(&o));
+    assert_eq!(rpm_installed(&root), v2);
+    let t = ok(&run(&b2, &["rollback", v1]));
+    assert!(
+        t.contains("rolling back to robodr 0.1.0~alpha.1-1 (rpm)"),
+        "{t}"
+    );
+    assert_eq!(rpm_installed(&root), v1);
+    assert!(
+        black_box_verifies(&bb),
+        "the black box survives the rollback"
+    );
+    // A deliberate downgrade (--allow-downgrade) is possible above the floor.
+    ok(&run(&b2, &["install"]));
+    ok(&run(&b1, &["install", "--allow-downgrade"]));
+    assert_eq!(rpm_installed(&root), v1);
+
+    // v3: its bundle raises the security floor to v2.
+    let t = ok(&run(&b3, &["install"]));
+    assert!(t.contains("security floor raised to 0.1.0-1"), "{t}");
+    assert_eq!(rpm_installed(&root), v3);
+    // Below the floor: refused by rollback and by install, no override.
+    let o = run(&b3, &["rollback", v1]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("security floor"), "{}", stderr(&o));
+    let o = run(&b1, &["install", "--allow-downgrade"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("security floor"), "{}", stderr(&o));
+    assert_eq!(rpm_installed(&root), v3);
+
+    // v3 writes format 2: rolling back to v2 (reads only 1) is refused by
+    // the format gate, naming the segment.
+    let mut seg = FRAME_MAGIC.to_vec();
+    seg.extend_from_slice(&64u32.to_be_bytes());
+    seg.push(2);
+    seg.extend_from_slice(&[0u8; 63]);
+    std::fs::write(bb.join("seg-0000000000000009.rbb"), &seg).unwrap();
+    let o = run(&b3, &["rollback", v2]);
+    let e = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{e}");
+    assert!(
+        e.contains("REFUSED") && e.contains("RBF1:2") && e.contains("seg-0000000000000009.rbb"),
+        "{e}"
+    );
+    assert_eq!(rpm_installed(&root), v3);
+    // `list` shows what each kept release reads.
+    let t = ok(&run(&b3, &["list"]));
+    assert!(
+        t.contains(&format!("{v3}  black-box formats read: RBF1:1 RBF1:2")),
+        "{t}"
+    );
+    // Archived chain: the rollback proceeds.
+    let archive = root.join("var/lib/robodr/archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::rename(&bb, archive.join("blackbox-agentd")).unwrap();
+    ok(&run(&b3, &["rollback", v2]));
+    assert_eq!(rpm_installed(&root), v2);
+
+    // A tampered kept release is refused.
+    let kept3 = root
+        .join("var/lib/robodr/releases")
+        .join(v3)
+        .join("robodr-0.2.0-1.noarch.rpm");
+    let mut b = std::fs::read(&kept3).unwrap();
+    let n = b.len() - 1;
+    b[n] ^= 1;
+    std::fs::write(&kept3, b).unwrap();
+    let o = run(&b3, &["rollback", v3]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("fails its checksums"), "{}", stderr(&o));
+    assert_eq!(rpm_installed(&root), v2);
+
+    // An RPM with an epoch is refused (versions would not compare as written).
+    let be = bundle_named(
+        &dir,
+        &stub_rpm(&dir, "0.3.0-1", f, "epoch", Some(1)),
+        "epoch",
+        None,
+    );
+    let o = run(&be, &["install"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("epoch"), "{}", stderr(&o));
+    assert_eq!(rpm_installed(&root), v2);
+
+    // A .deb bundle on a unit where robodr is installed as an RPM: refused
+    // (when dpkg is here to try it).
+    if have("dpkg-deb") {
+        let _ = dpkg_root(&dir);
+        let bd = bundle(&dir, &stub_deb(&dir, "0.4.0-1", f));
+        let o = run(&bd, &["install"]);
+        assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+        assert!(
+            stderr(&o).contains("installed here as an rpm package"),
+            "{}",
+            stderr(&o)
+        );
+        assert_eq!(installed(&root), "");
+    }
+    assert!(
+        is_empty_dir(&tmp),
+        "temporary files left in {}",
+        tmp.display()
+    );
+}
+
+#[test]
+fn rpm_bundle_from_make_bundle_installs_signed_only() {
+    if !rpm_available("rpm_signed") {
+        return;
+    }
+    if !have("minisign") {
+        assert!(
+            std::env::var("ROBODR_REQUIRE_RPM_TEST").as_deref() != Ok("1"),
+            "rpm_signed: needs minisign (ROBODR_REQUIRE_RPM_TEST=1)"
+        );
+        eprintln!("SKIPPED rpm_signed: needs minisign");
+        return;
+    }
+    let dir = TempDir::new("rpm-signed");
+    let root = rpm_root(&dir);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (public, secret) = release_key(&dir, "release");
+    let rpm = stub_rpm(&dir, "0.1.0-1", Some(("RBF1:1", "RBF1:1")), "genuine", None);
+    // The real make-bundle.sh around the RPM.
+    let out = dir.join("dist");
+    let o = Command::new("bash")
+        .arg(repo().join("packaging/make-bundle.sh"))
+        .arg("--rpm")
+        .arg(&rpm)
+        .arg("--out")
+        .arg(&out)
+        .env("SOURCE_DATE_EPOCH", "1790000000")
+        .output()
+        .unwrap();
+    let t = ok(&o);
+    let tarball = PathBuf::from(t.lines().last().unwrap().trim());
+    let name = tarball.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("robodr-") && name.ends_with("-all-rpm-offline.tar.gz"),
+        "{name}"
+    );
+    let list = ok(&sh(Command::new("tar").arg("-tzf").arg(&tarball)));
+    for want in [
+        "/robodr-0.1.0-1.noarch.rpm",
+        "/install-bundle.sh",
+        "/security-floor",
+        "/doc/THIRD_PARTY_NOTICES",
+        "/doc/GPL-2.0-SOURCE-OFFER",
+        "/doc/licenses/LICENSE-GPL-2.0",
+        "/SHA256SUMS",
+    ] {
+        assert!(
+            list.lines().any(|l| l.ends_with(want)),
+            "{want} missing:\n{list}"
+        );
+    }
+    minisign(&secret, &tarball);
+    let trusted = dir.join("trusted");
+    std::fs::create_dir_all(&trusted).unwrap();
+    let script = trusted.join("install-bundle.sh");
+    std::fs::copy(repo().join("packaging/install-bundle.sh"), &script).unwrap();
+    let (pk, tb) = (public.to_str().unwrap(), tarball.to_str().unwrap());
+
+    // Tampered tarball: signature fails, nothing installed.
+    let bad = out.join("tampered-rpm-offline.tar.gz");
+    let mut b = std::fs::read(&tarball).unwrap();
+    let n = b.len() / 2;
+    b[n] ^= 1;
+    std::fs::write(&bad, &b).unwrap();
+    std::fs::copy(
+        tarball.with_extension("gz.minisig"),
+        out.join("tampered-rpm-offline.tar.gz.minisig"),
+    )
+    .unwrap();
+    let o = run_bundle_with(
+        &root,
+        &script,
+        &[
+            "install",
+            "--pubkey",
+            pk,
+            "--tarball",
+            bad.to_str().unwrap(),
+        ],
+        false,
+        &tmp,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("SIGNATURE CHECK FAILED"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(rpm_installed(&root), "");
+
+    // The genuine one installs from its private extraction.
+    let t = ok(&run_bundle_with(
+        &root,
+        &script,
+        &["install", "--pubkey", pk, "--tarball", tb],
+        false,
+        &tmp,
+    ));
+    assert!(t.contains("signature OK"), "{t}");
+    assert_eq!(rpm_installed(&root), "0.1.0-1");
+    assert_eq!(stub_marker(&root), "0.1.0-1 genuine");
+    assert!(is_empty_dir(&tmp), "private staging directory removed");
 }

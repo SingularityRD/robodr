@@ -25,11 +25,15 @@ workflow artifacts; only `prepare` (creates the draft) and `publish`
 (behind the `release` environment) can write the release. Nothing is
 signed before `smoke` passed.
 
-19 assets + 19 `.minisig` per release (amd64 and arm64 each: `.deb`,
-offline bundle, SBOM tarball, `.rpm`, focal `.deb`, focal bundle, three
-per-arch hash files; plus `SHA256SUMS`). The RPM has no offline bundle
-(`install-bundle.sh` drives dpkg) and no SBOM tarball of its own (same
-`Cargo.lock` and crates as the `.deb`'s).
+21 assets + 21 `.minisig` per release (amd64 and arm64 each: `.deb`,
+offline bundle, SBOM tarball, `.rpm`, RPM offline bundle
+(`robodr-<ver>-<arch>-rpm-offline.tar.gz`, the same `install-bundle.sh`
+driving `rpm -U`), focal `.deb`, focal bundle, three per-arch hash files;
+plus `SHA256SUMS`). The RPM has no SBOM tarball of its own (same
+`Cargo.lock` and crates as the `.deb`'s). Every package and bundle carries
+`THIRD_PARTY_NOTICES` and `GPL-2.0-SOURCE-OFFER`
+(`scripts/third_party_notices.py`, committed; CI job `deny` fails when they
+no longer match `Cargo.lock` or the Pulsar commit).
 
 ## 2. Signing keys: ceremony and where secrets live
 
@@ -66,6 +70,13 @@ minisign has no certificate chains, so the hierarchy is procedural:
   - secret `MINISIGN_PASSWORD`: its password;
   - repository variable `ROBODR_MINISIGN_PUBKEY`: the `RW...` line of the
     public key (used to self-verify before publishing).
+- **Package maintainer.** Repository variable `ROBODR_MAINTAINER`:
+  `Name <address>` for the `.deb` `Maintainer:` and the RPM `Packager:`.
+  The build jobs run with `ROBODR_RELEASE=1`, so an unset value or a
+  placeholder (`robodr-maintainers@invalid`, the development default, or
+  any `.invalid` / `example.*` / `localhost` address) fails the release
+  build (`packaging/release-maintainer.sh`); development builds keep the
+  placeholder.
   No other job references the environment, so no build step can read the
   key. The offline copy of the release key stays with the root material.
 - **Environment protection** (`release`): required reviewers = at least two

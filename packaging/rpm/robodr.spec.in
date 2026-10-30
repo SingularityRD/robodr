@@ -28,6 +28,7 @@ Release:        @RELEASE@
 Summary:        @SYNOPSIS@
 License:        LicenseRef-Proprietary
 URL:            https://github.com/SingularityRD/robodr
+Packager:       @PACKAGER@
 # The units use LoadCredential= and ProtectProc= (systemd 247); RHEL 9 has 252.
 Requires:       systemd >= 247
 Requires(post): systemd

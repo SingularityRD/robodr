@@ -1,8 +1,15 @@
 #!/bin/sh
 # RoboDR offline install bundle: verify, install, upgrade, roll back.
-# POSIX sh; needs only coreutils (sha256sum), tar, gzip, dpkg and, for
-# signature checks, minisign. Runs on the air-gapped robot (or its entry
-# station).
+# POSIX sh; needs only coreutils (sha256sum), tar, gzip, the package
+# manager (dpkg for a .deb bundle; rpm, and rpm2archive or rpm2cpio + cpio,
+# for an RPM bundle) and, for signature checks, minisign. Runs on the
+# air-gapped robot (or its entry station).
+#
+# Package formats: a bundle holds exactly one package, robodr_*.deb or
+# robodr-focal_*.deb (Debian / Ubuntu / JetPack: dpkg) or robodr-*.rpm (RHEL /
+# Rocky / Alma 9, Fedora: rpm -U, see "RPM hosts" below). Every check below
+# (signature, private extraction, checksums, downgrade refusal, security
+# floor, black-box format gate, kept releases, rollback) is the same for both.
 #
 #   install-bundle.sh verify  [--pubkey robodr-release.pub --tarball T]
 #   install-bundle.sh install [--pubkey robodr-release.pub --tarball T]
@@ -35,14 +42,28 @@
 # verify   the signed checks above (with --pubkey and --tarball), or only
 #          the SHA256SUMS of the directory this script runs from (a
 #          warning says the signature was not checked).
-# install  verify, then `dpkg -i` the .deb, and keep a copy of it under
-#          /var/lib/robodr/releases/<version>/ for rollback. Services are not
-#          enabled; on upgrade the running ones are restarted by dpkg.
+# install  verify, then `dpkg -i` the .deb (`rpm -U` the .rpm), and keep a
+#          copy of it under /var/lib/robodr/releases/<version>/ for rollback.
+#          Services are not enabled; on upgrade the running ones are restarted
+#          by the package's maintainer scripts / scriptlets.
 #          Refuses to run without a signature check unless
 #          ROBODR_ALLOW_UNSIGNED=1 (lab only; the bundle is then the
 #          directory this script runs from).
-# rollback reinstall a kept release (dpkg downgrade). Config files (conffiles)
-#          and evidence are untouched; see OPERATIONS.md "Rollback".
+# rollback reinstall a kept release (a dpkg downgrade, or `rpm -U
+#          --oldpackage`). Config files (conffiles, %config(noreplace)) and
+#          evidence are untouched; see OPERATIONS.md "Rollback".
+#
+# RPM hosts. The .rpm is installed with `rpm -U` (with --oldpackage and
+# --replacepkgs: whether a downgrade or reinstall is allowed is decided
+# here, by the same rules as for a .deb, before rpm runs), not with dnf: an
+# air-gapped host has no repository to resolve from, and the package's
+# dependencies (systemd, glibc, openssl-libs, sqlite-libs) are part of
+# every supported base system. dnf notes the change in its history on its
+# next run. Versions are compared with rpm's own algorithm (rpm.vercmp);
+# the release and floor versions have the same form for both formats
+# (<upstream with "-" as "~">-1). A package with an RPM epoch is refused
+# (versions would no longer compare as written). A bundle of one format is
+# refused on a host where robodr is installed through the other one.
 #
 # Downgrades and the security floor. `install` of a release older than the
 # installed one is a downgrade and is REFUSED unless --allow-downgrade
@@ -78,7 +99,9 @@
 # information only: nothing here is triggered by it.
 #
 # ROBODR_ROOT=DIR (staging and the packaging test only) prefixes every
-# path and runs dpkg with --root=DIR (its own dpkg database under DIR).
+# path and runs dpkg with --root=DIR (its own dpkg database under DIR), or
+# rpm with --root DIR (its own rpm database under DIR, `rpm --root DIR
+# --initdb` first).
 #
 # Exit: 0 ok, 1 verification failed or refused, 2 usage or environment error.
 set -eu
@@ -199,9 +222,112 @@ dpkg_query() {
     if [ -n "$root" ]; then dpkg-query --admindir="$root/var/lib/dpkg" "$@"; else dpkg-query "$@"; fi
 }
 
-# The formats file of a .deb on stdout (empty for a legacy release).
-deb_formats() { # deb
-    dpkg-deb --fsys-tarfile "$1" | tar -xOf - ./usr/share/robodr/formats 2>/dev/null || true
+rpm_() {
+    if [ -n "$root" ]; then rpm --root "$root" "$@"; else rpm "$@"; fi
+}
+
+# Package format of a package file: deb or rpm (by its name, as find_pkg
+# selected it).
+format_of() { # file
+    case "$1" in *.rpm) echo rpm ;; *) echo deb ;; esac
+}
+
+need_tool() { # format
+    case "$1" in
+    deb)
+        if ! command -v dpkg >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
+            die 2 "dpkg not found: a .deb bundle installs on Debian / Ubuntu hosts (RPM hosts take the robodr-<version>-<arch>-rpm-offline bundle)"
+        fi
+        ;;
+    rpm)
+        command -v rpm >/dev/null 2>&1 ||
+            die 2 "rpm not found: an RPM bundle installs on RHEL / Rocky / Alma / Fedora hosts (Debian / Ubuntu hosts take the .deb bundle)"
+        ;;
+    esac
+}
+
+# Package name / version of a package file (Debian version form for both:
+# <version>-<release> for an RPM, which has no epoch).
+pkg_name() { # file
+    case "$(format_of "$1")" in
+    deb) dpkg-deb -f "$1" Package ;;
+    rpm) rpm -qp --nosignature --qf '%{NAME}' "$1" 2>/dev/null ;;
+    esac
+}
+
+pkg_version() { # file
+    case "$(format_of "$1")" in
+    deb) dpkg-deb -f "$1" Version ;;
+    rpm)
+        e=$(rpm -qp --nosignature --qf '%{EPOCHNUM}' "$1" 2>/dev/null) || die 1 "$1 is not a readable RPM"
+        [ "$e" = 0 ] || die 1 "$1 carries RPM epoch $e; RoboDR packages have none (refused: versions would not compare as written)"
+        rpm -qp --nosignature --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null
+        ;;
+    esac
+}
+
+# Whether version A is lower than B, by the package manager of $pkgfmt
+# (dpkg on a .deb host, rpm.vercmp on an RPM host; both are validated
+# versions, never shell text).
+ver_lt() { # a b
+    if [ "${pkgfmt:-deb}" = rpm ]; then
+        [ "$(rpm --eval "%{lua: print(rpm.vercmp('$1', '$2'))}")" = -1 ]
+    else
+        dpkg --compare-versions "$1" lt "$2"
+    fi
+}
+
+# The installed robodr packages: "<name> <version>" lines (none, or one).
+installed_pkgs() { # format
+    case "$1" in
+    deb)
+        command -v dpkg-query >/dev/null 2>&1 || return 0
+        for p in robodr robodr-focal; do
+            # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
+            v=$(dpkg_query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
+            case "$v" in ii*) echo "$p ${v##* }" ;; esac
+        done
+        ;;
+    rpm)
+        command -v rpm >/dev/null 2>&1 || return 0
+        v=$(rpm_ -q --qf '%{VERSION}-%{RELEASE}\n' robodr 2>/dev/null) || return 0
+        printf '%s\n' "$v" | sed -n '$s/^/robodr /p'
+        ;;
+    esac
+}
+
+# Refuse a package of one format where robodr is installed through the other.
+check_other_format() { # format
+    case "$1" in deb) o=rpm ;; *) o=deb ;; esac
+    other=$(installed_pkgs "$o")
+    [ -z "$other" ] || die 1 "REFUSED: robodr is installed here as an $o package ($(echo "$other" | tr '\n' ' ')); this bundle holds a $1 package. Use the $o bundle."
+}
+
+# The formats file of a package on stdout (empty for a legacy release).
+pkg_formats() { # file
+    case "$(format_of "$1")" in
+    deb) dpkg-deb --fsys-tarfile "$1" | tar -xOf - ./usr/share/robodr/formats 2>/dev/null || true ;;
+    rpm)
+        rpm -qpl --nosignature "$1" 2>/dev/null | grep -qx /usr/share/robodr/formats || return 0
+        if command -v rpm2archive >/dev/null 2>&1; then
+            rpm2archive - <"$1" | tar -xzOf - ./usr/share/robodr/formats ||
+                die 1 "cannot read /usr/share/robodr/formats from $1"
+        elif command -v rpm2cpio >/dev/null 2>&1 && command -v cpio >/dev/null 2>&1; then
+            rpm2cpio "$1" | cpio --quiet -i --to-stdout ./usr/share/robodr/formats ||
+                die 1 "cannot read /usr/share/robodr/formats from $1"
+        else
+            die 2 "rpm2archive (or rpm2cpio and cpio) needed to read the formats file of $1"
+        fi
+        ;;
+    esac
+}
+
+# Install a package file (policy already checked).
+pkg_install() { # file
+    case "$(format_of "$1")" in
+    deb) dpkg_ -i "$1" ;;
+    rpm) rpm_ -U --oldpackage --replacepkgs "$1" ;;
+    esac
 }
 
 # The black-box formats a formats file says it reads.
@@ -291,7 +417,7 @@ floor_now() {
 raise_floor() { # version source
     valid_version "$1" || die 1 "$2 names a malformed minimum version ($1)"
     cur=$(floor_now)
-    if [ -z "$cur" ] || dpkg --compare-versions "$1" gt "$cur"; then
+    if [ -z "$cur" ] || ver_lt "$cur" "$1"; then
         install -d -m 0750 "$releases"
         printf 'min_version=%s\nsource=%s\n' "$1" "$2" >"$floor_file.tmp"
         mv "$floor_file.tmp" "$floor_file"
@@ -308,7 +434,7 @@ floor_from_ring() {
 
 check_floor() { # version
     f=$(floor_now)
-    if [ -n "$f" ] && dpkg --compare-versions "$1" lt "$f"; then
+    if [ -n "$f" ] && ver_lt "$1" "$f"; then
         die 1 "REFUSED: $1 is below this unit's security floor $f ($(sed -n 's/^source=//p' "$floor_file")): releases below it are known to be vulnerable. There is no override."
     fi
     echo "install-bundle: security floor ${f:-none}: $1 is allowed"
@@ -340,18 +466,22 @@ ring_note() { # [deb-version]
     fi
 }
 
-# The bundle holds one package: robodr, or robodr-focal (static build for
-# systemd 245 hosts). The two conflict; dpkg replaces one with the other.
-find_deb() { # dir
+# The bundle (or a kept release) holds one package: the robodr .deb, or
+# robodr-focal (static build for systemd 245 hosts; the two conflict and
+# dpkg replaces one with the other), or the robodr .rpm. Sets $pkgfile,
+# $pkgfmt and $pkg.
+find_pkg() { # dir
     n=0
-    for d in "$1"/robodr_*.deb "$1"/robodr-focal_*.deb; do
+    for d in "$1"/robodr_*.deb "$1"/robodr-focal_*.deb "$1"/robodr-[0-9]*.rpm; do
         [ -f "$d" ] || continue
-        deb=$d
+        pkgfile=$d
         n=$((n + 1))
     done
-    [ "$n" -eq 1 ] || die 1 "expected exactly one robodr_*.deb or robodr-focal_*.deb in $1, found $n"
-    pkg=$(dpkg-deb -f "$deb" Package)
-    case "$pkg" in robodr | robodr-focal) ;; *) die 1 "unexpected package $pkg in $deb" ;; esac
+    [ "$n" -eq 1 ] || die 1 "expected exactly one robodr_*.deb, robodr-focal_*.deb or robodr-*.rpm in $1, found $n"
+    pkgfmt=$(format_of "$pkgfile")
+    need_tool "$pkgfmt"
+    pkg=$(pkg_name "$pkgfile") || die 1 "$pkgfile is not a readable package"
+    case "$pkgfmt:$pkg" in deb:robodr | deb:robodr-focal | rpm:robodr) ;; *) die 1 "unexpected package $pkg in $pkgfile" ;; esac
 }
 
 pubkey=""
@@ -424,18 +554,21 @@ install)
     if [ "$signed" -ne 1 ] && [ "${ROBODR_ALLOW_UNSIGNED:-0}" != 1 ]; then
         die 1 "refusing to install without a signature check (--pubkey/--tarball); ROBODR_ALLOW_UNSIGNED=1 for lab use"
     fi
-    find_deb "$bundle"
-    ver=$(dpkg-deb -f "$deb" Version)
+    find_pkg "$bundle"
+    ver=$(pkg_version "$pkgfile")
     valid_version "$ver" || die 1 "the package version $ver is malformed"
+    check_other_format "$pkgfmt"
     prev=""
     cur=""
-    for p in robodr robodr-focal; do
-        # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
-        v=$(dpkg_query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
-        case "$v" in ii*) prev="$prev $p ${v##* }"; cur=${v##* } ;; esac
-    done
-    echo "install-bundle: installing $pkg $ver (currently installed:${prev:- none})"
-    if [ -n "$cur" ] && dpkg --compare-versions "$ver" lt "$cur"; then
+    while read -r p v; do
+        [ -n "$p" ] || continue
+        prev="$prev $p $v"
+        cur=$v
+    done <<EOF
+$(installed_pkgs "$pkgfmt")
+EOF
+    echo "install-bundle: installing $pkg $ver ($pkgfmt; currently installed:${prev:- none})"
+    if [ -n "$cur" ] && ver_lt "$ver" "$cur"; then
         if [ "$allow_downgrade" -ne 1 ]; then
             die 1 "REFUSED: $ver is older than the installed $cur: a downgrade (it may bring back fixed vulnerabilities). Roll back to a kept release (rollback), or pass --allow-downgrade if this downgrade is deliberate; neither goes below the security floor."
         fi
@@ -449,14 +582,14 @@ install)
     fi
     check_floor "$ver"
     fmt=$(mktemp)
-    deb_formats "$deb" >"$fmt"
+    pkg_formats "$pkgfile" >"$fmt"
     check_formats "$fmt" "$ver" || { rm -f "$fmt"; exit 1; }
-    dpkg_ -i "$deb"
+    pkg_install "$pkgfile"
     install -d -m 0750 "$releases/$ver"
     # One package per kept version: the variant installed last (robodr and
     # robodr-focal share version numbers).
-    rm -f "$releases/$ver"/robodr_*.deb "$releases/$ver"/robodr-focal_*.deb
-    install -m 0644 "$deb" "$releases/$ver/"
+    rm -f "$releases/$ver"/robodr_*.deb "$releases/$ver"/robodr-focal_*.deb "$releases/$ver"/robodr-[0-9]*.rpm
+    install -m 0644 "$pkgfile" "$releases/$ver/"
     (cd "$bundle" && install -m 0644 SHA256SUMS "$releases/$ver/SHA256SUMS")
     if [ -s "$fmt" ]; then install -m 0644 "$fmt" "$releases/$ver/formats"; fi
     rm -f "$fmt"
@@ -464,6 +597,8 @@ install)
     ;;
 list)
     [ -d "$releases" ] || die 1 "no releases kept in $releases"
+    # Versions compare by this host's package manager.
+    if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then pkgfmt=rpm; fi
     f=$(floor_now)
     echo "security floor: ${f:-none}"
     for d in "$releases"/*/; do
@@ -472,7 +607,7 @@ list)
         valid_version "$v" || continue
         if [ -f "$d/formats" ]; then r=$(reads_of "$d/formats"); else r="$legacy_read (legacy)"; fi
         below=""
-        if [ -n "$f" ] && dpkg --compare-versions "$v" lt "$f"; then below="  (below the security floor)"; fi
+        if [ -n "$f" ] && ver_lt "$v" "$f"; then below="  (below the security floor)"; fi
         echo "$v  black-box formats read: $r$below"
     done
     ;;
@@ -489,23 +624,18 @@ rollback)
     if [ ! -d "$dir" ] || [ -L "$dir" ]; then die 1 "release $version_arg not kept in $releases"; fi
     (cd "$dir" && sha256sum --strict --quiet --ignore-missing -c SHA256SUMS) ||
         die 1 "kept release $version_arg fails its checksums"
-    n=0
-    for d in "$dir"/robodr_*.deb "$dir"/robodr-focal_*.deb; do
-        [ -f "$d" ] || continue
-        deb=$d
-        n=$((n + 1))
-    done
-    [ "$n" -eq 1 ] || die 1 "expected exactly one .deb in $dir, found $n"
-    [ "$(dpkg-deb -f "$deb" Version)" = "$version_arg" ] ||
-        die 1 "the kept .deb in $dir is not version $version_arg"
+    find_pkg "$dir"
+    [ "$(pkg_version "$pkgfile")" = "$version_arg" ] ||
+        die 1 "the kept package in $dir is not version $version_arg"
+    check_other_format "$pkgfmt"
     floor_from_ring
     check_floor "$version_arg"
     fmt=$(mktemp)
-    if [ -f "$dir/formats" ]; then cp "$dir/formats" "$fmt"; else deb_formats "$deb" >"$fmt"; fi
+    if [ -f "$dir/formats" ]; then cp "$dir/formats" "$fmt"; else pkg_formats "$pkgfile" >"$fmt"; fi
     check_formats "$fmt" "$version_arg" || { rm -f "$fmt"; exit 1; }
     rm -f "$fmt"
-    echo "install-bundle: rolling back to $(dpkg-deb -f "$deb" Package) $version_arg"
-    dpkg_ -i "$deb"
+    echo "install-bundle: rolling back to $pkg $version_arg ($pkgfmt)"
+    pkg_install "$pkgfile"
     ;;
 *)
     die 2 "unknown command $cmd (verify|install|list|rollback|ring)"
