@@ -133,8 +133,10 @@
 //!   lower mark.
 //! - The receiver trusts the unit's public key it is configured with; the
 //!   anchor signs with the key it was built with (the recorder's key at
-//!   start). A key rotation is a new chain: move the unit's state file
-//!   aside on the receiver when its key changes.
+//!   start). When the unit's key changes, replace its public key on the
+//!   receiver; after an in-place rotation (`Recorder::rotate_key`,
+//!   `robodr-blackbox rotate`) the chain continues, after a new chain move
+//!   the unit's state file aside.
 //! - The receiver's own state is only as safe as its host. Its signing key
 //!   stays there (0600); the units hold only its public half.
 //! - With `allow_plaintext` there is no transport confidentiality: marks

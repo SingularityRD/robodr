@@ -87,8 +87,9 @@
 
 use crate::crypto::{from_hex, hash_from_hex, to_hex};
 use crate::export::Checkpoint;
+use crate::keys::PreviousKeys;
 use crate::record::{Hash, MAX_SIG_LEN};
-use crate::sign::Signer;
+use crate::sign::{Signer, Verifier};
 use crate::store::{atomic_write, read_state, AnchoredHead, Error, HeadAnchor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -606,6 +607,9 @@ pub struct TpmNvCounterAnchor {
     dir: PathBuf,
     name: String,
     signer: Mutex<Box<dyn Signer>>,
+    /// Retired recorder keys: authenticate a sidecar written before a key
+    /// rotation ([`TpmNvCounterAnchor::with_previous_keys`]).
+    previous: Option<PreviousKeys>,
     min_interval: Duration,
     state: Mutex<State>,
 }
@@ -679,9 +683,22 @@ impl TpmNvCounterAnchor {
             dir: dir.to_path_buf(),
             name: name.to_string(),
             signer: Mutex::new(signer),
+            previous: None,
             min_interval: cfg.min_increment_interval,
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// Also accept a sidecar signed by one of `previous` (the recorder's
+    /// retired keys, the same set given to
+    /// [`crate::Recorder::open_with_keys`]), checked under the key the
+    /// sidecar names. Needed for the first open after
+    /// [`crate::Recorder::rotate_key`] ran without this anchor (e.g.
+    /// `robodr-blackbox rotate` with the daemon stopped): the next mark
+    /// rewrites the sidecar under the current key.
+    pub fn with_previous_keys(mut self, previous: PreviousKeys) -> Self {
+        self.previous = (!previous.is_empty()).then_some(previous);
+        self
     }
 
     /// The sidecar's path.
@@ -747,8 +764,17 @@ impl TpmNvCounterAnchor {
             .signer
             .lock()
             .map_err(|_| "anchor signer lock poisoned".to_string())?;
-        if j.key_id != signer.key_id() || signer.verify_own(&msg, &sig) != Some(true) {
-            return Err(bad("signature does not verify under the recorder's key"));
+        let own = j.key_id == signer.key_id() && signer.verify_own(&msg, &sig) == Some(true);
+        let retired = !own
+            && j.key_id != signer.key_id()
+            && self
+                .previous
+                .as_ref()
+                .is_some_and(|p| p.verify_as(&j.key_id, &msg, &sig));
+        if !own && !retired {
+            return Err(bad(
+                "signature does not verify under the recorder's key (or a previous key)",
+            ));
         }
         Ok(Some(Sidecar {
             counter: j.counter,
@@ -1262,5 +1288,41 @@ mod tests {
         assert!(t.run("../sh", &[]).is_err());
         assert!(Tpm2Tools::new("rel", "x", Duration::from_secs(1)).is_err());
         assert!(Tpm2Tools::new("/usr/bin", "a\nb", Duration::from_secs(1)).is_err());
+    }
+
+    // Key rotation: a sidecar written under the retired key is authentic
+    // only with that key among the previous keys (named by the sidecar);
+    // the next mark rewrites it under the current key.
+    #[test]
+    fn sidecar_of_a_retired_key_verifies_with_previous_keys() {
+        let e = env("tpm-rotated", Duration::ZERO);
+        e.anchor.advance(&mark(5)).unwrap();
+        let new_key = || Box::new(HmacSha256Key::new("unit-b", &[8; 32]).unwrap());
+        let mut c = TpmAnchorConfig::new(0x0150_0020, &e.sidecar);
+        c.min_increment_interval = Duration::ZERO;
+        let rotated =
+            TpmNvCounterAnchor::with_tools(&c, Box::new(e.fake.clone()), new_key()).unwrap();
+        let err = rotated.current().unwrap_err();
+        assert!(err.contains("previous key"), "{err}");
+        let old = crate::keys::KeyFile::hmac_from_secret(&[7; 32], Some("unit")).unwrap();
+        let prev = PreviousKeys::from_key_files(&[old], false).unwrap();
+        let rotated = TpmNvCounterAnchor::with_tools(&c, Box::new(e.fake.clone()), new_key())
+            .unwrap()
+            .with_previous_keys(prev);
+        assert_eq!(rotated.current().unwrap().map(|h| h.seq), Some(5));
+        rotated.advance(&mark(6)).unwrap();
+        let fresh =
+            TpmNvCounterAnchor::with_tools(&c, Box::new(e.fake.clone()), new_key()).unwrap();
+        assert_eq!(fresh.current().unwrap().map(|h| h.seq), Some(6));
+        // A wrong previous key does not authenticate the old sidecar.
+        let e2 = env("tpm-rotated-wrong", Duration::ZERO);
+        e2.anchor.advance(&mark(3)).unwrap();
+        let wrong = crate::keys::KeyFile::hmac_from_secret(&[9; 32], Some("unit")).unwrap();
+        let mut c2 = TpmAnchorConfig::new(0x0150_0020, &e2.sidecar);
+        c2.min_increment_interval = Duration::ZERO;
+        let r2 = TpmNvCounterAnchor::with_tools(&c2, Box::new(e2.fake.clone()), new_key())
+            .unwrap()
+            .with_previous_keys(PreviousKeys::from_key_files(&[wrong], false).unwrap());
+        assert!(r2.current().is_err());
     }
 }

@@ -74,8 +74,30 @@ it is owned by a uid other than the daemon's or root, if it is larger than
 .RI ( .pub ).
 With Ed25519 the evidence is verified with the public key file alone
 .RB ( "robodr\-blackbox verify \-\-keyring" " \fIFILE\fR.pub)"
-and verifiers cannot forge it. HMAC keys load with a start\-up warning: the
-verifying side holds the same secret and could forge evidence.
+and verifiers cannot forge it. HMAC keys (JSON or bare hex) are refused
+unless
+.B blackbox.allow_hmac
+is
+.BR true ;
+then they load with a start\-up warning: the verifying side holds the same
+secret and could forge evidence.
+.PP
+After an in\-place key rotation
+.RB ( "robodr\-blackbox rotate" ),
+.B blackbox.previous_keys
+lists the retired keys' public key (or keyring) files, at most 16. They
+authenticate the records signed before the rotation each time the black box
+is opened, the TPM anchor sidecar written before it, and the accepted\-profile
+records. A previous key must not be the current key, a key bound to a device
+must name
+.BR robot.id ,
+an Ed25519 secret key file is refused (use its
+.IR .pub ),
+and an HMAC key needs
+.BR blackbox.allow_hmac .
+Without the key that signed a retained record the daemon refuses to start and
+names
+.BR blackbox.previous_keys .
 .SH PROFILE TRUST
 .B sensor.profile_trust
 decides whether a locked profile is enforced:

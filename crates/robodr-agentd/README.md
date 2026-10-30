@@ -43,7 +43,7 @@ level, and every path must be absolute.
 | `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`), optional `robot_model` (a Unitree model, see "Unitree" below) |
 | `sensor` | The ROS 2 sensor's own `[module.robodr-sensor-ros2]` section in JSON form, validated by `robodr_ros2_pipeline::Config::validate`. It sets the profile path, capture (live interfaces or `pcap_replay`), the SPDP socket (`listen_spdp`, default **true**) and the binding settings. Its profile is used by the pipeline and by the agent. |
 | `policy_path` | Response policy (`robodr.response-policy/v1`; its `morphology` — required once OEM-validated or for platform `other`, e.g. `humanoid` — makes safe pause / safe state advisory only and sets the balancing-robot rules, see `robodr-responder`) |
-| `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`) |
+| `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`), optional `previous_keys` (retired keys after a key rotation, public key or keyring files, at most 16), `allow_hmac` (default `false`: a legacy HMAC key is refused), optional `head_anchor` |
 | `spool` | `dir`, `max_bytes` (default 64 MiB), `max_files` (default 10000) |
 | `findings` | Optional. `topic` (default `robodr.findings`) and `data_source` (default `robodr`): the deployment labels every finding carries (`robodr.findings` contract 2.x) |
 | `event_inputs` | `[{"kind":"stdin"}]` and/or `[{"kind":"unix_socket","path":...,"max_connections":4}]` |
@@ -61,17 +61,32 @@ level, and every path must be absolute.
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
 is either a secret key file as written by `robodr-blackbox keygen --out FILE`
 (Ed25519 by default, `robodr-blackbox-key/v2`; a legacy HMAC-SHA256 v1 file
-still loads with a start-up warning; its `key_id` is used unless
+is **refused** unless `blackbox.allow_hmac: true`, then it loads with a
+start-up warning; its `key_id` is used unless
 `blackbox.key_id` is set, and a `blackbox.key_id` that differs from it is a
 configuration error), or, as in 0.1.0-alpha.1, a bare hex HMAC key of at
 least 32 bytes (key id from `blackbox.key_id`, else derived from the key;
-also warned about). With Ed25519 the evidence is verified with `FILE.pub`
+also HMAC: refused unless `allow_hmac`). With Ed25519 the evidence is verified with `FILE.pub`
 alone (`robodr-blackbox verify --keyring FILE.pub`), so a verifier cannot
 forge it. The daemon refuses the file if it is a public key file (`.pub`),
 is a symlink, is not a regular file, is accessible by group or others (it
 must be `chmod 600`), is owned by a uid other than the daemon's or root, or
 is larger than 4 KiB. The checks run on the opened descriptor, and that
 descriptor is matched against the path.
+
+**Key rotation.** The black-box key is rotated in place, with the daemon
+stopped, by `robodr-blackbox rotate` (OPERATIONS 4.3): the chain continues
+under the new key after a `KeyRotation` record signed by the old one. The
+daemon then runs with the new key in `blackbox.key_file` and the retired
+key's **public** file in `blackbox.previous_keys`; those keys authenticate
+the records signed before the rotation at every open and reopen of the
+black box, the TPM anchor sidecar written before it, and the
+accepted-profile records the profile anti-rollback reads. Each previous key
+must have another id than the current key, a `device_id` binding must name
+`robot.id`, an Ed25519 secret is refused (the `.pub` suffices) and an HMAC
+key needs `allow_hmac`. Without the key that signed a retained record the
+daemon refuses to start (fail closed) and names `blackbox.previous_keys`;
+once the old segments have rotated out, the entry can be removed.
 
 **Profile trust.** The pipeline decides the mode, and the agent follows it.
 A sealed, locked profile with metadata and a valid detached signature
@@ -781,8 +796,8 @@ request.
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
   (handed over by systemd `LoadCredential=`); root on the unit can read it
   and sign as the unit. The Ed25519 implementation is the audited
-  `ed25519-dalek` crate (RFC 8032 vectors pinned). HMAC keys still load (warned: the
-  verifier can forge). Wall time is recorded with `TimeSource::Unknown`.
+  `ed25519-dalek` crate (RFC 8032 vectors pinned). HMAC keys load only with
+  `blackbox.allow_hmac` (warned: the verifier can forge). Wall time is recorded with `TimeSource::Unknown`.
 - **A dead daemon reports nothing.** If the process dies, nothing inside it
   can report that. A console must treat a missing or stale `status.json` or
   heartbeat as `unknown`. The systemd watchdog restarts a hung loop; the

@@ -1,6 +1,6 @@
 .\" robodr-blackbox(1). Source of truth: the USAGE text in
 .\" crates/robodr-blackbox/src/bin/robodr-blackbox.rs. Keep the two in sync.
-.TH ROBODR\-BLACKBOX 1 "2026-10-16" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.TH ROBODR\-BLACKBOX 1 "2026-10-30" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
 .SH NAME
 robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box logs
 .SH SYNOPSIS
@@ -8,7 +8,8 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .B \-\-out
 .I FILE
 .RB [ \-\-alg
-.BR ed25519 | hmac ]
+.BR ed25519 | hmac
+.BR \-\-allow\-hmac ]
 .RB [ \-\-key\-id
 .IR ID ]
 .RB [ \-\-pub\-out
@@ -29,8 +30,26 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .IR FILE ]
 .RB [ \-\-device
 .IR ID ]
+.RB [ \-\-allow\-hmac ]
+.RB [ \-\-allow\-mixed\-algorithms ]
 .RB [ \-\-strict ]
 .RB [ \-\-json ]
+.PP
+.B robodr\-blackbox rotate
+.I DIR
+.B \-\-old\-key
+.I FILE
+.B \-\-new\-key
+.I FILE
+.B \-\-device
+.I ID
+.RB [ \-\-previous\-keys
+.IR FILE ]...
+.RB [ \-\-boot\-id
+.IR ID ]
+.RB [ \-\-reason
+.IR TEXT ]
+.RB [ \-\-allow\-hmac ]
 .PP
 .B robodr\-blackbox inspect
 .IR DIR | SEGMENT
@@ -46,6 +65,7 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .I ID
 .RB [ \-\-out
 .IR FILE ]
+.RB [ \-\-allow\-hmac ]
 .SH DESCRIPTION
 The RoboDR black box is an append\-only, hash\-chained, signed log of evidence
 records split into segment files. This tool manages its keys and checks logs.
@@ -65,10 +85,12 @@ JSON, the 32\-byte Ed25519 seed, mode 0600) and the public key file
 (or
 .BR \-\-pub\-out ;
 mode 0644), which can verify but never sign and is safe to distribute.
-.B \-\-alg hmac
+.B \-\-alg hmac \-\-allow\-hmac
 writes a legacy HMAC\-SHA256 key file
 .RI ( robodr\-blackbox\-key/v1 ,
-0600, no public half) and prints a warning.
+0600, no public half) and prints a warning; without
+.B \-\-allow\-hmac
+it is refused.
 Key material is drawn from
 .IR /dev/urandom ;
 the command fails rather than fall back to weaker randomness. Files are
@@ -98,7 +120,13 @@ so a log that spans a key rotation verifies. Public key files
 are accepted whatever their mode. Files holding secret material are refused
 if group or others can access them or if they are owned by neither the
 current user nor root. Symlinks and non\-regular files are always refused.
-A warning is printed when an HMAC key is used.
+An HMAC key is refused unless
+.B \-\-allow\-hmac
+is given (then a warning is printed); mixing HMAC and Ed25519 keys also needs
+.BR \-\-allow\-mixed\-algorithms .
+Given a bundle file instead of a directory, an exported
+.I RBBXBND1
+bundle is verified.
 .B \-\-checkpoint
 names a trusted checkpoint held off the unit; without it the directory's own
 .I checkpoint.json
@@ -109,6 +137,41 @@ requires the chain's device id.
 also fails on warnings (for example a recovered torn tail).
 .B \-\-json
 prints the full report as JSON.
+.TP
+.B rotate
+Rotate the black\-box key in place, with the writer
+.RB ( robodr\-agentd )
+stopped. The log in
+.I DIR
+of unit
+.B \-\-device
+is opened with the current secret key
+.B \-\-old\-key
+(keys retired by an earlier rotation are given as public key or keyring files
+with
+.BR \-\-previous\-keys ),
+a
+.I KeyRotation
+record signed by the old key names the new key
+.B \-\-new\-key
+(an Ed25519 secret key file with a new key id; an HMAC target is refused),
+and a seal is written under the new key. The chain continues; nothing is
+archived or rewritten. Afterwards the writer needs the new key and the old
+public key as a previous key
+.RB ( robodr\-agentd :
+.I blackbox.key_file
+and
+.IR blackbox.previous_keys ),
+and verifiers need both public keys. An HMAC old key (the migration off
+HMAC) needs
+.BR \-\-allow\-hmac .
+Re\-running after a successful rotation reports
+.I already rotated
+and exits 0.
+.B \-\-reason
+is recorded;
+.B \-\-boot\-id
+defaults to this boot's id.
 .TP
 .B inspect
 List the frames of a log directory or of one segment file (sequence number,
@@ -130,6 +193,8 @@ to
 (created exclusively) or standard output, to be carried through the diode
 and applied by
 .BR "robodr\-anchor\-receiver ingest" (8).
+An HMAC key needs
+.BR \-\-allow\-hmac .
 .SH EXIT STATUS
 .TP
 .B 0
@@ -149,7 +214,10 @@ Ed25519 is the default: the robot keeps the secret file, verifiers get only
 .IR FILE .pub
 and cannot forge evidence. The Ed25519 implementation is in\-crate and not
 audited. HMAC\-SHA256 is the legacy symmetric placeholder: whoever holds the
-key can verify and also forge evidence; migrate at the next key rotation.
+key can verify and also forge evidence. It is refused unless
+.B \-\-allow\-hmac
+is given; migrate with
+.BR "rotate \-\-allow\-hmac" .
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-replay (1),

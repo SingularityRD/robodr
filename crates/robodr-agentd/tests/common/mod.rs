@@ -149,7 +149,10 @@ impl Setup {
             "sensor": sensor,
             "policy_path": self.policy,
             "blackbox": {"dir": self.blackbox, "key_file": self.key, "key_id": KEY_ID,
-                         "boot_id": "test-boot"},
+                         "boot_id": "test-boot",
+                         // The fixture key is a legacy HMAC key (KEY):
+                         // refused unless explicitly allowed.
+                         "allow_hmac": true},
             "spool": {"dir": self.spool},
             "event_inputs": event_inputs,
             "context": {"safety_state": "moving_slow"},

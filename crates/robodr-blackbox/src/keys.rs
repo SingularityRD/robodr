@@ -100,6 +100,16 @@
 //!   that rotated from a legacy HMAC key to Ed25519): a verifier that holds
 //!   an HMAC key can forge whatever that key is allowed to vouch for.
 //!
+//! ## Legacy HMAC policy (refused by default at every tool boundary)
+//!
+//! The library still parses and uses HMAC keys (existing logs must stay
+//! verifiable), but every place that loads a black-box key for an operator
+//! refuses one unless explicitly allowed: [`KeyFile::check_hmac_policy`]
+//! for a single key, [`Keyring::set_refuse_hmac`] for a ring (both fail
+//! with [`KeyFileError::LegacyHmac`]). `robodr-blackbox` takes
+//! `--allow-hmac`, `robodr-agentd` `blackbox.allow_hmac`, the diode tools
+//! `--allow-hmac`; profile and trust keys are Ed25519-only regardless.
+//!
 //! [`Keyring::verify_any`] (the recorder's own `previous_keys`, a trusted
 //! local input) is the one place where "any key in the ring" is accepted.
 
@@ -175,6 +185,9 @@ pub enum KeyFileError {
     },
     /// `device_id` is empty, too long or not printable ASCII.
     BadDeviceId,
+    /// A legacy HMAC key where the caller's policy refuses them
+    /// ([`KeyFile::check_hmac_policy`], [`Keyring::set_refuse_hmac`]).
+    LegacyHmac(String),
 }
 
 impl fmt::Display for KeyFileError {
@@ -229,6 +242,12 @@ impl fmt::Display for KeyFileError {
                 f,
                 "device id must be 1..={} printable ASCII characters",
                 crate::sign::MAX_KEY_ID_LEN
+            ),
+            KeyFileError::LegacyHmac(id) => write!(
+                f,
+                "key {id:?} is a legacy hmac-sha256 key, refused by default (symmetric: whoever \
+                 can verify can also forge); migrate to ed25519 (OPERATIONS 4.3), or accept it \
+                 knowingly with --allow-hmac (robodr-agentd: blackbox.allow_hmac)"
             ),
         }
     }
@@ -487,6 +506,17 @@ impl KeyFile {
     /// `true` for a symmetric key (HMAC): whoever can verify can also sign.
     pub fn is_symmetric(&self) -> bool {
         self.algorithm == HMAC_SHA256
+    }
+
+    /// The legacy-HMAC policy every tool applies at its boundary: a
+    /// symmetric key is [`KeyFileError::LegacyHmac`] unless `allow_hmac`
+    /// (the operator's explicit `--allow-hmac` / `blackbox.allow_hmac`).
+    /// Library constructors stay algorithm-agnostic; see the module docs.
+    pub fn check_hmac_policy(&self, allow_hmac: bool) -> Result<(), KeyFileError> {
+        if self.is_symmetric() && !allow_hmac {
+            return Err(KeyFileError::LegacyHmac(self.key_id.clone()));
+        }
+        Ok(())
     }
 
     /// The Ed25519 public key, if this is an Ed25519 key.
@@ -921,6 +951,7 @@ pub struct Keyring {
     keys: BTreeMap<String, Entry>,
     label: String,
     allow_mixed: bool,
+    refuse_hmac: bool,
 }
 
 impl fmt::Debug for Keyring {
@@ -928,6 +959,7 @@ impl fmt::Debug for Keyring {
         f.debug_struct("Keyring")
             .field("key_ids", &self.key_ids())
             .field("allow_mixed_algorithms", &self.allow_mixed)
+            .field("refuse_hmac", &self.refuse_hmac)
             .finish()
     }
 }
@@ -944,9 +976,22 @@ impl Keyring {
         self
     }
 
+    /// Refuse every HMAC key added to this ring from now on
+    /// ([`KeyFileError::LegacyHmac`]; nothing of a refused file is added).
+    /// Off for a plain [`Keyring::new`] (library compatibility); the
+    /// `robodr-blackbox` tool and `robodr-agentd` turn it on unless the
+    /// operator passes `--allow-hmac` / sets `blackbox.allow_hmac`.
+    pub fn set_refuse_hmac(&mut self, refuse: bool) -> &mut Self {
+        self.refuse_hmac = refuse;
+        self
+    }
+
     fn check_add(&self, id: &str, algorithm: &str) -> Result<(), KeyFileError> {
         if self.keys.contains_key(id) {
             return Err(KeyFileError::DuplicateKeyId(id.to_string()));
+        }
+        if self.refuse_hmac && algorithm == HMAC_SHA256 {
+            return Err(KeyFileError::LegacyHmac(id.to_string()));
         }
         if !self.allow_mixed {
             if let Some(e) = self
@@ -1019,6 +1064,7 @@ impl Keyring {
             if self.keys.contains_key(&k.key_id) || !seen.insert(k.key_id.as_str()) {
                 return Err(KeyFileError::DuplicateKeyId(k.key_id.clone()));
             }
+            k.check_hmac_policy(!self.refuse_hmac)?;
             let v = k.verifier()?;
             match &alg {
                 Some(a) if !self.allow_mixed && a != v.algorithm() => {
@@ -1147,6 +1193,143 @@ impl Verifier for Keyring {
         self.keys
             .values()
             .any(|e| e.verifier.verify_any(message, signature))
+    }
+}
+
+/// Load every key in a key file or keyring file, with the checks of
+/// [`Keyring::load_file`] (a file holding any secret must pass the
+/// permission/owner rule; public-only files load whatever their mode).
+pub fn load_key_files(path: &Path) -> Result<Vec<KeyFile>, KeyFileError> {
+    let (mut text, md) = read_key_text(path)?;
+    let r = parse_key_files(&text);
+    wipe_string(&mut text);
+    let keys = r?;
+    if keys.iter().any(|k| !k.is_public()) {
+        check_secret_access(&md)?;
+    }
+    Ok(keys)
+}
+
+/// A recorder's **previous** (retired) keys after a key rotation, as a
+/// `Send + Sync`, cheaply cloned set: what [`crate::Recorder::open_with_keys`]
+/// needs on every (re)open of a log whose older records are signed by keys
+/// the unit no longer signs with, and what
+/// [`crate::TpmNvCounterAnchor::with_previous_keys`] needs for a sidecar
+/// written before the rotation. Unlike a [`Keyring`] it can be shared
+/// between threads and reopens.
+///
+/// Keys are distinct by id and of one algorithm unless `allow_mixed` (an
+/// HMAC-to-Ed25519 migration has one HMAC key here and the Ed25519 signer
+/// outside, which is not mixing). Legacy-HMAC policy is the caller's
+/// ([`KeyFile::check_hmac_policy`]). [`Verifier::verify`] (no key named)
+/// accepts only with exactly one key; [`Verifier::verify_any`] is the
+/// recorder's trusted-local use (put only this unit's own keys here).
+#[derive(Clone, Default)]
+pub struct PreviousKeys {
+    keys: std::sync::Arc<Vec<(SyncVerifier, Option<String>)>>,
+    label: String,
+}
+
+type SyncVerifier = std::sync::Arc<dyn Verifier + Send + Sync>;
+
+impl fmt::Debug for PreviousKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreviousKeys")
+            .field("key_ids", &self.key_ids())
+            .finish()
+    }
+}
+
+impl PreviousKeys {
+    /// The verifying halves of `files` (Ed25519 secret or public, HMAC),
+    /// with their `device_id` bindings. Refuses duplicate ids
+    /// ([`KeyFileError::DuplicateKeyId`]) and, unless `allow_mixed`, keys
+    /// of different algorithms ([`KeyFileError::MixedAlgorithms`]).
+    pub fn from_key_files(files: &[KeyFile], allow_mixed: bool) -> Result<Self, KeyFileError> {
+        let mut keys: Vec<(SyncVerifier, Option<String>)> = Vec::with_capacity(files.len());
+        for k in files {
+            if keys.iter().any(|(v, _)| v.key_id() == k.key_id) {
+                return Err(KeyFileError::DuplicateKeyId(k.key_id.clone()));
+            }
+            if let Some((v, _)) = keys.first() {
+                if !allow_mixed && v.algorithm() != k.algorithm {
+                    return Err(KeyFileError::MixedAlgorithms {
+                        existing: v.algorithm().to_string(),
+                        added: k.algorithm.clone(),
+                    });
+                }
+            }
+            let v: SyncVerifier = match k.algorithm.as_str() {
+                ED25519 => std::sync::Arc::new(k.ed25519_verifying_key()?),
+                HMAC_SHA256 => std::sync::Arc::new(k.hmac()?),
+                a => return Err(KeyFileError::UnsupportedAlgorithm(a.to_string())),
+            };
+            keys.push((v, k.device_id.clone()));
+        }
+        let label = format!(
+            "previous[{}]",
+            keys.iter()
+                .map(|(v, _)| v.key_id())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Ok(Self {
+            keys: std::sync::Arc::new(keys),
+            label,
+        })
+    }
+
+    pub fn key_ids(&self) -> Vec<&str> {
+        self.keys.iter().map(|(v, _)| v.key_id()).collect()
+    }
+
+    /// `(key_id, algorithm, device_id)` of every key.
+    pub fn entries(&self) -> Vec<(&str, &str, Option<&str>)> {
+        self.keys
+            .iter()
+            .map(|(v, d)| (v.key_id(), v.algorithm(), d.as_deref()))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    fn find(&self, key_id: &str) -> Option<&(SyncVerifier, Option<String>)> {
+        self.keys.iter().find(|(v, _)| v.key_id() == key_id)
+    }
+}
+
+impl Verifier for PreviousKeys {
+    fn algorithm(&self) -> &str {
+        "keyring"
+    }
+    fn key_id(&self) -> &str {
+        &self.label
+    }
+    fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        match self.keys.as_slice() {
+            [(v, _)] => v.verify(message, signature),
+            _ => false,
+        }
+    }
+    fn verify_as(&self, key_id: &str, message: &[u8], signature: &[u8]) -> bool {
+        self.find(key_id)
+            .is_some_and(|(v, _)| v.verify(message, signature))
+    }
+    fn verify_key(&self, key_id: &str, algorithm: &str, message: &[u8], signature: &[u8]) -> bool {
+        self.find(key_id)
+            .is_some_and(|(v, _)| v.algorithm() == algorithm && v.verify(message, signature))
+    }
+    fn key_device(&self, key_id: &str) -> Option<&str> {
+        self.find(key_id).and_then(|(_, d)| d.as_deref())
+    }
+    fn verify_any(&self, message: &[u8], signature: &[u8]) -> bool {
+        self.keys.iter().any(|(v, _)| v.verify(message, signature))
     }
 }
 
@@ -1791,5 +1974,44 @@ mod tests {
             Err(KeyFileError::NotPublic(id)) if id == "f"
         ));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // Legacy HMAC policy: refused unless explicitly allowed, for a single
+    // key file and for a keyring (a refused ring file adds nothing).
+    #[test]
+    fn legacy_hmac_is_refused_unless_allowed() {
+        let h = KeyFile::hmac_from_secret(&[3; 32], Some("old-hmac")).unwrap();
+        let e = KeyFile::ed25519_from_seed(&[1; 32], Some("e")).unwrap();
+        assert!(matches!(
+            h.check_hmac_policy(false),
+            Err(KeyFileError::LegacyHmac(id)) if id == "old-hmac"
+        ));
+        assert!(h.check_hmac_policy(true).is_ok());
+        assert!(e.check_hmac_policy(false).is_ok());
+        let msg = h.check_hmac_policy(false).unwrap_err().to_string();
+        assert!(
+            msg.contains("--allow-hmac") && msg.contains("forge"),
+            "{msg}"
+        );
+
+        let mut strict = Keyring::new();
+        strict.set_refuse_hmac(true);
+        assert!(matches!(
+            strict.add_key_file(&h),
+            Err(KeyFileError::LegacyHmac(_))
+        ));
+        assert!(matches!(
+            strict.add_json(&h.to_json()),
+            Err(KeyFileError::LegacyHmac(_))
+        ));
+        assert!(strict.is_empty());
+        strict.add_key_file(&e).unwrap();
+        // Opted in: the same key verifies again (existing logs stay
+        // verifiable); a plain ring is unchanged (library compatibility).
+        let mut allowed = Keyring::new();
+        allowed.set_refuse_hmac(false);
+        allowed.add_json(&h.to_json()).unwrap();
+        assert_eq!(allowed.symmetric_key_ids(), vec!["old-hmac"]);
+        Keyring::new().add_key_file(&h).unwrap();
     }
 }

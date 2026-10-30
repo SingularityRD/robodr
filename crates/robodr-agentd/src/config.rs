@@ -63,12 +63,27 @@
 //!   written by `robodr-blackbox keygen`: Ed25519 by default, format v2, or
 //!   a legacy HMAC-SHA256 v1 file; its `key_id` is used) or bare hex
 //!   (>= 32 bytes HMAC; legacy 0.1.0-alpha.1 format). A public key file
-//!   (`.pub`) is refused: the recorder needs the secret. HMAC keys load
-//!   with a start-up warning (symmetric: every verifier can forge). The file
+//!   (`.pub`) is refused: the recorder needs the secret. **Legacy HMAC keys
+//!   (JSON or bare hex) are refused** unless `blackbox.allow_hmac: true`
+//!   (then they load with a start-up warning: symmetric, every verifier
+//!   can forge); migrate with `robodr-blackbox rotate`. The file
 //!   must be a regular file (not a symlink), owned by the daemon's effective
 //!   user or root, and not accessible by group or others (`chmod 600`); see
 //!   [`read_key_file`]. A `blackbox.key_id` that contradicts the key file's
 //!   own id is a configuration error.
+//! * `blackbox.previous_keys` (optional, at most [`MAX_PREVIOUS_KEY_FILES`]
+//!   absolute paths): the black box's **retired** keys after an in-place
+//!   key rotation (`robodr-blackbox rotate`), as Ed25519 **public** key
+//!   files or keyring files (a legacy HMAC key, the secret itself, only
+//!   with `allow_hmac`; an Ed25519 secret is refused: the `.pub` suffices).
+//!   They authenticate the records signed before the rotation each time
+//!   the black box is opened (`robodr_blackbox::Recorder::open_with_keys`),
+//!   the TPM anchor's sidecar written before it, and the accepted-profile
+//!   records of [`crate::profile_chain`]. Each key must have another id
+//!   than the current key, ids are unique, and a key bound to a device
+//!   (`device_id`) must be bound to `robot.id`. Without a key that signed
+//!   a retained record the daemon refuses to start (fail closed) and says
+//!   which setting is missing; see [`previous_keys`].
 //! * `spool.dir` and `blackbox.dir` must not be equal or contain each
 //!   other, and `sensor.profile_trust.state_file` must not be inside either.
 //!   The check ([`check_daemon_dirs`]) runs on resolved paths
@@ -132,6 +147,8 @@ use serde::Deserialize;
 pub const MAX_CONFIG_BYTES: u64 = 4 << 20;
 /// Max size of the key file (a JSON key file or a hex key plus whitespace).
 pub const MAX_KEY_FILE_BYTES: u64 = 4096;
+/// Most `blackbox.previous_keys` files.
+pub const MAX_PREVIOUS_KEY_FILES: usize = 16;
 /// Most event inputs.
 pub const MAX_EVENT_INPUTS: usize = 8;
 /// Most concurrent connections on one unix-socket event input.
@@ -374,6 +391,15 @@ pub struct BlackboxSection {
     /// given.
     #[serde(default)]
     pub key_id: Option<String>,
+    /// Retired black-box keys after a key rotation (public key or keyring
+    /// files); see the module docs and [`previous_keys`].
+    #[serde(default)]
+    pub previous_keys: Vec<PathBuf>,
+    /// Accept a legacy HMAC-SHA256 black-box key (`key_file` or in
+    /// `previous_keys`). Off by default: HMAC is symmetric, so whoever can
+    /// verify the evidence can also forge it.
+    #[serde(default)]
+    pub allow_hmac: bool,
     /// Boot id; default: `/proc/sys/kernel/random/boot_id`.
     #[serde(default)]
     pub boot_id: Option<String>,
@@ -836,6 +862,8 @@ pub struct Resolved {
     /// Effective key id: `blackbox.key_id`, else the JSON key file's id,
     /// else `None` (derived from the key).
     pub key_id: Option<String>,
+    /// `blackbox.previous_keys`, loaded (`None` when none are configured).
+    pub previous_keys: Option<robodr_blackbox::PreviousKeys>,
     pub boot_id: String,
     /// The validated live safety-state feed, if configured.
     pub safety_feed: Option<crate::safety::FeedSpec>,
@@ -1259,9 +1287,19 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         algorithm: key_algorithm,
     } = read_key(&config.blackbox.key_file)?;
     if key_algorithm == robodr_blackbox::sign::HMAC_SHA256 {
+        if !config.blackbox.allow_hmac {
+            return Err(format!(
+                "blackbox.key_file {}: legacy hmac-sha256 key refused (symmetric: whoever \
+                 verifies the evidence can also forge it); migrate to ed25519 \
+                 (robodr-blackbox keygen + robodr-blackbox rotate --allow-hmac, OPERATIONS \
+                 4.3), or set blackbox.allow_hmac: true to accept it knowingly",
+                config.blackbox.key_file.display()
+            ));
+        }
         warnings.push(
-            "black-box key is hmac-sha256, the symmetric placeholder: whoever verifies the \
-             evidence can also forge it; generate an ed25519 key (robodr-blackbox keygen)"
+            "black-box key is hmac-sha256, the symmetric placeholder (allowed by \
+             blackbox.allow_hmac): whoever verifies the evidence can also forge it; migrate to \
+             ed25519 (robodr-blackbox rotate, OPERATIONS 4.3)"
                 .into(),
         );
     }
@@ -1276,6 +1314,12 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         (Some(cfg), _) => Some(cfg.clone()),
         (None, file) => file,
     };
+    let previous = previous_keys(
+        &config.blackbox,
+        &config.robot.id,
+        key_id.as_deref(),
+        &mut warnings,
+    )?;
     let boot_id = match &config.blackbox.boot_id {
         Some(b) => b.clone(),
         None => read_boot_id(),
@@ -1285,7 +1329,11 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     let chain = if sensor.profile_trust.state_file.is_some() {
         let signer = signer_for(&key_algorithm, &key, key_id.as_deref())
             .map_err(|e| format!("black-box key: {e}"))?;
-        match crate::profile_chain::latest_accepted(&config.blackbox.dir, signer.as_ref()) {
+        match crate::profile_chain::latest_accepted(
+            &config.blackbox.dir,
+            signer.as_ref(),
+            previous.as_ref(),
+        ) {
             Ok(scan) => {
                 if scan.unverified > 0 {
                     warnings.push(format!(
@@ -1669,6 +1717,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         key,
         key_algorithm,
         key_id,
+        previous_keys: previous,
         boot_id,
         safety_feed,
         correlation,
@@ -2101,6 +2150,77 @@ pub fn read_boot_id() -> String {
 /// `robodr_blackbox::keys`; agentd itself needs no `unsafe` for it).
 pub fn effective_uid() -> u32 {
     robodr_blackbox::keys::effective_uid()
+}
+
+/// Load and check `blackbox.previous_keys` (see the module docs): absolute
+/// paths, at most [`MAX_PREVIOUS_KEY_FILES`], each a public key or keyring
+/// file (`robodr_blackbox::keys::load_key_files`: a file with a secret
+/// must pass the 0600 / owner rule); an Ed25519 secret is refused (its
+/// `.pub` suffices), an HMAC key needs `allow_hmac`; ids distinct and not
+/// the current key's; device bindings must name `robot_id`. `None` when
+/// the list is empty.
+pub fn previous_keys(
+    bb: &BlackboxSection,
+    robot_id: &str,
+    current_key_id: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<robodr_blackbox::PreviousKeys>, String> {
+    if bb.previous_keys.is_empty() {
+        return Ok(None);
+    }
+    if bb.previous_keys.len() > MAX_PREVIOUS_KEY_FILES {
+        return Err(format!(
+            "blackbox.previous_keys: at most {MAX_PREVIOUS_KEY_FILES} files"
+        ));
+    }
+    let mut all = Vec::new();
+    for p in &bb.previous_keys {
+        require_abs("blackbox.previous_keys[]", p)?;
+        let shown = p.display();
+        if resolve_path(p) == resolve_path(&bb.key_file) {
+            return Err(format!(
+                "blackbox.previous_keys {shown} is blackbox.key_file: list the retired keys only"
+            ));
+        }
+        let keys = robodr_blackbox::keys::load_key_files(p)
+            .map_err(|e| format!("blackbox.previous_keys {shown}: {e}"))?;
+        for k in keys {
+            let id = robodr_ros2_pipeline::sanitize(&k.key_id);
+            k.check_hmac_policy(bb.allow_hmac).map_err(|e| {
+                format!("blackbox.previous_keys {shown}: {e} (blackbox.allow_hmac)")
+            })?;
+            if !k.is_symmetric() && !k.is_public() {
+                return Err(format!(
+                    "blackbox.previous_keys {shown}: key {id:?} is a secret key file; a retired \
+                     ed25519 key is listed by its public file (robodr-blackbox export-pub)"
+                ));
+            }
+            if Some(k.key_id.as_str()) == current_key_id {
+                return Err(format!(
+                    "blackbox.previous_keys {shown}: key {id:?} is the current black-box key"
+                ));
+            }
+            if let Some(d) = k.device_id.as_deref() {
+                if d != robot_id {
+                    return Err(format!(
+                        "blackbox.previous_keys {shown}: key {id:?} is bound to device {:?}, \
+                         not robot.id {robot_id:?}",
+                        robodr_ros2_pipeline::sanitize(d)
+                    ));
+                }
+            }
+            if k.is_symmetric() {
+                warnings.push(format!(
+                    "blackbox.previous_keys: {id} is a legacy hmac-sha256 key (allowed by \
+                     blackbox.allow_hmac): whoever holds it can forge the records it signed"
+                ));
+            }
+            all.push(k);
+        }
+    }
+    robodr_blackbox::PreviousKeys::from_key_files(&all, bb.allow_hmac)
+        .map(Some)
+        .map_err(|e| format!("blackbox.previous_keys: {e}"))
 }
 
 /// [`read_key_material`] without the key id.

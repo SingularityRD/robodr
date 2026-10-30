@@ -98,7 +98,7 @@ pub mod tpm_anchor;
 pub mod verify;
 
 pub use export::{Ack, Anchor, Bundle, Checkpoint, Receiver, SignedCursor};
-pub use keys::{KeyFile, KeyFileError, Keyring};
+pub use keys::{KeyFile, KeyFileError, Keyring, PreviousKeys};
 pub use record::{ChainIdentity, Hash, Record, RecordKind};
 pub use remote_anchor::{AnchorReceiver, RemoteAnchorConfig, RemoteHeadAnchor, RemoteMark};
 pub use sign::{HmacSha256Key, Signer, Verifier};
