@@ -458,7 +458,9 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     `not_executor_action` for `rollback_config` of the `profile` (the
     anti-rollback chain refuses an older profile); `fall_hazard` for a
     restriction factor below `min_motion_factor` on a robot that
-    balances.
+    balances; `invalid_order` for a `restrict_motion` with
+    `workspace_zone` (no adapter enforces a zone: never silently
+    ignored).
 * **Trust boundary (executor M1).** agentd forwards the SOC's request
   with the order exactly as it was signed (method, target, the four
   credentials of §2, body). The executor verifies it itself, with its own

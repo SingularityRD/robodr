@@ -83,8 +83,16 @@ pub enum Rmw {
 }
 
 fn default_timeout_ms() -> u64 {
-    2000
+    1500
 }
+
+/// Longest a motion action may take to apply (or undo), all its adapters
+/// together, as configured (ms). The engine is held while an adapter
+/// runs and agentd waits for the answer (`executor.timeout_ms`, default
+/// 5000): an apply that outlived agentd's wait would be answered `failed`
+/// while in force. [`MotionSection::validate`] refuses a configuration
+/// whose worst case exceeds it.
+pub const MOTION_BUDGET_MS: u64 = 4000;
 fn default_resend_ms() -> u64 {
     200
 }
@@ -109,6 +117,11 @@ pub struct Ros2Peer {
     pub local_ip: Ipv4Addr,
     #[serde(default)]
     pub rmw: Rmw,
+    /// The executor's GUID prefix on the robot's DDS bus (24 hex digits),
+    /// so commissioning can profile it; default a fresh random one per
+    /// call (which the sensor then reports as an unknown participant).
+    #[serde(default)]
+    pub participant_prefix: Option<String>,
     /// Deadline of one call (ms, 100..=30000).
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -118,6 +131,17 @@ pub struct Ros2Peer {
 }
 
 impl Ros2Peer {
+    /// The configured participant prefix.
+    pub fn prefix(&self) -> Result<Option<[u8; 12]>, String> {
+        let Some(h) = &self.participant_prefix else {
+            return Ok(None);
+        };
+        let p: crate::net::GuidPrefix = h
+            .parse()
+            .map_err(|_| "participant_prefix must be 24 hex digits".to_string())?;
+        Ok(Some(p.0))
+    }
+
     pub fn peer(&self) -> Result<rtps::Peer, String> {
         let (m, u) = rtps::unicast_ports(self.domain_id, self.peer_participant_id)
             .ok_or("domain_id / peer_participant_id out of range")?;
@@ -135,6 +159,7 @@ impl Ros2Peer {
             return Err(format!("{at}.ros2.domain_id must be 0..=232"));
         }
         self.peer().map_err(|e| format!("{at}.ros2: {e}"))?;
+        self.prefix().map_err(|e| format!("{at}.ros2: {e}"))?;
         if !(100..=30_000).contains(&self.timeout_ms)
             || self.resend_ms < 20
             || self.resend_ms > self.timeout_ms
@@ -307,7 +332,7 @@ pub struct Px4Adapter {
 }
 
 fn default_rollback_timeout() -> u64 {
-    120
+    1500
 }
 
 /// `motion.rollback`.
@@ -319,10 +344,12 @@ pub struct RollbackAdapter {
     /// The site's rollback program (absolute; run without a shell as
     /// `program --config program --to-version <v> --request-id <id>`, then
     /// `program --verify --config program --to-version <v>`; exit 0 =
-    /// done).
+    /// done). It must switch to an already staged version (each run within
+    /// `timeout_ms`): the whole action has [`MOTION_BUDGET_MS`].
     pub program: PathBuf,
+    /// Per run (ms, 100..=2000, default 1500).
     #[serde(default = "default_rollback_timeout")]
-    pub timeout_s: u64,
+    pub timeout_ms: u64,
 }
 
 fn default_pause_ttl() -> u64 {
@@ -531,11 +558,51 @@ impl MotionSection {
             }
         }
         if let Some(r) = &self.rollback {
-            if !r.program.is_absolute() || !(1..=3600).contains(&r.timeout_s) {
-                return Err("motion.rollback: program absolute, timeout_s 1..=3600".into());
+            if !r.program.is_absolute() || !(100..=2000).contains(&r.timeout_ms) {
+                return Err("motion.rollback: program absolute, timeout_ms 100..=2000".into());
+            }
+        }
+        // Every action's worst case within the budget.
+        let mut actions: Vec<Vec<AdapterKind>> = vec![self.restrict_motion.clone()];
+        actions.extend(
+            [
+                self.safe_pause,
+                self.request_safe_state,
+                self.rollback_config,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|k| vec![k]),
+        );
+        for a in actions {
+            let ms: u64 = a.iter().map(|k| self.worst_case_ms(*k)).sum();
+            if ms > MOTION_BUDGET_MS {
+                return Err(format!(
+                    "motion: adapters {:?} may take {ms} ms, more than {MOTION_BUDGET_MS} ms \
+                     (agentd waits {} ms by default): lower their timeouts",
+                    a.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+                    5000
+                ));
             }
         }
         Ok(())
+    }
+
+    /// The longest one adapter may take as configured (ms).
+    pub fn worst_case_ms(&self, k: AdapterKind) -> u64 {
+        match k {
+            AdapterKind::Gateway => self.gateway.as_ref().map_or(0, |g| g.verify_timeout_ms),
+            AdapterKind::UnitreeSport => {
+                self.unitree_sport.as_ref().map_or(0, |u| u.ros2.timeout_ms)
+            }
+            AdapterKind::Nav2 => self.nav2.as_ref().map_or(0, |n| {
+                n.actions.len() as u64 * n.ros2.timeout_ms
+                    + u64::from(n.zero_twists) * n.zero_twist_interval_ms
+            }),
+            AdapterKind::Ros2Control => self.ros2_control.as_ref().map_or(0, |c| c.ros2.timeout_ms),
+            AdapterKind::Px4 => self.px4.as_ref().map_or(0, |p| p.timeout_ms),
+            AdapterKind::Rollback => self.rollback.as_ref().map_or(0, |r| 2 * r.timeout_ms),
+        }
     }
 }
 
@@ -746,6 +813,13 @@ pub fn plan(
                     codes::INVALID_ORDER,
                     "restrict_motion needs a factor in (0, 1] or a cap > 0 (max_linear_speed, \
                      max_joint_speed)",
+                ));
+            }
+            if req.workspace_zone.is_some() {
+                // Never silently dropped: no adapter can enforce a zone.
+                return Err(refuse(
+                    codes::INVALID_ORDER,
+                    "workspace_zone is not supported by the motion adapters (speed caps only)",
                 ));
             }
             if morph.needs_active_balance()

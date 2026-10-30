@@ -1662,7 +1662,11 @@ To enable:
    `adapter_not_validated`, nothing is sent.
 3. Allow the network: install the `40-motion.conf.example` drop-in
    (`AF_INET`, `IPAddressAllow=` the ROS 2 / PX4 peers, the gateway's
-   restriction directory) and restart the executor.
+   restriction directory) and restart the executor. Give the ROS 2
+   adapters a fixed `ros2.participant_prefix` and profile it at
+   commissioning (otherwise agentd reports the executor's participant as
+   unknown). Keep each action within 4 s (the configuration is refused
+   otherwise): agentd waits `executor.timeout_ms` (default 5 s).
 4. Gateway adapter: set `restriction_path` / `status_path` in both the
    executor's `motion.gateway` and the gateway's configuration
    (`restriction_path`, `status_path`); create the restriction directory

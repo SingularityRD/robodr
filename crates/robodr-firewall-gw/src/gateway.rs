@@ -1532,9 +1532,9 @@ impl Gateway {
 
     /// Cap a forwarded twist at the active restriction (`crate::restrict`):
     /// a passed or limited output above the caps becomes a limited one,
-    /// scaled down (direction kept). Substitutes are left alone (a zero or
-    /// held twist the firewall chose; the hold of a restricted stream is
-    /// itself restricted).
+    /// scaled down (direction kept). A substitute is capped the same way:
+    /// the firewall's hold is its own last output, which it computed
+    /// without the restriction.
     fn restrict_twist(&mut self, id: ChannelId, v: FwVerdict) -> FwVerdict {
         let Some(r) = &self.restriction else {
             return v;
@@ -1543,29 +1543,48 @@ impl Gateway {
             return v;
         };
         let (lin_cap, ang_cap) = r.twist_caps(ch.base_lin, ch.base_ang);
-        let cmd = match v {
-            FwVerdict::Passed { cmd, .. } | FwVerdict::Limited { cmd, .. } => cmd,
-            FwVerdict::Rejected { .. } => return v,
+        let cap = |cmd: Command| -> Option<Command> {
+            let Motion::Twist(t) = cmd.motion else {
+                return None;
+            };
+            let norm = |a: Vec3| (a.x * a.x + a.y * a.y + a.z * a.z).sqrt();
+            let (l, a) = (norm(t.linear), norm(t.angular));
+            let sl = if l > lin_cap { lin_cap / l } else { 1.0 };
+            let sa = if a > ang_cap { ang_cap / a } else { 1.0 };
+            if !(sl < 1.0 || sa < 1.0) || !sl.is_finite() || !sa.is_finite() {
+                return None;
+            }
+            let scale = |x: Vec3, k: f64| Vec3::new(x.x * k, x.y * k, x.z * k);
+            Some(Command {
+                motion: Motion::Twist(Twist::new(scale(t.linear, sl), scale(t.angular, sa))),
+                ..cmd
+            })
         };
-        let Motion::Twist(t) = cmd.motion else {
-            return v;
-        };
-        let norm = |a: Vec3| (a.x * a.x + a.y * a.y + a.z * a.z).sqrt();
-        let (l, a) = (norm(t.linear), norm(t.angular));
-        let sl = if l > lin_cap { lin_cap / l } else { 1.0 };
-        let sa = if a > ang_cap { ang_cap / a } else { 1.0 };
-        if !(sl < 1.0 || sa < 1.0) || !sl.is_finite() || !sa.is_finite() {
-            return v;
-        }
-        self.stats.restriction_capped += 1;
-        let scale = |x: Vec3, k: f64| Vec3::new(x.x * k, x.y * k, x.z * k);
-        let out = Command {
-            motion: Motion::Twist(Twist::new(scale(t.linear, sl), scale(t.angular, sa))),
-            ..cmd
-        };
-        FwVerdict::Limited {
-            cmd: out,
-            reasons: robodr_firewall::LimitReasons::SPEED,
+        match v {
+            FwVerdict::Passed { cmd, .. } | FwVerdict::Limited { cmd, .. } => match cap(cmd) {
+                Some(out) => {
+                    self.stats.restriction_capped += 1;
+                    FwVerdict::Limited {
+                        cmd: out,
+                        reasons: robodr_firewall::LimitReasons::SPEED,
+                    }
+                }
+                None => v,
+            },
+            FwVerdict::Rejected {
+                reason,
+                substitute: Some(sub),
+            } => match cap(sub.cmd) {
+                Some(out) => {
+                    self.stats.restriction_capped += 1;
+                    FwVerdict::Rejected {
+                        reason,
+                        substitute: Some(robodr_firewall::Substitute { cmd: out, ..sub }),
+                    }
+                }
+                None => v,
+            },
+            FwVerdict::Rejected { .. } => v,
         }
     }
 

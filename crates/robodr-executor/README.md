@@ -195,7 +195,8 @@ safety system does not own, a pause or safe state not while
 `allowed_states`) — re-checked with the state **at the moment of apply**;
 `rollback_config` only `idle` (`requires_idle`); the policy's safe
 behaviour one the adapter can carry out (`behaviour_unsupported`); the
-restriction's parameters (`invalid_order`; a factor below
+restriction's parameters (`invalid_order`, also for a `workspace_zone`,
+which no adapter can enforce; a factor below
 `min_motion_factor` on a balancing robot: `fall_hazard`). A control-plane
 order carries the parameters in its target (`{"kind": "motion", ...}`),
 which must equal the signed body's (`order_mismatch`); the planner's
@@ -212,6 +213,12 @@ tick. After a reboot a held motion action is re-applied only when re-armed
 (fresh safety state). The periodic read-back re-writes a restriction the
 gateway no longer reports. Non-reversible actions are journalled as an
 event before the adapter is called and finish `applied` or `failed`.
+
+The ROS 2 adapters' participant uses `ros2.participant_prefix` (24 hex
+digits) when set, so commissioning can profile the executor's host on the
+robot's bus; otherwise a fresh random prefix per call, which agentd's
+sensor reports as an unknown participant. Each call announces fresh
+writer / reader entities (no reused sequence numbers).
 
 Protocols (implemented here, std only): a minimal RTPS 2.3 participant
 (`src/motion/rtps.rs`: SPDP / SEDP announcements to one configured peer,

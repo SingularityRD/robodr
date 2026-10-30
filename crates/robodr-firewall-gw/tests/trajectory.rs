@@ -667,3 +667,44 @@ fn ros2_arm_example_parses() {
     assert!(c.channels.iter().all(|ch| ch.codec.is_trajectory()));
     assert!(c.findings_socket.is_some() && c.restriction_path.is_some());
 }
+
+/// A restriction also caps the firewall's hold substitute (its last
+/// output was computed without the restriction).
+#[test]
+fn restriction_caps_held_twists_too() {
+    use robodr_firewall_gw::ros2;
+    let mut g = g1_channels_gateway(|_| {});
+    let ann = packet(
+        CONTROLLER_IP,
+        7410,
+        &sedp_datagram(
+            PREFIX,
+            TWIST_WRITER,
+            "rt/cmd_vel",
+            "geometry_msgs::msg::dds_::Twist_",
+        ),
+    );
+    run(&mut g, &ann, 1);
+    let fast = ros2::encode([0.7, 0.0, 0.0, 0.0, 0.0, 0.0], None, false);
+    let (_, out) = decide(&mut g, TWIST_WRITER, 1, &fast);
+    assert_eq!(out.as_deref(), Some(&fast[..]));
+    g.set_restriction(Some(Restriction {
+        id: "r".into(),
+        max_linear_speed: Some(0.2),
+        max_joint_speed: None,
+        factor: None,
+        expires_unix_ms: u64::MAX,
+    }));
+    let lin = |p: &[u8]| ros2::decode_strict(p, false).unwrap().values[0];
+    let (_, out) = decide(&mut g, TWIST_WRITER, 2, &fast);
+    assert!(lin(&out.unwrap()) <= 0.2 + 1e-12);
+    // A non-finite twist is rejected; its substitute (the hold of the
+    // firewall's last output, 0.7 unrestricted) is capped.
+    let nan = ros2::encode([f64::NAN, 0.0, 0.0, 0.0, 0.0, 0.0], None, false);
+    let (_, held) = decide(&mut g, TWIST_WRITER, 3, &nan);
+    assert!(held.is_some(), "the fixture holds a rejected twist");
+    if let Some(sub) = held {
+        assert!(lin(&sub).abs() <= 0.2 + 1e-12, "{}", lin(&sub));
+    }
+    assert!(g.stats.restriction_capped >= 1);
+}

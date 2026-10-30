@@ -100,8 +100,9 @@
         "peer_ip": "192.168.10.2",
         "peer_participant_id": 0,
         "local_ip": "192.168.10.5",
+        "participant_prefix": "01104242424242420a000001",
         "rmw": "cyclonedds",
-        "timeout_ms": 2000,
+        "timeout_ms": 1500,
         "resend_ms": 200
       },
       "actions": [

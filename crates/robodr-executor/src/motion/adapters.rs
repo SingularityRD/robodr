@@ -10,7 +10,7 @@ use robodr_responder::{ActionId, SafeBehaviour};
 
 use super::cdr::{self, Dec};
 use super::mavlink::{self as mav, Heartbeat};
-use super::rtps::{Participant, Received};
+use super::rtps::{self, Participant, Received};
 use super::{AdapterKind, MotionSection, MotionSpec, Ros2Peer};
 
 fn missing(k: AdapterKind) -> String {
@@ -235,10 +235,6 @@ fn id64(s: &str) -> u64 {
     })
 }
 
-const REQ_WRITER: [u8; 4] = [0, 0, 0x01, 0x03];
-const REP_READER: [u8; 4] = [0, 0, 0x02, 0x04];
-const TOPIC_WRITER: [u8; 4] = [0, 0, 0x03, 0x03];
-
 /// A service call with the `rmw_cyclonedds` request header: the reply
 /// whose header carries our client id and sequence number.
 fn call_service(
@@ -249,15 +245,16 @@ fn call_service(
     client: u64,
     seq: i64,
 ) -> Result<Vec<u8>, String> {
-    let mut part = Participant::open(p.peer()?).map_err(|e| format!("socket: {e}"))?;
+    let mut part = Participant::open(p.peer()?, p.prefix()?).map_err(|e| format!("socket: {e}"))?;
+    let (req_w, rep_r) = (rtps::fresh_entity(0x03), rtps::fresh_entity(0x04));
     let name = service.trim_start_matches('/');
     let req_topic = format!("rq/{name}Request");
     let rep_topic = format!("rr/{name}Reply");
     let send = |part: &mut Participant| -> std::io::Result<()> {
         part.announce()?;
-        part.announce_writer(REQ_WRITER, &req_topic, &format!("{srv_type}Request_"))?;
-        part.announce_reader(REP_READER, &rep_topic, &format!("{srv_type}Response_"))?;
-        part.publish(REQ_WRITER, 1, request)
+        part.announce_writer(req_w, &req_topic, &format!("{srv_type}Request_"))?;
+        part.announce_reader(rep_r, &rep_topic, &format!("{srv_type}Response_"))?;
+        part.publish(req_w, 1, request)
     };
     send(&mut part).map_err(|e| format!("send: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
@@ -304,15 +301,16 @@ fn nav2_pause(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
         }
         notes.push(format!("{a}: {count} goal(s) cancelling (code {code})"));
     }
-    let mut part = Participant::open(n.ros2.peer()?).map_err(|e| format!("socket: {e}"))?;
+    let mut part =
+        Participant::open(n.ros2.peer()?, n.ros2.prefix()?).map_err(|e| format!("socket: {e}"))?;
     let topic = format!("rt{}", n.cmd_vel_topic);
+    let tw = rtps::fresh_entity(0x03);
     part.announce().map_err(|e| format!("send: {e}"))?;
-    part.announce_writer(TOPIC_WRITER, &topic, "geometry_msgs::msg::dds_::Twist_")
+    part.announce_writer(tw, &topic, "geometry_msgs::msg::dds_::Twist_")
         .map_err(|e| format!("send: {e}"))?;
     let z = cdr::zero_twist();
     for sn in 1..=i64::from(n.zero_twists) {
-        part.publish(TOPIC_WRITER, sn, &z)
-            .map_err(|e| format!("send: {e}"))?;
+        part.publish(tw, sn, &z).map_err(|e| format!("send: {e}"))?;
         std::thread::sleep(Duration::from_millis(n.zero_twist_interval_ms));
     }
     notes.push(format!(
@@ -364,13 +362,15 @@ fn unitree_speed_level(
     const SPEED_LEVEL: i64 = 1015;
     let id = (id64(&format!("{}:{level}", spec.id)) >> 1) as i64;
     let req = cdr::unitree_request(id, SPEED_LEVEL, &format!("{{\"data\":{level}}}"));
-    let mut part = Participant::open(u.ros2.peer()?).map_err(|e| format!("socket: {e}"))?;
+    let mut part =
+        Participant::open(u.ros2.peer()?, u.ros2.prefix()?).map_err(|e| format!("socket: {e}"))?;
     let (rq, rs) = (u.request_topic.clone(), u.response_topic.clone());
+    let (req_w, rep_r) = (rtps::fresh_entity(0x03), rtps::fresh_entity(0x04));
     let send = |part: &mut Participant| -> std::io::Result<()> {
         part.announce()?;
-        part.announce_writer(REQ_WRITER, &rq, "unitree_api::msg::dds_::Request_")?;
-        part.announce_reader(REP_READER, &rs, "unitree_api::msg::dds_::Response_")?;
-        part.publish(REQ_WRITER, 1, &req)
+        part.announce_writer(req_w, &rq, "unitree_api::msg::dds_::Request_")?;
+        part.announce_reader(rep_r, &rs, "unitree_api::msg::dds_::Response_")?;
+        part.publish(req_w, 1, &req)
     };
     send(&mut part).map_err(|e| format!("send: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(u.ros2.timeout_ms);
@@ -386,7 +386,10 @@ fn unitree_speed_level(
     if code != 0 {
         return Err(format!("SpeedLevel({level}) answered status code {code}"));
     }
-    Ok(format!("sport SpeedLevel({level}) acknowledged"))
+    Ok(format!(
+        "sport SpeedLevel({level}) acknowledged (the sport API takes a speed level, not the \
+         requested caps)"
+    ))
 }
 
 // ------------------------------------------------------------------ PX4
@@ -535,7 +538,7 @@ fn rollback(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
         .as_ref()
         .ok_or_else(|| missing(AdapterKind::Rollback))?;
     let v = spec.request.to_version.as_deref().ok_or("no to_version")?;
-    let t = Duration::from_secs(r.timeout_s);
+    let t = Duration::from_millis(r.timeout_ms);
     run(
         &r.program,
         &[

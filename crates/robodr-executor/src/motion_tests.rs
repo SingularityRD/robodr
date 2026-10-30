@@ -281,7 +281,8 @@ fn sim_ros2(
 
 fn ros2_peer(port: u16) -> Value {
     json!({"peer_ip": "127.0.0.1", "peer_meta_port": port, "peer_user_port": port,
-           "local_ip": "127.0.0.1", "timeout_ms": 1500, "resend_ms": 100})
+           "local_ip": "127.0.0.1", "timeout_ms": 1500, "resend_ms": 100,
+           "participant_prefix": "0f0e0d0c0b0a090807060504"})
 }
 
 /// Echo a service request's header in front of `body`.
@@ -855,6 +856,25 @@ fn gates_of_the_motion_actions() {
         code(&e.submit(&o, &mut state(SafetyState::Idle), now())),
         codes::NO_ADAPTER
     );
+    // A workspace zone no adapter can enforce: refused, never dropped.
+    let zone = Target::Motion(MotionRequest {
+        max_linear_speed: Some(0.5),
+        workspace_zone: Some("dock".into()),
+        ..Default::default()
+    });
+    let o = signed(
+        "g3b",
+        ActionId::RestrictMotion,
+        Morphology::Aerial,
+        zone,
+        Some(10),
+        &[],
+        SafetyState::Idle,
+    );
+    assert_eq!(
+        code(&e.submit(&o, &mut state(SafetyState::Idle), now())),
+        codes::INVALID_ORDER
+    );
     drop(e);
     // A humanoid never pauses (it would fall).
     let d2 = tmpdir("gates-h");
@@ -976,6 +996,11 @@ fn motion_configuration_is_strict() {
         json!({"rollback_config": "rollback"}),
         json!({"safe_pause_ttl_s": 0}),
         json!({"unitree_sport": {"ros2": peer, "speed_level": 2}}),
+        // Over the time budget agentd waits for (MOTION_BUDGET_MS).
+        json!({"safe_pause": "nav2", "nav2": {"ros2": {"peer_ip": "10.0.0.2",
+               "local_ip": "10.0.0.1", "timeout_ms": 3000}}}),
+        json!({"rollback_config": "rollback",
+               "rollback": {"program": "/bin/true", "timeout_ms": 2500}}),
     ] {
         assert!(base(bad.clone()).is_err(), "{bad} accepted");
     }

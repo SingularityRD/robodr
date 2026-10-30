@@ -75,6 +75,15 @@ pub fn random_prefix() -> [u8; 12] {
     p
 }
 
+/// A user entity id with a fresh random key (`kind` 0x03: writer without
+/// key, 0x04: reader without key). Each call announces new endpoints, so
+/// a participant with a fixed prefix never reuses a writer GUID (whose
+/// sequence numbers a reliable reader would take for duplicates).
+pub fn fresh_entity(kind: u8) -> [u8; 4] {
+    let r = random_prefix();
+    [r[0], r[1], r[2], kind]
+}
+
 /// RTPS message builder (little-endian submessages).
 #[derive(Debug, Clone)]
 pub struct Msg {
@@ -226,13 +235,15 @@ pub struct Participant {
 }
 
 impl Participant {
-    /// Bind an ephemeral UDP port on `peer.local_ip`.
-    pub fn open(peer: Peer) -> std::io::Result<Self> {
+    /// Bind an ephemeral UDP port on `peer.local_ip`. `prefix`: the
+    /// participant's GUID prefix (a fixed one the site profiled, or a
+    /// fresh random one).
+    pub fn open(peer: Peer, prefix: Option<[u8; 12]>) -> std::io::Result<Self> {
         let sock = UdpSocket::bind(SocketAddrV4::new(peer.local_ip, 0))?;
         let local_port = sock.local_addr()?.port();
         Ok(Participant {
             sock,
-            prefix: random_prefix(),
+            prefix: prefix.unwrap_or_else(random_prefix),
             peer,
             local_port,
             sn_pub: 0,
