@@ -3,6 +3,9 @@
 #
 #   packaging/build-deb.sh --bin-dir target/release --arch amd64 [--out dist]
 #   packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-linux-musl --arch arm64
+#   packaging/build-deb.sh --bin-dir target/release --arch amd64 --stage-only DIR
+#       (only the file tree into DIR and the conffiles list into DIR.conffiles,
+#       no .deb: packaging/build-rpm.sh builds the RPM from it)
 #
 # Variants:
 #   standard (default) package "robodr": glibc binaries (libc6 floor read
@@ -48,15 +51,26 @@
 #
 # Environment:
 #   SOURCE_DATE_EPOCH   timestamp for every file
-#   DEB_DEPENDS         Depends: field of the standard variant (default below; Rust binaries link
-#                       glibc + libgcc_s, robodr-pulsard also libsqlite3
-#                       unless built with Pulsar's sqlite3-vendored feature;
-#                       the default libc6 floor is the newest GLIBC_x.y
-#                       version the packaged binaries need, at least 2.35,
-#                       read with readelf)
+#   DEB_DEPENDS         Depends: field of the standard variant, replacing the
+#                       computed one (below); for experiments only
+#   DEB_SHLIBDEPS       auto (default): Depends from dpkg-shlibdeps when it is
+#                       installed and --arch is the build host's dpkg
+#                       architecture (the release builds in its oldest
+#                       supported userland, Ubuntu 22.04, so the versions are
+#                       the ones that userland's libraries declare); 0: the
+#                       readelf fallback only. Either way every DT_NEEDED
+#                       soname must be in the soname -> package table below
+#                       (an unknown library fails the build), and the libc6
+#                       floor is at least the newest GLIBC_x.y version need
+#                       of any packaged binary (readelf -V) and at least 2.35
+#                       (the oldest supported userland).
 #   DEB_MAINTAINER      Maintainer: field
 #   ROBODR_DEB_REQUIRE  extra binaries that must be present
 set -euo pipefail
+# Files created by redirection (man pages, pulsar.toml) take their mode from
+# the umask: a build under umask 000 (seen in a container) must not ship
+# group/other-writable files.
+umask 022
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -65,12 +79,14 @@ bin_dir=""
 arch=""
 out="dist"
 variant="standard"
+stage_only=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --variant) variant="$2"; shift 2 ;;
     --bin-dir) bin_dir="$2"; shift 2 ;;
     --arch) arch="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
+    --stage-only) stage_only="$2"; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "build-deb: unknown argument $1" >&2; exit 2 ;;
     esac
@@ -99,7 +115,9 @@ focal)
     ;;
 *) echo "build-deb: unknown variant '$variant' (standard | focal)" >&2; exit 2 ;;
 esac
-command -v dpkg-deb >/dev/null || { echo "build-deb: dpkg-deb not found" >&2; exit 2; }
+if [[ -z "$stage_only" ]]; then
+    command -v dpkg-deb >/dev/null || { echo "build-deb: dpkg-deb not found" >&2; exit 2; }
+fi
 
 upstream="$(tr -d '[:space:]' <"$root/VERSION")"
 # Debian ordering: a pre-release sorts before the release with "~".
@@ -108,14 +126,16 @@ if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
     SOURCE_DATE_EPOCH="$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)"
 fi
 export SOURCE_DATE_EPOCH
-# Default Depends; the libc6 floor is raised below to the newest GLIBC_x.y
-# symbol version any packaged binary requires.
+# The libc6 floor of the standard variant: the oldest supported userland
+# (Ubuntu 22.04, glibc 2.35), raised below to the newest GLIBC_x.y version
+# need of any packaged binary and to what dpkg-shlibdeps reports.
 libc_floor=2.35
-depends_rest="libgcc-s1, libsqlite3-0, systemd (>= 247)"
 maintainer="${DEB_MAINTAINER:-RoboDR maintainers <robodr-maintainers@invalid>}"
 
-mkdir -p "$out"
-out="$(cd "$out" && pwd)"
+if [[ -z "$stage_only" ]]; then
+    mkdir -p "$out"
+    out="$(cd "$out" && pwd)"
+fi
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 pkg="$stage/${package}_${deb_version}_${arch}"
@@ -149,6 +169,18 @@ install_bin() { # name dest-dir required(0/1)
     return 1
 }
 
+# A unit drop-in example, installed under the examples: the focal variant's
+# own version (packaging/systemd/focal/<unit>.service.d/<file>) when there is
+# one, otherwise the regular file, which scripts/check-focal-units.py then
+# requires to use nothing newer than systemd 245.
+install_dropin() { # <unit>.service.d/<file>
+    local src="$here/systemd/$1"
+    if [[ "$variant" == focal && -f "$here/systemd/focal/$1" ]]; then
+        src="$here/systemd/focal/$1"
+    fi
+    install -D -m 0644 "$src" "$pkg/usr/share/doc/robodr/examples/$1"
+}
+
 for b in robodr-commission robodr-replay robodr-ros2-watch; do
     install_bin "$b" usr/bin 1
 done
@@ -168,17 +200,14 @@ fi
 if install_bin robodr-kafka-publish usr/bin 0; then
     install -D -m 0644 "$unit_src/robodr-kafka-publish.service" "$pkg/$units/robodr-kafka-publish.service"
     install -D -m 0644 "$here/etc/kafka-publish.env.example" "$pkg/$ex/kafka-publish.env.example"
-    install -D -m 0644 "$here/systemd/robodr-kafka-publish.service.d/50-brokers.conf.example" \
-        "$pkg/$ex/robodr-kafka-publish.service.d/50-brokers.conf.example"
-    install -D -m 0644 "$here/systemd/robodr-kafka-publish.service.d/60-tls-credentials.conf.example" \
-        "$pkg/$ex/robodr-kafka-publish.service.d/60-tls-credentials.conf.example"
+    install_dropin robodr-kafka-publish.service.d/50-brokers.conf.example
+    install_dropin robodr-kafka-publish.service.d/60-tls-credentials.conf.example
 fi
 # Ingest API uplink (connected sites; conflicts with both units above).
 if install_bin robodr-uplink usr/bin 0; then
     install -D -m 0644 "$unit_src/robodr-uplink.service" "$pkg/$units/robodr-uplink.service"
     install -D -m 0644 "$here/etc/uplink.env.example" "$pkg/$ex/uplink.env.example"
-    install -D -m 0644 "$here/systemd/robodr-uplink.service.d/50-soc.conf.example" \
-        "$pkg/$ex/robodr-uplink.service.d/50-soc.conf.example"
+    install_dropin robodr-uplink.service.d/50-soc.conf.example
 fi
 if [[ "$variant" == focal ]]; then
     for b in robodr-pulsard robodr-anchor-receiver; do
@@ -190,10 +219,10 @@ if [[ "$variant" == focal ]]; then
     install -D -m 0755 "$here/focal/robodr-load-credential" "$pkg/usr/lib/robodr/robodr-load-credential"
 elif install_bin robodr-pulsard usr/sbin 0; then
     install -D -m 0644 "$here/systemd/robodr-pulsard.service" "$pkg/$units/robodr-pulsard.service"
-    install -D -m 0644 "$here/systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-pulsard.service.d/10-cap-sys-admin.conf.example"
-    install -D -m 0644 "$here/systemd/robodr-pulsard.service.d/30-host-threats.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-pulsard.service.d/30-host-threats.conf.example"
+    # External-BTF guard of the unit (kernels without BTF, docs/UNITREE.md 3.2.1).
+    install -D -m 0755 "$here/btf/robodr-btf-check" "$pkg/usr/lib/robodr/robodr-btf-check"
+    install_dropin robodr-pulsard.service.d/10-cap-sys-admin.conf.example
+    install_dropin robodr-pulsard.service.d/30-host-threats.conf.example
     # Default config: base header + the RoboDR sensor sections (a conffile).
     install -d -m 0750 "$pkg/etc/robodr"
     cat "$here/etc/pulsar.base.toml" "$root/config/robodr.toml.example" >"$pkg/etc/robodr/pulsar.toml"
@@ -211,14 +240,11 @@ elif install_bin robodr-pulsard usr/sbin 0; then
 fi
 if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
-    install -D -m 0644 "$unit_src/robodr-agentd.service.d/20-finding-key.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/20-finding-key.conf.example"
-    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-control-plane.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-control-plane.conf.example"
+    install_dropin robodr-agentd.service.d/20-finding-key.conf.example
+    install_dropin robodr-agentd.service.d/30-control-plane.conf.example
     # Passive sensor box (tap / port mirror; docs/UNITREE.md): agentd drop-in,
     # capture-NIC networkd file and host firewall. Examples, never active.
-    install -D -m 0644 "$here/systemd/robodr-agentd.service.d/40-sensor-box.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/40-sensor-box.conf.example"
+    install_dropin robodr-agentd.service.d/40-sensor-box.conf.example
     for f in 10-robodr-capture.network.example nftables.conf.example; do
         install -D -m 0644 "$here/sensor-box/$f" "$pkg/usr/share/doc/robodr/examples/sensor-box/$f"
     done
@@ -228,14 +254,12 @@ fi
 # agentd's key drop-in example.
 if install_bin robodr-executor usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-executor.service" "$pkg/$units/robodr-executor.service"
-    install -D -m 0644 "$unit_src/robodr-agentd.service.d/30-executor.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-agentd.service.d/30-executor.conf.example"
+    install_dropin robodr-agentd.service.d/30-executor.conf.example
     install -D -m 0644 "$root/config/executor.example.json" "$pkg/$ex/executor.example.json"
     # Sprint 8 motion adapters: example configuration and unit drop-in.
     install -D -m 0644 "$root/config/executor.motion.example.json" \
         "$pkg/$ex/executor.motion.example.json"
-    install -D -m 0644 "$here/systemd/robodr-executor.service.d/40-motion.conf.example" \
-        "$pkg/usr/share/doc/robodr/examples/robodr-executor.service.d/40-motion.conf.example"
+    install_dropin robodr-executor.service.d/40-motion.conf.example
 fi
 # In-path Motion Firewall gateway (inline bridge on a sensor box,
 # crates/robodr-firewall-gw): the gateway and its ruleset unit, installed
@@ -284,6 +308,7 @@ for page in "$root"/man/*.[1-8]; do
     if [[ -e "$pkg/usr/bin/$cmd" || -e "$pkg/usr/sbin/$cmd" ]]; then
         install -d "$pkg/usr/share/man/man$sec"
         gzip -9 -n -c "$page" >"$pkg/usr/share/man/man$sec/$name.gz"
+        chmod 0644 "$pkg/usr/share/man/man$sec/$name.gz"
     fi
 done
 
@@ -330,6 +355,126 @@ fi
 find "$pkg" -type d -exec chmod 0755 {} +
 [[ -d "$pkg/etc/robodr" ]] && chmod 0750 "$pkg/etc/robodr"
 
+# --stage-only DIR (packaging/build-rpm.sh): the package's file tree, exactly
+# as the .deb would carry it, plus conffiles (the list the RPM turns into
+# %config(noreplace)); no Depends, no control data, no dpkg-deb.
+if [[ -n "$stage_only" ]]; then
+    if [[ -e "$stage_only" && -n "$(ls -A "$stage_only" 2>/dev/null)" ]]; then
+        echo "build-deb: --stage-only $stage_only exists and is not empty" >&2
+        exit 2
+    fi
+    mkdir -p "$stage_only"
+    touch "$pkg/DEBIAN/conffiles"
+    install -m 0644 "$pkg/DEBIAN/conffiles" "$stage_only.conffiles"
+    rm -rf "$pkg/DEBIAN"
+    find "$pkg" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+    cp -a "$pkg/." "$stage_only/"
+    echo "build-deb: staged $package ($variant, $arch) in $stage_only" >&2
+    exit 0
+fi
+
+# soname -> Debian package, for every shared library a packaged binary may
+# link (DT_NEEDED). Package names exist in Debian 12/13 and Ubuntu
+# 22.04/24.04 (on the 64-bit-time_t distributions libssl3t64 provides
+# libssl3). A soname missing here fails the build: add the library
+# deliberately, with its RPM counterpart in packaging/build-rpm.sh's
+# documentation (RPM generates its Requires from the same ELF data).
+soname_package() {
+    case "$1" in
+    libc.so.6 | libm.so.6 | libpthread.so.0 | libdl.so.2 | librt.so.1 | libutil.so.1 | \
+        ld-linux-x86-64.so.2 | ld-linux-aarch64.so.1) echo libc6 ;;
+    libgcc_s.so.1) echo libgcc-s1 ;;
+    libsqlite3.so.0) echo libsqlite3-0 ;;
+    libssl.so.3 | libcrypto.so.3) echo libssl3 ;;
+    *) return 1 ;;
+    esac
+}
+
+# Depends: of the standard variant, printed on stdout: one entry per
+# package the binaries' DT_NEEDED sonames map to, versioned by
+# dpkg-shlibdeps where it can run (native architecture), the libc6 floor
+# raised to the binaries' GLIBC_x.y needs, then systemd (>= 247) for the
+# units (LoadCredential=, ProtectProc=).
+standard_depends() {
+    command -v readelf >/dev/null || { echo "build-deb: readelf (binutils) not found; needed for Depends (or set DEB_DEPENDS)" >&2; exit 2; }
+    local bins=() f so pkgname need floor shl="" host_arch="" deps=() d
+    while IFS= read -r f; do
+        if [[ "$(head -c4 "$f" | od -An -tx1 | tr -d '[:space:]')" == 7f454c46 ]]; then
+            bins+=("$f")
+        fi
+    done < <(find "$pkg/usr/bin" "$pkg/usr/sbin" -type f 2>/dev/null | LC_ALL=C sort)
+    [[ ${#bins[@]} -gt 0 ]] || { echo "build-deb: no ELF binaries staged" >&2; exit 1; }
+    # Packages from DT_NEEDED (sorted, unique).
+    local pkgs=()
+    while IFS= read -r so; do
+        [[ -n "$so" ]] || continue
+        if ! pkgname="$(soname_package "$so")"; then
+            echo "build-deb: a packaged binary needs $so, which has no package mapping (soname_package in build-deb.sh)" >&2
+            exit 1
+        fi
+        pkgs+=("$pkgname")
+    done < <(for f in "${bins[@]}"; do readelf -dW "$f" 2>/dev/null; done |
+        sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' | LC_ALL=C sort -u)
+    mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | LC_ALL=C sort -u)
+    # GLIBC_x.y version needs (weak references still carry a hard version
+    # need: Rust std's pidfd_spawnp@GLIBC_2.39 on a 2.39 build host).
+    need="$(printf '%s\0' "${bins[@]}" | xargs -0 readelf -V --wide 2>/dev/null |
+        sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -uV | tail -n1)"
+    floor="$libc_floor"
+    [[ -z "$need" ]] || floor="$(printf '%s\n%s\n' "$floor" "$need" | sort -V | tail -n1)"
+    # dpkg-shlibdeps: versions from the build userland's shlibs/symbols files.
+    command -v dpkg >/dev/null && host_arch="$(dpkg --print-architecture 2>/dev/null || true)"
+    if [[ "${DEB_SHLIBDEPS:-auto}" != 0 ]] && command -v dpkg-shlibdeps >/dev/null && [[ "$host_arch" == "$arch" ]]; then
+        local sd
+        sd="$(mktemp -d)"
+        mkdir -p "$sd/debian"
+        : >"$sd/debian/control"
+        if ! shl="$(cd "$sd" && dpkg-shlibdeps -O "${bins[@]}" 2>"$sd/err")"; then
+            cat "$sd/err" >&2
+            rm -rf "$sd"
+            echo "build-deb: dpkg-shlibdeps failed (DEB_SHLIBDEPS=0 to use the readelf fallback)" >&2
+            exit 1
+        fi
+        rm -rf "$sd"
+        shl="${shl#shlibs:Depends=}"
+        echo "build-deb: dpkg-shlibdeps ($host_arch): $shl" >&2
+    else
+        echo "build-deb: dpkg-shlibdeps not used (host ${host_arch:-?}, package $arch); unversioned library dependencies, libc6 floor from readelf" >&2
+    fi
+    for p in "${pkgs[@]}"; do
+        d="$p"
+        if [[ -n "$shl" ]]; then
+            # The shlibdeps entry of this package, e.g. "libssl3 (>= 3.0.0)".
+            local e
+            e="$(printf '%s\n' "$shl" | tr ',' '\n' | sed 's/^ *//' | grep -E "^$p( |\$)" | head -n1 || true)"
+            [[ -z "$e" ]] || d="$e"
+        fi
+        if [[ "$p" == libc6 ]]; then
+            local v="${d#libc6 (>= }"
+            v="${v%)}"
+            [[ "$v" == "$d" ]] && v=0
+            d="libc6 (>= $(printf '%s\n%s\n' "$floor" "$v" | sort -V | tail -n1))"
+        fi
+        deps+=("$d")
+    done
+    # shlibdeps must not know a package the soname table does not.
+    if [[ -n "$shl" ]]; then
+        local e base
+        while IFS= read -r e; do
+            e="${e# }"
+            base="${e%% *}"
+            [[ -n "$base" ]] || continue
+            if [[ " ${pkgs[*]} " != *" $base "* ]]; then
+                echo "build-deb: dpkg-shlibdeps names $base, which the soname table does not map to (soname_package)" >&2
+                exit 1
+            fi
+        done < <(printf '%s\n' "$shl" | tr ',' '\n')
+    fi
+    deps+=("systemd (>= 247)")
+    local IFS=,
+    printf '%s\n' "${deps[*]}" | sed 's/,/, /g'
+}
+
 # libc6 floor from the binaries' version needs (readelf -V reads any ELF
 # arch). Rust std references e.g. pidfd_spawnp@GLIBC_2.39 when linked on a
 # glibc >= 2.39 host; the reference is weak, but its version need is not, so
@@ -353,16 +498,10 @@ if [[ "$variant" == focal ]]; then
     echo "build-deb: static binaries, Depends: $depends" >&2
 elif [[ -n "${DEB_DEPENDS:-}" ]]; then
     depends="$DEB_DEPENDS"
+    echo "build-deb: Depends from DEB_DEPENDS (not computed): $depends" >&2
 else
-    command -v readelf >/dev/null || { echo "build-deb: readelf (binutils) not found; needed for the libc6 floor (or set DEB_DEPENDS)" >&2; exit 2; }
-    need="$(find "$pkg/usr" -type f \( -path "$pkg/usr/bin/*" -o -path "$pkg/usr/sbin/*" \) | LC_ALL=C sort |
-        xargs -r readelf -V --wide 2>/dev/null | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' |
-        sort -uV | tail -n1)"
-    if [[ -n "$need" ]]; then
-        libc_floor="$(printf '%s\n%s\n' "$libc_floor" "$need" | sort -V | tail -n1)"
-    fi
-    echo "build-deb: libc6 (>= $libc_floor)" >&2
-    depends="libc6 (>= $libc_floor), $depends_rest"
+    depends="$(standard_depends)"
+    echo "build-deb: Depends: $depends" >&2
 fi
 
 installed_kb="$(du -sk --exclude=DEBIAN "$pkg" | cut -f1)"

@@ -1,0 +1,27 @@
+#!/bin/sh
+# robodr preun scriptlet (RPM). The counterpart of packaging/deb/prerm: stops the
+# services on removal; on upgrade they keep running until the new
+# package's post scriptlet try-restarts them.
+#
+# $1: 0 = removal, >= 1 = upgrade (this is the old package's scriptlet).
+set -e
+
+if [ "${1:-0}" -eq 0 ]; then
+    if [ -d /run/systemd/system ]; then
+        # robodr-firewall-gw-rules is deliberately not stopped (it has no
+        # ExecStop=): the ruleset stays, so with fail_closed the bridge keeps
+        # refusing motion datagrams after the gateway is removed. Take the
+        # gateway out of the path explicitly (OPERATIONS.md 6.6).
+        for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
+            robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
+            robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service; do
+            systemctl stop "$u" 2>/dev/null || :
+        done
+    fi
+    # executor v1: without the executor nothing would lift its actions at
+    # their TTL, so its table goes with it (only this table, never another).
+    if command -v nft >/dev/null 2>&1 && nft list table inet robodr >/dev/null 2>&1; then
+        nft delete table inet robodr || :
+    fi
+fi
+exit 0

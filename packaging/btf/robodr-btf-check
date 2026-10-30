@@ -1,0 +1,40 @@
+#!/bin/sh
+# robodr-btf-check: refuse to start robodr-pulsard with an external BTF file
+# of another kernel build (robodr-pulsard.service, ExecStartPre=).
+#
+# Installed as /usr/lib/robodr/robodr-btf-check by the robodr package (with
+# robodr-pulsard). On a kernel without BTF (NVIDIA L4T on JetPack 5/6) the
+# operator generates the kernel's BTF on a build host and installs it as
+# /etc/robodr/btf/vmlinux, with /etc/robodr/btf/vmlinux.kernel holding the
+# `uname -r` and `uname -v` lines of the kernel it was generated for
+# (docs/UNITREE.md 3.2.1). Pulsar relocates its probes with whatever BTF it
+# is given: one of another kernel build gives wrong field offsets, and the
+# probes may load and report garbage without any error. After a kernel
+# update (L4T OTA) the stamp no longer matches and the daemon does not start
+# until the BTF is regenerated: fail closed, loudly.
+#
+#   robodr-btf-check [DIR]      (default DIR: /etc/robodr/btf)
+#
+# No DIR/vmlinux: nothing to check (the kernel's own BTF is used), exit 0.
+# Exit: 0 ok, 1 mismatch or missing stamp.
+set -eu
+dir=${1:-/etc/robodr/btf}
+btf=$dir/vmlinux
+stamp=$dir/vmlinux.kernel
+
+[ -e "$btf" ] || exit 0
+if [ ! -f "$stamp" ]; then
+    echo "robodr-btf-check: $btf has no $stamp (uname -r and uname -v of its kernel); see UNITREE.md 3.2.1" >&2
+    exit 1
+fi
+want=$(printf '%s\n%s\n' "$(uname -r)" "$(uname -v)")
+got=$(cat "$stamp")
+if [ "$got" != "$want" ]; then
+    echo "robodr-btf-check: $btf was generated for" >&2
+    printf '%s\n' "$got" | sed 's/^/  /' >&2
+    echo "but the running kernel is" >&2
+    printf '%s\n' "$want" | sed 's/^/  /' >&2
+    echo "regenerate it for this kernel (UNITREE.md 3.2.1) before starting robodr-pulsard" >&2
+    exit 1
+fi
+exit 0

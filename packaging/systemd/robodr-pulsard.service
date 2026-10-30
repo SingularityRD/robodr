@@ -29,8 +29,14 @@ Documentation=man:robodr-pulsard(8) file:/usr/share/doc/robodr/OPERATIONS.md
 # Pulsar would otherwise try to mount it itself, which this unit does not
 # allow (no @mount syscalls, read-only /sys). Fail loudly, not silently.
 AssertPathIsMountPoint=/sys/fs/bpf
-# BTF is required by Pulsar (CO-RE probes); see docs/BUILD.md "To run".
-AssertPathExists=/sys/kernel/btf/vmlinux
+# BTF is required by Pulsar (CO-RE probes): the kernel's own
+# (/sys/kernel/btf/vmlinux), or on a kernel built without it (NVIDIA L4T on
+# JetPack 5/6) an external BTF file generated for exactly the running
+# kernel, installed at /etc/robodr/btf/vmlinux and named in
+# /etc/robodr/pulsar.toml ([pulsar] btf_path; docs/UNITREE.md 3.2.1).
+# The unit refuses to start when neither exists ("|": either is enough).
+AssertPathExists=|/sys/kernel/btf/vmlinux
+AssertPathExists=|/etc/robodr/btf/vmlinux
 AssertPathExists=/etc/robodr/pulsar.toml
 After=local-fs.target network.target
 Wants=network.target
@@ -39,6 +45,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+# An external BTF file (/etc/robodr/btf/vmlinux) must have been generated
+# for exactly the running kernel (its stamp vmlinux.kernel = uname -r and
+# uname -v): after a kernel update the daemon does not start until it is
+# regenerated (packaging/btf/robodr-btf-check; no-op without the file).
+ExecStartPre=/usr/lib/robodr/robodr-btf-check
 ExecStart=/usr/sbin/robodr-pulsard --config-file /etc/robodr/pulsar.toml
 # Pulsar does not call sd_notify(), so neither Type=notify nor WatchdogSec=
 # can be used yet: with WatchdogSec= set, systemd would kill a healthy daemon

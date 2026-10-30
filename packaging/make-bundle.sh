@@ -22,6 +22,10 @@
 # Deterministic: sorted entries, root:root numeric owners, mtimes =
 # SOURCE_DATE_EPOCH, no atime/ctime in PAX headers, gzip -n.
 set -euo pipefail
+# Directories and the SHA256SUMS file take their mode from the umask: a
+# build under umask 000 (seen in containers) must not produce a
+# world-writable bundle, and the tarball's bytes must not depend on it.
+umask 022
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"

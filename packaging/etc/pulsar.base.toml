@@ -11,6 +11,15 @@
 # The unit only allows writes to its RuntimeDirectory, not to /var/run.
 # The `pulsar` CLI must be pointed at this socket explicitly.
 api_socket_path = "/run/robodr-pulsard/pulsar.sock"
+# Kernels without BTF (no /sys/kernel/btf/vmlinux, e.g. NVIDIA L4T on
+# JetPack 5/6): an external BTF file for EXACTLY the running kernel
+# (`uname -r` and build), generated as described in
+# /usr/share/doc/robodr/UNITREE.md section 3.2.1 and installed as
+# /etc/robodr/btf/vmlinux (0644 root:root, in a 0755 root:root directory).
+# Pulsar then reads the kernel types from it instead of the kernel. A BTF
+# file of another kernel build gives wrong field offsets: the probes may
+# load and silently report garbage. Leave unset on kernels with BTF.
+#btf_path = "/etc/robodr/btf/vmlinux"
 
 [module.rules-engine]
 # Read-only, shipped by the package: RoboDR rules (rules/robodr) and the
