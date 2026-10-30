@@ -45,10 +45,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# An external BTF file (/etc/robodr/btf/vmlinux) must have been generated
-# for exactly the running kernel (its stamp vmlinux.kernel = uname -r and
-# uname -v): after a kernel update the daemon does not start until it is
-# regenerated (packaging/btf/robodr-btf-check; no-op without the file).
+# An external BTF file ([pulsar] btf_path, only /etc/robodr/btf/vmlinux
+# allowed) must have been generated for exactly the running kernel: its
+# stamp vmlinux.kernel = uname -r, uname -v and the file's SHA-256. After a
+# kernel update the daemon does not start until it is regenerated
+# (packaging/btf/robodr-btf-check; no-op while btf_path is unset).
 ExecStartPre=/usr/lib/robodr/robodr-btf-check
 ExecStart=/usr/sbin/robodr-pulsard --config-file /etc/robodr/pulsar.toml
 # Pulsar does not call sd_notify(), so neither Type=notify nor WatchdogSec=

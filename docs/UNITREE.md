@@ -419,11 +419,13 @@ with `pahole`, on a build host, from NVIDIA's sources for that L4T release.
    ```sh
    pahole --btf_encode_detached=vmlinux.btf vmlinux
    bpftool btf dump file vmlinux.btf format raw | head    # parses
-   printf '%s\n%s\n' "<uname -r of the Jetson>" "<uname -v of the Jetson>" > vmlinux.kernel
+   printf '%s\n%s\n%s\n' "<uname -r of the Jetson>" "<uname -v of the Jetson>" \
+       "$(sha256sum vmlinux.btf | cut -d' ' -f1)" > vmlinux.kernel
    ```
 
-   `vmlinux.kernel` is the stamp the unit checks: exactly the two lines
-   `uname -r` and `uname -v` print on the Jetson.
+   `vmlinux.kernel` is the stamp the unit checks: exactly the lines
+   `uname -r` and `uname -v` print on the Jetson, then the SHA-256 of the
+   BTF file, so a file replaced without a new stamp is refused too.
 4. **Install** (through the site's vetted media, like any other file that
    reaches the unit) and point Pulsar at it:
 
@@ -437,10 +439,12 @@ with `pahole`, on a build host, from NVIDIA's sources for that L4T release.
    ```
 
    The unit starts when `/sys/kernel/btf/vmlinux` **or**
-   `/etc/robodr/btf/vmlinux` exists, and its `ExecStartPre=`
-   (`/usr/lib/robodr/robodr-btf-check`) refuses to start when
-   `vmlinux.kernel` is missing or names another kernel than the running
-   one: after an L4T update (OTA) the daemon stays down, visibly in the
+   `/etc/robodr/btf/vmlinux` exists. Its `ExecStartPre=`
+   (`/usr/lib/robodr/robodr-btf-check`) reads `btf_path` from
+   `pulsar.toml`: any other path than `/etc/robodr/btf/vmlinux` is refused,
+   and with that path the daemon does not start when the file or
+   `vmlinux.kernel` is missing, or the stamp names another kernel or
+   another file hash than the running kernel and the installed file: after an L4T update (OTA) the daemon stays down, visibly in the
    journal, until the file is regenerated (steps 1 to 4) for the new
    kernel.
 5. **Check that the probes see the truth**, not only that they load:

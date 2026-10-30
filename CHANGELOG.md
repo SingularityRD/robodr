@@ -29,7 +29,8 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `robodr-pulsard` unit accepts `/etc/robodr/btf/vmlinux` (Pulsar's
   `[pulsar] btf_path`, commented in `pulsar.toml`) instead of
   `/sys/kernel/btf/vmlinux`, and `robodr-btf-check` refuses to start with
-  a file stamped for another kernel build. Generation with `pahole`:
+  any other `btf_path`, or a file whose stamp names another kernel build
+  or another SHA-256. Generation with `pahole`:
   `docs/UNITREE.md` 3.2.1.
 - `robodr-focal`: a systemd 245 variant of the Kafka TLS / SASL credential
   drop-in example (`robodr-load-credential` instead of `LoadCredential=`).

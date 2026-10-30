@@ -1,40 +1,72 @@
 #!/bin/sh
 # robodr-btf-check: refuse to start robodr-pulsard with an external BTF file
-# of another kernel build (robodr-pulsard.service, ExecStartPre=).
+# that is not the one generated for the running kernel
+# (robodr-pulsard.service, ExecStartPre=; runs inside the unit's sandbox).
 #
 # Installed as /usr/lib/robodr/robodr-btf-check by the robodr package (with
 # robodr-pulsard). On a kernel without BTF (NVIDIA L4T on JetPack 5/6) the
 # operator generates the kernel's BTF on a build host and installs it as
-# /etc/robodr/btf/vmlinux, with /etc/robodr/btf/vmlinux.kernel holding the
-# `uname -r` and `uname -v` lines of the kernel it was generated for
-# (docs/UNITREE.md 3.2.1). Pulsar relocates its probes with whatever BTF it
-# is given: one of another kernel build gives wrong field offsets, and the
-# probes may load and report garbage without any error. After a kernel
-# update (L4T OTA) the stamp no longer matches and the daemon does not start
-# until the BTF is regenerated: fail closed, loudly.
+# /etc/robodr/btf/vmlinux, with /etc/robodr/btf/vmlinux.kernel holding three
+# lines: `uname -r` and `uname -v` of the kernel it was generated for and
+# the SHA-256 of vmlinux (docs/UNITREE.md 3.2.1). Pulsar relocates its
+# probes with whatever BTF it is given: one of another kernel build gives
+# wrong field offsets, and the probes may load and report garbage without
+# any error. After a kernel update (L4T OTA), or when the file is replaced
+# without a new stamp, the daemon does not start: fail closed, loudly.
 #
-#   robodr-btf-check [DIR]      (default DIR: /etc/robodr/btf)
+#   robodr-btf-check [--config /etc/robodr/pulsar.toml] [--dir /etc/robodr/btf]
 #
-# No DIR/vmlinux: nothing to check (the kernel's own BTF is used), exit 0.
-# Exit: 0 ok, 1 mismatch or missing stamp.
+# Reads [pulsar] btf_path from the config:
+#   unset (or no config)          nothing to check (the kernel's own BTF is
+#                                 used; the unit asserts it exists), exit 0
+#   "/etc/robodr/btf/vmlinux"     DIR/vmlinux and its stamp must match the
+#                                 running kernel and the file's SHA-256
+#   anything else                 refused: only that path is checked and
+#                                 documented
+# Exit: 0 ok, 1 refused.
 set -eu
-dir=${1:-/etc/robodr/btf}
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+canonical=/etc/robodr/btf/vmlinux
+config=/etc/robodr/pulsar.toml
+dir=/etc/robodr/btf
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --config) config=$2; shift 2 ;;
+    --dir) dir=$2; shift 2 ;;
+    *) echo "robodr-btf-check: unknown argument $1" >&2; exit 1 ;;
+    esac
+done
+die() { echo "robodr-btf-check: $*" >&2; exit 1; }
+
+# [pulsar] btf_path = "..." (or '...'); other sections and comments ignored.
+btf_path=""
+if [ -f "$config" ]; then
+    btf_path=$(awk '
+        /^[[:space:]]*\[/ { sect = $0; gsub(/[[:space:]]/, "", sect); next }
+        sect == "[pulsar]" && /^[[:space:]]*btf_path[[:space:]]*=/ {
+            v = $0; sub(/^[^=]*=[[:space:]]*/, "", v)
+            q = substr(v, 1, 1)
+            if (q == "\"" || q == "\047") { v = substr(v, 2); sub(q ".*$", "", v) } else { v = "?" v }
+            print v; exit
+        }' "$config")
+fi
+[ -n "$btf_path" ] || exit 0
+[ "$btf_path" = "$canonical" ] ||
+    die "[pulsar] btf_path = $btf_path in $config: only $canonical is supported (its kernel stamp is checked here; UNITREE.md 3.2.1)"
+
 btf=$dir/vmlinux
 stamp=$dir/vmlinux.kernel
-
-[ -e "$btf" ] || exit 0
-if [ ! -f "$stamp" ]; then
-    echo "robodr-btf-check: $btf has no $stamp (uname -r and uname -v of its kernel); see UNITREE.md 3.2.1" >&2
-    exit 1
-fi
-want=$(printf '%s\n%s\n' "$(uname -r)" "$(uname -v)")
+[ -f "$btf" ] || die "btf_path is set but $btf is missing"
+[ -f "$stamp" ] || die "$btf has no $stamp (uname -r, uname -v, sha256 of the file); see UNITREE.md 3.2.1"
+sum=$(sha256sum "$btf" | cut -d' ' -f1)
+want=$(printf '%s\n%s\n%s\n' "$(uname -r)" "$(uname -v)" "$sum")
 got=$(cat "$stamp")
 if [ "$got" != "$want" ]; then
-    echo "robodr-btf-check: $btf was generated for" >&2
+    echo "robodr-btf-check: $stamp says" >&2
     printf '%s\n' "$got" | sed 's/^/  /' >&2
-    echo "but the running kernel is" >&2
+    echo "but the running kernel and $btf give" >&2
     printf '%s\n' "$want" | sed 's/^/  /' >&2
-    echo "regenerate it for this kernel (UNITREE.md 3.2.1) before starting robodr-pulsard" >&2
-    exit 1
+    die "regenerate the BTF file and its stamp for this kernel (UNITREE.md 3.2.1) before starting robodr-pulsard"
 fi
 exit 0

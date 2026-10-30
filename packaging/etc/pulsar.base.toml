@@ -15,7 +15,9 @@ api_socket_path = "/run/robodr-pulsard/pulsar.sock"
 # JetPack 5/6): an external BTF file for EXACTLY the running kernel
 # (`uname -r` and build), generated as described in
 # /usr/share/doc/robodr/UNITREE.md section 3.2.1 and installed as
-# /etc/robodr/btf/vmlinux (0644 root:root, in a 0755 root:root directory).
+# /etc/robodr/btf/vmlinux (0644 root:root, in a 0755 root:root directory)
+# with its stamp vmlinux.kernel (uname -r, uname -v, sha256 of the file);
+# robodr-btf-check refuses any other btf_path and a stale stamp.
 # Pulsar then reads the kernel types from it instead of the kernel. A BTF
 # file of another kernel build gives wrong field offsets: the probes may
 # load and silently report garbage. Leave unset on kernels with BTF.
