@@ -242,6 +242,15 @@ pub enum Codec {
     /// `StopCustomAction` 7113, `GetActionList` 7107): every call but a
     /// query refused unless in `allowed_api_ids`.
     UnitreeArmRequest,
+    /// RTPS DATA, ROS 2 `trajectory_msgs/msg/JointTrajectory` (the topic of
+    /// a `joint_trajectory_controller`): checked against `trajectory`
+    /// (`crate::trajectory`), passed, time-scaled in place or suppressed.
+    Ros2JointTrajectory,
+    /// RTPS DATA, the `send_goal` request of a ROS 2
+    /// `control_msgs/action/FollowJointTrajectory` action
+    /// (`rq/<action>/_action/send_goalRequest`): its trajectory checked as
+    /// [`Codec::Ros2JointTrajectory`], its multi-DOF part must be empty.
+    Ros2FollowJointTrajectoryGoal,
 }
 
 /// The humanoid whose locomotion client a `unitree_loco_request` channel
@@ -312,6 +321,14 @@ impl Codec {
         matches!(self, Codec::Ros2Twist | Codec::Ros2TwistStamped)
     }
 
+    /// `true` for the ROS 2 joint-trajectory codecs (`crate::trajectory`).
+    pub fn is_trajectory(self) -> bool {
+        matches!(
+            self,
+            Codec::Ros2JointTrajectory | Codec::Ros2FollowJointTrajectoryGoal
+        )
+    }
+
     /// Motor slots of a joint codec (`None` for hands: the firewall
     /// channel's count).
     pub fn slots(self) -> Option<usize> {
@@ -358,6 +375,8 @@ impl Codec {
             Codec::Ros2Twist => "ros2_twist",
             Codec::Ros2TwistStamped => "ros2_twist_stamped",
             Codec::UnitreeArmRequest => "unitree_arm_request",
+            Codec::Ros2JointTrajectory => "ros2_joint_trajectory",
+            Codec::Ros2FollowJointTrajectoryGoal => "ros2_follow_joint_trajectory_goal",
         }
     }
 
@@ -375,6 +394,10 @@ impl Codec {
             Codec::Ros2TwistStamped => "geometry_msgs::msg::dds_::TwistStamped_",
             Codec::Go1HighCmd => "unitree_legged_sdk::HighCmd",
             Codec::Go1LowCmd => "unitree_legged_sdk::LowCmd",
+            Codec::Ros2JointTrajectory => "trajectory_msgs::msg::dds_::JointTrajectory_",
+            Codec::Ros2FollowJointTrajectoryGoal => {
+                "control_msgs::action::dds_::FollowJointTrajectory_SendGoal_Request_"
+            }
         }
     }
 }
@@ -483,10 +506,162 @@ pub struct ChannelConfig {
     pub engage_stable_frames: Option<u32>,
     #[serde(default)]
     pub engage_stable_q: Option<f64>,
+    /// Trajectory codecs (required): the joints, their bounds and the
+    /// trajectory bounds ([`TrajectoryConfig`]).
+    #[serde(default)]
+    pub trajectory: Option<TrajectoryConfig>,
     /// Free text for the operator (ignored; at most 500 characters, no
     /// control characters). The shipped examples explain each channel here.
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// One joint of a trajectory channel.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrajectoryJointConfig {
+    /// The joint name exactly as the controller knows it (1..=255 octets,
+    /// no control characters).
+    pub name: String,
+    /// Position bounds (rad or m), finite, `min < max`.
+    pub min_position: f64,
+    pub max_position: f64,
+    /// Speed bound (rad/s or m/s), finite, `> 0`; capped by the profile
+    /// envelope's `max_joint_speed` of the channel.
+    pub max_velocity: f64,
+    /// Acceleration bound, finite, `> 0`.
+    pub max_acceleration: f64,
+    /// Effort bound (N·m or N), finite, `> 0`.
+    pub max_effort: f64,
+}
+
+/// What a velocity / acceleration violation does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnVelocityViolation {
+    /// **Default.** The trajectory is suppressed.
+    #[default]
+    Reject,
+    /// Slowed down in place by the smallest factor that fits, up to
+    /// `max_time_scale` (`crate::trajectory`, "Time scaling").
+    TimeScale,
+}
+
+/// The `service request header` layout in front of a `send_goal` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestHeader {
+    /// `rmw_fastrtps_cpp` (Jazzy's default): none in the payload.
+    #[default]
+    None,
+    /// `rmw_cyclonedds_cpp`: 16 octets (client GUID hash, sequence).
+    Cyclone,
+}
+
+/// The bounds of a trajectory channel (`crate::trajectory`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrajectoryConfig {
+    /// 1..=32 joints, distinct names.
+    pub joints: Vec<TrajectoryJointConfig>,
+    /// Most points per trajectory (1..=4096, default 256).
+    #[serde(default = "default_max_points")]
+    pub max_points: usize,
+    /// Longest `time_from_start` of the last point (s, `(0, 3600]`,
+    /// default 60).
+    #[serde(default = "default_max_duration")]
+    pub max_duration_s: f64,
+    #[serde(default)]
+    pub on_velocity_violation: OnVelocityViolation,
+    /// Largest slow-down of `time_scale` (`[1, 100]`, default 4).
+    #[serde(default = "default_max_time_scale")]
+    pub max_time_scale: f64,
+    /// `ros2_follow_joint_trajectory_goal` only: the RMW's request header.
+    #[serde(default)]
+    pub request_header: RequestHeader,
+}
+
+fn default_max_points() -> usize {
+    256
+}
+fn default_max_duration() -> f64 {
+    60.0
+}
+fn default_max_time_scale() -> f64 {
+    4.0
+}
+
+impl TrajectoryConfig {
+    fn validate(&self, at: &str, codec: Codec) -> Result<(), String> {
+        if self.joints.is_empty() || self.joints.len() > crate::trajectory::MAX_JOINTS {
+            return Err(format!("{at}: trajectory.joints: 1..=32 joints"));
+        }
+        for (i, j) in self.joints.iter().enumerate() {
+            if j.name.is_empty()
+                || j.name.len() >= crate::trajectory::MAX_NAME
+                || j.name.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "{at}: trajectory.joints[{i}].name: 1..=255 octets, no control characters"
+                ));
+            }
+            if self.joints[..i].iter().any(|k| k.name == j.name) {
+                return Err(format!("{at}: trajectory joint {:?} listed twice", j.name));
+            }
+            let pos = |x: f64| x.is_finite() && x > 0.0;
+            if !(j.min_position.is_finite()
+                && j.max_position.is_finite()
+                && j.min_position < j.max_position
+                && pos(j.max_velocity)
+                && pos(j.max_acceleration)
+                && pos(j.max_effort))
+            {
+                return Err(format!(
+                    "{at}: trajectory joint {:?}: finite bounds, min_position < max_position, \
+                     max_velocity / max_acceleration / max_effort > 0",
+                    j.name
+                ));
+            }
+        }
+        if !(1..=crate::trajectory::HARD_MAX_POINTS).contains(&self.max_points) {
+            return Err(format!("{at}: trajectory.max_points must be in 1..=4096"));
+        }
+        if !(self.max_duration_s.is_finite()
+            && self.max_duration_s > 0.0
+            && self.max_duration_s <= 3600.0)
+        {
+            return Err(format!(
+                "{at}: trajectory.max_duration_s must be in (0, 3600]"
+            ));
+        }
+        if !(self.max_time_scale.is_finite() && (1.0..=100.0).contains(&self.max_time_scale)) {
+            return Err(format!(
+                "{at}: trajectory.max_time_scale must be in [1, 100]"
+            ));
+        }
+        if codec != Codec::Ros2FollowJointTrajectoryGoal
+            && self.request_header != RequestHeader::None
+        {
+            return Err(format!(
+                "{at}: trajectory.request_header is for ros2_follow_joint_trajectory_goal only"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The decoder layout of `codec`.
+    pub fn layout(&self, codec: Codec) -> crate::trajectory::Layout {
+        use crate::trajectory::{GoalHeader, Layout};
+        match (codec, self.request_header) {
+            (Codec::Ros2FollowJointTrajectoryGoal, RequestHeader::Cyclone) => {
+                Layout::Goal(GoalHeader::Cyclone)
+            }
+            (Codec::Ros2FollowJointTrajectoryGoal, RequestHeader::None) => {
+                Layout::Goal(GoalHeader::None)
+            }
+            _ => Layout::Trajectory,
+        }
+    }
 }
 
 /// Default `max_weight_step` (per accepted frame).
@@ -589,6 +764,16 @@ pub struct GatewayConfig {
     /// Housekeeping period (drain events, status, watchdog), ms.
     #[serde(default = "default_housekeeping")]
     pub housekeeping_ms: u64,
+    /// agentd's `gateway_feed` socket: the gateway's findings
+    /// (`robot.gateway.*`) and the firewall's deviations go there as JSON
+    /// lines (`crate::feed`). Default: none (events file only).
+    #[serde(default)]
+    pub findings_socket: Option<PathBuf>,
+    /// The `restrict_motion` restriction file written by the executor's
+    /// gateway adapter (`crate::restrict`), read every housekeeping tick.
+    /// Default: none (no restriction can be applied).
+    #[serde(default)]
+    pub restriction_path: Option<PathBuf>,
 }
 
 fn default_max_queue_delay() -> u64 {
@@ -646,9 +831,15 @@ impl GatewayConfig {
                 return Err(format!("{what} must be an absolute path"));
             }
         }
-        for p in [&self.events_path, &self.status_path, &self.rtps.state_file]
-            .into_iter()
-            .flatten()
+        for p in [
+            &self.events_path,
+            &self.status_path,
+            &self.rtps.state_file,
+            &self.findings_socket,
+            &self.restriction_path,
+        ]
+        .into_iter()
+        .flatten()
         {
             if !p.is_absolute() {
                 return Err(format!("{} must be an absolute path", p.display()));
@@ -900,6 +1091,16 @@ impl GatewayConfig {
             }
             if c.allowed_high_modes.is_some() && c.codec != Codec::Go1HighCmd {
                 return Err(format!("{at}: allowed_high_modes is for go1_high_cmd only"));
+            }
+            match (&c.trajectory, c.codec.is_trajectory()) {
+                (Some(t), true) => t.validate(&at, c.codec)?,
+                (None, false) => {}
+                _ => {
+                    return Err(format!(
+                        "{at}: trajectory is required for the ros2_joint_trajectory / \
+                         ros2_follow_joint_trajectory_goal codecs, and only for them"
+                    ))
+                }
             }
         }
         Ok(())
