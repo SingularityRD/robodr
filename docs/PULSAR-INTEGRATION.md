@@ -324,7 +324,7 @@ the systemd drop-in that lets `robodr-pulsard` reach a `0660` socket are in
   | `robot.ros2.identity_instances_exceeded` | High | a participant matches a profile identity whose every `max_instances` slot is held by a live participant |
   | `robot.rtps.malformed_discovery` | Low | parse anomalies (`report_anomalies`) |
   | `robot.rtps.fragmented_discovery` | Low | `DATA_FRAG` discovery is seen (`report_fragmentation`) |
-  | `robot.rtps.discovery_fragment_rejected` | Medium | fragments are refused by the reassembler (always reported) |
+  | `robot.rtps.discovery_fragment_rejected` | Medium; Critical / High for SEDP publications / subscriptions refused over a cap or capacity | fragments are refused by the reassembler (always reported; names the writer prefix) |
 
   Fragmented SEDP is now reassembled and evaluated. Before, it was missed.
 - **Dedup.**

@@ -192,14 +192,16 @@ fn fragmented_sedp_is_reassembled_and_flagged() {
 
 #[test]
 fn oversized_fragmented_sample_is_rejected_and_reported() {
-    // A sample claiming 200 KiB is over the 64 KiB reassembly cap.
+    // A sample claiming 2 MiB is over the reassembly cap (512 KiB by
+    // default, 1 MiB at most). An SEDP publication a DDS stack may accept
+    // went uninspected: Critical.
     let mut d = header(ROGUE);
     d.extend(data_frag(
         ENTITY_SEDP_PUB_WRITER,
         1,
         1,
         1024,
-        200 * 1024,
+        2 << 20,
         &[0u8; 1024],
     ));
     let frames = vec![frame(ROGUE_IP, ROBOT_IP, 7410, &d)];
@@ -207,7 +209,10 @@ fn oversized_fragmented_sample_is_rejected_and_reported() {
     let f = run(&pcap(&frames), &mut p);
     let r = rules_of(&f);
     assert!(
-        r.contains(&(rules::DISCOVERY_FRAGMENT_REJECTED.into(), Severity::Medium)),
+        r.contains(&(
+            rules::DISCOVERY_FRAGMENT_REJECTED.into(),
+            Severity::Critical
+        )),
         "{r:?}"
     );
     assert_eq!(p.stats().fragments_rejected, 1);
