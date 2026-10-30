@@ -105,6 +105,9 @@ struct RawSubmit {
     requested_by: String,
     source: String,
     authority: String,
+    /// The SOC-side approvers (two-person actions; contract §4).
+    #[serde(default)]
+    approved_by: Option<Vec<String>>,
 }
 
 /// Every parameter any action may carry; anything else refuses the body.
@@ -126,6 +129,26 @@ struct RawRevert {
     #[serde(default)]
     reason: Option<String>,
     requested_by: String,
+    #[serde(default)]
+    approved_by: Option<Vec<String>>,
+}
+
+/// Most approvers a body may name.
+pub const MAX_APPROVERS: usize = 4;
+
+/// `approved_by`: at most [`MAX_APPROVERS`] names, each like
+/// `requested_by` (1..=100 characters, no control characters).
+fn approvers(v: Option<Vec<String>>) -> Result<Vec<String>, ApiError> {
+    let v = v.unwrap_or_default();
+    if v.len() > MAX_APPROVERS {
+        return Err(bad(
+            "invalid_field",
+            format!("approved_by: at most {MAX_APPROVERS} names"),
+        ));
+    }
+    v.iter()
+        .map(|a| text("approved_by", a, MAX_REQUESTED_BY_CHARS, true))
+        .collect()
 }
 
 /// The validated parameters of an action.
@@ -159,6 +182,11 @@ pub struct ActionRequest {
     pub reason: String,
     pub requested_by: String,
     pub source: String,
+    /// The SOC-side approvers the body names (two-person actions). The
+    /// executor checks them itself in the signed body; recorded here as
+    /// evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_by: Vec<String>,
 }
 
 impl ActionRequest {
@@ -175,6 +203,9 @@ impl ActionRequest {
 pub struct RevertRequest {
     pub reason: String,
     pub requested_by: String,
+    /// The SOC-side approvers of the revert (two-person actions).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_by: Vec<String>,
 }
 
 fn name_ok(s: &str, max: usize) -> bool {
@@ -443,6 +474,7 @@ pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
             true,
         )?,
         source,
+        approved_by: approvers(raw.approved_by)?,
     })
 }
 
@@ -463,6 +495,7 @@ pub fn parse_revert(body: &[u8]) -> Result<RevertRequest, ApiError> {
             MAX_REQUESTED_BY_CHARS,
             true,
         )?,
+        approved_by: approvers(raw.approved_by)?,
     })
 }
 
@@ -2720,6 +2753,7 @@ mod tests {
         let rv = RevertRequest {
             reason: "false positive".into(),
             requested_by: "analyst".into(),
+            approved_by: Vec::new(),
         };
         let v = e.handle(
             &Call::Revert(r.request_id.clone(), rv.clone()),
@@ -2754,6 +2788,7 @@ mod tests {
                 RevertRequest {
                     reason: String::new(),
                     requested_by: "a".into(),
+                    approved_by: Vec::new(),
                 },
             ),
             &meta(),
