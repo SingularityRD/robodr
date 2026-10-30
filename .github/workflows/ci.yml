@@ -111,6 +111,7 @@ jobs:
           python3 scripts/ci-pure-excludes.py --self-test
           python3 scripts/check-focal-units.py --self-test
           python3 scripts/check-packages.py --self-test
+          python3 scripts/third_party_notices.py --self-test
           scripts/ci-install-ebpf-toolchain.sh --self-test
       - name: Package variants consistent (programs, workflows, maintainer scripts)
         # Every robodr-* program classified per package variant, every
@@ -169,18 +170,19 @@ jobs:
         run: cargo clippy --workspace $PURE_EXCLUDES $CARGO_LOCKED --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace $PURE_EXCLUDES $CARGO_LOCKED
-      - name: install-bundle.sh against a real dpkg (root; Sprint 9 update/rollback test)
+      - name: install-bundle.sh against a real dpkg and rpm (root; update/rollback tests)
         # The test binary is built as the runner user and run as root, so no
         # root-owned files land in target/ (the cache).
         # minisign: the signed-install tests (signature, private extraction,
-        # a tampered extracted directory refused).
+        # a tampered extracted directory refused). rpm (rpm, rpmbuild,
+        # rpm2archive): the RPM bundle tests, in a separate rpm root.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign
+          sudo apt-get install -y --no-install-recommends minisign rpm
           bin=$(cargo test -p robodr-fleet --test packaging $CARGO_LOCKED --no-run 2>&1 |
             sed -n 's/.*Executable tests\/packaging.rs (\(.*\))$/\1/p')
           test -x "$bin"
-          sudo env ROBODR_REQUIRE_DPKG_TEST=1 "$bin"
+          sudo env ROBODR_REQUIRE_DPKG_TEST=1 ROBODR_REQUIRE_RPM_TEST=1 "$bin"
       - name: Build did not modify tracked files
         run: |
           git status --porcelain
@@ -282,6 +284,15 @@ jobs:
         # --locked: cargo-deny's internal `cargo metadata` must audit the
         # committed resolution, not silently re-resolve a stale lock.
         run: cargo deny --locked check advisories bans licenses sources
+      - name: Third-party notices and eBPF source offer up to date
+        # THIRD_PARTY_NOTICES and GPL-2.0-SOURCE-OFFER are committed and
+        # shipped as they are (build-deb.sh, build-rpm.sh, make-bundle.sh);
+        # regenerated here from Cargo.lock (offline, after the fetch) and the
+        # Pulsar submodule, with every crate's licence checked against
+        # deny.toml. On failure: python3 scripts/third_party_notices.py, commit.
+        run: |
+          cargo fetch --locked
+          python3 scripts/third_party_notices.py --check
       - name: Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
 

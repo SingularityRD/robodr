@@ -20,6 +20,9 @@
 # libssl.so.3 / libcrypto.so.3 with their symbol versions): the RPM
 # counterpart of build-deb.sh's soname table and dpkg-shlibdeps.
 #
+# Packager: RPM_PACKAGER, else DEB_MAINTAINER, else a development
+# placeholder (robodr-maintainers@invalid); with ROBODR_RELEASE=1 (release.yml)
+# a placeholder or malformed value fails the build (exit 2).
 # Binaries: as build-deb.sh (same required and optional set; ROBODR_DEB_REQUIRE
 # applies here too, so a release RPM cannot silently lack a daemon).
 # Versions: upstream VERSION with "-" -> "~" (pre-releases sort first, as in
@@ -66,6 +69,15 @@ if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
     SOURCE_DATE_EPOCH="$(git -C "$root" log -1 --format=%ct 2>/dev/null || echo 0)"
 fi
 export SOURCE_DATE_EPOCH
+
+# Packager: RPM_PACKAGER, else DEB_MAINTAINER (one maintainer for both
+# formats), else the development placeholder; a release (ROBODR_RELEASE=1)
+# refuses the placeholder (packaging/release-maintainer.sh).
+packager="${RPM_PACKAGER:-${DEB_MAINTAINER:-RoboDR maintainers <robodr-maintainers@invalid>}}"
+# shellcheck source=packaging/release-maintainer.sh
+. "$here/release-maintainer.sh"
+check_release_maintainer "$packager" "RPM_PACKAGER (or DEB_MAINTAINER)" build-rpm
+case "$packager" in *%*) echo "build-rpm: the packager contains '%' (rpm macro expansion)" >&2; exit 2 ;; esac
 
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
@@ -116,7 +128,8 @@ while IFS= read -r p; do
         esac
     elif [[ "$conffiles" == *" $path "* ]]; then
         echo "%config(noreplace) %attr($mode,root,root) $path" >>"$files"
-    elif [[ "$path" == /usr/share/doc/robodr/copyright || "$path" == /usr/share/doc/robodr/licenses/* ]]; then
+    elif [[ "$path" == /usr/share/doc/robodr/copyright || "$path" == /usr/share/doc/robodr/licenses/* ||
+        "$path" == /usr/share/doc/robodr/THIRD_PARTY_NOTICES || "$path" == /usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER ]]; then
         # %license, not %doc: installed even with tsflags=nodocs.
         echo "%license %attr($mode,root,root) $path" >>"$files"
     elif [[ -L "$payload$path" ]]; then
@@ -130,14 +143,15 @@ synopsis="RoboDR - Robot Detection & Response (protective only)"
 spec="$work/top/SPECS/robodr.spec"
 awk -v payload="$payload" -v version="$rpm_version" -v release="$rpm_release" \
     -v synopsis="$synopsis" -v post="$here/rpm/post" -v preun="$here/rpm/preun" \
-    -v postun="$here/rpm/postun" -v files="$files" '
+    -v postun="$here/rpm/postun" -v files="$files" -v packager="$packager" '
     function slurp(f,   line) { while ((getline line < f) > 0) { if (line !~ /^#!/) print line } close(f) }
     /^@POST@$/ { slurp(post); next }
     /^@PREUN@$/ { slurp(preun); next }
     /^@POSTUN@$/ { slurp(postun); next }
     /^@FILES@$/ { while ((getline line < files) > 0) print line; close(files); next }
     { gsub(/@PAYLOAD@/, payload); gsub(/@VERSION@/, version); gsub(/@RELEASE@/, release)
-      s = synopsis; gsub(/&/, "\\\\&", s); gsub(/@SYNOPSIS@/, s); print }
+      s = synopsis; gsub(/&/, "\\\\&", s); gsub(/@SYNOPSIS@/, s)
+      k = packager; gsub(/&/, "\\\\&", k); gsub(/@PACKAGER@/, k); print }
 ' "$here/rpm/robodr.spec.in" >"$spec"
 
 rpmbuild -bb --target "$rpm_arch" \

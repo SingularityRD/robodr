@@ -134,6 +134,11 @@ FOCAL_ONLY = [
     "/usr/lib/robodr/robodr-load-credential",
 ]
 ALLOWED_ROOTS = ("/usr/", "/etc/robodr")
+# Every variant ships the third-party notices and the eBPF source offer.
+NOTICE_FILES = (
+    "/usr/share/doc/robodr/THIRD_PARTY_NOTICES",
+    "/usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER",
+)
 SECRET_MARKERS = (
     re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(rb"minisign encrypted secret key"),
@@ -427,7 +432,12 @@ def rpm_fileflags(path: Path) -> dict[str, str]:
     return flags
 
 
-LICENSE_FILES = ("/usr/share/doc/robodr/copyright", "/usr/share/doc/robodr/licenses/*")
+LICENSE_FILES = (
+    "/usr/share/doc/robodr/copyright",
+    "/usr/share/doc/robodr/licenses/*",
+    "/usr/share/doc/robodr/THIRD_PARTY_NOTICES",
+    "/usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER",
+)
 
 
 def check_rpm_flags(label: str, flags: dict[str, str], conffiles: set[str] | None) -> list[str]:
@@ -516,6 +526,9 @@ def check_package(label: str, variant: str, entries: dict[str, Entry], contents:
             has_unit = f"/usr/lib/systemd/system/{u}" in entries
             if has_unit != (prog in progs):
                 errs.append(f"{label}: {u} {'without' if has_unit else 'missing for'} {prog}")
+    for p in NOTICE_FILES:
+        if p not in entries:
+            errs.append(f"{label}: lacks {p} (scripts/third_party_notices.py)")
     for prog in sorted(progs):
         for page in sorted((root / "man").glob(f"{prog}.[1-8]")):
             sec = page.suffix[1:]
@@ -656,7 +669,11 @@ def self_test() -> int:
     for page in (ROOT / "man").glob("robodr-*.[1-8]"):
         if page.stem in base or any(k.endswith("/" + page.stem) for k in base):
             base[f"/usr/share/man/man{page.suffix[1:]}/{page.name}.gz"] = ent()
+    for n in NOTICE_FILES:
+        base[n] = ent()
     expect("clean package", check_package("t", STD, base, {}, ROOT), True)
+    no_notices = {k: v for k, v in base.items() if not k.endswith("/THIRD_PARTY_NOTICES")}
+    expect("notices missing", check_package("t", STD, no_notices, {}, ROOT), False)
     expect("setuid", check_package("t", STD, {**base, "/usr/bin/robodr-replay": ent(mode=0o4755)}, {}, ROOT), False)
     expect("not root", check_package("t", STD, {**base, "/usr/share/x": ent(owner="robodr")}, {}, ROOT), False)
     expect("state in payload", check_package("t", STD, {**base, "/var/lib/robodr/x": ent()}, {}, ROOT), False)
@@ -683,13 +700,14 @@ def self_test() -> int:
            "/usr/share/doc/robodr/README.md": "d", "/etc/robodr/pulsar.toml": "cn"}
     expect("rpm flags ok", check_rpm_flags("r", lic, {"/etc/robodr/pulsar.toml"}), True)
     expect("licence as %doc", check_rpm_flags("r", {**lic, "/usr/share/doc/robodr/copyright": "d"}, None), False)
+    expect("notices as %doc", check_rpm_flags("r", {**lic, "/usr/share/doc/robodr/THIRD_PARTY_NOTICES": "d"}, None), False)
     expect("config without noreplace", check_rpm_flags("r", {**lic, "/etc/robodr/pulsar.toml": "c"}, None), False)
     expect("conffile not %config", check_rpm_flags("r", {**lic, "/etc/robodr/pulsar.toml": ""}, {"/etc/robodr/pulsar.toml"}), False)
     hidden, _ = read_tar(_tar_with("./.hidden") )
     root_only, _ = read_tar(_tar_with("."))
     expect("archive root skipped", [] if not root_only else [str(root_only)], True)
     expect("hidden name keeps its dot", [] if "/.hidden" in hidden else [str(hidden)], True)
-    total = 33
+    total = 35
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

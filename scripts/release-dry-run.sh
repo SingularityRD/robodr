@@ -296,7 +296,10 @@ for j in $jobs; do
             --subst "cargo install =>env -u CARGO_BUILD_TARGET cargo install "
         )
     fi
-    secrets=()
+    # The build jobs run with ROBODR_RELEASE=1, which refuses a placeholder
+    # maintainer; the dry run's own (reserved .test domain) stands in for
+    # the repository variable ROBODR_MAINTAINER.
+    secrets=("DRYRUN_VAR_ROBODR_MAINTAINER=RoboDR release dry run <dry-run@robodr.test>")
     if [[ "$job" == publish ]]; then
         secrets=(
             "DRYRUN_SECRET_MINISIGN_SECRET_KEY=$(cat "$keydir/TEST-ONLY.key")"
