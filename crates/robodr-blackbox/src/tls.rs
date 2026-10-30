@@ -170,6 +170,13 @@ pub fn spki_sha256(cert: &CertificateDer<'_>) -> Result<[u8; 32], String> {
 /// Read a PEM file (module docs, "Files"); `secret`: a private key.
 pub fn read_pem(what: &str, path: &Path, secret: bool) -> Result<Vec<u8>, String> {
     let shown = path.display();
+    // Checked before opening too, so a FIFO or device never blocks the open.
+    if !std::fs::metadata(path)
+        .map_err(|e| format!("{what} {shown}: {e}"))?
+        .is_file()
+    {
+        return Err(format!("{what} {shown}: not a regular file"));
+    }
     let f = std::fs::File::open(path).map_err(|e| format!("{what} {shown}: {e}"))?;
     let meta = f.metadata().map_err(|e| format!("{what} {shown}: {e}"))?;
     if !meta.is_file() {

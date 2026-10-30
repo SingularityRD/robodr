@@ -431,4 +431,20 @@ fn file_checks() {
         ..Default::default()
     })
     .is_err());
+    // A FIFO where a file belongs is refused without blocking on open.
+    let fifo = pki.p("fifo.pem");
+    if std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let t = std::time::Instant::now();
+        let e = tls::load_client(&ClientTlsFiles {
+            ca_file: fifo,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
 }

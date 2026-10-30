@@ -608,7 +608,10 @@ impl Conn {
                     stream,
                     tls,
                     name,
-                    Instant::now() + cfg.request_timeout.min(cfg.connect_timeout * 2),
+                    Instant::now()
+                        + cfg
+                            .request_timeout
+                            .min(cfg.connect_timeout.saturating_mul(2)),
                 )
                 .map_err(|e| {
                     NetError::Io(io::Error::new(
