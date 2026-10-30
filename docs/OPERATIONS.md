@@ -3478,7 +3478,7 @@ journal and findings.
 | `robot.deliver.refused` (`unauthentic_key`) | a wrap in the deployment is not this unit's (another unit's, tampered) | check the depot's re-wrapping |
 | `robot.seal.erased`, `robot.seal.tamper` | crypto-erase ran (trigger, what was destroyed and the volume's state in the detail) | investigate the trigger; if the volume is "STILL OPEN", power the unit off |
 | `robot.seal.lease_expired` | a sealed item waits for a site lease (none yet, or the TPM's clock or reboot budget passed it) | bring the unit back into LAN reach of the depot, or give it a media pack with a fresh lease (§13.5) |
-| `robot.seal.erase_deferred` | an erase trigger fired while the robot moved (or its state was unknown); the erase runs as soon as it is idle, safe-state or e-stopped | treat as tamper in progress; bring the robot to a safe state |
+| `robot.seal.erase_deferred` | an erase trigger fired while the robot moved (or its state was unknown): the keys are already destroyed; stopping services and closing the runtime volume runs as soon as it is idle, safe-state or e-stopped (High once it waited past `erase.max_lockdown_deferral_s`) | treat as tamper in progress; bring the robot to a safe state |
 
 ### 12.8 Executed crypto-erase from platform inputs (Sprint 14b)
 

@@ -163,6 +163,17 @@ deviation that is not `observe_only` and `record`-only
 (`Violation::ObserveOnlyDeviationActed`). Prefer the latter when the deviation
 is at hand.
 
+## Crypto-erase (`erase`)
+
+`plan_erase` (outside the SOC catalog, `docs/SECURE-DELIVERY.md` §7.6):
+the **keys** are destroyed in every safety state, `unknown` included
+(no actuator is touched); the **lockdown** of the runtime volume (stop
+services, unmount, close) runs only in `idle`, `safe_state_active` or
+`estop_active` and is otherwise deferred (`DestroyKeysDeferLockdown`),
+escalating once it waited past `DEFAULT_MAX_LOCKDOWN_DEFERRAL_S`
+(`lockdown_overdue`). A signed command or an operator's erase needs two
+distinct approvers first.
+
 ## Escalation, hysteresis, rate limiting (`Responder`)
 
 - **Escalation:** `threshold` deviations from the same source within `window_ms`

@@ -272,6 +272,9 @@ fn erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed() {
     u.anchor(&site);
     let sock = u.dir.join("erase.sock");
     u.cfg_json["erase"] = serde_json::json!({"trigger_socket": sock, "feeder_uids": [4242]});
+    // A runtime volume mapping to lock down at erase (absent here: closing
+    // and suspending it fail and are noted; the deferral is what counts).
+    u.cfg_json["seal"]["mapper_name"] = "robodr-sealed-x14b".into();
     let cfg = u.cfg();
     let trig = robodr_deliverd::erasex::TriggerSocket::bind(cfg.erase.as_ref().unwrap()).unwrap();
     let mut e = u.open();
@@ -325,7 +328,9 @@ fn erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed() {
     std::fs::remove_file(&fake).unwrap();
     assert!(e.state().erase_pending.is_none());
     u.seal().probe().unwrap();
-    // The tamper input while moving fast: planned, deferred.
+    // The tamper input while moving fast: the keys are destroyed at once
+    // (no actuator involved); the lockdown of the runtime volume is
+    // deferred.
     u.safety("moving_fast");
     send(&sock, EraseTrigger::Tamper).unwrap();
     let evs = trig.poll();
@@ -333,15 +338,15 @@ fn erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed() {
         panic!("{evs:?}")
     };
     let r = e.erase_trigger(*trigger, 0).unwrap();
-    assert!(r.starts_with("deferred"), "{r}");
-    u.seal().probe().unwrap();
-    // Still deferred after a restart of the agent.
+    assert!(r.starts_with("keys destroyed"), "{r}");
+    let err = u.seal().probe().unwrap_err();
+    assert_eq!(err.kind, robodr_seal::ErrorKind::Erased);
+    // The lockdown is still pending after a restart of the agent; idle
+    // finishes it.
     drop(e);
     let mut e = u.open();
     u.run(&mut e, 2);
     assert!(e.state().erase_pending.is_some());
-    u.seal().probe().unwrap();
-    // Idle: the erase runs.
     u.safety("idle");
     u.run(&mut e, 2);
     assert!(e.state().erase_pending.is_none());
@@ -355,8 +360,8 @@ fn erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed() {
             .position(|x| x == r)
             .unwrap_or_else(|| panic!("{r}: {rules:?}"))
     };
-    assert!(pos("robot.seal.tamper") < pos("robot.seal.erase_deferred"));
-    assert!(pos("robot.seal.erase_deferred") < pos("robot.seal.erased"));
+    assert!(pos("robot.seal.tamper") < pos("robot.seal.erased"));
+    assert!(pos("robot.seal.erased") < pos("robot.seal.erase_deferred"));
     assert_eq!(
         rules.iter().filter(|r| *r == "robot.seal.erased").count(),
         1

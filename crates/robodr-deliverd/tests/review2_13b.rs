@@ -396,6 +396,7 @@ fn la_reanchor_refuses_a_trust_file_older_than_the_journal_saw() {
     std::fs::remove_file(hw_path(&u)).unwrap();
     std::fs::remove_file(u.cfg.anchor_path()).unwrap();
     std::fs::remove_file(robodr_release::ops::sig_path(&u.cfg.anchor_path())).unwrap();
+    std::fs::remove_file(robodr_release::ops::anchor_chain_path(&u.cfg.anchor_path())).unwrap();
     let mut e = u.open();
     assert!(e.state().locked.is_some());
     let r = e.reanchor(&u.trust_path);
@@ -418,6 +419,7 @@ fn lb_reanchor_takes_the_black_box_key_file() {
     let u = Unit::new("lb-key");
     std::fs::remove_file(u.cfg.anchor_path()).unwrap();
     std::fs::remove_file(robodr_release::ops::sig_path(&u.cfg.anchor_path())).unwrap();
+    std::fs::remove_file(robodr_release::ops::anchor_chain_path(&u.cfg.anchor_path())).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

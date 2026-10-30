@@ -618,3 +618,176 @@ fn a_tpm_unit_installs_refuses_after_a_pcr_change_and_erases() {
     drop(sw);
     assert!(u.black_box_verifies());
 }
+
+// ------------------------------------------- erase in every safety state --
+
+/// Records every `cryptsetup` / `systemctl` / `umount` call, all succeed.
+#[derive(Debug, Clone, Default)]
+struct Script(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl robodr_seal::cmd::Runner for Script {
+    fn run(
+        &self,
+        program: &Path,
+        args: &[String],
+        _env: &[(&str, &str)],
+        _stdin: Option<&[u8]>,
+        _timeout: std::time::Duration,
+    ) -> Result<robodr_seal::cmd::Output, robodr_seal::SealError> {
+        let name = program.file_name().unwrap().to_string_lossy().into_owned();
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{name} {}", args.join(" ")));
+        Ok(robodr_seal::cmd::Output {
+            status: Some(0),
+            stdout: Default::default(),
+            stderr: Default::default(),
+        })
+    }
+}
+
+impl Script {
+    fn calls(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Review finding (HIGH): `unknown` and every moving state deferred the
+/// whole erase without limit, and the agent went on importing, storing
+/// wraps, unwrapping and writing plaintext under the keys slated for
+/// destruction; an attacker who unplugs or spoofs the safety feed keeps
+/// them alive. The keys are now destroyed at once in every state; only the
+/// lockdown (stop services, close the volume) waits, escalates past its
+/// cap, and nothing is imported or unwrapped meanwhile.
+#[test]
+fn erase_destroys_keys_in_unknown_state_and_blocks_imports_until_lockdown() {
+    let u = Unit::with("sealed-erase-unknown", |v| {
+        let d = PathBuf::from(v["state_dir"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut s = seal_cfg(&d, None);
+        s["mapper_name"] = "robodr-sealed".into();
+        s["stop_units"] = serde_json::json!(["robodr-app.service"]);
+        v["seal"] = s;
+        v["erase"] = serde_json::json!({"trigger_socket": d.join("erase.sock"),
+                                         "max_lockdown_deferral_s": 0});
+    });
+    let su = SealUnit::enroll_fallback(
+        &u.dir().join("seal"),
+        UNIT,
+        "ugv-x1",
+        &u.dir().join("runtime/.robodr-seal/uwk.key"),
+        robodr_seal::unit::KeyLocation::Unchecked,
+    )
+    .unwrap();
+    let depot = X25519Secret::generate().unwrap();
+    let r1 = sealed_rpk(&u, "nav-model", 1, &depot, true);
+    let b1 = u.bundle(1, None, std::slice::from_ref(&r1));
+    sealed_pack(
+        &u,
+        "p1",
+        1,
+        std::slice::from_ref(&r1),
+        std::slice::from_ref(&b1),
+        vec![wrapped_for(&depot, &r1, su.record())],
+    );
+    let mut e = u.open();
+    let script = Script::default();
+    e.set_luks(robodr_seal::luks::Luks::new(
+        "/usr/sbin".into(),
+        "/usr/bin".into(),
+        std::time::Duration::from_secs(1),
+        Box::new(script.clone()),
+    ));
+    u.run(&mut e, 10);
+    let runtime = u.dir().join("runtime");
+    assert_eq!(
+        u.current(&runtime.join("model"), "nav-model").as_deref(),
+        Some("1")
+    );
+    let uwk = u.dir().join("runtime/.robodr-seal/uwk.key");
+    assert!(uwk.exists());
+    // The safety feed is gone (unknown): the tamper input destroys the
+    // keys at once; nothing is stopped or closed yet.
+    std::fs::remove_file(&u.cfg.safety.agentd_status).unwrap();
+    let r = e
+        .erase_trigger(robodr_responder::erase::EraseTrigger::Tamper, 0)
+        .unwrap();
+    assert!(r.starts_with("keys destroyed"), "{r}");
+    assert!(!uwk.exists(), "the UWK survived an erase in state unknown");
+    let calls = script.calls();
+    assert!(
+        calls.iter().any(|c| c.starts_with("cryptsetup erase")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("systemctl") || c.starts_with("cryptsetup close")),
+        "lockdown ran in state unknown: {calls:?}"
+    );
+    assert!(e
+        .state()
+        .erase_pending
+        .as_ref()
+        .unwrap()
+        .keys_destroyed
+        .is_some());
+    // While the lockdown is pending: nothing is imported, stored or
+    // unwrapped (a new sealed release with its wrap waits).
+    let r2 = sealed_rpk(&u, "nav-model", 2, &depot, true);
+    let b2 = u.bundle(2, Some(bundle_hash(&b1)), std::slice::from_ref(&r2));
+    sealed_pack(
+        &u,
+        "p2",
+        2,
+        std::slice::from_ref(&r2),
+        &[b2],
+        vec![wrapped_for(&depot, &r2, su.record())],
+    );
+    for _ in 0..3 {
+        let rep = e.tick().unwrap();
+        assert!(rep.imported.is_empty(), "{rep:?}");
+    }
+    assert_eq!(e.state().deployment.as_ref().unwrap().seq, 1);
+    assert_eq!(u.notes_of("robodr.deliver.staged").len(), 1);
+    // Past its cap (0 s here) the deferred lockdown escalated, once.
+    let deferred: Vec<String> = u
+        .findings()
+        .into_iter()
+        .filter(|f| f.0 == "robot.seal.erase_deferred")
+        .map(|f| f.1)
+        .collect();
+    assert!(deferred.contains(&"medium".to_string()), "{deferred:?}");
+    assert_eq!(
+        deferred.iter().filter(|s| *s == "high").count(),
+        1,
+        "{deferred:?}"
+    );
+    assert_eq!(
+        u.findings()
+            .iter()
+            .filter(|f| f.0 == "robot.seal.erased")
+            .count(),
+        1
+    );
+    // Idle: the lockdown runs and the erase is done.
+    u.safety("idle");
+    u.run(&mut e, 3);
+    assert!(e.state().erase_pending.is_none());
+    let calls = script.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == "systemctl stop -- robodr-app.service"),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("cryptsetup close")),
+        "{calls:?}"
+    );
+    assert_eq!(u.notes_of("robodr.seal.erase_lockdown").len(), 1);
+    assert!(u.black_box_verifies());
+}

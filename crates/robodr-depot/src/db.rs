@@ -125,6 +125,11 @@ pub struct Unit {
     pub enrolled_at: Option<u64>,
     pub cert_serial: Option<u64>,
     pub last_report: Option<LastReport>,
+    /// The TPM time `(reset count, clock)` of the enrolment quote: a
+    /// report must be later (no replay of reports signed before this
+    /// enrolment; `last_report` starts empty at every enrolment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_floor: Option<(u32, u64)>,
     pub erased: bool,
     pub lease_seq: u64,
 }

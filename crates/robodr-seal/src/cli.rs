@@ -604,6 +604,7 @@ fn erase(args: Vec<String>) -> Result<(), Cmd> {
         mapper: opt(&a, "mapper")?,
         mount: mount.as_deref(),
         stop_units: &units,
+        defer_lockdown: false,
     };
     let r = u.erase(req(&a, "trigger")?, &luks, &target)?;
     print(serde_json::to_value(&r).unwrap_or_default());

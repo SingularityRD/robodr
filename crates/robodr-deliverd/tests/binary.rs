@@ -53,6 +53,7 @@ fn enrol_check_run_once_and_status() {
     // A unit configuration file, without the anchor Unit::new created.
     std::fs::remove_file(u.cfg.anchor_path()).unwrap();
     std::fs::remove_file(robodr_release::ops::sig_path(&u.cfg.anchor_path())).unwrap();
+    std::fs::remove_file(robodr_release::ops::anchor_chain_path(&u.cfg.anchor_path())).unwrap();
     let cfgp = u.dir().join("deliverd.json");
     std::fs::write(&cfgp, serde_json::to_vec_pretty(&u.cfg).unwrap()).unwrap();
     let c = cfgp.to_str().unwrap();

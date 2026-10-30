@@ -961,10 +961,16 @@ safety-state grading as every other action; and a real `Executor` in
 every `SafetyState`.
 
 **14b implementation.** `robodr-responder` gained the `crypto_erase` plan
-(`src/erase.rs`, outside the SOC action catalog): `idle`,
-`safe_state_active` and `estop_active` execute; `moving_slow`,
-`moving_fast`, `collaborative_human_nearby` and `unknown` defer; a signed
-command or an operator's erase needs two distinct approvers. The executor
+(`src/erase.rs`, outside the SOC action catalog), in two parts (review
+of 2026-10-30, see below): the **keys** (epoch increment, UWK blobs and
+volume wrap deleted; without a TPM the keyslot wipe) are destroyed at
+once in **every** safety state, `unknown` included, since that part
+touches no actuator; the **lockdown** (stop `seal.stop_units`, unmount,
+close the mapping) runs in `idle`, `safe_state_active` and
+`estop_active` and is deferred in `moving_slow`, `moving_fast`,
+`collaborative_human_nearby` and `unknown`, escalating once (High) past
+`erase.max_lockdown_deferral_s` (default 600 s); a signed command or an
+operator's erase needs two distinct approvers. The executor
 is `robodr-deliverd` on the unit, under the rules of
 `robodr-agent/src/executor.rs` (re-derive the plan, nothing for a replay,
 the live safety state read again immediately before acting, the intent
@@ -973,7 +979,8 @@ attestation-failure and authentication-failure inputs reach it through
 its trigger socket, accepted only from root or configured feeders
 (`SO_PEERCRED`); a deferred erase stays pending in the state file across
 restarts (`robot.seal.erase_deferred`, Medium, once per state) and runs as
-soon as the state allows. Not routed yet: the lease-expiry trigger (the
+soon as the state allows. While any part of an erase is pending the agent
+imports, stores wraps, unwraps and installs nothing. Not routed yet: the lease-expiry trigger (the
 TPM already refuses every unseal) and a signed remote command (§11 item 7).
 
 ### 7.7 Units without a TPM (software fallback)
@@ -1734,7 +1741,7 @@ tests against software TPMs, offline.** Decisions:
 | Exit criterion | Demonstrated by | Against |
 |---|---|---|
 | Lease expiry blocks unseal after reboot | `robodr-depot/tests/exit_14b.rs` `lease_expiry_blocks_unseal_after_reboot`: a site with leases refuses a UWK enrolled without the lease key; with no lease the sealed model waits (`robot.seal.lease_expired`), the report's answer brings one and it installs; the TPM clock moved past the lease and a reboot: the unit's probe fails with `lease_expired`, and the TPM itself refuses; a renewed lease (LAN, then by media with an unchanged deployment) opens it again. `robodr-seal/tests/lease_14b.rs`: the TPM refuses after the clock or the reboot budget passed, a lease for another unit or by another key, an older lease (replay), a lengthened lease (signature) and setting the clock back | swtpm (`tpm2_setclock`, `Shutdown(CLEAR)` + restart) |
-| Erase from a simulated tamper input: `Idle` executes, `MovingFast` defers | `erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed`: the tamper line on the trigger socket while agentd's live safety state is `moving_fast`: planned, deferred (`robot.seal.erase_deferred`), still pending after a restart of the agent; `idle`: executed (epoch incremented, `robot.seal.tamper`, `robot.seal.erased`), nothing unseals. Spoofing does nothing: a process of another uid on the socket, a person's trigger (`operator`) on the platform socket, a `robot.seal.tamper` record dropped into the spool | swtpm, a real agentd status socket |
+| Erase from a simulated tamper input: `Idle` executes, `MovingFast` defers | `erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed`: the tamper line on the trigger socket while agentd's live safety state is `moving_fast`: the keys are destroyed at once (epoch incremented, `robot.seal.tamper`, `robot.seal.erased`, nothing unseals), the runtime volume's lockdown is deferred (`robot.seal.erase_deferred`) across a restart of the agent; `idle`: the lockdown runs (review of 2026-10-30: before it, the whole erase was deferred). Spoofing does nothing: a process of another uid on the socket, a person's trigger (`operator`) on the platform socket, a `robot.seal.tamper` record dropped into the spool | swtpm, a real agentd status socket |
 | The SOC sees the full chain of findings | the same tests export the unit's and the depot's spools with `robodr-spool-export`'s exporter into diode batches, carry and import them with `robodr-diode`, and find `robot.seal.lease_expired`, `robot.deliver.installed`, `robot.seal.erase_deferred`, `robot.seal.tamper`, `robot.seal.erased`, `robot.depot.enrolment_refused` and `robot.depot.unit_enrolled` on the far side, validated against contract 2.3 | in-process exporter / diode |
 | Floors moved to TPM NV counters | `floors_in_a_tpm_nv_counter_survive_disk_rollback_and_counter_recreation`: a 13b unit (no anchor) migrates to the counter on its next start; a restored disk image (state, black box and record together), a deleted state and black box, and a recreated counter all lock the agent; `adversarial_14a.rs` `a_rolled_back_depot_database_locks_the_depot`: a restored or deleted depot database and a recreated counter lock the depot | swtpm |
 
@@ -1778,6 +1785,46 @@ that failed before it:
   bounds the whole exchange by one deadline, `depot.deadline_s` plus one
   second per MiB of pack body, and the depot caps connections per source
   address and cuts an unfinished TLS handshake after 10 s.)
+
+**Review of the delivery chain (2026-10-30)**, after the self-review;
+each fix with a regression test that failed before it:
+
+* High: `plan_erase` deferred the **whole** erase in `unknown` and every
+  moving state, without limit, and the agent went on importing, storing
+  wraps, unwrapping and writing plaintext under the keys slated for
+  destruction; whoever can keep the safety feed `unknown` (unplug,
+  spoof) or the robot moving kept the keys alive. Key destruction now
+  runs at once in every state; only the lockdown waits, escalates past
+  its cap, and nothing is imported, stored, unwrapped or installed until
+  the erase is complete (`robodr-responder` `keys_are_destroyed_in_every_safety_state`;
+  `robodr-deliverd/tests/sealed.rs`
+  `erase_destroys_keys_in_unknown_state_and_blocks_imports_until_lockdown`).
+* Medium: a missing or unverifiable trust anchor left the unit with no
+  anchor and silently skipped the site's revocations, floors and trust
+  expiry at install; and a **root-set rotation** made the committed
+  anchor stop verifying under the configured pins (exact match), which
+  produced exactly that state; `commit_anchor` wrote document and
+  signature with two renames. A missing or invalid anchor now locks
+  imports and installs (High finding); the anchor keeps its accepted
+  rotations in one record (`ANCHOR.chain`, `robodr-trust-anchor/1`)
+  committed by a single rename, so the pins advance with an accepted
+  rotation and a crash cannot tear it (`robodr-release/tests/anchor_rotation.rs`,
+  `robodr-deliverd/tests/review_14b.rs`).
+* Medium: the depot skipped the AK's time attestation for a report saying
+  `erased` and took the report's **claimed** TPM time as the unit's
+  high-water mark, so root on a unit could sign `erased` with a huge
+  clock: the unit dropped out of stages, packs and mTLS and every later
+  genuine report was a "replay", also after re-enrolment (which carried
+  `last_report` over). Every attested unit's report now needs the
+  attestation, the mark is the **attested** time, and a new enrolment
+  starts a new history above its enrolment quote's TPM time
+  (`report_floor`), so reports signed before it are not replayed
+  (`depot.rs` tests). The `erased` claim itself is still the unit's
+  signed statement (no NV certify of the epoch yet).
+* Low: `check_ak` was a superset check (`adminWithPolicy` and other bits
+  passed, the authPolicy was ignored); the AK is now held to its exact
+  template with an empty authPolicy, like the UWK and UIK
+  (`attest.rs` `the_ak_must_be_exactly_the_ak_template`).
 
 Fuzzing: `pkg_entry` (entry reports, pack listings, request and response
 heads) and `seal_attest` (TPM public areas, attestations, enrolment
