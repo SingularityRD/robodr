@@ -183,6 +183,7 @@ fn decoders_and_reassembler_never_panic() {
                 offset: rng.below(70_000) & !7,
                 more: rng.below(2) == 0,
                 data: &data,
+                header_len: 20,
             };
             let _ = reasm.push(ts, &frag);
             // max_datagrams applies per IP version.
