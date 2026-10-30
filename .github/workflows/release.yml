@@ -54,12 +54,30 @@
 # full commit SHA (resolved with `git ls-remote --tags`) before adding it;
 # do not use a tag ref.
 #
-# Reproducibility: the pure binaries are built twice from different paths
-# (scripts/ci-repro.sh) in the same userland as the release build (Ubuntu
-# 22.04 container, Rocky Linux 9 container, or the runner for musl) and the
-# released bytes must equal those hashes.
-# robodr-pulsard (Pulsar-bound: clang-built eBPF objects) is built with the
-# same flags but its bit-for-bit reproducibility is NOT yet verified.
+# Reproducibility, two layers:
+#  1. In each build job the pure binaries are built twice from different
+#     paths (scripts/ci-repro.sh) and the released bytes must equal those
+#     hashes (same job, same toolchain installation: catches path and
+#     ordering leaks only).
+#  2. Independent rebuild (jobs rebuild-deb, rebuild-rpm, rebuild-static):
+#     a separate job on another runner (ubuntu-22.04 hosts for the .deb /
+#     .rpm containers, whose builds run on ubuntu-24.04; a fresh
+#     ubuntu-24.04 VM for robodr-focal, whose pinned clang is noble's), the
+#     Rust toolchain installed WITHOUT rustup from hash-pinned artifacts
+#     (scripts/ci-install-pinned-toolchain.sh: the channel manifest is pinned
+#     by SHA-256, every component checked against it), a fresh CARGO_HOME,
+#     rebuilds every program, robodr-pulsard included, and every package and
+#     offline bundle (scripts/ci-rebuild.sh). `publish` compares binaries
+#     and packages with the release (scripts/compare-rebuild.py) and signs
+#     nothing unless they are identical (bundles: except their SBOM, the
+#     cargo-cyclonedx output). robodr-pulsard (Pulsar-bound: clang-built
+#     eBPF objects) is not claimed to be bit-for-bit reproducible: the
+#     rebuilt packages carry the release's robodr-pulsard so every other
+#     byte is compared, and whether the rebuilt robodr-pulsard matched is
+#     recorded in REPRODUCIBILITY-<version>.txt, a signed release asset that
+#     is also appended to the release notes.
+# The tagged commit must be on main (git merge-base --is-ancestor), checked
+# in `prepare` and again in `publish` before anything is signed.
 name: Release
 
 on:
@@ -94,6 +112,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Every branch: the tagged commit must be on main.
+          fetch-depth: 0
+      - name: The tagged commit is on main
+        run: |
+          commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null ||
+            { echo "::error::origin/main not fetched"; exit 1; }
+          if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME points at $commit, which is not on main: only reviewed, merged commits are released"
+            exit 1
+          fi
       - name: Tag, VERSION, CHANGELOG and Cargo.lock agree
         id: meta
         run: |
@@ -454,9 +483,181 @@ jobs:
           scripts/pkg-smoke-matrix.sh "$RUNNER_TEMP/pkgs"
 
   # ---------------------------------------------------------------------------
+  # Independent rebuilds (see "Reproducibility" above). Each rebuilds one
+  # build job's output on another runner with the toolchain from hash-pinned
+  # artifacts (no rustup, fresh CARGO_HOME); `publish` compares.
+  rebuild-deb:
+    name: Independent rebuild, robodr .deb (${{ matrix.arch }})
+    needs: [prepare, build]
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: docker.io/library/ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: git for actions/checkout (the image has none)
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build userland (base packages, pinned clang, eBPF toolchain; no rustup)
+        run: |
+          scripts/ci-container-prep.sh
+          scripts/ci-install-clang.sh
+          scripts/ci-install-ebpf-toolchain.sh
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >> "$GITHUB_PATH"
+      - name: Rust toolchain from hash-pinned artifacts
+        run: scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+      - name: The release job's package (only its robodr-pulsard is reused)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+      - name: Rebuild (every program, robodr-pulsard included), package, bundle
+        env:
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal robodr-depot
+          ROBODR_RELEASE: "1"
+          DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
+        run: scripts/ci-rebuild.sh deb "$ARCH" dist/rebuild "$RUNNER_TEMP/release"
+      - name: Hand the rebuild to publish
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebuild-deb-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/rebuild
+          if-no-files-found: error
+          retention-days: 90
+
+  rebuild-rpm:
+    name: Independent rebuild, robodr .rpm (${{ matrix.arch }})
+    needs: [prepare, build-rpm]
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: quay.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: git for actions/checkout
+        run: dnf install -y --setopt=install_weak_deps=False git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build userland (base packages, pinned clang, eBPF toolchain; no rustup)
+        run: |
+          scripts/ci-container-prep.sh
+          scripts/ci-install-clang.sh
+          scripts/ci-install-ebpf-toolchain.sh
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >> "$GITHUB_PATH"
+      - name: Rust toolchain from hash-pinned artifacts
+        run: scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: The release job's package (only its robodr-pulsard is reused)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-rpm-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+      - name: Rebuild (every program, robodr-pulsard included), package, bundle
+        env:
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal robodr-depot
+          ROBODR_RELEASE: "1"
+          DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
+        run: scripts/ci-rebuild.sh rpm "$ARCH" dist/rebuild "$RUNNER_TEMP/release"
+      - name: Hand the rebuild to publish
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebuild-rpm-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/rebuild
+          if-no-files-found: error
+          retention-days: 90
+
+  rebuild-static:
+    # A fresh ubuntu-24.04 VM: the pinned clang (scripts/c-toolchain.sh) is
+    # noble's, so the userland stays; the Rust toolchain does not.
+    name: Independent rebuild, robodr-focal (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Rust toolchain and musl target from hash-pinned artifacts (no rustup), fresh CARGO_HOME
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >> "$GITHUB_PATH"
+          scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust" "$TARGET"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Linker (rust-lld, self-contained musl)
+        run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: Pinned C compiler (clang 18.1.3; scripts/c-toolchain.sh)
+        run: scripts/ci-install-clang.sh
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+      - name: Rebuild, package, bundle
+        env:
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot
+          ROBODR_RELEASE: "1"
+          DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
+        run: scripts/ci-rebuild.sh focal "$ARCH" dist/rebuild
+      - name: Hand the rebuild to publish
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebuild-focal-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/rebuild
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
   publish:
     name: Checksums, sign, publish
-    needs: [prepare, build, build-rpm, build-static, smoke]
+    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static]
     runs-on: ubuntu-24.04
     # Secrets live in this environment only; give it required reviewers.
     environment: release
@@ -466,10 +667,21 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Install minisign
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: The tagged commit is on main (again, right before signing)
+        run: |
+          commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME points at $commit, which is not on main"
+            exit 1
+          fi
+      - name: Install minisign (and rpm2archive for the rebuild comparison)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign
+          sudo apt-get install -y --no-install-recommends minisign rpm
           minisign -v
       - name: Download the build jobs' assets
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -477,8 +689,22 @@ jobs:
           pattern: release-*-${{ github.sha }}
           merge-multiple: true
           path: ${{ runner.temp }}/rel
+      - name: Download the independent rebuilds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rebuild-*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rebuild
       - name: List assets
-        run: ls -l "$RUNNER_TEMP/rel"
+        run: ls -l "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild"
+      - name: Independent rebuild == release (binaries, packages, bundles), recorded
+        # Fails (nothing is signed) on any difference except robodr-pulsard's
+        # own reproducibility, which is recorded either way in the signed
+        # REPRODUCIBILITY-<version>.txt (scripts/compare-rebuild.py).
+        run: |
+          python3 scripts/compare-rebuild.py --release "$RUNNER_TEMP/rel" --rebuild "$RUNNER_TEMP/rebuild" \
+            --version "$VERSION" --out "$RUNNER_TEMP/rel/REPRODUCIBILITY-$VERSION.txt"
+          cat "$RUNNER_TEMP/rel/REPRODUCIBILITY-$VERSION.txt"
       - name: Check per-arch hashes, write SHA256SUMS
         working-directory: ${{ runner.temp }}/rel
         run: |
@@ -521,4 +747,17 @@ jobs:
         working-directory: ${{ runner.temp }}/rel
         run: |
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber ./*
+          # The reproducibility record (signed asset) in the release notes too.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          {
+            echo
+            echo "### Independent rebuild"
+            echo
+            echo "Signed record: \`REPRODUCIBILITY-$VERSION.txt\` (with \`.minisig\`, listed in \`SHA256SUMS\`)."
+            echo
+            echo '```'
+            cat "REPRODUCIBILITY-$VERSION.txt"
+            echo '```'
+          } >> "$RUNNER_TEMP/notes.md"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

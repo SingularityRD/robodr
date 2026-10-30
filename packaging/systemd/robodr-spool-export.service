@@ -11,7 +11,7 @@
 #     every --interval-ms (default 5000 ms) and retries after errors itself;
 #     exit 2 = usage error.
 #   * It renames <spool>/ready/* to acked/ (and invalid ones to rejected/),
-#     so it runs as User=robodr, through the spool's group (agentd
+#     so it runs as its own user robodr-spool with Group=robodr, through the spool's group (agentd
 #     itself runs as robodr-agentd: an exporter cannot write its black
 #     box, its state or its sockets).
 #   * --key-file: the unit's diode signing key, a `robodr-blackbox keygen`
@@ -65,7 +65,10 @@ IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 
 # --- Identity and capabilities ---------------------------------------------
-User=robodr
+# Its own user (review: a uid shared with the other exporters and the
+# gateway let each read the others' credentials); group robodr for
+# the spool queues and /etc/robodr.
+User=robodr-spool
 Group=robodr
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -77,6 +80,11 @@ UMask=0027
 #   /run/credentials/robodr-spool-export.service/diode.key
 LoadCredential=diode.key:/etc/robodr/keys/diode.key
 InaccessiblePaths=-/etc/robodr/keys
+# Defense in depth: only this unit's own credentials are visible here;
+# every other unit's /run/credentials/<unit>/ is hidden by an empty
+# read-only tmpfs (each also belongs to another user).
+TemporaryFileSystem=/run/credentials:ro
+BindReadOnlyPaths=-/run/credentials/robodr-spool-export.service
 
 # --- Filesystem --------------------------------------------------------------
 ProtectSystem=strict

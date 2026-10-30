@@ -8,10 +8,14 @@
 # against a DB carried in through the entry station (docs/BUILD.md).
 
 [graph]
-# Targets we ship for: robot companion computers are x86_64 or aarch64 Linux.
+# Targets we ship for: robot companion computers are x86_64 or aarch64 Linux,
+# glibc (robodr .deb / .rpm) and static musl (robodr-focal), the same four
+# platforms scripts/third_party_notices.py reports.
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
 ]
 all-features = false
 

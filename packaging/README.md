@@ -13,11 +13,11 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-agentd.service.d/40-sensor-box.conf.example` | `/usr/share/doc/robodr/examples/` | **sensor box only**: passive tap / port-mirror mode of `robodr-agentd` (`CAP_NET_RAW` only, all IP denied, waits for the writable data mount; [`docs/UNITREE.md`](../docs/UNITREE.md)) |
 | `sensor-box/10-robodr-capture.network.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: systemd-networkd file for the capture NIC (no address, no ARP, no IPv6 link-local, promiscuous) |
 | `sensor-box/nftables.conf.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: host firewall (capture NIC silent, uplink to the Kafka broker set, NTP and admin SSH only, no forwarding) |
-| `systemd/robodr-spool-export.service` | `/usr/lib/systemd/system/` | robot-side findings exporter for **diode sites**: agentd spool -> signed batches in `/var/lib/robodr/export/diode`; `User=robodr`, `PrivateNetwork=yes`, key via `LoadCredential=` (`/etc/robodr/keys/diode.key`), settings in `/etc/robodr/spool-export.env` (only if the binary is built) |
-| `systemd/robodr-kafka-publish.service` | `/usr/lib/systemd/system/` | findings publisher for **connected sites**, running on the unit or sensor box: agentd spool -> Kafka; `User=robodr`, `IPAddressDeny=any` plus the broker drop-in, settings in `/etc/robodr/kafka-publish.env`. Conflicts with the exporter above (only if the binary is built) |
+| `systemd/robodr-spool-export.service` | `/usr/lib/systemd/system/` | robot-side findings exporter for **diode sites**: agentd spool -> signed batches in `/var/lib/robodr/export/diode`; `User=robodr-spool` (its own user, group `robodr`), `PrivateNetwork=yes`, key via `LoadCredential=` (`/etc/robodr/keys/diode.key`), settings in `/etc/robodr/spool-export.env` (only if the binary is built) |
+| `systemd/robodr-kafka-publish.service` | `/usr/lib/systemd/system/` | findings publisher for **connected sites**, running on the unit or sensor box: agentd spool -> Kafka; `User=robodr-kafka`, `IPAddressDeny=any` plus the broker drop-in, settings in `/etc/robodr/kafka-publish.env`. Conflicts with the exporter above (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service.d/50-brokers.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for **every** Kafka broker (the publisher connects to each partition leader, not only to the bootstrap broker) |
 | `systemd/robodr-kafka-publish.service.d/60-tls-credentials.conf.example` | `/usr/share/doc/robodr/examples/` | `LoadCredential=` for the mutual-TLS client key and the SASL/SCRAM password file, named in `ROBODR_KAFKA_TLS_ARGS` (`--tls-key`, `--sasl-password-file`); in **`robodr-focal`** the same path holds `systemd/focal/robodr-kafka-publish.service.d/60-tls-credentials.conf.example`, which does it with `robodr-load-credential` (systemd 245) |
-| `systemd/robodr-uplink.service` | `/usr/lib/systemd/system/` | findings uplink to the SOC's AutoSecOps ingest API for **connected sites**, running on the unit or sensor box: agentd spool -> HTTPS (signed batches, CA bundle `/etc/robodr/uplink-ca.pem`, optional SPKI pin); `User=robodr`, key via `LoadCredential=` (`/etc/robodr/keys/uplink.key`), `IPAddressDeny=any` plus the SOC drop-in, settings in `/etc/robodr/uplink.env`. Conflicts with both units above (only if the binary is built) |
+| `systemd/robodr-uplink.service` | `/usr/lib/systemd/system/` | findings uplink to the SOC's AutoSecOps ingest API for **connected sites**, running on the unit or sensor box: agentd spool -> HTTPS (signed batches, CA bundle `/etc/robodr/uplink-ca.pem`, optional SPKI pin); `User=robodr-uplink`, key via `LoadCredential=` (`/etc/robodr/keys/uplink.key`), `IPAddressDeny=any` plus the SOC drop-in, settings in `/etc/robodr/uplink.env`. Conflicts with both units above (only if the binary is built) |
 | `systemd/robodr-uplink.service.d/50-soc.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for the SOC ingest address(es) (map the URL's host name in `/etc/hosts`: DNS is not reachable) |
 | `etc/spool-export.env.example`, `etc/kafka-publish.env.example`, `etc/uplink.env.example` | `/usr/share/doc/robodr/examples/` | the three exporter units' site settings (unit id; bootstrap brokers; ingest URL and pin) |
 | `systemd/focal/*.service`, `systemd/focal/<unit>.service.d/*.conf.example` | `/usr/lib/systemd/system/` (and examples) of **`robodr-focal`** | systemd 245 variants (Ubuntu 20.04 / JetPack 5): `LoadCredential=` replaced by `robodr-load-credential`, no `ProtectProc=` / `ProcSubset=`; otherwise identical, enforced by `scripts/check-focal-units.py`. `build-deb.sh --variant focal` takes a drop-in example from `systemd/focal/` when it exists there and the regular one otherwise; the checker then requires the regular one to need nothing newer than systemd 245 |
@@ -36,7 +36,8 @@ operator installs on a robot. The procedures that use it are in
 | `make-bundle.sh` | (build time) | offline install bundle: `--deb` (Debian / Ubuntu / JetPack) or `--rpm` (`robodr-<ver>-<arch>-rpm-offline.tar.gz`, RHEL / Rocky / Alma 9, Fedora) |
 | `install-bundle.sh` | inside the bundle; `/usr/lib/robodr/install-bundle.sh` | verify (signature, then a private extraction), install, list, roll back on the robot, with dpkg or `rpm -U` (same checks for both formats); the installed copy is the trusted verifier for the next upgrade |
 | `release-maintainer.sh` | (build time; sourced by `build-deb.sh`, `build-rpm.sh`) | with `ROBODR_RELEASE=1` (release.yml) the `.deb` `Maintainer:` / RPM `Packager:` (`DEB_MAINTAINER`, `RPM_PACKAGER`; repository variable `ROBODR_MAINTAINER`) must be `Name <address>` and not a placeholder (`@invalid`, `example.*`, `localhost`); development builds keep `robodr-maintainers@invalid` |
-| `licenses/MIT.txt` | (build time) | canonical MIT text for `THIRD_PARTY_NOTICES` where a crate ships no licence file |
+| `licenses/MIT.txt` | (build time) | MIT template for `THIRD_PARTY_NOTICES`: filled only with a crate's real copyright holders (`OVERRIDES` in `scripts/third_party_notices.py`) or the Rust project's; never shipped with a placeholder |
+| `licenses/musl-1.2.5-COPYRIGHT`, `licenses/Unicode-3.0.txt`, `licenses/LLVM-exception.txt` | (build time) | texts of the statically linked runtime code in `THIRD_PARTY_NOTICES`: musl libc and LLVM libunwind (robodr-focal), the Rust standard library |
 | `../THIRD_PARTY_NOTICES`, `../GPL-2.0-SOURCE-OFFER` | `/usr/share/doc/robodr/` (RPM: `%license`); `doc/` of every bundle | third-party crate notices and the written source offer for the Pulsar eBPF probes; committed, generated by `scripts/third_party_notices.py`, checked by CI job `deny` |
 | `security-floor` | inside the bundle | `min_version=`: no install or rollback below it (recorded per unit, only rises) |
 
@@ -59,9 +60,9 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-seal` | **not a service**: root-only operator tool (`/usr/sbin`) | the unit's TPM (provisioning, refused without an owner and lockout authorization), enrolment, signed PCR policies, the sealed runtime volume, crypto-erase (OPERATIONS 12). `robodr-deliverd.service` reaches the TPM through `DeviceAllow=/dev/tpmrm0 rw` under `DevicePolicy=closed` (not `PrivateDevices=yes`, which would hide it); TPM session files go to `/run/robodr-seal` (tmpfs) |
 | `robodr-depot` | systemd service on the **depot box** (never a robot), user `robodr-depot` (member of `robodr` for the spool), no capabilities, `ProtectSystem=strict`, TCP only; its other commands are operator tools run as the same user | the site depot (Sprint 14a, OPERATIONS 13): `serve` gives each enrolled unit its own pack over mutual TLS and takes its reports; imports, enrolments, approvals, rollouts and media packs are deliberate operator acts. The database anchor uses the box's TPM (`DeviceAllow=/dev/tpmrm0 rw`, group `tss` through the drop-in `50-tpm-anchor.conf.example`). `robodr-deliverd.service` needs the drop-in `50-depot-lan.conf.example` for LAN pulls (TCP to the depot only) and the erase trigger socket |
 | `robodr-anchor-receiver` | systemd service on a **base station**, dynamic user, no capabilities; never enabled on a robot | holds the robots' black-box head marks off the robots |
-| `robodr-spool-export` | systemd service (`User=robodr`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
-| `robodr-kafka-publish` | systemd service (`User=robodr`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
-| `robodr-uplink` | systemd service (`User=robodr`, SOC address only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack` (`--diode-out`, a `relay` key), from the SOC's own unit or procedure | sends findings to the AutoSecOps ingest API over TLS; one consumer per spool, so it conflicts with the two units above |
+| `robodr-spool-export` | systemd service (`User=robodr-spool`, no network, no capabilities) on the **unit or sensor box** of a diode site | loops on agentd's spool and writes signed diode batches; the transfer to the diode is the site's procedure |
+| `robodr-kafka-publish` | systemd service (`User=robodr-kafka`, brokers only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack`, from the SOC's own unit or procedure (`--diode-out`) | publishes findings to Kafka; one consumer per spool, so it conflicts with `robodr-spool-export` and `robodr-uplink` |
+| `robodr-uplink` | systemd service (`User=robodr-uplink`, SOC address only) on the **unit or sensor box** of a connected site; on a diode site it runs on the **SOC (high) side** after `robodr-diode-unpack` (`--diode-out`, a `relay` key), from the SOC's own unit or procedure | sends findings to the AutoSecOps ingest API over TLS; one consumer per spool, so it conflicts with the two units above |
 
 All services are installed **disabled**. A robot is commissioned first and its
 locked profile installed; then the operator enables the services
@@ -144,7 +145,7 @@ Neither watchdog has been exercised under a real systemd yet.
 │   └── pulsard/                 0750 root:robodr   single writer: robodr-pulsard
 ├── spool/                       0750 root:robodr   OCSF findings awaiting export
 │   ├── agentd/                  2750 robodr-agentd:robodr  written by agentd (and robodr-deliverd through fds)
-│   │   └── ready/ acked/ rejected/  2770 robodr-agentd:robodr  exporters (robodr) read and rename here
+│   │   └── ready/ acked/ rejected/  2770 robodr-agentd:robodr  exporters (their own users, group robodr) read and rename here
 │   └── pulsard/                 0750 root:robodr
 ├── control-plane/               0750 root:robodr
 │   └── agentd/                  0700 robodr-agentd:robodr control_plane.state_dir: request journal, replay store, evidence exports
@@ -152,6 +153,10 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── profile-state-pulsard/       0750 root:robodr   profile anti-rollback state of the Pulsar sensor
 ├── commission/                  0750 root:robodr   operator workspace: runs, drafts, sign-offs
 ├── export/                      0750 root:robodr   bundles staged for the diode / media
+│   ├── diode/ spool-export/     0750 robodr-spool:robodr   robodr-spool-export: diode outbox, its state
+│   ├── kafka-publish/           0750 robodr-kafka:robodr   robodr-kafka-publish's state
+│   └── uplink/                  0750 robodr-uplink:robodr  robodr-uplink's state
+├── firewall-gw/                 0750 robodr-gw:robodr      robodr-firewall-gw (StateDirectory=)
 ├── archive/                     0750 root:robodr   black boxes closed by a key rotation
 ├── executor/                    0700 robodr-exec:robodr journal of robodr-executor (active actions, TTL deadlines)
 ├── fleet/                       0700 root:root     robodr-enroll state, staged profile, fleet journal (black box)
@@ -165,7 +170,9 @@ Neither watchdog has been exercised under a real systemd yet.
 /run/robodr-agentd/                                 agentd's sockets (0751 robodr-agentd:robodr-agentd): status.sock
                                                     (0600, read by robodr-deliverd, SO_PEERCRED), safety.sock (0600, or
                                                     0660 group robodr-safety; SO_PEERCRED), events.sock, host-threats.sock
-/run/credentials/<unit>/blackbox.key                key copy for the service (systemd)
+/run/credentials/<unit>/<name>                      key copies for the service (systemd; robodr-focal:
+                                                    robodr-load-credential), 0400, owned by that service's
+                                                    own user; units see only their own directory
 /usr/share/robodr/rules/{robodr,pulsar}/            Pulsar rules, read-only
 /usr/share/robodr/formats                           black-box formats the release writes / reads (install-bundle.sh gate)
 /opt/robodr-delivered/<name>/{<serial>-<digest>,current}  delivered files (robodr-deliverd only)

@@ -10,11 +10,87 @@
 #
 # Not here, on purpose: the deb's agentd-tree migration (review H1). It
 # moves trees written by releases where robodr-agentd ran as robodr; no RPM
-# of such a release exists. Requires(post): systemd guarantees
-# systemd-sysusers and systemd-tmpfiles (no adduser fallback needed).
+# of such a release exists. The exporter / gateway user split is here
+# (RPM releases where they shared robodr exist): the same block as the
+# deb's postinst, between the markers below. Requires(post): systemd
+# guarantees systemd-sysusers and systemd-tmpfiles (no adduser fallback
+# needed).
 set -e
 
+# >>> migrate_agentd_tree (tests/review2_13b.rs runs this block)
+# migrate_agentd_tree DIR OLD_OWNER NEW_OWNER GROUP
+#
+# Give agentd's tree DIR (owned by OLD_OWNER, the user agentd and the
+# exporters shared before review H1) to NEW_OWNER:GROUP. Every step is
+# idempotent, so an interrupted run is simply repeated:
+#   1. a symlink, FIFO, socket or device in the tree is removed (agentd
+#      creates none there; a planted link would otherwise be followed);
+#   2. a regular file with more than one link is replaced by a copy (same
+#      owner, mode and times), so the inode shared with a file elsewhere is
+#      left alone and keeps its owner;
+#   3. entries of OLD_OWNER get NEW_OWNER:GROUP (chown -h, find -P: no
+#      symlink is ever followed, no other file system is entered);
+#   4. group/other write is removed everywhere, setuid/setgid from files.
+# Directory modes and the spool queues' group write and setgid bit come
+# back from tmpfiles afterwards.
+migrate_agentd_tree() {
+    mt_dir=$1
+    mt_old=$2
+    mt_owner=$3:$4
+    if [ ! -d "$mt_dir" ] || [ -L "$mt_dir" ]; then
+        return 0
+    fi
+    find -P "$mt_dir" -xdev -mindepth 1 ! -type f ! -type d -exec rm -f -- {} +
+    find -P "$mt_dir" -xdev -type f -links +1 -exec sh -c '
+        for f do
+            t="$f.robodr-migrate"
+            rm -f -- "$t"
+            cp -P --preserve=mode,ownership,timestamps -- "$f" "$t"
+            mv -f -- "$t" "$f"
+        done' sh {} +
+    find -P "$mt_dir" -xdev -user "$mt_old" -exec chown -h "$mt_owner" {} +
+    find -P "$mt_dir" -xdev \( -type f -o -type d \) -perm /022 -exec chmod go-w {} +
+    find -P "$mt_dir" -xdev -type f -perm /6000 -exec chmod ug-s {} +
+}
+# <<< migrate_agentd_tree
+
+# >>> migrate_exporter_users (packaging/rpm/post carries the same block;
+# scripts/check-packages.py keeps them identical)
+# Upgrade from a release where robodr-spool-export, robodr-kafka-publish,
+# robodr-uplink and robodr-firewall-gw all ran as the shared user robodr
+# (review: each could read the others' credentials and rewrite their
+# state). Each now has its own user; the state those releases wrote as
+# robodr moves to it once, with the four units stopped, by the same
+# link-safe, resumable steps as the agentd migration (migrate_agentd_tree:
+# no symlink followed, hardlinks broken, group/other write and
+# setuid/setgid removed). Marker: /var/lib/robodr/.exporter-users-migrated.
+migrate_exporter_users() {
+    meu_marker=/var/lib/robodr/.exporter-users-migrated
+    [ ! -e "$meu_marker" ] || return 0
+    if [ -d /run/systemd/system ]; then
+        for u in robodr-spool-export.service robodr-kafka-publish.service \
+            robodr-uplink.service robodr-firewall-gw.service; do
+            if systemctl is-active --quiet "$u"; then
+                systemctl stop "$u"
+                stopped="$stopped $u"
+            fi
+        done
+    fi
+    for meu_pair in /var/lib/robodr/export/diode:robodr-spool \
+        /var/lib/robodr/export/spool-export:robodr-spool \
+        /var/lib/robodr/export/kafka-publish:robodr-kafka \
+        /var/lib/robodr/export/uplink:robodr-uplink \
+        /var/lib/robodr/firewall-gw:robodr-gw; do
+        migrate_agentd_tree "${meu_pair%%:*}" robodr "${meu_pair#*:}" robodr
+    done
+    mkdir -p /var/lib/robodr
+    : >"$meu_marker"
+}
+# <<< migrate_exporter_users
+
+stopped=""
 systemd-sysusers /usr/lib/sysusers.d/robodr.conf
+migrate_exporter_users
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
 # First install: the executor's first-start marker (see packaging/deb/postinst).
 exec_state=/var/lib/robodr/executor
@@ -24,6 +100,10 @@ if [ "${1:-1}" -lt 2 ] && [ -d "$exec_state" ] && [ ! -L "$exec_state" ] \
 fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || :
+    # What the migration stopped starts again on the new binaries.
+    for u in $stopped; do
+        systemctl start "$u" || :
+    done
     if [ "${1:-1}" -ge 2 ]; then
         # Upgrade: restart only what was running.
         for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \

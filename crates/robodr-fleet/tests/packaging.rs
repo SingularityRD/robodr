@@ -124,22 +124,47 @@ fn stub_deb_marked(
     formats: Option<(&str, &str)>,
     marker: &str,
 ) -> PathBuf {
+    stub_deb_pkg(dir, "robodr", version, formats, marker, None)
+}
+
+/// [`stub_deb_marked`] of package `pkg` (robodr or robodr-focal; the two
+/// conflict and replace each other, as the real ones) with an optional
+/// postinst script.
+fn stub_deb_pkg(
+    dir: &Path,
+    pkg: &str,
+    version: &str,
+    formats: Option<(&str, &str)>,
+    marker: &str,
+    postinst: Option<&str>,
+) -> PathBuf {
     let out = if marker == "genuine" {
         dir.to_path_buf()
     } else {
         dir.join(marker)
     };
-    let st = out.join(format!("stage-{version}"));
+    let st = out.join(format!("stage-{pkg}-{version}"));
     std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
     std::fs::create_dir_all(st.join("usr/lib/robodr")).unwrap();
+    let other = if pkg == "robodr" {
+        "robodr-focal"
+    } else {
+        "robodr"
+    };
     std::fs::write(
         st.join("DEBIAN/control"),
         format!(
-            "Package: robodr\nVersion: {version}\nArchitecture: all\nMaintainer: test <t@invalid>\n\
+            "Package: {pkg}\nVersion: {version}\nArchitecture: all\nMaintainer: test <t@invalid>\n\
+             Conflicts: {other}\nReplaces: {other}\n\
              Description: stub robodr package for the install-bundle test\n"
         ),
     )
     .unwrap();
+    if let Some(script) = postinst {
+        let f = st.join("DEBIAN/postinst");
+        std::fs::write(&f, script).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     std::fs::write(
         st.join("usr/lib/robodr/stub-version"),
         format!("{version} {marker}"),
@@ -153,7 +178,7 @@ fn stub_deb_marked(
         )
         .unwrap();
     }
-    let deb = out.join(format!("robodr_{version}_all.deb"));
+    let deb = out.join(format!("{pkg}_{version}_all.deb"));
     ok(&sh(Command::new("dpkg-deb")
         .args(["--root-owner-group", "-Zxz", "--build"])
         .arg(&st)
@@ -436,6 +461,11 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
     for m in [
         None,
         Some("RoboDR maintainers <robodr-maintainers@invalid>"),
+        // Control characters would inject fields into DEBIAN/control or
+        // the spec (review: newline in the name).
+        Some("RoboDR\nX-Injected: yes <release@robodr.dev>"),
+        Some("RoboDR\rRelease <release@robodr.dev>"),
+        Some("RoboDR\tRelease <release@robodr.dev>"),
     ] {
         let mut c = Command::new("bash");
         c.arg(repo().join("packaging/build-deb.sh"))
@@ -511,6 +541,27 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         sysu.lines().any(|l| l.starts_with("u      robodr-depot ")),
         "{sysu}"
     );
+    // One user per network-facing service (review: a shared uid let each
+    // read the others' credentials), owning its own state.
+    for (u, d) in [
+        ("robodr-spool", "/var/lib/robodr/export/diode"),
+        ("robodr-kafka", "/var/lib/robodr/export/kafka-publish"),
+        ("robodr-uplink", "/var/lib/robodr/export/uplink"),
+        ("robodr-gw", ""),
+    ] {
+        assert!(
+            sysu.lines().any(|l| l.starts_with(&format!("u      {u} "))),
+            "{u}: {sysu}"
+        );
+        if !d.is_empty() {
+            assert!(
+                tmpf.lines()
+                    .any(|l| l.split_whitespace().collect::<Vec<_>>()[..]
+                        .starts_with(&["d", d, "0750", u, "robodr"])),
+                "{d}: {tmpf}"
+            );
+        }
+    }
     // The offline bundle around it verifies.
     let o = Command::new("bash")
         .arg(repo().join("packaging/make-bundle.sh"))
@@ -902,6 +953,11 @@ fn unknown_frames_do_not_block_and_unreadable_segments_are_accepted_by_name() {
     let f = Some(("RBF1:1", "RBF1:1"));
     let b1 = bundle(&dir, &stub_deb(&dir, "0.1.0-1", f));
     let b2 = bundle(&dir, &stub_deb(&dir, "0.2.0-1", f));
+    // b3 writes format 2 (and reads 1 and 2).
+    let b3 = bundle(
+        &dir,
+        &stub_deb(&dir, "0.3.0-1", Some(("RBF1:2", "RBF1:1,RBF1:2"))),
+    );
     let run = |b: &Path, args: &[&str]| {
         run_bundle_with(&root, &b.join("install-bundle.sh"), args, true, &tmp)
     };
@@ -917,14 +973,27 @@ fn unknown_frames_do_not_block_and_unreadable_segments_are_accepted_by_name() {
     assert!(t.contains("not a RoboDR black-box frame"), "{t}");
     assert!(!t.contains("newer release"), "{t}");
     assert_eq!(installed(&root), "0.2.0-1");
-    // A recognised format the release cannot read: refused by name ...
+    // A segment claiming a format no release installed here ever wrote
+    // (agentd, which can write these files, forging a "newer" segment):
+    // unverifiable, reported as UNKNOWN, and it does NOT block updates.
     let mut seg = FRAME_MAGIC.to_vec();
     seg.extend_from_slice(&64u32.to_be_bytes());
     seg.push(2);
     seg.extend_from_slice(&[0u8; 63]);
     let newer = bb.join("seg-0000000000000009.rbb");
     std::fs::write(&newer, &seg).unwrap();
-    let o = run(&b2, &["install"]);
+    let t = ok(&run(&b2, &["install"]));
+    assert!(
+        t.contains("UNKNOWN") && t.contains("claims RBF1:2") && t.contains("does not block"),
+        "{t}"
+    );
+    assert!(!t.contains("REFUSED"), "{t}");
+    // Once a release that writes format 2 was installed, the claim is
+    // verified: rolling back to one that cannot read it is refused by
+    // name ...
+    ok(&run(&b3, &["install"]));
+    assert_eq!(installed(&root), "0.3.0-1");
+    let o = run(&b3, &["rollback", "0.2.0-1"]);
     let e = stderr(&o);
     assert_eq!(o.status.code(), Some(1), "{e}");
     assert!(
@@ -933,15 +1002,27 @@ fn unknown_frames_do_not_block_and_unreadable_segments_are_accepted_by_name() {
     );
     // ... unless the operator accepts exactly that segment.
     let o = run(
-        &b2,
-        &["install", "--accept-unreadable", junk.to_str().unwrap()],
+        &b3,
+        &[
+            "rollback",
+            "0.2.0-1",
+            "--accept-unreadable",
+            junk.to_str().unwrap(),
+        ],
     );
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(installed(&root), "0.3.0-1");
     let t = ok(&run(
-        &b2,
-        &["install", "--accept-unreadable", newer.to_str().unwrap()],
+        &b3,
+        &[
+            "rollback",
+            "0.2.0-1",
+            "--accept-unreadable",
+            newer.to_str().unwrap(),
+        ],
     ));
     assert!(t.contains("accepted"), "{t}");
+    assert_eq!(installed(&root), "0.2.0-1");
 }
 
 /// The gate judges the black-box chains on the unit, agentd's and the
@@ -961,7 +1042,11 @@ fn the_format_gate_reads_the_fleet_journal_and_ignores_other_state() {
     std::fs::create_dir_all(&tmp).unwrap();
     let f = Some(("RBF1:1", "RBF1:1"));
     let b1 = bundle(&dir, &stub_deb(&dir, "0.1.0-1", f));
-    let b2 = bundle(&dir, &stub_deb(&dir, "0.2.0-1", f));
+    // b2 writes format 2, so a format-2 segment is verified below.
+    let b2 = bundle(
+        &dir,
+        &stub_deb(&dir, "0.2.0-1", Some(("RBF1:2", "RBF1:1,RBF1:2"))),
+    );
     let run = |b: &Path, args: &[&str]| {
         run_bundle_with(&root, &b.join("install-bundle.sh"), args, true, &tmp)
     };
@@ -1071,8 +1156,270 @@ fn rollback_version_and_blackbox_dirs_are_neither_paths_nor_patterns() {
         "--blackbox-dir",
         dir.join("no-such-dir").to_str().unwrap(),
     ]));
-    let o = run(&["install", "--blackbox-dir", bbx1.to_str().unwrap()]);
+    // The directory named is judged (its unverifiable segment reported).
+    let t = ok(&run(&["install", "--blackbox-dir", bbx1.to_str().unwrap()]));
+    assert!(t.contains("bbx1/seg-0000000000000001.rbb"), "{t}");
+}
+
+/// The version of package `pkg` in the dpkg root, if dpkg knows it in any
+/// state ("" otherwise), and its `db:Status-Abbrev`.
+fn dpkg_state(root: &Path, pkg: &str) -> (String, String) {
+    let o = sh(Command::new("dpkg-query")
+        .arg(format!(
+            "--admindir={}",
+            root.join("var/lib/dpkg").display()
+        ))
+        .args(["-W", "-f", "${db:Status-Abbrev}|${Version}", pkg]));
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    let (st, v) = t.split_once('|').unwrap_or(("", ""));
+    (v.to_string(), st.trim().to_string())
+}
+
+/// A signed tarball of bundle directory `b` named `name` in `out`, with its
+/// signature (default minisign trusted comment: `file:<name>`).
+fn signed_tarball_named(out: &Path, b: &Path, secret: &Path, name: &str) -> PathBuf {
+    std::fs::create_dir_all(out).unwrap();
+    let t = out.join(name);
+    ok(&sh(Command::new("tar")
+        .arg("-C")
+        .arg(b.parent().unwrap())
+        .arg("-czf")
+        .arg(&t)
+        .arg(b.file_name().unwrap())));
+    minisign(secret, &t);
+    t
+}
+
+/// Copy a signed tarball and its signature to `dir/name` (+ `.minisig`).
+fn copy_signed(t: &Path, dir: &Path, name: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let to = dir.join(name);
+    std::fs::copy(t, &to).unwrap();
+    std::fs::copy(
+        format!("{}.minisig", t.display()),
+        format!("{}.minisig", to.display()),
+    )
+    .unwrap();
+    to
+}
+
+/// Review finding (packaging, HIGH): the signed tarball was re-opened for
+/// every step (minisign, sha256sum, tar -t, tar -x), so a file swapped
+/// after the signature check was what got extracted and installed. Now it
+/// must be a regular file and is copied once into the private directory;
+/// every check and the extraction read that copy. Also: the signature's
+/// trusted comment must name the tarball (a renamed signed bundle is
+/// refused), the signed name must match the variant inside, and a signed
+/// robodr-focal bundle does not silently replace robodr.
+#[test]
+fn signed_install_reads_one_private_copy_and_checks_name_and_variant() {
+    if !minisign_available("signed_copy") {
+        return;
+    }
+    let dir = TempDir::new("signed-copy");
+    let root = dpkg_root(&dir);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (public, secret) = release_key(&dir, "release");
+    let pk = public.to_str().unwrap();
+    let v = "0.1.0-1";
+    let f = Some(("RBF1:1", "RBF1:1"));
+    let genuine = bundle_named(&dir, &stub_deb(&dir, v, f), "robodr-0.1.0-all", None);
+    let t = signed_tarball(&dir.join("rel"), &genuine, &secret);
+    // An unsigned bundle of the same layout with another package inside.
+    let evil_dir = dir.join("evil-src");
+    let evil = bundle_named(
+        &evil_dir,
+        &stub_deb_marked(&dir, v, f, "evil"),
+        "robodr-0.1.0-all",
+        None,
+    );
+    let evil_t = dir.join("evil.tar.gz");
+    ok(&sh(Command::new("tar")
+        .arg("-C")
+        .arg(&evil_dir)
+        .arg("-czf")
+        .arg(&evil_t)
+        .arg(evil.file_name().unwrap())));
+    let trusted = dir.join("trusted");
+    std::fs::create_dir_all(&trusted).unwrap();
+    let script = trusted.join("install-bundle.sh");
+    std::fs::copy(repo().join("packaging/install-bundle.sh"), &script).unwrap();
+    let run = |args: &[&str]| run_bundle_with(&root, &script, args, false, &tmp);
+
+    // Not a regular file: a symlink to the genuine tarball, and a FIFO.
+    let odd = dir.join("odd");
+    std::fs::create_dir_all(&odd).unwrap();
+    let link = odd.join("robodr-0.1.0-all-offline.tar.gz");
+    std::os::unix::fs::symlink(&t, &link).unwrap();
+    let fifo = odd.join("robodr-0.2.0-all-offline.tar.gz");
+    ok(&sh(Command::new("mkfifo").arg(&fifo)));
+    for p in [&link, &fifo] {
+        let o = run(&["install", "--pubkey", pk, "--tarball", p.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+        assert!(stderr(&o).contains("not a regular file"), "{}", stderr(&o));
+        assert_eq!(installed(&root), "");
+    }
+
+    // The tarball is swapped for the unsigned one right after minisign
+    // accepted it (a wrapper around the real minisign does the swap, as a
+    // same-user process or removable media could): the private copy is
+    // what gets installed, never the swapped file.
+    let real = ok(&sh(Command::new("sh").args(["-c", "command -v minisign"])))
+        .trim()
+        .to_string();
+    let wrap = dir.join("wrap");
+    std::fs::create_dir_all(&wrap).unwrap();
+    let w = wrap.join("minisign");
+    std::fs::write(
+        &w,
+        format!(
+            "#!/bin/sh\n{real} \"$@\"\nrc=$?\nif [ -n \"${{SWAP_FROM:-}}\" ]; then cp \"$SWAP_FROM\" \"$SWAP_TO\"; fi\nexit $rc\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let swapped = copy_signed(&t, &dir.join("swap"), "robodr-0.1.0-all-offline.tar.gz");
+    let o = Command::new("sh")
+        .arg(&script)
+        .args([
+            "install",
+            "--pubkey",
+            pk,
+            "--tarball",
+            swapped.to_str().unwrap(),
+        ])
+        .env("ROBODR_ROOT", &root)
+        .env("TMPDIR", &tmp)
+        .env_remove("ROBODR_ALLOW_UNSIGNED")
+        .env(
+            "PATH",
+            format!("{}:{}", wrap.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("SWAP_FROM", &evil_t)
+        .env("SWAP_TO", &swapped)
+        .output()
+        .unwrap();
+    let out = ok(&o);
+    assert_eq!(
+        std::fs::read(&swapped).unwrap(),
+        std::fs::read(&evil_t).unwrap(),
+        "the wrapper swapped the file: {out}"
+    );
+    assert_eq!(installed(&root), v);
+    assert_eq!(stub_marker(&root), format!("{v} genuine"), "{out}");
+    assert!(is_empty_dir(&tmp), "private staging directory removed");
+
+    // A signed tarball renamed to pass for another one (here: the
+    // robodr-focal bundle): its trusted comment names the original file.
+    let renamed = copy_signed(
+        &t,
+        &dir.join("renamed"),
+        "robodr-focal-0.1.0-all-offline.tar.gz",
+    );
+    let o = run(&[
+        "install",
+        "--pubkey",
+        pk,
+        "--tarball",
+        renamed.to_str().unwrap(),
+    ]);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("trusted comment"), "{}", stderr(&o));
+
+    // A genuinely signed robodr-focal bundle does not silently replace the
+    // installed robodr (robodr-focal has no robodr-pulsard) ...
+    let fdeb = stub_deb_pkg(&dir, "robodr-focal", v, f, "focal", None);
+    let fb = bundle_named(
+        &dir.join("focal-src"),
+        &fdeb,
+        "robodr-focal-0.1.0-all",
+        None,
+    );
+    let ft = signed_tarball(&dir.join("rel-focal"), &fb, &secret);
+    let ftb = ft.to_str().unwrap();
+    let o = run(&["install", "--pubkey", pk, "--tarball", ftb]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("REPLACES robodr") && stderr(&o).contains("--allow-variant-switch"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(installed(&root), v);
+    // ... a signed tarball whose name names the other variant is refused ...
+    let mixed = signed_tarball_named(
+        &dir.join("rel-mixed"),
+        &fb,
+        &secret,
+        "robodr-0.1.0-all-offline.tar.gz",
+    );
+    let o = run(&[
+        "install",
+        "--pubkey",
+        pk,
+        "--tarball",
+        mixed.to_str().unwrap(),
+        "--allow-variant-switch",
+    ]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("names the robodr variant but holds robodr-focal"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(installed(&root), v);
+    // ... and the deliberate switch works.
+    let t2 = ok(&run(&[
+        "install",
+        "--pubkey",
+        pk,
+        "--tarball",
+        ftb,
+        "--allow-variant-switch",
+    ]));
+    assert!(t2.contains("switching from robodr to robodr-focal"), "{t2}");
+    assert_eq!(dpkg_state(&root, "robodr-focal").0, v);
+    assert!(is_empty_dir(&tmp), "private staging directory removed");
+}
+
+/// Review finding (packaging, LOW-MED): only `ii` counted as installed, so
+/// after a failed upgrade (robodr half-configured) an older release passed
+/// `install` without the downgrade refusal.
+#[test]
+fn a_half_configured_package_counts_as_installed() {
+    if !dpkg_available("half_configured") {
+        return;
+    }
+    let dir = TempDir::new("half");
+    let root = dpkg_root(&dir);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let f = Some(("RBF1:1", "RBF1:1"));
+    let b1 = bundle(&dir, &stub_deb(&dir, "0.1.0-1", f));
+    let broken = stub_deb_pkg(
+        &dir,
+        "robodr",
+        "0.2.0-1",
+        f,
+        "broken",
+        Some("#!/bin/sh\necho postinst fails >&2\nexit 1\n"),
+    );
+    let b2 = bundle_named(&dir, &broken, "b2", None);
+    let run = |b: &Path, args: &[&str]| {
+        run_bundle_with(&root, &b.join("install-bundle.sh"), args, true, &tmp)
+    };
+    let o = run(&b2, &["install"]);
+    assert_ne!(o.status.code(), Some(0), "{}", stderr(&o));
+    let (v, st) = dpkg_state(&root, "robodr");
+    assert_eq!(
+        (v.as_str(), st.as_str()),
+        ("0.2.0-1", "iF"),
+        "half-configured"
+    );
+    let o = run(&b1, &["install"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("downgrade"), "{}", stderr(&o));
+    assert_eq!(dpkg_state(&root, "robodr").0, "0.2.0-1");
 }
 
 // ------------------------------------------------------- RPM bundles ---

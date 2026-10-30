@@ -42,6 +42,40 @@ migrate_agentd_tree() {
 }
 # <<< migrate_agentd_tree
 
+# >>> migrate_exporter_users (packaging/rpm/post carries the same block;
+# scripts/check-packages.py keeps them identical)
+# Upgrade from a release where robodr-spool-export, robodr-kafka-publish,
+# robodr-uplink and robodr-firewall-gw all ran as the shared user robodr
+# (review: each could read the others' credentials and rewrite their
+# state). Each now has its own user; the state those releases wrote as
+# robodr moves to it once, with the four units stopped, by the same
+# link-safe, resumable steps as the agentd migration (migrate_agentd_tree:
+# no symlink followed, hardlinks broken, group/other write and
+# setuid/setgid removed). Marker: /var/lib/robodr/.exporter-users-migrated.
+migrate_exporter_users() {
+    meu_marker=/var/lib/robodr/.exporter-users-migrated
+    [ ! -e "$meu_marker" ] || return 0
+    if [ -d /run/systemd/system ]; then
+        for u in robodr-spool-export.service robodr-kafka-publish.service \
+            robodr-uplink.service robodr-firewall-gw.service; do
+            if systemctl is-active --quiet "$u"; then
+                systemctl stop "$u"
+                stopped="$stopped $u"
+            fi
+        done
+    fi
+    for meu_pair in /var/lib/robodr/export/diode:robodr-spool \
+        /var/lib/robodr/export/spool-export:robodr-spool \
+        /var/lib/robodr/export/kafka-publish:robodr-kafka \
+        /var/lib/robodr/export/uplink:robodr-uplink \
+        /var/lib/robodr/firewall-gw:robodr-gw; do
+        migrate_agentd_tree "${meu_pair%%:*}" robodr "${meu_pair#*:}" robodr
+    done
+    mkdir -p /var/lib/robodr
+    : >"$meu_marker"
+}
+# <<< migrate_exporter_users
+
 case "$1" in
 configure)
     if command -v systemd-sysusers >/dev/null 2>&1; then
@@ -67,6 +101,14 @@ configure)
                 --shell /usr/sbin/nologin robodr-depot
         fi
         adduser robodr-depot robodr >/dev/null
+        # One user per network-facing service (their units set
+        # Group=robodr; sysusers.d/robodr.conf).
+        for u in robodr-spool robodr-kafka robodr-uplink robodr-gw; do
+            if ! getent passwd "$u" >/dev/null; then
+                adduser --system --group --home /var/lib/robodr --no-create-home \
+                    --shell /usr/sbin/nologin "$u"
+            fi
+        done
     fi
     # Upgrade from a version where robodr-agentd ran as robodr (review H1):
     # agentd's own trees move to its own user before tmpfiles sets the
@@ -95,6 +137,7 @@ configure)
         mkdir -p /var/lib/robodr
         : >"$migrated"
     fi
+    migrate_exporter_users
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
     fi

@@ -96,7 +96,11 @@ robodr_pin_cc "$triple" build-static || exit 1
 cc_var="CC_$(printf '%s' "$triple" | tr '-' '_')"
 echo "build-static: $triple, linker ${!linker_var}, C compiler ${!cc_var}, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >&2
 
-if ! rustup target list --installed 2>/dev/null | grep -qx "$triple"; then
+# The target's standard library must be installed: through rustup, or in
+# the sysroot of a toolchain installed without it
+# (scripts/ci-install-pinned-toolchain.sh, release.yml's rebuild).
+if ! rustup target list --installed 2>/dev/null | grep -qx "$triple" &&
+    [[ ! -d "$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$triple/lib" ]]; then
     echo "build-static: target $triple not installed: rustup target add $triple" >&2
     exit 1
 fi

@@ -57,12 +57,18 @@ MemoryHigh=96M
 MemoryMax=128M
 
 # --- Identity and capabilities ---------------------------------------------
-User=robodr
+# Its own user (review: a uid shared with the other exporters and the
+# gateway let each read the others' credentials); group robodr for
+# the spool queues and /etc/robodr.
+User=robodr-gw
 Group=robodr
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 UMask=0027
+# Defense in depth: no unit's credentials are visible here (this unit
+# loads none; /run/credentials is an empty read-only tmpfs).
+TemporaryFileSystem=/run/credentials:ro
 
 # --- Filesystem --------------------------------------------------------------
 ProtectSystem=strict
