@@ -229,8 +229,11 @@
   remote erase are not done ([`docs/SECURE-DELIVERY.md`](../SECURE-DELIVERY.md) §10).
 - **Backup and restore** are documented ([`docs/OPERATIONS.md`](../OPERATIONS.md)
   §14), but the restore order has not been rehearsed on a unit.
-- **Debian 12 and Ubuntu 22.04 hosts** get the agentd-only package
-  ([`support-matrix.md`](support-matrix.md)).
+- **Ubuntu 20.04 / JetPack 5 hosts** (glibc 2.31, systemd 245) get the
+  `robodr-focal` package: agentd and the tools, no `robodr-pulsard`, so
+  no host rules. Debian 12 and Ubuntu 22.04 take the regular package
+  (glibc 2.35+, systemd 247+;
+  [platform requirements](support-matrix.md#platform-requirements)).
 - **Resource budgets are unmeasured** on target hardware.
 - **The Kafka exporter** is idempotent by default (exactly-once per
   partition within a producer id's lifetime), tested against an in-process

@@ -16,16 +16,45 @@
 | **V0 none** | Targeted or expected to work, but not exercised. |
 | **Not supported** | Known not to work, or out of scope. |
 
+## Platform requirements
+
+This is the one requirements table; the other documents link here. The
+levels below say how far each platform has been verified.
+
+| Item | `robodr` `.deb` | `robodr` `.rpm` | `robodr-focal` `.deb` |
+|---|---|---|---|
+| Distributions | Ubuntu 22.04 / 24.04, NVIDIA JetPack 6, Debian 12 / 13 | RHEL / Rocky / Alma 9, Fedora | Ubuntu 20.04, NVIDIA JetPack 5; also installs on 22.04 and newer |
+| Architectures | amd64, arm64 | x86_64, aarch64 | amd64, arm64 |
+| glibc | **2.35 or newer** (`Depends: libc6 (>= 2.35)`, read from the binaries; the release is built in an Ubuntu 22.04 container) | **2.34 or newer** (built in a Rocky Linux 9 container) | none (static musl) |
+| systemd | **247 or newer** (`LoadCredential=`, `ProtectProc=`) | 247 or newer (RHEL 9 has 252) | **245 or newer** |
+| Other libraries | libgcc-s1, libsqlite3-0 (declared by the package) | openssl-libs, sqlite-libs (generated requirements) | none |
+| Host monitoring (`robodr-pulsard`, eBPF) | Linux 5.5 or newer with BTF (`/sys/kernel/btf/vmlinux`) or, on JetPack 6, an external BTF file for exactly the running kernel; bpffs at `/sys/fs/bpf` | same | **not shipped** |
+| Offline bundle | `robodr-<ver>-<arch>-offline.tar.gz` (`install-bundle.sh`, `dpkg`) | `robodr-<ver>-<arch>-rpm-offline.tar.gz` (same `install-bundle.sh`, `rpm -U`) | `robodr-focal-<ver>-<arch>-offline.tar.gz` |
+| Tools to install | `sha256sum`, and `minisign` wherever the bundle signature is checked (`install-bundle.sh` refuses to install without a signature check) | same | same |
+
+Optional components need more from the kernel:
+
+| Component | Needs |
+|---|---|
+| `robodr-agentd` live capture | `CAP_NET_RAW` (the unit grants only that) and the capture interface; a mirror port or tap on a sensor box |
+| `robodr-executor` (off by default) | nf_tables (`nft`), `CAP_NET_ADMIN`; `br_netfilter` to isolate bridged traffic |
+| `robodr-firewall-gw` (inline gateway, sensor box) | two NICs bridged, `br_netfilter`, `nfnetlink_queue` (NFQUEUE), `CAP_NET_ADMIN`; IPv4 only |
+| Black-box TPM anchor, sealed delivery | TPM 2.0 and `tpm2-tools` (verified with swtpm only) |
+
+Not supported: glibc older than 2.35 or systemd older than 247 with the
+`robodr` `.deb` (use `robodr-focal`), RHEL 8, SUSE, 32-bit architectures,
+non-systemd init systems.
+
 ## Operating system and architecture
 
 | Platform | Package | Level | Evidence / notes |
 |---|---|---|---|
 | Ubuntu 22.04 / 24.04, amd64 | `robodr` (built for glibc ≥ 2.35, systemd ≥ 247, with `robodr-pulsard`) | V1 | amd64: built in an Ubuntu 22.04 container and installed with apt in Ubuntu 22.04 and 24.04 containers (2026-10-30): dependencies resolved, maintainer scripts ran, every program started, units verified by that systemd, remove/purge kept evidence. No booted systemd, no target host. |
-| Ubuntu 22.04 / 24.04, arm64, incl. NVIDIA JetPack 6 | `robodr` (arm64) | V0 | Same build in CI configuration (native arm64 runner, Ubuntu 22.04 container); **not yet built or run**: CI has not run. Host rules on JetPack 6 additionally need BTF or an external BTF file ([`docs/UNITREE.md`](../UNITREE.md) 3.2.1). |
+| Ubuntu 22.04 / 24.04, arm64, incl. NVIDIA JetPack 6 | `robodr` (arm64) | V0 | The current build (native arm64 runner, Ubuntu 22.04 container) is configured in CI but has not produced a package yet. An earlier configuration was cross-built and its tests run under qemu-user ([`docs/BUILD.md`](../BUILD.md), "arm64 (cross-compiled, 2026-10-18)"); never run on arm64 hardware. Host rules on JetPack 6 additionally need BTF or an external BTF file ([`docs/UNITREE.md`](../UNITREE.md) 3.2.1). |
 | Ubuntu 20.04 / JetPack 5, amd64 + arm64 (also usable on 22.04) | `robodr-focal` (static musl, systemd ≥ 245, **no `robodr-pulsard`**) | V1 | Built, reproduced, smoke-run (arm64 under qemu-user), and installed with dpkg in a container. Not run on a Jetson or under a real systemd 245. The arm64 binaries are non-PIE. |
 | Debian 12, amd64 | `robodr` | V1 | The Ubuntu 22.04 build installed with apt in a Debian 12 container (2026-10-30), same checks as above. arm64: CI configuration only. |
 | Debian 13 | `robodr` expected to work | V0 | Same package names and a newer glibc than Debian 12; not installed there. |
-| RHEL / Rocky / Alma 9, Fedora 42, x86_64 | `robodr` `.rpm` (built on Rocky Linux 9, glibc ≥ 2.34) | V1 | Built in a Rocky Linux 9 container and installed with dnf in Rocky Linux 9.8 and Fedora 42 containers (2026-10-30), same checks as above. No offline bundle (the bundle installer is dpkg-based): verify the minisign signature, then `dnf install`. aarch64: CI configuration only. |
+| RHEL / Rocky / Alma 9, Fedora 42, x86_64 | `robodr` `.rpm` (built on Rocky Linux 9, glibc ≥ 2.34) | V1 | Built in a Rocky Linux 9 container and installed with dnf in Rocky Linux 9.8 and Fedora 42 containers (2026-10-30), same checks as above. Offline: the RPM offline bundle (`install-bundle.sh` with `rpm -U`), tested against `rpm` in a separate root only; or verify the minisign signature and `dnf install` the `.rpm`. aarch64: CI configuration only. |
 | Other RPM distributions (SUSE, RHEL 8) | — | Not supported | |
 
 ## Kernel and host monitoring (`robodr-pulsard`, eBPF)

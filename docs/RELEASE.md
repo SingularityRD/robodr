@@ -144,7 +144,7 @@ repository.
 - [ ] signed tag pushed
 - [ ] reproducibility lines present in all six build jobs
 - [ ] `smoke` green on both architectures
-- [ ] 19 assets + `.minisig` each in the published release, per-arch `SHA256SUMS-*`
+- [ ] 21 assets + `.minisig` each in the published release (section 1), per-arch `SHA256SUMS-*`
 - [ ] `release` environment approved by a second maintainer
 - [ ] published release verified offline with the pinned key
 - [ ] `deb-install-smoke.sh` on the published `.deb`s
@@ -256,8 +256,9 @@ for real (`clang-20`, `lld-20`, `llvm-20`, `minisign`, ...); its
 job and acceptance check passed; it found and fixed three defects
 (`prepare` did not compare the `Cargo.toml` version with `VERSION`;
 `ROBODR_DEB_REQUIRE` lacked three daemons; `ci-repro.sh` leaked its scratch
-directory). The package smoke test reports eight binaries without a working
-`--version` (and two whose `--help` exits 2): crate code, not yet fixed.
+directory). The package smoke test reported eight binaries without a working
+`--version` (and two whose `--help` exits 2); fixed in the crates after
+the run, and the dry run now runs the smoke test with `--strict`.
 Details, adaptations and the artefact hashes: `docs/BUILD.md`, "Release
 dry run (2026-10-26)".
 

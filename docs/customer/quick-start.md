@@ -25,7 +25,7 @@ the motion stack depends on it**, and run the first field period
 
 | | On-robot agent | Passive sensor box |
 |---|---|---|
-| Where | The robot's companion computer (Ubuntu 24.04, or `robodr-focal` on 20.04 / 22.04) | A separate box on a tap or mirror port |
+| Where | The robot's companion computer: `robodr` on Ubuntu 22.04 / 24.04, JetPack 6, Debian 12 / 13 or EL9; `robodr-focal` on Ubuntu 20.04 / JetPack 5 ([platform requirements](support-matrix.md#platform-requirements)) | A separate box on a tap or mirror port |
 | Sees | DDS traffic on that computer's interfaces, plus host behaviour if `robodr-pulsard` can run (a BTF kernel) | DDS traffic on the mirrored link. Installs nothing on the robot. |
 
 ## 1. Entry station: verify the release
@@ -58,9 +58,12 @@ sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
 ```
 
 Units are installed **disabled**. Before installing, check the
-requirements: kernel with BTF for `robodr-pulsard`, systemd 247+, glibc
-2.39 for the regular package ([OPERATIONS section 1](../OPERATIONS.md)). On
-a sensor box, also follow the hardening checklist in
+[platform requirements](support-matrix.md#platform-requirements): for the
+`robodr` package glibc 2.35+ and systemd 247+ (`robodr-focal`: systemd
+245+), a kernel with BTF for `robodr-pulsard`, and `minisign` where the
+signature is checked. RHEL / Rocky / Alma 9 use the RPM offline bundle
+(`robodr-$V-$A-rpm-offline.tar.gz`) with the same commands. On a sensor
+box, also follow the hardening checklist in
 [UNITREE.md section 3.1](../UNITREE.md).
 
 ## 3. Keys
