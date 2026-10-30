@@ -59,6 +59,21 @@ Checks (``--only`` takes these names):
       ``--skip-git`` to leave this check out (it is then reported as
       skipped, never as passed).
 
+  evidence-links
+      Every document in STAMPED_DOCS and EVIDENCE_DOCS is evidence for a
+      customer: each relative Markdown link target (``](path)``, anchors
+      ignored) and each backticked repository path (``crates/...``,
+      ``scripts/...``, ``docs/...``, ``packaging/...``, ``fuzz/...``,
+      ``tools/...``, ``config/...``, ``rules/...``, ``man/...``, or a test
+      file written as ``robodr-<crate>/tests/<f>.rs`` relative to crates/)
+      must exist.
+
+  pulsar-pin
+      Source: the gitlink of vendor/pulsar in HEAD. The Pulsar
+      due-diligence record names that commit in full, and
+      docs/PULSAR-INTEGRATION.md's "Verified against Pulsar commit" names
+      its prefix. Needs git (left out, and reported, with --skip-git).
+
 Usage:
   scripts/check-doc-facts.py [--root DIR] [--only CHECK[,CHECK...]]
                              [--max-stamp-age N] [--skip-git]
@@ -95,6 +110,12 @@ STAMPED_DOCS = (
     "docs/customer/data-handling.md",
 )
 
+# Further documents whose evidence links must resolve.
+EVIDENCE_DOCS = ("SECURITY.md",)
+
+DUE_DILIGENCE_MD = "docs/compliance/third-party-due-diligence.md"
+PULSAR_INTEGRATION_MD = "docs/PULSAR-INTEGRATION.md"
+
 MODEL_RS = "crates/robodr-ocsf/src/model.rs"
 CONTRACT_MD = "docs/contracts/robodr.findings.md"
 SCHEMA_JSON = "docs/contracts/robodr-finding.schema.json"
@@ -106,7 +127,21 @@ ADR_0005 = "docs/adr/0005-action-catalog.md"
 MOTION_RS = "crates/robodr-executor/src/motion/mod.rs"
 EXECUTOR_README = "crates/robodr-executor/README.md"
 
-CHECKS = ("contract-version", "workspace-members", "fuzz-targets", "action-catalog", "stamps")
+CHECKS = (
+    "contract-version",
+    "workspace-members",
+    "fuzz-targets",
+    "action-catalog",
+    "stamps",
+    "evidence-links",
+    "pulsar-pin",
+)
+
+LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
+PATH_RE = re.compile(
+    r"`((?:crates|scripts|docs|packaging|fuzz|tools|config|rules|man)/[A-Za-z0-9_./-]+"
+    r"|robodr-[a-z0-9-]+/tests/[A-Za-z0-9_]+\.rs)`"
+)
 
 HISTORY_MARKERS = re.compile(
     r"(?:\bsince|\bbefore|\buntil|\bfrom|\bup to|\badded in|\bintroduced in)\s+(?:the\s+)?$",
@@ -501,6 +536,49 @@ def check_stamps(root: Path, max_age: int | None, notes: list[str]) -> list[str]
     return errs
 
 
+def check_evidence_links(root: Path) -> list[str]:
+    errs: list[str] = []
+    for rel in expand(root, STAMPED_DOCS + EVIDENCE_DOCS):
+        text = read(root, rel)
+        base = (root / rel).parent
+        for m in LINK_RE.finditer(text):
+            target = m.group(1).split("#", 1)[0]
+            if not target or re.match(r"^[a-z]+:", target):
+                continue
+            if not (base / target).exists():
+                errs.append(f"{rel}:{line_of(text, m.start())}: link target {target} does not exist")
+        for m in PATH_RE.finditer(text):
+            path = m.group(1).rstrip("./")
+            cand = root / "crates" / path if path.startswith("robodr-") else root / path
+            if not cand.exists():
+                errs.append(f"{rel}:{line_of(text, m.start())}: path {m.group(1)} does not exist")
+    return errs
+
+
+def check_pulsar_pin(root: Path) -> list[str]:
+    r = git(root, "ls-tree", "HEAD", "vendor/pulsar")
+    m = re.match(r"160000 commit ([0-9a-f]{40})\t", r.stdout)
+    if r.returncode != 0 or not m:
+        raise SourceError("vendor/pulsar is not a submodule gitlink in HEAD")
+    sha = m.group(1)
+    errs: list[str] = []
+    dd = read(root, DUE_DILIGENCE_MD)
+    named = re.search(r"Pinned commit \| `([0-9a-f]{40})`", dd)
+    if not named or named.group(1) != sha:
+        errs.append(
+            f"{DUE_DILIGENCE_MD}: pinned commit {named.group(1) if named else '(none)'}, "
+            f"vendor/pulsar is at {sha}; review the bump and update the record"
+        )
+    pi = read(root, PULSAR_INTEGRATION_MD)
+    v = re.search(r"Verified against Pulsar commit ([0-9a-f]{7,40})", pi)
+    if not v or not sha.startswith(v.group(1)):
+        errs.append(
+            f"{PULSAR_INTEGRATION_MD}: verified against {v.group(1) if v else '(none)'}, "
+            f"vendor/pulsar is at {sha[:12]}"
+        )
+    return errs
+
+
 def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tuple[list[str], list[str]]:
     errs: list[str] = []
     notes: list[str] = []
@@ -519,6 +597,13 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
                     notes.append("stamps: SKIPPED (--skip-git); nothing about the stamps was checked")
                 else:
                     errs += check_stamps(root, max_age, notes)
+            elif name == "evidence-links":
+                errs += check_evidence_links(root)
+            elif name == "pulsar-pin":
+                if skip_git:
+                    notes.append("pulsar-pin: SKIPPED (--skip-git); the Pulsar pin was not checked")
+                else:
+                    errs += check_pulsar_pin(root)
         except SourceError as e:
             raise SourceError(f"{name}: {e}") from e
     return errs, notes
@@ -543,7 +628,15 @@ GOOD_TREE: dict[str, str] = {
         "Findings: `robodr.findings` 2.4 over uplink; since `robodr.findings` 2.2 the deliverd.\n"
         "All 2 members inherit it. 3 fuzz targets.\n"
     ),
-    "docs/compliance/a.md": "> Verified at commit `STAMP` (date).\n\nfindings contract 2.4.0\n",
+    "docs/compliance/a.md": (
+        "> Verified at commit `STAMP` (date).\n\nfindings contract 2.4.0\n"
+        "See [the readme](../../README.md#layout) and `robodr-a/tests/t.rs`, `scripts/x.py`.\n"
+    ),
+    "crates/robodr-a/tests/t.rs": "",
+    "scripts/x.py": "",
+    "SECURITY.md": "Report via [web](https://example.invalid/) or [here](#reporting).\n",
+    DUE_DILIGENCE_MD: "> Verified at commit `STAMP`.\n\n| Pinned commit | `PULSAR` (date) |\n",
+    PULSAR_INTEGRATION_MD: "**Verified against Pulsar commit PULSHORT by reading its source**\n",
     "docs/customer/data-handling.md": "> Verified at commit `STAMP`.\n",
     "fuzz/Cargo.toml": "".join(
         f'[[bin]]\nname = "{t}"\npath = "fuzz_targets/{t}.rs"\n\n' for t in ("t_one", "t_two", "t_three")
@@ -630,6 +723,13 @@ MUTATIONS = (
     ("action-catalog", MOTION_RS, '            AdapterKind::Nav2 => "nav2",\n',
      '            AdapterKind::Nav2 => "nav2",\n            AdapterKind::Px4 => "px4",\n',
      "does not name adapter `px4`"),
+    ("evidence-links", "docs/compliance/a.md", "`robodr-a/tests/t.rs`", "`robodr-a/tests/gone.rs`",
+     "path robodr-a/tests/gone.rs does not exist"),
+    ("evidence-links", "docs/compliance/a.md", "(../../README.md#layout)", "(../../READ.md)",
+     "link target ../../READ.md does not exist"),
+    ("evidence-links", "SECURITY.md", "(#reporting)", "(docs/none.md)", "link target docs/none.md does not exist"),
+    ("pulsar-pin", DUE_DILIGENCE_MD, "`PULSAR`", "`" + "a" * 40 + "`", "review the bump"),
+    ("pulsar-pin", PULSAR_INTEGRATION_MD, "PULSHORT", "abcdef1", "verified against abcdef1"),
     ("stamps", "docs/customer/data-handling.md", "> Verified at commit `STAMP`.\n", "> Reviewed.\n",
      "no 'Verified at commit"),
     ("stamps", "docs/compliance/a.md", "`STAMP`", "`0123456789abcdef0123456789abcdef01234567`",
@@ -644,9 +744,16 @@ def build_tree(root: Path, tree: dict[str, str]) -> None:
         p.write_text(content, encoding="utf-8")
 
 
-def git_commit(root: Path, msg: str) -> str:
+def git_commit(root: Path, msg: str, gitlink: str | None = None) -> str:
     env = ["-c", "user.name=t", "-c", "user.email=t@invalid", "-c", "commit.gpgsign=false"]
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, capture_output=True)
+    if gitlink:
+        # vendor/pulsar as a submodule gitlink (an index entry, no checkout).
+        subprocess.run(
+            ["git", "-C", str(root), "update-index", "--add", "--cacheinfo",
+             f"160000,{gitlink},vendor/pulsar"],
+            check=True, capture_output=True,
+        )
     subprocess.run(["git", "-C", str(root), *env, "commit", "-q", "--allow-empty", "-m", msg],
                    check=True, capture_output=True)
     return git(root, "rev-parse", "HEAD").stdout.strip()
@@ -667,11 +774,16 @@ def self_test() -> int:
         base = Path(td) / "repo"
         base.mkdir()
         subprocess.run(["git", "init", "-q", str(base)], check=True, capture_output=True)
-        build_tree(base, {k: v.replace("STAMP", "0" * 7) for k, v in GOOD_TREE.items()})
-        first = git_commit(base, "first")
-        stamped = {k: v.replace("STAMP", first[:12]) for k, v in GOOD_TREE.items()}
+        pulsar = "4796504895ce42f95ffc1e414be19a5d7f40fc0a"
+
+        def fill(v: str, stamp: str) -> str:
+            return v.replace("STAMP", stamp).replace("PULSHORT", pulsar[:7]).replace("PULSAR", pulsar)
+
+        build_tree(base, {k: fill(v, "0" * 7) for k, v in GOOD_TREE.items()})
+        first = git_commit(base, "first", pulsar)
+        stamped = {k: fill(v, first[:12]) for k, v in GOOD_TREE.items()}
         build_tree(base, stamped)
-        git_commit(base, "stamp")
+        git_commit(base, "stamp", pulsar)
 
         errs, notes = run(base, list(CHECKS), None, False)
         expect("consistent tree passes", errs == [], str(errs))
@@ -681,7 +793,7 @@ def self_test() -> int:
         side = git(base, "rev-parse", "HEAD").stdout.strip()
         subprocess.run(["git", "-C", str(base), "checkout", "-q", "-b", "side"], check=True)
         build_tree(base, {"other.txt": "x"})
-        side_commit = git_commit(base, "side")
+        side_commit = git_commit(base, "side", pulsar)
         subprocess.run(["git", "-C", str(base), "checkout", "-q", side], check=True, capture_output=True)
         p = base / "docs/compliance/a.md"
         p.write_text(stamped["docs/compliance/a.md"].replace(first[:12], side_commit[:12]))
@@ -691,7 +803,7 @@ def self_test() -> int:
 
         # Stamp age limit: one code commit after the stamp.
         build_tree(base, {"crates/robodr-a/src/lib.rs": "// change\n"})
-        git_commit(base, "code")
+        git_commit(base, "code", pulsar)
         errs, _ = run(base, ["stamps"], 0, False)
         expect("--max-stamp-age 0 fails an aged stamp", any("code commits old" in e for e in errs), str(errs))
         errs, _ = run(base, ["stamps"], 5, False)
@@ -707,7 +819,7 @@ def self_test() -> int:
         rd.write_text(stamped["README.md"])
 
         for check, rel, old, new, want in MUTATIONS:
-            old = old.replace("STAMP", first[:12])
+            old = old.replace("STAMP", first[:12]).replace("PULSHORT", pulsar[:7]).replace("PULSAR", pulsar)
             p = base / rel
             orig = p.read_text(encoding="utf-8")
             if old not in orig:
