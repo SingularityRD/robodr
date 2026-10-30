@@ -934,7 +934,10 @@ impl Pipeline {
             if let Some(p) = &p {
                 self.binding.note_finding(p, dev.severity);
             }
-            let key = format!("{}|{}", dev.rule, dev.detail);
+            // Dedup on what is displayed (Finding::description / extra):
+            // details that differ only in text `sanitize` cuts out are one
+            // finding, not a flood of identical-looking ones.
+            let key = format!("{}|{}", dev.rule, sanitize(&dev.detail));
             if self.seen.contains(&key) || !batch_keys.insert(key.clone()) {
                 self.stats.duplicates += 1;
                 continue;

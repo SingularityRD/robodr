@@ -975,3 +975,36 @@ fn evicted_profiled_discovery_sample_is_named_and_high() {
     assert!(detail.contains("profiled"), "{detail}");
     assert!(p.stats().fragment_evictions >= 1);
 }
+
+// ------------------------------------------------- finding text review ----
+
+/// Review: findings were deduplicated on the raw detail, but displayed
+/// sanitized and cut to 512 chars, so announcements whose names differed
+/// only in the cut-out part became a flood of identical-looking findings;
+/// and a long topic pushed the participant / source address out of the
+/// displayed detail.
+#[test]
+fn long_names_dedup_on_displayed_text_and_keep_the_attribution() {
+    let mut p = pipeline();
+    let t = Instant::now();
+    bind_legit(&mut p, t);
+    let topic = |mid: char| format!("rt/{}{mid}{}", "a".repeat(1500), "b".repeat(1500));
+    // An endpoint of the profiled participant announced from another IP:
+    // the binding detail names the topic first, then participant and IP.
+    let f1 = p.process_at(&sedp_from(LEGIT, LEGIT, &topic('X')), XIP, t);
+    let m1 = with_rule(&f1, rules::ENDPOINT_SOURCE_MISMATCH);
+    assert_eq!(m1.len(), 1, "{f1:#?}");
+    let shown = m1[0].description();
+    assert!(shown.contains(LEGIT_HEX), "{shown}");
+    assert!(shown.contains(XIP), "{shown}");
+    // Same announcement with a different character in the middle of the
+    // name: displayed identically, so it is a duplicate.
+    let f2 = p.process_at(&sedp_from(LEGIT, LEGIT, &topic('Y')), XIP, t);
+    for f in &f2 {
+        assert!(
+            !f1.iter().any(|g| g.description() == f.description()),
+            "identical-looking finding reported twice: {}",
+            f.description()
+        );
+    }
+}
