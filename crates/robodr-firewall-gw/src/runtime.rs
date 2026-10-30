@@ -353,6 +353,12 @@ struct Events {
     /// Status: the NFLOG group could not be bound / copies lost.
     observe_unavailable: bool,
     observe_overruns: u64,
+    /// agentd's gateway feed (`findings_socket`), on its own thread.
+    feed: Option<crate::feed::FeedThread>,
+    /// The restriction file, read on its own thread.
+    watcher: Option<crate::restrict::Watcher>,
+    /// The last restriction file error (status `restriction_error`).
+    restriction_error: Option<String>,
 }
 
 impl Events {
@@ -379,17 +385,104 @@ impl Events {
             port_warned: false,
             observe_unavailable: false,
             observe_overruns: 0,
+            feed: cfg.findings_socket.clone().and_then(|p| {
+                crate::feed::FeedThread::spawn(p)
+                    .map_err(|e| eprintln!("robodr-firewall-gw: findings feed thread: {e}"))
+                    .ok()
+            }),
+            watcher: cfg.restriction_path.clone().and_then(|p| {
+                crate::restrict::Watcher::spawn(p, Duration::from_millis(cfg.housekeeping_ms))
+                    .map_err(|e| eprintln!("robodr-firewall-gw: restriction thread: {e}"))
+                    .ok()
+            }),
+            restriction_error: None,
         }
     }
 }
 
+/// Apply the restriction watcher's latest read (`latest`, `None`: nothing
+/// new) to the gateway; an expired restriction is lifted whatever was
+/// read (the gateway enforces the TTL itself). Returns the read error to
+/// report, or the previous one when nothing new arrived.
+pub fn apply_restriction(
+    gw: &mut Gateway,
+    latest: Option<Result<Option<crate::restrict::Restriction>, String>>,
+    previous_error: Option<String>,
+    now_unix_ms: u64,
+) -> Option<String> {
+    let err = match latest {
+        None => previous_error,
+        Some(Ok(Some(r))) if !r.expired(now_unix_ms) => {
+            gw.set_restriction(Some(r));
+            None
+        }
+        Some(Ok(_)) => {
+            gw.set_restriction(None);
+            None
+        }
+        // Never "no restriction" silently: the one in force stays until
+        // its own expiry, and the status says why.
+        Some(Err(e)) => Some(e),
+    };
+    if gw.restriction().is_some_and(|r| r.expired(now_unix_ms)) {
+        gw.set_restriction(None);
+    }
+    err
+}
+
 fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist: &LatencyHist) {
-    let devs = gw.firewall_mut().drain_deviations();
-    for d in devs {
+    let latest = events.watcher.as_ref().and_then(|w| w.latest());
+    let err = apply_restriction(
+        gw,
+        latest,
+        events.restriction_error.clone(),
+        sys::realtime_ns() / 1_000_000,
+    );
+    if err.is_some() && err != events.restriction_error {
+        eprintln!(
+            "robodr-firewall-gw: WARNING: restriction file ignored: {}",
+            err.as_deref().unwrap_or("")
+        );
+    }
+    events.restriction_error = err;
+    gw.discovery_mut().expire(Instant::now());
+    if let Some(w) = gw.discovery().port_bypass().map(|w| w.to_string()) {
+        if !events.port_warned {
+            gw.findings
+                .note(crate::findings::rules::PORT_BYPASS_RISK, None, || {
+                    crate::findings::Detail {
+                        what: Some(w),
+                        ..crate::findings::Detail::reason("unqueued_locator")
+                    }
+                });
+        }
+    }
+    let mode = match gw.mode() {
+        GatewayMode::Enforce => robodr_events::Mode::Enforce,
+        GatewayMode::Observe => robodr_events::Mode::Observe,
+    };
+    let mut out: Vec<(robodr_events::Deviation, Option<String>, u64)> = gw
+        .firewall_mut()
+        .drain_deviations()
+        .into_iter()
+        .map(|d| (d, None, 1))
+        .collect();
+    out.extend(
+        gw.findings
+            .drain(mode)
+            .into_iter()
+            .map(|g| (g.deviation, g.channel, g.count)),
+    );
+    for (d, channel, count) in &out {
+        if let Some(feed) = events.feed.as_mut() {
+            if let Some(l) = crate::feed::line(d, channel.as_deref(), *count) {
+                feed.push(l);
+            }
+        }
         let Some(f) = events.file.as_mut() else {
             continue;
         };
-        let Ok(line) = serde_json::to_string(&d) else {
+        let Ok(line) = serde_json::to_string(d) else {
             continue;
         };
         if events.written + line.len() as u64 + 1 > events.max {
@@ -403,7 +496,6 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
     if let Some(f) = events.file.as_mut() {
         let _ = f.flush();
     }
-    gw.discovery_mut().expire(Instant::now());
     if let Some(w) = gw.discovery().port_bypass() {
         if !events.port_warned {
             events.port_warned = true;
@@ -452,6 +544,20 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
                 "max": hist.max_ns,
             },
             "events_dropped_size_cap": events.dropped,
+            "restriction": gw.restriction().map(|r| json!({
+                "id": r.id, "max_linear_speed": r.max_linear_speed,
+                "max_joint_speed": r.max_joint_speed, "factor": r.factor,
+                "expires_unix_ms": r.expires_unix_ms,
+            })),
+            "restriction_error": events.restriction_error,
+            "findings_total": gw.findings.total,
+            "findings_feed": events.feed.as_ref().map(|f| {
+                let s = f.status();
+                json!({
+                    "connected": s.connected, "sent": s.sent, "pending": s.pending,
+                    "dropped": s.dropped, "last_error": s.last_error,
+                })
+            }),
         });
         let tmp = p.with_extension("tmp");
         if std::fs::write(&tmp, status.to_string()).is_ok() {

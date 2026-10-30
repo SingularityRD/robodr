@@ -113,6 +113,9 @@ pub enum Status {
     Failed,
     /// Recorded only (v1 `restrict_motion`).
     Advisory,
+    /// A non-reversible motion action took effect (`request_safe_state`,
+    /// `rollback_config`); there is nothing to revert.
+    Applied,
     /// Removed from outside (`nft delete table inet robodr`).
     RemovedExternally,
     /// After a reboot: waiting for re-validation and a fresh safety check
@@ -132,6 +135,7 @@ impl Status {
             Status::Refused => "refused",
             Status::Failed => "failed",
             Status::Advisory => "advisory",
+            Status::Applied => "applied",
             Status::RemovedExternally => "removed_externally",
             Status::Held => "held",
             Status::Unknown => "unknown",
@@ -299,6 +303,8 @@ pub struct Engine {
     pub journal_errors: u64,
     /// The executor's own SOC replay store (trust boundary M1).
     soc_replay: crate::soc::ReplayStore,
+    /// The platform adapters of motion actions (Sprint 8).
+    motion: Box<dyn crate::motion::MotionPorts + Send>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -366,6 +372,7 @@ impl Engine {
             last_hold_reason: None,
             journal_errors: 0,
             soc_replay,
+            motion: Box::new(crate::motion::SystemPorts),
         };
         if let Some(why) = e.soc_replay.fenced_because.clone() {
             e.state.event(
@@ -474,6 +481,8 @@ impl Engine {
         for mut en in entries {
             match en.phase {
                 Phase::Applying => {
+                    // A motion action may have reached its adapter.
+                    self.motion_best_effort(&en, now.wall_ms, "interrupted apply");
                     self.finish(
                         &en,
                         Final::Failed,
@@ -488,6 +497,10 @@ impl Engine {
                         "interrupted between apply and commit: reverted at restart",
                     );
                     summary.push(format!("{} interrupted apply reverted", en.id));
+                }
+                Phase::Reverting if !self.motion_settled(&en, now.wall_ms) => {
+                    summary.push(format!("{} revert retried every tick", en.id));
+                    keep.push(en);
                 }
                 Phase::Reverting => {
                     self.finish(
@@ -520,6 +533,12 @@ impl Engine {
                         Some(en.action),
                         "TTL expired while the executor was down (or the clock moved back)",
                     );
+                    if !self.motion_settled(&en, now.wall_ms) {
+                        en.phase = Phase::Reverting;
+                        summary.push(format!("{} expired, revert retried every tick", en.id));
+                        keep.push(en);
+                        continue;
+                    }
                     self.finish(
                         &en,
                         Final::Reverted,
@@ -579,7 +598,9 @@ impl Engine {
                 }
             }
         }
-        let installed = keep.iter().any(|e| e.phase == Phase::Active);
+        let installed = keep
+            .iter()
+            .any(|e| e.phase == Phase::Active && is_nft(&e.effect));
         if installed && same_boot && !nft::table_exists(self.nft.as_mut())? {
             self.state.entries = keep;
             self.operator_removed(
@@ -764,6 +785,8 @@ impl Engine {
     fn operator_removed(&mut self, now_ms: u64, detail: &str) {
         let entries = std::mem::take(&mut self.state.entries);
         for en in &entries {
+            // The executor is disabled: its motion actions are lifted too.
+            self.motion_best_effort(en, now_ms, "executor disabled by the operator");
             self.finish(en, Final::RemovedExternally, now_ms, detail);
             self.state.event(
                 now_ms,
@@ -792,7 +815,12 @@ impl Engine {
     /// re-created) and answer `true`. An nft error answers `false` (the
     /// transaction then reports it).
     fn removed_by_operator(&mut self, now_ms: u64) -> bool {
-        if !self.state.entries.iter().any(|e| e.phase == Phase::Active) {
+        if !self
+            .state
+            .entries
+            .iter()
+            .any(|e| e.phase == Phase::Active && is_nft(&e.effect))
+        {
             return false;
         }
         match nft::table_exists(self.nft.as_mut()) {
@@ -885,6 +913,9 @@ impl Engine {
             Ok(p) => p,
             Err(r) => return self.refuse(order, &digest, r, now_ms),
         };
+        if matches!(planned.effect, Effect::Motion(_)) {
+            return self.submit_motion(order, digest, planned, oracle, now);
+        }
         let ttl = match planned.effect {
             Effect::Evidence => {
                 return self.refuse(
@@ -1059,7 +1090,15 @@ impl Engine {
                     max_skew_s: self.cfg.config.soc.max_clock_skew_s,
                     now_ms,
                 };
-                crate::soc::verify(order, &cx, &mut self.soc_replay)?;
+                let approvers = crate::soc::verify(order, &cx, &mut self.soc_replay)?;
+                // With a `motion` section the two-person actions can be
+                // executed: their approvers are checked here (without one
+                // they are refused `not_executor_action` by the precheck).
+                if crate::motion::two_person(order.action) && self.cfg.config.motion.is_some() {
+                    if let crate::order::Origin::ControlPlane { requested_by, .. } = &order.origin {
+                        crate::motion::approvers_ok(order.action, requested_by, &approvers)?;
+                    }
+                }
                 o.human_approved = true;
             }
         }
@@ -1078,6 +1117,7 @@ impl Engine {
         if !self.has_held() {
             return;
         }
+        let state_now = current.as_ref().ok().map(|c| c.state);
         if let Err(r) = decision::recheck_rearm(current, self.cfg.config.max_safety_age_ms) {
             let why = format!("{}: {}", r.code, r.reason);
             if self.last_hold_reason.as_deref() != Some(why.as_str()) {
@@ -1106,7 +1146,12 @@ impl Engine {
             .cloned()
             .collect();
         let mut armed = Vec::new();
+        let mut waiting = Vec::new();
         for en in held {
+            if let Some(why) = state_now.and_then(|s| self.motion_rearm_blocked(&en.effect, s)) {
+                waiting.push(format!("{}: {why}", en.id));
+                continue;
+            }
             let check = match &reload {
                 Some(r) => Err(r.clone()),
                 None => self.revalidate(&en),
@@ -1144,6 +1189,14 @@ impl Engine {
                 }
             }
         }
+        if !waiting.is_empty() {
+            let why = format!("held actions not re-armed: {}", waiting.join("; "));
+            if self.last_hold_reason.as_deref() != Some(why.as_str()) {
+                self.state
+                    .event(now_ms, EventKind::Held, None, None, why.clone());
+                self.last_hold_reason = Some(why);
+            }
+        }
         if armed.is_empty() {
             let _ = self.save();
             return;
@@ -1178,6 +1231,7 @@ impl Engine {
         if done.is_err() {
             let _ = self.install();
         }
+        self.motion_rearmed(&armed, now_ms);
         let _ = self.save();
     }
 
@@ -1285,7 +1339,12 @@ impl Engine {
                     max_skew_s: self.cfg.config.soc.max_clock_skew_s,
                     now_ms: now.wall_ms,
                 };
-                crate::soc::verify_revert(id, soc, &cx, &mut self.soc_replay)
+                let (rb, approvers) =
+                    crate::soc::verify_revert(id, soc, &cx, &mut self.soc_replay)?;
+                if crate::motion::two_person(action) {
+                    crate::motion::approvers_ok(action, &rb, &approvers)?;
+                }
+                Ok(())
             });
             if let Err(r) = checked {
                 self.state.event(
@@ -1366,6 +1425,9 @@ impl Engine {
         };
         if self.removed_by_operator(now_ms) {
             return self.status(id);
+        }
+        if let Err(o) = self.motion_undo(&en, reason, now_ms) {
+            return *o;
         }
         match self.install() {
             Ok(()) => {
@@ -1457,6 +1519,7 @@ impl Engine {
     /// is dropped, nothing is re-applied and orders are refused until
     /// `rearm`. Any other difference is drift: the rendering is re-applied.
     pub fn periodic_verify(&mut self, now_ms: u64) {
+        self.motion_verify(now_ms);
         let r = self.rendered();
         let listed = match nft::read_table(self.nft.as_mut()) {
             Ok(l) => l,
@@ -1544,6 +1607,7 @@ impl Engine {
                     Final::Failed => Status::Failed,
                     Final::Refused => Status::Refused,
                     Final::Advisory => Status::Advisory,
+                    Final::Applied => Status::Applied,
                     Final::RemovedExternally => Status::RemovedExternally,
                 },
             );
@@ -1568,14 +1632,23 @@ impl Engine {
 }
 
 /// Two effects on the same target: one isolation at a time, one
-/// quarantine per participant.
+/// quarantine per participant, one motion action of each kind.
 fn clashes(a: &Effect, b: &Effect) -> bool {
     match (a, b) {
         (Effect::Isolate(_), Effect::Isolate(_)) => true,
         (Effect::Quarantine(x), Effect::Quarantine(y)) => x.guid_prefix == y.guid_prefix,
+        (Effect::Motion(x), Effect::Motion(y)) => x.action == y.action,
         _ => false,
     }
 }
+
+/// An effect rendered into table `inet robodr`.
+fn is_nft(e: &Effect) -> bool {
+    matches!(e, Effect::Isolate(_) | Effect::Quarantine(_))
+}
+
+#[path = "engine_motion.rs"]
+mod motion_exec;
 
 /// Delete the table and mark every journalled action reverted, without
 /// reconciling (systemd `ExecStopPost=` after a failed run, and a fatal

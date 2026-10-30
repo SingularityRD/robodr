@@ -1,0 +1,16 @@
+# Sprint 8 motion adapters (docs/OPERATIONS.md 6.5, "Motion adapters"):
+# only for a site whose executor.json has a `motion` section. Copy to
+# /etc/systemd/system/robodr-executor.service.d/40-motion.conf, adapt,
+# `systemctl daemon-reload`, restart the executor.
+[Service]
+# The ROS 2 adapters (Nav2, ros2_control, Unitree sport) and PX4 talk UDP
+# to ONE peer each: allow IPv4 and exactly those addresses (the unit
+# denies every address otherwise).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
+IPAddressAllow=192.168.10.2/32
+# The gateway adapter writes robodr-firewall-gw's restriction file
+# (motion.gateway.restriction_path; directory owned by robodr-exec, group
+# robodr, mode 0750, so the gateway can read it and nobody else write it).
+ReadWritePaths=/run/robodr-firewall-gw/restrict
+# The rollback adapter runs the site's rollback program as this unit's
+# user: give it what that program needs here (and nothing more).

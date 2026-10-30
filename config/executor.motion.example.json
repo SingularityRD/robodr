@@ -1,0 +1,122 @@
+{
+  "schema": "robodr-executor-config/v1",
+  "robot_id": "ugv-007",
+  "socket": "/run/robodr-executor/executor.sock",
+  "socket_mode": "0660",
+  "key_file": "/run/credentials/robodr-executor.service/executor.key",
+  "state_dir": "/var/lib/robodr/executor",
+  "policy_path": "/etc/robodr/response-policy.json",
+  "nft": "/usr/sbin/nft",
+  "network": {
+    "management": [
+      {
+        "cidr": "10.20.0.0/24",
+        "proto": "tcp",
+        "port": 22,
+        "note": "operator SSH (illustrative)"
+      },
+      {
+        "cidr": "10.20.0.5",
+        "proto": "tcp",
+        "port": 443,
+        "note": "SOC: client of the mutual-TLS control plane (illustrative)"
+      }
+    ],
+    "uplink": [
+      {
+        "cidr": "10.20.0.10",
+        "proto": "tcp",
+        "port": 443,
+        "note": "AutoSecOps ingest API (robodr-uplink, illustrative)"
+      }
+    ],
+    "control_buses": {
+      "exempt": true,
+      "entries": [
+        {
+          "interface": "eth1",
+          "note": "robot-internal Ethernet to the motor controllers (illustrative)"
+        }
+      ]
+    },
+    "motion_control_path": [
+      {
+        "cidr": "192.168.10.0/24",
+        "udp_ports": [
+          7400,
+          7600
+        ],
+        "note": "ROS 2 / DDS between the navigation and base controllers (illustrative)"
+      }
+    ],
+    "discovery": {
+      "multicast_groups": [
+        "239.255.0.1"
+      ],
+      "domains": [
+        0
+      ]
+    },
+    "quarantine": {
+      "cidrs": [
+        "192.168.10.0/24"
+      ]
+    }
+  },
+  "ttl": {
+    "default_s": 900,
+    "max_s": 86400
+  },
+  "max_safety_age_ms": 500,
+  "verify_interval_s": 10,
+  "soc": {
+    "keys": [
+      "/etc/robodr/soc/soc.pub"
+    ],
+    "max_clock_skew_s": 30,
+    "robot_keys": [
+      "/etc/robodr/keys/blackbox.pub",
+      "/etc/robodr/keys/finding.pub"
+    ]
+  },
+  "require_approval_for_all_containment": false,
+  "motion": {
+    "restrict_motion": [
+      "gateway"
+    ],
+    "safe_pause": "nav2",
+    "request_safe_state": "nav2",
+    "safe_pause_ttl_s": 3600,
+    "gateway": {
+      "oem_validated": false,
+      "restriction_path": "/run/robodr-firewall-gw/restrict/restriction.json",
+      "status_path": "/run/robodr-firewall-gw/status.json",
+      "verify_timeout_ms": 3000
+    },
+    "nav2": {
+      "oem_validated": false,
+      "ros2": {
+        "domain_id": 0,
+        "peer_ip": "192.168.10.2",
+        "peer_participant_id": 0,
+        "local_ip": "192.168.10.5",
+        "participant_prefix": "01104242424242420a000001",
+        "rmw": "cyclonedds",
+        "timeout_ms": 1500,
+        "resend_ms": 200
+      },
+      "actions": [
+        "/navigate_to_pose",
+        "/navigate_through_poses"
+      ],
+      "cmd_vel_topic": "/cmd_vel",
+      "zero_twists": 10,
+      "zero_twist_interval_ms": 50,
+      "allowed_states": [
+        "idle",
+        "moving_slow",
+        "collaborative_human_nearby"
+      ]
+    }
+  }
+}

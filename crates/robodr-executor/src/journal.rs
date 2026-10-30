@@ -94,6 +94,9 @@ pub enum Final {
     Advisory,
     /// The table was removed from outside (operator emergency disable).
     RemovedExternally,
+    /// A non-reversible motion action (`request_safe_state`,
+    /// `rollback_config`) took effect through its adapter; nothing to undo.
+    Applied,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

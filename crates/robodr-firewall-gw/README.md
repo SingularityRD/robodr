@@ -433,6 +433,130 @@ writer's sample that decodes exactly as the configured layout is decided
 as `/cmd_vel` (and is then a foreign source unless its GUID is allowed);
 `rtps.unknown_writers: pass` opts out.
 
+## ROS 2 joint trajectories (`ros2_joint_trajectory`, `ros2_follow_joint_trajectory_goal`)
+
+The topic of a `joint_trajectory_controller`
+(`trajectory_msgs/msg/JointTrajectory`, e.g.
+`rt/arm_controller/joint_trajectory`) and the `send_goal` request of its
+`control_msgs/action/FollowJointTrajectory` action
+(`rq/<action>/_action/send_goalRequest`). Both need a `trajectory`
+section (example: `config/firewall-gw.ros2-arm.example.json`): the joints
+by name with `min_position` / `max_position`, `max_velocity`,
+`max_acceleration`, `max_effort`, plus `max_points` (default 256),
+`max_duration_s` (default 60), `on_velocity_violation` (`reject`, the
+default, or `time_scale` with `max_time_scale`, default 4) and, for the
+goal, `request_header` (`none` for `rmw_fastrtps`, `cyclone` for
+`rmw_cyclonedds`). The firewall channel is `kind: {"joints": {"count":
+<n>}}` (one per trajectory joint): it decides the **source, rate and
+fault policy** (`check_access`); the profile envelope's `max_joint_speed`
+caps every joint's `max_velocity`.
+
+* **Strict decode** (`src/trajectory.rs`): plain CDR (XCDR1) either
+  endianness, canonical (zero alignment gaps, no gap after an empty
+  `float64[]`, strings 1..=256 octets UTF-8 without inner NUL, nothing
+  after the message but the announced padding), counts bounded before
+  anything is allocated. The real Jazzy captures of both RMWs
+  (`fixtures/captures/ros2-jazzy/*_frag_run1.pcap`, 40-point 6-joint
+  trajectories) decode strictly (`tests/trajectory.rs`). The goal's
+  multi-DOF trajectory must be empty and its tolerances must name the
+  trajectory's joints, at most once, with finite values. Anything else is
+  undecidable: suppressed, `robot.gateway.undecodable_command`, and a
+  non-finite command for the firewall (its source rules apply).
+* **Bounds**: joint names known and unique (a name differing in case,
+  white space or encoding is unknown), positions on every point for every
+  joint, `velocities` / `accelerations` / `effort` empty or one per
+  joint, every value finite, `time_from_start` non-negative and strictly
+  increasing, the last at most `max_duration_s`; positions within their
+  range; declared velocities and the rate between consecutive positions
+  within `max_velocity`; declared accelerations, the change of declared
+  velocities and the acceleration of three consecutive positions within
+  `max_acceleration`; efforts within `max_effort`. An empty trajectory
+  (a stop: the controller holds) passes.
+* **Between points** (review F2): the segment the controller interpolates
+  is bounded too, not only the waypoints. Assumed interpolation:
+  `joint_trajectory_controller`'s default `splines`, per joint and
+  segment, a quintic when both points carry accelerations, a cubic
+  Hermite when both carry velocities, linear otherwise. Position,
+  velocity and acceleration are checked at the polynomial's extremes on
+  the segment. A segment that leaves the position range is refused (no
+  time scaling fixes a path); one that only exceeds velocity /
+  acceleration is time-scaled when `time_scale` is configured. Another
+  `interpolation_method` (`none`) or a vendor scheme is not modelled.
+* **Start time** (review F1): a non-zero `header.stamp` makes the
+  controller start the trajectory at that time (a past stamp skips into
+  the middle of it: a jump the checks never saw). The gateway zeroes it
+  in place (the controller starts on receipt), verified by decoding
+  again: outcome rewritten, status counter `trajectory_stamp_zeroed`.
+* **Outcomes**: pass unchanged; with `time_scale`, a trajectory whose only
+  violations are velocity / acceleration is **slowed down in place** by
+  the smallest factor that fits (every interval scaled up and rounded up
+  to the ns, velocities divided by the factor, accelerations by its
+  square; positions and efforts untouched; verified by decoding and
+  checking again), `robot.gateway.trajectory_time_scaled`; anything else
+  is **suppressed** (PAD), `robot.gateway.trajectory_rejected`. Nothing is
+  substituted: the gateway has no trajectory it knows to be safe (the
+  robot's current position is not in the message), so the controller
+  keeps executing (or holding at the end of) the last accepted one.
+* **DATA_FRAG**: suppressed as on every motion channel. A trajectory must
+  fit one RTPS DATA: the lab's 40-point, 6-joint trajectory is 5220
+  octets, above Cyclone DDS's default 1344-octet fragment size; raise the
+  DDS message / fragment size on the controller (Cyclone
+  `General/MaxMessageSize` and `FragmentSize`, Fast DDS
+  `maxMessageSize`) or bound `max_points` (README "Known limits").
+
+## Gateway findings and the agentd feed
+
+The gateway counts its own decisions (`src/findings.rs`, findings contract
+2.3 `robot.gateway.*`: `trajectory_rejected`, `trajectory_time_scaled`,
+`undecodable_command`, `fragmented_command`, `writer_binding_conflict`,
+`sequence_jump`, `port_bypass_risk`, `restriction_changed`,
+`findings_dropped`) per (rule, channel) on the decision path (no I/O, no
+allocation for repeats) and reports one aggregated deviation per
+housekeeping period. With `findings_socket` (agentd's `gateway_feed`
+socket) those and the Motion Firewall's own deviations (`robot.firewall.*`)
+go to agentd as JSON lines (`robodr-gateway-finding/v1`, `src/feed.rs`),
+which turns each into a finding of its normal pipeline (black box, spool,
+responder, correlation). The socket is connected, and written with a
+50 ms timeout, on a dedicated thread (`gw-feed`, review F5): the packet
+thread only hands lines over a bounded channel (256, non-blocking; a full
+channel drops the line, counted), so agentd being slow or away never
+delays a decision. While agentd is away up to 1024 lines wait on the feed
+thread (oldest dropped, counted: status `findings_feed`). The events file
+keeps everything either way.
+
+## `restrict_motion` (restriction file)
+
+With `restriction_path`, `robodr-executor`'s gateway adapter writes a
+restriction (`src/restrict.rs`, `robodr-gw-restriction/v1`: `id`,
+`max_linear_speed`, `max_joint_speed`, `factor`, `expires_unix_ms`) that
+the gateway reads on a dedicated thread (`gw-restriction`, review F4: no
+file I/O on the packet thread) and applies at the next housekeeping tick.
+The file is opened with `O_NOFOLLOW | O_NONBLOCK` (a symlink or a FIFO
+fails at once instead of being followed or blocking) and checked on the
+open descriptor: a regular file, not group- or world-writable, owned by
+root or by the owner of its directory. It only **tightens**: twist
+channels (ROS 2 twist, sport `Move`, loco `SetVelocity`, Go1 `HighCmd`)
+are capped at `max_linear_speed` and `factor` × the channel's own linear
+limit, angular speed at `factor` × its angular limit (a forwarded output
+above the caps becomes a limited one, direction kept); trajectory
+channels get `max_velocity` ≤ `max_joint_speed` and `factor` × the
+configured value. A twist command is capped **before** the Motion
+Firewall decides (review F3), so the firewall's ramp state follows the
+capped speed and lifting the restriction ramps up from it at the
+channel's acceleration limit. While a restriction is active, the sport
+API's `SpeedLevel` (1015) is refused (review F8): the firmware's speed
+range must not be raised under a restriction. A restriction applies to
+commands decided after it; a trajectory the controller already accepted
+keeps executing at its accepted speeds (review F9; `safe_pause` stops
+it). Low-level joint channels (`LowCmd_`, arm SDK, hands) are
+**not** restricted (scaling a balance controller's targets is not a speed
+limit). The gateway lifts it at `expires_unix_ms` itself (wall clock), so
+a restriction ends at its TTL even with the executor down; a malformed,
+symlinked, non-regular, wrongly owned or group / world-writable file is ignored with a warning and status
+`restriction_error` (the restriction in force keeps its own expiry). The
+status file's `restriction.id` is what the executor reads back to verify.
+A forged restriction can only slow the robot down.
+
 ## Non-motor `LowCmd_` fields
 
 A `LowCmd_` carries fields besides the motor slots. Review finding F3: the
@@ -670,6 +794,7 @@ Operations (status, maintenance bypass, troubleshooting):
 | Loco, arm SDK, hands, ROS 2 twist, extra port ranges and the unqueued-locator warning: `SetVelocity` limited and duration-capped (`Move(..., true)` = 864000 s), every G1 / H1 FSM helper but `Start` refused (`Damp`, `ZeroTorque`, posture), allowlists, hand-over / trick / unknown ids refused, H1's own service, the sport codec refused on a humanoid; arm frames with mode-0 gains passed, limited with modes and weight kept, weight out of range / leg gains → hold of the last accepted frame, nothing accepted → suppressed; hands passed or suppressed; ROS 2 `Twist` / `TwistStamped` limited in place; 6000 mutated packets with invariants (no forwarded `SetFsmId` but `Start`, no forwarded velocity / duration above the limits, no forwarded weight outside `[0, 1]` or leg gains, hands only unchanged and inside the envelope) | `tests/channels.rs`, unit tests in `src/{sport,armsdk,hand,ros2,config,ruleset}.rs` |
 | Real kernel, new channels (`new_channels_and_extra_ports_end_to_end`): loco `SetVelocity` limited and capped, `Damp` removed, `Start` byte-identical, arm frame byte-identical, Dex3 out of envelope removed, twist limited; `ZeroTorque` on an extra port range removed, on a port outside every range delivered unchecked; an SEDP reader announcing that port sets `port_bypass_risk` in the status file | `tests/netns_e2e.rs` |
 | Review of `f27e02d` (each test written first and seen failing): F1 weight flapping / rate / engagement without `rt/lowstate`; F2 XCDR2 and trailing-zero twists and Dex3 with non-zero padding / trailing octets from a foreign GUID suppressed; F5 Dex3 mode octet, hand-SDK weight; F6 `stopMotors` passes, `balance_critical: false` refused on body channels; F10 SetVelocity expiry, queries feed no twist, malformed `SetVelocity` suppressed, `Start` allowlisted, arm action service, `float` rounding | `tests/exec_gw_review.rs`, `robodr-firewall/tests/exec_gw_review.rs`, `src/sport.rs` |
+| Review of the motion branch (each test written first and seen failing): F1 a past `header.stamp` zeroed; F2 cubic overshoot / acceleration and quintic interior acceleration refused, time-scaled until the spline fits; F3 lifting a restriction ramps from the capped speed; F4 FIFO / symlink / group-writable restriction file refused without blocking, the watcher thread; F5 the feed hand-off never blocks; F8 `SpeedLevel` refused while restricted; too many points reported as `too_many_points` | `tests/review_motion.rs` |
 | Robot side (NFLOG copies): engagement checked against `rt/lowstate` (close / far / stale / restart), fragmented `LowState_` reassembled, bad CRC ignored; robot reader of `rt/lowcmd` and robot participant at unqueued ports flagged | `tests/robot_side.rs`, `src/{observe,nflog}.rs` |
 | Real kernel (`new_channels_and_extra_ports_end_to_end`): the arm engagement removed without `rt/lowstate` and byte-identical once the robot namespace publishes it (500 Hz, fragmented, through the NFLOG rule), the robot's own reader of `rt/lowcmd` at an unqueued port flagged in the status file | `tests/netns_e2e.rs` |
 | Fuzz: packet path + NFQUEUE / NFLOG parsers + robot-side observation, invariants (no panic; accept = unchanged; rewrite = same length, valid checksums; no forwarded enforced sample that does not decode strictly / with a valid CRC; no forwarded unprobeable sample of an unknown writer; no forwarded go `LowCmd_` with `bms_cmd.off != 0`; channels fixture: arm weight within `[0, 1]` and stepped by at most 0.02, no forwarded loco `SetFsmId` / malformed call / duration above 1 s, hand frames with the SDK's mode octets, canonical twists) | `fuzz/fuzz_targets/firewall_gw_packet.rs`, smoke run `tests/fuzz_smoke.rs` |
@@ -723,6 +848,19 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
 
 ## Known limits
 
+- **Joint trajectories** (Sprint 8): verified on real Fast DDS and
+  Cyclone DDS captures for the decode only, and with synthetic frames for
+  the gateway path; not against a real `joint_trajectory_controller`. A
+  trajectory must fit one RTPS DATA (fragments are suppressed). The first
+  point's step from the robot's current position is not checked (it is
+  not in the message): a single point at `t = 0` far from the current
+  position is a jump the controller executes; bound it with the
+  controller's own `constraints` / `allow_nonzero_velocity_at_trajectory_end`
+  and the profile envelope. A refused trajectory is removed, not replaced.
+  `restrict_motion` does not restrict low-level joint channels, nor a
+  trajectory the controller accepted before it was applied. Segment
+  checks assume the controller's default spline interpolation (see
+  "Joint trajectories").
 - **Not run against a real robot, a real Cyclone DDS stack or a real
   sensor box.** The RTPS / CDR layouts follow the published IDL and the
   repository's decoders; the e2e test uses synthetic datagrams.

@@ -1707,6 +1707,52 @@ A failed revert is retried every 500 ms until it verifies. Treat
 `revert_failures > 0` as urgent. The finding for it is not in the
 findings contract yet, so watch this counter instead.
 
+**Motion adapters (Sprint 8).** Off unless `executor.json` has a `motion`
+section (example `config/executor.motion.example.json`; contract §6a,
+"Motion adapters"; design and gates:
+[`crates/robodr-executor/README.md`](../crates/robodr-executor/README.md#motion-adapters-sprint-8)).
+To enable:
+
+1. Choose the adapters per action: `restrict_motion` (`gateway`,
+   `unitree_sport`), `safe_pause` / `request_safe_state` (`nav2`,
+   `ros2_control`, `px4`), `rollback_config` (`rollback`, the site's
+   program). The response policy's `safe_pause` / `safe_state` behaviour
+   must be one the adapter carries out (Nav2: `controlled_stop`;
+   ros2_control: `protective_stop_category2`; PX4: `hold`, and
+   `return_to_launch` for the safe state).
+2. Test each adapter on the robot with the OEM, then set its
+   `oem_validated: true`. Until then every motion order is refused
+   `adapter_not_validated`, nothing is sent.
+3. Allow the network: install the `40-motion.conf.example` drop-in
+   (`AF_INET`, `IPAddressAllow=` the ROS 2 / PX4 peers, the gateway's
+   restriction directory) and restart the executor. Give the ROS 2
+   adapters a fixed `ros2.participant_prefix` and profile it at
+   commissioning (otherwise agentd reports the executor's participant as
+   unknown). Keep each action within 4 s (the configuration is refused
+   otherwise): agentd waits `executor.timeout_ms` (default 5 s).
+4. Gateway adapter: set `restriction_path` / `status_path` in both the
+   executor's `motion.gateway` and the gateway's configuration
+   (`restriction_path`, `status_path`); create the restriction directory
+   owned by `robodr-exec`, group `robodr`, mode `0750`.
+5. SOC side: `safe_pause`, `request_safe_state` and `rollback_config` need
+   `approved_by` with two people in the signed request (and in a revert of
+   a `safe_pause`): names `[A-Za-z0-9._%+@-]{1,100}`, compared
+   case-insensitively. The executor trusts the SOC key for who approved:
+   enforce the two-person rule in the SOC's workflow too.
+6. Set `ros2.peer_participant_prefix` to the robot participant's GUID
+   prefix (from the commissioning capture) so only its replies count. With
+   both `unitree_sport` and `gateway` for `restrict_motion`, list
+   `unitree_sport` first (enforced).
+
+What to expect: `restrict_motion` and `safe_pause` answer `verified` and
+are lifted at their TTL (`motion.safe_pause_ttl_s` for a pause) or by
+revert; lifting a pause **releases** it and never resumes a mission
+(Nav2 goals are not restored, PX4 stays in hold); `request_safe_state` and
+`rollback_config` answer `applied` and are not reversible. A pause or safe
+state is refused while `moving_fast` unless the adapter lists it in
+`allowed_states`. Watch the executor's events: an adapter undo that fails
+(`revert_failed`) is retried every tick; check the platform by hand.
+
 ### 6.6 Inline Motion Firewall gateway (`robodr-firewall-gw`)
 
 The in-path enforcement mode for a sensor box bridged into the controller
@@ -1818,6 +1864,35 @@ while the chain is flushed.
 * Large IP datagrams from the controller side disappear: defragmentation
   did not run (another ruleset flushed the `raw` table); re-run the rules
   unit.
+
+**ROS 2 joint trajectories, findings feed, restriction (Sprint 8).**
+
+* Trajectory channels (`ros2_joint_trajectory`,
+  `ros2_follow_joint_trajectory_goal`, example
+  `config/firewall-gw.ros2-arm.example.json`): list every joint with its
+  bounds in `trajectory`; the firewall channel is `kind joints` with that
+  count. Make the controller send each trajectory in one RTPS DATA (raise
+  the DDS message / fragment size, or bound `max_points`): a fragmented
+  one is suppressed (`robot.gateway.fragmented_command`). Start with
+  `mode: observe` and check `status.json` `gateway.trajectory_refused` /
+  `trajectory_time_scaled` against the controller's real trajectories.
+* Findings to agentd: set agentd's `gateway_feed` (`socket_path`,
+  `allowed_uids` = the gateway's uid, `socket_mode: "0660"` with the
+  gateway's user in agentd's group) and the gateway's `findings_socket` to
+  the same path. `status.json` `findings_feed` shows `connected`, `sent`,
+  `pending`, `dropped`, `last_error`; agentd counts
+  `daemon.gateway_findings`.
+* `restrict_motion`: with `restriction_path`, `status.json` `restriction`
+  is the restriction in force (`null`: none) and `restriction_error` why a
+  file was ignored. Removing the file lifts it at the next housekeeping
+  tick; it also lapses at its own expiry. The file must be a regular
+  file, not group- or world-writable, owned by root or the directory's
+  owner (a symlink or FIFO is refused without blocking). While it is in
+  force the gateway refuses the sport `SpeedLevel`. A trajectory the
+  controller accepted before the restriction keeps its speeds: pause it.
+* Trajectories: a non-zero `header.stamp` is zeroed (status
+  `trajectory_stamp_zeroed`); the segments between points are checked as
+  the controller's default spline interpolation executes them.
 
 ## 7. Upgrade and rollback
 

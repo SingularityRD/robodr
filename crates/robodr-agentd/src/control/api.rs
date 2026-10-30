@@ -105,6 +105,9 @@ struct RawSubmit {
     requested_by: String,
     source: String,
     authority: String,
+    /// The SOC-side approvers (two-person actions; contract §4).
+    #[serde(default)]
+    approved_by: Option<Vec<String>>,
 }
 
 /// Every parameter any action may carry; anything else refuses the body.
@@ -126,6 +129,37 @@ struct RawRevert {
     #[serde(default)]
     reason: Option<String>,
     requested_by: String,
+    #[serde(default)]
+    approved_by: Option<Vec<String>>,
+}
+
+/// Most approvers a body may name.
+pub const MAX_APPROVERS: usize = 4;
+
+/// `approved_by`: at most [`MAX_APPROVERS`] names, each 1..=100 ASCII
+/// characters of `[A-Za-z0-9._%+@-]` (user names, email-like ids; the
+/// executor's grammar, `robodr_executor::motion::approver_name_ok`, which
+/// compares them case-insensitively).
+fn approvers(v: Option<Vec<String>>) -> Result<Vec<String>, ApiError> {
+    let v = v.unwrap_or_default();
+    if v.len() > MAX_APPROVERS {
+        return Err(bad(
+            "invalid_field",
+            format!("approved_by: at most {MAX_APPROVERS} names"),
+        ));
+    }
+    v.iter()
+        .map(|a| {
+            if robodr_executor::motion::approver_name_ok(a) {
+                Ok(a.clone())
+            } else {
+                Err(bad(
+                    "invalid_field",
+                    "approved_by: each name 1..=100 characters of [A-Za-z0-9._%+@-]",
+                ))
+            }
+        })
+        .collect()
 }
 
 /// The validated parameters of an action.
@@ -159,6 +193,11 @@ pub struct ActionRequest {
     pub reason: String,
     pub requested_by: String,
     pub source: String,
+    /// The SOC-side approvers the body names (two-person actions). The
+    /// executor checks them itself in the signed body; recorded here as
+    /// evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_by: Vec<String>,
 }
 
 impl ActionRequest {
@@ -175,6 +214,9 @@ impl ActionRequest {
 pub struct RevertRequest {
     pub reason: String,
     pub requested_by: String,
+    /// The SOC-side approvers of the revert (two-person actions).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_by: Vec<String>,
 }
 
 fn name_ok(s: &str, max: usize) -> bool {
@@ -381,10 +423,10 @@ pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
             }
             params.config = Some(kind);
             if let Some(v) = p.to_version {
-                if !name_ok(&v, 64) {
+                if !robodr_executor::motion::version_ok(&v) {
                     return Err(bad(
                         "invalid_parameter",
-                        "to_version must match [A-Za-z0-9._-]{1,64}",
+                        "to_version must match [A-Za-z0-9._-]{1,64}, not starting with '-'",
                     ));
                 }
                 params.to_version = Some(v);
@@ -443,6 +485,7 @@ pub fn parse_submit(body: &[u8]) -> Result<ActionRequest, ApiError> {
             true,
         )?,
         source,
+        approved_by: approvers(raw.approved_by)?,
     })
 }
 
@@ -463,6 +506,7 @@ pub fn parse_revert(body: &[u8]) -> Result<RevertRequest, ApiError> {
             MAX_REQUESTED_BY_CHARS,
             true,
         )?,
+        approved_by: approvers(raw.approved_by)?,
     })
 }
 
@@ -2033,6 +2077,45 @@ mod tests {
         assert!(parse_submit(&serde_json::to_vec(&v).unwrap()).is_ok());
     }
 
+    /// Review F6 / minor: approver names follow the executor's grammar
+    /// (email-like ids pass; white space, invisible or combining
+    /// characters do not) and a version never starts with `-`.
+    #[test]
+    fn approver_names_and_versions_are_strict() {
+        let with = |approvers: Value| {
+            let mut v: Value =
+                serde_json::from_slice(&body("safe_pause", json!({}), None)).unwrap();
+            v["approved_by"] = approvers;
+            serde_json::to_vec(&v).unwrap()
+        };
+        assert!(parse_submit(&with(json!(["alice.smith+ops@soc.example", "bob-2"]))).is_ok());
+        for bad in [
+            "bob\u{200b}",
+            "bob smith",
+            "bob\u{0301}",
+            "",
+            "b\u{f6}b",
+            "o'neil",
+        ] {
+            assert_eq!(
+                code(parse_submit(&with(json!(["alice", bad])))),
+                "invalid_field",
+                "{bad:?}"
+            );
+        }
+        for v in ["-rf", "--help", "-"] {
+            assert_eq!(
+                code(parse_submit(&body(
+                    "rollback_config",
+                    json!({"config": "program", "to_version": v}),
+                    None
+                ))),
+                "invalid_parameter",
+                "{v}"
+            );
+        }
+    }
+
     #[test]
     fn allow_list_refuses_everything_else() {
         assert_eq!(
@@ -2720,6 +2803,7 @@ mod tests {
         let rv = RevertRequest {
             reason: "false positive".into(),
             requested_by: "analyst".into(),
+            approved_by: Vec::new(),
         };
         let v = e.handle(
             &Call::Revert(r.request_id.clone(), rv.clone()),
@@ -2754,6 +2838,7 @@ mod tests {
                 RevertRequest {
                     reason: String::new(),
                     requested_by: "a".into(),
+                    approved_by: Vec::new(),
                 },
             ),
             &meta(),

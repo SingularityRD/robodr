@@ -189,6 +189,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "firewall_gw_trajectory"
+path = "fuzz_targets/firewall_gw_trajectory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fleet_token"
 path = "fuzz_targets/fleet_token.rs"
 test = false

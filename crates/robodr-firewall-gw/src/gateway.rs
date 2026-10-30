@@ -20,9 +20,12 @@ use crate::config::{
     Codec, GatewayConfig, GatewayMode, LocoModel, MalformedPolicy, OnGatewayDown, UnknownWriters,
 };
 use crate::discovery::{Discovery, WriterInfo};
+use crate::findings::{rules as gw_rules, Detail, GatewayFindings};
 use crate::ip::{parse_ipv4_udp, refresh_udp_checksum};
 use crate::lowcmd::{self, Forwarded, LowCmdCodec, WireLowCmd};
+use crate::restrict::Restriction;
 use crate::rtps::{self, Content, Guid, Sample, SampleKind, WalkOptions};
+use crate::trajectory::{self, Layout, TrajectoryLimits, TrajectoryVerdict};
 use crate::{armsdk, hand, legacy, ros2, sport};
 use robodr_cdr::unitree::{ApiClass, ApiService};
 
@@ -148,6 +151,17 @@ pub struct GatewayStats {
     pub arm_request_refused: u64,
     /// Loco twist state reset because a `SetVelocity` duration ended.
     pub velocity_expired: u64,
+    /// Trajectories (or goals) suppressed for a bound violation.
+    pub trajectory_refused: u64,
+    /// Trajectories slowed down in place (counted in `limited` too).
+    pub trajectory_time_scaled: u64,
+    /// Twist outputs capped by an active `restrict_motion` restriction.
+    pub restriction_capped: u64,
+    /// Trajectories whose non-zero `header.stamp` was zeroed (F1).
+    pub trajectory_stamp_zeroed: u64,
+    /// Sport `SpeedLevel` requests refused while a restriction is in
+    /// force (F8).
+    pub restriction_speed_level_refused: u64,
     /// Robot-side packets observed (NFLOG copies; never verdicted).
     pub observed_packets: u64,
     /// `rt/lowstate` samples taken from them.
@@ -279,6 +293,13 @@ struct Channel {
     tick: u64,
     last_low: Option<Forwarded>,
     last_legacy: Option<LegacyLast>,
+    /// Trajectory codecs: the configured bounds and the decoder layout.
+    traj: Option<(TrajectoryLimits, Layout)>,
+    /// Twist codecs: the channel's linear / angular limits (profile
+    /// envelope and firewall spec; `INFINITY` when none), the base of a
+    /// `restrict_motion` factor.
+    base_lin: f64,
+    base_ang: f64,
 }
 
 impl Channel {
@@ -369,6 +390,11 @@ pub struct Gateway {
     /// robot's discovery (see [`Gateway::observe`]).
     observer: crate::observe::Observer,
     pub stats: GatewayStats,
+    /// The gateway's own findings (`crate::findings`), drained at
+    /// housekeeping.
+    pub findings: GatewayFindings,
+    /// The `restrict_motion` restriction in force (`crate::restrict`).
+    restriction: Option<Restriction>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -388,6 +414,9 @@ fn hex(b: &[u8]) -> String {
     }
     s
 }
+
+/// Sport API `SpeedLevel` (`sport_api.hpp`).
+const SPORT_SPEED_LEVEL: i64 = 1015;
 
 fn twist(vx: f64, vy: f64, vyaw: f64) -> Motion {
     Motion::Twist(Twist::new(
@@ -472,6 +501,21 @@ impl Gateway {
                          (the firewall refuses fail_open there for the same reason)"
                     ));
                 }
+            } else if c.codec.is_trajectory() {
+                let spec = fwcfg.channels.get(&c.firewall_channel).ok_or_else(|| {
+                    format!(
+                        "{at}: codec {} needs a firewall channels entry of kind joints",
+                        c.codec.as_str()
+                    )
+                })?;
+                let n = c.trajectory.as_ref().map_or(0, |t| t.joints.len());
+                if spec.kind != (ChannelKind::Joints { count: n }) {
+                    return Err(format!(
+                        "{at}: codec {} needs kind {{\"joints\": {{\"count\": {n}}}}} (one per \
+                         trajectory joint)",
+                        c.codec.as_str()
+                    ));
+                }
             } else {
                 let spec = fwcfg.channels.get(&c.firewall_channel).ok_or_else(|| {
                     format!(
@@ -528,6 +572,50 @@ impl Gateway {
                     }
                 }
             }
+            let envelope = profile.motion_envelopes.get(&c.firewall_channel);
+            let fin = |v: Option<f64>| v.filter(|x| x.is_finite() && *x > 0.0);
+            let traj = c.trajectory.as_ref().map(|t| {
+                // The profile envelope caps every joint's speed.
+                let env_joint = envelope
+                    .and_then(|e| fin(e.max_joint_speed))
+                    .unwrap_or(f64::INFINITY);
+                let spec_joint = fwcfg
+                    .channels
+                    .get(&c.firewall_channel)
+                    .and_then(|s| fin(s.max_joint_speed))
+                    .unwrap_or(f64::INFINITY);
+                (
+                    TrajectoryLimits {
+                        joints: t
+                            .joints
+                            .iter()
+                            .map(|j| trajectory::JointBounds {
+                                name: j.name.clone(),
+                                min_position: j.min_position,
+                                max_position: j.max_position,
+                                max_velocity: j.max_velocity.min(env_joint).min(spec_joint),
+                                max_acceleration: j.max_acceleration,
+                                max_effort: j.max_effort,
+                            })
+                            .collect(),
+                        max_points: t.max_points,
+                        max_duration_ns: (t.max_duration_s * 1e9) as i64,
+                        time_scale: t.on_velocity_violation
+                            == crate::config::OnVelocityViolation::TimeScale,
+                        max_time_scale: t.max_time_scale,
+                    },
+                    t.layout(c.codec),
+                )
+            });
+            let twist_spec = fwcfg
+                .channels
+                .get(&c.firewall_channel)
+                .filter(|s| s.kind == ChannelKind::Twist);
+            let base_lin = fin(envelope.and_then(|e| e.max_linear_speed))
+                .unwrap_or(f64::INFINITY)
+                .min(fin(twist_spec.and_then(|s| s.max_linear_speed)).unwrap_or(f64::INFINITY));
+            let base_ang =
+                fin(twist_spec.and_then(|s| s.max_angular_speed)).unwrap_or(f64::INFINITY);
             let mut legacy_sources = Vec::new();
             for (ip, s) in &c.legacy_sources {
                 let ip: Ipv4Addr = ip.parse().map_err(|_| format!("{at}: bad IP {ip}"))?;
@@ -573,6 +661,9 @@ impl Gateway {
                 tick: 0,
                 last_low: None,
                 last_legacy: None,
+                traj,
+                base_lin,
+                base_ang,
             });
         }
         let topics = cfg
@@ -600,6 +691,8 @@ impl Gateway {
             max_queue_delay_ns: cfg.max_queue_delay_ns,
             observer: crate::observe::Observer::new(cfg),
             stats: GatewayStats::default(),
+            findings: GatewayFindings::default(),
+            restriction: None,
         })
     }
 
@@ -621,6 +714,42 @@ impl Gateway {
 
     pub fn mode(&self) -> GatewayMode {
         self.mode
+    }
+
+    /// The `restrict_motion` restriction in force.
+    pub fn restriction(&self) -> Option<&Restriction> {
+        self.restriction.as_ref()
+    }
+
+    /// Apply (`Some`) or lift (`None`) a restriction (`crate::restrict`);
+    /// a change is a `robot.gateway.restriction_changed` finding.
+    pub fn set_restriction(&mut self, r: Option<Restriction>) {
+        if self.restriction == r {
+            return;
+        }
+        let what = match (&self.restriction, &r) {
+            (_, Some(n)) => format!(
+                "{} (max_linear_speed {:?}, max_joint_speed {:?}, factor {:?}, expires {} ms)",
+                n.id, n.max_linear_speed, n.max_joint_speed, n.factor, n.expires_unix_ms
+            ),
+            (Some(o), None) => format!("{} lifted", o.id),
+            (None, None) => String::new(),
+        };
+        let reason = if r.is_some() { "applied" } else { "lifted" };
+        self.findings
+            .note(gw_rules::RESTRICTION_CHANGED, None, || Detail {
+                what: Some(what),
+                ..Detail::reason(reason)
+            });
+        self.restriction = r;
+    }
+
+    /// Note a gateway finding on channel `ci` (`crate::findings`).
+    fn note(&mut self, rule: &'static str, ci: Option<usize>, detail: impl FnOnce() -> Detail) {
+        let name = ci
+            .and_then(|i| self.channels.get(i))
+            .map(|c| c.name.as_str());
+        self.findings.note(rule, name, detail);
     }
 
     /// Decide one queued packet (the IPv4 packet, rewritten in place when
@@ -867,6 +996,10 @@ impl Gateway {
                 Codec::Ros2Twist | Codec::Ros2TwistStamped => {
                     ros2::plausible(slot, c.codec == Codec::Ros2TwistStamped).then_some(3)
                 }
+                Codec::Ros2JointTrajectory | Codec::Ros2FollowJointTrajectoryGoal => c
+                    .traj
+                    .as_ref()
+                    .and_then(|(_, layout)| trajectory::plausible(slot, *layout).then_some(4)),
                 Codec::Go1HighCmd | Codec::Go1LowCmd => None,
             }
         };
@@ -952,6 +1085,15 @@ impl Gateway {
                 // command nobody checked (see the crate docs).
                 self.stats.unknown_undecidable += 1;
                 self.stats.suppressed += 1;
+                let kind = s.kind;
+                self.note(gw_rules::FRAGMENTED_COMMAND, None, || Detail {
+                    what: Some("unknown writer".into()),
+                    ..Detail::reason(if kind == SampleKind::DataFrag {
+                        "data_frag"
+                    } else {
+                        "key_only_or_non_standard"
+                    })
+                });
                 return Outcome::Suppress;
             }
         };
@@ -961,6 +1103,14 @@ impl Gateway {
             // channel cannot be decided in place (see the crate docs).
             self.stats.unsupported_sample += 1;
             self.stats.suppressed += 1;
+            let kind = s.kind;
+            self.note(gw_rules::FRAGMENTED_COMMAND, Some(ci), || {
+                Detail::reason(if kind == SampleKind::DataFrag {
+                    "data_frag"
+                } else {
+                    "key_only_or_non_standard"
+                })
+            });
             return Outcome::Suppress;
         }
         let Some(range) = s.payload.clone() else {
@@ -996,7 +1146,7 @@ impl Gateway {
             if late {
                 self.stats.late += 1;
             }
-            let o = self.decide_sample(ci, &mut d[range], source, meta.now_ns, late, !guarded);
+            let o = self.decide_noting(ci, &mut d[range], source, meta.now_ns, late, !guarded);
             self.count(o);
             return o;
         }
@@ -1014,6 +1164,14 @@ impl Gateway {
                 if now.saturating_sub(w.bound_at) <= takeover {
                     self.stats.binding_conflicts += 1;
                     self.stats.suppressed += 1;
+                    self.note(gw_rules::WRITER_BINDING_CONFLICT, Some(ci), || Detail {
+                        what: Some(format!(
+                            "writer {} from {src}, bound to {}",
+                            hex(&s.writer),
+                            b.ip
+                        )),
+                        ..Detail::reason("other_ip_or_mac")
+                    });
                     return Outcome::Suppress;
                 }
                 // The bound side has been silent past the takeover time:
@@ -1067,6 +1225,12 @@ impl Gateway {
                     w.pending_jump = Some((s.sn, binding));
                     self.stats.sn_jumps += 1;
                     self.stats.suppressed += 1;
+                    let sn = s.sn;
+                    self.note(gw_rules::SEQUENCE_JUMP, Some(ci), || Detail {
+                        value: Some(sn as f64),
+                        limit: Some(l as f64),
+                        ..Detail::reason("held_until_confirmed")
+                    });
                     return Outcome::Suppress;
                 }
             }
@@ -1075,7 +1239,7 @@ impl Gateway {
         if late {
             self.stats.late += 1;
         }
-        let outcome = self.decide_sample(ci, &mut d[range.clone()], source, now, late, true);
+        let outcome = self.decide_noting(ci, &mut d[range.clone()], source, now, late, true);
         self.count(outcome);
         // 5. Only what was forwarded advances the stream (and binds it);
         //    a suppression is remembered (a retransmission is suppressed
@@ -1098,6 +1262,29 @@ impl Gateway {
             }
         }
         outcome
+    }
+
+    /// [`Self::decide_sample`], noting an undecodable payload as a gateway
+    /// finding.
+    fn decide_noting(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+        late: bool,
+        emit: bool,
+    ) -> Outcome {
+        let before = self.stats.undecidable;
+        let o = self.decide_sample(ci, slot, source, now, late, emit);
+        if self.stats.undecidable > before {
+            let foreign = source == SourceId::UNKNOWN;
+            self.note(gw_rules::UNDECODABLE_COMMAND, Some(ci), || Detail {
+                what: foreign.then(|| "foreign source".to_string()),
+                ..Detail::reason("not_strictly_decodable")
+            });
+        }
+        o
     }
 
     /// Decide one enforced payload slot with the channel's codec. `emit`:
@@ -1129,6 +1316,9 @@ impl Gateway {
             }
             Some(Codec::UnitreeDex3HandCmd | Codec::UnitreeHandSdk) => {
                 self.hand_sample(ci, slot, source, now, late)
+            }
+            Some(Codec::Ros2JointTrajectory | Codec::Ros2FollowJointTrajectoryGoal) => {
+                self.trajectory_sample(ci, slot, source, now, late)
             }
             Some(Codec::Go1HighCmd | Codec::Go1LowCmd) | None => Outcome::Suppress,
         }
@@ -1334,16 +1524,111 @@ impl Gateway {
         motion: Motion,
         late: bool,
     ) -> FwVerdict {
+        // Review F3: the restriction caps the command **before** the
+        // firewall decides, so its ramp state follows what is forwarded
+        // (lifting the restriction then ramps up from the capped speed).
+        let capped = self.cap_twist(id, motion);
         let cmd = Command {
             source,
             channel: id,
             stamp_ns: now,
-            motion,
+            motion: capped.unwrap_or(motion),
         };
-        if late {
+        let v = if late {
             self.fw.fault_verdict(&cmd, now)
         } else {
             self.fw.check(&cmd, now)
+        };
+        let v = match v {
+            FwVerdict::Passed { cmd, .. } if capped.is_some() => {
+                self.stats.restriction_capped += 1;
+                FwVerdict::Limited {
+                    cmd,
+                    reasons: robodr_firewall::LimitReasons::SPEED,
+                }
+            }
+            v => v,
+        };
+        self.restrict_twist(id, v)
+    }
+
+    /// `motion` capped at the restriction in force (`None`: within it).
+    fn cap_twist(&self, id: ChannelId, motion: Motion) -> Option<Motion> {
+        let r = self.restriction.as_ref()?;
+        let ch = self.channels.iter().find(|c| c.id == id)?;
+        let (lin_cap, ang_cap) = r.twist_caps(ch.base_lin, ch.base_ang);
+        let Motion::Twist(t) = motion else {
+            return None;
+        };
+        let norm = |a: Vec3| (a.x * a.x + a.y * a.y + a.z * a.z).sqrt();
+        let (l, a) = (norm(t.linear), norm(t.angular));
+        let sl = if l > lin_cap { lin_cap / l } else { 1.0 };
+        let sa = if a > ang_cap { ang_cap / a } else { 1.0 };
+        if !(sl < 1.0 || sa < 1.0) || !sl.is_finite() || !sa.is_finite() {
+            return None;
+        }
+        let scale = |x: Vec3, k: f64| Vec3::new(x.x * k, x.y * k, x.z * k);
+        Some(Motion::Twist(Twist::new(
+            scale(t.linear, sl),
+            scale(t.angular, sa),
+        )))
+    }
+
+    /// Cap a forwarded twist at the active restriction (`crate::restrict`):
+    /// a passed or limited output above the caps becomes a limited one,
+    /// scaled down (direction kept). A substitute is capped the same way:
+    /// the firewall's hold is its own last output, which it computed
+    /// without the restriction.
+    fn restrict_twist(&mut self, id: ChannelId, v: FwVerdict) -> FwVerdict {
+        let Some(r) = &self.restriction else {
+            return v;
+        };
+        let Some(ch) = self.channels.iter().find(|c| c.id == id) else {
+            return v;
+        };
+        let (lin_cap, ang_cap) = r.twist_caps(ch.base_lin, ch.base_ang);
+        let cap = |cmd: Command| -> Option<Command> {
+            let Motion::Twist(t) = cmd.motion else {
+                return None;
+            };
+            let norm = |a: Vec3| (a.x * a.x + a.y * a.y + a.z * a.z).sqrt();
+            let (l, a) = (norm(t.linear), norm(t.angular));
+            let sl = if l > lin_cap { lin_cap / l } else { 1.0 };
+            let sa = if a > ang_cap { ang_cap / a } else { 1.0 };
+            if !(sl < 1.0 || sa < 1.0) || !sl.is_finite() || !sa.is_finite() {
+                return None;
+            }
+            let scale = |x: Vec3, k: f64| Vec3::new(x.x * k, x.y * k, x.z * k);
+            Some(Command {
+                motion: Motion::Twist(Twist::new(scale(t.linear, sl), scale(t.angular, sa))),
+                ..cmd
+            })
+        };
+        match v {
+            FwVerdict::Passed { cmd, .. } | FwVerdict::Limited { cmd, .. } => match cap(cmd) {
+                Some(out) => {
+                    self.stats.restriction_capped += 1;
+                    FwVerdict::Limited {
+                        cmd: out,
+                        reasons: robodr_firewall::LimitReasons::SPEED,
+                    }
+                }
+                None => v,
+            },
+            FwVerdict::Rejected {
+                reason,
+                substitute: Some(sub),
+            } => match cap(sub.cmd) {
+                Some(out) => {
+                    self.stats.restriction_capped += 1;
+                    FwVerdict::Rejected {
+                        reason,
+                        substitute: Some(robodr_firewall::Substitute { cmd: out, ..sub }),
+                    }
+                }
+                None => v,
+            },
+            FwVerdict::Rejected { .. } => v,
         }
     }
 
@@ -1415,6 +1700,14 @@ impl Gateway {
                 };
             }
             _ => {
+                // Review F8: while a restriction is in force nobody may
+                // change the sport speed level (the executor's
+                // unitree_sport adapter set the restricted one).
+                if self.restriction.is_some() && req.api_id == SPORT_SPEED_LEVEL {
+                    self.stats.restriction_speed_level_refused += 1;
+                    let _ = self.access_check(id, source, now, twist(0.0, 0.0, 0.0));
+                    return Outcome::Suppress;
+                }
                 // Not a velocity call: allowlist, then the source / rate
                 // check only (the twist state is not touched, F10 b).
                 if allow.as_ref().is_some_and(|a| !a.contains(&req.api_id)) {
@@ -1760,6 +2053,139 @@ impl Gateway {
             }
             _ => {
                 self.stats.rewrite_failed += 1;
+                Outcome::Suppress
+            }
+        }
+    }
+
+    // ------------------------------------------------------ trajectories
+
+    /// A ROS 2 joint trajectory / `FollowJointTrajectory` goal
+    /// (`crate::trajectory`). The firewall decides the source, rate and
+    /// (late packets) the fault policy with a zero joint command of the
+    /// channel's width (`check_access`: no motion state moves); the
+    /// trajectory is then decided against the channel's bounds (scaled by
+    /// an active restriction): passed, time-scaled in place, or
+    /// suppressed. Nothing is ever substituted: there is no trajectory the
+    /// gateway could write that it knows to be safe (the robot's current
+    /// position is not in the message), so a refused trajectory is removed
+    /// as if lost and the controller keeps executing (or holding at the
+    /// end of) the last accepted one.
+    fn trajectory_sample(
+        &mut self,
+        ci: usize,
+        slot: &mut [u8],
+        source: SourceId,
+        now: u64,
+        late: bool,
+    ) -> Outcome {
+        let Some(ch) = self.channels.get(ci) else {
+            return Outcome::Suppress;
+        };
+        let id = ch.id;
+        let Some((base, layout)) = ch.traj.clone() else {
+            return Outcome::Suppress;
+        };
+        let n = base.joints.len();
+        let zero = Motion::Joints(robodr_firewall::JointVelocities::zeros(n));
+        let decoded = trajectory::decode_strict(slot, layout, base.max_points);
+        let cmd = Command {
+            source,
+            channel: id,
+            stamp_ns: now,
+            motion: zero,
+        };
+        let mut t = match decoded {
+            Ok(t) => t,
+            Err(_)
+                if trajectory::decode_strict(slot, layout, trajectory::HARD_MAX_POINTS)
+                    .is_ok_and(|t| t.points.len() > base.max_points) =>
+            {
+                // Readable, only longer than the channel allows: a bound
+                // violation (too_many_points), not an undecodable payload.
+                let _ = self.fw.check_access(&cmd, now);
+                self.stats.trajectory_refused += 1;
+                let max = base.max_points;
+                self.note(gw_rules::TRAJECTORY_REJECTED, Some(ci), || Detail {
+                    limit: Some(max as f64),
+                    ..Detail::reason(trajectory::Violation::TooManyPoints.as_str())
+                });
+                return Outcome::Suppress;
+            }
+            Err(e) => {
+                self.stats.undecidable += 1;
+                // Recorded by the firewall as a non-finite command of this
+                // source (its source and rate rules apply).
+                let nan = Motion::Joints(
+                    robodr_firewall::JointVelocities::from_slice(&vec![f64::NAN; n])
+                        .unwrap_or_else(|| robodr_firewall::JointVelocities::zeros(n)),
+                );
+                let _ = self.fw.check(&Command { motion: nan, ..cmd }, now);
+                let _ = e;
+                return Outcome::Suppress;
+            }
+        };
+        let access = if late {
+            self.fw.fault_verdict(&cmd, now).is_passed()
+        } else {
+            self.fw.check_access(&cmd, now)
+        };
+        if !access {
+            return Outcome::Suppress;
+        }
+        let mut lim = base;
+        if let Some(r) = &self.restriction {
+            for j in &mut lim.joints {
+                j.max_velocity = r.joint_cap(j.max_velocity);
+            }
+        }
+        // Review F1: a controller starts the trajectory at header.stamp; a
+        // past one would start it part-way through. Zeroed ("now"), which
+        // is what the checks below assume.
+        let mut stamped = false;
+        if t.stamp != (0, 0) {
+            if trajectory::write_zero_stamp(slot, &mut t).is_err() {
+                self.stats.rewrite_failed += 1;
+                return Outcome::Suppress;
+            }
+            self.stats.trajectory_stamp_zeroed += 1;
+            stamped = true;
+        }
+        match trajectory::check(&t, &lim) {
+            TrajectoryVerdict::Pass if stamped => Outcome::Rewritten,
+            TrajectoryVerdict::Pass => Outcome::Pass,
+            TrajectoryVerdict::TimeScaled { factor, cause } => {
+                match trajectory::write_time_scale(slot, &t, layout, factor, &lim) {
+                    Ok(()) => {
+                        self.stats.limited += 1;
+                        self.stats.trajectory_time_scaled += 1;
+                        self.note(gw_rules::TRAJECTORY_TIME_SCALED, Some(ci), || Detail {
+                            what: cause.joint.clone(),
+                            value: Some(factor),
+                            limit: Some(lim.max_time_scale),
+                            ..Detail::reason(cause.violation.as_str())
+                        });
+                        Outcome::Rewritten
+                    }
+                    Err(_) => {
+                        self.stats.rewrite_failed += 1;
+                        self.stats.trajectory_refused += 1;
+                        self.note(gw_rules::TRAJECTORY_REJECTED, Some(ci), || Detail {
+                            what: cause.joint.clone(),
+                            ..Detail::reason("time_scale_failed")
+                        });
+                        Outcome::Suppress
+                    }
+                }
+            }
+            TrajectoryVerdict::Refused(r) => {
+                self.stats.trajectory_refused += 1;
+                self.note(gw_rules::TRAJECTORY_REJECTED, Some(ci), || Detail {
+                    what: r.joint.clone(),
+                    value: r.value.is_finite().then_some(r.value),
+                    limit: Some(r.limit),
+                    ..Detail::reason(r.violation.as_str())
+                });
                 Outcome::Suppress
             }
         }

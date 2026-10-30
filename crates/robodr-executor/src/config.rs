@@ -129,6 +129,12 @@ pub struct ExecutorConfig {
     /// Default `false` (the morphology rules decide).
     #[serde(default)]
     pub require_approval_for_all_containment: bool,
+    /// Motion actions through platform adapters (Sprint 8,
+    /// [`crate::motion`]). Absent: executor v1 behaviour (`restrict_motion`
+    /// advisory, `safe_pause` / `request_safe_state` / `rollback_config`
+    /// refused `not_executor_action`).
+    #[serde(default)]
+    pub motion: Option<crate::motion::MotionSection>,
 }
 
 fn default_soc_skew_s() -> u64 {
@@ -537,6 +543,9 @@ impl ExecutorConfig {
         }
         if !(1..=300).contains(&self.soc.max_clock_skew_s) {
             return Err("soc.max_clock_skew_s must be 1..=300".into());
+        }
+        if let Some(m) = &self.motion {
+            m.validate(t.max_s)?;
         }
         Ok(Resolved {
             config: self,

@@ -542,6 +542,8 @@ fn map(o: &Outcome) -> Option<ExecutorOutcome> {
         ExStatus::Held => return None,
         ExStatus::Reverted | ExStatus::RemovedExternally => ExecutorOutcome::Reverted,
         ExStatus::Advisory => ExecutorOutcome::RecordedNotExecuted,
+        // A non-reversible motion action took effect (Sprint 8).
+        ExStatus::Applied => ExecutorOutcome::Applied,
         ExStatus::Failed => ExecutorOutcome::Failed(
             o.error
                 .clone()
@@ -591,6 +593,19 @@ pub fn order_for(a: &AcceptedAction<'_>, own: Morphology, now_ms: u64) -> Order 
             (None, Some(n)) => Target::Node { name: n.clone() },
             (None, None) => Target::None,
         },
+        // Sprint 8: the executor's motion adapters act on these (and check
+        // them against the signed body).
+        ActionId::RestrictMotion => Target::Motion(robodr_executor::motion::MotionRequest {
+            max_linear_speed: p.max_linear_speed,
+            max_joint_speed: p.max_joint_speed,
+            workspace_zone: p.workspace_zone.clone(),
+            ..Default::default()
+        }),
+        ActionId::RollbackConfig => Target::Motion(robodr_executor::motion::MotionRequest {
+            config: Some(p.config.clone().unwrap_or_else(|| "profile".into())),
+            to_version: p.to_version.clone(),
+            ..Default::default()
+        }),
         _ => Target::None,
     };
     Order {
@@ -727,9 +742,18 @@ pub fn orders_for_plan(req: &ExecutionRequest<'_>, own: Morphology, now_ms: u64)
                 // A source that is not a GUID prefix cannot be quarantined.
                 Err(_) => continue,
             },
-            // A process is never acted on by executor v1; motion limits are
-            // advisory (the plan is already recorded); safe pause and safe
-            // state are never executor actions.
+            // Sprint 8: a motion limit becomes a restriction of the
+            // envelope by the plan's factor (the executor's restrict_motion
+            // adapters; advisory there without them).
+            ResponseAction::LimitMotion { factor } => (
+                ActionId::RestrictMotion,
+                Target::Motion(robodr_executor::motion::MotionRequest {
+                    factor: Some(*factor),
+                    ..Default::default()
+                }),
+            ),
+            // A process is never acted on by the executor; safe pause and
+            // safe state need two people (never a planner order).
             _ => continue,
         };
         if a.step() == Step::Record {
@@ -1060,10 +1084,34 @@ mod tests {
         };
         assert!(orders_for_plan(&bare, Morphology::WheeledMobile, 0).is_empty());
         let orders = orders_for_plan(&req, Morphology::WheeledMobile, 0);
-        assert!(orders
+        assert!(orders.iter().all(|o| !o.human_approved));
+        assert!(orders.iter().any(|o| o.action == ActionId::QuarantineNode));
+        // Sprint 8: the plan's motion limit becomes a restriction order with
+        // the policy's factor (the executor's default TTL).
+        let rm: Vec<_> = orders
             .iter()
-            .all(|o| o.action == ActionId::QuarantineNode && !o.human_approved));
-        assert!(!orders.is_empty(), "{:?}", plan.actions);
+            .filter(|o| o.action == ActionId::RestrictMotion)
+            .collect();
+        if plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, ResponseAction::LimitMotion { .. }))
+        {
+            assert_eq!(rm.len(), 1, "{:?}", plan.actions);
+            assert!(matches!(
+                &rm[0].target,
+                Target::Motion(m) if m.factor == Some(pol.limit_motion_factor)
+            ));
+            assert_eq!(rm[0].ttl_s, None);
+        }
+        assert!(
+            orders.iter().all(|o| matches!(
+                o.action,
+                ActionId::QuarantineNode | ActionId::RestrictMotion
+            )),
+            "{:?}",
+            plan.actions
+        );
         // Another body, a replay: nothing.
         assert!(orders_for_plan(&req, Morphology::Humanoid, 0).is_empty());
         let replay = ExecutionRequest {
@@ -1075,7 +1123,9 @@ mod tests {
         let mut p2 = plan.clone();
         p2.source = "/teleop".into();
         let r2 = ExecutionRequest { plan: &p2, ..req };
-        assert!(orders_for_plan(&r2, Morphology::WheeledMobile, 0).is_empty());
+        assert!(!orders_for_plan(&r2, Morphology::WheeledMobile, 0)
+            .iter()
+            .any(|o| o.action == ActionId::QuarantineNode));
     }
 
     #[test]
