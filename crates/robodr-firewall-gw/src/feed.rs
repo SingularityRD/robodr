@@ -152,6 +152,79 @@ impl Feed {
     }
 }
 
+/// What the feed thread reports (status file).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedStatus {
+    pub connected: bool,
+    pub sent: u64,
+    pub pending: usize,
+    /// Lines dropped: backlog full, or the hand-off to the thread full.
+    pub dropped: u64,
+    pub last_error: Option<String>,
+}
+
+/// Lines handed to the feed thread before [`FeedThread::push`] drops.
+pub const HANDOFF: usize = 256;
+
+/// The feed on its own thread (review F5): connecting and writing may
+/// block (a wedged agentd), so the packet thread only hands lines over
+/// ([`FeedThread::push`], never blocks) and reads the status.
+#[derive(Debug)]
+pub struct FeedThread {
+    tx: std::sync::mpsc::SyncSender<String>,
+    status: std::sync::Arc<std::sync::Mutex<FeedStatus>>,
+    handoff_dropped: u64,
+}
+
+impl FeedThread {
+    pub fn spawn(path: PathBuf) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(HANDOFF);
+        let status = std::sync::Arc::new(std::sync::Mutex::new(FeedStatus::default()));
+        let st = std::sync::Arc::clone(&status);
+        std::thread::Builder::new()
+            .name("gw-feed".into())
+            .spawn(move || {
+                let mut f = Feed::new(path);
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(l) => f.push(l),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    while let Ok(l) = rx.try_recv() {
+                        f.push(l);
+                    }
+                    f.flush(Instant::now());
+                    if let Ok(mut s) = st.lock() {
+                        s.connected = f.connected();
+                        s.sent = f.sent;
+                        s.pending = f.pending();
+                        s.dropped = f.dropped;
+                        s.last_error = f.last_error.clone();
+                    }
+                }
+            })?;
+        Ok(Self {
+            tx,
+            status,
+            handoff_dropped: 0,
+        })
+    }
+
+    /// Hand a line to the thread (never blocks; a full hand-off drops it).
+    pub fn push(&mut self, line: String) {
+        if self.tx.try_send(line).is_err() {
+            self.handoff_dropped = self.handoff_dropped.saturating_add(1);
+        }
+    }
+
+    pub fn status(&self) -> FeedStatus {
+        let mut s = self.status.lock().map(|g| g.clone()).unwrap_or_default();
+        s.dropped = s.dropped.saturating_add(self.handoff_dropped);
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

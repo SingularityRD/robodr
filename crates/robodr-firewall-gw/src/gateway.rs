@@ -157,6 +157,11 @@ pub struct GatewayStats {
     pub trajectory_time_scaled: u64,
     /// Twist outputs capped by an active `restrict_motion` restriction.
     pub restriction_capped: u64,
+    /// Trajectories whose non-zero `header.stamp` was zeroed (F1).
+    pub trajectory_stamp_zeroed: u64,
+    /// Sport `SpeedLevel` requests refused while a restriction is in
+    /// force (F8).
+    pub restriction_speed_level_refused: u64,
     /// Robot-side packets observed (NFLOG copies; never verdicted).
     pub observed_packets: u64,
     /// `rt/lowstate` samples taken from them.
@@ -409,6 +414,9 @@ fn hex(b: &[u8]) -> String {
     }
     s
 }
+
+/// Sport API `SpeedLevel` (`sport_api.hpp`).
+const SPORT_SPEED_LEVEL: i64 = 1015;
 
 fn twist(vx: f64, vy: f64, vyaw: f64) -> Motion {
     Motion::Twist(Twist::new(
@@ -1516,18 +1524,54 @@ impl Gateway {
         motion: Motion,
         late: bool,
     ) -> FwVerdict {
+        // Review F3: the restriction caps the command **before** the
+        // firewall decides, so its ramp state follows what is forwarded
+        // (lifting the restriction then ramps up from the capped speed).
+        let capped = self.cap_twist(id, motion);
         let cmd = Command {
             source,
             channel: id,
             stamp_ns: now,
-            motion,
+            motion: capped.unwrap_or(motion),
         };
         let v = if late {
             self.fw.fault_verdict(&cmd, now)
         } else {
             self.fw.check(&cmd, now)
         };
+        let v = match v {
+            FwVerdict::Passed { cmd, .. } if capped.is_some() => {
+                self.stats.restriction_capped += 1;
+                FwVerdict::Limited {
+                    cmd,
+                    reasons: robodr_firewall::LimitReasons::SPEED,
+                }
+            }
+            v => v,
+        };
         self.restrict_twist(id, v)
+    }
+
+    /// `motion` capped at the restriction in force (`None`: within it).
+    fn cap_twist(&self, id: ChannelId, motion: Motion) -> Option<Motion> {
+        let r = self.restriction.as_ref()?;
+        let ch = self.channels.iter().find(|c| c.id == id)?;
+        let (lin_cap, ang_cap) = r.twist_caps(ch.base_lin, ch.base_ang);
+        let Motion::Twist(t) = motion else {
+            return None;
+        };
+        let norm = |a: Vec3| (a.x * a.x + a.y * a.y + a.z * a.z).sqrt();
+        let (l, a) = (norm(t.linear), norm(t.angular));
+        let sl = if l > lin_cap { lin_cap / l } else { 1.0 };
+        let sa = if a > ang_cap { ang_cap / a } else { 1.0 };
+        if !(sl < 1.0 || sa < 1.0) || !sl.is_finite() || !sa.is_finite() {
+            return None;
+        }
+        let scale = |x: Vec3, k: f64| Vec3::new(x.x * k, x.y * k, x.z * k);
+        Some(Motion::Twist(Twist::new(
+            scale(t.linear, sl),
+            scale(t.angular, sa),
+        )))
     }
 
     /// Cap a forwarded twist at the active restriction (`crate::restrict`):
@@ -1656,6 +1700,14 @@ impl Gateway {
                 };
             }
             _ => {
+                // Review F8: while a restriction is in force nobody may
+                // change the sport speed level (the executor's
+                // unitree_sport adapter set the restricted one).
+                if self.restriction.is_some() && req.api_id == SPORT_SPEED_LEVEL {
+                    self.stats.restriction_speed_level_refused += 1;
+                    let _ = self.access_check(id, source, now, twist(0.0, 0.0, 0.0));
+                    return Outcome::Suppress;
+                }
                 // Not a velocity call: allowlist, then the source / rate
                 // check only (the twist state is not touched, F10 b).
                 if allow.as_ref().is_some_and(|a| !a.contains(&req.api_id)) {
@@ -2043,8 +2095,23 @@ impl Gateway {
             stamp_ns: now,
             motion: zero,
         };
-        let t = match decoded {
+        let mut t = match decoded {
             Ok(t) => t,
+            Err(_)
+                if trajectory::decode_strict(slot, layout, trajectory::HARD_MAX_POINTS)
+                    .is_ok_and(|t| t.points.len() > base.max_points) =>
+            {
+                // Readable, only longer than the channel allows: a bound
+                // violation (too_many_points), not an undecodable payload.
+                let _ = self.fw.check_access(&cmd, now);
+                self.stats.trajectory_refused += 1;
+                let max = base.max_points;
+                self.note(gw_rules::TRAJECTORY_REJECTED, Some(ci), || Detail {
+                    limit: Some(max as f64),
+                    ..Detail::reason(trajectory::Violation::TooManyPoints.as_str())
+                });
+                return Outcome::Suppress;
+            }
             Err(e) => {
                 self.stats.undecidable += 1;
                 // Recorded by the firewall as a non-finite command of this
@@ -2072,7 +2139,20 @@ impl Gateway {
                 j.max_velocity = r.joint_cap(j.max_velocity);
             }
         }
+        // Review F1: a controller starts the trajectory at header.stamp; a
+        // past one would start it part-way through. Zeroed ("now"), which
+        // is what the checks below assume.
+        let mut stamped = false;
+        if t.stamp != (0, 0) {
+            if trajectory::write_zero_stamp(slot, &mut t).is_err() {
+                self.stats.rewrite_failed += 1;
+                return Outcome::Suppress;
+            }
+            self.stats.trajectory_stamp_zeroed += 1;
+            stamped = true;
+        }
         match trajectory::check(&t, &lim) {
+            TrajectoryVerdict::Pass if stamped => Outcome::Rewritten,
             TrajectoryVerdict::Pass => Outcome::Pass,
             TrajectoryVerdict::TimeScaled { factor, cause } => {
                 match trajectory::write_time_scale(slot, &t, layout, factor, &lim) {

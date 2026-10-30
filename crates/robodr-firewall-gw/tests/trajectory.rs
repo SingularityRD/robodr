@@ -579,6 +579,12 @@ fn reference_passes(payload: &[u8]) -> bool {
                 if !vel.is_empty() && !pvel.is_empty() && (vel[j] - pvel[j]).abs() / dt > TRAJ_A {
                     return false;
                 }
+                if !vel.is_empty()
+                    && !pvel.is_empty()
+                    && !cubic_within(ppos[j], pvel[j], pos[j], vel[j], dt)
+                {
+                    return false;
+                }
                 if let Some((ppt, pppos)) = &prev2 {
                     let dt0 = pt - ppt;
                     let a = 2.0 * ((pos[j] - ppos[j]) / dt - (ppos[j] - pppos[j]) / dt0).abs()
@@ -596,10 +602,38 @@ fn reference_passes(payload: &[u8]) -> bool {
     last <= 20.0
 }
 
+/// The Hermite cubic a joint_trajectory_controller executes between two
+/// points with velocities, solved analytically here: position within
+/// `±TRAJ_Q`, velocity within `TRAJ_V`, acceleration within `TRAJ_A`.
+fn cubic_within(p0: f64, v0: f64, p1: f64, v1: f64, t: f64) -> bool {
+    let c2 = 3.0 * (p1 - p0) / (t * t) - (2.0 * v0 + v1) / t;
+    let c3 = 2.0 * (p0 - p1) / (t * t * t) + (v0 + v1) / (t * t);
+    let p = |x: f64| p0 + v0 * x + c2 * x * x + c3 * x * x * x;
+    let v = |x: f64| v0 + 2.0 * c2 * x + 3.0 * c3 * x * x;
+    let a = |x: f64| 2.0 * c2 + 6.0 * c3 * x;
+    let mut pts = vec![0.0, t];
+    // Velocity zeros (position extrema).
+    let (qa, qb, qc) = (3.0 * c3, 2.0 * c2, v0);
+    if qa.abs() > 1e-300 {
+        let disc = qb * qb - 4.0 * qa * qc;
+        if disc >= 0.0 {
+            pts.push((-qb + disc.sqrt()) / (2.0 * qa));
+            pts.push((-qb - disc.sqrt()) / (2.0 * qa));
+        }
+        pts.push(-qb / (2.0 * qa)); // velocity extremum
+    } else if qb.abs() > 1e-300 {
+        pts.push(-qc / qb);
+    }
+    pts.iter()
+        .filter(|x| (0.0..=t).contains(*x))
+        .all(|&x| p(x).abs() <= TRAJ_Q && v(x).abs() <= TRAJ_V && a(x).abs() <= TRAJ_A)
+}
+
 /// Random trajectories, mutated or not, with the bounds crossed or not:
 /// the gateway forwards a trajectory iff the reference passes it, and
-/// what it forwards is byte-identical. Mutations that break the encoding
-/// are suppressed by the gateway whatever the lenient reference decodes.
+/// what it forwards is byte-identical but for a zeroed `header.stamp`.
+/// Mutations that break the encoding are suppressed by the gateway
+/// whatever the lenient reference decodes.
 #[test]
 fn gateway_matches_the_reference() {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -640,7 +674,12 @@ fn gateway_matches_the_reference() {
         let reference = reference_passes(&payload);
         match (out.is_some(), reference) {
             (true, true) => {
-                assert_eq!(out.as_deref(), Some(&payload[..]), "round {round}");
+                // A non-zero header.stamp is zeroed in place (the
+                // controller then starts the trajectory on receipt, which
+                // is what the checks assume); nothing else changes.
+                let mut want = payload.clone();
+                want[4..12].fill(0);
+                assert_eq!(out.as_deref(), Some(&want[..]), "round {round}");
                 agree_pass += 1;
             }
             (false, false) => agree_refuse += 1,

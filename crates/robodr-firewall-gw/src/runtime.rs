@@ -353,8 +353,10 @@ struct Events {
     /// Status: the NFLOG group could not be bound / copies lost.
     observe_unavailable: bool,
     observe_overruns: u64,
-    /// agentd's gateway feed (`findings_socket`).
-    feed: Option<crate::feed::Feed>,
+    /// agentd's gateway feed (`findings_socket`), on its own thread.
+    feed: Option<crate::feed::FeedThread>,
+    /// The restriction file, read on its own thread.
+    watcher: Option<crate::restrict::Watcher>,
     /// The last restriction file error (status `restriction_error`).
     restriction_error: Option<String>,
 }
@@ -383,44 +385,59 @@ impl Events {
             port_warned: false,
             observe_unavailable: false,
             observe_overruns: 0,
-            feed: cfg.findings_socket.clone().map(crate::feed::Feed::new),
+            feed: cfg.findings_socket.clone().and_then(|p| {
+                crate::feed::FeedThread::spawn(p)
+                    .map_err(|e| eprintln!("robodr-firewall-gw: findings feed thread: {e}"))
+                    .ok()
+            }),
+            watcher: cfg.restriction_path.clone().and_then(|p| {
+                crate::restrict::Watcher::spawn(p, Duration::from_millis(cfg.housekeeping_ms))
+                    .map_err(|e| eprintln!("robodr-firewall-gw: restriction thread: {e}"))
+                    .ok()
+            }),
             restriction_error: None,
         }
     }
 }
 
-/// Read the restriction file (`crate::restrict`) and apply it to the
-/// gateway; an expired one is lifted (the gateway enforces the TTL itself).
-pub fn refresh_restriction(
-    cfg: &GatewayConfig,
+/// Apply the restriction watcher's latest read (`latest`, `None`: nothing
+/// new) to the gateway; an expired restriction is lifted whatever was
+/// read (the gateway enforces the TTL itself). Returns the read error to
+/// report, or the previous one when nothing new arrived.
+pub fn apply_restriction(
     gw: &mut Gateway,
+    latest: Option<Result<Option<crate::restrict::Restriction>, String>>,
+    previous_error: Option<String>,
     now_unix_ms: u64,
 ) -> Option<String> {
-    let Some(p) = &cfg.restriction_path else {
-        return None;
-    };
-    match crate::restrict::load(p) {
-        Ok(Some(r)) if !r.expired(now_unix_ms) => {
+    let err = match latest {
+        None => previous_error,
+        Some(Ok(Some(r))) if !r.expired(now_unix_ms) => {
             gw.set_restriction(Some(r));
             None
         }
-        Ok(_) => {
+        Some(Ok(_)) => {
             gw.set_restriction(None);
             None
         }
-        Err(e) => {
-            // Never "no restriction" silently: the one in force stays
-            // until its own expiry, and the status says why.
-            if gw.restriction().is_some_and(|r| r.expired(now_unix_ms)) {
-                gw.set_restriction(None);
-            }
-            Some(e)
-        }
+        // Never "no restriction" silently: the one in force stays until
+        // its own expiry, and the status says why.
+        Some(Err(e)) => Some(e),
+    };
+    if gw.restriction().is_some_and(|r| r.expired(now_unix_ms)) {
+        gw.set_restriction(None);
     }
+    err
 }
 
 fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist: &LatencyHist) {
-    let err = refresh_restriction(cfg, gw, sys::realtime_ns() / 1_000_000);
+    let latest = events.watcher.as_ref().and_then(|w| w.latest());
+    let err = apply_restriction(
+        gw,
+        latest,
+        events.restriction_error.clone(),
+        sys::realtime_ns() / 1_000_000,
+    );
     if err.is_some() && err != events.restriction_error {
         eprintln!(
             "robodr-firewall-gw: WARNING: restriction file ignored: {}",
@@ -479,9 +496,6 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
     if let Some(f) = events.file.as_mut() {
         let _ = f.flush();
     }
-    if let Some(feed) = events.feed.as_mut() {
-        feed.flush(Instant::now());
-    }
     if let Some(w) = gw.discovery().port_bypass() {
         if !events.port_warned {
             events.port_warned = true;
@@ -537,10 +551,13 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
             })),
             "restriction_error": events.restriction_error,
             "findings_total": gw.findings.total,
-            "findings_feed": events.feed.as_ref().map(|f| json!({
-                "connected": f.connected(), "sent": f.sent, "pending": f.pending(),
-                "dropped": f.dropped, "last_error": f.last_error,
-            })),
+            "findings_feed": events.feed.as_ref().map(|f| {
+                let s = f.status();
+                json!({
+                    "connected": s.connected, "sent": s.sent, "pending": s.pending,
+                    "dropped": s.dropped, "last_error": s.last_error,
+                })
+            }),
         });
         let tmp = p.with_extension("tmp");
         if std::fs::write(&tmp, status.to_string()).is_ok() {

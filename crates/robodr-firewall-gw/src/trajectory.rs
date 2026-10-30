@@ -57,7 +57,41 @@
 //!   velocity, the rate implied by consecutive positions, declared
 //!   acceleration, the acceleration implied by consecutive velocities and
 //!   the one implied by three consecutive positions within
-//!   `max_velocity` / `max_acceleration`; effort within `max_effort`.
+//!   `max_velocity` / `max_acceleration`; effort within `max_effort`;
+//! - between points, the segment the controller interpolates (below):
+//!   position inside the bounds, velocity and acceleration within them,
+//!   over the whole segment, not only at the waypoints.
+//!
+//! # Interpolation assumed
+//!
+//! `joint_trajectory_controller`'s default `splines` interpolation, per
+//! joint and segment of duration `T`: a **quintic** when both points
+//! carry accelerations (positions, velocities and accelerations matched
+//! at both ends), a **cubic** Hermite when both carry velocities, and
+//! **linear** otherwise (bounded by the waypoint checks above: a straight
+//! line between two in-bounds positions stays in bounds at the implied
+//! rate). The polynomial's extremes on `[0, T]` (ends, roots of its
+//! derivative found by sampling plus bisection) are checked for position,
+//! velocity and acceleration. A controller configured with another
+//! `interpolation_method` (`none`) or a vendor controller with another
+//! scheme is not modelled: configure the bounds with that margin.
+//!
+//! # Start time (`header.stamp`)
+//!
+//! A non-zero `header.stamp` asks the controller to start the trajectory
+//! at that time: in the past, it skips into the middle of the trajectory
+//! (sampling from the current state to a later point, a jump the checks
+//! never saw); in the future, it delays. The gateway rewrites the stamp to
+//! zero in place ([`write_zero_stamp`], verified by decoding again) so the
+//! controller starts on receipt, which is what the checks assume.
+//!
+//! # Restrictions and accepted trajectories
+//!
+//! A `restrict_motion` scales the limits of trajectories decided **after**
+//! it is applied. A trajectory the controller already accepted keeps
+//! executing at the speeds it was accepted with; the gateway cannot reach
+//! it (it decides messages, not controller state). To stop one, use
+//! `safe_pause` (the controller switch holds position).
 //!
 //! An empty trajectory (no points) is a stop for a
 //! `joint_trajectory_controller` (it holds the current position) and
@@ -73,7 +107,10 @@
 //! `time_from_start` is multiplied by `k` (rounded up to the nanosecond),
 //! every velocity divided by `k` and every acceleration by `k^2`. The path
 //! (the positions) is untouched, so a time-scaled trajectory goes through
-//! the same configurations, slower. The rewrite is in place (same length,
+//! the same configurations, slower; this applies to the interpolated
+//! segments too (velocity scales by `1/k`, acceleration by `1/k^2`), but a
+//! segment that leaves the position bounds does so at any speed and is
+//! refused. The rewrite is in place (same length,
 //! [`write_time_scale`]) and is verified by decoding and checking again.
 //! Anything else is refused.
 
@@ -157,6 +194,8 @@ pub struct GoalParts {
 pub struct WireTrajectory {
     pub big: bool,
     pub stamp: (i32, u32),
+    /// Slot offset of `header.stamp.sec`.
+    pub stamp_off: usize,
     pub frame_id: String,
     pub joint_names: Vec<String>,
     pub points: Vec<WirePoint>,
@@ -293,6 +332,8 @@ impl<'a> Cur<'a> {
     }
 
     fn trajectory(&mut self, max_points: usize) -> R<WireTrajectory> {
+        self.align(4)?;
+        let stamp_off = self.pos + 4;
         let (stamp, frame_id) = self.header()?;
         let joint_names = self.names()?;
         // A point is at least 4 counts + a Duration.
@@ -322,6 +363,7 @@ impl<'a> Cur<'a> {
         Ok(WireTrajectory {
             big: self.big,
             stamp,
+            stamp_off,
             frame_id,
             joint_names,
             points,
@@ -729,6 +771,41 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
             if dt <= 0.0 {
                 return Err(refused(Violation::TimeNotIncreasing, None, dt, 0.0));
             }
+            // What the controller executes between the two points (review
+            // F2): the segment's polynomial, not only its ends.
+            if let Some(c) = segment(prev, p, j, dt) {
+                let (lo, hi) = range(&c, dt);
+                if !(lo.is_finite() && hi.is_finite()) {
+                    return Err(refused(Violation::NonFinite, Some(&b.name), f64::NAN, 0.0));
+                }
+                if lo < b.min_position || hi > b.max_position {
+                    let (v, l) = if lo < b.min_position {
+                        (lo, b.min_position)
+                    } else {
+                        (hi, b.max_position)
+                    };
+                    return Err(refused(Violation::Position, Some(&b.name), v, l));
+                }
+                let dc = deriv(&c);
+                let (vlo, vhi) = range(&dc, dt);
+                let vmax = vlo.abs().max(vhi.abs());
+                need(
+                    vmax / b.max_velocity,
+                    Violation::Velocity,
+                    b,
+                    vmax,
+                    b.max_velocity,
+                );
+                let (alo, ahi) = range(&deriv(&dc), dt);
+                let amax = alo.abs().max(ahi.abs());
+                need(
+                    amax / b.max_acceleration,
+                    Violation::Acceleration,
+                    b,
+                    amax,
+                    b.max_acceleration,
+                );
+            }
             let rate = (p.positions[j] - prev.positions[j]).abs() / dt;
             need(
                 rate / b.max_velocity,
@@ -768,6 +845,106 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
         return Err(first.unwrap_or_else(|| refused(Violation::Velocity, None, k, 0.0)));
     }
     Ok((k, first))
+}
+
+/// The polynomial (coefficients `c0 + c1 t + ...`, `t` in seconds from
+/// `a`) a `joint_trajectory_controller` (ros2_control, `splines`
+/// interpolation, `trajectory.cpp` `interpolate_between_points`) executes
+/// for joint `j` between points `a` and `b`, `dt` apart: **quintic** when
+/// both points carry velocities and accelerations, **cubic** (Hermite)
+/// when both carry velocities, `None` (linear: positions only, whose
+/// bounds are the points' and whose speed is the rate checked above)
+/// otherwise.
+fn segment(a: &WirePoint, b: &WirePoint, j: usize, dt: f64) -> Option<Vec<f64>> {
+    let (p0, p1) = (*a.positions.get(j)?, *b.positions.get(j)?);
+    let (v0, v1) = (*a.velocities.get(j)?, *b.velocities.get(j)?);
+    let t = dt;
+    match (a.accelerations.get(j), b.accelerations.get(j)) {
+        (Some(&a0), Some(&a1)) => {
+            let dp = p1 - p0;
+            Some(vec![
+                p0,
+                v0,
+                a0 / 2.0,
+                (20.0 * dp - (8.0 * v1 + 12.0 * v0) * t - (3.0 * a0 - a1) * t * t)
+                    / (2.0 * t.powi(3)),
+                (-30.0 * dp + (14.0 * v1 + 16.0 * v0) * t + (3.0 * a0 - 2.0 * a1) * t * t)
+                    / (2.0 * t.powi(4)),
+                (12.0 * dp - 6.0 * (v1 + v0) * t - (a0 - a1) * t * t) / (2.0 * t.powi(5)),
+            ])
+        }
+        _ => Some(vec![
+            p0,
+            v0,
+            (3.0 * (p1 - p0) / t - 2.0 * v0 - v1) / t,
+            (2.0 * (p0 - p1) / t + v0 + v1) / (t * t),
+        ]),
+    }
+}
+
+fn eval(c: &[f64], t: f64) -> f64 {
+    c.iter().rev().fold(0.0, |acc, x| acc * t + x)
+}
+
+fn deriv(c: &[f64]) -> Vec<f64> {
+    c.iter()
+        .enumerate()
+        .skip(1)
+        .map(|(i, x)| x * i as f64)
+        .collect()
+}
+
+/// `(min, max)` of the polynomial on `[0, t_end]`: its ends, 256 samples
+/// and every interior extremum (a sign change of the derivative between
+/// samples, located by bisection).
+fn range(c: &[f64], t_end: f64) -> (f64, f64) {
+    const N: usize = 256;
+    let d = deriv(c);
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut put = |x: f64| {
+        if x.is_nan() {
+            lo = f64::NAN;
+            hi = f64::NAN;
+        } else if !lo.is_nan() {
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+    };
+    put(eval(c, 0.0));
+    let (mut t0, mut d0) = (0.0, eval(&d, 0.0));
+    for i in 1..=N {
+        let t1 = t_end * i as f64 / N as f64;
+        put(eval(c, t1));
+        let d1 = eval(&d, t1);
+        if d0 != 0.0 && d1 != 0.0 && d0.signum() != d1.signum() {
+            let (mut a, mut b) = (t0, t1);
+            for _ in 0..60 {
+                let m = 0.5 * (a + b);
+                if eval(&d, m).signum() == d0.signum() {
+                    a = m;
+                } else {
+                    b = m;
+                }
+            }
+            put(eval(c, 0.5 * (a + b)));
+        }
+        t0 = t1;
+        d0 = d1;
+    }
+    (lo, hi)
+}
+
+/// Zero `header.stamp` in place (review F1): a controller starts a
+/// trajectory at its stamp, so a past stamp would make it start part-way
+/// through (an immediate jump the point checks do not see); a zero stamp
+/// means "now", which is what the checks assume.
+pub fn write_zero_stamp(slot: &mut [u8], t: &mut WireTrajectory) -> Result<(), RewriteError> {
+    slot.get_mut(t.stamp_off..t.stamp_off + 8)
+        .ok_or(RewriteError::Length)?
+        .copy_from_slice(&[0; 8]);
+    t.stamp = (0, 0);
+    Ok(())
 }
 
 /// Decide `t` against `lim` (module docs).
