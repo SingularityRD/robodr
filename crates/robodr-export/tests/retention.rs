@@ -84,8 +84,9 @@ fn publisher_prunes_markers_and_dead_letters_it_no_longer_needs() {
     // deleting a marker would publish its batch again.
     assert_eq!((rep.pruned_done.removed, rep.pruned_done.held), (0, 3));
     // Three dead letters, one per file; past keep = 1 the oldest goes
-    // (its batch is done: the entry protects nothing).
+    // (its batch is done: the entry protects nothing), counted and logged.
     assert_eq!(rep.pruned_dead_letters.removed, 1, "{rep:?}");
+    assert_eq!(rep.pruned_dead_letters.removed_entries, 1, "{rep:?}");
     assert_eq!(
         dl_files(&state),
         ["dead-letter.jsonl.1", "dead-letter.jsonl"]
@@ -157,6 +158,37 @@ fn spool_dead_letters_are_held_while_the_file_is_in_ready() {
         (1, 1)
     );
     assert_eq!(dl_files(&state), ["dead-letter.jsonl.2"]);
+}
+
+/// Review finding: the publisher rotated by default, and pruning deleted
+/// rotated files whose entries could be the only copy of Kafka-refused
+/// findings. Rotation is now opt-in: by default nothing is ever deleted,
+/// whatever the batches' state.
+#[test]
+fn publisher_keeps_every_dead_letter_by_default() {
+    let tmp = TempDir::new("ret-default");
+    let out = tmp.path().join("out");
+    let state = tmp.path().join("state");
+    for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        write_batch(&out, b, 1);
+    }
+    let cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &state);
+    assert_eq!(cfg.dead_letter_rotation, None, "rotation is opt-in");
+    let mut p = Publisher::open(cfg, OkSink).unwrap();
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.dead_lettered, 3);
+    // The batches are done and even gone from out/: their entries protect
+    // nothing for deduplication, yet nothing is deleted.
+    for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        fs::remove_dir_all(out.join(b)).unwrap();
+    }
+    for _ in 0..2 {
+        let rep = p.run_once().unwrap();
+        assert_eq!(rep.pruned_dead_letters, Default::default());
+    }
+    assert_eq!(dl_files(&state), ["dead-letter.jsonl"]);
+    let dl = fs::read_to_string(state.join("dead-letter.jsonl")).unwrap();
+    assert_eq!(dl.lines().count(), 3);
 }
 
 #[test]

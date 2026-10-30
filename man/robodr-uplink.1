@@ -127,7 +127,10 @@ to the spool's
 .BR rejected/ ).
 A record that fails the local validation is dead\-lettered with code
 .B local
-and never sent. Network errors,
+and never sent; so is a spool file that cannot be read (I/O error such as
+EACCES or EIO, 3 attempts), with the error as its reason (moved to
+.BR rejected/ ,
+kept for a re\-drive) instead of failing every run. Network errors,
 .BR 408 ,
 .B 429
 and
@@ -451,8 +454,9 @@ or
 .BR diode_batches ,
 .BR reinject_generations ),
 .BR next_attempt_at_ms ,
-.B dead_letter_malformed
-and the delivery totals. Times are ms since the epoch.
+.BR dead_letter_malformed ,
+.B quarantined_unreadable
+(spool files this process could not read, see below) and the delivery totals. Times are ms since the epoch.
 .TP
 .IB DIR /uplink.lock
 The state directory's lock (never removed; harmless when stale: the kernel

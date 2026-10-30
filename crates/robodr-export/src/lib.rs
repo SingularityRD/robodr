@@ -72,6 +72,8 @@ pub mod retention;
 pub mod spool_export;
 pub mod uplink;
 
+#[doc(hidden)]
+pub use fsutil::inject_read_errors;
 pub use fsutil::now_ms;
 pub use publish::{PublishConfig, PublishError, PublishReport, Publisher, Sink, Source};
 pub use spool_export::{ExportConfig, ExportError, ExportReport, Exporter};

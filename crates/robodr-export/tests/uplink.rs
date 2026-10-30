@@ -235,6 +235,39 @@ fn spool_partial_acceptance_dead_letters_and_acks() {
     );
 }
 
+/// Review finding: an I/O error (EACCES, EIO) reading one spool file failed
+/// every run forever. Now it is quarantined after a bounded number of
+/// attempts (local dead letter with the error, moved to rejected/) and the
+/// rest is sent.
+#[test]
+fn unreadable_spool_file_is_quarantined_not_fatal() {
+    let r = Rig::new("eio", Role::Uplink);
+    r.spool(UNIT, 0, 3, false);
+    let bad = r.ready()[1].clone();
+    let mut u = r.uplink(r.spool_cfg());
+    robodr_export::inject_read_errors(&bad, u32::MAX);
+    let rep = u.run_once();
+    robodr_export::inject_read_errors(&bad, 0);
+    let rep = rep.unwrap();
+    assert_eq!(
+        (rep.accepted, rep.quarantined_unreadable),
+        (2, 1),
+        "{rep:?}"
+    );
+    assert_eq!(rep.dead_lettered_local, 1);
+    assert!(r.ready().is_empty());
+    assert_eq!(r.rejected(), vec![bad]);
+    let dl = r.dead_letters();
+    assert_eq!(dl.len(), 1);
+    assert!(
+        dl[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("unreadable (I/O error"),
+        "{dl:?}"
+    );
+}
+
 #[test]
 fn request_headers_and_signature_follow_the_contract() {
     let r = Rig::new("headers", Role::Uplink);
