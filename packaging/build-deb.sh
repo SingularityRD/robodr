@@ -39,6 +39,9 @@
 #             robodr-deliverd (pure; on-unit delivery agent, usr/sbin, with
 #             its unit, installed disabled; robodr-safety-replay, the test
 #             tool of the same crate, is never packaged)
+#             robodr-seal (pure; sealing: TPM provisioning, enrolment,
+#             signed PCR policies, runtime volume, crypto-erase; usr/sbin,
+#             root-only tool, no unit)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -246,6 +249,9 @@ fi
 if install_bin robodr-deliverd usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-deliverd.service" "$pkg/$units/robodr-deliverd.service"
 fi
+# Sealing (Sprint 13c, docs/SECURE-DELIVERY.md 7.9): the operator's tool for
+# the unit's TPM and runtime volume (OPERATIONS.md section 12); root-only.
+install_bin robodr-seal usr/sbin 0 || true
 # Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
 # (config/fleet.example.json goes to the examples with the other configs.)
 install_bin robodr-enroll usr/sbin 0 || true

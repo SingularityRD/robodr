@@ -213,7 +213,7 @@ jobs:
       - name: Debian package
         env:
           # A release must never ship without the daemons and their tools.
-          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/release
@@ -301,7 +301,7 @@ jobs:
             sudo apt-get install -y --no-install-recommends qemu-user-static
             run=qemu-aarch64-static
           fi
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor robodr-deliverd; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor robodr-deliverd robodr-seal; do
             $run "dist/static/$TARGET/$b" --version
           done
       - name: Cargo.lock unchanged
@@ -314,7 +314,7 @@ jobs:
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
       - name: robodr-focal package and offline bundle
         env:
-          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/release)
