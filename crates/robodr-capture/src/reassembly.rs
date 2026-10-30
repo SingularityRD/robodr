@@ -319,8 +319,29 @@ struct Family {
     lru: BTreeMap<u64, Key>,
 }
 
+#[cfg(test)]
 fn family(addr: &IpAddr) -> usize {
     usize::from(addr.is_ipv6())
+}
+
+/// The per-version state for IPv6 (`v6`) or IPv4.
+fn fam(families: &[Family; 2], v6: bool) -> &Family {
+    let [v4f, v6f] = families;
+    if v6 {
+        v6f
+    } else {
+        v4f
+    }
+}
+
+/// [`fam`], mutably.
+fn fam_mut(families: &mut [Family; 2], v6: bool) -> &mut Family {
+    let [v4f, v6f] = families;
+    if v6 {
+        v6f
+    } else {
+        v4f
+    }
 }
 
 /// Bounded fragment reassembler. Feed it every [`IpFragment`] with its capture
@@ -384,7 +405,7 @@ impl Reassembler {
 
     /// Bytes currently charged to one destination address.
     pub fn buffered_bytes_for(&self, dst: IpAddr) -> usize {
-        self.families[family(&dst)]
+        fam(&self.families, dst.is_ipv6())
             .dsts
             .get(&dst)
             .map_or(0, |d| d.bytes)
@@ -395,7 +416,7 @@ impl Reassembler {
         if let Some(e) = self.entries.get_mut(key) {
             e.charge = e.charge + add - sub;
         }
-        let f = &mut self.families[family(&key.dst)];
+        let f = fam_mut(&mut self.families, key.dst.is_ipv6());
         f.bytes = f.bytes + add - sub;
         if let Some(d) = f.dsts.get_mut(&key.dst) {
             d.bytes = d.bytes + add - sub;
@@ -408,7 +429,7 @@ impl Reassembler {
         let Some(e) = self.entries.get_mut(key) else {
             return;
         };
-        let f = &mut self.families[family(&key.dst)];
+        let f = fam_mut(&mut self.families, key.dst.is_ipv6());
         f.lru.remove(&e.progress);
         e.progress = clock;
         f.lru.insert(clock, *key);
@@ -418,7 +439,7 @@ impl Reassembler {
         let charge = self.entries.get(key)?.charge;
         self.recharge(key, 0, charge);
         let e = self.entries.remove(key)?;
-        let f = &mut self.families[family(&key.dst)];
+        let f = fam_mut(&mut self.families, key.dst.is_ipv6());
         f.datagrams -= 1;
         f.lru.remove(&e.progress);
         if let Some(d) = f.dsts.get_mut(&key.dst) {
@@ -442,24 +463,24 @@ impl Reassembler {
     }
 
     fn expire(&mut self) {
-        for fi in 0..2 {
-            let timeout = if fi == 0 {
-                self.limits.timeout
-            } else {
+        for v6 in [false, true] {
+            let timeout = if v6 {
                 self.limits.timeout_v6
+            } else {
+                self.limits.timeout
             };
-            while let Some(&(t, generation, key)) = self.families[fi].order.front() {
+            while let Some(&(t, generation, key)) = fam(&self.families, v6).order.front() {
                 if t.saturating_add(timeout) >= self.now {
                     break;
                 }
-                self.families[fi].order.pop_front();
+                fam_mut(&mut self.families, v6).order.pop_front();
                 if Self::is_live(&self.entries, &key, generation) {
                     self.remove(&key);
                     self.stats.dropped_timeout += 1;
                 }
             }
             // Keep the order queue proportional to the live entries.
-            let f = &mut self.families[fi];
+            let f = fam_mut(&mut self.families, v6);
             if f.order.len() > 2 * f.datagrams + 1024 {
                 let entries = &self.entries;
                 f.order.retain(|(_, g, k)| Self::is_live(entries, k, *g));
@@ -470,15 +491,15 @@ impl Reassembler {
     /// Record a (new or restarted) datagram generation in the expiry queue.
     fn track(&mut self, key: Key, generation: u64) {
         let now = self.now;
-        self.families[family(&key.dst)]
+        fam_mut(&mut self.families, key.dst.is_ipv6())
             .order
             .push_back((now, generation, key));
     }
 
-    /// Evict the least recently progressed datagram of family `fi` other
-    /// than `arriving`. False when there is none.
-    fn evict_lru(&mut self, fi: usize, arriving: &Key) -> bool {
-        let victim = self.families[fi]
+    /// Evict the least recently progressed datagram of the IPv6 (`v6`) or
+    /// IPv4 family other than `arriving`. False when there is none.
+    fn evict_lru(&mut self, v6: bool, arriving: &Key) -> bool {
+        let victim = fam(&self.families, v6)
             .lru
             .values()
             .take(2)
@@ -497,20 +518,23 @@ impl Reassembler {
     /// Kernel `inet_frag_find` threshold check plus the sensor's global
     /// bound, see the module docs.
     fn admit(&mut self, key: &Key, exists: bool) -> bool {
-        let fi = family(&key.dst);
-        let dst_bytes = self.families[fi].dsts.get(&key.dst).map_or(0, |d| d.bytes);
+        let v6 = key.dst.is_ipv6();
+        let dst_bytes = fam(&self.families, v6)
+            .dsts
+            .get(&key.dst)
+            .map_or(0, |d| d.bytes);
         // Like the kernel: refuse while *above* the threshold.
         if dst_bytes > self.limits.max_bytes_per_dst {
             return false;
         }
         loop {
-            let f = &self.families[fi];
+            let f = fam(&self.families, v6);
             let full = f.bytes > self.limits.max_bytes
                 || (!exists && f.datagrams >= self.limits.max_datagrams);
             if !full {
                 return true;
             }
-            if !self.evict_lru(fi, key) {
+            if !self.evict_lru(v6, key) {
                 return false;
             }
         }
@@ -535,7 +559,7 @@ impl Reassembler {
                 ingress: None,
             },
         );
-        let f = &mut self.families[family(&key.dst)];
+        let f = fam_mut(&mut self.families, key.dst.is_ipv6());
         f.datagrams += 1;
         f.lru.insert(self.clock, key);
         f.dsts.entry(key.dst).or_default().datagrams += 1;
@@ -653,7 +677,7 @@ impl Reassembler {
                         return None;
                     }
                     end &= !7;
-                    data = &data[..end.saturating_sub(offset).min(data.len())];
+                    data = data.get(..end.saturating_sub(offset)).unwrap_or(data);
                 }
                 if end > e.len {
                     if e.last_in {
@@ -758,9 +782,10 @@ impl Reassembler {
         match e.runs.get(idx) {
             Some(r) if r.start < end => {
                 if offset >= r.start && end <= r.end() {
-                    let held = &r.bytes[offset - r.start..end - r.start];
+                    // Within the run: `r.end() == r.start + r.bytes.len()`.
+                    let held = r.bytes.get(offset - r.start..end - r.start);
                     Insert::Dup {
-                        conflict: held != data,
+                        conflict: held != Some(data),
                     }
                 } else {
                     Insert::Overlap

@@ -104,7 +104,7 @@ pub fn well_known_port(kind: PortKind, domain: u16, participant: u16) -> Option<
 
 /// Whether a UDP payload starts with the RTPS magic.
 pub fn has_rtps_magic(payload: &[u8]) -> bool {
-    payload.len() >= 4 && payload[..4] == RTPS_MAGIC
+    payload.starts_with(&RTPS_MAGIC)
 }
 
 /// The set of well-known RTPS ports for some domains and participant ids

@@ -209,7 +209,7 @@ impl BpfProgram {
                 code => return Err(BpfError::UnknownOpcode { at, code }),
             }
         }
-        if self.insns[n - 1].code & 0x07 != BPF_RET {
+        if self.insns.last().is_none_or(|i| i.code & 0x07 != BPF_RET) {
             return Err(BpfError::NoFinalReturn);
         }
         Ok(())
@@ -349,7 +349,7 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
     let tcp6_ja = p.len() - 3;
     // Shared UDP check, X = offset of the UDP header.
     let shared = p.len();
-    p[ja_at].k = (shared - (ja_at + 1)) as u32;
+    patch_ja(&mut p, ja_at, shared);
     if use_ports {
         p.push(stmt(LDH_IND, 2)); // destination port
         for (lo, hi) in filter.ports.port_ranges() {
@@ -408,9 +408,18 @@ pub fn rtps_filter_program(filter: &RtpsFilter) -> Result<BpfProgram, BpfError> 
         drop,
         stmt(RET_K, ZENOH_SNAP_LEN),
     ]);
-    p[tcp4_ja].k = (tcp4 - (tcp4_ja + 1)) as u32;
-    p[tcp6_ja].k = (tcp6 - (tcp6_ja + 1)) as u32;
+    patch_ja(&mut p, tcp4_ja, tcp4);
+    patch_ja(&mut p, tcp6_ja, tcp6);
     BpfProgram::new(p)
+}
+
+/// Point the `JA` at `at` to instruction `target` (`target > at`). The
+/// builder only patches instructions it emitted; [`BpfProgram::validate`]
+/// rejects a program whose jump was left unpatched or out of range.
+fn patch_ja(p: &mut [SockFilter], at: usize, target: usize) {
+    if let Some(i) = p.get_mut(at) {
+        i.k = (target - (at + 1)) as u32;
+    }
 }
 
 #[cfg(test)]

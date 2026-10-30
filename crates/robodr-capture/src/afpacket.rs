@@ -383,10 +383,9 @@ impl AfPacketSource {
         let addr = SockaddrLl {
             family: AF_PACKET as u16,
             protocol: ETH_P_ALL.to_be(),
-            ifindex: if ifindexes.len() == 1 {
-                ifindexes[0]
-            } else {
-                0
+            ifindex: match ifindexes.as_slice() {
+                [one] => *one,
+                _ => 0,
             },
             ..Default::default()
         };
@@ -452,7 +451,8 @@ impl PacketSource for AfPacketSource {
         let (len, addr) = loop {
             let mut addr = SockaddrLl::default();
             let mut alen = size_of::<SockaddrLl>() as u32;
-            let room = &mut self.buf[SLL_HDR_LEN..];
+            // `buf` is allocated with room behind the cooked header.
+            let room = self.buf.get_mut(SLL_HDR_LEN..).unwrap_or_default();
             // SAFETY: `room` (the buffer behind the cooked header) is valid
             // writable memory of `room.len()` bytes;
             // `addr`/`alen` are valid for writes and `alen` holds the size of
@@ -498,7 +498,9 @@ impl PacketSource for AfPacketSource {
         if len > self.buf.len() - SLL_HDR_LEN {
             self.stats.truncated += 1;
         }
-        self.buf[..SLL_HDR_LEN].copy_from_slice(&cooked_header(&addr));
+        if let Some(head) = self.buf.first_chunk_mut::<SLL_HDR_LEN>() {
+            *head = cooked_header(&addr);
+        }
         self.stats.delivered += 1;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -516,7 +518,10 @@ impl PacketSource for AfPacketSource {
         Ok(Some(Packet {
             ts,
             linktype: LinkType::LINUX_SLL,
-            data: &self.buf[..SLL_HDR_LEN.saturating_add(len).min(self.buf.len())],
+            data: self
+                .buf
+                .get(..SLL_HDR_LEN.saturating_add(len))
+                .unwrap_or(&self.buf),
             orig_len: u32::try_from(SLL_HDR_LEN.saturating_add(len)).unwrap_or(u32::MAX),
             ingress: PacketIngress {
                 ifindex,
