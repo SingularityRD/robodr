@@ -11,7 +11,7 @@ use robodr_ocsf::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -138,6 +138,40 @@ pub struct State {
     pub produce_max_version: i16,
     pub acks_seen: Vec<i16>,
     pub batches_seen: u64,
+    /// Serve TLS (read when a connection is accepted).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Require SASL/SCRAM before Metadata / Produce.
+    pub scram: Option<ScramServer>,
+    /// Connections that completed SCRAM.
+    pub authenticated: u64,
+    /// SCRAM attempts refused.
+    pub auth_failures: u64,
+}
+
+/// The broker side of SASL/SCRAM (RFC 5802), for the fake cluster.
+#[derive(Debug, Clone)]
+pub struct ScramServer {
+    pub mechanism: robodr_export::kafka::sasl::Mechanism,
+    pub user: String,
+    pub password: String,
+    pub iterations: u32,
+    /// SaslAuthenticate v1 `session_lifetime_ms`.
+    pub session_lifetime_ms: i64,
+    /// Answer with a wrong server signature (an impostor broker).
+    pub forge_server_signature: bool,
+}
+
+impl ScramServer {
+    pub fn new(mechanism: robodr_export::kafka::sasl::Mechanism, user: &str, pw: &str) -> Self {
+        Self {
+            mechanism,
+            user: user.into(),
+            password: pw.into(),
+            iterations: 4096,
+            session_lifetime_ms: 0,
+            forge_server_signature: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -148,13 +182,21 @@ pub struct Cluster {
 impl Cluster {
     /// `nodes` brokers (ids 1..=nodes), `partitions` partitions all led by node 1.
     pub fn start(nodes: i32, partitions: usize) -> Self {
-        let state = Arc::new(Mutex::new(State {
+        Self::start_with(nodes, partitions, |_| {})
+    }
+
+    /// [`Cluster::start`] with `f` applied to the initial state (TLS,
+    /// SCRAM).
+    pub fn start_with(nodes: i32, partitions: usize, f: impl FnOnce(&mut State)) -> Self {
+        let mut init = State {
             leaders: vec![1; partitions],
             max_value_bytes: usize::MAX,
             max_batch_bytes: usize::MAX,
             produce_max_version: 8,
             ..Default::default()
-        }));
+        };
+        f(&mut init);
+        let state = Arc::new(Mutex::new(init));
         for node in 1..=nodes {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = l.local_addr().unwrap().port();
@@ -164,7 +206,24 @@ impl Cluster {
                 for s in l.incoming() {
                     let Ok(s) = s else { continue };
                     let st = st.clone();
-                    std::thread::spawn(move || serve(node, s, st));
+                    std::thread::spawn(move || {
+                        let (idle, tls) = {
+                            let g = st.lock().unwrap();
+                            (g.idle_close, g.tls.clone())
+                        };
+                        if idle.is_some() {
+                            let _ = s.set_read_timeout(idle);
+                        }
+                        match tls {
+                            None => serve(node, s, st),
+                            Some(cfg) => {
+                                let Ok(conn) = rustls::ServerConnection::new(cfg) else {
+                                    return;
+                                };
+                                serve(node, rustls::StreamOwned::new(conn, s), st)
+                            }
+                        }
+                    });
                 }
             });
         }
@@ -207,7 +266,7 @@ impl Cluster {
     }
 }
 
-fn read_frame(s: &mut TcpStream) -> Option<Vec<u8>> {
+fn read_frame(s: &mut impl Read) -> Option<Vec<u8>> {
     let mut len = [0u8; 4];
     s.read_exact(&mut len).ok()?;
     let n = i32::from_be_bytes(len);
@@ -219,19 +278,91 @@ fn read_frame(s: &mut TcpStream) -> Option<Vec<u8>> {
     Some(b)
 }
 
-fn write_response(s: &mut TcpStream, corr: i32, body: &[u8]) -> std::io::Result<()> {
+fn write_response(s: &mut impl Write, corr: i32, body: &[u8]) -> std::io::Result<()> {
     let mut f = Vec::with_capacity(body.len() + 8);
     f.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     f.extend_from_slice(&corr.to_be_bytes());
     f.extend_from_slice(body);
-    s.write_all(&f)
+    s.write_all(&f)?;
+    s.flush()
 }
 
-fn serve(node: i32, mut s: TcpStream, st: Arc<Mutex<State>>) {
-    let idle = st.lock().unwrap().idle_close;
-    if idle.is_some() {
-        let _ = s.set_read_timeout(idle);
+/// One connection's SCRAM state.
+#[derive(Default)]
+struct ScramConn {
+    mechanism_ok: bool,
+    /// `(client-first-bare, server-first)` after the first message.
+    first: Option<(String, String)>,
+    done: bool,
+}
+
+/// Answer one SaslAuthenticate message: `Ok(reply)` or `Err(reason)`.
+fn scram_step(srv: &ScramServer, c: &mut ScramConn, msg: &[u8]) -> Result<String, String> {
+    use robodr_export::kafka::sasl::{b64_decode, b64_encode};
+    let m = srv.mechanism;
+    let msg = std::str::from_utf8(msg).map_err(|_| "not UTF-8")?;
+    match c.first.take() {
+        None => {
+            let bare = msg.strip_prefix("n,,").ok_or("bad GS2 header")?;
+            let mut parts = bare.split(',');
+            let user = parts
+                .next()
+                .and_then(|u| u.strip_prefix("n="))
+                .ok_or("no user")?
+                .replace("=2C", ",")
+                .replace("=3D", "=");
+            let cnonce = parts
+                .next()
+                .and_then(|r| r.strip_prefix("r="))
+                .ok_or("no nonce")?;
+            if user != srv.user {
+                return Err("unknown user".into());
+            }
+            let sf = format!(
+                "r={cnonce}fakebrokernonce,s={},i={}",
+                b64_encode(b"robodr-salt"),
+                srv.iterations
+            );
+            c.first = Some((bare.to_string(), sf.clone()));
+            Ok(sf)
+        }
+        Some((bare, sf)) => {
+            let (without_proof, proof) = msg.rsplit_once(",p=").ok_or("no proof")?;
+            let proof = b64_decode(proof).ok_or("bad proof")?;
+            let auth = format!("{bare},{sf},{without_proof}");
+            let salted = m.hi(srv.password.as_bytes(), b"robodr-salt", srv.iterations);
+            let client_key = m.hmac(&salted, b"Client Key");
+            let stored: Vec<u8> = {
+                use sha2::Digest;
+                match m {
+                    robodr_export::kafka::sasl::Mechanism::ScramSha256 => {
+                        sha2::Sha256::digest(&client_key).to_vec()
+                    }
+                    robodr_export::kafka::sasl::Mechanism::ScramSha512 => {
+                        sha2::Sha512::digest(&client_key).to_vec()
+                    }
+                }
+            };
+            let sig = m.hmac(&stored, auth.as_bytes());
+            let ck: Vec<u8> = proof.iter().zip(&sig).map(|(a, b)| a ^ b).collect();
+            if ck != client_key {
+                return Err("bad proof".into());
+            }
+            let server_key = m.hmac(&salted, b"Server Key");
+            let mut ss = m.hmac(&server_key, auth.as_bytes());
+            if srv.forge_server_signature {
+                ss[0] ^= 1;
+            }
+            c.done = true;
+            Ok(format!("v={}", b64_encode(&ss)))
+        }
     }
+}
+
+fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
+    use robodr_export::kafka::sasl;
+    let scram = st.lock().unwrap().scram.clone();
+    let mut sc = ScramConn::default();
     while let Some(frame) = read_frame(&mut s) {
         let Ok((h, mut r)) = proto::parse_request_header(&frame) else {
             return;
@@ -240,28 +371,110 @@ fn serve(node: i32, mut s: TcpStream, st: Arc<Mutex<State>>) {
             .unwrap()
             .seen
             .push((node, h.api_key, h.api_version));
+        if scram.is_some()
+            && !sc.done
+            && ![
+                proto::API_VERSIONS,
+                sasl::API_SASL_HANDSHAKE,
+                sasl::API_SASL_AUTHENTICATE,
+            ]
+            .contains(&h.api_key)
+        {
+            // Like Kafka: unauthenticated, the connection is closed.
+            return;
+        }
         match h.api_key {
+            sasl::API_SASL_HANDSHAKE => {
+                let mech = r.string().unwrap_or_default().to_string();
+                let Some(srv) = &scram else { return };
+                sc.mechanism_ok = mech == srv.mechanism.name();
+                let body = sasl::encode_handshake_response(
+                    if sc.mechanism_ok { 0 } else { 33 },
+                    &[srv.mechanism.name()],
+                );
+                if write_response(&mut s, h.correlation_id, &body).is_err() {
+                    return;
+                }
+            }
+            sasl::API_SASL_AUTHENTICATE => {
+                let msg = r
+                    .nullable_bytes()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_vec();
+                let Some(srv) = &scram else { return };
+                let res = if sc.mechanism_ok {
+                    scram_step(srv, &mut sc, &msg)
+                } else {
+                    Err("no handshake".into())
+                };
+                let resp = match &res {
+                    Ok(reply) => sasl::AuthenticateResponse {
+                        error_code: 0,
+                        error_message: None,
+                        auth_bytes: reply.clone().into_bytes(),
+                        session_lifetime_ms: if sc.done { srv.session_lifetime_ms } else { 0 },
+                    },
+                    Err(e) => sasl::AuthenticateResponse {
+                        error_code: 58,
+                        error_message: Some(format!("Authentication failed: {e}")),
+                        auth_bytes: Vec::new(),
+                        session_lifetime_ms: 0,
+                    },
+                };
+                {
+                    let mut g = st.lock().unwrap();
+                    if res.is_err() {
+                        g.auth_failures += 1;
+                    } else if sc.done {
+                        g.authenticated += 1;
+                    }
+                }
+                let body = sasl::encode_authenticate_response(h.api_version, &resp);
+                if write_response(&mut s, h.correlation_id, &body).is_err() || res.is_err() {
+                    return;
+                }
+            }
             proto::API_VERSIONS => {
                 let pmax = st.lock().unwrap().produce_max_version;
+                let mut apis = vec![
+                    ApiRange {
+                        api_key: sasl::API_SASL_HANDSHAKE,
+                        min: 0,
+                        max: 1,
+                    },
+                    ApiRange {
+                        api_key: sasl::API_SASL_AUTHENTICATE,
+                        min: 0,
+                        max: 2,
+                    },
+                ];
+                if scram.is_none() {
+                    apis.clear();
+                }
                 let body = proto::encode_api_versions_response(&ApiVersionsResponse {
                     error_code: 0,
-                    apis: vec![
-                        ApiRange {
-                            api_key: 0,
-                            min: 0,
-                            max: pmax,
-                        },
-                        ApiRange {
-                            api_key: 3,
-                            min: 0,
-                            max: 12,
-                        },
-                        ApiRange {
-                            api_key: 18,
-                            min: 0,
-                            max: 3,
-                        },
-                    ],
+                    apis: apis
+                        .into_iter()
+                        .chain(vec![
+                            ApiRange {
+                                api_key: 0,
+                                min: 0,
+                                max: pmax,
+                            },
+                            ApiRange {
+                                api_key: 3,
+                                min: 0,
+                                max: 12,
+                            },
+                            ApiRange {
+                                api_key: 18,
+                                min: 0,
+                                max: 3,
+                            },
+                        ])
+                        .collect(),
                 });
                 if write_response(&mut s, h.correlation_id, &body).is_err() {
                     return;

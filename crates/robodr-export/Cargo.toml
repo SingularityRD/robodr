@@ -11,8 +11,9 @@ repository.workspace = true
 description = "Exporters for robodr.findings: agentd spool -> diode packer (robot side); diode importer output / site spool -> Kafka (std-only Kafka producer) or -> the AutoSecOps ingest API over TLS (robodr-uplink)."
 
 # Pure Rust crates + RoboDR crates + serde; the Kafka client is a minimal
-# in-crate implementation (no TLS/SASL; see README). rustls (+ ring) is the
-# TLS stack of robodr-uplink only (ingest API client, README "robodr-uplink").
+# in-crate implementation (README). rustls (+ ring) is the TLS stack of
+# robodr-uplink (ingest API client) and of the Kafka producer (through
+# robodr_blackbox::tls); sha2 / zeroize serve its SASL/SCRAM.
 [dependencies]
 robodr-agentd = { workspace = true }
 robodr-blackbox = { workspace = true }
@@ -20,6 +21,8 @@ robodr-diode = { workspace = true }
 robodr-ocsf = { workspace = true }
 rustls = { workspace = true }
 webpki = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

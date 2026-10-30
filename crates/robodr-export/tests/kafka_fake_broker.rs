@@ -11,6 +11,7 @@ use std::time::Duration;
 
 fn cfg(c: &Cluster) -> ProducerConfig {
     let mut p = ProducerConfig::new(c.bootstrap());
+    p.allow_plaintext = true;
     p.retry_backoff = Duration::from_millis(5);
     p.retry_backoff_max = Duration::from_millis(50);
     p.request_timeout = Duration::from_secs(5);
@@ -348,11 +349,12 @@ fn tls_listener_is_named_in_the_error() {
         let _ = s.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x50]);
     });
     let mut cf = ProducerConfig::new(vec![addr]);
+    cf.allow_plaintext = true;
     cf.retries = 1;
     cf.retry_backoff = Duration::from_millis(1);
     let mut p = Producer::new(cf).unwrap();
     let e = p.partition_count(TOPIC).unwrap_err().to_string();
-    assert!(e.contains("TLS") && e.contains("PLAINTEXT only"), "{e}");
+    assert!(e.contains("TLS record") && e.contains("CA file"), "{e}");
 }
 
 /// Regression (found against Kafka 3.9.1): a SASL_PLAINTEXT listener
@@ -390,6 +392,7 @@ fn sasl_listener_is_named_in_the_error() {
         let _ = read_request(&mut s);
     });
     let mut cf = ProducerConfig::new(vec![addr]);
+    cf.allow_plaintext = true;
     cf.retries = 1;
     cf.retry_backoff = Duration::from_millis(1);
     let mut p = Producer::new(cf).unwrap();

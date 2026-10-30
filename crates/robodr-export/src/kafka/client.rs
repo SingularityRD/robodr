@@ -1,9 +1,18 @@
 //! A minimal, synchronous Kafka producer (std only).
 //!
-//! * Plain TCP. **No TLS, no SASL.** Put it behind a local TLS proxy
-//!   (stunnel, a sidecar) or run it on an isolated SOC network segment.
-//!   Pointed at a TLS listener (answers with a TLS alert) or a SASL listener
-//!   (closes the connection after ApiVersions), the error says so.
+//! * **TLS** ([`ProducerConfig::tls`], `robodr_blackbox::tls`: rustls,
+//!   TLS 1.3 / 1.2): every broker's certificate is verified against the
+//!   configured CA file only (chain, validity, `serverAuth`, and the broker's
+//!   host as dialled, bootstrap or advertised, unless `server_name` is
+//!   set), optional SPKI pins add to that, and an optional client
+//!   certificate gives mutual TLS. **Plain TCP is refused** unless
+//!   [`ProducerConfig::allow_plaintext`] is set explicitly; there is no
+//!   fallback from TLS to plain TCP.
+//! * **SASL/SCRAM** ([`ProducerConfig::sasl`], [`super::sasl`]):
+//!   SCRAM-SHA-256 / -512 after ApiVersions, over TLS only. Pointed at a
+//!   TLS listener without TLS (answers with a TLS alert) or a SASL listener
+//!   without SASL (closes the connection after ApiVersions), the error says
+//!   so.
 //! * Connections unused for `connections_max_idle` (9 min, as the Java
 //!   client) are closed before the broker's own idle timeout (10 min)
 //!   would make the next request fail.
@@ -52,7 +61,10 @@
 use super::batch::{encode_batch, ProduceRecord, BATCH_OVERHEAD};
 use super::errors::{self, classify, ErrorClass};
 use super::proto::{self, ApiRange};
+use super::sasl::{self, SaslConfig, ScramClient};
 use super::wire::DecodeError;
+use robodr_blackbox::tls::ClientTls;
+use rustls::{ClientConnection, StreamOwned};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -95,6 +107,12 @@ pub struct ProducerConfig {
     /// after their own `connections.max.idle.ms` (default 10 min), and a
     /// request on such a connection fails and costs a retry.
     pub connections_max_idle: Duration,
+    /// TLS to every broker (`robodr_blackbox::tls::load_client`).
+    pub tls: Option<ClientTls>,
+    /// SASL/SCRAM after the TLS handshake (needs `tls`).
+    pub sasl: Option<SaslConfig>,
+    /// Plain TCP when `tls` is `None` (default `false`: refused).
+    pub allow_plaintext: bool,
 }
 
 impl ProducerConfig {
@@ -114,6 +132,9 @@ impl ProducerConfig {
             retry_backoff_max: Duration::from_secs(10),
             metadata_max_age: Duration::from_secs(300),
             connections_max_idle: Duration::from_secs(540),
+            tls: None,
+            sasl: None,
+            allow_plaintext: false,
         }
     }
 
@@ -121,6 +142,19 @@ impl ProducerConfig {
         let bad = |m: &str| Err(ProduceError::Config(m.into()));
         if self.bootstrap.is_empty() {
             return bad("no bootstrap brokers");
+        }
+        match (&self.tls, self.allow_plaintext) {
+            (None, false) => {
+                return bad(
+                    "plain TCP to the brokers is refused: configure TLS (a CA file), or allow \
+                     plain TCP explicitly (isolated network or a local TLS proxy only)",
+                )
+            }
+            (Some(_), true) => return bad("TLS and allow_plaintext are both set: remove one"),
+            _ => {}
+        }
+        if self.sasl.is_some() && self.tls.is_none() {
+            return bad("SASL needs TLS (an authenticated plain-TCP connection can be taken over)");
         }
         if self.client_id.len() > 255 {
             return bad("client id too long");
@@ -219,6 +253,25 @@ enum NetError {
     Io(io::Error),
     Protocol(String),
     Unsupported(String),
+    /// SASL authentication failed (not retried).
+    Auth {
+        code: i16,
+        context: String,
+    },
+}
+
+impl NetError {
+    /// A connection error that fails the whole call.
+    fn fatal(&self) -> Option<ProduceError> {
+        match self {
+            NetError::Unsupported(m) => Some(ProduceError::Unsupported(m.clone())),
+            NetError::Auth { code, context } => Some(ProduceError::Fatal {
+                code: *code,
+                context: context.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for NetError {
@@ -227,6 +280,7 @@ impl fmt::Display for NetError {
             NetError::Io(e) => write!(f, "I/O: {e}"),
             NetError::Protocol(m) => write!(f, "protocol: {m}"),
             NetError::Unsupported(m) => write!(f, "unsupported: {m}"),
+            NetError::Auth { context, .. } => write!(f, "authentication: {context}"),
         }
     }
 }
@@ -243,8 +297,47 @@ impl From<DecodeError> for NetError {
     }
 }
 
+/// A broker connection: plain TCP or TLS over it.
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Stream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Stream::Plain(s) => s,
+            Stream::Tls(t) => &t.sock,
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            Stream::Tls(t) => t.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::Tls(t) => t.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(t) => t.flush(),
+        }
+    }
+}
+
 struct Conn {
-    stream: TcpStream,
+    stream: Stream,
     produce_v: i16,
     metadata_v: i16,
     /// No request after the ApiVersions handshake has completed yet. A
@@ -253,16 +346,38 @@ struct Conn {
     fresh: bool,
     /// End of the last completed exchange (or of the handshake).
     last_used: Instant,
+    /// Close before this (a SASL session lifetime announced by the broker).
+    expires: Option<Instant>,
+}
+
+impl Conn {
+    fn usable(&self, max_idle: Duration) -> bool {
+        self.last_used.elapsed() < max_idle && self.expires.is_none_or(|e| Instant::now() < e)
+    }
 }
 
 /// Explain a response that is really a TLS record (a plaintext request to
 /// a TLS listener is answered with a TLS alert, `15 03 0x ...`).
+/// Name a TLS failure inside an I/O error (rustls reports alerts and
+/// certificate errors as `io::Error(InvalidData, rustls::Error)`).
+fn tls_io(e: io::Error) -> io::Error {
+    if e.get_ref()
+        .is_some_and(|x| x.downcast_ref::<rustls::Error>().is_some())
+    {
+        io::Error::new(
+            e.kind(),
+            format!("TLS: {}", robodr_blackbox::tls::describe(&e)),
+        )
+    } else {
+        e
+    }
+}
+
 fn tls_hint(prefix: [u8; 4]) -> Option<String> {
     (matches!(prefix[0], 0x15 | 0x16) && prefix[1] == 0x03).then(|| {
         format!(
             "the broker answered with a TLS record ({:02x} {:02x} {:02x} ...): this listener \
-             requires TLS, and this client speaks PLAINTEXT only (use a PLAINTEXT listener \
-             or a local TLS proxy)",
+             requires TLS (configure the brokers' CA file instead of allowing plain TCP)",
             prefix[0], prefix[1], prefix[2]
         )
     })
@@ -282,7 +397,7 @@ fn sasl_hint(e: io::Error) -> io::Error {
             e.kind(),
             format!(
                 "{e} on the first request after ApiVersions: if this listener requires \
-                 SASL, note that this client has no SASL/TLS (use a PLAINTEXT listener)"
+                 SASL, configure SASL/SCRAM (mechanism, user, password file)"
             ),
         )
     } else {
@@ -293,13 +408,18 @@ fn sasl_hint(e: io::Error) -> io::Error {
 /// Write all of `buf` before `deadline` (the write timeout is re-armed with
 /// the remaining time before every `write`, so a peer that drains slowly
 /// cannot extend the exchange).
-fn write_all_deadline(s: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
-    while !buf.is_empty() {
+fn write_all_deadline(s: &mut Stream, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
+    let arm = |s: &Stream| -> io::Result<()> {
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
         }
-        s.set_write_timeout(Some(deadline - now))?;
+        // TLS writes may read (key updates), so both are bounded.
+        s.tcp().set_write_timeout(Some(deadline - now))?;
+        s.tcp().set_read_timeout(Some(deadline - now))
+    };
+    while !buf.is_empty() {
+        arm(s)?;
         match s.write(buf) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -314,6 +434,17 @@ fn write_all_deadline(s: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> i
             }
             Err(e) => return Err(e),
         }
+    }
+    // TLS buffers records; push them out within the deadline.
+    if let Stream::Tls(_) = s {
+        arm(s)?;
+        s.flush().map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(io::ErrorKind::TimedOut, "request timed out")
+            } else {
+                e
+            }
+        })?;
     }
     Ok(())
 }
@@ -361,14 +492,15 @@ pub(crate) fn resolve(addr: &str, timeout: Duration) -> io::Result<Vec<SocketAdd
     }
 }
 
-fn read_exact_deadline(s: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+fn read_exact_deadline(s: &mut Stream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
     let mut off = 0;
     while off < buf.len() {
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
         }
-        s.set_read_timeout(Some(deadline - now))?;
+        s.tcp().set_read_timeout(Some(deadline - now))?;
+        s.tcp().set_write_timeout(Some(deadline - now))?;
         match s.read(&mut buf[off..]) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -406,8 +538,14 @@ impl Conn {
             )));
         }
         let deadline = Instant::now() + cfg.request_timeout;
-        let hint = self.fresh && api != proto::API_VERSIONS;
-        let io = |e: io::Error| NetError::Io(if hint { sasl_hint(e) } else { e });
+        let hint = self.fresh && api != proto::API_VERSIONS && api != sasl::API_SASL_HANDSHAKE;
+        let io = |e: io::Error| {
+            NetError::Io(if hint {
+                sasl_hint(tls_io(e))
+            } else {
+                tls_io(e)
+            })
+        };
         write_all_deadline(&mut self.stream, &frame, deadline).map_err(io)?;
         let mut len = [0u8; 4];
         read_exact_deadline(&mut self.stream, &mut len, deadline).map_err(io)?;
@@ -420,7 +558,10 @@ impl Conn {
         }
         let mut buf = vec![0u8; n as usize];
         read_exact_deadline(&mut self.stream, &mut buf, deadline).map_err(io)?;
-        if api != proto::API_VERSIONS {
+        if api != proto::API_VERSIONS
+            && api != sasl::API_SASL_HANDSHAKE
+            && api != sasl::API_SASL_AUTHENTICATE
+        {
             self.fresh = false;
         }
         self.last_used = Instant::now();
@@ -456,12 +597,35 @@ impl Conn {
             }
         };
         stream.set_nodelay(true)?;
+        let stream = match &cfg.tls {
+            None => Stream::Plain(stream),
+            Some(tls) => {
+                let name = tls
+                    .name_for(robodr_blackbox::tls::host_of(addr))
+                    .map_err(NetError::Protocol)?;
+                // The handshake is bounded like a request.
+                let t = robodr_blackbox::tls::connect_client(
+                    stream,
+                    tls,
+                    name,
+                    Instant::now() + cfg.request_timeout.min(cfg.connect_timeout * 2),
+                )
+                .map_err(|e| {
+                    NetError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("{addr}: {e}"),
+                    ))
+                })?;
+                Stream::Tls(Box::new(t))
+            }
+        };
         let mut c = Conn {
             stream,
             produce_v: 0,
             metadata_v: 0,
             fresh: true,
             last_used: Instant::now(),
+            expires: None,
         };
         let body = c.exchange(cfg, corr, proto::API_VERSIONS, 0, &[])?;
         let av = proto::decode_api_versions(&body)?;
@@ -491,7 +655,105 @@ impl Conn {
             proto::METADATA_VERSIONS,
             "Metadata",
         )?;
+        if let Some(s) = &cfg.sasl {
+            let hv = pick(
+                &av.apis,
+                sasl::API_SASL_HANDSHAKE,
+                sasl::HANDSHAKE_VERSIONS,
+                "SaslHandshake",
+            )?;
+            let av_ = pick(
+                &av.apis,
+                sasl::API_SASL_AUTHENTICATE,
+                sasl::AUTHENTICATE_VERSIONS,
+                "SaslAuthenticate",
+            )?;
+            c.authenticate(addr, cfg, corr, s, hv, av_)?;
+        }
         Ok(c)
+    }
+
+    /// SASL/SCRAM ([`super::sasl`]); failures are fatal ([`NetError::Auth`]).
+    fn authenticate(
+        &mut self,
+        addr: &str,
+        cfg: &ProducerConfig,
+        corr: &mut i32,
+        s: &SaslConfig,
+        handshake_v: i16,
+        auth_v: i16,
+    ) -> Result<(), NetError> {
+        let mech = s.mechanism.name();
+        let auth = |code: i16, m: String| NetError::Auth {
+            code,
+            context: format!("{addr}: SASL {mech}: {m}"),
+        };
+        let body = sasl::encode_handshake_request(mech)?;
+        let resp = self.exchange(cfg, corr, sasl::API_SASL_HANDSHAKE, handshake_v, &body)?;
+        let (code, enabled) = sasl::decode_handshake_response(&resp)?;
+        if code != 0 {
+            let shown: Vec<String> = enabled
+                .iter()
+                .take(8)
+                .map(|m| m.chars().take(40).collect())
+                .collect();
+            return Err(auth(
+                code,
+                format!(
+                    "the broker refused the mechanism ({}; it offers {shown:?})",
+                    super::errors::name(code)
+                ),
+            ));
+        }
+        let mut scram = ScramClient::start(s.mechanism, &s.username)
+            .map_err(|e| auth(super::errors::SASL_AUTHENTICATION_FAILED, e))?;
+        let step = |c: &mut Conn, corr: &mut i32, msg: &[u8]| -> Result<_, NetError> {
+            let body = sasl::encode_authenticate_request(msg)?;
+            let resp = c.exchange(cfg, corr, sasl::API_SASL_AUTHENTICATE, auth_v, &body)?;
+            let r = sasl::decode_authenticate_response(auth_v, &resp)?;
+            if r.error_code != 0 {
+                return Err(auth(
+                    r.error_code,
+                    format!(
+                        "{} ({})",
+                        super::errors::name(r.error_code),
+                        r.error_message
+                            .unwrap_or_default()
+                            .chars()
+                            .map(|c| if c.is_control() { ' ' } else { c })
+                            .collect::<String>()
+                    ),
+                ));
+            }
+            Ok(r)
+        };
+        let first = step(self, corr, scram.client_first().as_bytes())?;
+        let server_first = std::str::from_utf8(&first.auth_bytes).map_err(|_| {
+            auth(
+                super::errors::SASL_AUTHENTICATION_FAILED,
+                "server-first-message is not UTF-8".into(),
+            )
+        })?;
+        let fin = scram
+            .client_final(server_first, s.password())
+            .map_err(|e| auth(super::errors::SASL_AUTHENTICATION_FAILED, e))?;
+        let last = step(self, corr, fin.as_bytes())?;
+        let server_final = std::str::from_utf8(&last.auth_bytes).map_err(|_| {
+            auth(
+                super::errors::SASL_AUTHENTICATION_FAILED,
+                "server-final-message is not UTF-8".into(),
+            )
+        })?;
+        scram
+            .verify_final(server_final)
+            .map_err(|e| auth(super::errors::SASL_AUTHENTICATION_FAILED, e))?;
+        if last.session_lifetime_ms > 0 {
+            // Re-authenticate by reconnecting before the broker would close
+            // the connection (KIP-368 re-authentication is not implemented).
+            let ms = (last.session_lifetime_ms as u64).saturating_mul(4) / 5;
+            self.expires = Some(Instant::now() + Duration::from_millis(ms));
+        }
+        Ok(())
     }
 }
 
@@ -561,12 +823,8 @@ impl Producer {
     /// Drop connections idle for `connections_max_idle` or longer.
     fn close_idle(&mut self) {
         let max = self.cfg.connections_max_idle;
-        self.conns.retain(|_, c| c.last_used.elapsed() < max);
-        if self
-            .bootstrap_conn
-            .as_ref()
-            .is_some_and(|c| c.last_used.elapsed() >= max)
-        {
+        self.conns.retain(|_, c| c.usable(max));
+        if self.bootstrap_conn.as_ref().is_some_and(|c| !c.usable(max)) {
             self.bootstrap_conn = None;
         }
     }
@@ -610,8 +868,11 @@ impl Producer {
             self.stats.connects += 1;
             let mut c = match Conn::open(addr, &self.cfg, &mut self.corr) {
                 Ok(c) => c,
-                Err(NetError::Unsupported(m)) => {
-                    return Err(Retry::Fatal(ProduceError::Unsupported(m)))
+                Err(e) if e.fatal().is_some() => {
+                    return Err(Retry::Fatal(
+                        e.fatal()
+                            .unwrap_or(ProduceError::Unsupported(e.to_string())),
+                    ))
                 }
                 Err(e) => {
                     self.stats.io_errors += 1;
@@ -966,7 +1227,11 @@ impl Producer {
         }
         let conn = match self.conn_for(leader) {
             Ok(c) => c,
-            Err(NetError::Unsupported(m)) => return Err(ProduceError::Unsupported(m)),
+            Err(e) if e.fatal().is_some() => {
+                return Err(e
+                    .fatal()
+                    .unwrap_or(ProduceError::Unsupported(e.to_string())))
+            }
             Err(e) => {
                 self.stats.io_errors += 1;
                 self.stale = true;
@@ -1098,19 +1363,25 @@ struct RoundResult {
 mod tests {
     use super::*;
 
+    fn plain(b: Vec<String>) -> ProducerConfig {
+        let mut c = ProducerConfig::new(b);
+        c.allow_plaintext = true;
+        c
+    }
+
     #[test]
     fn config_checks() {
-        assert!(Producer::new(ProducerConfig::new(vec![])).is_err());
-        let mut c = ProducerConfig::new(vec!["127.0.0.1:1".into()]);
+        assert!(Producer::new(plain(vec![])).is_err());
+        let mut c = plain(vec!["127.0.0.1:1".into()]);
         c.max_request_bytes = 100;
         assert!(Producer::new(c).is_err());
-        let c = ProducerConfig::new(vec!["127.0.0.1:1".into()]);
+        let c = plain(vec!["127.0.0.1:1".into()]);
         assert!(Producer::new(c).is_ok());
     }
 
     #[test]
     fn request_timeout_must_exceed_produce_timeout() {
-        let d = ProducerConfig::new(vec!["127.0.0.1:1".into()]);
+        let d = plain(vec!["127.0.0.1:1".into()]);
         assert!(
             d.request_timeout > Duration::from_millis(d.produce_timeout_ms as u64),
             "defaults are consistent"
@@ -1167,7 +1438,7 @@ mod tests {
 
     #[test]
     fn broker_map_is_replaced_and_capped() {
-        let mut p = Producer::new(ProducerConfig::new(vec!["127.0.0.1:1".into()])).unwrap();
+        let mut p = Producer::new(plain(vec!["127.0.0.1:1".into()])).unwrap();
         // A hostile response with a huge broker list is capped.
         let many: Vec<_> = (0..(MAX_BROKERS as i32 + 500))
             .map(|i| broker(i, "10.0.0.1"))
@@ -1189,7 +1460,7 @@ mod tests {
 
     #[test]
     fn backoff_is_exponential_and_capped() {
-        let mut c = ProducerConfig::new(vec!["x:1".into()]);
+        let mut c = plain(vec!["x:1".into()]);
         c.retry_backoff = Duration::from_millis(100);
         c.retry_backoff_max = Duration::from_millis(1000);
         let p = Producer::new(c).unwrap();
@@ -1203,7 +1474,7 @@ mod tests {
     #[test]
     fn unreachable_bootstrap_exhausts_retries() {
         // Port 1 on localhost: connection refused, quickly.
-        let mut c = ProducerConfig::new(vec!["127.0.0.1:1".into()]);
+        let mut c = plain(vec!["127.0.0.1:1".into()]);
         c.retries = 2;
         c.retry_backoff = Duration::from_millis(1);
         let mut p = Producer::new(c).unwrap();
