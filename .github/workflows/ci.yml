@@ -111,6 +111,7 @@ jobs:
           python3 scripts/ci-pure-excludes.py --self-test
           python3 scripts/check-focal-units.py --self-test
           python3 scripts/check-packages.py --self-test
+          scripts/ci-install-ebpf-toolchain.sh --self-test
       - name: Package variants consistent (programs, workflows, maintainer scripts)
         # Every robodr-* program classified per package variant, every
         # ROBODR_DEB_REQUIRE list complete, deb and rpm scripts stopping and
