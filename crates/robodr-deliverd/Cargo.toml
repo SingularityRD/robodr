@@ -25,6 +25,9 @@ robodr-ocsf = { workspace = true }
 robodr-pkg = { workspace = true }
 robodr-release = { workspace = true }
 robodr-responder = { workspace = true }
+# Sealed RPKs (Sprint 13c): content keys unwrapped by the unit's UWK (TPM
+# or fallback) and chunks opened into the sealed runtime volume.
+robodr-seal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # robodr-rules payloads: structural check of Pulsar rule files (already in

@@ -137,8 +137,15 @@ crates/
   robodr-release/         Connected-side release tool: build RPKs, sign with a
                           key quorum, assemble chained bundles with parity,
                           verify anywhere, repair from parity. Binary:
-                          robodr-release. Sprint 13a; no sealing, no unit
-                          agent, no depot yet.
+                          robodr-release. Sprint 13a; sealed RPKs
+                          (`build rpk --seal-to`) since 13c; no depot yet.
+  robodr-seal/            Captured-unit protection (docs/SECURE-DELIVERY.md
+                          §7): XChaCha20-Poly1305 sealed chunks, key wraps
+                          to depots and units, a TPM-resident unit key
+                          behind a signed PCR policy, a policy floor and an
+                          erase epoch (tpm2-tools), the LUKS2 runtime
+                          volume and the Clevis/Tang fallback. Binary:
+                          robodr-seal. Sprint 13c; tested against swtpm.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's

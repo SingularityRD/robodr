@@ -316,6 +316,25 @@ impl Drop for Staging {
 /// the same spec and payload give the same bytes on any host (no times,
 /// no host paths, sorted traversal).
 pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<BuiltRpk, Fail> {
+    build_rpk_with(spec, payload, out_parent, None)
+}
+
+/// [`build_rpk`], sealed when `seal_to` names depot wrapping keys
+/// (X25519 public keys; `docs/SECURE-DELIVERY.md` §7.1, §7.2): a fresh
+/// content key encrypts every file but the SBOM (`robodr-seal`), is
+/// wrapped to each depot key into the manifest's `seal` member, and is
+/// then forgotten. A sealed build is not deterministic (fresh key and
+/// `seal_id`); everything else about it is.
+pub fn build_rpk_with(
+    spec: &RpkSpec,
+    payload: &Path,
+    out_parent: &Path,
+    seal_to: Option<&[[u8; 32]]>,
+) -> Result<BuiltRpk, Fail> {
+    let sealer = match seal_to {
+        Some(_) => Some(robodr_seal::rpk::Sealer::new().map_err(seal_fail)?),
+        None => None,
+    };
     let tree = walk(payload)?;
     require_exact(payload, &tree, &tree.files)?; // no empty directories
     if tree.files.is_empty() {
@@ -328,7 +347,7 @@ pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<Bu
     let mut chunks: BTreeMap<String, u64> = BTreeMap::new();
     let mut files: Vec<(String, u32, u64, String, Vec<String>)> = Vec::new();
     let mut buf = vec![0u8; CHUNK_SIZE as usize];
-    for rel in &tree.files {
+    for (fi, rel) in tree.files.iter().enumerate() {
         if !is_safe_rel_path(rel) {
             return Err(Refusal::new(
                 Code::Invalid,
@@ -338,8 +357,19 @@ pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<Bu
         }
         let path = payload.join(rel);
         let (mut f, _) = open_regular(&path)?;
-        let mode = f.metadata().map_err(|e| io_err(&path, e))?.mode() & 0o7777;
+        let md = f.metadata().map_err(|e| io_err(&path, e))?;
+        let mode = md.mode() & 0o7777;
+        // Every file but the SBOM is sealed in a sealed build.
+        let seal = sealer
+            .as_ref()
+            .filter(|_| spec.sbom_path.as_deref() != Some(rel.as_str()));
+        let expect = md.len();
+        let count = u32::try_from(expect.div_ceil(CHUNK_SIZE))
+            .map_err(|_| Refusal::new(Code::TooLarge, format!("{rel}: too large")))?;
+        let fi = u32::try_from(fi)
+            .map_err(|_| Refusal::new(Code::TooLarge, "too many payload files"))?;
         let mut whole = robodr_blackbox::crypto::Sha256::new();
+        let mut keyed = seal.map(|s| s.file_digest());
         let mut size = 0u64;
         let mut refs = Vec::new();
         loop {
@@ -348,25 +378,39 @@ pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<Bu
                 break;
             }
             let piece = &buf[..n];
-            whole.update(piece);
             size += n as u64;
-            let h = sha256_hex(piece);
+            let stored = match (seal, keyed.as_mut()) {
+                (Some(s), Some(k)) => {
+                    k.update(piece);
+                    let pos = refs.len() as u32;
+                    if pos >= count {
+                        return Err(Fail::Io(format!("{}: changed while read", path.display())));
+                    }
+                    std::borrow::Cow::Owned(s.seal_piece(fi, pos, count, piece).map_err(seal_fail)?)
+                }
+                _ => {
+                    whole.update(piece);
+                    std::borrow::Cow::Borrowed(piece)
+                }
+            };
+            let h = sha256_hex(&stored);
             if !chunks.contains_key(&h) {
-                write_new(&chunk_dir.join(&h), piece)?;
-                chunks.insert(h.clone(), n as u64);
+                write_new(&chunk_dir.join(&h), &stored)?;
+                chunks.insert(h.clone(), stored.len() as u64);
             }
             refs.push(h);
             if n < buf.len() {
                 break;
             }
         }
-        files.push((
-            rel.clone(),
-            mode,
-            size,
-            robodr_blackbox::crypto::to_hex(&whole.finalize()),
-            refs,
-        ));
+        if seal.is_some() && size != expect {
+            return Err(Fail::Io(format!("{}: changed while read", path.display())));
+        }
+        let digest = match keyed {
+            Some(k) => robodr_blackbox::crypto::to_hex(&k.finalize()),
+            None => robodr_blackbox::crypto::to_hex(&whole.finalize()),
+        };
+        files.push((rel.clone(), mode, size, digest, refs));
     }
     let index: BTreeMap<&str, u32> = chunks
         .keys()
@@ -408,7 +452,11 @@ pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<Bu
         requires: spec.requires.clone(),
         conflicts: spec.conflicts.clone(),
         security_floor: spec.security_floor,
-        confidentiality: Confidentiality::Public,
+        confidentiality: if sealer.is_some() {
+            Confidentiality::Sealed
+        } else {
+            Confidentiality::Public
+        },
         content,
         chunks: chunks
             .iter()
@@ -421,7 +469,12 @@ pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<Bu
         install: spec.install.clone(),
         health: spec.health.clone(),
         expires_at: spec.expires_at,
+        seal: match (&sealer, seal_to) {
+            (Some(s), Some(to)) => Some(s.seal_member(to).map_err(seal_fail)?),
+            _ => None,
+        },
     };
+    drop(sealer);
     let bytes = to_canonical(&m)?;
     // Self-check through the same parser every verifier uses.
     let parsed = rpk::parse_manifest(&bytes)?;
@@ -432,6 +485,10 @@ pub fn build_rpk(spec: &RpkSpec, payload: &Path, out_parent: &Path) -> Result<Bu
         digest: rpk::rpk_digest(&bytes),
         manifest: parsed,
     })
+}
+
+fn seal_fail(e: robodr_seal::SealError) -> Fail {
+    Fail::Refused(Refusal::new(Code::Invalid, format!("sealing: {e}")))
 }
 
 /// Minimal CycloneDX check of an SBOM: a JSON object with

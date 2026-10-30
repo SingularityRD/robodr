@@ -110,6 +110,36 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   - Build: `robodr-blackbox` now depends on rustls / rustls-webpki, so
     ring's C is compiled for every crate that depends on it
     (`docs/BUILD.md`).
+- Adversarial review of Sprint 13c (sealing; `docs/SECURE-DELIVERY.md` §10
+  "Adversarial review of 13c"); each fix has a regression test that failed
+  before it (`crates/robodr-seal/tests/review_13c.rs`):
+  - H1 (high): **a revoked PCR policy worked again on a TPM with an empty
+    owner authorization**: root could undefine and redefine the policy
+    floor. `robodr-seal provision` now refuses unless the owner and lockout
+    authorizations are set (`--owner-auth-file` is required), `policy
+    commit` refuses while they are empty, `status` warns. **Units
+    provisioned with an earlier build:** set both authorizations
+    (OPERATIONS §12.1) before the next `policy commit`.
+  - H2 (high): **erasing a unit without a TPM could report success while
+    destroying nothing** (UWK file absent because the runtime volume was
+    closed). The erase of such a unit is now the LUKS2 keyslot wipe; the
+    device is required (`seal.device`, required in `deliverd.json` without
+    a TPM; `--device`), and the report and `robot.seal.erased` list exactly
+    what was destroyed.
+  - M1 (medium): erase now stops `seal.stop_units`, unmounts the runtime
+    root and closes `seal.mapper_name`, or suspends it when busy; it used
+    to leave an open volume readable.
+  - M2 (medium): TPM session contexts (session keys) are written only under
+    a tmpfs work directory (`/run/robodr-seal`, checked; `--work-dir`,
+    `seal.tpm.work_dir`), never the seal directory, and leftovers of killed
+    commands are swept.
+  - L1: `enroll-fallback` refuses a key directory that is not on dm-crypt.
+    L2: a successful epoch increment with a failed read-back counts as the
+    erase. L3: the fallback key and the owner-auth file are opened with
+    `O_NOFOLLOW`.
+  - `robodr-deliverd.service` reached no TPM (`PrivateDevices=yes`): now
+    `DevicePolicy=closed` with `DeviceAllow=/dev/tpmrm0 rw`.
+
 - Third review of the F1 / F3 fixes (`tools/e2e/REDTEAM.md`, "Third
   review of the F1 / F3 fixes"); each fixed finding has a regression test
   that failed before its fix:
@@ -574,6 +604,44 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ### Added
 
+- Secure delivery, Sprint 13c (sealing; `docs/SECURE-DELIVERY.md` §7,
+  §7.9, §10 "13c status"; `docs/OPERATIONS.md` §12):
+  - `robodr-seal` (new crate and binary): sealed chunks (XChaCha20-Poly1305
+    under HKDF-SHA256 subkeys of a fresh content key, bound to the RPK's
+    `seal_id` and the chunk's place, synthetic nonces, key commitment,
+    keyed file digests); key wraps (X25519 to depots and units without a
+    TPM, P-256 to a TPM-resident UWK) bound to recipient and purpose; the
+    signed PCR policy `robodr-seal-policy/1` (ECDSA P-256 by the policy
+    authority, verified by the TPM through `TPM2_PolicyAuthorize`); a
+    policy floor (NV bit field: older signed policies revoked after a
+    committed update) and an erase epoch (NV counter: one increment kills
+    every key sealed to the unit); provisioning, enrolment, unwrap in an
+    encrypted policy session, the LUKS2 runtime volume keyed through the
+    UWK, the Clevis/Tang fallback, `rewrap` (the depot's step until 14a),
+    erase. Driven through `tpm2-tools`, `cryptsetup` and `clevis`.
+  - `robodr-release build rpk --seal-to DEPOT.pub`: sealed RPKs (`files`,
+    `model`, `config`; every file but the SBOM encrypted, the content key
+    written only wrapped to the depots).
+  - `robodr-pkg`: the manifest member `seal` (sealed RPKs only; public
+    manifests unchanged byte for byte) and typed deployment
+    `wrapped_keys` (`{unit, rpk_digest, wrap}`); bundle listings accept
+    sealed chunk sizes.
+  - `robodr-deliverd`: optional `seal` configuration; sealed RPKs and every
+    `model` installed only into the mounted dm-crypt runtime volume, the
+    unit's wrap kept in the store, chunks authenticated before they are
+    written; `robodr-deliverd erase`.
+  - Findings contract `robodr.findings` **2.3.0**: catalog entries
+    `robot.seal.unseal_failed` (High), `lease_expired` (Medium, emitted
+    from 14b), `erased` and `tamper` (Critical), data source
+    `robodr_delivery`; `robodr.ingest` vectors regenerated. SOC
+    validators must move to 2.3 before units install sealed RPKs.
+  - Fuzz targets `seal_policy`, `seal_wrap` (std-only smoke runs).
+  - New dependencies (MIT / Apache-2.0, no C): `chacha20poly1305`, `hkdf`,
+    `hmac`, `x25519-dalek`, `p256`.
+  - Tested against swtpm 0.7.3 / tpm2-tools 5.6 (`ROBODR_SWTPM=1`), a real
+    Tang server (`ROBODR_TANG=1`) and `cryptsetup` on image files; the
+    dm-crypt open path is gated (`ROBODR_SEAL_DM=1`) and was not run.
+    `robodr-seal` is packaged (`/usr/sbin`, both variants).
 - Secure delivery, Sprint 13b (unit agent, local; `docs/SECURE-DELIVERY.md`
   §4.2, §6, §10 "13b status"):
   - `robodr-deliverd` (new crate and daemon, `/usr/sbin`, unit

@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Contract | `robodr.findings`, version **2.3.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
-| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings into the same spool; since 2.3 the in-path gateway `robodr-firewall-gw` reports its `robot.gateway.*` findings through agentd's `gateway_feed` socket), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
+| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings, and since 2.3 its `robot.seal.*` findings, into the same spool; since 2.3 the in-path gateway `robodr-firewall-gw` reports its `robot.gateway.*` findings through agentd's `gateway_feed` socket), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
 | Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`; it also describes 2.0.x, 2.1.x and 2.2.x messages, whose only difference is the rule catalog the validator applies, §3) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
@@ -423,7 +423,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
   | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
-  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) |
+  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c) |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -531,6 +531,36 @@ Reasons a `robot.gateway.trajectory_rejected` finding names (`first:`):
 `tolerance`, `time_scale_failed`.
 
 <!-- end of the 2.3 gateway block -->
+## 3c. Rule catalog 2.3: sealing (`robot.seal.*`)
+
+The 2.3 addition for captured-unit software protection
+(`docs/SECURE-DELIVERY.md` §7, §9; Sprint 13c), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.3.x (or later 2.x). Like §3a: data source
+`robodr_delivery` (`finding_info.data_sources` exactly
+`["robodr_delivery"]`, `types` exactly `["robot_deviation",
+"robodr_delivery"]`), no techniques, producer `robodr-deliverd`. Other
+2.3 additions are documented in their own section (§3b).
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.seal.unseal_failed` | Unit could not unseal delivered software | High |
+| `robot.seal.lease_expired` | Site lease expired | Medium (catalogued; emitted from Sprint 14b, which adds the lease) |
+| `robot.seal.erased` | Crypto-erase of delivered software executed | Critical |
+| `robot.seal.tamper` | Enclosure tamper or erase trigger fired | Critical |
+
+Catalog sentences (`finding_info.desc`):
+
+* `robot.seal.unseal_failed`: The unit's TPM refused to release the key of a sealed (encrypted) delivered package: the boot measurements do not match the signed PCR policy, the policy was revoked, or the unit's sealing keys were crypto-erased. The package stays unreadable on the unit; RoboDR detection keeps running.
+* `robot.seal.lease_expired`: The unit's site lease for unsealing delivered software expired: sealed packages become unavailable after its next reboot until a fresh lease is issued.
+* `robot.seal.erased`: The unit's sealing keys were cryptographically erased (the TPM erase epoch moved on, or the fallback key and volume keyslots were destroyed), with the trigger named in the finding. Every sealed package on the unit is permanently unreadable; recovery is re-enrolment and re-delivery.
+* `robot.seal.tamper`: An enclosure tamper input or another crypto-erase trigger fired on the unit; a crypto-erase of its sealing keys follows.
+
+The detail of `robot.seal.unseal_failed` starts with the reason
+(`policy_refused` or `erased`, before the first `:`); that of
+`robot.seal.erased` names the trigger (`operator`, `tamper`, ...). A wrap
+that does not authenticate (tampered, or another unit's) is not a sealing
+finding but a `robot.deliver.refused` with reason `unauthentic_key`.
 
 ## 4. Ordering and partitioning
 
@@ -561,14 +591,15 @@ Reasons a `robot.gateway.trajectory_rejected` finding names (`first:`):
   parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
-* **2.0 vs 2.1 vs 2.2.** 2.1 and 2.2 only added rule-catalog entries
-  (§3; 2.2 also the data source `robodr_delivery` they use). A 2.2
-  validator accepts 2.0 and 2.1 messages with their own catalogs; an older
+* **2.0 vs 2.1 vs 2.2 vs 2.3.** 2.1, 2.2 and 2.3 only added rule-catalog
+  entries (§3; 2.2 also the data source `robodr_delivery` they use). A 2.3
+  validator accepts 2.0, 2.1 and 2.2 messages with their own catalogs; an older
   validator accepts a newer message for every rule both catalogs share and
   rejects one for a rule only the newer minor catalogues (title / data
   source differ): upgrade consumers (and both sides of a diode) before
   producers. Sites that run `robodr-deliverd` need 2.2 validators on the
-  SOC side before its findings are exported.
+  SOC side before its findings are exported, and 2.3 validators once it
+  installs sealed RPKs (`robot.seal.*`).
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -872,6 +903,14 @@ safely. Nothing here is specific to one product.
     `robodr-firewall-gw` and reported by agentd (`gateway_feed`).
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
 <!-- end of the 2.3 gateway block -->
+* **2.3.0** — rule-catalog entries only (minor). Sealing block, Sprint 13c
+  (other 2.3 additions are listed as their own items):
+  - New entries (data source `robodr_delivery`, already in the schema's
+    enums since 2.2): `robot.seal.unseal_failed`, `robot.seal.lease_expired`,
+    `robot.seal.erased`, `robot.seal.tamper` (`docs/SECURE-DELIVERY.md`
+    §9), emitted by `robodr-deliverd` (`lease_expired` from 14b). §3c.
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
+
 * **2.2.0** — rule-catalog entries only (minor), Sprint 13b:
   - New entries (data source `robodr_delivery`, added to the schema's
     `types` / `data_sources` enums): `robot.deliver.installed`,

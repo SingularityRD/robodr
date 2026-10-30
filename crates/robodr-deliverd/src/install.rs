@@ -91,6 +91,10 @@ pub enum PrepError {
     Refused(String),
     /// A problem of this host (retry later).
     Io(String),
+    /// The content key of a sealed RPK could not be unwrapped
+    /// (`robodr-seal`: the TPM refused the policy, the unit was erased,
+    /// the wrap does not authenticate, or the TPM is unreachable).
+    Unseal(robodr_seal::SealError),
 }
 
 impl std::fmt::Display for PrepError {
@@ -98,6 +102,7 @@ impl std::fmt::Display for PrepError {
         match self {
             PrepError::Refused(s) => write!(f, "refused: {s}"),
             PrepError::Io(s) => write!(f, "error: {s}"),
+            PrepError::Unseal(e) => write!(f, "unseal: {e}"),
         }
     }
 }
@@ -110,7 +115,7 @@ fn io(p: &Path, e: impl std::fmt::Display) -> PrepError {
 pub fn supported(k: Kind) -> bool {
     matches!(
         k,
-        Kind::Files | Kind::Config | Kind::Deb | Kind::RobodrRules
+        Kind::Files | Kind::Config | Kind::Deb | Kind::RobodrRules | Kind::Model
     )
 }
 
@@ -193,10 +198,19 @@ pub fn parse_version_name(n: &str) -> Option<(u64, Option<String>)> {
 pub struct Installer<'a> {
     pub cfg: &'a Config,
     pub store: &'a Store,
+    /// Sealing (13c), when configured.
+    pub sealing: Option<&'a crate::sealing::Sealing>,
 }
 
 impl Installer<'_> {
-    fn versions_root(&self, kind: Kind) -> PathBuf {
+    /// Where versions of `kind` live; every sealed RPK and every `model`
+    /// in the runtime volume (§7.4).
+    fn versions_root(&self, kind: Kind, sealed: bool) -> PathBuf {
+        if sealed || kind == Kind::Model {
+            if let Some(s) = &self.cfg.seal {
+                return s.runtime_root.join(crate::sealing::kind_dir(kind));
+            }
+        }
         match kind {
             Kind::Config => self.cfg.install.config_root.clone(),
             Kind::RobodrRules => self.cfg.state_dir.join("rules"),
@@ -207,16 +221,23 @@ impl Installer<'_> {
 
     /// The prepared version directory of `name` at `serial` with RPK
     /// `digest` (not `deb`): `<root>/<name>/<serial>-<digest>`.
-    pub fn version_dir(&self, kind: Kind, name: &str, serial: u64, digest: &str) -> PathBuf {
-        self.versions_root(kind)
+    pub fn version_dir(
+        &self,
+        kind: Kind,
+        sealed: bool,
+        name: &str,
+        serial: u64,
+        digest: &str,
+    ) -> PathBuf {
+        self.versions_root(kind, sealed)
             .join(name)
             .join(version_name(serial, digest))
     }
 
-    fn link(&self, kind: Kind, name: &str) -> PathBuf {
+    fn link(&self, kind: Kind, sealed: bool, name: &str) -> PathBuf {
         match kind {
             Kind::RobodrRules => self.cfg.install.rules_active.join(name),
-            _ => self.versions_root(kind).join(name).join("current"),
+            _ => self.versions_root(kind, sealed).join(name).join("current"),
         }
     }
 
@@ -236,24 +257,53 @@ impl Installer<'_> {
         if m.kind == Kind::Deb {
             return self.prepare_deb(m, v);
         }
-        let root = self.versions_root(m.kind);
+        let in_volume = crate::sealing::in_volume(m);
+        if in_volume {
+            let s = self.sealing.ok_or_else(|| {
+                PrepError::Refused(
+                    "sealed RPKs and models need the seal configuration (13c)".into(),
+                )
+            })?;
+            // The volume not being open is this host's problem: retry.
+            crate::sealing::check_volume(&s.cfg).map_err(PrepError::Io)?;
+            if !fsx::is_real_dir(&s.cfg.runtime_root) {
+                return Err(PrepError::Io(format!(
+                    "{}: the sealed runtime volume is not open",
+                    s.cfg.runtime_root.display()
+                )));
+            }
+        }
+        v.sealed = m.is_sealed();
+        let root = self.versions_root(m.kind, v.sealed);
         if !fsx::is_real_dir(&root) {
             // The roots are created by the package (tmpfiles); a missing
             // one is created, a symlink or file in its place refuses.
-            fsx::ensure_dir(&root, 0o755)
+            fsx::ensure_dir(&root, if in_volume { 0o750 } else { 0o755 })
                 .map_err(|e| PrepError::Refused(format!("{}: {e}", root.display())))?;
         }
         let pdir = root.join(&m.name);
         fsx::ensure_dir(&pdir, 0o755)
             .map_err(|e| PrepError::Refused(format!("{}: {e}", pdir.display())))?;
         let vdir = pdir.join(version_name(m.version.serial, &v.digest));
-        if self.is_active(m.kind, &m.name, v) {
+        if self.is_active(m.kind, v.sealed, &m.name, v) {
             return Ok(());
         }
+        // The content key: unwrapped by this unit's UWK only now, used to
+        // open the chunks into the runtime volume, wiped on return.
+        let ck = match (m.is_sealed(), self.sealing) {
+            (true, Some(s)) => {
+                let w = self.store.wrap(&v.digest).ok_or_else(|| {
+                    PrepError::Refused("the deployment carries no wrapped key for this unit".into())
+                })?;
+                Some(s.content_key(m, &v.digest, &w).map_err(PrepError::Unseal)?)
+            }
+            _ => None,
+        };
         fsx::remove_any(&vdir).map_err(|e| io(&vdir, e))?;
         let stage = fsx::temp_sibling(&vdir, "stage");
-        fsx::ensure_dir(&stage, 0o755).map_err(|e| io(&stage, e))?;
-        let res = self.write_tree(m, &stage).and_then(|()| {
+        fsx::ensure_dir(&stage, if in_volume { 0o750 } else { 0o755 })
+            .map_err(|e| io(&stage, e))?;
+        let res = self.write_tree(m, &stage, ck.as_ref()).and_then(|()| {
             if m.kind == Kind::RobodrRules {
                 self.check_rules(m, &stage)?;
             }
@@ -267,8 +317,14 @@ impl Installer<'_> {
         res
     }
 
-    /// Materialise the payload files of `m` under `dir` (a fresh tree).
-    fn write_tree(&self, m: &Manifest, dir: &Path) -> Result<(), PrepError> {
+    /// Materialise the payload files of `m` under `dir` (a fresh tree);
+    /// sealed files are opened with `ck`.
+    fn write_tree(
+        &self,
+        m: &Manifest,
+        dir: &Path,
+        ck: Option<&robodr_seal::chunk::ContentKey>,
+    ) -> Result<(), PrepError> {
         for f in m.payload_files() {
             // Defence in depth: robodr-pkg refused these already.
             if !is_safe_rel_path(&f.path) {
@@ -299,7 +355,24 @@ impl Installer<'_> {
                     f.path
                 )));
             }
-            self.store.materialize(m, f, &dest).map_err(PrepError::Io)?;
+            if m.is_sealed_file(f) {
+                let ck = ck.ok_or_else(|| {
+                    PrepError::Refused("a sealed file without its content key".into())
+                })?;
+                let index = m
+                    .content
+                    .iter()
+                    .position(|c| c.path == f.path)
+                    .ok_or_else(|| PrepError::Refused("content index".into()))?;
+                self.store
+                    .materialize_sealed(m, index, &dest, ck)
+                    .map_err(|e| match e.kind {
+                        robodr_seal::ErrorKind::Io => PrepError::Io(e.to_string()),
+                        _ => PrepError::Refused(format!("sealed content: {e}")),
+                    })?;
+            } else {
+                self.store.materialize(m, f, &dest).map_err(PrepError::Io)?;
+            }
         }
         Ok(())
     }
@@ -378,12 +451,12 @@ impl Installer<'_> {
             if pkg == except || !robodr_pkg::common::is_pkg_name(&pkg) {
                 continue;
             }
-            let vdir = match self.active_version(Kind::RobodrRules, &pkg) {
+            let vdir = match self.active_version(Kind::RobodrRules, false, &pkg) {
                 Ok(Some((serial, Some(d)))) => {
-                    self.version_dir(Kind::RobodrRules, &pkg, serial, &d)
+                    self.version_dir(Kind::RobodrRules, false, &pkg, serial, &d)
                 }
                 Ok(Some((serial, None))) => self
-                    .versions_root(Kind::RobodrRules)
+                    .versions_root(Kind::RobodrRules, false)
                     .join(&pkg)
                     .join(serial.to_string()),
                 _ => continue,
@@ -840,11 +913,11 @@ impl Installer<'_> {
                 }
             }
             kind => {
-                let vdir = self.version_dir(kind, name, v.serial, &v.digest);
+                let vdir = self.version_dir(kind, v.sealed, name, v.serial, &v.digest);
                 if !fsx::is_real_dir(&vdir) {
                     return Err(format!("{}: version not prepared", vdir.display()));
                 }
-                let link = self.link(kind, name);
+                let link = self.link(kind, v.sealed, name);
                 if let Some(parent) = link.parent() {
                     if kind == Kind::RobodrRules {
                         fsx::ensure_dir(parent, 0o755)
@@ -895,9 +968,10 @@ impl Installer<'_> {
     pub fn active_version(
         &self,
         kind: Kind,
+        sealed: bool,
         name: &str,
     ) -> Result<Option<(u64, Option<String>)>, String> {
-        let link = self.link(kind, name);
+        let link = self.link(kind, sealed, name);
         let Some(t) = fsx::read_link(&link).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
@@ -905,7 +979,7 @@ impl Installer<'_> {
         let (s, d) = parse_version_name(file)
             .ok_or_else(|| format!("{}: unexpected link target", link.display()))?;
         if kind == Kind::RobodrRules
-            && t.parent() != Some(self.versions_root(kind).join(name).as_path())
+            && t.parent() != Some(self.versions_root(kind, sealed).join(name).as_path())
         {
             return Err(format!(
                 "{}: link points outside the rules versions",
@@ -916,23 +990,34 @@ impl Installer<'_> {
     }
 
     /// The active serial of a non-`deb` package (from its link).
-    pub fn active_serial(&self, kind: Kind, name: &str) -> Result<Option<u64>, String> {
-        Ok(self.active_version(kind, name)?.map(|(s, _)| s))
+    pub fn active_serial(
+        &self,
+        kind: Kind,
+        sealed: bool,
+        name: &str,
+    ) -> Result<Option<u64>, String> {
+        Ok(self.active_version(kind, sealed, name)?.map(|(s, _)| s))
     }
 
     /// `v` is exactly the active version of `name` (serial and digest).
-    fn is_active(&self, kind: Kind, name: &str, v: &Ver) -> bool {
+    fn is_active(&self, kind: Kind, sealed: bool, name: &str, v: &Ver) -> bool {
         matches!(
-            self.active_version(kind, name),
+            self.active_version(kind, sealed, name),
             Ok(Some((s, Some(d)))) if s == v.serial && d == v.digest
         )
     }
 
     /// Which of `known` is active for `name` (recovery). `Ok(None)`: none
     /// of them (absent, or a state none of them explains).
-    pub fn active_of(&self, name: &str, kind: Kind, known: &[&Ver]) -> Result<Option<u64>, String> {
+    pub fn active_of(
+        &self,
+        name: &str,
+        kind: Kind,
+        sealed: bool,
+        known: &[&Ver],
+    ) -> Result<Option<u64>, String> {
         if kind != Kind::Deb {
-            return Ok(match self.active_version(kind, name)? {
+            return Ok(match self.active_version(kind, sealed, name)? {
                 None => None,
                 // A link naming a digest is the known version with that
                 // digest, or none of them.
@@ -966,10 +1051,10 @@ impl Installer<'_> {
         let p = match v.kind {
             Kind::Deb => self.deb_dir(&v.digest),
             k => {
-                if self.is_active(k, name, v) {
+                if self.is_active(k, v.sealed, name, v) {
                     return Ok(());
                 }
-                self.version_dir(k, name, v.serial, &v.digest)
+                self.version_dir(k, v.sealed, name, v.serial, &v.digest)
             }
         };
         fsx::remove_any(&p).map_err(|e| format!("{}: {e}", p.display()))

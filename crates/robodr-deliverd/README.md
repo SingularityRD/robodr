@@ -17,11 +17,21 @@ robodr-deliverd init-anchor  --config FILE --trust TRUST.json   # once, at enrol
 robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]   # lift the lock after a lost state
 robodr-deliverd status       --config FILE
 robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
+robodr-deliverd erase        --config FILE --trigger T [--device DEV] [--key FILE]   # crypto-erase (13c)
 robodr-safety-replay --socket PATH --file REPORTS.jsonl [--repeat-ms N] [--hold-ms N] [--check]
 ```
 
 Exit codes: 0 ok, 1 refused or error, 2 usage. `man robodr-deliverd(8)`,
 `docs/OPERATIONS.md` section 11.
+
+**Sealed RPKs (Sprint 13c).** With the `seal` configuration section a
+sealed `files` / `model` / `config` RPK, and every `model`, is installed
+only into the sealed runtime volume (`seal.runtime_root`, a mounted
+dm-crypt mapping): the deployment's wrapped key for this unit is
+unwrapped through `robodr-seal` (TPM under the signed PCR policy, policy
+floor and erase epoch; or the fallback key), and each chunk is
+authenticated before it is written (`src/sealing.rs`,
+`tests/sealed.rs`; `docs/OPERATIONS.md` section 12).
 
 ## What a pass does
 

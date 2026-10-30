@@ -5,8 +5,9 @@
 //! panic":
 //!
 //! * a deployment that parses is exactly its canonical encoding, has
-//!   `not_before < expires_at`, at least one target and item, and an empty
-//!   `wrapped_keys`;
+//!   `not_before < expires_at`, at least one target and item, and every
+//!   wrapped key names one of its items (and a targeted unit when it
+//!   targets no group);
 //! * a deployment that verifies against the harness site is for its site,
 //!   carries a depot signature and the production operator quorum unless
 //!   the lab quorum applies (a `lab` / `canary` ring, units only, each
@@ -37,7 +38,10 @@ pub fn run(data: &[u8]) {
         assert!(d.not_before < d.expires_at);
         assert!(!d.items.is_empty());
         assert!(d.targets.units.len() + d.targets.groups.len() > 0);
-        assert!(d.wrapped_keys.is_empty());
+        for w in &d.wrapped_keys {
+            assert!(d.items.iter().any(|i| i.rpk_digest == w.rpk_digest));
+            assert!(!d.targets.groups.is_empty() || d.targets.units.contains(&w.unit));
+        }
     }
     let Some(sig) = parts.get(1) else {
         return;

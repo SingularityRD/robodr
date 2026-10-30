@@ -1,0 +1,253 @@
+.\" robodr-seal(8). Source of truth: the USAGE text in
+.\" crates/robodr-seal/src/cli.rs, the crate docs and
+.\" docs/SECURE-DELIVERY.md (sections 7 and 10). Keep them in sync.
+.TH ROBODR\-SEAL 8 "2026-10-30" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-seal \- seal delivered software to a unit's TPM: keys, signed PCR policies, runtime volume, crypto-erase
+.SH SYNOPSIS
+.B robodr\-seal keygen depot|policy \-\-out
+.I FILE
+.br
+.B robodr\-seal policy sign \-\-key
+.I FILE
+.B \-\-platform
+.I P
+.B \-\-version
+.I N
+.B \-\-pcr
+.IR I = HEX ...
+.RB [ \-\-floor\-nv
+.IR 0xNNNNNNNN ]
+.RB [ \-\-last\-version ]
+.B \-\-out
+.I FILE
+.br
+.B robodr\-seal provision \-\-owner\-auth\-file
+.I FILE TPM
+.br
+.B robodr\-seal enroll \-\-seal\-dir
+.I DIR
+.B \-\-unit
+.I U
+.B \-\-platform
+.I P
+.B \-\-policy\-authority
+.I FILE.pub
+.I TPM
+.br
+.B robodr\-seal enroll\-fallback \-\-seal\-dir
+.I DIR
+.B \-\-unit
+.I U
+.B \-\-platform
+.I P
+.B \-\-key
+.I FILE
+.RB [ \-\-unchecked\-key\-location ]
+.br
+.B robodr\-seal policy install|commit \-\-seal\-dir
+.I DIR
+.RB [ \-\-policy
+.IR FILE ]
+.I TPM
+.br
+.B robodr\-seal rewrap \-\-depot\-key
+.I FILE
+.B \-\-rpk
+.I DIR
+.B \-\-unit\-record
+.I UNIT.json
+.br
+.B robodr\-seal volume format|open|format\-tang|open\-tang|close
+.I ...
+.br
+.B robodr\-seal erase \-\-seal\-dir
+.I DIR
+.B \-\-trigger
+.I T
+.RB [ \-\-device
+.IR DEV ]
+.RB [ \-\-mapper
+.IR NAME ]
+.RB [ \-\-mount
+.IR DIR ]
+.RB [ \-\-stop\-unit
+.IR UNIT ]...
+.RI [ TPM ]
+.br
+.B robodr\-seal status \-\-seal\-dir
+.I DIR
+.RI [ TPM ]
+.PP
+.I TPM
+is
+.RB [ \-\-tcti
+.IR TCTI ]
+.RB [ \-\-tools\-dir
+.IR DIR ]
+.RB [ \-\-srk
+.IR 0x81NNNNNN ]
+.RB [ \-\-epoch\-nv
+.IR 0x01NNNNNN ]
+.RB [ \-\-floor\-nv
+.IR 0x01NNNNNN ]
+.RB [ \-\-timeout\-ms
+.IR MS ]
+.RB [ \-\-work\-dir
+.IR DIR ]
+(defaults
+.IR device:/dev/tpmrm0 ,
+.IR /usr/bin ,
+0x81000001, 0x01500040, 0x01500041, 10000,
+.IR /run/robodr\-seal ).
+The work directory holds the tools' object and session contexts (session
+keys) for one command at a time; it must be on tmpfs, and directories a
+killed command left are removed by the next one.
+.SH DESCRIPTION
+Captured-unit software protection of RoboDR's secure delivery (Sprint
+13c). A sealed package (RPK) is encrypted with a fresh content key
+(XChaCha20-Poly1305 per chunk); the release wraps that key to the site
+depots' X25519 keys, a depot re-wraps it to each unit's
+.B UWK
+(unit wrapping key), and the unit unwraps it only into its encrypted
+runtime volume.
+.PP
+On a unit with a TPM 2.0 the UWK is a P-256 key created inside the TPM
+.RB ( enroll ),
+usable only under a policy: a PCR policy signed by the
+.B policy authority
+for the unit's platform, whose version the TPM's
+.B policy floor
+(an NV bit field) has not revoked, and while the TPM's
+.B erase epoch
+(an NV counter) is unchanged. The TPM is driven with
+.BR tpm2\-tools ;
+the shared secret is computed in an encrypted, salted policy session and
+never written to a file. A unit without a TPM keeps an X25519 UWK inside
+a runtime volume that opens only through the site's Tang server.
+.SH COMMANDS
+.TP
+.B keygen depot
+An X25519 depot wrapping key: secret
+.I FILE
+(0600) and
+.IR FILE .pub
+(what
+.B robodr\-release build rpk \-\-seal\-to
+takes).
+.TP
+.B keygen policy
+The P-256 policy authority key (offline, with the delivery roots) and its
+public file (pinned into every UWK at enrolment).
+.TP
+.B policy sign
+Sign the approved policy for SHA-256 PCR values
+.RB ( \-\-pcr " index=value, 1..24) and version " N " (0..63)."
+Version 63 can never be revoked (the floor has no higher bit), so it
+needs
+.BR \-\-last\-version ;
+the update after it needs a new enrolment.
+.TP
+.B provision
+Define the erase-epoch counter, the policy-floor bit field and the
+persistent SRK (idempotent; an index with other attributes is refused,
+never redefined). Refused unless the TPM's owner and lockout
+authorizations are set (to secrets kept off the unit): with an empty owner
+authorization root could undefine and redefine the policy floor. The owner
+authorization is read from
+.B \-\-owner\-auth\-file
+(a regular file, mode 0600 or stricter, not a symlink) and passed to the
+tools on stdin.
+.TP
+.B enroll
+Create the UWK in the TPM and print the enrolment record (public) for
+the depot.
+.TP
+.B enroll\-fallback
+Create an X25519 UWK in
+.I FILE
+(inside the open runtime volume) for a unit without a TPM. A key
+directory that is not on a dm-crypt mapping is refused
+.RB ( \-\-unchecked\-key\-location :
+tests and labs only).
+.TP
+.B policy install
+Install a signed policy (checked against the enrolled authority,
+platform and floor; a revoked version is refused).
+.TP
+.B policy commit
+Unseal a probe key under the installed policy, then revoke every lower
+version in the TPM. Run it only after the first boot that unseals with a
+new policy. Refused while the owner or lockout authorization is empty.
+.TP
+.B rewrap
+The depot's step: print the deployment
+.B wrapped_keys
+entry of RPK
+.I DIR
+for the unit of
+.IR UNIT.json .
+.TP
+.B volume format
+Create the LUKS2 runtime volume on
+.B \-\-device
+with a random key stored only wrapped to the UWK;
+.B volume open
+opens it as
+.B \-\-name
+(device-mapper).
+.TP
+.B volume format\-tang
+Fallback: LUKS2 bound only to the Tang server
+.RB ( \-\-tang\-url ,
+.BR \-\-tang\-thp );
+.B volume open\-tang
+opens it while the server is reachable.
+.TP
+.B erase
+Crypto-erase. TPM unit: increment the erase epoch (every key sealed to
+the unit is dead), delete the UWK blobs and the volume wrap; with
+.B \-\-device
+also wipe every LUKS2 keyslot. Unit without a TPM: wipe the keyslots of
+.B \-\-device
+(required: nothing is erased without it), then destroy the UWK file if
+the volume is open. Then stop each
+.BR \-\-stop\-unit ,
+unmount
+.B \-\-mount
+and close the mapping
+.BR \-\-mapper ,
+or suspend it when busy. The JSON report lists what was
+.B destroyed
+and what is
+.BR incomplete .
+Final.
+.B robodr\-deliverd erase
+does the same with journal entries and findings.
+.TP
+.B status
+Mode, erase state, enrolled and current epoch, policy version, floor
+bits, whether the owner and lockout authorizations are set, warnings.
+.SH FILES
+.TP
+.I /var/lib/robodr\-seal/
+The seal directory (0700): unit.json (enrolment record), uwk.pub and
+uwk.priv (the UWK's TPM blobs, useless without that TPM), policy.json,
+volume.wrap, erased.json.
+.SH EXIT STATUS
+0 ok, 1 refused or error, 2 usage.
+.SH LIMITS
+Tested against swtpm only, not on a hardware TPM; the dm-crypt open path
+is tested only where device-mapper is available. The policy authority is
+one key (the TPM cannot enforce the roots' quorum). Erase destroys keys,
+not plaintext already in memory. The UWK is not yet
+certified by the TPM's endorsement key (Sprint 14a): a depot must get
+enrolment records over a trusted channel. Erase is final and not yet
+triggered automatically (Sprint 14b).
+.SH SEE ALSO
+.BR robodr\-deliverd (8),
+.BR tpm2_createprimary (1),
+.BR cryptsetup (8),
+.BR clevis (1),
+/usr/share/doc/robodr/OPERATIONS.md,
+/usr/share/doc/robodr/SECURE-DELIVERY.md

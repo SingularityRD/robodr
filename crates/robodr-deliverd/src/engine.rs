@@ -114,6 +114,8 @@ pub struct Engine {
     /// The highest record generation known (record, state, journal): the
     /// next write takes the one after it (review M-B).
     hw_gen: u64,
+    /// Sealing (13c), when configured.
+    sealing: Option<crate::sealing::Sealing>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -286,6 +288,10 @@ impl Engine {
                 .map_or(0, |h| h.generation),
         );
         let store = Store::open(&cfg.state_dir)?;
+        let cfg_seal = cfg
+            .seal
+            .as_ref()
+            .map(|s| crate::sealing::Sealing::new(s, &cfg.unit.id));
         let mut e = Self {
             cfg,
             clock,
@@ -297,6 +303,7 @@ impl Engine {
             anchor: None,
             reported: BTreeSet::new(),
             media_cache: std::collections::BTreeMap::new(),
+            sealing: cfg_seal,
             hw_key,
             hw_written: None,
             hw_gen,
@@ -578,6 +585,7 @@ impl Engine {
         Installer {
             cfg: &self.cfg,
             store: &self.store,
+            sealing: self.sealing.as_ref(),
         }
     }
 
@@ -707,6 +715,13 @@ impl Engine {
         }
         self.load_anchor();
         let d = &imp.deployment.deployment;
+        // This unit's content-key wraps of sealed items (§7.3): kept with
+        // the store; another unit's entries are not this unit's business.
+        for w in d.wrapped_keys.iter().filter(|w| w.unit == self.cfg.unit.id) {
+            if let Some(b) = robodr_seal::from_hex(&w.wrap) {
+                self.store.put_wrap(&w.rpk_digest, &b)?;
+            }
+        }
         let old_pack = self.state.deployment.as_ref().map(|x| x.pack.clone());
         self.state.last_deployment = Some(LastDeployment {
             seq: d.deployment_seq,
@@ -879,6 +894,120 @@ impl Engine {
         Ok(())
     }
 
+    /// A sealed item whose content key could not be unwrapped. The TPM
+    /// refusing the policy (changed boot measurements, revoked policy) or
+    /// an erased unit is `robot.seal.unseal_failed` and refuses the item;
+    /// a wrap that does not authenticate is a delivery refusal; an
+    /// unreachable TPM is retried.
+    fn unseal_failed(
+        &mut self,
+        idx: usize,
+        it: &Item,
+        e: robodr_seal::SealError,
+        rep: &mut TickReport,
+    ) -> R<()> {
+        use robodr_seal::ErrorKind as K;
+        match e.kind {
+            K::PolicyRefused | K::Erased => {
+                self.set_item(idx, |i| i.status = ItemStatus::Refused);
+                self.save()?;
+                let ev = self.journal.note(
+                    kinds::UNSEAL_FAILED,
+                    json!({"name": it.name, "serial": it.serial, "digest": it.digest,
+                           "reason": e.kind.as_str(), "detail": e.detail}),
+                )?;
+                self.finding(
+                    rules::SEAL_UNSEAL_FAILED,
+                    Severity::High,
+                    format!(
+                        "{}: {} {}: the unit could not unseal its content key: {}",
+                        e.kind.as_str(),
+                        it.name,
+                        it.serial,
+                        e.detail
+                    ),
+                    Some(ev),
+                );
+                rep.refused.push(format!(
+                    "{} {}: {}: {}",
+                    it.name,
+                    it.serial,
+                    e.kind.as_str(),
+                    e.detail
+                ));
+                Ok(())
+            }
+            K::Unauthentic | K::Invalid => self.refuse_item(idx, "unauthentic_key", e.detail, rep),
+            K::Unavailable | K::Io => {
+                let k = format!("unseal:{}:{}", it.name, e.detail);
+                if self.reported.insert(k) {
+                    self.journal.note(
+                        kinds::REFUSED,
+                        json!({"stage": "unseal", "name": it.name, "transient": true, "detail": e.detail}),
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Crypto-erase this unit's sealing keys (§7.6, `robodr-seal`'s
+    /// `Unit::erase`): with a TPM the erase epoch moves on (every key
+    /// sealed to the unit is dead); without one the runtime volume's
+    /// LUKS2 keyslots are wiped (`seal.device`, or `device`). Then the
+    /// open runtime volume is locked down (`seal.stop_units` stopped,
+    /// `runtime_root` unmounted, `seal.mapper_name` closed or suspended).
+    /// Noted in the journal; `robot.seal.erased` (Critical) says exactly
+    /// what was destroyed and what was not, and `robot.seal.tamper`
+    /// (Critical) comes first when the trigger is a tamper input. An erase
+    /// whose essential step failed reports nothing as erased. Executing an
+    /// erase is not gated here: the trigger's planner (an operator now,
+    /// `robodr-responder` from 14b) decides when.
+    pub fn erase(
+        &mut self,
+        trigger: &str,
+        device: Option<&std::path::Path>,
+    ) -> R<serde_json::Value> {
+        let s = self
+            .sealing
+            .clone()
+            .ok_or_else(|| EngineError("no seal configuration: nothing to erase".into()))?;
+        if trigger == "tamper" {
+            let ev = self
+                .journal
+                .note(kinds::TAMPER, json!({"trigger": trigger}))?;
+            self.finding(
+                rules::SEAL_TAMPER,
+                Severity::Critical,
+                "tamper: an enclosure tamper input fired; crypto-erase follows".into(),
+                Some(ev),
+            );
+        }
+        let unit = s.unit().map_err(|e| EngineError(e.to_string()))?;
+        let luks = robodr_seal::luks::Luks::system();
+        let device = device.or(s.cfg.device.as_deref());
+        let mount = robodr_seal::mounts::is_mount_point(&s.cfg.runtime_root)
+            .then_some(s.cfg.runtime_root.as_path());
+        let target = robodr_seal::unit::EraseTarget {
+            device,
+            mapper: s.cfg.mapper_name.as_deref(),
+            mount,
+            stop_units: &s.cfg.stop_units,
+        };
+        let rep = unit
+            .erase(trigger, &luks, &target)
+            .map_err(|e| EngineError(format!("erase failed: {e}")))?;
+        let v = serde_json::to_value(&rep).map_err(|e| EngineError(e.to_string()))?;
+        let ev = self.journal.note(kinds::ERASED, v.clone())?;
+        self.finding(
+            rules::SEAL_ERASED,
+            Severity::Critical,
+            erase_summary(&rep),
+            Some(ev),
+        );
+        Ok(v)
+    }
+
     fn item(&mut self, idx: usize, sys: u64, rep: &mut TickReport) -> R<()> {
         let Some(dep) = self.state.deployment.clone() else {
             return Ok(());
@@ -965,6 +1094,7 @@ impl Engine {
             Some(v) if self.prepared(&it.name, &v) => v,
             _ => {
                 let mut v = Ver {
+                    sealed: m.is_sealed(),
                     serial: m.version.serial,
                     digest: it.digest.clone(),
                     kind: m.kind,
@@ -991,6 +1121,7 @@ impl Engine {
                 match self.installer().prepare(&m, &mut v) {
                     Ok(()) => {}
                     Err(PrepError::Refused(e)) => return self.refuse_item(idx, "invalid", e, rep),
+                    Err(PrepError::Unseal(e)) => return self.unseal_failed(idx, &it, e, rep),
                     Err(PrepError::Io(e)) => {
                         let k = format!("prepare:{}:{e}", it.name);
                         if self.reported.insert(k) {
@@ -1078,6 +1209,10 @@ impl Engine {
             match self.installer().check_deb_paths(&m, &ver, own) {
                 Ok(()) => {}
                 Err(PrepError::Refused(e)) => return self.refuse_item(idx, "invalid", e, rep),
+                // A deb is never sealed.
+                Err(PrepError::Unseal(e)) => {
+                    return self.refuse_item(idx, "invalid", e.to_string(), rep)
+                }
                 Err(PrepError::Io(e)) => {
                     let k = format!("paths:{}:{e}", it.name);
                     if self.reported.insert(k) {
@@ -1458,9 +1593,11 @@ impl Engine {
     fn prepared(&self, name: &str, v: &Ver) -> bool {
         match v.kind {
             robodr_pkg::rpk::Kind::Deb => v.deb.is_some() && self.store.has_rpk(&v.digest),
-            k => {
-                crate::fsx::is_real_dir(&self.installer().version_dir(k, name, v.serial, &v.digest))
-            }
+            k => crate::fsx::is_real_dir(
+                &self
+                    .installer()
+                    .version_dir(k, v.sealed, name, v.serial, &v.digest),
+            ),
         }
     }
 
@@ -1951,7 +2088,9 @@ impl Engine {
             }
             Phase::Activating => {
                 let known: Vec<&Ver> = txn.from.iter().chain(std::iter::once(&txn.to)).collect();
-                let active = self.installer().active_of(&txn.name, txn.to.kind, &known);
+                let active =
+                    self.installer()
+                        .active_of(&txn.name, txn.to.kind, txn.to.sealed, &known);
                 let from_serial = txn.from.as_ref().map(|f| f.serial);
                 match active {
                     Ok(Some(s)) if s == txn.to.serial => {
@@ -2092,4 +2231,41 @@ pub fn confirm_path(cfg: &Config, deployment_digest: &str, name: &str) -> PathBu
         "{}-{name}",
         &deployment_digest[..deployment_digest.len().min(64)]
     ))
+}
+
+/// The `robot.seal.erased` text: what was destroyed, and what was not.
+pub fn erase_summary(rep: &robodr_seal::unit::EraseReport) -> String {
+    use robodr_seal::unit as u;
+    let what: Vec<String> = rep
+        .destroyed
+        .iter()
+        .map(|d| match d.as_str() {
+            u::DESTROYED_EPOCH => match (rep.epoch_before, rep.epoch_after) {
+                (Some(b), Some(a)) => format!("TPM erase epoch moved {b} -> {a}"),
+                _ => "TPM erase epoch incremented".into(),
+            },
+            u::DESTROYED_UWK_BLOBS => "UWK blobs deleted".into(),
+            u::DESTROYED_VOLUME_WRAP => "volume key wrap deleted".into(),
+            u::DESTROYED_FALLBACK_UWK => "UWK file destroyed".into(),
+            u::DESTROYED_KEYSLOTS => "runtime volume keyslots wiped".into(),
+            other => other.to_string(),
+        })
+        .collect();
+    let volume = match &rep.lockdown {
+        Some(l) if l.closed => "runtime volume closed".to_string(),
+        Some(l) if l.suspended => {
+            "runtime volume suspended (busy: not closed; its key is out of the kernel)".into()
+        }
+        Some(_) => "runtime volume STILL OPEN: its plaintext is readable until power-off".into(),
+        None => "runtime volume not closed (no seal.mapper_name)".into(),
+    };
+    let mut t = format!(
+        "erased: trigger {}: {}; {volume}",
+        rep.trigger,
+        what.join(", ")
+    );
+    if !rep.incomplete.is_empty() {
+        t.push_str(&format!("; not done: {}", rep.incomplete.join("; ")));
+    }
+    t
 }
