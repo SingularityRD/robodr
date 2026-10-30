@@ -40,11 +40,18 @@ actions wait until after GA.
 - SOC integrations register the actions under their wire names
   (`robot_<name>`, unchanged from the earlier integration) and send the
   plain names to the control plane.
-- The GA column is a plan. **Today nothing is executed**: agentd's only
-  executor records, and `robodr-agent::executor` has `NoopExecutor` and a
-  logging executor ([`crates/robodr-agent/src/executor.rs`](../../crates/robodr-agent/src/executor.rs)).
-  The executor is Sprint 7. The firewall gateway and the `safe_pause`
-  adapters are Sprint 8.
+- The GA column is a plan. When this ADR was written nothing was
+  executed (agentd's only executor recorded). Status at commit `8b2b172`
+  (2026-10-30): by default nothing is executed still (`executor.enabled`
+  is off). With executor v1 enabled, `isolate_network`, `quarantine_node`
+  and `record_evidence` are executed (Sprint 7); with its `motion` section
+  and OEM-validated adapters, `restrict_motion` (gateway restriction,
+  Unitree speed level), `safe_pause` (Nav2, ros2_control, PX4) and, beyond
+  the GA plan above, `request_safe_state` and `rollback_config`
+  (`config: program`) are carried out through platform adapters, the last
+  three only with two approvers (Sprint 8;
+  [`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md),
+  "Motion adapters"). None of this has run on a robot.
 - Morphology narrows the catalog per robot
   ([ADR-0012](0012-balancing-robot-response-rules.md)). A humanoid never
   gets an executable `safe_pause` or `request_safe_state`.

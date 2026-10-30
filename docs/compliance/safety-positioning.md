@@ -1,7 +1,8 @@
 # Safety positioning
 
-> **Status: position statement, refreshed 2026-10-26** (after executor v1
-> and the in-path gateway were merged). It describes RoboDR's intended
+> **Status: position statement. Verified at commit `8b2b172`
+> (2026-10-30)**, after executor v1, its motion adapters (Sprint 8) and
+> the in-path gateway's ROS 2 channels were merged. It describes RoboDR's intended
 > relation to functional safety. It is not a safety case and not legal
 > advice. The standards named here are context. RoboDR has not been
 > assessed against any of them, and **neither component that acts has run
@@ -36,28 +37,51 @@ safety integrity level (SIL) or performance level (PL). In particular:
 | An unknown safety state, a human in command, or a transient phase means motion-affecting steps need human approval. The executor refuses an `unknown` state outright. | Responder invariant 3; executor review L6 (`31d1aa4`) |
 | Nothing acts until the profile is locked and the response policy is **OEM-validated** (`oem_validated`). Until then, everything is recorded only. | Responder invariant 4 |
 | Agentd is sized and confined so that it is OOM-killed before the motion stack, and its loss is visible. | [`packaging/systemd/robodr-agentd.service`](../../packaging/systemd/robodr-agentd.service) |
-| **Both acting components are opt-in.** Executor v1 runs only with `executor.enabled: true` (off by default); the gateway runs only where a sensor box is bridged into the controller cable, and should start in `mode: observe`. | [`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md); [`docs/OPERATIONS.md`](../OPERATIONS.md) 6.5, 6.6 |
+| **Both acting components are opt-in.** Executor v1 runs only with `executor.enabled: true` (off by default); its motion adapters run only with a `motion` section in `executor.json` **and** `oem_validated: true` on each adapter; the gateway runs only where a sensor box is bridged into the controller cable, and should start in `mode: observe`. | [`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md) "Motion adapters"; [`docs/OPERATIONS.md`](../OPERATIONS.md) 6.5, 6.6 |
 
 ## 2a. The components that act, and their limits
 
-Since executor v1 (`0499a47`, review fixes `31d1aa4`) and the in-path
+Since executor v1 (`0499a47`, review fixes `31d1aa4`), its motion
+adapters (`f557b2f`, review fixes `ec98227`, `e0ae2d8`) and the in-path
 gateway (`a4e0b4b`, review fixes `e85471c`), RoboDR can change what
-reaches the robot. Both are cybersecurity controls with a stated safety
-argument, not safety functions.
+reaches the robot, and, through the motion adapters, ask the platform to
+pause or restrict it. All of them are cybersecurity controls with a
+stated safety argument, not safety functions.
 
 ### Executor v1 (`robodr-executor`)
 
-**What it does:** reversible network containment in one nftables table,
-`inet robodr`: `isolate_network`, `quarantine_node` (RTPS by GUID prefix,
-UDP by SPDP locator), and the `record_evidence` mark. Nothing else.
+**What it does:**
+
+- always (when enabled): reversible network containment in one nftables
+  table, `inet robodr`: `isolate_network`, `quarantine_node` (RTPS by
+  GUID prefix, UDP by SPDP locator), and the `record_evidence` mark;
+- only with a `motion` section and an adapter the site marked
+  `oem_validated` (Sprint 8): `restrict_motion` through the gateway's
+  restriction file or Unitree sport `SpeedLevel`; `safe_pause` through
+  Nav2 (cancel goals, zero twists), ros2_control (switch to a hold
+  controller) or PX4 (AUTO.LOITER); `request_safe_state` through the
+  same adapters (hold, or return to launch when the policy says so);
+  `rollback_config` (`config: program`) through the site's own validated
+  rollback program. Every one of these asks the **platform's own**
+  interface; none drives an actuator, cuts power or touches the e-stop.
+  `safe_pause`, `request_safe_state` and `rollback_config` need two
+  approvers named in the SOC-signed request (neither the requester), and
+  are refused on a robot whose morphology forbids them (`fall_hazard`).
 
 **Safety argument** ([`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md),
 "Safety argument"):
 
-- it has no code path to actuators, the e-stop or power; `safe_pause`,
-  `request_safe_state` and `rollback_config` are refused, and
-  `restrict_motion` is recorded only;
-- it can only remove traffic, never open anything another table drops;
+- it has no code path to actuators, the e-stop or power; without a
+  `motion` section `safe_pause`, `request_safe_state` and
+  `rollback_config` are refused and `restrict_motion` is recorded only;
+  with one, the motion actions go only through the platform's own
+  pause, hold, mode and speed-level interfaces named above;
+- a `safe_pause` is never lifted automatically (not at its TTL, a
+  restart or an emergency disable): only by the SOC's two-person signed
+  revert, with the safety state re-checked, because lifting it may set
+  the robot moving;
+- its network actions can only remove traffic, never open anything
+  another table drops;
 - the protected motion control path, management, control buses and DDS
   discovery stay open, and their accepts precede every drop;
 - it decides twice: agentd judges the request, then the executor checks
@@ -76,21 +100,33 @@ UDP by SPDP locator), and the `record_evidence` mark. Nothing else.
   listed correctly, and why on humanoids nothing outside the OEM's
   `fall_safe_restrict` list is executed, and nothing without a human
   ([ADR-0012](../adr/0012-balancing-robot-response-rules.md)).
-- A compromised agentd can assert a human approval to the executor; the
-  executor then still enforces its own rules (reversible, TTL-bounded,
-  never the protected path), but the approval itself is not verified on
-  the robot yet (executor review M1, 4-2 GAP-23).
-- No High finding for a failed revert yet; it is reported through the
-  request state, a critical black-box note and `status.json`.
-- Not run on a robot or under systemd; tested with real nftables in
-  network namespaces only.
+- The executor verifies the SOC-signed request itself (its own SOC keys
+  and replay store), so a compromised agentd cannot assert a human
+  approval (executor review M1, 4-2 GAP-23 closed in code). It cannot
+  verify that the named approvers really approved: the two-person rule
+  is as strong as the SOC's own approval workflow (4-2 GAP-07).
+- A failed or stuck revert is a High finding
+  (`robot.agent.executor_revert_failed`); a journal reset is
+  `robot.agent.executor_journal_reset`.
+- What a platform does on a pause, hold or mode change is the OEM's
+  behaviour; the adapters were exercised against test peers and, in the
+  red team of 2026-10-30, up to the adapter only (no Nav2, ros2_control,
+  PX4 or Unitree sport peer answered). `restrict_motion` through the
+  gateway was exercised end to end.
+- `SpeedLevel` is a firmware speed range, not a cap: without the gateway
+  in the path anyone on the bus can set another level.
+- Not run on a robot or under a real systemd; network actions tested with
+  real nftables in network namespaces only.
 
 ### Inline gateway (`robodr-firewall-gw`)
 
 **What it does:** on a sensor box bridged into the controller cable, it
 decides every motion-channel sample from the controller side (Unitree
-`rt/lowcmd`, sport `Move`, Go1 legacy UDP) and passes it unchanged, limits
-it in place, replaces it with a hold, or removes it.
+`rt/lowcmd`, sport `Move`, loco requests, arm SDK, hands, Go1 legacy and
+compressed UDP; ROS 2 `cmd_vel` twists and `JointTrajectory` /
+`FollowJointTrajectory` goals) and passes it unchanged, limits it in
+place, replaces it with a hold, or removes it. It also enforces the
+executor's `restrict_motion` restriction file.
 
 **Safety argument** ([`crates/robodr-firewall-gw/README.md`](../../crates/robodr-firewall-gw/README.md),
 "What hold means on the wire", "When the gateway itself fails"):
@@ -127,6 +163,12 @@ it in place, replaces it with a hold, or removes it.
 - Latency was measured on a shared development VM only (median added
   ≈ 20–70 µs); the p99 < 1 ms acceptance gate must be measured on the
   target sensor box.
+- Under CPU pressure a late sample gets the fault verdict and is reported
+  as a Critical `robot.firewall.internal_fault`, also when the cause is
+  overload rather than a fault (1,364 in a 2 h soak on a shared VM,
+  [`tools/e2e/RESULTS.md`](../../tools/e2e/RESULTS.md) O1).
+- The channel configuration (limits, allowed sources) is a plain file,
+  not signed or anti-rollback protected like the profile.
 - Not run on a real robot, a real Cyclone DDS stack or a real sensor box.
 
 ## 3. Relation to robot safety standards
@@ -135,8 +177,8 @@ it in place, replaces it with a hold, or removes it.
 |---|---|
 | **ISO 10218-1 / -2** (industrial robots and robot systems) | The integrator's risk assessment and the robot's safety functions stay governed by ISO 10218. RoboDR adds no safety function. When the inline gateway is placed between a controller and the robot, the integrator must treat it as part of the control system: its failure behaviour (`fail_closed` or `bypass`) and its latency must be part of their risk assessment, and the OEM must validate it. Recent editions of ISO 10218 also expect cybersecurity to be considered; RoboDR can be one measure for that, not a substitute for the safety design. |
 | **IEC 61508 / IEC 62061 / ISO 13849-1** (functional safety, SIL/PL) | Not claimed. RoboDR is not developed under these lifecycles. Where its outputs reach a safety-related system, they must be treated as **non-safety inputs**: requests that the safety system may refuse. The gateway's limits are not safety-rated limits. |
-| **IEC 60204-1** (stop categories) | RoboDR never issues category 0 or 1 stops. The responder's platform-specific "safe behaviours" (for example `protective_stop_category2` for arms) are *requests* to the platform, and none is executed in this release. |
-| **ISO 3691-4** (driverless industrial trucks / AMRs), **ISO 13482** (personal care robots), **ISO/TS 15066** (collaborative operation) | Same position: platform safety functions remain the platform's. The gateway's speed and joint limits can only lower commands within the commissioned envelope, never raise them, and are never a safety-rated speed limit. `restrict_motion` from the SOC is still recorded only. |
+| **IEC 60204-1** (stop categories) | RoboDR never issues category 0 or 1 stops. The responder's platform-specific "safe behaviours" (for example `protective_stop_category2` for arms) are *requests* to the platform. The executor carries one out only through an OEM-validated adapter (for example a ros2_control switch to a hold controller for a category 2 stop) with two approvers; the stop itself is the platform's. |
+| **ISO 3691-4** (driverless industrial trucks / AMRs), **ISO 13482** (personal care robots), **ISO/TS 15066** (collaborative operation) | Same position: platform safety functions remain the platform's. The gateway's speed and joint limits can only lower commands within the commissioned envelope, never raise them, and are never a safety-rated speed limit. `restrict_motion` from the SOC is executed only through the gateway's restriction (which lowers limits further, never below the floor for a balancing robot) or a Unitree speed level, under an OEM-validated adapter; neither is a safety-rated speed limit. |
 | **IEC 62443** and the safety/security interplay (for example IEC TR 63069) | RoboDR's security functions are designed not to degrade safety: they only request or reduce, they defer to the safety system, and they fail toward "record only" (executor) or toward the robot's own command timeout (gateway). See [`iec-62443-4-2-gap-analysis.md`](iec-62443-4-2-gap-analysis.md). |
 
 ## 4. Humanoid and balancing robots

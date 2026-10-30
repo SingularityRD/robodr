@@ -140,6 +140,9 @@ repository.
 - [ ] CI green on the release commit
 - [ ] `VERSION`, `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` agree
 - [ ] security floor / formats reviewed
+- [ ] `docs/compliance/threat-model.md`, `third-party-due-diligence.md` (Pulsar) and the other compliance documents reviewed against the release commit, findings recorded in their review logs, and restamped ("Verified at commit")
+- [ ] customer documents (`docs/customer/`, `SECURITY.md`, `docs/customer/data-handling.md`) refreshed for what changed since the last release
+- [ ] `python3 scripts/check-doc-facts.py` passes on the release commit
 - [ ] dry run passed on the release commit (optional)
 - [ ] signed tag pushed
 - [ ] reproducibility lines present in all six build jobs
