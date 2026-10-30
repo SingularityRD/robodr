@@ -127,7 +127,7 @@ written for that target; the component dependency order is unchanged.
    ├ robodr-pkg       RPK / bundle / deployment formats       [P] (13a)
    ├ robodr-release   build / sign / verify bundles (connected) [P] (13a)
    ├ robodr-deliverd  on-unit install, rollback, safety gate  [ ]
-   └ robodr-seal      TPM-sealed payload keys, crypto-erase   [ ]
+   └ robodr-seal      TPM-sealed payload keys, crypto-erase   [P] (13c)
                  │ OCSF findings  (robodr-ocsf mapper          [P])
                  ▼
  SOC (any; robodr.findings v2 + control plane)  triage · hunt · workflows [ ]

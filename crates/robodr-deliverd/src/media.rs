@@ -515,6 +515,33 @@ pub fn check_item(
             ),
         ));
     }
+    if crate::sealing::in_volume(m) && cfg.seal.is_none() {
+        return Err(Refused::new(
+            Code::Unsupported,
+            format!(
+                "{}: sealed RPKs and models go into the sealed runtime volume; this unit has no \
+                 seal configuration",
+                m.name
+            ),
+        ));
+    }
+    if let Some(i) = state.installed.get(&m.name) {
+        // One package lives in one place: a package never changes kind,
+        // nor moves between the runtime volume and the public trees.
+        if i.ver.kind != m.kind || i.ver.sealed != m.is_sealed() {
+            return Err(Refused::new(
+                Code::Invalid,
+                format!(
+                    "{}: installed as {:?}{}, this release is {:?}{}",
+                    m.name,
+                    i.ver.kind,
+                    if i.ver.sealed { " (sealed)" } else { "" },
+                    m.kind,
+                    if m.is_sealed() { " (sealed)" } else { "" }
+                ),
+            ));
+        }
+    }
     if m.arch != robodr_pkg::rpk::Arch::All && m.arch != u.arch {
         return Err(Refused::new(
             Code::WrongScope,

@@ -1,7 +1,7 @@
 .\" robodr-deliverd(8). Source of truth: the USAGE text in
 .\" crates/robodr-deliverd/src/cli.rs, the crate docs and
 .\" docs/SECURE-DELIVERY.md (sections 4.2, 6 and 10). Keep them in sync.
-.TH ROBODR\-DELIVERD 8 "2026-10-27" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.TH ROBODR\-DELIVERD 8 "2026-10-30" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
 .SH NAME
 robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind the robot's safety-state gate
 .SH SYNOPSIS
@@ -42,6 +42,15 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .I DIGEST
 .B \-\-package
 .I NAME
+.br
+.B robodr\-deliverd erase \-\-config
+.I FILE
+.B \-\-trigger
+.I TRIGGER
+.RB [ \-\-device
+.IR DEV ]
+.RB [ \-\-key
+.IR KEYFILE ]
 .br
 .B robodr\-deliverd \-\-version
 .SH DESCRIPTION
@@ -231,6 +240,67 @@ of the deployment with digest
 when its RPK sets
 .BR install.requires_operator_present .
 Consumed by the install.
+.TP
+.B erase
+Crypto-erase the unit's sealing keys (needs the
+.B seal
+section): the TPM's erase epoch moves on, so every key sealed to the unit
+is dead; without a TPM the runtime volume's LUKS2 keyslots are wiped
+.RB ( seal.device
+or
+.BR \-\-device ,
+required). With a TPM a device's keyslots are wiped too. Then
+.B seal.stop_units
+are stopped,
+.I runtime_root
+is unmounted and
+.B seal.mapper_name
+closed, or suspended when busy. Reports
+.B robot.seal.erased
+(Critical; its text lists what was destroyed and the volume's state),
+preceded by
+.B robot.seal.tamper
+for the trigger
+.BR tamper .
+Final: recovery is re-enrolment and re-delivery. Stop the service first;
+.B \-\-key
+as for
+.BR reanchor .
+.SH SEALED PACKAGES
+With the optional
+.B seal
+section
+.RB ( seal_dir ", " runtime_root ", " volume_check
+.RB "(" dm_crypt ", default, or " unchecked " for tests only), " tpm
+.RB "(" tcti ", " tools_dir ", " srk ", " epoch_nv ", " floor_nv ", " timeout_ms ", " work_dir " (tmpfs)); absent for a unit without a TPM),"
+.B device
+(the LUKS2 partition; required without a TPM),
+.B mapper_name
+and
+.B stop_units
+(what erase closes and stops)
+the agent installs sealed
+.BR files ,
+.B model
+and
+.B config
+RPKs, and every
+.B model
+RPK, only below
+.IR runtime_root /{files,model,config}/,
+which must be a mounted dm-crypt mapping. The deployment's wrapped key for
+this unit is unwrapped by its TPM (signed PCR policy, policy floor, erase
+epoch;
+.BR robodr\-seal (8))
+only when a version is staged; each chunk is authenticated before it is
+written. A TPM refusal or an erased unit is
+.B robot.seal.unseal_failed
+(High); a wrap that is not this unit's is
+.B robot.deliver.refused
+.RB ( unauthentic_key ).
+The shipped unit reaches only
+.I /dev/tpmrm0
+.RB ( DevicePolicy=closed ", " DeviceAllow= ).
 .SH CONFIGURATION
 .I /etc/robodr/deliverd.json
 .RB ( robodr\-deliverd\-config/1 ,
@@ -342,8 +412,10 @@ Enable after commissioning and
 .BR init\-anchor .
 .SH LIMITS
 Kinds
-.BR oci\-image ", " model ", " robodr\-profile ", " os\-image
-and sealed RPKs are refused. Floors live in the state file, the signed
+.BR oci\-image ", " robodr\-profile ", " os\-image
+are refused, and sealed RPKs and models without a
+.B seal
+section. Floors live in the state file, the signed
 high-water record and the black box, not in a TPM: root deleting the
 black box together with the other two, or flooding it and putting an
 older record back, is not detected. The safety state is
@@ -355,6 +427,7 @@ Release signers are root-equivalent for
 packages: the unit's hardening does not contain approved content.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
+.BR robodr\-seal (8),
 .BR robodr\-blackbox (1),
 .BR robodr\-spool\-export (1),
 /usr/share/doc/robodr/OPERATIONS.md,

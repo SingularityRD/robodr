@@ -18,6 +18,7 @@ usage:
   robodr-deliverd rekey        --config FILE --old-key FILE --new-key FILE
   robodr-deliverd status       --config FILE
   robodr-deliverd confirm      --config FILE --deployment DIGEST --package NAME
+  robodr-deliverd erase        --config FILE --trigger TRIGGER [--device DEV] [--key FILE]
   robodr-deliverd --version
 
 The on-unit delivery agent (docs/SECURE-DELIVERY.md §4.2, §6; man
@@ -54,6 +55,17 @@ rekey         after the unit's black-box key was rotated (OPERATIONS
 status        print the state (installed versions, floors, deployment).
 confirm       record a local operator's confirmation for an RPK that
               requires one (install.requires_operator_present).
+erase         crypto-erase the unit's sealing keys (docs/SECURE-DELIVERY.md
+              §7.6; needs the seal section): the TPM's erase epoch moves
+              on, so every key sealed to the unit is dead; without a TPM
+              the runtime volume's LUKS2 keyslots are wiped (seal.device or
+              --device, required). With a TPM, a device wipes them too.
+              Then seal.stop_units are stopped, runtime_root unmounted and
+              seal.mapper_name closed (or suspended when busy). The report
+              and robot.seal.erased say what was destroyed and what was
+              not. Final: recovery is re-enrolment and re-delivery. TRIGGER is [a-z0-9_]{1,64} (operator, tamper,
+              attestation, lease, auth_failures, remote); tamper also
+              reports robot.seal.tamper. --key as for reanchor.
 
 Exit codes: 0 ok, 1 refused or error, 2 usage.";
 
@@ -107,6 +119,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "reanchor" => &["config", "trust", "key"],
         "rekey" => &["config", "old-key", "new-key"],
         "confirm" => &["config", "deployment", "package"],
+        "erase" => &["config", "trigger", "device", "key"],
         "run" | "once" | "check-config" | "status" => &["config"],
         other => {
             return usage(
@@ -140,6 +153,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "rekey" => rekey(&cfg, &a),
         "status" => status(&cfg),
         "confirm" => confirm(&cfg, &a),
+        "erase" => erase(cfg, &a),
         "once" => once(cfg),
         _ => run_loop(cfg),
     };
@@ -186,6 +200,21 @@ fn reanchor(mut cfg: Config, a: &Args) -> Result<(), String> {
     }
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
     let v = e.reanchor(Path::new(&trust)).map_err(|e| e.0);
+    let closed = e.close().map_err(|e| e.0);
+    print(v?);
+    closed
+}
+
+fn erase(mut cfg: Config, a: &Args) -> Result<(), String> {
+    let trigger = a.req("trigger")?.to_string();
+    let device = a.one("device")?.map(std::path::PathBuf::from);
+    if let Some(k) = a.one("key")? {
+        let p = Path::new(k);
+        check_key_file(p)?;
+        cfg.blackbox.key = p.to_path_buf();
+    }
+    let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    let v = e.erase(&trigger, device.as_deref()).map_err(|e| e.0);
     let closed = e.close().map_err(|e| e.0);
     print(v?);
     closed

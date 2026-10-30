@@ -123,6 +123,23 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.deliver.refused",
     "robot.deliver.stale",
     "robot.deliver.chain_gap",
+    // robodr-deliverd sealing (captured-unit protection, Sprint 13c,
+    // contract 2.3): spooled directly by the delivery agent as above.
+    "robot.seal.unseal_failed",
+    "robot.seal.lease_expired",
+    "robot.seal.erased",
+    "robot.seal.tamper",
+    // robodr-firewall-gw in-path gateway (Sprint 8, contract 2.3): fed to
+    // agentd through its `gateway_feed` socket and correlated like any input.
+    "robot.gateway.trajectory_rejected",
+    "robot.gateway.trajectory_time_scaled",
+    "robot.gateway.undecodable_command",
+    "robot.gateway.fragmented_command",
+    "robot.gateway.writer_binding_conflict",
+    "robot.gateway.sequence_jump",
+    "robot.gateway.port_bypass_risk",
+    "robot.gateway.restriction_changed",
+    "robot.gateway.findings_dropped",
     // robodr-agentd self-health (always observe-only downstream)
     "robot.agent.input_silent",
     "robot.agent.input_ended",

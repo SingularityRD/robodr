@@ -432,6 +432,32 @@ the black box; plus a crash at every step and the adversarial cases.
 Shipped in both packages (`robodr-deliverd.service`, installed disabled).
 Not done: 13c, 14a–c, any run on a robot.
 
+**Status as of 2026-10-30 — Sprint 13c: sealing done, against a software
+TPM** ([`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §7.9, §10 "13c
+status"). `robodr-seal` (library and CLI): sealed RPKs (XChaCha20-Poly1305
+chunks bound to their place, key commitment, keyed file digests;
+`robodr-release build rpk --seal-to`), content-key wraps release → depot →
+unit, a P-256 UWK created inside the TPM and usable only under a PCR
+policy signed by the policy authority, a policy floor (older signed
+policies revoked in the TPM) and an erase epoch; the LUKS2 runtime volume
+keyed through the UWK; the Clevis/Tang fallback. `robodr-deliverd`
+installs sealed RPKs and every model only into the mounted dm-crypt
+runtime volume and crypto-erases (`erase`); `robot.seal.*` findings
+(contract 2.3). Exit criteria shown by tests against swtpm 0.7.3 +
+tpm2-tools 5.6, a real Tang server and `cryptsetup` on image files: a
+disk image of an enrolled unit yields no plaintext, a changed PCR refuses
+unseal, an epoch increment kills every sealed key, a fallback unit cannot
+unlock without Tang; plus policy and epoch rollback, wrong-unit and
+tampered wraps, chunk reordering / truncation / swaps, nonce reuse. Not
+done: the dm-crypt open path (no device-mapper in the test container;
+gated test), a hardware TPM, EK / AK certification (14a), erase triggers
+and lease (14b), a libFuzzer campaign of the two new targets. An
+adversarial review of 13c (two high, two medium, three low findings:
+floor rollback without a TPM owner authorization, a fallback erase that
+destroyed nothing, an open volume left readable, session contexts on
+disk) is fixed with regression tests; `robodr-seal` is packaged and the
+agent's unit reaches the TPM.
+
 ---
 
 ## Phase 4 — AI-robot security + the frontier lab (Sprints 18–21)

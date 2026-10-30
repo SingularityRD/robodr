@@ -11,7 +11,9 @@
 //! * 2.2: + the secure-delivery ids of `robodr-deliverd` (`robot.deliver.*`,
 //!   data source `robodr_delivery`, `docs/SECURE-DELIVERY.md` §9);
 //! * 2.3: + the in-path gateway ids of `robodr-firewall-gw`
-//!   (`robot.gateway.*`, data source `ros2_motion_commands`, Sprint 8).
+//!   (`robot.gateway.*`, data source `ros2_motion_commands`, Sprint 8) and
+//!   the sealing ids (`robot.seal.*`, data source `robodr_delivery`,
+//!   `docs/SECURE-DELIVERY.md` §7, §9, Sprint 13c).
 
 mod common;
 
@@ -301,6 +303,69 @@ fn a_2_0_message_validates_with_its_own_catalog() {
         let down = v21.replace(
             &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
             "\"contract_version\":\"2.0.0\"",
+        );
+        assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
+    }
+}
+
+/// Sealing ids whose catalog entry was added after contract 2.2.0 (2.3).
+const IDS_2_3_SEAL: &[&str] = &[
+    "robot.seal.unseal_failed",
+    "robot.seal.lease_expired",
+    "robot.seal.erased",
+    "robot.seal.tamper",
+];
+
+#[test]
+fn seal_entries_added_after_2_2_are_not_in_2_2_or_earlier() {
+    let g = generic();
+    for id in IDS_2_3_SEAL {
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert_eq!(full.data_source, "robodr_delivery", "{id}");
+        for v in ["1.0.0", "1.3.0", "2.0.0", "2.1.0", "2.2.0", "2.2.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.3.0", "2.3.4", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        assert_eq!(rule_info_for_contract(id, "x"), full);
+    }
+}
+
+/// What a 2.2.0 producer emitted for a sealing id: the generic entry.
+fn seal_as_2_2(json: &str, id: &str) -> String {
+    let new = rule_info(id);
+    let old = rule_info_for_contract(id, "2.2.0");
+    assert!(old.techniques.is_empty() && new.techniques.is_empty());
+    json.replace(new.title, old.title)
+        .replace(new.desc, old.desc)
+        .replace(
+            &format!("\"{}\"", new.data_source),
+            &format!("\"{}\"", old.data_source),
+        )
+        .replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.2.0\"",
+        )
+}
+
+#[test]
+fn a_2_2_seal_message_validates_with_its_own_catalog() {
+    for id in IDS_2_3_SEAL {
+        let v23 = build(id);
+        robodr_ocsf::parse_and_validate(&v23).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let v22 = seal_as_2_2(&v23, id);
+        assert_ne!(v22, v23);
+        robodr_ocsf::parse_and_validate(&v22).unwrap_or_else(|e| panic!("{id} 2.2: {e:?}"));
+        let up = v22.replace(
+            "\"contract_version\":\"2.2.0\"",
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+        );
+        assert!(robodr_ocsf::parse_and_validate(&up).is_err(), "{id}");
+        let down = v23.replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.2.0\"",
         );
         assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
     }
