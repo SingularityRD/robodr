@@ -3,16 +3,24 @@
 Ajanlarla devam etmek için ayrıntılı görev tanımı: `docs/HANDOFF.md`.
 
 Durum: RoboDR main b05b271, AutoSecOps main 056e2fb. W2-4 ve W2-5 düzeltildi
-ve çalışma dalına birleştirildi (8d064e2), main'e değil; bağımsız
-incelemesi yeniden yapılacak (docs/HANDOFF.md, P0).
+ve çalışma dalına birleştirildi (8d064e2), main'e değil. İnceleme bulguları
+bekliyor (docs/HANDOFF.md, P0).
 
 ## A. Yazılımla kapatılabilecekler (ajanlarla yapılabilir)
 
-1. **W2-4 yavaş bağlantı saldırısı.** Düzeltildi, çalışma dalında (8d064e2). Bundan sonra:
-   - incelemenin bulguları düzeltilecek;
+1. **W2-4 yavaş bağlantı saldırısı.** İlk düzeltme çalışma dalında (8d064e2),
+   ama bağımsız inceleme 4 orta seviye açık buldu: tek bir tam ClientHello
+   ile süre sınırı atlatılabiliyor, dolgulu bağlantı yağmuru güvenlik
+   merkezinin bağlantısını düşürebiliyor, sessiz kaynak muafiyeti ve kaynak
+   tablosu doluluğu hız sınırını boşa çıkarıyor. Bu açıklar ancak güvenlik
+   merkezi öncelikli listede değilse geçerli. Bundan sonra:
+   - incelemenin bulguları düzeltilecek (ayrıntılar ve PoC'ler:
+     docs/HANDOFF.md P0, tools/e2e/review-w2-4/);
    - iş RoboDR'a birleştirilip PR açılacak;
    - `robot.agent.control_plane_pressure` AutoSecOps'a eşitlenecek.
-2. **W2-5 ağ geçidi bildirim hattı.** W2-4 ile birlikte düzeltildi.
+2. **W2-5 ağ geçidi bildirim hattı.** Düzeltildi, ama incelemede bir sorun
+   çıktı: gürültülü kurallar kritik bir bulguyu 60 saniyeye kadar
+   geciktirebiliyor. Bu da P0'da düzeltilecek.
 3. **Saha deposu anahtarları.** Diskte dosya olarak duruyor; TPM ya da HSM'ye
    taşınmalı (PKCS#11 / TPM ile imzalama).
 4. **14c: işletim sisteminin A/B güncellemesi.** Disk görüntüsü türü,

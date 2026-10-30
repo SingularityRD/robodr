@@ -1,0 +1,14 @@
+[package]
+name = "slowloris-poc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+robodr-blackbox = { path = "../../../crates/robodr-blackbox" }
+robodr-agentd = { path = "../../../crates/robodr-agentd" }
+robodr-events = { path = "../../../crates/robodr-events" }
+robodr-firewall = { path = "../../../crates/robodr-firewall" }
+robodr-firewall-gw = { path = "../../../crates/robodr-firewall-gw" }

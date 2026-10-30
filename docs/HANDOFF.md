@@ -18,9 +18,10 @@ implemented and merged into the RoboDR work branch (`8d064e2`), **not yet into
 plane, `robodr-anchor-receiver` and `robodr-depot serve`; new finding
 `robot.agent.control_plane_pressure` (`catalog_2_3_agent`, findings §3f);
 gateway_feed severity ranges and per-rule cap. Red-team before/after numbers
-are in `tools/e2e/RESULTS.md`. An independent adversarial review was running
-when this handoff was written and its result is **not** carried over: redo it
-(package P0).
+are in `tools/e2e/RESULTS.md`. An independent adversarial review found real
+defects (below, P0); they are **not fixed yet**, so do not merge this to
+`main` before P0 is done. Its proofs of concept are in
+`tools/e2e/review-w2-4/`.
 
 Key docs to read first (RoboDR): `docs/GA-ROADMAP.md` (Turkish),
 `docs/SECURE-DELIVERY.md` (§7 sealing, §10 sprint table and 13a–14b status
@@ -98,18 +99,75 @@ Order: P0 → (P1, P2, P3 in parallel) → (P4, P5, P6) → (P7, P8) → P9 → 
 Each has acceptance criteria (AC); record honestly what is verified only
 synthetically.
 
-### P0 — W2-4 / W2-5: review, fix, PR
-Already implemented on the work branch (see section 0). Run an independent
-adversarial review of `git diff b05b271...8d064e2` restricted to the
-admission/gateway-feed commits (54e1e95, aeb6ca5, a71c048): starvation via
-complete-ClientHello-then-trickle, padding, many /24s, IPv4-mapped IPv6,
-churn draining the global bucket, idle-source exemption abuse, eviction
-gaming against a legitimate handshake, slot accounting leaks on error paths,
-priority_sources CIDR edge cases, W2-5 folding/severity. Fix findings
-test-first, then open the RoboDR PR (CI blocked → comment + merge on the
-user's request) and sync `robot.agent.control_plane_pressure` to AutoSecOps
-(catalog block byte-identical, like the other `robot.agent.control_plane_*`
-ids; CI green, then merge).
+### P0 — W2-4 / W2-5: fix the review findings, then PR
+Already implemented on the work branch (see section 0). The independent
+review (unit-level PoCs against the public API, release build; the live
+red-team rerun was not done) found the following. PoCs:
+`tools/e2e/review-w2-4/` (`admission_poc.rs` tests f1, f2, f2b, f3, f4 pass =
+defect reproduces; `gateway_poc.rs` written, not run). Fix all test-first
+(each PoC becomes a regression test in the owning crate), then delete that
+directory.
+
+- **F1 (Medium) progress floor bypassed by one complete ClientHello.**
+  `crates/robodr-blackbox/src/admission.rs` ~344-355: deadline = accept +
+  hello_timeout + bytes_in*1000/floor with cumulative, uncapped `bytes_in`
+  from accept, so a 1400 B hello buys ~12 s, 4 KiB ~33 s (receiver
+  `io_timeout` up to 60 s). Fix: measure the floor from the server's answer,
+  counting only bytes received after it (or cap credited bytes and require
+  post-answer bytes within an RTT budget).
+- **F2 (Medium/High for unlisted SOCs) padded-hello churn evicts unfinished
+  SOC handshakes.** `rank` (~385-399) credits up to 4096 B over ≥100 ms, so a
+  fresh padded attacker outranks a SOC waiting one RTT for its certificate
+  flight; the newcomer is always admitted and the worst cut (~712-728)
+  without comparing ranks. A SOC accepted before its hello is queued
+  (`seen = 0`) is the first victim. Fix: evict only if the victim ranks below
+  the newcomer's expected rank, else refuse the newcomer; protection window
+  of about one RTT budget after the server answered; cap hello credit near
+  512 B; recommend `priority_sources` for the SOC by default.
+- **F3 (Medium) quiet-source exemption lifts the global budget.**
+  `take_token` (~786-831): any source unseen for 1 s bypasses an empty global
+  bucket; 2000 IPv6 /64s got ~1900/s vs 100/s configured. Fix: a second
+  bucket capping quiet admissions and/or key quiet state per IPv6 /48 and
+  IPv4 /24.
+- **F4 (Medium) per-source bucket map saturation locks out an unlisted SOC.**
+  When `sources` holds `MAX_SOURCE_BUCKETS` (4096) busy entries a new source
+  gets no bucket and is not quiet; the SOC's idle entry was dropped after
+  1 s, so two hammering sources keep it `RateLimited` (0/3 admitted). Fix: LRU
+  eviction of the map, or treat bucketless sources as quiet under the F3
+  bucket, or pin recently successful SOC entries longer.
+- **W2-5 (Medium) a feed-wide budget flood delays an unrelated Critical
+  finding up to 60 s and drops its channel.** `GatewayLimiter::admit` needs a
+  rule token and a feed token; ten noisy rules exhaust the feed burst, the
+  first `robot.firewall.rejected_over_hard_limit` is folded, surfaces only at
+  the window end with `channel: None`. Fix: exempt Critical (and possibly
+  High) from the feed-wide budget or reserve budget per severity; emit a
+  rule's first folded line immediately; keep the channel when the aggregate
+  has one.
+- **L1** plain (no-TLS) loopback control plane and receiver with
+  `allow_plaintext`: the 1 s hello timeout now bounds the whole request
+  (was 5 s); fix or document. **L2** a connection whose `promote` failed
+  stays evictable mid-request (depot pack download under load); keep it
+  protected. **L3** `priority_sources` accepts `0.0.0.0/0` / `::/0`; refuse
+  /0 and warn on very short prefixes. **L4** receiver/depot handshake rate
+  limit defaults to 0 (off) and admission does linear scans under the mutex
+  (pool up to 4096+4096); consider defaults and complexity.
+- **Docs overclaims to correct:** module docs, agentd README, OPERATIONS §6.4
+  and RESULTS.md claim a trickled handshake is cut after ~1 s, padding does
+  not buy rank, and a quiet SOC cannot be starved of budget (contradicted by
+  F1–F4); RESULTS.md says `adversarial_14a` covered the depot scenario but
+  it skips without `ROBODR_SWTPM=1`.
+- **Checked sound by the review:** pool separation (no pre-auth connection
+  reaches the authenticated pool without authenticating on all three
+  servers), slot accounting on every path including panics, IPv4-mapped IPv6
+  canonicalisation, CIDR parsing bounds, arithmetic, finding counters,
+  `control_plane_pressure` catalog consistency, W2-5 severity clamping.
+
+After the fixes: rerun the red-team S2/S3 with the release binaries
+(`tools/e2e/redteam2-slowloris.sh`) and the depot test with `ROBODR_SWTPM=1`,
+update RESULTS.md, a second independent review, then the RoboDR PR (CI
+blocked → comment + merge on the user's request) and the AutoSecOps sync of
+`robot.agent.control_plane_pressure` (catalog block byte-identical; CI green,
+then merge).
 
 ### P1 — Depot keys in TPM / HSM (SECURE-DELIVERY §5.1)
 `robodr-depot` signing, wrapping, lease and CA keys are files today. Add a
