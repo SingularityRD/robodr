@@ -215,10 +215,10 @@ impl Discovery {
             if !inside {
                 self.stats.unqueued_locators += 1;
                 if self.port_bypass.is_none() {
-                    let a = &l.address[12..16];
+                    let [.., a, b, c, d] = l.address;
                     self.port_bypass = Some(format!(
-                        "{what} announces {}.{}.{}.{}:{}, outside every queued port range",
-                        a[0], a[1], a[2], a[3], l.port
+                        "{what} announces {a}.{b}.{c}.{d}:{}, outside every queued port range",
+                        l.port
                     ));
                 }
             }

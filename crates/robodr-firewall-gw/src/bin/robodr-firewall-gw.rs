@@ -14,11 +14,12 @@
 // S10 (R9): release builds use `panic = "abort"`, so any panic kills the
 // gateway (systemd restarts it; while it is down the kernel applies
 // `on_gateway_down`). Non-test code has no unwrap / expect / panic!-family
-// call; slice indexing and arithmetic are left to review and fuzzing
+// call and no unchecked indexing; arithmetic is left to review and fuzzing
 // (fuzz/README.md, `firewall_gw_packet`).
 #![cfg_attr(
     not(test),
     deny(
+        clippy::indexing_slicing,
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,

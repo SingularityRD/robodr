@@ -74,9 +74,11 @@ fn f64_at(b: &[u8], off: usize, big: bool) -> Option<f64> {
 /// Decode `slot` strictly (module docs). `stamped`: `TwistStamped`.
 pub fn decode_strict(slot: &[u8], stamped: bool) -> Result<WireTwist, Undecidable> {
     let big = rep(slot).ok_or(Undecidable::Decode)?;
-    let options = slot.get(2..4).ok_or(Undecidable::Decode)?;
-    let pad = usize::from(options[1] & 0x03);
-    if options[0] != 0 || options[1] & !0x03 != 0 {
+    let &[opt0, opt1] = slot.get(2..4).ok_or(Undecidable::Decode)? else {
+        return Err(Undecidable::Decode);
+    };
+    let pad = usize::from(opt1 & 0x03);
+    if opt0 != 0 || opt1 & !0x03 != 0 {
         return Err(Undecidable::NonCanonical);
     }
     let body = slot.get(4..).ok_or(Undecidable::Decode)?;
@@ -86,7 +88,7 @@ pub fn decode_strict(slot: &[u8], stamped: bool) -> Result<WireTwist, Undecidabl
             return Err(Undecidable::Decode);
         }
         let s = body.get(12..12 + len).ok_or(Undecidable::Decode)?;
-        if s.last() != Some(&0) || s[..len - 1].contains(&0) {
+        if !matches!(s.split_last(), Some((0, text)) if !text.contains(&0)) {
             return Err(Undecidable::NonCanonical);
         }
         let end = 12 + len;
@@ -134,8 +136,8 @@ pub fn decode_strict(slot: &[u8], stamped: bool) -> Result<WireTwist, Undecidabl
 /// `DHEADER`.
 pub fn plausible(slot: &[u8], stamped: bool) -> bool {
     let Some(r) = slot
-        .get(..2)
-        .and_then(|h| Representation::from_id(u16::from_be_bytes([h[0], h[1]])))
+        .first_chunk::<2>()
+        .and_then(|h| Representation::from_id(u16::from_be_bytes(*h)))
     else {
         return false;
     };

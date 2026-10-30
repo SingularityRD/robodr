@@ -634,7 +634,7 @@ impl TrajectoryConfig {
                     "{at}: trajectory.joints[{i}].name: 1..=255 octets, no control characters"
                 ));
             }
-            if self.joints[..i].iter().any(|k| k.name == j.name) {
+            if self.joints.iter().take(i).any(|k| k.name == j.name) {
                 return Err(format!("{at}: trajectory joint {:?} listed twice", j.name));
             }
             let pos = |x: f64| x.is_finite() && x > 0.0;

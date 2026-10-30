@@ -195,8 +195,7 @@ fn u16_at(b: &[u8], at: usize, le: bool) -> Option<u16> {
 }
 
 fn u32_at(b: &[u8], at: usize, le: bool) -> Option<u32> {
-    let s = b.get(at..at.checked_add(4)?)?;
-    let x = [s[0], s[1], s[2], s[3]];
+    let x = arr4(b, at)?;
     Some(if le {
         u32::from_le_bytes(x)
     } else {
@@ -205,8 +204,7 @@ fn u32_at(b: &[u8], at: usize, le: bool) -> Option<u32> {
 }
 
 fn arr4(b: &[u8], at: usize) -> Option<[u8; 4]> {
-    let s = b.get(at..at.checked_add(4)?)?;
-    Some([s[0], s[1], s[2], s[3]])
+    b.get(at..)?.first_chunk().copied()
 }
 
 /// The RTPS header's GUID prefix, if `d` starts with a valid header.
@@ -226,7 +224,7 @@ pub fn walk(d: &[u8], opts: WalkOptions, out: &mut Vec<Sample>) -> Result<Summar
     if d.len() < HEADER_LEN || d.get(..4) != Some(b"RTPS") {
         return Err(WalkError::NotRtps);
     }
-    if d[4] != 2 {
+    if d.get(4) != Some(&2) {
         return Err(WalkError::UnsupportedVersion);
     }
     let mut source: GuidPrefix = header_prefix(d).ok_or(WalkError::NotRtps)?;
@@ -253,7 +251,11 @@ pub fn walk(d: &[u8], opts: WalkOptions, out: &mut Vec<Sample>) -> Result<Summar
                 if blen < 20 {
                     return Err(WalkError::Malformed);
                 }
-                source.copy_from_slice(&d[body + 8..body + 20]);
+                // body + 20 <= end <= d.len() (checked above).
+                source = d
+                    .get(body + 8..)
+                    .and_then(|s| s.first_chunk().copied())
+                    .ok_or(WalkError::Malformed)?;
             }
             INFO_DST => {
                 if blen < 12 {
@@ -379,16 +381,19 @@ pub fn suppress(d: &mut [u8], sub: &Range<usize>, little_endian: bool) -> bool {
     let Ok(body) = u16::try_from(len - 4) else {
         return false;
     };
-    let s = &mut d[sub.start..sub.end];
-    s[0] = PAD;
-    s[1] = if little_endian { FLAG_E } else { 0 };
-    let b = if little_endian {
+    let Some((head, rest)) = d
+        .get_mut(sub.start..sub.end)
+        .and_then(|s| s.split_first_chunk_mut::<4>())
+    else {
+        return false;
+    };
+    let [b0, b1] = if little_endian {
         body.to_le_bytes()
     } else {
         body.to_be_bytes()
     };
-    s[2..4].copy_from_slice(&b);
-    s[4..].fill(0);
+    *head = [PAD, if little_endian { FLAG_E } else { 0 }, b0, b1];
+    rest.fill(0);
     true
 }
 

@@ -299,12 +299,15 @@ pub fn write_move(
     let dst = slot
         .get_mut(req.param.clone())
         .ok_or(RewriteError::Length)?;
-    let (body, tail) = dst.split_at_mut(n - 1);
-    body.copy_from_slice(&text[..n - 1]);
+    let src = text.get(..n - 1).ok_or(RewriteError::Length)?;
+    let (body, tail) = dst
+        .split_at_mut_checked(src.len())
+        .ok_or(RewriteError::Length)?;
+    body.copy_from_slice(src);
     // Spaces before the closing brace, then the brace as the last octet.
-    let (spaces, last) = tail.split_at_mut(tail.len() - 1);
+    let (last, spaces) = tail.split_last_mut().ok_or(RewriteError::Length)?;
     spaces.fill(b' ');
-    last[0] = b'}';
+    *last = b'}';
     // Verify.
     let back = decode_strict(slot, model).map_err(|_| RewriteError::Verify)?;
     match back.call {
@@ -385,11 +388,14 @@ pub fn write_set_velocity(
     let dst = slot
         .get_mut(req.param.clone())
         .ok_or(RewriteError::Length)?;
-    let (body, tail) = dst.split_at_mut(n - 1);
-    body.copy_from_slice(&text[..n - 1]);
-    let (spaces, last) = tail.split_at_mut(tail.len() - 1);
+    let src = text.get(..n - 1).ok_or(RewriteError::Length)?;
+    let (body, tail) = dst
+        .split_at_mut_checked(src.len())
+        .ok_or(RewriteError::Length)?;
+    body.copy_from_slice(src);
+    let (last, spaces) = tail.split_last_mut().ok_or(RewriteError::Length)?;
     spaces.fill(b' ');
-    last[0] = b'}';
+    *last = b'}';
     let back = decode_strict_for(slot, service, model).map_err(|_| RewriteError::Verify)?;
     match back.call {
         ApiCall::SetVelocity {
@@ -433,7 +439,7 @@ pub fn encode_request(rep: Representation, id: i64, api_id: i64, param: &str) ->
     let pad = (4 - n % 4) % 4;
     let idb = rep.id().to_be_bytes();
     let mut v = vec![idb[0], idb[1], 0, pad as u8];
-    v.extend_from_slice(&scratch[..n]);
+    v.extend_from_slice(scratch.get(..n).unwrap_or_default());
     v.extend(std::iter::repeat_n(0u8, pad));
     v
 }

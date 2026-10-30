@@ -187,15 +187,24 @@ pub fn build_ipv4_udp(
     p.extend_from_slice(&[0x12, 0x34, 0x40, 0x00, 64, 17, 0, 0]);
     p.extend_from_slice(&src.octets());
     p.extend_from_slice(&dst.octets());
-    let hc = robodr_capture::checksum::ipv4_header_checksum(&p[..20]);
-    p[10..12].copy_from_slice(&hc.to_be_bytes());
+    // `p` is exactly the 20-byte header here.
+    let hc = robodr_capture::checksum::ipv4_header_checksum(&p);
+    if let Some(field) = p.get_mut(10..12) {
+        field.copy_from_slice(&hc.to_be_bytes());
+    }
     p.extend_from_slice(&src_port.to_be_bytes());
     p.extend_from_slice(&dst_port.to_be_bytes());
     p.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     p.extend_from_slice(&[0, 0]);
     p.extend_from_slice(payload);
-    let c = udp_checksum(IpAddr::V4(src), IpAddr::V4(dst), &p[20..]);
-    p[26..28].copy_from_slice(&c.to_be_bytes());
+    let c = udp_checksum(
+        IpAddr::V4(src),
+        IpAddr::V4(dst),
+        p.get(20..).unwrap_or_default(),
+    );
+    if let Some(field) = p.get_mut(26..28) {
+        field.copy_from_slice(&c.to_be_bytes());
+    }
     p
 }
 

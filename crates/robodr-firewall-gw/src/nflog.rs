@@ -103,14 +103,15 @@ pub fn parse_packets<'a>(buf: &'a [u8], mut f: impl FnMut(Item<'a>)) {
             f(Item::Malformed);
             return;
         };
-        let Some(end) = at
+        let Some(msg) = at
             .checked_add(len)
-            .filter(|&e| len >= NLMSG_HDRLEN && e <= buf.len())
+            .filter(|_| len >= NLMSG_HDRLEN)
+            .and_then(|end| buf.get(at..end))
         else {
             f(Item::Malformed);
             return;
         };
-        f(parse_one(&buf[at..end]));
+        f(parse_one(msg));
         match align4(len).and_then(|a| at.checked_add(a)) {
             Some(n) => at = n,
             None => return,
@@ -157,13 +158,15 @@ fn parse_one(msg: &[u8]) -> Item<'_> {
         else {
             return Item::Malformed;
         };
-        let v = &msg[at + NLA_HDRLEN..aend];
+        let Some(v) = msg.get(at + NLA_HDRLEN..aend) else {
+            return Item::Malformed;
+        };
         match aty & NLA_TYPE_MASK {
             NFULA_PACKET_HDR => {
-                let Some(b) = v.get(..2) else {
+                let Some(b) = v.first_chunk::<2>() else {
                     return Item::Malformed;
                 };
-                p.hw_protocol = u16::from_be_bytes([b[0], b[1]]);
+                p.hw_protocol = u16::from_be_bytes(*b);
                 have_hdr = true;
             }
             NFULA_PAYLOAD => p.payload = v,
@@ -213,7 +216,9 @@ fn header(out: &mut Vec<u8>, msg: u16, flags: u16, seq: u32, group: u16) {
 
 fn finish(out: &mut [u8]) {
     let len = out.len() as u32;
-    out[..4].copy_from_slice(&len.to_ne_bytes());
+    if let Some(head) = out.first_chunk_mut() {
+        *head = len.to_ne_bytes();
+    }
 }
 
 /// One configuration request (acknowledged).
@@ -449,7 +454,7 @@ mod socket {
             for _ in 0..64 {
                 let n = self.recv_flags(0)?;
                 let mut result: Option<i32> = None;
-                parse_packets(&self.buf[..n], |it| {
+                parse_packets(self.buf.get(..n).unwrap_or_default(), |it| {
                     if let Item::Ack { seq: s, error } = it {
                         if s == seq {
                             result = Some(error);

@@ -390,16 +390,16 @@ impl<'a> Cur<'a> {
 /// The encapsulation: `Some(big)` for plain CDR (XCDR1) LE / BE, options
 /// word checked. Returns `(big, announced padding)`.
 fn encapsulation(slot: &[u8]) -> R<(bool, usize)> {
-    let h = slot.get(..4).ok_or(Undecidable::Decode)?;
-    let big = match (h[0], h[1]) {
+    let [h0, h1, h2, h3] = *slot.first_chunk::<4>().ok_or(Undecidable::Decode)?;
+    let big = match (h0, h1) {
         (0x00, 0x00) => true,
         (0x00, 0x01) => false,
         _ => return Err(Undecidable::Decode),
     };
-    if h[2] != 0 || h[3] & !0x03 != 0 {
+    if h2 != 0 || h3 & !0x03 != 0 {
         return Err(Undecidable::NonCanonical);
     }
-    Ok((big, usize::from(h[3] & 0x03)))
+    Ok((big, usize::from(h3 & 0x03)))
 }
 
 /// Decode `slot` strictly (module docs). `max_points` bounds the points
@@ -466,11 +466,11 @@ pub fn decode_strict(slot: &[u8], layout: Layout, max_points: usize) -> R<WireTr
 /// a trajectory's (a `frame_id` string after an 8-octet stamp, then a count
 /// of at most [`MAX_JOINTS`] names).
 pub fn plausible(slot: &[u8], layout: Layout) -> bool {
-    let Some(h) = slot.get(..2) else {
+    let Some(h) = slot.first_chunk::<2>() else {
         return false;
     };
     // CDR_BE/LE, PL_CDR_*, CDR2_*, D_CDR2_*, PL_CDR2_*.
-    let id = u16::from_be_bytes([h[0], h[1]]);
+    let id = u16::from_be_bytes(*h);
     if !matches!(id, 0x0000 | 0x0001 | 0x0006 | 0x0007 | 0x0008 | 0x0009) {
         return false;
     }
@@ -629,7 +629,7 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
     // Joint names.
     let mut map = Vec::with_capacity(t.joint_names.len());
     for (i, n) in t.joint_names.iter().enumerate() {
-        if t.joint_names[..i].contains(n) {
+        if t.joint_names.iter().take(i).any(|m| m == n) {
             return Err(refused(Violation::DuplicateJoint, Some(n), 0.0, 0.0));
         }
         let Some(b) = lim.joints.iter().find(|j| j.name == *n) else {
@@ -640,7 +640,7 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
     if let Some(g) = &t.goal {
         for tols in [&g.path_tolerance, &g.goal_tolerance] {
             for (i, x) in tols.iter().enumerate() {
-                let dup = tols[..i].iter().any(|y| y.name == x.name);
+                let dup = tols.iter().take(i).any(|y| y.name == x.name);
                 let known = t.joint_names.contains(&x.name);
                 let finite =
                     x.position.is_finite() && x.velocity.is_finite() && x.acceleration.is_finite();
@@ -703,7 +703,10 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
         }
         prev_t = Some(ts);
         for (j, b) in map.iter().enumerate() {
-            let q = p.positions[j];
+            // positions.len() == n (shape check above).
+            let Some(&q) = p.positions.get(j) else {
+                return Err(refused(Violation::PointShape, None, 0.0, n as f64));
+            };
             if q < b.min_position || q > b.max_position {
                 let lim_q = if q < b.min_position {
                     b.min_position
@@ -806,7 +809,10 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
                     b.max_acceleration,
                 );
             }
-            let rate = (p.positions[j] - prev.positions[j]).abs() / dt;
+            let (Some(&q1), Some(&q0)) = (p.positions.get(j), prev.positions.get(j)) else {
+                return Err(refused(Violation::PointShape, None, 0.0, n as f64));
+            };
+            let rate = (q1 - q0).abs() / dt;
             need(
                 rate / b.max_velocity,
                 Violation::Velocity,
@@ -827,8 +833,11 @@ fn evaluate(t: &WireTrajectory, lim: &TrajectoryLimits) -> Result<(f64, Option<R
             if let Some(pp) = i.checked_sub(2).and_then(|x| t.points.get(x)) {
                 let dt0 = secs(prev) - secs(pp);
                 if dt0 > 0.0 {
-                    let v0 = (prev.positions[j] - pp.positions[j]) / dt0;
-                    let v1 = (p.positions[j] - prev.positions[j]) / dt;
+                    let Some(&qpp) = pp.positions.get(j) else {
+                        return Err(refused(Violation::PointShape, None, 0.0, n as f64));
+                    };
+                    let v0 = (q0 - qpp) / dt0;
+                    let v1 = (q1 - q0) / dt;
                     let acc = 2.0 * (v1 - v0).abs() / (dt0 + dt);
                     need(
                         acc / b.max_acceleration,

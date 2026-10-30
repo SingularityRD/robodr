@@ -517,14 +517,19 @@ pub fn write_slot(slot: &mut [u8], header: [u8; 4], msg: &WireLowCmd) -> Result<
     if slot.len() < total || slot.len() > total + 3 {
         return Err(RewriteError::Length);
     }
-    slot[..4].copy_from_slice(&header);
-    slot[4..total].copy_from_slice(&scratch[..n]);
-    slot[total..].fill(0);
+    let body = scratch.get(..n).ok_or(RewriteError::Length)?;
+    let (head, rest) = slot
+        .split_first_chunk_mut::<4>()
+        .ok_or(RewriteError::Length)?;
+    let (out, tail) = rest.split_at_mut_checked(n).ok_or(RewriteError::Length)?;
+    *head = header;
+    out.copy_from_slice(body);
+    tail.fill(0);
     // Verify with the independent decoder.
     let back = decode_strict(slot, msg.codec()).map_err(|_| RewriteError::Verify)?;
     let mut again = [0u8; BODY_SCRATCH];
     let m = encode_body(&back.msg, endian, version, &mut again).ok_or(RewriteError::Verify)?;
-    if m != n || again[..m] != scratch[..n] || !back.msg.crc_ok() {
+    if m != n || again.get(..m) != Some(body) || !back.msg.crc_ok() {
         return Err(RewriteError::Verify);
     }
     Ok(())
@@ -649,7 +654,7 @@ pub fn encode_payload(msg: &WireLowCmd, rep: Representation) -> Vec<u8> {
     let n = encode_body(msg, endian, version, &mut scratch).unwrap_or(0);
     let pad = (4 - n % 4) % 4;
     let mut v = vec![id[0], id[1], 0, pad as u8];
-    v.extend_from_slice(&scratch[..n]);
+    v.extend_from_slice(scratch.get(..n).unwrap_or_default());
     v.extend(std::iter::repeat_n(0u8, pad));
     v
 }
