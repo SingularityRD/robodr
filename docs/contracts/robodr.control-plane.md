@@ -261,9 +261,9 @@ their wire names (`robot_<name>`); it sends the plain name here.
 | `quarantine_node` | `robot_quarantine_node` | exactly one of `participant_guid` (24 or 32 lower-case hex), `node` (plain ROS 2 name) | not allowed | yes | `restrict` (participant) | single | executed |
 | `isolate_network` | `robot_isolate_network` | none | required, 1..=86400 | yes | `restrict` (network) | single | executed |
 | `record_evidence` | `robot_record_evidence` | none | not allowed | not applicable: evidence is never reverted (a revert answers `not_reversible`) | `record` | single | executed; accepted in every safety state and in observe mode |
-| `safe_pause` | `robot_safe_pause` | none | not allowed | yes | `safe_pause` | two-person | platform adapter only (OEM-validated policy); never on a humanoid |
-| `request_safe_state` | `robot_request_safe_state` | none | not allowed | no (an operator restarts) | `request_safe_state` | two-person | plan only; never on a humanoid |
-| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only; never on a humanoid or quadruped (a controller restart) |
+| `safe_pause` | `robot_safe_pause` | none | not allowed | yes | `safe_pause` | two-person | platform adapter only (OEM-validated policy and adapter, executor `motion` section, §6a); never on a humanoid |
+| `request_safe_state` | `robot_request_safe_state` | none | not allowed | no (an operator restarts) | `request_safe_state` | two-person | plan only by default; executed through an OEM-validated adapter when the executor has a `motion` section (§6a); never on a humanoid |
+| `rollback_config` | `robot_rollback_config` | `config` (`profile` default, or `program`), `to_version` (`[A-Za-z0-9._-]{1,64}`) | not allowed | no | `restrict` (needs `idle`) | two-person | plan only by default; `config: program` executed through the site's OEM-validated rollback adapter when the executor has a `motion` section (§6a); never on a humanoid or quadruped (a controller restart) |
 
 No action is ever autonomous: the SOC sends one only after the approval
 above. The "GA" column is the catalog's plan for the first executing
