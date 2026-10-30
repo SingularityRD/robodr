@@ -3926,19 +3926,22 @@ impl Recorder {
     /// evidence is not). Returns whether the confirmed position advanced.
     pub fn refresh_export_state(&mut self) -> bool {
         let mut advanced = false;
+        // Cheap before costly: only a cursor ahead of the held one is
+        // authenticated (which may re-read a segment).
+        let held = self.export_cursor.as_ref().map(|c| c.seq);
+        let ahead = |seq: u64| held.is_none_or(|h| seq > h);
         if let Ok(Some(s)) = read_state(&self.cfg.dir, CURSOR_FILE) {
-            if let Ok(a) = self.check_cursor(&s) {
-                if self.export_cursor.as_ref().is_none_or(|c| a.seq > c.seq) {
-                    self.export_cursor = Some(a);
-                    advanced = self.ack_verifier.is_none();
-                }
+            let newer = SignedCursor::from_json(&s).is_some_and(|c| ahead(c.anchor.seq));
+            if let Some(a) = newer.then(|| self.check_cursor(&s).ok()).flatten() {
+                self.export_cursor = Some(a);
+                advanced = self.ack_verifier.is_none();
             }
         }
         if self.ack_verifier.is_some() {
             if let Ok(Some(s)) = read_state(&self.cfg.dir, ACK_FILE) {
                 if let Some(ack) = Ack::from_json(&s) {
-                    if self.check_ack(&ack).is_ok()
-                        && self.acked.as_ref().is_none_or(|a| ack.seq > a.seq)
+                    if self.acked.as_ref().is_none_or(|a| ack.seq > a.seq)
+                        && self.check_ack(&ack).is_ok()
                     {
                         self.acked = Some(ack.anchor());
                         advanced = true;

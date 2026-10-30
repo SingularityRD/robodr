@@ -118,6 +118,7 @@ pub mod host;
 pub mod input;
 pub mod notify;
 pub mod profile_chain;
+pub mod retention;
 pub mod safety;
 pub mod signal;
 pub mod spool;

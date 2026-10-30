@@ -519,6 +519,8 @@ struct Daemon<'a> {
     /// Recorder generation (`AgentStats::blackbox_reopens`) whose open
     /// incidents were last reported.
     incidents_reported: Option<u64>,
+    /// `blackbox.retention` pressure / unexported-drop findings (T15).
+    retention_watch: crate::retention::RetentionWatch,
     /// Per input: the forwarder's cumulative `dropped` at its last
     /// heartbeat (host-threat inputs only).
     host_upstream_seen: Vec<u64>,
@@ -697,6 +699,23 @@ impl<'a> Daemon<'a> {
             firmware: None,
         };
         let mut bcfg = RecorderConfig::new(&cfg.blackbox.dir, &cfg.robot.id, &r.boot_id);
+        if let Some(ret) = &cfg.blackbox.retention {
+            // T15: the configured retention must fit on the black box's
+            // filesystem (the nearest existing directory, before the first
+            // start creates it).
+            let fs_dir = cfg
+                .blackbox
+                .dir
+                .ancestors()
+                .find(|d| d.is_dir())
+                .unwrap_or(&cfg.blackbox.dir);
+            ret.check_space(
+                crate::retention::segments_bytes(&cfg.blackbox.dir),
+                crate::control::evidence::free_bytes(fs_dir),
+            )
+            .map_err(DaemonError::Config)?;
+            ret.apply(&mut bcfg);
+        }
         match &cfg.blackbox.head_anchor {
             Some(crate::config::HeadAnchorConfig::File { path }) => {
                 let a = robodr_blackbox::FileHeadAnchor::new(path)
@@ -1269,6 +1288,7 @@ impl<'a> Daemon<'a> {
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
             incidents_reported: None,
+            retention_watch: crate::retention::RetentionWatch::default(),
             host_upstream_seen: Vec::new(),
             control,
             control_reported: [0; 2],
@@ -1347,6 +1367,7 @@ impl<'a> Daemon<'a> {
         d.control_state_at_start();
         d.profile_witness(accepted_ok);
         d.evidence_incidents();
+        d.retention_tick();
         let names: Vec<String> = d.inputs.iter().map(|i| sanitize(&i.name)).collect();
         let _ = writeln!(
             d.log,
@@ -2349,6 +2370,24 @@ impl<'a> Daemon<'a> {
         }
     }
 
+    /// T15: report unexported evidence filling the black box's retention
+    /// before it is dropped, and any drop of unexported evidence
+    /// (`crate::retention`). Re-reads the export cursor an exporter in
+    /// another process moved.
+    fn retention_tick(&mut self) {
+        let ret = self.r.config.blackbox.retention.clone().unwrap_or_default();
+        let Some(st) = self.agent.blackbox_retention() else {
+            return;
+        };
+        let saturation = ret.mode == crate::retention::RetentionKind::Saturation;
+        for dev in self
+            .retention_watch
+            .observe(&st, ret.warn_percent, saturation)
+        {
+            self.self_health("agentd:blackbox", dev);
+        }
+    }
+
     /// Correlation housekeeping: expire state on a quiet bus; report a
     /// rising eviction / refusal count (rate-limited like other health
     /// counters).
@@ -2551,6 +2590,7 @@ impl<'a> Daemon<'a> {
         self.correlation_tick();
         self.control_findings();
         self.evidence_incidents();
+        self.retention_tick();
         self.mark_head();
         for f in self.agent.take_faults() {
             let _ = writeln!(

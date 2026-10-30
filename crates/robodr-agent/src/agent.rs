@@ -773,6 +773,17 @@ impl Agent {
         rec.mark_head().map(|()| true).map_err(|e| e.to_string())
     }
 
+    /// Where the black box's retention stands (T15): unexported segments
+    /// against capacity, unexported drops. Re-reads the export cursor /
+    /// ack first (`Recorder::refresh_export_state`), so an exporter in
+    /// another process (`robodr-blackbox export-pending`) counts. `None`
+    /// while the black box is unavailable.
+    pub fn blackbox_retention(&mut self) -> Option<robodr_blackbox::RetentionStatus> {
+        let rec = self.recorder.as_mut()?;
+        rec.refresh_export_state();
+        Some(rec.retention_status())
+    }
+
     /// Closed black-box segments the current recorder found damaged and
     /// quarantined when it was opened (or last reopened after an outage).
     /// Empty while the black box is unavailable.
