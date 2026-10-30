@@ -119,6 +119,9 @@ pub mod input;
 pub mod notify;
 pub mod profile_chain;
 pub mod safety;
+/// Health record and early warnings (credential expiry, clock, disk,
+/// executor reachability).
+pub mod selfcheck;
 pub mod signal;
 pub mod spool;
 

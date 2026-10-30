@@ -453,6 +453,9 @@ pub struct Agent {
     seen: BTreeMap<String, (u64, u64)>,
     faults: VecDeque<AgentFault>,
     stats: AgentStats,
+    /// The health record for the finding being built (only between
+    /// [`Agent::report_health`] and its `build_finding`).
+    pending_health: Option<robodr_ocsf::AgentHealth>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -642,6 +645,7 @@ impl Agent {
             seen: BTreeMap::new(),
             faults: VecDeque::new(),
             stats: AgentStats::default(),
+            pending_health: None,
         })
     }
 
@@ -1053,6 +1057,31 @@ impl Agent {
         )
     }
 
+    /// Report the daemon's periodic health record: a
+    /// [`robodr_ocsf::AGENT_HEALTH_RULE`] deviation handled exactly like
+    /// [`Agent::handle_external`] with [`Detector::SelfHealth`]
+    /// (observe-only, recorded, a validated and signed finding), whose
+    /// finding carries `health` as `entity_context.agent_health` (findings
+    /// contract 2.5). `dev` must have that rule id; for any other the
+    /// record is dropped and the finding is built without it.
+    pub fn report_health(
+        &mut self,
+        now: Timestamp,
+        source: &str,
+        subject: Subject,
+        dev: Deviation,
+        health: robodr_ocsf::AgentHealth,
+        safety: SafetyState,
+    ) -> Outcome {
+        if dev.rule_str() == robodr_ocsf::AGENT_HEALTH_RULE {
+            self.pending_health = Some(health);
+        }
+        let o = self.handle_external(now, Detector::SelfHealth, source, subject, dev, safety);
+        // Never carried over to another finding.
+        self.pending_health = None;
+        o
+    }
+
     /// Record a deviation in the black box only, exactly as
     /// [`Agent::handle_external`] records it (same mode rule, same record
     /// kind and criticality), but without a response plan, a finding or an
@@ -1414,6 +1443,9 @@ impl Agent {
         let mut b = FindingBuilder::from_deviation(dev, &self.ocsf)
             .safety_state(ocsf_safety(safety))
             .attestation(self.attestation);
+        if let Some(h) = self.pending_health.take() {
+            b = b.agent_health(h);
+        }
         let event = match subject {
             FindingSubject::Event(ev) => {
                 b = b.event(ev);

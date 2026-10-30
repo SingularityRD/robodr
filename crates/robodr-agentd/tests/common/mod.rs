@@ -142,6 +142,13 @@ impl Setup {
             "silence_ms": 60000,
             "lag_ms": 5000,
             "health_report_ms": 0,
+            // The early warnings must not depend on the test machine's
+            // disk or clock (tests of them set their own thresholds).
+            "self_health": {
+                "disk_warn_percent": 1,
+                "disk_critical_percent": 0,
+                "clock_unsynced_grace_ms": 86_400_000,
+            },
         });
         merge(&mut d, daemon);
         serde_json::json!({

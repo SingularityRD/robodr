@@ -175,6 +175,18 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // robodr-agentd executor link (failed revert, executor journal reset)
     "robot.agent.executor_revert_failed",
     "robot.agent.executor_journal_reset",
+    // robodr-agentd early warnings (contract 2.5, `selfcheck`). The
+    // periodic `robot.agent.health` record is never fed to the engine.
+    "robot.agent.credential_expiring",
+    "robot.agent.clock_unsynced",
+    "robot.agent.clock_jump",
+    "robot.agent.disk_low",
+    "robot.agent.executor_unreachable",
+    // Contract 2.5 ids reserved for their producers (control-plane replay
+    // fence, field self-test, in-path gateway overload).
+    "robot.agent.control_plane_request_fenced",
+    "robot.agent.selftest",
+    "robot.gateway.overload",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",
