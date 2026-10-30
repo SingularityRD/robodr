@@ -1,6 +1,8 @@
 //! Shared fixtures: temp dirs, findings, and an in-process fake Kafka
-//! cluster (std `TcpListener`) implementing ApiVersions v0, Metadata v1–8
-//! and Produce v3–8 from the protocol documentation.
+//! cluster (std `TcpListener`) implementing ApiVersions v0, Metadata v1–8,
+//! Produce v3–8 and InitProducerId v0–1 from the protocol documentation,
+//! with a broker's idempotent-producer checks (sequence numbers, epochs,
+//! duplicates of the last five batches).
 #![allow(dead_code)]
 
 use robodr_events::graph::Endpoint;
@@ -146,6 +148,80 @@ pub struct State {
     pub authenticated: u64,
     /// SCRAM attempts refused.
     pub auth_failures: u64,
+    /// Offer InitProducerId (v0-4) in ApiVersions.
+    pub init_pid_supported: bool,
+    /// Answer InitProducerId with this error (e.g. 31,
+    /// CLUSTER_AUTHORIZATION_FAILED).
+    pub init_pid_error: Option<i16>,
+    /// Next producer id handed out.
+    pub next_pid: i64,
+    /// Idempotent producer state per `(producer id, partition)`, as a
+    /// broker keeps it: the epoch, the last sequence written, and the last
+    /// five batches `(first seq, last seq, base offset)` for duplicate
+    /// detection.
+    pub producers: BTreeMap<(i64, i32), ProducerEntry>,
+    /// Answer a recognised duplicate with DUPLICATE_SEQUENCE_NUMBER (46)
+    /// instead of success with the original offset (current brokers).
+    pub dup_error_code: bool,
+    /// Idempotent batches received (with a producer id).
+    pub idempotent_batches: u64,
+    /// Duplicates recognised (not appended).
+    pub duplicates: u64,
+    /// `(partition, producer id, epoch, base sequence, records)` of every
+    /// idempotent batch appended.
+    pub appended: Vec<(i32, i64, i16, i32, i32)>,
+}
+
+/// What a broker remembers of an idempotent producer on one partition.
+#[derive(Debug, Clone, Default)]
+pub struct ProducerEntry {
+    pub epoch: i16,
+    pub last_seq: i32,
+    pub recent: VecDeque<(i32, i32, i64)>,
+}
+
+/// `seq + n`, wrapping like Kafka.
+pub fn inc_seq(seq: i32, n: i32) -> i32 {
+    if seq > i32::MAX - n {
+        n - (i32::MAX - seq) - 1
+    } else {
+        seq + n
+    }
+}
+
+/// The broker's sequence check for one idempotent batch (Kafka's
+/// `ProducerAppendInfo`): `Ok(None)` append, `Ok(Some(offset))` duplicate
+/// of a recent batch, `Err(code)` refuse.
+fn check_sequence(
+    st: &State,
+    pid: i64,
+    epoch: i16,
+    p: i32,
+    first: i32,
+    n: i32,
+) -> Result<Option<i64>, i16> {
+    let last = inc_seq(first, n - 1);
+    match st.producers.get(&(pid, p)) {
+        // An unknown (or expired) producer: any sequence is accepted.
+        None => Ok(None),
+        Some(e) if epoch < e.epoch => Err(47),
+        Some(e) if epoch > e.epoch => {
+            if first == 0 {
+                Ok(None)
+            } else {
+                Err(45)
+            }
+        }
+        Some(e) => {
+            if let Some((_, _, off)) = e.recent.iter().find(|(f, l, _)| *f == first && *l == last) {
+                Ok(Some(*off))
+            } else if first == inc_seq(e.last_seq, 1) {
+                Ok(None)
+            } else {
+                Err(45)
+            }
+        }
+    }
 }
 
 /// The broker side of SASL/SCRAM (RFC 5802), for the fake cluster.
@@ -193,6 +269,8 @@ impl Cluster {
             max_value_bytes: usize::MAX,
             max_batch_bytes: usize::MAX,
             produce_max_version: 8,
+            init_pid_supported: true,
+            next_pid: 1000,
             ..Default::default()
         };
         f(&mut init);
@@ -263,6 +341,22 @@ impl Cluster {
 
     pub fn total(&self) -> usize {
         self.state.lock().unwrap().log.values().map(Vec::len).sum()
+    }
+
+    /// Forget every idempotent producer (as after
+    /// `producer.id.expiration.ms`): their next batch is accepted with any
+    /// sequence.
+    pub fn forget_producers(&self) {
+        self.state.lock().unwrap().producers.clear();
+    }
+
+    /// InitProducerId requests answered.
+    pub fn init_pid_requests(&self) -> usize {
+        let s = self.state.lock().unwrap();
+        s.seen
+            .iter()
+            .filter(|(_, k, _)| *k == proto::API_INIT_PRODUCER_ID)
+            .count()
     }
 }
 
@@ -436,8 +530,45 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                     return;
                 }
             }
+            proto::API_INIT_PRODUCER_ID => {
+                let req = proto::decode_init_producer_id_request(&mut r).expect("init pid");
+                assert_eq!(req.0, None, "no transactional id");
+                let resp = {
+                    let mut g = st.lock().unwrap();
+                    match g.init_pid_error {
+                        Some(code) => proto::InitProducerIdResponse {
+                            throttle_time_ms: 0,
+                            error_code: code,
+                            producer_id: -1,
+                            producer_epoch: -1,
+                        },
+                        None => {
+                            let id = g.next_pid;
+                            g.next_pid += 1;
+                            proto::InitProducerIdResponse {
+                                throttle_time_ms: 0,
+                                error_code: 0,
+                                producer_id: id,
+                                producer_epoch: 0,
+                            }
+                        }
+                    }
+                };
+                let body = proto::encode_init_producer_id_response(&resp);
+                if write_response(&mut s, h.correlation_id, &body).is_err() {
+                    return;
+                }
+            }
             proto::API_VERSIONS => {
-                let pmax = st.lock().unwrap().produce_max_version;
+                let (pmax, init_pid) = {
+                    let g = st.lock().unwrap();
+                    (g.produce_max_version, g.init_pid_supported)
+                };
+                let init_pid_api = init_pid.then_some(ApiRange {
+                    api_key: proto::API_INIT_PRODUCER_ID,
+                    min: 0,
+                    max: 4,
+                });
                 let mut apis = vec![
                     ApiRange {
                         api_key: sasl::API_SASL_HANDSHAKE,
@@ -474,6 +605,7 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                                 max: 3,
                             },
                         ])
+                        .chain(init_pid_api)
                         .collect(),
                 });
                 if write_response(&mut s, h.correlation_id, &body).is_err() {
@@ -558,12 +690,70 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                         }
                         let mut base = -1;
                         if code == 0 && append {
-                            let log = st.log.entry(*p).or_default();
-                            base = log.len() as i64;
                             for b in batches {
-                                assert_eq!(b.producer_id, -1, "idempotence must be off");
-                                log.extend(b.records);
+                                let n = b.records.len() as i32;
+                                assert_eq!(b.last_offset_delta, n - 1);
+                                let offset = st.log.get(p).map_or(0, Vec::len) as i64;
+                                if b.producer_id >= 0 {
+                                    st.idempotent_batches += 1;
+                                    assert!(b.producer_epoch >= 0 && b.base_sequence >= 0);
+                                    match check_sequence(
+                                        &st,
+                                        b.producer_id,
+                                        b.producer_epoch,
+                                        *p,
+                                        b.base_sequence,
+                                        n,
+                                    ) {
+                                        Err(c) => {
+                                            code = c;
+                                            break;
+                                        }
+                                        Ok(Some(orig)) => {
+                                            st.duplicates += 1;
+                                            if st.dup_error_code {
+                                                code = 46;
+                                            } else if base < 0 {
+                                                base = orig;
+                                            }
+                                            continue;
+                                        }
+                                        Ok(None) => {
+                                            let e = st
+                                                .producers
+                                                .entry((b.producer_id, *p))
+                                                .or_default();
+                                            if e.epoch != b.producer_epoch {
+                                                e.recent.clear();
+                                            }
+                                            e.epoch = b.producer_epoch;
+                                            e.last_seq = inc_seq(b.base_sequence, n - 1);
+                                            e.recent.push_back((
+                                                b.base_sequence,
+                                                e.last_seq,
+                                                offset,
+                                            ));
+                                            if e.recent.len() > 5 {
+                                                e.recent.pop_front();
+                                            }
+                                            st.appended.push((
+                                                *p,
+                                                b.producer_id,
+                                                b.producer_epoch,
+                                                b.base_sequence,
+                                                n,
+                                            ));
+                                        }
+                                    }
+                                }
+                                if base < 0 {
+                                    base = offset;
+                                }
+                                st.log.entry(*p).or_default().extend(b.records);
                             }
+                        }
+                        if code != 0 {
+                            base = -1;
                         }
                         parts.push(proto::PartitionProduceResponse {
                             partition: *p,

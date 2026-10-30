@@ -14,10 +14,14 @@ use std::time::Duration;
 const USAGE: &str = "usage: robodr-spool-export --spool DIR --outbox DIR --state FILE \
 --pack-state FILE --unit ID --key-file FILE [--key-id ID] [--allow-hmac] \
 [--max-batch-bytes N] [--max-findings N] [--rejected-dir DIR] [--interval-ms N] [--once] \
-[--upgrade-data-source LABEL] [--upgrade-topic TOPIC]\n\
+[--upgrade-data-source LABEL] [--upgrade-topic TOPIC] \
+[--rejected-max-age-s N] [--rejected-max-count N] [--rejected-max-bytes N]\n\
 Unsigned contract 1.x records (spooled before an upgrade) are upgraded to contract 2.0 with \
 --upgrade-data-source (default robodr) and --upgrade-topic (default robodr.findings); signed \
-ones are moved to the rejected directory (\"legacy 1.x signed record: re-sign required\").";
+ones are moved to the rejected directory (\"legacy 1.x signed record: re-sign required\").\n\
+The rejected directory is kept in full unless --rejected-max-age-s / --rejected-max-count / \
+--rejected-max-bytes bound it (0 = no bound): the oldest rejected records (with their \
+.reason.json) beyond the bounds are deleted after each run.";
 
 struct Opts {
     cfg: ExportConfig,
@@ -49,6 +53,12 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if let Some(t) = a.one("upgrade-topic")? {
         cfg.upgrade_topic = t.into();
     }
+    cfg.rejected_retention = robodr_export::retention::with_flags(
+        cfg.rejected_retention,
+        a.num("rejected-max-age-s")?,
+        a.num("rejected-max-count")?,
+        a.num("rejected-max-bytes")?,
+    );
     let interval: u64 = a.num("interval-ms")?.unwrap_or(5_000);
     if interval == 0 {
         return Err("--interval-ms must be > 0".into());
@@ -77,7 +87,11 @@ fn run_one(o: &Opts) -> Result<(), String> {
         Exporter::open_checked(o.cfg.clone(), &o.pack, packer).map_err(|e| e.to_string())?;
     loop {
         let r = x.run_once(now_ms()).map_err(|e| e.to_string())?;
-        if r.exported > 0 || !r.rejected.is_empty() || r.recovered.is_some() {
+        if r.exported > 0
+            || !r.rejected.is_empty()
+            || r.recovered.is_some()
+            || r.pruned_rejected.removed > 0
+        {
             println!("{}", serde_json::to_string(&r).unwrap_or_default());
         }
         if o.once {
@@ -116,6 +130,9 @@ fn main() -> ExitCode {
             "interval-ms",
             "upgrade-data-source",
             "upgrade-topic",
+            "rejected-max-age-s",
+            "rejected-max-count",
+            "rejected-max-bytes",
         ],
         &["allow-hmac", "once"],
     );

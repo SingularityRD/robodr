@@ -1148,6 +1148,10 @@ fn dead_letters_rotate() {
     cfg.dead_letter_rotation = Some(rot);
     let rep = r.uplink(cfg.clone()).run_once().unwrap();
     assert_eq!(rep.rejected, 120);
+    // Files past `keep` were deleted after the run: their records left
+    // ready/ (moved to rejected/), so no entry is needed any more.
+    assert!(rep.pruned_dead_letters.removed >= 1, "{rep:?}");
+    assert_eq!(rep.pruned_dead_letters.held, 0);
     let files = robodr_export::deadletter::files(&r.state, "dead-letter.jsonl").unwrap();
     let names: Vec<String> = files
         .iter()

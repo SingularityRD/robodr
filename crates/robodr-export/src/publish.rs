@@ -66,10 +66,43 @@
 //!
 //! For a spool source the commit is the rename `ready/ → acked/` of the
 //! chunk's files (dead-lettered ones go to `<spool>/rejected/`).
+//!
+//! # Idempotent producer across restarts
+//!
+//! With the producer's idempotence on (the default,
+//! [`crate::kafka::client`]), `progress.json` also holds the producer id,
+//! epoch and per-partition sequences, and, while a chunk is being sent, the
+//! chunk's journal (its source, input positions and batches: acknowledged
+//! or in doubt). The producer has the file replaced **before** every
+//! request that carries a newly numbered batch. A publisher restarted after
+//! a crash (or a failed run) re-reads the same chunk; when its source and
+//! positions match the journal, acknowledged batches are not sent again
+//! and the batch in doubt is re-sent with its original sequence, which the
+//! broker recognises: the chunk is **not duplicated**. A chunk that does
+//! not match (input or configuration changed) is sent as new records: a
+//! possible duplicate, never a loss. Turning idempotence off drops the
+//! producer state from the file (at-least-once as before).
+//!
+//! # Retention
+//!
+//! After every run ([`PublishConfig::done_retention`],
+//! [`PublishConfig::dead_letter_retention`], [`crate::retention`]):
+//!
+//! * a `done/` marker over the bounds is deleted only when its batch is no
+//!   longer in `out/` (while it is, the marker is what keeps the batch from
+//!   being published again);
+//! * the dead-letter file rotates ([`PublishConfig::dead_letter_rotation`])
+//!   and a rotated file past `keep` or over the bounds is deleted only when
+//!   none of its entries can be needed for deduplication any more: diode
+//!   entries while their batch is in `out/` without a `done/` marker, spool
+//!   entries while their file is still in `ready/`.
 
-use crate::deadletter::DeadLetters;
+use crate::deadletter::{DeadLetters, Rotation, DEFAULT_ROTATION};
 use crate::fsutil::{self, ReadError};
-use crate::kafka::{Outcome, ProduceError, ProduceRecord, Producer};
+use crate::kafka::{
+    IdempotentState, Outcome, PersistFn, ProduceError, ProduceRecord, Producer, SendJournal,
+};
+use crate::retention::{PruneReport, Retention};
 use robodr_agentd::spool::SpoolRecord;
 use robodr_ocsf::{DEFAULT_DATA_SOURCE, DEFAULT_TOPIC};
 use serde::{Deserialize, Serialize};
@@ -98,9 +131,43 @@ pub trait Sink {
         topic: &str,
         records: &[(i32, ProduceRecord)],
     ) -> Result<Vec<Outcome>, ProduceError>;
+
+    /// The idempotent producer's state to persist (`None`: not idempotent).
+    fn idempotent_state(&self) -> Option<IdempotentState> {
+        None
+    }
+
+    /// Continue with a persisted idempotent state.
+    fn restore_idempotent_state(&mut self, _state: IdempotentState) {}
+
+    /// [`Producer::send_journaled`]; by default a plain [`Sink::send`].
+    fn send_journaled(
+        &mut self,
+        topic: &str,
+        records: &[(i32, ProduceRecord)],
+        _resume: Option<&SendJournal>,
+        _persist: &mut PersistFn<'_>,
+    ) -> Result<Vec<Outcome>, ProduceError> {
+        self.send(topic, records)
+    }
 }
 
 impl Sink for Producer {
+    fn idempotent_state(&self) -> Option<IdempotentState> {
+        Producer::idempotent_state(self).cloned()
+    }
+    fn restore_idempotent_state(&mut self, state: IdempotentState) {
+        Producer::restore_idempotent_state(self, state)
+    }
+    fn send_journaled(
+        &mut self,
+        topic: &str,
+        records: &[(i32, ProduceRecord)],
+        resume: Option<&SendJournal>,
+        persist: &mut PersistFn<'_>,
+    ) -> Result<Vec<Outcome>, ProduceError> {
+        Producer::send_journaled(self, topic, records, resume, persist)
+    }
     fn partition_count(&mut self, topic: &str) -> Result<u32, ProduceError> {
         Producer::partition_count(self, topic)
     }
@@ -137,6 +204,14 @@ pub struct PublishConfig {
     /// upgraded to contract 2.0 (default [`DEFAULT_DATA_SOURCE`]); its topic
     /// becomes [`topic`](Self::topic).
     pub upgrade_data_source: String,
+    /// Dead-letter rotation (default [`DEFAULT_ROTATION`]: 64 MiB, 4 kept;
+    /// `None`: one growing file).
+    pub dead_letter_rotation: Option<Rotation>,
+    /// Further bounds on the rotated dead-letter files (default none
+    /// beyond the rotation's `keep`), see the module docs.
+    pub dead_letter_retention: Retention,
+    /// Bounds on `done/` markers (default: 30 days), see the module docs.
+    pub done_retention: Retention,
     /// Test hook: fail with [`PublishError::Injected`] after the n-th
     /// chunk (1-based) was acknowledged by Kafka but before progress was
     /// saved — a simulated crash.
@@ -153,10 +228,18 @@ impl PublishConfig {
             chunk_records: 500,
             max_record_bytes: 1024 * 1024,
             upgrade_data_source: DEFAULT_DATA_SOURCE.into(),
+            dead_letter_rotation: Some(DEFAULT_ROTATION),
+            dead_letter_retention: Retention::UNBOUNDED,
+            done_retention: DEFAULT_DONE_RETENTION,
             fail_after_send: None,
         }
     }
 }
+
+/// Default retention of `done/` markers: older than 30 days (a marker is
+/// never deleted while its batch is still in `out/`).
+pub const DEFAULT_DONE_RETENTION: Retention =
+    Retention::max_age(std::time::Duration::from_secs(30 * 86_400));
 
 #[derive(Debug)]
 pub enum PublishError {
@@ -204,6 +287,33 @@ pub struct Progress {
     pub in_flight: BTreeMap<String, u64>,
     pub published_total: u64,
     pub dead_lettered_total: u64,
+    /// The idempotent producer's state (see the module docs). Absent from
+    /// the file with idempotence off, so such a file stays readable by
+    /// earlier versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<ProducerProgress>,
+}
+
+/// The idempotent producer's persisted state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerProgress {
+    pub state: IdempotentState,
+    /// The chunk being sent, until it is committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<ChunkJournal>,
+}
+
+/// A chunk's journal: which input it was sent from, and its batches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChunkJournal {
+    /// Diode batch name, or the spool root.
+    pub context: String,
+    /// Input positions of the records sent (line numbers / spool seqs), in
+    /// the order sent.
+    pub positions: Vec<u64>,
+    pub journal: SendJournal,
 }
 
 impl Progress {
@@ -213,6 +323,7 @@ impl Progress {
             in_flight: BTreeMap::new(),
             published_total: 0,
             dead_lettered_total: 0,
+            producer: None,
         }
     }
 
@@ -300,6 +411,12 @@ pub struct PublishReport {
     /// Malformed lines found in the dead-letter file when it was loaded in
     /// this run (torn fragments, edits; [`crate::deadletter`]).
     pub dead_letter_malformed: u64,
+    /// `done/` markers deleted by retention (and held: over the bounds,
+    /// batch still in `out/`).
+    pub pruned_done: PruneReport,
+    /// Rotated dead-letter files deleted by retention (and held: entries
+    /// still needed for deduplication).
+    pub pruned_dead_letters: PruneReport,
 }
 
 /// One input record, as the importer writes it (and as agentd spools it).
@@ -650,6 +767,21 @@ pub struct Publisher<S: Sink> {
     dead_loaded: bool,
 }
 
+fn save_progress(state_dir: &Path, p: &Progress) -> Result<(), PublishError> {
+    let b = serde_json::to_vec_pretty(p).map_err(|e| PublishError::State(e.to_string()))?;
+    fsutil::atomic_write(&state_dir.join(PROGRESS_FILE), &b)?;
+    Ok(())
+}
+
+/// Whether anything exists at `p` (not following symlinks).
+pub(crate) fn exists(p: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(p) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn valid_batch_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 128
@@ -667,7 +799,13 @@ pub(crate) fn spool_seq(name: &str) -> Option<u64> {
 }
 
 impl<S: Sink> Publisher<S> {
-    pub fn open(cfg: PublishConfig, sink: S) -> Result<Self, PublishError> {
+    pub fn open(cfg: PublishConfig, mut sink: S) -> Result<Self, PublishError> {
+        if cfg.dead_letter_rotation.is_some_and(|r| !r.is_valid()) {
+            return Err(PublishError::Config(format!(
+                "dead-letter rotation: keep >= 1 and max_bytes >= {} required",
+                crate::deadletter::MIN_ROTATION_BYTES
+            )));
+        }
         if !(1..=10_000).contains(&cfg.chunk_records) {
             return Err(PublishError::Config(
                 "chunk_records must be in 1..=10000".into(),
@@ -705,7 +843,10 @@ impl<S: Sink> Publisher<S> {
             Err(ReadError::Missing) => Progress::empty(),
             Err(e) => return Err(PublishError::State(format!("{}: {e}", path.display()))),
         };
-        let dead = DeadLetters::new(&cfg.state_dir, DEAD_LETTER_FILE, None);
+        if let Some(pp) = &progress.producer {
+            sink.restore_idempotent_state(pp.state.clone());
+        }
+        let dead = DeadLetters::new(&cfg.state_dir, DEAD_LETTER_FILE, cfg.dead_letter_rotation);
         Ok(Self {
             cfg,
             sink,
@@ -729,9 +870,53 @@ impl<S: Sink> Publisher<S> {
     }
 
     fn save(&self) -> Result<(), PublishError> {
-        let b = serde_json::to_vec_pretty(&self.progress)
-            .map_err(|e| PublishError::State(e.to_string()))?;
-        fsutil::atomic_write(&self.cfg.state_dir.join(PROGRESS_FILE), &b)?;
+        save_progress(&self.cfg.state_dir, &self.progress)
+    }
+
+    /// The chunk was committed: its journal is no longer needed (saved with
+    /// the commit).
+    fn chunk_committed(&mut self) {
+        if let Some(p) = self.progress.producer.as_mut() {
+            p.chunk = None;
+        }
+    }
+
+    /// Whether a dead letter `(source, position)` may still be needed for
+    /// deduplication: its record can be processed again (see the module
+    /// docs).
+    fn dead_letter_needed(&self, source: &str, pos: u64) -> io::Result<bool> {
+        match &self.cfg.source {
+            Source::DiodeOut(out) => {
+                if !valid_batch_name(source) {
+                    return Ok(false);
+                }
+                let done = self.cfg.state_dir.join(DONE_DIR).join(source);
+                Ok(exists(&out.join(source))? && !exists(&done)?)
+            }
+            Source::Spool(root) => Ok(source == root.display().to_string()
+                && exists(&root.join("ready").join(format!("{pos:020}.json")))?),
+        }
+    }
+
+    /// Retention (see the module docs).
+    fn prune(&mut self, report: &mut PublishReport) -> Result<(), PublishError> {
+        let now = std::time::SystemTime::now();
+        if let Source::DiodeOut(out) = &self.cfg.source {
+            report.pruned_done = crate::retention::prune_done_markers(
+                &self.cfg.state_dir.join(DONE_DIR),
+                out,
+                &self.cfg.done_retention,
+                now,
+            )?;
+        }
+        let r = self.cfg.dead_letter_retention;
+        let mut dead = std::mem::replace(
+            &mut self.dead,
+            DeadLetters::new(&self.cfg.state_dir, DEAD_LETTER_FILE, None),
+        );
+        let res = dead.prune(&r, now, |s, p| self.dead_letter_needed(s, p));
+        self.dead = dead;
+        report.pruned_dead_letters = res?;
         Ok(())
     }
 
@@ -838,7 +1023,45 @@ impl<S: Sink> Publisher<S> {
             }
         }
         if !to_send.is_empty() {
-            let outcomes = self.sink.send(&self.cfg.topic, &to_send)?;
+            let positions: Vec<u64> = sent_items.iter().map(|it| it.pos).collect();
+            // The journal of this very chunk, left by a run that did not
+            // finish it (see the module docs).
+            let resume = self
+                .progress
+                .producer
+                .as_ref()
+                .and_then(|p| p.chunk.as_ref())
+                .filter(|c| c.context == context && c.positions == positions)
+                .map(|c| c.journal.clone());
+            let Self {
+                sink,
+                progress,
+                cfg,
+                ..
+            } = self;
+            let mut persist = |s: &IdempotentState, j: &SendJournal| -> Result<(), String> {
+                progress.producer = Some(ProducerProgress {
+                    state: s.clone(),
+                    chunk: Some(ChunkJournal {
+                        context: context.to_string(),
+                        positions: positions.clone(),
+                        journal: j.clone(),
+                    }),
+                });
+                save_progress(&cfg.state_dir, progress).map_err(|e| e.to_string())
+            };
+            let sent = sink.send_journaled(&cfg.topic, &to_send, resume.as_ref(), &mut persist);
+            // Keep the chunk's journal until the chunk is committed (a
+            // failed or interrupted run resumes from it); take the
+            // producer's current state.
+            match sink.idempotent_state() {
+                Some(state) => {
+                    let chunk = progress.producer.take().and_then(|p| p.chunk);
+                    progress.producer = Some(ProducerProgress { state, chunk });
+                }
+                None => progress.producer = None,
+            }
+            let outcomes = sent?;
             self.chunks_sent += 1;
             if outcomes.len() != to_send.len() {
                 return Err(PublishError::State(
@@ -874,6 +1097,7 @@ impl<S: Sink> Publisher<S> {
             Source::DiodeOut(out) => self.run_diode(&out, &mut report)?,
             Source::Spool(root) => self.run_spool(&root, &mut report)?,
         }
+        self.prune(&mut report)?;
         Ok(report)
     }
 
@@ -949,6 +1173,7 @@ impl<S: Sink> Publisher<S> {
         if let Some(last) = chunk.last() {
             self.progress.set_committed(name, last.pos);
         }
+        self.chunk_committed();
         self.save()
     }
 
@@ -984,6 +1209,7 @@ impl<S: Sink> Publisher<S> {
             fsutil::fsync_dir(&acked)?;
             fsutil::fsync_dir(&rejected)?;
             fsutil::fsync_dir(&ready)?;
+            self.chunk_committed();
             self.save()?;
         }
     }

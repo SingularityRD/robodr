@@ -5,7 +5,9 @@
 #![forbid(unsafe_code)]
 
 use robodr_diode::cli::{argv, is_version_request, parse_args_with_switches, Args};
+use robodr_export::deadletter::{DEFAULT_ROTATION, MIN_ROTATION_BYTES};
 use robodr_export::kafka::{Producer, ProducerConfig};
+use robodr_export::retention;
 use robodr_export::{PublishConfig, Publisher, Source};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -13,7 +15,9 @@ use std::time::Duration;
 const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootstrap ...] \
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
 [--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
-[--interval-ms N] [--once] [--upgrade-data-source LABEL] \
+[--interval-ms N] [--once] [--upgrade-data-source LABEL] [--no-idempotence] \
+[--dead-letter-max-bytes N] [--dead-letter-keep N] [--dead-letter-max-age-s N] \
+[--done-max-age-s N] [--done-max-count N] \
 (--tls-ca FILE [--tls-cert FILE --tls-key FILE] [--tls-server-name NAME] [--tls-spki-sha256 HEX]... \
 [--sasl-mechanism SCRAM-SHA-256|SCRAM-SHA-512 --sasl-username U --sasl-password-file FILE] \
 | --allow-plaintext)\n\
@@ -22,7 +26,15 @@ default robodr; topic --topic); signed ones are dead-lettered \
 (\"legacy 1.x signed record: re-sign required\").\n\
 TLS is required: every broker certificate is verified against --tls-ca (and the broker's \
 host name, or --tls-server-name); --tls-cert/--tls-key add a client certificate (mutual TLS). \
-Plain TCP only with an explicit --allow-plaintext (isolated network or a local TLS proxy).";
+Plain TCP only with an explicit --allow-plaintext (isolated network or a local TLS proxy).\n\
+The producer is idempotent (InitProducerId, sequence numbers; a re-sent batch is dropped by the \
+broker); --no-idempotence for brokers that refuse it (Kafka < 3.0 without the IDEMPOTENT_WRITE \
+cluster ACL): at-least-once.\n\
+Retention: dead-letter.jsonl rotates at --dead-letter-max-bytes (default 64 MiB, 0 = never) with \
+--dead-letter-keep rotated files (default 4) and optionally --dead-letter-max-age-s; done/ markers \
+older than --done-max-age-s (default 2592000 = 30 days, 0 = keep) or beyond --done-max-count are \
+deleted once their batch has left the importer's out/. Nothing still needed for deduplication \
+is deleted.";
 
 struct Opts {
     producer: ProducerConfig,
@@ -55,6 +67,7 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if let Some(n) = a.num("max-request-bytes")? {
         p.max_request_bytes = n;
     }
+    p.idempotence = !a.flag("no-idempotence");
     security(a, &mut p)?;
     // Configuration errors (plain TCP not allowed, SASL without TLS, bad
     // bounds) are usage errors (exit 2), not retried at run time.
@@ -74,6 +87,38 @@ fn opts(a: &Args) -> Result<Opts, String> {
     if let Some(l) = a.one("upgrade-data-source")? {
         c.upgrade_data_source = l.into();
     }
+    let mut rot = DEFAULT_ROTATION;
+    match a.num::<u64>("dead-letter-max-bytes")? {
+        Some(0) => c.dead_letter_rotation = None,
+        Some(n) => rot.max_bytes = n,
+        None => {}
+    }
+    if let Some(k) = a.num::<u32>("dead-letter-keep")? {
+        if k == 0 {
+            return Err("--dead-letter-keep must be >= 1".into());
+        }
+        rot.keep = k;
+    }
+    if c.dead_letter_rotation.is_some() {
+        if !rot.is_valid() {
+            return Err(format!(
+                "--dead-letter-max-bytes must be 0 or >= {MIN_ROTATION_BYTES}"
+            ));
+        }
+        c.dead_letter_rotation = Some(rot);
+    }
+    c.dead_letter_retention = retention::with_flags(
+        c.dead_letter_retention,
+        a.num("dead-letter-max-age-s")?,
+        None,
+        None,
+    );
+    c.done_retention = retention::with_flags(
+        c.done_retention,
+        a.num("done-max-age-s")?,
+        a.num("done-max-count")?,
+        None,
+    );
     let interval: u64 = a.num("interval-ms")?.unwrap_or(2_000);
     if interval == 0 {
         return Err("--interval-ms must be > 0".into());
@@ -152,7 +197,12 @@ fn run(o: &Opts) -> Result<(), String> {
     let mut p = Publisher::open(o.publish.clone(), producer).map_err(|e| e.to_string())?;
     loop {
         let r = p.run_once().map_err(|e| e.to_string())?;
-        if r.published > 0 || r.dead_lettered > 0 || !r.batches_done.is_empty() {
+        if r.published > 0
+            || r.dead_lettered > 0
+            || !r.batches_done.is_empty()
+            || r.pruned_done.removed > 0
+            || r.pruned_dead_letters.removed > 0
+        {
             println!("{}", serde_json::to_string(&r).unwrap_or_default());
         }
         if o.once {
@@ -192,6 +242,11 @@ fn main() -> ExitCode {
             "max-request-bytes",
             "interval-ms",
             "upgrade-data-source",
+            "dead-letter-max-bytes",
+            "dead-letter-keep",
+            "dead-letter-max-age-s",
+            "done-max-age-s",
+            "done-max-count",
             "tls-ca",
             "tls-cert",
             "tls-key",
@@ -201,7 +256,7 @@ fn main() -> ExitCode {
             "sasl-username",
             "sasl-password-file",
         ],
-        &["once", "allow-plaintext"],
+        &["once", "allow-plaintext", "no-idempotence"],
     );
     let o = match parsed.and_then(|a| opts(&a)) {
         Ok(o) => o,

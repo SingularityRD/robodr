@@ -1,16 +1,18 @@
 //! Harness: the Kafka wire decoders of `robodr-export` (`kafka::proto`,
 //! `kafka::batch`, `kafka::wire`): what the producer parses from a broker
-//! (ApiVersions v0, Metadata v1-8 and Produce v3-8 responses) and what the
-//! in-process test broker parses from a client (request header, Metadata and
-//! Produce requests, RecordBatch v2).
+//! (ApiVersions v0, Metadata v1-8, Produce v3-8 and InitProducerId v0-1
+//! responses) and what the in-process test broker parses from a client
+//! (request header, Metadata, Produce and InitProducerId requests,
+//! RecordBatch v2 with or without the idempotent producer's fields).
 //!
 //! Input: `selector body`. `selector % 8` picks the decoder, `selector / 8`
 //! the API version (Metadata `1 + s % 8`, Produce `3 + s % 6`):
 //!
-//! 0. ApiVersions response; 1. Metadata response; 2. Produce response;
+//! 0. ApiVersions response (`s` even) or InitProducerId response (`s` odd);
+//! 1. Metadata response; 2. Produce response;
 //! 3. RecordBatch v2 with the CRC-32C fixed up (so mutations get past the
 //!    checksum); 4. RecordBatch v2 as is; 5. request header + Metadata
-//!    request; 6. request header + Produce request (+ its record batches);
+//!    request (or InitProducerId request when the header names API 22); 6. request header + Produce request (+ its record batches);
 //! 7. the primitive reader (strings, bytes, varints) on its own.
 //!
 //! Invariants beyond "no panic" (and no huge allocation: every array length
@@ -19,6 +21,7 @@
 //! * responses: decode -> encode (the test broker's encoders) -> decode is
 //!   the identity; version negotiation only ever picks a version inside
 //!   both ranges; error-code classification is total;
+//! * InitProducerId: decode -> encode -> decode is the identity;
 //! * record batches: a decoded batch has at most one record per 7 bytes,
 //!   and the CRC-fixed variant fails only on structure, never on the CRC.
 //!
@@ -29,9 +32,11 @@ use robodr_export::crc32c::crc32c;
 use robodr_export::kafka::batch::decode_batches;
 use robodr_export::kafka::errors::{classify, name};
 use robodr_export::kafka::proto::{
-    decode_api_versions, decode_metadata, decode_metadata_request, decode_produce_request,
-    decode_produce_response, encode_api_versions_response, encode_metadata_response,
-    encode_produce_response, negotiate, parse_request_header, METADATA_VERSIONS, PRODUCE_VERSIONS,
+    decode_api_versions, decode_init_producer_id_request, decode_init_producer_id_response,
+    decode_metadata, decode_metadata_request, decode_produce_request, decode_produce_response,
+    encode_api_versions_response, encode_init_producer_id_response, encode_metadata_response,
+    encode_produce_response, negotiate, parse_request_header, API_INIT_PRODUCER_ID,
+    INIT_PRODUCER_ID_VERSIONS, METADATA_VERSIONS, PRODUCE_VERSIONS,
 };
 use robodr_export::kafka::wire::Reader;
 
@@ -41,14 +46,19 @@ pub fn run(data: &[u8]) {
     };
     let s = sel / 8;
     match sel % 8 {
+        0 if s % 2 == 1 => init_producer_id(body),
         0 => api_versions(body),
         1 => metadata(1 + i16::from(s % 8), body),
         2 => produce(3 + i16::from(s % 6), body),
         3 => batches(&fix_crcs(body), true),
         4 => batches(body, false),
         5 => {
-            if let Ok((_h, mut r)) = parse_request_header(body) {
-                let _ = decode_metadata_request(&mut r);
+            if let Ok((h, mut r)) = parse_request_header(body) {
+                if h.api_key == API_INIT_PRODUCER_ID {
+                    let _ = decode_init_producer_id_request(&mut r);
+                } else {
+                    let _ = decode_metadata_request(&mut r);
+                }
             }
         }
         6 => {
@@ -74,7 +84,11 @@ fn api_versions(body: &[u8]) {
     let _ = name(r.error_code);
     let again = decode_api_versions(&encode_api_versions_response(&r)).expect("re-decodes");
     assert_eq!(again, r);
-    for (key, ours) in [(0i16, PRODUCE_VERSIONS), (3, METADATA_VERSIONS)] {
+    for (key, ours) in [
+        (0i16, PRODUCE_VERSIONS),
+        (3, METADATA_VERSIONS),
+        (API_INIT_PRODUCER_ID, INIT_PRODUCER_ID_VERSIONS),
+    ] {
         if let Some(v) = negotiate(&r.apis, key, ours) {
             assert!((ours.0..=ours.1).contains(&v), "v{v} outside ours {ours:?}");
             let a = r
@@ -85,6 +99,17 @@ fn api_versions(body: &[u8]) {
             assert!(a.min <= v && v <= a.max, "v{v} outside the broker's {a:?}");
         }
     }
+}
+
+fn init_producer_id(body: &[u8]) {
+    let Ok(r) = decode_init_producer_id_response(body) else {
+        return;
+    };
+    let _ = classify(r.error_code);
+    let _ = name(r.error_code);
+    let again = decode_init_producer_id_response(&encode_init_producer_id_response(&r))
+        .expect("re-encoded init producer id response decodes");
+    assert_eq!(again, r);
 }
 
 fn metadata(version: i16, body: &[u8]) {
@@ -147,6 +172,10 @@ fn batches(body: &[u8], crc_fixed: bool) {
                 assert!(b.records.len() <= body.len() / 7 + 1);
                 for r in &b.records {
                     let _ = (&r.key, &r.value, &r.headers);
+                }
+                let _ = (b.producer_id, b.producer_epoch, b.base_sequence);
+                if let Some(last) = b.records.last() {
+                    assert_eq!(last.offset_delta, b.last_offset_delta);
                 }
             }
         }

@@ -1,4 +1,5 @@
-//! libFuzzer target: Kafka wire decoders (ApiVersions / Metadata / Produce, RecordBatch v2).
+//! libFuzzer target: Kafka wire decoders (ApiVersions / Metadata / Produce / InitProducerId,
+//! RecordBatch v2).
 //!
 //! The harness (input format, invariants) is `fuzz/harness/kafka_wire.rs`; its std-only
 //! smoke test is `crates/robodr-export/tests/fuzz_smoke.rs`.

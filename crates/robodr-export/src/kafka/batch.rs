@@ -1,4 +1,6 @@
-//! RecordBatch v2 (magic 2), uncompressed, non-transactional, no idempotence.
+//! RecordBatch v2 (magic 2), uncompressed, non-transactional; idempotent
+//! ([`encode_batch_idempotent`]: producer id, epoch and base sequence set) or
+//! not ([`encode_batch`]: all three -1).
 //!
 //! ```text
 //! baseOffset           int64   0 (the broker assigns offsets)
@@ -10,9 +12,9 @@
 //! lastOffsetDelta      int32   records - 1
 //! baseTimestamp        int64   first record's timestamp
 //! maxTimestamp         int64   largest record timestamp
-//! producerId           int64   -1 (no idempotence)
-//! producerEpoch        int16   -1
-//! baseSequence         int32   -1
+//! producerId           int64   -1, or the idempotent producer's id
+//! producerEpoch        int16   -1, or its epoch
+//! baseSequence         int32   -1, or the first record's sequence number
 //! records              int32   count, then each record:
 //!   length         varint  bytes of the rest of the record
 //!   attributes     int8    0
@@ -81,8 +83,34 @@ pub enum EncodeError {
     TooLarge,
 }
 
-/// Encode `records` as one RecordBatch v2.
+/// The idempotent producer's fields of a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProducerFields {
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    /// Sequence number of the batch's first record (the others follow).
+    pub base_sequence: i32,
+}
+
+impl ProducerFields {
+    /// No idempotence: `-1, -1, -1`.
+    pub const NONE: Self = Self {
+        producer_id: -1,
+        producer_epoch: -1,
+        base_sequence: -1,
+    };
+}
+
+/// Encode `records` as one RecordBatch v2 without idempotence.
 pub fn encode_batch(records: &[ProduceRecord]) -> Result<Vec<u8>, EncodeError> {
+    encode_batch_idempotent(records, ProducerFields::NONE)
+}
+
+/// Encode `records` as one RecordBatch v2 with the producer fields `pf`.
+pub fn encode_batch_idempotent(
+    records: &[ProduceRecord],
+    pf: ProducerFields,
+) -> Result<Vec<u8>, EncodeError> {
     let first = records.first().ok_or(EncodeError::Empty)?;
     let n = i32::try_from(records.len()).map_err(|_| EncodeError::TooLarge)?;
     let base_ts = first.timestamp_ms;
@@ -102,9 +130,9 @@ pub fn encode_batch(records: &[ProduceRecord]) -> Result<Vec<u8>, EncodeError> {
     b.extend_from_slice(&(n - 1).to_be_bytes()); // lastOffsetDelta
     b.extend_from_slice(&base_ts.to_be_bytes());
     b.extend_from_slice(&max_ts.to_be_bytes());
-    b.extend_from_slice(&(-1i64).to_be_bytes()); // producerId
-    b.extend_from_slice(&(-1i16).to_be_bytes()); // producerEpoch
-    b.extend_from_slice(&(-1i32).to_be_bytes()); // baseSequence
+    b.extend_from_slice(&pf.producer_id.to_be_bytes());
+    b.extend_from_slice(&pf.producer_epoch.to_be_bytes());
+    b.extend_from_slice(&pf.base_sequence.to_be_bytes());
     b.extend_from_slice(&n.to_be_bytes());
     debug_assert_eq!(b.len(), BATCH_OVERHEAD);
     for (i, r) in records.iter().enumerate() {
@@ -169,6 +197,11 @@ pub struct DecodedBatch {
     pub base_offset: i64,
     pub attributes: i16,
     pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
+    /// `lastOffsetDelta` (the batch's last sequence is `base_sequence` plus
+    /// this, wrapping).
+    pub last_offset_delta: i32,
     pub records: Vec<DecodedRecord>,
 }
 
@@ -216,8 +249,8 @@ fn decode_batch_body(base_offset: i64, body: &[u8]) -> Result<DecodedBatch, Deco
     let base_ts = r.i64()?;
     let _max_ts = r.i64()?;
     let producer_id = r.i64()?;
-    let _producer_epoch = r.i16()?;
-    let _base_seq = r.i32()?;
+    let producer_epoch = r.i16()?;
+    let base_sequence = r.i32()?;
     let count = r.array_len(7)?;
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {
@@ -266,6 +299,9 @@ fn decode_batch_body(base_offset: i64, body: &[u8]) -> Result<DecodedBatch, Deco
         base_offset,
         attributes,
         producer_id,
+        producer_epoch,
+        base_sequence,
+        last_offset_delta,
         records,
     })
 }
@@ -396,6 +432,42 @@ mod tests {
         let mut two = b.clone();
         two.extend_from_slice(&b);
         assert_eq!(decode_batches(&two).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn idempotent_producer_fields() {
+        let recs = [rec("k", "v", 1000, &[]), rec("k2", "v2", 1001, &[])];
+        let pf = ProducerFields {
+            producer_id: 0x0102_0304_0506_0708,
+            producer_epoch: 3,
+            base_sequence: 41,
+        };
+        let b = encode_batch_idempotent(&recs, pf).unwrap();
+        assert_eq!(&b[43..51], &pf.producer_id.to_be_bytes());
+        assert_eq!(&b[51..53], &3i16.to_be_bytes());
+        assert_eq!(&b[53..57], &41i32.to_be_bytes());
+        let d = &decode_batches(&b).unwrap()[0];
+        assert_eq!(
+            (
+                d.producer_id,
+                d.producer_epoch,
+                d.base_sequence,
+                d.last_offset_delta
+            ),
+            (pf.producer_id, 3, 41, 1)
+        );
+        // Same bytes as the non-idempotent encoding apart from those fields
+        // and the CRC.
+        let plain = encode_batch(&recs).unwrap();
+        assert_eq!(plain.len(), b.len());
+        assert_eq!(&plain[..17], &b[..17]);
+        assert_eq!(&plain[21..43], &b[21..43]);
+        assert_eq!(&plain[57..], &b[57..]);
+        let d = &decode_batches(&plain).unwrap()[0];
+        assert_eq!(
+            (d.producer_id, d.producer_epoch, d.base_sequence),
+            (-1, -1, -1)
+        );
     }
 
     #[test]

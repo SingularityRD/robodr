@@ -18,12 +18,24 @@
 //!
 //! **Rotation** (optional, [`Rotation`]): when an append would take the
 //! current file over `max_bytes`, it is renamed to `<name>.1` (older ones
-//! shift to `.2`, ...; files past `keep` are deleted). Deduplication reads
-//! the current file and every rotated file present, so it covers the kept
-//! history; a record whose entry was rotated out may be dead-lettered once
-//! more.
+//! shift to `.2`, ...). Deduplication reads the current file and every
+//! rotated file present, so it covers the kept history.
+//!
+//! **Retention** ([`DeadLetters::prune`], called by the exporters after
+//! every run): rotated files beyond `keep`, or over a
+//! [`Retention`](crate::retention::Retention) (age, count, total bytes),
+//! are deleted **only when none of their entries is still needed for
+//! deduplication**: an entry is needed while its record may be processed
+//! again (the caller decides: its diode batch is not done yet, its spool
+//! file is still in `ready/`, its re-injected generation is not done). A
+//! file holding such an entry is kept (reported as held) and looked at
+//! again on the next run, so deduplication never loses an entry it still
+//! needs: once a record cannot come back, its entry protects nothing, and
+//! deleting it cannot cause a second dead letter. The current file is never
+//! deleted. Malformed lines carry no key and protect nothing either.
 
 use crate::fsutil;
+use crate::retention::{file_meta, Candidate, PruneReport, Retention};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -31,6 +43,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// 128-bit key of a dead-letter entry: `(source, position)`.
 pub(crate) fn dead_key(source: &str, pos: u64) -> u128 {
@@ -49,8 +62,27 @@ pub(crate) fn dead_key(source: &str, pos: u64) -> u128 {
 pub struct Rotation {
     /// Rotate when an append would take the current file past this size.
     pub max_bytes: u64,
-    /// Rotated files kept (`<name>.1` .. `<name>.<keep>`), at least 1.
+    /// Rotated files kept (`<name>.1` .. `<name>.<keep>`), at least 1;
+    /// older ones are deleted by [`DeadLetters::prune`] once no entry of
+    /// theirs is needed any more.
     pub keep: u32,
+}
+
+/// Smallest rotation size (a single larger entry is still written whole:
+/// rotation happens before an append, never inside one).
+pub const MIN_ROTATION_BYTES: u64 = 64 * 1024;
+
+/// Default rotation: 64 MiB per file, 4 rotated files kept.
+pub const DEFAULT_ROTATION: Rotation = Rotation {
+    max_bytes: 64 * 1024 * 1024,
+    keep: 4,
+};
+
+impl Rotation {
+    /// `keep >= 1` and `max_bytes >=` [`MIN_ROTATION_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        self.keep >= 1 && self.max_bytes >= MIN_ROTATION_BYTES
+    }
 }
 
 /// What loading the dead-letter files found.
@@ -217,7 +249,7 @@ impl DeadLetters {
                 Err(e) => return Err(e),
             };
             if size > 0 && size.saturating_add(line.len() as u64) > r.max_bytes {
-                self.rotate(r.keep)?;
+                self.rotate()?;
             }
         }
         fsutil::append_durable(&self.path(), line)?;
@@ -228,35 +260,104 @@ impl DeadLetters {
         Ok(true)
     }
 
-    /// `<name>` → `<name>.1`, `.i` → `.i+1`; files past `keep` deleted.
-    fn rotate(&mut self, keep: u32) -> io::Result<()> {
-        let keep = keep.max(1);
-        let rotated = |i: u32| self.dir.join(format!("{}.{i}", self.name));
-        // Past `keep` (also left over from a larger earlier `keep`).
-        for p in files(&self.dir, &self.name)? {
-            if let Some(i) = p
-                .file_name()
-                .and_then(|f| f.to_str())
-                .and_then(|f| rotated_index(f, &self.name))
-            {
-                if i >= keep {
-                    fs::remove_file(&p)?;
-                }
-            }
-        }
-        for i in (1..keep).rev() {
-            match fs::rename(rotated(i), rotated(i + 1)) {
+    /// The rotated files present, `(index, path)`, highest index (oldest)
+    /// first.
+    fn rotated(&self) -> io::Result<Vec<(u32, PathBuf)>> {
+        let mut v: Vec<(u32, PathBuf)> = files(&self.dir, &self.name)?
+            .into_iter()
+            .filter_map(|p| {
+                let i = p
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(|f| rotated_index(f, &self.name))?;
+                Some((i, p))
+            })
+            .collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.0));
+        Ok(v)
+    }
+
+    /// `<name>` → `<name>.1`, every `.i` → `.i+1` (highest first, so no
+    /// rename ever replaces a file; a crash in between leaves a gap in the
+    /// indices, which [`files`] tolerates). Nothing is deleted here: see
+    /// [`DeadLetters::prune`].
+    fn rotate(&mut self) -> io::Result<()> {
+        for (i, p) in self.rotated()? {
+            let to = self
+                .dir
+                .join(format!("{}.{}", self.name, i.saturating_add(1)));
+            match fs::rename(&p, &to) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        fs::rename(self.path(), rotated(1))?;
-        fsutil::fsync_dir(&self.dir)?;
-        // The dedup set keeps the keys of the deleted file until the next
-        // load; that only suppresses re-appending records already dead-
-        // lettered, which is the intent.
-        Ok(())
+        fs::rename(self.path(), self.dir.join(format!("{}.1", self.name)))?;
+        fsutil::fsync_dir(&self.dir)
+    }
+
+    /// Delete rotated files beyond the rotation's `keep` or over `r`
+    /// (oldest first), except those holding an entry for which `needed`
+    /// (`(source, position)`) says the record may still be processed again
+    /// (see the module docs). Without rotation, only `r` applies.
+    pub fn prune(
+        &mut self,
+        r: &Retention,
+        now: SystemTime,
+        mut needed: impl FnMut(&str, u64) -> io::Result<bool>,
+    ) -> io::Result<PruneReport> {
+        let mut bounds = *r;
+        if let Some(rot) = self.rotation {
+            let keep = u64::from(rot.keep.max(1));
+            bounds.max_count = Some(bounds.max_count.map_or(keep, |c| c.min(keep)));
+        }
+        let mut candidates = Vec::new();
+        for (_, p) in self.rotated()? {
+            if let Some((modified, bytes)) = file_meta(&p)? {
+                candidates.push(Candidate {
+                    name: p.display().to_string(),
+                    paths: vec![p],
+                    modified,
+                    bytes,
+                });
+            }
+        }
+        // Rotation order, not modification time, says which file is older
+        // (a file rotated in the same second as another has the same
+        // time): give each the oldest time of itself and the newer ones.
+        let mut newest = None::<SystemTime>;
+        for c in candidates.iter_mut().rev() {
+            let t = newest.map_or(c.modified, |n: SystemTime| n.min(c.modified));
+            c.modified = t;
+            newest = Some(t);
+        }
+        let cur = self.path();
+        crate::retention::prune(&self.dir, &candidates, &bounds, now, |c| {
+            let mut still = false;
+            for p in &c.paths {
+                if *p == cur {
+                    return Ok(false);
+                }
+                let file = match fs::File::open(p) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                for line in BufReader::new(file).split(b'\n') {
+                    let line = line?;
+                    if let Ok(k) = serde_json::from_slice::<KeyFields>(&line) {
+                        if needed(&k.source, k.position)? {
+                            still = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(!still)
+        })
+        // The dedup set keeps the keys of deleted files until the next
+        // load; that only suppresses re-appending records already
+        // dead-lettered, which is the intent.
     }
 }
 
@@ -325,12 +426,24 @@ mod tests {
         for i in 1..=7 {
             assert!(dl.append("src", i, &entry("src", i)).unwrap());
         }
-        let names: Vec<String> = files(&d, "dl.jsonl")
-            .unwrap()
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["dl.jsonl.2", "dl.jsonl.1", "dl.jsonl"]);
+        let names = |d: &Path| -> Vec<String> {
+            files(d, "dl.jsonl")
+                .unwrap()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        // Rotation itself deletes nothing; pruning removes what is past
+        // `keep` (nothing is needed here).
+        assert_eq!(
+            names(&d),
+            ["dl.jsonl.3", "dl.jsonl.2", "dl.jsonl.1", "dl.jsonl"]
+        );
+        let rep = dl
+            .prune(&Retention::UNBOUNDED, SystemTime::now(), |_, _| Ok(false))
+            .unwrap();
+        assert_eq!((rep.removed, rep.held), (1, 0));
+        assert_eq!(names(&d), ["dl.jsonl.2", "dl.jsonl.1", "dl.jsonl"]);
         // 7 entries, 2 per file: the current file holds 7, .1 holds 5-6,
         // .2 holds 3-4; 1-2 were rotated out.
         let mut fresh = DeadLetters::new(&d, "dl.jsonl", Some(rot));
@@ -339,8 +452,8 @@ mod tests {
             assert!(fresh.contains("src", i).unwrap(), "{i}");
         }
         assert!(!fresh.contains("src", 1).unwrap());
-        // Files past `keep` (e.g. after lowering it) are removed on the
-        // next rotation; unrelated names are ignored.
+        // Files past `keep` (e.g. after lowering it) are removed by the
+        // next prune; unrelated names are ignored.
         fs::write(d.join("dl.jsonl.9"), entry("src", 99)).unwrap();
         fs::write(d.join("dl.jsonl.01"), b"x").unwrap();
         fs::write(d.join("dl.jsonl.tmp"), b"x").unwrap();
@@ -349,8 +462,63 @@ mod tests {
         for i in 8..=9 {
             dl.append("src", i, &entry("src", i)).unwrap();
         }
-        assert!(!d.join("dl.jsonl.9").exists());
+        dl.prune(&Retention::UNBOUNDED, SystemTime::now(), |_, _| Ok(false))
+            .unwrap();
+        assert!(!d.join("dl.jsonl.9").exists() && !d.join("dl.jsonl.10").exists());
+        assert_eq!(names(&d), ["dl.jsonl.2", "dl.jsonl.1", "dl.jsonl"]);
         assert!(d.join("dl.jsonl.01").exists() && d.join("dl.jsonl.tmp").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A rotated file whose entries may still be needed for deduplication
+    /// (their records can be processed again) is held, whatever the
+    /// bounds; once they are not, it goes. The current file never goes.
+    #[test]
+    fn prune_holds_files_still_needed_for_dedup() {
+        let d = tmp("prune-needed");
+        let one = entry("batch-a", 1).len() as u64;
+        let rot = Rotation {
+            max_bytes: one,
+            keep: 1,
+        };
+        let mut dl = DeadLetters::new(&d, "dl.jsonl", Some(rot));
+        // One entry per file: a1 (.3), a2 (.2), b1 (.1), b2 (current).
+        for (s, p) in [
+            ("batch-a", 1),
+            ("batch-a", 2),
+            ("batch-b", 1),
+            ("batch-b", 2),
+        ] {
+            dl.append(s, p, &entry(s, p)).unwrap();
+        }
+        assert_eq!(files(&d, "dl.jsonl").unwrap().len(), 4);
+        // batch-a is not done yet: its files are held; batch-b's rotated
+        // file (too old, not needed) goes.
+        let later = SystemTime::now() + std::time::Duration::from_secs(86_400 * 30);
+        let age = Retention::max_age(std::time::Duration::from_secs(86_400));
+        let rep = dl.prune(&age, later, |s, _| Ok(s == "batch-a")).unwrap();
+        assert_eq!((rep.removed, rep.held), (1, 2), "{rep:?}");
+        assert!(
+            !d.join("dl.jsonl.1").exists(),
+            "batch-b, too old, not needed"
+        );
+        assert!(d.join("dl.jsonl.3").exists() && d.join("dl.jsonl.2").exists());
+        // A fresh load still deduplicates batch-a's entries.
+        let mut fresh = DeadLetters::new(&d, "dl.jsonl", Some(rot));
+        assert!(!fresh.append("batch-a", 1, &entry("batch-a", 1)).unwrap());
+        // batch-a done: everything past the bounds goes, except the
+        // current file.
+        let rep = fresh.prune(&age, later, |_, _| Ok(false)).unwrap();
+        assert_eq!((rep.removed, rep.held), (2, 0));
+        assert_eq!(files(&d, "dl.jsonl").unwrap(), vec![d.join("dl.jsonl")]);
+        // An error from the predicate is reported, nothing deleted.
+        for (s, p) in [("batch-c", 1), ("batch-c", 2), ("batch-c", 3)] {
+            fresh.append(s, p, &entry(s, p)).unwrap();
+        }
+        let before = files(&d, "dl.jsonl").unwrap();
+        let e = fresh.prune(&age, later, |_, _| Err(io::Error::other("boom")));
+        assert!(e.is_err());
+        assert_eq!(files(&d, "dl.jsonl").unwrap(), before);
         let _ = fs::remove_dir_all(&d);
     }
 

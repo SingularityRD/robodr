@@ -71,9 +71,9 @@ def record(i, ts_delta, key, value, headers):
     for k,hv in headers: body+=varint(len(k))+k+varbytes(hv)
     return varint(len(body))+body
 
-def batch(records, base_ts=1790000000000):
+def batch(records, base_ts=1790000000000, pid=-1, epoch=-1, seq=-1):
     recs=b''.join(record(i, i*5, b'ugv-007', b'{"finding":%d}'%i, [(b'robodr-schema', b'2.0')]) for i in range(records))
-    after_crc = i16(0)+i32(records-1)+i64(base_ts)+i64(base_ts+5*(records-1))+i64(-1)+i16(-1)+i32(-1)+i32(records)+recs
+    after_crc = i16(0)+i32(records-1)+i64(base_ts)+i64(base_ts+5*(records-1))+i64(pid)+i16(epoch)+i32(seq)+i32(records)+recs
     after_len = i32(-1)+i8(2)+u32(crc32c(after_crc))+after_crc
     return i64(0)+i32(len(after_len))+after_len
 
@@ -91,6 +91,9 @@ seeds = {
  'seed-batch-raw.bin': bytes([4])+batch(3)+batch(1),
  'seed-metadata-request.bin': bytes([5])+req_header(3,8,7,"robodr")+i32(1)+string("robodr.findings")+i8(0)+i8(0)+i8(0),
  'seed-produce-request.bin': bytes([6])+req_header(0,8,9,"robodr")+nstring(None)+i16(-1)+i32(30000)+i32(1)+string("robodr.findings")+i32(1)+i32(0)+nbytes(batch(2)),
+ 'seed-init-producer-id.bin': bytes([8])+i32(0)+i16(0)+i64(4242)+i16(0),
+ 'seed-init-producer-id-request.bin': bytes([5])+req_header(22,1,3,"robodr")+nstring(None)+i32(60000),
+ 'seed-batch-idempotent.bin': bytes([3])+batch(2, pid=4242, epoch=0, seq=7),
  'seed-primitives.bin': bytes([7])+string("abc")+nstring(None)+nbytes(b"xyz")+varint(-5)+varlong(1<<40)+varbytes(b"q")+i32(1)+b"\x01",
 }
 for n,b in seeds.items():

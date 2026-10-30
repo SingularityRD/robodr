@@ -391,8 +391,9 @@ fn count(dir: &Path) -> usize {
 
 /// Every expected record present exactly `times(key)` times, with the
 /// documented partition, key, value bytes, headers (contract order,
-/// signature last and verifying), CreateTime ~ publish time, producer id -1
-/// (idempotence off) and per-partition offsets strictly increasing.
+/// signature last and verifying), CreateTime ~ publish time, a producer id
+/// (>= 0, idempotent; -1 only with idempotence off) and per-partition
+/// offsets strictly increasing.
 fn check(
     got: &[Fetched],
     want: &BTreeMap<String, robodr_ocsf::Record>,
@@ -403,6 +404,9 @@ fn check(
     for f in got {
         by_key.entry(f.key()).or_default().push(f);
     }
+    // One mode per check: all idempotent, or all without a producer id.
+    let modes: std::collections::BTreeSet<bool> = got.iter().map(|f| f.producer_id >= 0).collect();
+    assert!(modes.len() <= 1, "mixed producer ids");
     let unexpected: Vec<&String> = by_key.keys().filter(|k| !want.contains_key(*k)).collect();
     assert!(unexpected.is_empty(), "unexpected keys: {unexpected:?}");
     let keys = verifying_keys();
@@ -418,7 +422,7 @@ fn check(
                 .map(|(a, b)| (a.to_string(), b.clone()))
                 .collect();
             assert_eq!(f.headers(), wh, "headers of {k}");
-            assert_eq!(f.producer_id, -1);
+            assert!(f.producer_id >= -1, "producer id of {k}");
             let ts = f.rec.timestamp_ms as u64;
             assert!(
                 ts + 1000 >= t_start && ts <= now_ms() + 1000,
@@ -582,20 +586,34 @@ fn real_diode_path_exactly_once() {
 
 /// A crash after Kafka acknowledged chunk 2 but before it was committed:
 /// the restarted publisher re-sends exactly that chunk, nothing is lost.
+/// Idempotent (the default): the broker drops the copy, every record once.
+/// With idempotence off: that chunk is in the topic twice.
 #[test]
 #[ignore = "needs a Kafka broker: ROBODR_KAFKA_BROKER (scripts/kafka-it.sh)"]
-fn real_resume_after_crash_duplicates_one_chunk() {
+fn real_resume_after_crash_is_deduplicated() {
     let Some(b) = broker() else { return };
-    let t = TempDir::new("real-resume");
+    for idempotence in [true, false] {
+        resume_after_crash(&b, idempotence);
+    }
+}
+
+fn resume_after_crash(b: &str, idempotence: bool) {
+    let t = TempDir::new(if idempotence {
+        "real-resume-idem"
+    } else {
+        "real-resume"
+    });
     let sp = t.path().join("spool");
     let want = spool(&sp, 2000, 100, true, &ROBOTS);
-    let mut c = Consumer::connect(&b);
+    let mut c = Consumer::connect(b);
     let marks = c.marks(TOPIC, PARTITIONS);
     let t0 = now_ms();
+    let mut pcfg = producer_cfg(b);
+    pcfg.idempotence = idempotence;
     let mut cfg = PublishConfig::new(Source::Spool(sp.clone()), t.path().join("soc"));
     cfg.chunk_records = 25;
     cfg.fail_after_send = Some(2);
-    let mut p = Publisher::open(cfg.clone(), Producer::new(producer_cfg(&b)).unwrap()).unwrap();
+    let mut p = Publisher::open(cfg.clone(), Producer::new(pcfg.clone()).unwrap()).unwrap();
     assert!(p.run_once().is_err(), "injected crash");
     drop(p);
     assert_eq!(count(&sp.join("acked")), 25, "chunk 1 committed");
@@ -615,13 +633,18 @@ fn real_resume_after_crash_duplicates_one_chunk() {
         })
         .collect();
     cfg.fail_after_send = None;
-    let mut p = Publisher::open(cfg, Producer::new(producer_cfg(&b)).unwrap()).unwrap();
+    let mut p = Publisher::open(cfg, Producer::new(pcfg.clone()).unwrap()).unwrap();
     assert_eq!(p.run_once().unwrap().published, 75);
     assert_eq!(count(&sp.join("ready")), 0);
     assert_eq!(count(&sp.join("acked")), 100);
     let got = c.since(TOPIC, &marks);
-    assert_eq!(got.len(), 125);
-    check(&got, &want, |k| if dup.contains(k) { 2 } else { 1 }, t0);
+    if idempotence {
+        assert_eq!(got.len(), 100, "the broker dropped the re-sent chunk");
+        check(&got, &want, |_| 1, t0);
+    } else {
+        assert_eq!(got.len(), 125);
+        check(&got, &want, |k| if dup.contains(k) { 2 } else { 1 }, t0);
+    }
 }
 
 /// 5 000 findings in chunks of 1 000 (requests split under
