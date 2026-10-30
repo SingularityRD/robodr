@@ -537,7 +537,12 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
     what the receiver holds. Key rotation is a new chain: move the unit's
     receiver state aside when its key changes. With `allow_plaintext`
     marks are not encrypted (hashes and seqs only). Mutual TLS
-    authenticates hosts, not unit ids; no CRL / OCSP. Tested over loopback with a real receiver
+    authenticates hosts; a unit's `client_spki_sha256` on the receiver
+    binds its `current` queries to its TLS client certificate
+    (`AnchorReceiver::set_client_bindings`; unbound units are listed at
+    start). CRLs (`src/crl.rs`): a CRL number is required, the highest per
+    issuer wins, an older CRL put back is refused (high-water marks,
+    persisted in the receiver's `crl-high-water.json`); no OCSP. Tested over loopback with a real receiver
     process (`tests/remote_anchor.rs`), not across a real network.
 - **Truncation evidence:** an authentic `checkpoint.json` or
   `export-cursor.json` naming a seq **beyond** the head proves the tail was

@@ -348,7 +348,8 @@ mod tests {
 
     fn idle(port: u16) -> TcpStream {
         let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        c.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
         c
     }
 

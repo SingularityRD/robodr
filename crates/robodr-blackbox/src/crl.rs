@@ -832,8 +832,7 @@ impl CrlStats {
     }
 
     fn in_service(&self, loaded: &Loaded) {
-        self.crls
-            .store(loaded.crls.len() as u64, Ordering::Relaxed);
+        self.crls.store(loaded.crls.len() as u64, Ordering::Relaxed);
         *lock(&self.in_use) = loaded.in_use.iter().map(|(_, u)| u.clone()).collect();
         *lock(&self.error) = None;
     }
@@ -1419,11 +1418,23 @@ mod tests {
     /// A structurally valid v2 CRL with only an authority key identifier
     /// extension (no CRL number); the signature is junk.
     fn crl_without_number() -> Vec<u8> {
-        let alg = der(0x30, &der(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]));
+        let alg = der(
+            0x30,
+            &der(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]),
+        );
         let cn = der(0x0c, b"RoboDR test CA with CRLs");
-        let name = der(0x30, &der(0x31, &der(0x30, &[der(0x06, &[0x55, 0x04, 0x03]), cn].concat())));
+        let name = der(
+            0x30,
+            &der(
+                0x31,
+                &der(0x30, &[der(0x06, &[0x55, 0x04, 0x03]), cn].concat()),
+            ),
+        );
         let aki = der(0x30, &der(0x80, &[7u8; 20]));
-        let ext = der(0x30, &[der(0x06, &[0x55, 0x1d, 0x23]), der(0x04, &aki)].concat());
+        let ext = der(
+            0x30,
+            &[der(0x06, &[0x55, 0x1d, 0x23]), der(0x04, &aki)].concat(),
+        );
         let tbs = der(
             0x30,
             &[

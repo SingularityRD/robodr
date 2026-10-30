@@ -706,8 +706,13 @@ impl fmt::Debug for UnitKey {
 pub enum Refusal {
     UnknownUnit(String),
     BadSignature(String),
-    Lower { held: u64, offered: u64 },
-    Fork { seq: u64 },
+    Lower {
+        held: u64,
+        offered: u64,
+    },
+    Fork {
+        seq: u64,
+    },
     Broken(String),
     Storage(String),
     BadRequest(String),
@@ -965,10 +970,7 @@ impl AnchorReceiver {
         if let Some(units) = client.and_then(|c| self.bindings.get(c)) {
             return units.iter().any(|u| u == unit);
         }
-        !self
-            .bindings
-            .values()
-            .any(|b| b.iter().any(|u| u == unit))
+        !self.bindings.values().any(|b| b.iter().any(|u| u == unit))
     }
 
     /// TLS handshakes that failed since start (no, unknown or expired

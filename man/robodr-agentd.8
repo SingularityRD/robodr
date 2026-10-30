@@ -207,7 +207,11 @@ be valid, not be revoked by a CRL in
 .B crl_files
 (PEM or DER; every issuing CA needs a current CRL, an expired or unusable
 CRL refuses every client; the files are re\-read when they change, no
-restart) and, if pins are set, have a pinned public key. Without
+restart; replace them by rename; every CRL needs a CRL number, of several
+CRLs of one CA the highest number is used, and an older CRL put back is
+refused, fail closed, also across restarts:
+.IR state_dir /crl\-high\-water.json)
+and, if pins are set, have a pinned public key. Without
 .B tls
 the address must be loopback (plain HTTP). The key file must have no
 group/other permission bits.

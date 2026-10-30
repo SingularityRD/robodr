@@ -379,7 +379,10 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   must chain to `client_ca`, be valid and permit `clientAuth`, and — with
   pins — have a pinned SPKI; with `crl_files`, not be revoked (an issuer
   without a CRL, an expired CRL or an unusable replacement fails closed;
-  the files are re-read when they change, no restart; counters in
+  the files are re-read when they change, no restart; a CRL number is
+  required, the highest per CA wins, an older CRL put back is refused
+  (high-water marks in `<state_dir>/crl-high-water.json`); files are
+  opened `O_NOFOLLOW | O_NONBLOCK` and checked on the descriptor; counters in
   `status.json` `control_plane.tls.crl`, `robodr_blackbox::crl`); no
   session resumption. Without `tls`,
   `listen_tcp` must be loopback (plain HTTP, tests / a local relay); the

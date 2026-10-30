@@ -507,11 +507,10 @@ pub fn load_server_tls_with_crl_state(
             let (v, crl) = crate::crl::client_verifier(
                 Arc::new(roots("client_ca", ca)?),
                 provider,
-                crate::crl::CrlFiles::new("crl_files", &f.crl_files)?
-                    .map(|c| match crl_state {
-                        Some(p) => c.with_state_file(p),
-                        None => c,
-                    }),
+                crate::crl::CrlFiles::new("crl_files", &f.crl_files)?.map(|c| match crl_state {
+                    Some(p) => c.with_state_file(p),
+                    None => c,
+                }),
             )
             .map_err(|e| format!("client_ca {}: {e}", ca.display()))?;
             (b.with_client_cert_verifier(v), crl)

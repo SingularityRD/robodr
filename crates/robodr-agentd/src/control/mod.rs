@@ -354,10 +354,9 @@ impl ControlPlaneSection {
                 let crl_state = std::fs::symlink_metadata(&self.state_dir)
                     .is_ok_and(|m| m.is_dir())
                     .then(|| self.state_dir.join(robodr_blackbox::crl::STATE_FILE));
-                Some(t.resolve_with_crl_state(
-                    crate::config::effective_uid(),
-                    crl_state.as_deref(),
-                )?)
+                Some(
+                    t.resolve_with_crl_state(crate::config::effective_uid(), crl_state.as_deref())?,
+                )
             }
         };
         Ok(ControlPlaneSpec {

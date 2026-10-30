@@ -25,8 +25,8 @@
 use crate::config::{Config, DepotCfg};
 use crate::engine::Engine;
 use crate::sealing::Sealing;
-use robodr_pkg::wire::{self, Request};
 use robodr_blackbox::tls::{ClientTls, DeadlineTcp};
+use robodr_pkg::wire::{self, Request};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -173,8 +173,7 @@ fn pull_with(cfg: &Config, skip_same: bool) -> Result<Option<PathBuf>, String> {
     }
     // The body: `deadline_s` more, plus one second per MiB listed.
     s.sock.set_deadline(
-        Instant::now()
-            + Duration::from_secs(d.deadline_s.saturating_add(total / MIN_BODY_RATE)),
+        Instant::now() + Duration::from_secs(d.deadline_s.saturating_add(total / MIN_BODY_RATE)),
     );
     let stage = cfg.media_dir.join(format!(
         ".lan-{}-{}",
