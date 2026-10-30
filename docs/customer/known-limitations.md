@@ -133,9 +133,15 @@
 - **Pulsar host rules** have been validated by script only, never in a
   running engine on a robot. `robodr-pulsard` ran only under WSL2. arm64
   eBPF has never been loaded.
-- **No host rules on current Unitree EDU images** (JetPack 5 has no BTF;
-  JetPack 6 needs a glibc 2.35 build) ([`docs/UNITREE.md`](../UNITREE.md)
-  "Known limits").
+- **No host rules on JetPack 5 Unitree EDU images** (no `robodr-pulsard`
+  for glibc 2.31 / systemd 245, and no BTF). On JetPack 6 the regular
+  package runs `robodr-pulsard` when the kernel has BTF or an external BTF
+  file for the running kernel is installed; not yet tried on a Jetson
+  ([`docs/UNITREE.md`](../UNITREE.md) section 3.2).
+- **The RPM has no offline bundle**: `install-bundle.sh` (signature check,
+  rollback, security floor) is dpkg-based. On RHEL / Rocky / Fedora,
+  verify the minisign signature by hand, then `dnf install`; rollback is
+  `dnf downgrade` without the security-floor gate.
 - **Host-side (Pulsar) signals do not reach correlation** yet. Every host
   detection reaches the planner as `robot.host.pulsar_threat`, so a policy
   cannot single out one host rule.

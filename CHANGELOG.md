@@ -10,6 +10,56 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Added (packaging and platforms)
+
+- The `robodr` `.deb` is built in an **Ubuntu 22.04** userland (glibc
+  2.35), natively for amd64 and arm64, `robodr-pulsard` included (clang-20
+  from apt.llvm.org, archive key pinned by fingerprint): it installs on
+  Ubuntu 22.04 / NVIDIA JetPack 6, Debian 12 and newer. Before, it was
+  built on Ubuntu 24.04 and needed glibc 2.39. `Depends:` now comes from
+  `dpkg-shlibdeps` plus a soname table (an unknown library fails the
+  build), with the libc6 floor checked (`scripts/check-glibc-floor.sh`).
+- **RPM** for RHEL / Rocky / Alma 9 and Fedora (`packaging/build-rpm.sh`,
+  `packaging/rpm/`): built on Rocky Linux 9 (glibc 2.34), the `.deb`'s file
+  tree (`build-deb.sh --stage-only`), `%config(noreplace)` for
+  `pulsar.toml`, scriptlets equivalent to the maintainer scripts, rpm's
+  generated ELF requirements. Released with its own `SHA256SUMS-rpm-<arch>`
+  and minisign signatures; no offline bundle, no OpenPGP signature yet.
+- External BTF for kernels without it (NVIDIA L4T): the
+  `robodr-pulsard` unit accepts `/etc/robodr/btf/vmlinux` (Pulsar's
+  `[pulsar] btf_path`, commented in `pulsar.toml`) instead of
+  `/sys/kernel/btf/vmlinux`, and `robodr-btf-check` refuses to start with
+  a file stamped for another kernel build. Generation with `pahole`:
+  `docs/UNITREE.md` 3.2.1.
+- `robodr-focal`: a systemd 245 variant of the Kafka TLS / SASL credential
+  drop-in example (`robodr-load-credential` instead of `LoadCredential=`).
+- CI: `package-deb`, `package-rpm` (container jobs per architecture, with
+  the reproducibility proof in the build userland) and `package-smoke`
+  (apt / dnf installs in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky
+  Linux 9 and Fedora 42 containers, `scripts/pkg-install-smoke.sh`).
+  `release.yml` builds the same way, smoke-installs before signing, and
+  its build jobs no longer hold `contents: write`.
+- `scripts/check-packages.py`: every workspace program classified per
+  package variant, every `ROBODR_DEB_REQUIRE` list complete, deb and rpm
+  scripts handling the same units, and built packages compared (paths,
+  modes, content, ownership, no setuid / group-writable file, no private
+  key material). `scripts/check-focal-units.py` also checks the regular
+  drop-in examples that `robodr-focal` ships unchanged.
+
+### Fixed (packaging)
+
+- CI's `robodr-focal` build did not require `robodr-executor` and
+  `robodr-firewall-gw` (the release did): a CI package could lack them.
+- `robodr-focal` shipped the Kafka credential drop-in example with
+  `LoadCredential=`, which systemd 245 ignores.
+- `build-deb.sh` created man pages with the caller's umask: under umask
+  000 (as in a container) they were world-writable in the package. It now
+  sets umask 022 and the mode explicitly.
+- The `.deb`'s `prerm` did not stop `robodr-deliverd` on removal.
+- `scripts/deb-install-smoke.sh` used `cp --update=none` (coreutils >= 9.3).
+- The pinned clang of ring now also pins the LLVM libraries that hold its
+  code generator (`libllvm*`, `libclang-cpp*`, ...), not only the driver.
+
 ### Added (Unitree coverage gaps)
 
 - `robodr-cdr`: the Go1 `unitree_legged_sdk` v3.8.6 **compressed

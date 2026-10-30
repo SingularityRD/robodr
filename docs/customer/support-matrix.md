@@ -1,6 +1,6 @@
 # Support matrix
 
-> **Pre-release draft (refreshed 2026-10-26).** This lists what RoboDR targets and,
+> **Pre-release draft (refreshed 2026-10-30).** This lists what RoboDR targets and,
 > for each row, **how far it has actually been verified**. The GA targets
 > come from GA-ROADMAP Sprint 0 and are not yet confirmed by the product
 > owner. **No row is field-verified. Nothing has run on a customer or
@@ -20,12 +20,13 @@
 
 | Platform | Package | Level | Evidence / notes |
 |---|---|---|---|
-| Ubuntu 24.04, amd64 | `robodr` (glibc ≥ 2.39, systemd ≥ 247) | V1 | Built, packaged and bundled in the local CI run of 2026-10-17 ([`docs/BUILD.md`](../BUILD.md)). Install, upgrade and rollback have not been rehearsed on a target host. |
-| Ubuntu 24.04, arm64 | `robodr` | V1 | Cross-built, tests run under qemu-user (2026-10-18). Not run on arm64 hardware. |
-| Ubuntu 22.04 / 20.04, amd64 + arm64 (incl. NVIDIA JetPack 6 / 5) | `robodr-focal` (static musl, systemd ≥ 245, **no `robodr-pulsard`**) | V1 | Built, reproduced, smoke-run (arm64 under qemu-user), and installed with dpkg in a container. Not run on a Jetson or under a real systemd 245. The arm64 binaries are non-PIE. |
-| Debian 12 | `robodr` does **not** install (glibc 2.36 < 2.39). `robodr-focal` expected to work. | V0 | The GA target names Debian 12. Today only the agentd-only package fits it. |
-| Debian 13 | `robodr` expected to work | V1 | The test suites ran on Debian 13 under WSL2 (development host). Packages were not installed there. |
-| Other distributions, RPM-based | — | Not supported | Packaging is `.deb` only. |
+| Ubuntu 22.04 / 24.04, amd64 | `robodr` (built for glibc ≥ 2.35, systemd ≥ 247, with `robodr-pulsard`) | V1 | amd64: built in an Ubuntu 22.04 container and installed with apt in Ubuntu 22.04 and 24.04 containers (2026-10-30): dependencies resolved, maintainer scripts ran, every program started, units verified by that systemd, remove/purge kept evidence. No booted systemd, no target host. |
+| Ubuntu 22.04 / 24.04, arm64, incl. NVIDIA JetPack 6 | `robodr` (arm64) | V0 | Same build in CI configuration (native arm64 runner, Ubuntu 22.04 container); **not yet built or run**: CI has not run. Host rules on JetPack 6 additionally need BTF or an external BTF file ([`docs/UNITREE.md`](../UNITREE.md) 3.2.1). |
+| Ubuntu 20.04 / JetPack 5, amd64 + arm64 (also usable on 22.04) | `robodr-focal` (static musl, systemd ≥ 245, **no `robodr-pulsard`**) | V1 | Built, reproduced, smoke-run (arm64 under qemu-user), and installed with dpkg in a container. Not run on a Jetson or under a real systemd 245. The arm64 binaries are non-PIE. |
+| Debian 12, amd64 | `robodr` | V1 | The Ubuntu 22.04 build installed with apt in a Debian 12 container (2026-10-30), same checks as above. arm64: CI configuration only. |
+| Debian 13 | `robodr` expected to work | V0 | Same package names and a newer glibc than Debian 12; not installed there. |
+| RHEL / Rocky / Alma 9, Fedora 42, x86_64 | `robodr` `.rpm` (built on Rocky Linux 9, glibc ≥ 2.34) | V1 | Built in a Rocky Linux 9 container and installed with dnf in Rocky Linux 9.8 and Fedora 42 containers (2026-10-30), same checks as above. No offline bundle (the bundle installer is dpkg-based): verify the minisign signature, then `dnf install`. aarch64: CI configuration only. |
+| Other RPM distributions (SUSE, RHEL 8) | — | Not supported | |
 
 ## Kernel and host monitoring (`robodr-pulsard`, eBPF)
 
@@ -33,7 +34,7 @@
 |---|---|---|
 | Linux ≥ 5.5 with BTF, amd64 | V2 | Ran as root with eBPF probes loaded under WSL2 (kernel 6.18). Not on a robot. Multicast and DDS coexistence on the robot are open. |
 | arm64 kernels | V0 | Pulsar's probes have never been loaded on arm64. |
-| Kernels without BTF (for example JetPack 5 L4T) | Not supported | Use `robodr-focal`: agentd only, no host rules. |
+| Kernels without BTF (NVIDIA L4T) | V0 (JetPack 6) / Not supported (JetPack 5) | JetPack 6 with the `robodr` package: an external BTF file generated for exactly the running kernel ([`docs/UNITREE.md`](../UNITREE.md) 3.2.1); the unit refuses a file of another kernel build. Never tried on an L4T kernel. JetPack 5: `robodr-focal`, agentd only, no host rules. |
 | `rules/robodr/*.toml` in a running rules engine | V0 | Checked by `scripts/validate_rules.py` only. |
 
 ## ROS 2 and middleware
