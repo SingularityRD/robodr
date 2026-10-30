@@ -29,6 +29,7 @@
     "listen": "0.0.0.0:8443",
     "server_name": "depot.site-a.internal",
     "max_connections": 16,
+    "max_connections_per_source": 4,
     "deadline_s": 600
   },
   "anchor": {
