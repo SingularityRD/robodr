@@ -467,9 +467,15 @@ fn ros2_twist_uses_the_twist_firewall() {
             now += 20 * MS;
             run(gw, &pkt(TWIST_WRITER, sn, &ros2::encode(v, st, false)), now)
         };
+        // A TwistStamped's non-zero stamp is zeroed (gateway review,
+        // finding 4), so a passed one is rewritten.
         assert_eq!(
             send(&mut gw, [0.2, 0.0, 0.0, 0.0, 0.0, 0.3]).0,
-            Verdict::Accept
+            if stamped {
+                Verdict::AcceptModified
+            } else {
+                Verdict::Accept
+            }
         );
         let (v, out) = send(&mut gw, [3.0, 0.0, 0.0, 0.0, 0.0, -2.0]);
         assert_eq!(v, Verdict::AcceptModified);

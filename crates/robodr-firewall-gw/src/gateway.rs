@@ -187,6 +187,9 @@ pub struct GatewayStats {
     pub restriction_capped: u64,
     /// Trajectories whose non-zero `header.stamp` was zeroed (F1).
     pub trajectory_stamp_zeroed: u64,
+    /// `TwistStamped` commands whose non-zero `header.stamp` was zeroed
+    /// (gateway review, finding 4).
+    pub twist_stamp_zeroed: u64,
     /// Sport `SpeedLevel` requests refused while a restriction is in
     /// force (F8).
     pub restriction_speed_level_refused: u64,
@@ -2345,6 +2348,18 @@ impl Gateway {
                 return Outcome::Suppress;
             }
         };
+        // Finding 4: the stamp is the controller's command age; a
+        // far-future one defeats its `cmd_vel_timeout`. Zeroed ("now"), as
+        // for trajectories, whatever the firewall decides below.
+        let mut zeroed = false;
+        if stamped && !ros2::stamp_is_zero(slot) {
+            if ros2::write_zero_stamp(slot).is_err() {
+                self.stats.rewrite_failed += 1;
+                return Outcome::Suppress;
+            }
+            self.stats.twist_stamp_zeroed += 1;
+            zeroed = true;
+        }
         let v = w.values;
         let motion = Motion::Twist(Twist::new(
             Vec3::new(v[0], v[1], v[2]),
@@ -2362,6 +2377,7 @@ impl Gateway {
             Motion::Joints(_) => None,
         };
         let out = match self.twist_check(id, source, now, motion, late) {
+            FwVerdict::Passed { .. } if zeroed => return Outcome::Rewritten,
             FwVerdict::Passed { .. } => return Outcome::Pass,
             FwVerdict::Limited { cmd, .. } => six(&cmd).map(|x| (x, true)),
             FwVerdict::Rejected {

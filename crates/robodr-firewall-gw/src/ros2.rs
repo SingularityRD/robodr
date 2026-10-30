@@ -26,7 +26,9 @@
 //!
 //! A limited or substitute twist overwrites the six `float64` in place
 //! (`f64` exactly as the firewall output it: no rounding), keeps the
-//! header, stamp and `frame_id`, and is verified by decoding again.
+//! encapsulation header and `frame_id`, and is verified by decoding again.
+//! A `TwistStamped`'s non-zero `header.stamp` is zeroed in every forwarded
+//! command ([`write_zero_stamp`], gateway review finding 4).
 
 use robodr_cdr::{Endian, Representation, XcdrVersion};
 
@@ -160,6 +162,31 @@ pub fn plausible(slot: &[u8], stamped: bool) -> bool {
         let end = start + 12 + len;
         body.len() >= end + 48
     })
+}
+
+/// Offset of `header.stamp` (`sec`, `nanosec`) in a `TwistStamped` slot.
+const STAMP: std::ops::Range<usize> = 4..12;
+
+/// `header.stamp` of a strictly decoded `TwistStamped` slot as written
+/// (the eight octets, either endianness: zero iff both fields are zero).
+pub fn stamp_is_zero(slot: &[u8]) -> bool {
+    slot.get(STAMP).is_some_and(|s| s.iter().all(|b| *b == 0))
+}
+
+/// Zero `header.stamp` of a strictly decoded `TwistStamped` slot in place
+/// (gateway review, finding 4). `diff_drive_controller` drops a command
+/// older than `cmd_vel_timeout` by its stamp, so a far-future stamp kept a
+/// command alive long after the controller stopped sending; a zero stamp
+/// is taken as "now" (as by `joint_trajectory_controller`,
+/// `crate::trajectory::write_zero_stamp`). Verified by decoding again.
+pub fn write_zero_stamp(slot: &mut [u8]) -> Result<(), RewriteError> {
+    slot.get_mut(STAMP)
+        .ok_or(RewriteError::Length)?
+        .copy_from_slice(&[0; 8]);
+    match decode_strict(slot, true) {
+        Ok(_) if stamp_is_zero(slot) => Ok(()),
+        _ => Err(RewriteError::Verify),
+    }
 }
 
 /// Overwrite the twist in `slot` (decoded as `w`) with `v` and verify.

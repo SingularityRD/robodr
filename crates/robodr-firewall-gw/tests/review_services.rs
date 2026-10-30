@@ -4,6 +4,10 @@
 //! `StopMove` (always allowed), so an unbounded velocity or position
 //! target passed. And a Go2 configuration without a channel for every
 //! motion service now refuses to start in enforce mode.
+//!
+//! Finding 4: a `TwistStamped` with a far-future `header.stamp` was
+//! forwarded untouched, so `diff_drive_controller` kept executing it past
+//! its `cmd_vel_timeout`; the stamp is now zeroed ("now").
 
 use std::time::Instant;
 
@@ -12,7 +16,7 @@ use robodr_cdr::{ApiCall, Representation};
 use robodr_firewall_gw::ip::parse_ipv4_udp;
 use robodr_firewall_gw::rtps::{self, build::Datagram, Content, WalkOptions};
 use robodr_firewall_gw::testkit::*;
-use robodr_firewall_gw::{sport, Gateway, GatewayConfig, PacketMeta, Verdict};
+use robodr_firewall_gw::{ros2, sport, Gateway, GatewayConfig, PacketMeta, Verdict};
 
 const MS: u64 = 1_000_000;
 const T0: u64 = 1_000_000_000;
@@ -157,4 +161,52 @@ fn f3_go2_without_every_motion_service_refuses_to_start() {
     v["mode"] = serde_json::json!("enforce");
     v["robot_model"] = serde_json::json!("b2");
     assert!(GatewayConfig::from_json(&v.to_string()).is_ok());
+}
+
+/// Finding 4: a far-future (and a past) stamp is zeroed in place, on a
+/// passed command too; a zero stamp is forwarded byte-identical.
+#[test]
+fn f4_twist_stamped_stamp_is_zeroed() {
+    let mut gw = g1_channels_gateway(|v| {
+        v["channels"][5]["codec"] = serde_json::json!("ros2_twist_stamped");
+    });
+    let sedp = sedp_datagram(
+        PREFIX,
+        TWIST_WRITER,
+        "rt/cmd_vel",
+        "geometry_msgs::msg::dds_::TwistStamped_",
+    );
+    run(&mut gw, &packet(CONTROLLER_IP, 7410, &sedp), T0);
+    let mut now = T0;
+    for (sn, sec) in [(1, 0i32), (2, 2_000_000_000), (3, 1)] {
+        now += 20 * MS;
+        let p = ros2::encode(
+            [0.1, 0.0, 0.0, 0.0, 0.0, 0.1],
+            Some((sec, 5, "base_link")),
+            false,
+        );
+        let out = send(&mut gw, PREFIX, TWIST_WRITER, sn, &p, now);
+        let got = out_payload(&out).expect("forwarded");
+        let w = ros2::decode_strict(&got, true).unwrap();
+        assert_eq!(w.values, [0.1, 0.0, 0.0, 0.0, 0.0, 0.1]);
+        assert!(ros2::stamp_is_zero(&got), "sec {sec}");
+        if sec == 0 {
+            assert_ne!(got, p, "nanosec 5 is zeroed too");
+        }
+    }
+    assert_eq!(gw.stats.twist_stamp_zeroed, 3);
+    // Already zero: untouched.
+    now += 20 * MS;
+    let p = ros2::encode(
+        [0.1, 0.0, 0.0, 0.0, 0.0, 0.1],
+        Some((0, 0, "base_link")),
+        false,
+    );
+    let d = Datagram::new(PREFIX)
+        .data(TWIST_WRITER, 4, &[], &p)
+        .finish();
+    assert_eq!(
+        run(&mut gw, &packet(CONTROLLER_IP, DDS_PORT, &d), now).0,
+        Verdict::Accept
+    );
 }
