@@ -2625,6 +2625,7 @@ dependencies = [
  "robodr-pkg",
  "robodr-release",
  "robodr-responder",
+ "robodr-seal",
  "serde",
  "serde_json",
  "toml",

@@ -4,6 +4,8 @@
 //! store/chunks/<sha256>              payload chunks, 0600, named by their hash
 //! store/rpks/<digest>/MANIFEST.json  the signed manifest (its digest is the dir name)
 //! store/rpks/<digest>/MANIFEST.sig
+//! store/wraps/<digest>               sealed RPKs: this unit's wrap of the
+//!                                    content key (from the deployment)
 //! ```
 //!
 //! It is filled only from the **verified copy** of an imported pack
@@ -41,7 +43,12 @@ impl Store {
     /// Open (create) `<state_dir>/store`.
     pub fn open(state_dir: &Path) -> Result<Self, String> {
         let root = state_dir.join("store");
-        for d in [root.clone(), root.join("chunks"), root.join("rpks")] {
+        for d in [
+            root.clone(),
+            root.join("chunks"),
+            root.join("rpks"),
+            root.join("wraps"),
+        ] {
             fsx::ensure_dir(&d, 0o700).map_err(|e| io(&d, e))?;
         }
         Ok(Self { root })
@@ -177,6 +184,85 @@ impl Store {
         out.sync_all().map_err(|e| io(dest, e))
     }
 
+    /// Keep this unit's wrap of sealed RPK `digest`'s content key (from an
+    /// accepted deployment; replaced by a newer one).
+    pub fn put_wrap(&self, digest: &str, wrap: &[u8]) -> Result<(), String> {
+        if !robodr_pkg::common::is_hex64(digest) {
+            return Err("store: bad digest".into());
+        }
+        let dir = self.root.join("wraps");
+        let dst = dir.join(digest);
+        let tmp = fsx::temp_sibling(&dst, "in");
+        fsx::write_new(&tmp, wrap, 0o600).map_err(|e| io(&tmp, e))?;
+        fs::rename(&tmp, &dst).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            io(&dst, e)
+        })?;
+        fsx::sync_dir(&dir).map_err(|e| io(&dir, e))
+    }
+
+    /// This unit's wrap of sealed RPK `digest`, if one was delivered.
+    pub fn wrap(&self, digest: &str) -> Option<Vec<u8>> {
+        if !robodr_pkg::common::is_hex64(digest) {
+            return None;
+        }
+        read_capped(
+            &self.root.join("wraps").join(digest),
+            robodr_pkg::deployment::MAX_WRAP_BYTES,
+        )
+        .ok()
+    }
+
+    /// Write content file `content[index]` of sealed `m` to `dest`
+    /// (created exclusively, mode `f.mode`), opening each stored chunk
+    /// with `ck` (`robodr-seal`): a chunk is hash-checked, authenticated
+    /// for its place, and only then written; the size and the keyed file
+    /// digest are checked at the end. On any failure nothing stays.
+    pub fn materialize_sealed(
+        &self,
+        m: &Manifest,
+        index: usize,
+        dest: &Path,
+        ck: &robodr_seal::chunk::ContentKey,
+    ) -> Result<(), robodr_seal::SealError> {
+        let f = m.content.get(index).ok_or_else(|| {
+            robodr_seal::SealError::new(robodr_seal::ErrorKind::Invalid, "content index")
+        })?;
+        let ioe = |e: std::io::Error| {
+            robodr_seal::SealError::new(
+                robodr_seal::ErrorKind::Io,
+                format!("{}: {e}", dest.display()),
+            )
+        };
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dest)
+            .map_err(ioe)?;
+        let r = robodr_seal::rpk::open_file(
+            ck,
+            m,
+            index,
+            &mut |c| {
+                read_capped(&self.chunk_path(&c.sha256), c.size as usize).map_err(|e| {
+                    robodr_seal::SealError::new(robodr_seal::ErrorKind::Io, format!("store: {e}"))
+                })
+            },
+            &mut |p| out.write_all(p).map_err(ioe),
+        )
+        .and_then(|()| {
+            out.set_permissions(fs::Permissions::from_mode(f.mode))
+                .map_err(ioe)?;
+            out.sync_all().map_err(ioe)
+        });
+        if r.is_err() {
+            drop(out);
+            let _ = fs::remove_file(dest);
+        }
+        r
+    }
+
     /// Drop every stored RPK not in `keep`, then every chunk no kept RPK
     /// uses. Returns the number of RPKs removed.
     pub fn gc(&self, keep: &BTreeSet<String>) -> Result<usize, String> {
@@ -194,6 +280,15 @@ impl Store {
             }
             fsx::remove_any(&e.path()).map_err(|x| io(&e.path(), x))?;
             removed += 1;
+        }
+        let wraps = self.root.join("wraps");
+        if let Ok(rd) = fs::read_dir(&wraps) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !keep.contains(&name) {
+                    let _ = fsx::remove_any(&e.path());
+                }
+            }
         }
         let chunks = self.root.join("chunks");
         for e in fs::read_dir(&chunks).map_err(|e| io(&chunks, e))? {

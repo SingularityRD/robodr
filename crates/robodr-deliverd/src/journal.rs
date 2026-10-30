@@ -48,6 +48,12 @@ pub mod kinds {
     /// generation, trust version, deployment, chain heads, time floor),
     /// carried over under the new key.
     pub const REKEYED: &str = "robodr.deliver.rekeyed";
+    /// Sealing (13c): a sealed item's key could not be unsealed.
+    pub const UNSEAL_FAILED: &str = "robodr.seal.unseal_failed";
+    /// Sealing (13c): an erase trigger reported tamper.
+    pub const TAMPER: &str = "robodr.seal.tamper";
+    /// Sealing (13c): crypto-erase executed.
+    pub const ERASED: &str = "robodr.seal.erased";
 }
 
 /// What the notes still in the journal say about the unit's history

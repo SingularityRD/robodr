@@ -81,6 +81,14 @@ pub struct Ver {
     /// Probe users resolved at staging: name -> `[uid, gid]`. A name that
     /// resolves differently at probe time fails the probe.
     pub probe_users: BTreeMap<String, [u32; 2]>,
+    /// A sealed RPK, installed into the runtime volume (Sprint 13c; absent
+    /// in state files of public versions, so 13b state is unchanged).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sealed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The installed version of a package.
@@ -493,6 +501,7 @@ mod tests {
 
     fn ver(serial: u64) -> Ver {
         Ver {
+            sealed: false,
             serial,
             digest: "ab".repeat(32),
             kind: Kind::Files,

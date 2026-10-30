@@ -455,6 +455,101 @@ pub struct Config {
     /// stamp (names, sizes, times) instead.
     #[serde(default = "d_pack_digest_max_mb")]
     pub pack_digest_max_mb: u64,
+    /// Sealed RPKs and models (Sprint 13c, `docs/SECURE-DELIVERY.md` §7):
+    /// absent, the agent refuses them (`unsupported`).
+    #[serde(default)]
+    pub seal: Option<SealCfg>,
+}
+
+/// How the runtime volume is checked before anything is installed into it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeCheck {
+    /// `runtime_root` must be a mount point whose device is a dm-crypt
+    /// mapping (`/proc/self/mountinfo`, `/sys/dev/block/*/dm/uuid`
+    /// `CRYPT-*`): plaintext of sealed RPKs never lands on an unencrypted
+    /// file system.
+    #[default]
+    DmCrypt,
+    /// No check: tests and labs only (the journal notes it on every
+    /// sealed install). Never in production.
+    Unchecked,
+}
+
+/// The unit's TPM (absent: a unit without a TPM, §7.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealTpmCfg {
+    #[serde(default = "d_tcti")]
+    pub tcti: String,
+    #[serde(default = "d_tools_dir")]
+    pub tools_dir: PathBuf,
+    #[serde(default = "d_srk")]
+    pub srk: String,
+    #[serde(default = "d_epoch_nv")]
+    pub epoch_nv: String,
+    #[serde(default = "d_floor_nv")]
+    pub floor_nv: String,
+    /// Bound on one tpm2-tools run, milliseconds (100..=120000).
+    #[serde(default = "d_tpm_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn d_tcti() -> String {
+    robodr_seal::tpm::DEFAULT_TCTI.into()
+}
+fn d_tools_dir() -> PathBuf {
+    robodr_seal::tpm::DEFAULT_TOOLS_DIR.into()
+}
+fn d_srk() -> String {
+    format!("0x{:08x}", robodr_seal::tpm::DEFAULT_SRK)
+}
+fn d_epoch_nv() -> String {
+    format!("0x{:08x}", robodr_seal::tpm::DEFAULT_EPOCH_NV)
+}
+fn d_floor_nv() -> String {
+    format!("0x{:08x}", robodr_seal::tpm::DEFAULT_FLOOR_NV)
+}
+fn d_tpm_timeout() -> u64 {
+    10_000
+}
+
+impl SealTpmCfg {
+    /// The `robodr-seal` TPM configuration.
+    pub fn tpm_config(&self) -> Result<robodr_seal::tpm::TpmConfig, String> {
+        use robodr_seal::unit::parse_handle;
+        let c = robodr_seal::tpm::TpmConfig {
+            tools_dir: self.tools_dir.clone(),
+            tcti: self.tcti.clone(),
+            timeout: std::time::Duration::from_millis(self.timeout_ms),
+            srk: parse_handle(&self.srk, 0x81)
+                .map_err(|e| format!("seal.tpm.srk: {}", e.detail))?,
+            epoch_nv: parse_handle(&self.epoch_nv, 0x01)
+                .map_err(|e| format!("seal.tpm.epoch_nv: {}", e.detail))?,
+            floor_nv: parse_handle(&self.floor_nv, 0x01)
+                .map_err(|e| format!("seal.tpm.floor_nv: {}", e.detail))?,
+        };
+        c.validate()
+            .map_err(|e| format!("seal.tpm: {}", e.detail))?;
+        Ok(c)
+    }
+}
+
+/// Sealing on this unit (§7.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealCfg {
+    /// `robodr-seal`'s seal directory of this unit (enrolment record, TPM
+    /// blobs, signed policy): root-owned, outside the runtime volume.
+    pub seal_dir: PathBuf,
+    /// The mounted runtime volume: sealed RPKs and every `model` are
+    /// installed only below it (`<runtime_root>/<files|model|config>/`).
+    pub runtime_root: PathBuf,
+    #[serde(default)]
+    pub volume_check: VolumeCheck,
+    /// Absent: a unit without a TPM (its UWK is on the runtime volume).
+    #[serde(default)]
+    pub tpm: Option<SealTpmCfg>,
 }
 
 fn d_pack_digest_max_mb() -> u64 {
@@ -590,6 +685,17 @@ impl Config {
         if let Some(k) = &self.findings.finding_key {
             paths.push(("findings.finding_key", k));
         }
+        if let Some(sc) = &self.seal {
+            paths.push(("seal.seal_dir", &sc.seal_dir));
+            paths.push(("seal.runtime_root", &sc.runtime_root));
+            if let Some(t) = &sc.tpm {
+                paths.push(("seal.tpm.tools_dir", &t.tools_dir));
+                if !(100..=120_000).contains(&t.timeout_ms) {
+                    return Err("seal.tpm.timeout_ms: 100..=120000".into());
+                }
+                t.tpm_config()?;
+            }
+        }
         for (what, p) in &paths {
             if !is_clean_abs(p) {
                 return Err(format!("{what}: must be a normalised absolute path"));
@@ -599,7 +705,7 @@ impl Config {
         // never land in the state directory (anchor, floors), a files RPK
         // never in the config root, the media (untrusted) never overlap
         // anything it trusts.
-        let trees: [(&str, &Path); 7] = [
+        let mut trees: Vec<(&str, &Path)> = vec![
             ("state_dir", &self.state_dir),
             ("media_dir", &self.media_dir),
             ("install.files_root", &i.files_root),
@@ -608,6 +714,13 @@ impl Config {
             ("blackbox.dir", &self.blackbox.dir),
             ("findings.spool", &self.findings.spool),
         ];
+        // The runtime volume holds only installed plaintext; the seal
+        // directory (TPM blobs, policy) is outside it and outside every
+        // tree an RPK can write.
+        if let Some(sc) = &self.seal {
+            trees.push(("seal.seal_dir", &sc.seal_dir));
+            trees.push(("seal.runtime_root", &sc.runtime_root));
+        }
         for (a, pa) in &trees {
             for (b, pb) in &trees {
                 if a != b && contains(pa, pb) {
