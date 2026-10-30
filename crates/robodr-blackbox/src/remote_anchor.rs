@@ -149,6 +149,7 @@ use crate::export::Checkpoint;
 use crate::record::{signing_message, Hash, MAX_SIG_LEN};
 use crate::sign::{Signer, Verifier, MAX_KEY_ID_LEN};
 use crate::store::{atomic_write, lock_file, read_state, AnchoredHead, Error, HeadAnchor};
+use crate::tls::DeadlineTcp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -620,10 +621,17 @@ fn exchange(cfg: &RemoteAnchorConfig, line: &str) -> Result<Vec<u8>, String> {
         .to_socket_addrs()
         .map_err(|e| format!("resolving {address}: {e}"))?
         .collect();
+    // Connect: all addresses together within one timeout.
+    let connect_end = Instant::now() + timeout;
     let mut last = format!("{address}: no address");
     let mut stream = None;
     for a in addrs {
-        match TcpStream::connect_timeout(&a, timeout) {
+        let left = connect_end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            last = format!("{address}: connect timed out");
+            break;
+        }
+        match TcpStream::connect_timeout(&a, left) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -631,41 +639,36 @@ fn exchange(cfg: &RemoteAnchorConfig, line: &str) -> Result<Vec<u8>, String> {
             Err(e) => last = format!("connecting to {a}: {e}"),
         }
     }
-    let mut s = stream.ok_or(last)?;
-    let io = |e: io::Error| format!("{address}: {e}");
-    s.set_read_timeout(Some(timeout)).map_err(io)?;
-    s.set_write_timeout(Some(timeout)).map_err(io)?;
+    let s = stream.ok_or(last)?;
     let _ = s.set_nodelay(true);
+    // Everything after the connect shares one deadline (review F2): each
+    // read and write re-arms the socket timeout with the time left, so a
+    // peer that trickles bytes cannot stretch the exchange.
+    let end = Instant::now() + timeout * if cfg.tls.is_some() { 3 } else { 2 };
     let mut req = Vec::with_capacity(line.len() + 1);
     req.extend_from_slice(line.as_bytes());
     req.push(b'\n');
+    let io = |e: io::Error| format!("{address}: {}", crate::tls::describe(&e));
     match &cfg.tls {
         None => {
-            s.write_all(&req).map_err(io)?;
-            s.flush().map_err(io)?;
-            read_frame(&mut s, Instant::now() + timeout)
-                .map_err(|e| format!("{address}: answer: {e}"))
+            let mut d = DeadlineTcp::new(s);
+            d.set_deadline(end);
+            d.write_all(&req).map_err(io)?;
+            d.flush().map_err(io)?;
+            read_frame(&mut d, end).map_err(|e| format!("{address}: answer: {e}"))
         }
         Some(tls) => {
             let name = tls.name_for(crate::tls::host_of(address))?;
-            let mut t = crate::tls::connect_client(s, tls, name, Instant::now() + timeout)
+            let mut t = crate::tls::connect_client(s, tls, name, end)
                 .map_err(|e| format!("{address}: {e}"))?;
-            s_timeouts(&t.sock, timeout).map_err(io)?;
-            let tio = |e: io::Error| format!("{address}: {}", crate::tls::describe(&e));
-            t.write_all(&req).map_err(tio)?;
-            t.flush().map_err(tio)?;
-            let r = read_frame(&mut t, Instant::now() + timeout)
-                .map_err(|e| format!("{address}: answer: {e}"));
+            t.write_all(&req).map_err(io)?;
+            t.flush().map_err(io)?;
+            let r = read_frame(&mut t, end).map_err(|e| format!("{address}: answer: {e}"));
             t.conn.send_close_notify();
             let _ = t.conn.complete_io(&mut t.sock);
             r
         }
     }
-}
-
-fn s_timeouts(s: &TcpStream, t: Duration) -> io::Result<()> {
-    s.set_read_timeout(Some(t))?;
-    s.set_write_timeout(Some(t))
 }
 
 // ---------------------------------------------------------------------------
@@ -774,7 +777,14 @@ pub struct ServeOptions {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// Serve plain TCP when `tls` is `None` (default `false`: refused).
     pub allow_plaintext: bool,
+    /// Most connections open at once from one source address (default
+    /// [`DEFAULT_MAX_CONNECTIONS_PER_SOURCE`]): one host cannot take every
+    /// slot, before or after authenticating.
+    pub max_connections_per_source: usize,
 }
+
+/// Default of [`ServeOptions::max_connections_per_source`].
+pub const DEFAULT_MAX_CONNECTIONS_PER_SOURCE: usize = 8;
 
 impl Default for ServeOptions {
     fn default() -> Self {
@@ -783,6 +793,7 @@ impl Default for ServeOptions {
             io_timeout: DEFAULT_IO_TIMEOUT,
             tls: None,
             allow_plaintext: false,
+            max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
         }
     }
 }
@@ -1128,15 +1139,17 @@ impl AnchorReceiver {
 
     fn connection(
         &self,
-        mut s: TcpStream,
+        s: TcpStream,
         io_timeout: Duration,
         tls: Option<Arc<rustls::ServerConfig>>,
         peer: SocketAddr,
     ) {
         let _ = s.set_nonblocking(false);
-        let _ = s.set_read_timeout(Some(io_timeout));
-        let _ = s.set_write_timeout(Some(io_timeout));
         let _ = s.set_nodelay(true);
+        // Review F1: `io_timeout` bounds the request as a whole (TLS
+        // handshake included): every read and write re-arms the socket
+        // timeout with the time left, so a trickling peer is cut. Writing
+        // the answer gets its own `io_timeout`.
         let deadline = Instant::now() + io_timeout;
         let answer = |r: Result<Vec<u8>, FrameError>| match r {
             Ok(line) => Some(self.handle(&line)),
@@ -1147,7 +1160,10 @@ impl AnchorReceiver {
         };
         match tls {
             None => {
+                let mut s = DeadlineTcp::new(s);
+                s.set_deadline(deadline);
                 if let Some(a) = answer(read_frame(&mut s, deadline)) {
+                    s.set_deadline(Instant::now() + io_timeout);
                     let _ = s.write_all(&a);
                     let _ = s.flush();
                 }
@@ -1169,6 +1185,7 @@ impl AnchorReceiver {
                     }
                 };
                 if let Some(a) = answer(read_frame(&mut t, deadline)) {
+                    t.sock.set_deadline(Instant::now() + io_timeout);
                     let _ = t.write_all(&a);
                     let _ = t.flush();
                 }
@@ -1187,10 +1204,18 @@ impl AnchorReceiver {
         opts: &ServeOptions,
         stop: &AtomicBool,
     ) -> io::Result<()> {
-        struct Active(Arc<AtomicUsize>);
+        type PerSource = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
+        struct Active(Arc<AtomicUsize>, PerSource, std::net::IpAddr);
         impl Drop for Active {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::SeqCst);
+                let mut m = lock(&self.1);
+                if let Some(n) = m.get_mut(&self.2) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        m.remove(&self.2);
+                    }
+                }
             }
         }
         if opts.tls.is_none() && !opts.allow_plaintext {
@@ -1201,7 +1226,9 @@ impl AnchorReceiver {
         }
         listener.set_nonblocking(true)?;
         let active = Arc::new(AtomicUsize::new(0));
+        let per_source: PerSource = Arc::new(Mutex::new(HashMap::new()));
         let max = opts.max_connections.max(1);
+        let max_src = opts.max_connections_per_source.max(1);
         let mut warned_full = false;
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -1218,8 +1245,19 @@ impl AnchorReceiver {
                         continue;
                     }
                     warned_full = false;
+                    let src = peer.ip();
+                    {
+                        let mut m = lock(&per_source);
+                        let n = m.entry(src).or_insert(0);
+                        if *n >= max_src {
+                            drop(m);
+                            drop(s);
+                            continue;
+                        }
+                        *n += 1;
+                    }
                     active.fetch_add(1, Ordering::SeqCst);
-                    let guard = Active(Arc::clone(&active));
+                    let guard = Active(Arc::clone(&active), Arc::clone(&per_source), src);
                     let me = Arc::clone(self);
                     let t = opts.io_timeout;
                     let tls = opts.tls.clone();
@@ -1366,6 +1404,12 @@ struct Slot {
     failures: u64,
     shutdown: bool,
     worker_gone: bool,
+    /// When the delivery attempt in progress started (backstop: one that
+    /// outlives its bound, e.g. a hanging name lookup, is reported as a
+    /// failure by `advance`).
+    attempt_since: Option<Instant>,
+    /// That overdue attempt was already counted.
+    attempt_reported: bool,
 }
 
 struct Shared {
@@ -1417,8 +1461,14 @@ fn worker(shared: Arc<Shared>, cfg: RemoteAnchorConfig, done: mpsc::Sender<()>) 
                 s = shared.cv.wait(s).unwrap_or_else(|p| p.into_inner());
             }
         };
+        {
+            let mut s = lock(&shared.slot);
+            s.attempt_since = Some(Instant::now());
+            s.attempt_reported = false;
+        }
         let res = send_mark(&cfg, &mark);
         let mut s = lock(&shared.slot);
+        s.attempt_since = None;
         let same = |s: &Slot| s.pending.as_ref().map(|p| p.seq) == Some(mark.seq);
         match res {
             Ok(()) => {
@@ -1652,6 +1702,20 @@ impl HeadAnchor for RemoteHeadAnchor {
         }
         s.pending = Some(m);
         self.shared.cv.notify_all();
+        let bound = self.cfg.timeout * self.steps() + Duration::from_secs(1);
+        if !s.attempt_reported
+            && s.attempt_since
+                .is_some_and(|t| t.elapsed() > bound && s.error.is_none())
+        {
+            s.attempt_reported = true;
+            s.failures += 1;
+            return Err(format!(
+                "remote anchor {}: a delivery attempt has not finished within {} ms \
+                 (name lookup or network stalled)",
+                self.cfg.address,
+                bound.as_millis()
+            ));
+        }
         match s.error.take() {
             Some(e) => Err(e),
             None => Ok(()),
@@ -2068,6 +2132,7 @@ mod tests {
                     io_timeout,
                     tls: None,
                     allow_plaintext: true,
+                    ..ServeOptions::default()
                 },
                 &s2,
             )

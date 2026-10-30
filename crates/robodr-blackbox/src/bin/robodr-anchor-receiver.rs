@@ -30,7 +30,7 @@
 //!  "key_file": "/etc/robodr-anchor-receiver/receiver.key",
 //!  "units": [{"unit": "ugv-07",
 //!             "public_key": "/etc/robodr-anchor-receiver/units/ugv-07-blackbox.key.pub"}],
-//!  "max_connections": 64, "io_timeout_ms": 5000,
+//!  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
 //!  "tls": {"cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
 //!          "key_file": "/etc/robodr-anchor-receiver/tls/receiver.key",
 //!          "client_ca": "/etc/robodr-anchor-receiver/tls/units-ca.pem"}}
@@ -90,6 +90,8 @@ struct Config {
     max_connections: Option<usize>,
     #[serde(default)]
     io_timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_connections_per_source: Option<usize>,
     #[serde(default)]
     tls: Option<TlsConfig>,
     #[serde(default)]
@@ -222,6 +224,11 @@ fn load_config(path: &Path) -> Result<Config, String> {
     if c.max_connections.is_some_and(|n| !(1..=4096).contains(&n)) {
         return Err("max_connections must be 1..=4096".into());
     }
+    if c.max_connections_per_source
+        .is_some_and(|n| !(1..=4096).contains(&n))
+    {
+        return Err("max_connections_per_source must be 1..=4096".into());
+    }
     if c.io_timeout_ms
         .is_some_and(|t| !(100..=60_000).contains(&t))
     {
@@ -332,6 +339,9 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
             .map_or(remote_anchor::DEFAULT_IO_TIMEOUT, Duration::from_millis),
         allow_plaintext: tls.is_none() && c.allow_plaintext,
         tls,
+        max_connections_per_source: c
+            .max_connections_per_source
+            .unwrap_or(remote_anchor::DEFAULT_MAX_CONNECTIONS_PER_SOURCE),
     };
     {
         let mut out = std::io::stdout().lock();

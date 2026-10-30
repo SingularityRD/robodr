@@ -22,12 +22,13 @@ use robodr_blackbox::tls::{self, ClientTls, ClientTlsFiles, ServerTlsFiles};
 use robodr_blackbox::{Ed25519SigningKey, HeadAnchor, Signer};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
-use std::net::{SocketAddr, TcpListener};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const UNIT: &str = "ugv-07";
 
@@ -124,6 +125,19 @@ fn serve(tls: Option<Arc<rustls::ServerConfig>>, allow_plaintext: bool) -> Srv {
 }
 
 fn serve_at(bind: &str, tls: Option<Arc<rustls::ServerConfig>>, allow_plaintext: bool) -> Srv {
+    serve_with(
+        bind,
+        ServeOptions {
+            max_connections: 8,
+            io_timeout: Duration::from_millis(1500),
+            tls,
+            allow_plaintext,
+            ..ServeOptions::default()
+        },
+    )
+}
+
+fn serve_with(bind: &str, opts: ServeOptions) -> Srv {
     let d = TestDir::new("tls-recv");
     let recv = Arc::new(
         AnchorReceiver::open(
@@ -141,12 +155,6 @@ fn serve_at(bind: &str, tls: Option<Arc<rustls::ServerConfig>>, allow_plaintext:
     let addr = l.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let (r2, s2) = (Arc::clone(&recv), Arc::clone(&stop));
-    let opts = ServeOptions {
-        max_connections: 8,
-        io_timeout: Duration::from_millis(1500),
-        tls,
-        allow_plaintext,
-    };
     let th = std::thread::spawn(move || r2.serve(l, &opts, &s2));
     Srv {
         addr,
@@ -447,4 +455,180 @@ fn file_checks() {
         assert!(e.contains("not a regular file"), "{e}");
         assert!(t.elapsed() < Duration::from_secs(2));
     }
+}
+
+// --- Review of the TLS work: deadlines over the whole handshake ------------
+
+/// Send a TLS handshake record header announcing 16 KiB, then one byte every
+/// `gap`, until stopped or the peer closes: a handshake that never ends but
+/// never lets a single read time out.
+fn trickle(mut s: TcpStream, gap: Duration, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if s.write_all(&[0x16, 0x03, 0x01, 0x40, 0x00]).is_err() {
+            return;
+        }
+        for _ in 0..16_000 {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(gap);
+            if s.write_all(&[0x01]).is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// Is the peer's side of `s` still open (no EOF / reset within 50 ms)?
+fn still_open(s: &TcpStream) -> bool {
+    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut b = [0u8; 64];
+    loop {
+        match (&*s).read(&mut b) {
+            Ok(0) => return false,
+            Ok(_) => continue,
+            Err(e) => {
+                return matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            }
+        }
+    }
+}
+
+/// Review F1: a peer without a certificate that trickles its handshake held
+/// a receiver slot forever (the socket timeout was armed once, rustls loops
+/// over reads); two of them locked out every unit. `io_timeout` now bounds
+/// the whole connection, handshake included.
+#[test]
+fn receiver_cuts_a_trickled_handshake_at_io_timeout() {
+    let pki = Pki::new();
+    let io_timeout = Duration::from_millis(500);
+    let s = serve_with(
+        "127.0.0.1:0",
+        ServeOptions {
+            max_connections: 2,
+            io_timeout,
+            tls: Some(pki.server("server", Some("ca.pem"))),
+            ..ServeOptions::default()
+        },
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut probes = vec![];
+    let mut atk = vec![];
+    for _ in 0..2 {
+        let c = TcpStream::connect(s.addr).unwrap();
+        probes.push(c.try_clone().unwrap());
+        atk.push(trickle(c, Duration::from_millis(100), Arc::clone(&stop)));
+    }
+    std::thread::sleep(io_timeout * 4);
+    for p in &probes {
+        assert!(!still_open(p), "the trickled handshake outlived io_timeout");
+    }
+    stop.store(true, Ordering::SeqCst);
+    for t in atk {
+        let _ = t.join();
+    }
+    let a = anchor(
+        &s.addr,
+        Some(pki.client("ca.pem", Some("client"), None, &[])),
+        false,
+    )
+    .unwrap();
+    assert_eq!(round_trip(&a), Ok(Some(5)));
+}
+
+/// Review F2: an on-path peer that trickles the receiver's side of the
+/// handshake stalled the unit's delivery thread forever, with no anchor
+/// failure ever counted. Each exchange is now bounded as a whole.
+#[test]
+fn a_stalled_handshake_is_an_anchor_failure_not_a_silent_hang() {
+    let pki = Pki::new();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = Arc::clone(&stop);
+    let mitm = std::thread::spawn(move || {
+        l.set_nonblocking(true).unwrap();
+        let mut held = vec![];
+        while !s2.load(Ordering::SeqCst) {
+            if let Ok((mut c, _)) = l.accept() {
+                c.set_nonblocking(false).unwrap();
+                let mut b = [0u8; 4096];
+                let _ = c.read(&mut b); // ClientHello
+                held.push(trickle(c, Duration::from_millis(100), Arc::clone(&s2)));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for h in held {
+            let _ = h.join();
+        }
+    });
+    let timeout = Duration::from_millis(300);
+    let mut c = RemoteAnchorConfig::new(addr.to_string(), UNIT);
+    c.timeout = timeout;
+    c.tls = Some(pki.client("ca.pem", None, None, &[]));
+    let a = RemoteHeadAnchor::new(
+        c,
+        Box::new(receiver_key().verifying_key()),
+        Box::new(unit_key()),
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    assert!(a.current().is_err());
+    assert!(
+        t0.elapsed() < timeout * 6,
+        "current took {:?}",
+        t0.elapsed()
+    );
+    let mut errs = 0;
+    for seq in 1..=8u64 {
+        if a.advance(&cp(seq)).is_err() {
+            errs += 1;
+        }
+        std::thread::sleep(timeout * 2);
+    }
+    assert!(errs > 0, "no advance reported the stalled delivery");
+    assert!(a.delivery_failures() > 0);
+    assert_eq!(a.delivered_seq(), None);
+    let t1 = Instant::now();
+    drop(a);
+    assert!(t1.elapsed() < timeout * 8, "drop waited {:?}", t1.elapsed());
+    stop.store(true, Ordering::SeqCst);
+    let _ = mitm.join();
+}
+
+/// Review F1 (second half): one source address cannot take every slot,
+/// before or after authenticating.
+#[test]
+fn one_source_cannot_hold_every_slot() {
+    let pki = Pki::new();
+    let s = serve_with(
+        "127.0.0.1:0",
+        ServeOptions {
+            max_connections: 8,
+            io_timeout: Duration::from_secs(3),
+            tls: Some(pki.server("server", None)),
+            max_connections_per_source: 2,
+            ..ServeOptions::default()
+        },
+    );
+    let held: Vec<TcpStream> = (0..2)
+        .map(|_| TcpStream::connect(s.addr).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let third = TcpStream::connect(s.addr).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !still_open(&third),
+        "a third connection from one source was served"
+    );
+    for h in &held {
+        assert!(still_open(h));
+    }
+    drop(held);
+    std::thread::sleep(Duration::from_millis(200));
+    let a = anchor(&s.addr, Some(pki.client("ca.pem", None, None, &[])), false).unwrap();
+    assert_eq!(round_trip(&a), Ok(Some(5)));
 }

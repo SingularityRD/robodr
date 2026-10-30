@@ -51,7 +51,7 @@ use rustls::{
     RootCertStore, ServerConfig, ServerConnection, SignatureScheme, StreamOwned,
 };
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -412,27 +412,94 @@ pub fn describe(e: &io::Error) -> String {
     e.to_string()
 }
 
-fn arm(tcp: &TcpStream, deadline: Instant) -> io::Result<()> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+/// A TCP stream bounded by one deadline: before **every** read and write
+/// the socket timeout is set to the time left, and past the deadline the
+/// call fails with `TimedOut`. rustls loops over many reads (the handshake's
+/// `complete_io`, `StreamOwned::read` while a record is partial), so a
+/// timeout armed once would let a peer that sends one byte per timeout hold
+/// the connection for ever; this cannot (the pattern of agentd's
+/// `DeadlineTcp` and the uplink's `DeadlineStream`).
+#[derive(Debug)]
+pub struct DeadlineTcp {
+    pub tcp: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineTcp {
+    /// No deadline until [`DeadlineTcp::set_deadline`].
+    pub fn new(tcp: TcpStream) -> Self {
+        Self {
+            tcp,
+            deadline: None,
+        }
     }
-    tcp.set_read_timeout(Some(left))?;
-    tcp.set_write_timeout(Some(left))
+
+    /// Every read and write after this fails once `at` has passed.
+    pub fn set_deadline(&mut self, at: Instant) {
+        self.deadline = Some(at);
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn arm(&self, write: bool) -> io::Result<()> {
+        let Some(at) = self.deadline else {
+            return Ok(());
+        };
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
+        }
+        if write {
+            self.tcp.set_write_timeout(Some(left))
+        } else {
+            self.tcp.set_read_timeout(Some(left))
+        }
+    }
+}
+
+impl Read for DeadlineTcp {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm(false)?;
+        self.tcp.read(buf).map_err(timed_out)
+    }
+}
+
+impl Write for DeadlineTcp {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm(true)?;
+        self.tcp.write(buf).map_err(timed_out)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// A socket timeout (`WouldBlock` on Linux) is a `TimedOut`.
+fn timed_out(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(io::ErrorKind::TimedOut, "timed out")
+    } else {
+        e
+    }
 }
 
 /// Run the client handshake on `tcp` against `name`, giving up at
-/// `deadline`. The socket timeouts are left armed with the time left.
+/// `deadline`. The returned stream keeps that deadline for every later
+/// read and write until the caller moves it ([`DeadlineTcp::set_deadline`]
+/// on `sock`).
 pub fn connect_client(
     tcp: TcpStream,
     tls: &ClientTls,
     name: ServerName<'static>,
     deadline: Instant,
-) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
+) -> Result<StreamOwned<ClientConnection, DeadlineTcp>, String> {
     let conn = ClientConnection::new(tls.config.clone(), name).map_err(|e| format!("TLS: {e}"))?;
-    let mut s = StreamOwned::new(conn, tcp);
+    let mut sock = DeadlineTcp::new(tcp);
+    sock.set_deadline(deadline);
+    let mut s = StreamOwned::new(conn, sock);
     while s.conn.is_handshaking() {
-        arm(&s.sock, deadline).map_err(|e| format!("TLS handshake: {}", describe(&e)))?;
         s.conn
             .complete_io(&mut s.sock)
             .map_err(|e| format!("TLS handshake: {}", describe(&e)))?;
@@ -440,16 +507,18 @@ pub fn connect_client(
     Ok(s)
 }
 
-/// Run the server handshake on `tcp`, giving up at `deadline`.
+/// Run the server handshake on `tcp`, giving up at `deadline` (kept for
+/// later reads and writes, as for [`connect_client`]).
 pub fn accept_server(
     tcp: TcpStream,
     config: Arc<ServerConfig>,
     deadline: Instant,
-) -> Result<StreamOwned<ServerConnection, TcpStream>, String> {
+) -> Result<StreamOwned<ServerConnection, DeadlineTcp>, String> {
     let conn = ServerConnection::new(config).map_err(|e| format!("TLS: {e}"))?;
-    let mut s = StreamOwned::new(conn, tcp);
+    let mut sock = DeadlineTcp::new(tcp);
+    sock.set_deadline(deadline);
+    let mut s = StreamOwned::new(conn, sock);
     while s.conn.is_handshaking() {
-        arm(&s.sock, deadline).map_err(|e| format!("TLS handshake: {}", describe(&e)))?;
         s.conn
             .complete_io(&mut s.sock)
             .map_err(|e| format!("TLS handshake: {}", describe(&e)))?;

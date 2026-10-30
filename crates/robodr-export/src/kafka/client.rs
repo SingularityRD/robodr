@@ -63,7 +63,7 @@ use super::errors::{self, classify, ErrorClass};
 use super::proto::{self, ApiRange};
 use super::sasl::{self, SaslConfig, ScramClient};
 use super::wire::DecodeError;
-use robodr_blackbox::tls::ClientTls;
+use robodr_blackbox::tls::{ClientTls, DeadlineTcp};
 use rustls::{ClientConnection, StreamOwned};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -300,14 +300,17 @@ impl From<DecodeError> for NetError {
 /// A broker connection: plain TCP or TLS over it.
 enum Stream {
     Plain(TcpStream),
-    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    /// Every read and write bounded by the exchange's deadline (review F3:
+    /// rustls loops over reads, a socket timeout armed once does not bound
+    /// a peer that trickles bytes).
+    Tls(Box<StreamOwned<ClientConnection, DeadlineTcp>>),
 }
 
 impl Stream {
     fn tcp(&self) -> &TcpStream {
         match self {
             Stream::Plain(s) => s,
-            Stream::Tls(t) => &t.sock,
+            Stream::Tls(t) => &t.sock.tcp,
         }
     }
 }
@@ -538,6 +541,9 @@ impl Conn {
             )));
         }
         let deadline = Instant::now() + cfg.request_timeout;
+        if let Stream::Tls(t) = &mut self.stream {
+            t.sock.set_deadline(deadline);
+        }
         let hint = self.fresh && api != proto::API_VERSIONS && api != sasl::API_SASL_HANDSHAKE;
         let io = |e: io::Error| {
             NetError::Io(if hint {

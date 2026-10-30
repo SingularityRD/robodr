@@ -449,3 +449,47 @@ fn cli_requires_tls_or_an_explicit_plaintext_flag() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(c.total(), 2);
 }
+
+/// Review F3: an on-path peer that answers the ClientHello with a TLS
+/// record header and then one byte at a time held the producer for ever
+/// (the socket timeout was armed once and rustls loops over reads):
+/// connect, request and delivery deadlines were all defeated. The
+/// handshake and every TLS request are now bounded as a whole.
+#[test]
+fn a_trickled_tls_handshake_cannot_outlast_the_deadlines() {
+    use std::io::{Read, Write};
+    let pki = Pki::new();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            std::thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                let _ = s.read(&mut b); // ClientHello
+                let _ = s.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]);
+                for _ in 0..1000 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if s.write_all(&[0x02]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut c = ProducerConfig::new(vec![addr.to_string()]);
+    c.tls = Some(pki.client("ca.pem", None, None, &[]));
+    c.connect_timeout = Duration::from_millis(300);
+    c.request_timeout = Duration::from_millis(600);
+    c.produce_timeout_ms = 300;
+    c.delivery_timeout = Duration::from_millis(1500);
+    c.retries = 0;
+    let mut p = Producer::new(c).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t0 = Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(p.partition_count(TOPIC).is_err());
+    });
+    let r = rx.recv_timeout(Duration::from_secs(8));
+    assert_eq!(r, Ok(true), "still connecting after {:?}", t0.elapsed());
+}
