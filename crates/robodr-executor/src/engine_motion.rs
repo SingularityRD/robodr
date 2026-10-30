@@ -2,6 +2,15 @@
 //! (journal intent → adapter apply + read back → commit), undo on revert /
 //! TTL / restart / operator disable, re-arm after a reboot and the
 //! periodic read-back. A child module of [`crate::engine`].
+//!
+//! Review finding 1 (ADR-0006): a `safe_pause`
+//! ([`MotionSpec::lift_needs_people`]) is **never undone automatically**.
+//! Its TTL is reported (`expired`, `HIGH: ...`) and the pause stays in
+//! force; a restart, an operator's emergency disable, a failed apply,
+//! commit or re-arm leave the platform paused and say so. Only
+//! [`Engine::revert_request`] lifts it: the SOC's two-person signed revert,
+//! then the safety state now (known, fresh, not engaged, allowed by the
+//! pause's adapters).
 
 use super::*;
 use crate::motion::MotionSpec;
@@ -190,8 +199,18 @@ impl Engine {
             Ok(n) => n,
             Err(e) => {
                 // Undo whatever may have reached the platform (the
-                // adapters undo a partial multi-adapter apply themselves).
-                let undo = self.motion.revert(&m, &spec);
+                // adapters undo a partial multi-adapter apply themselves);
+                // never a pause (review finding 1): its undo may set the
+                // robot moving.
+                let undo = if spec.lift_needs_people() {
+                    Err(
+                        "a pause is never undone automatically: check the platform, it may \
+                         be paused"
+                            .to_string(),
+                    )
+                } else {
+                    self.motion.revert(&m, &spec)
+                };
                 let en = self
                     .state
                     .entries
@@ -223,11 +242,19 @@ impl Engine {
             en.phase = Phase::Active;
         }
         if let Err(e) = self.save() {
-            let _ = self.motion.revert(&m, &spec);
             self.state.entries.retain(|en| en.id != order.id);
             let mut o = Outcome::bare(&order.id, Status::Failed);
             o.action = Some(order.action);
-            o.error = Some(format!("journal commit failed ({e}): undone"));
+            if spec.lift_needs_people() {
+                // Review finding 1: left paused (the safe direction).
+                o.error = Some(format!(
+                    "journal commit failed ({e}): the pause is in force on the platform and \
+                     is not undone automatically; an operator restores the robot"
+                ));
+            } else {
+                let _ = self.motion.revert(&m, &spec);
+                o.error = Some(format!("journal commit failed ({e}): undone"));
+            }
             return o;
         }
         self.state.event(
@@ -253,15 +280,31 @@ impl Engine {
     /// Undo a motion entry before it is finished as reverted. `Err` with
     /// the answer when the adapter failed (the entry stays `reverting`
     /// and the revert is retried every tick).
+    ///
+    /// A pause ([`MotionSpec::lift_needs_people`]) is undone only with
+    /// `lift` ([`Engine::revert_request`] checked the two-person revert
+    /// and the safety state); otherwise, and when its undo fails, it goes
+    /// back to `active` (still paused) and `Err` answers why.
     pub(super) fn motion_undo(
         &mut self,
         en: &Entry,
         reason: &str,
         now_ms: u64,
+        lift: bool,
     ) -> Result<(), Box<Outcome>> {
         let Effect::Motion(spec) = &en.effect else {
             return Ok(());
         };
+        if spec.lift_needs_people() && !lift {
+            return Err(self.pause_kept(
+                en,
+                now_ms,
+                format!(
+                    "{reason}: a safe_pause is never lifted automatically (ADR-0006): left in \
+                     force; lift it with the SOC's two-person signed revert"
+                ),
+            ));
+        }
         let m = self.motion_cfg();
         match self.motion.revert(&m, spec) {
             Ok(n) => {
@@ -274,6 +317,14 @@ impl Engine {
                 );
                 Ok(())
             }
+            Err(e) if spec.lift_needs_people() => Err(self.pause_kept(
+                en,
+                now_ms,
+                format!(
+                    "{reason}: adapter undo failed ({e}): the pause stays in force (not \
+                     retried: a new signed revert re-checks the safety state)"
+                ),
+            )),
             Err(e) => {
                 self.state.event(
                     now_ms,
@@ -294,18 +345,112 @@ impl Engine {
         }
     }
 
+    /// A pause left in force (review finding 1): back to `active` when it
+    /// is still an entry, a `HIGH` event, and the answer.
+    fn pause_kept(&mut self, en: &Entry, now_ms: u64, why: String) -> Box<Outcome> {
+        if let Some(x) = self.state.entries.iter_mut().find(|x| x.id == en.id) {
+            x.phase = Phase::Active;
+        }
+        let why = format!("HIGH: {why}");
+        self.state.event(
+            now_ms,
+            EventKind::Refused,
+            Some(&en.id),
+            Some(en.action),
+            why.clone(),
+        );
+        let _ = self.save();
+        let mut o = self.status(&en.id);
+        o.error = Some(why);
+        Box::new(o)
+    }
+
+    /// The safety state now allows lifting `spec` (a pause): known, fresh,
+    /// not engaged ([`decision::recheck_rearm`]) and one its adapters
+    /// allow ([`MotionSpec::allowed`]).
+    pub(super) fn lift_safety_ok(
+        &self,
+        spec: &MotionSpec,
+        oracle: &mut dyn SafetyOracle,
+    ) -> Result<(), Refusal> {
+        let current = oracle.current();
+        let state = current.as_ref().ok().map(|c| c.state);
+        decision::recheck_rearm(current, self.cfg.config.max_safety_age_ms).map_err(|mut r| {
+            r.reason = format!("{}: the pause stays in force", r.reason);
+            r
+        })?;
+        match state {
+            Some(s) if spec.allowed(&self.motion_cfg(), s) => Ok(()),
+            s => Err(Refusal::new(
+                codes::SAFETY_STATE_NOT_ALLOWED,
+                format!(
+                    "lifting {} is not allowed in safety state {} by its adapter(s): the pause \
+                     stays in force",
+                    spec.action.as_str(),
+                    s.map(crate::motion::state_name).unwrap_or_default()
+                ),
+            )),
+        }
+    }
+
+    /// TTL expiry of a pause (review finding 1): reported once, never
+    /// lifted. `true` when `id` is such a pause (the caller leaves it).
+    pub(super) fn pause_outlives_ttl(&mut self, id: &str, now_ms: u64) -> bool {
+        let Some(en) = self.state.entry(id) else {
+            return false;
+        };
+        let pause = en.phase == Phase::Active
+            && matches!(&en.effect, Effect::Motion(s) if s.lift_needs_people());
+        if !pause {
+            return false;
+        }
+        let action = en.action;
+        let reported = self
+            .state
+            .events
+            .iter()
+            .any(|ev| ev.kind == EventKind::Expired && ev.id.as_deref() == Some(id));
+        if !reported {
+            self.state.event(
+                now_ms,
+                EventKind::Expired,
+                Some(id),
+                Some(action),
+                "HIGH: safe_pause reached motion.safe_pause_ttl_s: left in force (a pause is \
+                 never lifted automatically, ADR-0006); lift it with the SOC's two-person \
+                 signed revert once the robot is safe to move",
+            );
+            let _ = self.save();
+        }
+        true
+    }
+
     /// Restart reconciliation: undo a motion entry; `false` when the
-    /// adapter failed (the caller keeps it `reverting`).
+    /// adapter failed (the caller keeps it `reverting`). A pause is never
+    /// undone here (`false`: the next tick puts it back to `active`).
     pub(super) fn motion_settled(&mut self, en: &Entry, now_ms: u64) -> bool {
-        self.motion_undo(en, "at restart", now_ms).is_ok()
+        self.motion_undo(en, "at restart", now_ms, false).is_ok()
     }
 
     /// Undo without retry (interrupted apply, operator disable): failures
-    /// are recorded.
+    /// are recorded. A pause is left in force (review finding 1).
     pub(super) fn motion_best_effort(&mut self, en: &Entry, now_ms: u64, why: &str) {
         let Effect::Motion(spec) = &en.effect else {
             return;
         };
+        if spec.lift_needs_people() {
+            self.state.event(
+                now_ms,
+                EventKind::Refused,
+                Some(&en.id),
+                Some(en.action),
+                format!(
+                    "HIGH: {why}: the safe_pause is not undone (never automatically, \
+                     ADR-0006): the platform may still be paused; an operator restores it"
+                ),
+            );
+            return;
+        }
         let m = self.motion_cfg();
         let detail = match self.motion.revert(&m, spec) {
             Ok(n) => format!("{why}: adapter undo: {n}"),
@@ -377,8 +522,15 @@ impl Engine {
                 }
                 Err(e) => {
                     let en = self.state.entries.remove(pos);
-                    let why = format!("could not be re-armed after a reboot ({e}): reverted");
-                    let _ = self.motion.revert(&m, &spec);
+                    let why = if spec.lift_needs_people() {
+                        format!(
+                            "HIGH: could not be re-armed after a reboot ({e}): dropped, not \
+                             undone (a pause never is automatically): check the platform"
+                        )
+                    } else {
+                        let _ = self.motion.revert(&m, &spec);
+                        format!("could not be re-armed after a reboot ({e}): reverted")
+                    };
                     self.finish(&en, Final::Reverted, now_ms, &why);
                     self.state
                         .event(now_ms, EventKind::Reverted, Some(id), Some(en.action), why);

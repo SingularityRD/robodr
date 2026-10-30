@@ -10,7 +10,7 @@
 //! | `restrict_motion` | `gateway` | restriction file for `robodr-firewall-gw` (caps / factor, expiry = TTL), read back from the gateway's status | file removed, read back; the gateway also lifts it at its expiry on its own |
 //! | | `unitree_sport` | sport `SpeedLevel(level)` request (`rt/api/sport/request`), reply code 0; held by the gateway (it refuses `SpeedLevel` while restricted: list `unitree_sport` first), advisory without it | `SpeedLevel(0)` (the SDK default: not necessarily the level before) |
 //! | `safe_pause` | `nav2` | `CancelGoal` (zero id: every goal) on each action server, then a burst of zero `Twist` on `cmd_vel` | **nothing to undo**: goals are not restored, the operator re-issues the mission (documented) |
-//! | | `ros2_control` | `SwitchController` STRICT: deactivate the motion controllers, activate the hold controllers | the inverse switch |
+//! | | `ros2_control` | `SwitchController` STRICT: deactivate the motion controllers, activate the hold controllers | the inverse switch, only on the SOC's two-person signed revert with the safety state re-checked (never automatically: [`MotionSpec::lift_needs_people`]) |
 //! | | `px4` | MAVLink `DO_SET_MODE` AUTO.LOITER (hold), ack + heartbeat read back | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
 //! | `request_safe_state` | `px4` (hold / RTL per the policy's `safe_state`), `nav2`, `ros2_control` | as above | not reversible (an operator restores the robot) |
 //! | `rollback_config` | `rollback` (`config: program` only) | the site's OEM-validated rollback program, `--verify` afterwards | not reversible |
@@ -396,10 +396,19 @@ pub struct MotionSection {
     pub request_safe_state: Option<AdapterKind>,
     #[serde(default)]
     pub rollback_config: Option<AdapterKind>,
-    /// How long a `safe_pause` stays in force before the executor releases
-    /// it (s; the contract gives it no TTL).
+    /// How long a `safe_pause` is expected to last (s; the contract gives it
+    /// no TTL). Reaching it is **reported** (event `expired`, detail
+    /// `HIGH: ...`), never acted on: a pause is lifted only by the SOC's
+    /// two-person signed revert, with the safety state re-checked
+    /// (ADR-0006; review finding 1).
     #[serde(default = "default_pause_ttl")]
     pub safe_pause_ttl_s: u64,
+    /// The robot's motion envelope (the profile's, as the gateway applies
+    /// it): the base an absolute `restrict_motion` cap is converted to a
+    /// factor against on a robot that balances (review finding 3).
+    /// Without it, an absolute cap is refused there (`fall_hazard`).
+    #[serde(default)]
+    pub envelope: Option<MotionEnvelope>,
     #[serde(default)]
     pub gateway: Option<GatewayAdapter>,
     #[serde(default)]
@@ -422,6 +431,7 @@ impl Default for MotionSection {
             request_safe_state: None,
             rollback_config: None,
             safe_pause_ttl_s: default_pause_ttl(),
+            envelope: None,
             gateway: None,
             unitree_sport: None,
             nav2: None,
@@ -430,6 +440,16 @@ impl Default for MotionSection {
             rollback: None,
         }
     }
+}
+
+/// `motion.envelope`: the profile envelope's speeds (finite, `> 0`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MotionEnvelope {
+    #[serde(default)]
+    pub max_linear_speed: Option<f64>,
+    #[serde(default)]
+    pub max_joint_speed: Option<f64>,
 }
 
 fn topic_ok(s: &str) -> bool {
@@ -523,6 +543,12 @@ impl MotionSection {
         }
         if self.safe_pause_ttl_s == 0 || self.safe_pause_ttl_s > max_ttl_s {
             return Err("motion.safe_pause_ttl_s must be 1..=ttl.max_s".into());
+        }
+        if let Some(e) = &self.envelope {
+            let ok = |v: Option<f64>| v.is_none_or(|x| x.is_finite() && x > 0.0);
+            if !ok(e.max_linear_speed) || !ok(e.max_joint_speed) {
+                return Err("motion.envelope: speeds must be finite and > 0".into());
+            }
         }
         if let Some(g) = &self.gateway {
             if !g.restriction_path.is_absolute() || !g.status_path.is_absolute() {
@@ -687,6 +713,15 @@ pub struct MotionSpec {
 }
 
 impl MotionSpec {
+    /// Lifting this action may set the robot moving again (a `safe_pause`:
+    /// its undo re-activates the motion controllers). It is **never**
+    /// undone automatically (TTL, restart, operator disable, a failed
+    /// apply or re-arm): only by the SOC's two-person signed revert, with
+    /// the safety state re-checked first (ADR-0006; review finding 1).
+    pub fn lift_needs_people(&self) -> bool {
+        self.action == ActionId::SafePause
+    }
+
     /// The safety states the adapters allow (the intersection).
     pub fn allowed(&self, m: &MotionSection, s: SafetyState) -> bool {
         self.adapters
@@ -800,6 +835,22 @@ pub fn approvers_ok(
     requested_by: &str,
     approved_by: &[String],
 ) -> Result<(), Refusal> {
+    // Review finding 7: the requester is a name like the approvers, or it
+    // cannot be told apart from one of them ("alice\u{200b}", a Cyrillic
+    // "a").
+    if !approver_name_ok(requested_by) {
+        return Err(refuse(
+            codes::APPROVAL_MISSING,
+            format!(
+                "requested_by {:?} is not 1..={MAX_APPROVER_CHARS} characters of \
+                 [A-Za-z0-9._%+@-]: it cannot be compared with the approvers",
+                requested_by
+                    .chars()
+                    .take(MAX_APPROVER_CHARS)
+                    .collect::<String>()
+            ),
+        ));
+    }
     if let Some(bad) = approved_by.iter().find(|a| !approver_name_ok(a)) {
         return Err(refuse(
             codes::APPROVAL_MISSING,
@@ -810,7 +861,7 @@ pub fn approvers_ok(
             ),
         ));
     }
-    let requester = requested_by.trim().to_ascii_lowercase();
+    let requester = requested_by.to_ascii_lowercase();
     let mut distinct: Vec<String> = Vec::new();
     for a in approved_by {
         let a = a.to_ascii_lowercase();
@@ -893,17 +944,66 @@ pub fn plan(
                     "workspace_zone is not supported by the motion adapters (speed caps only)",
                 ));
             }
-            if morph.needs_active_balance()
-                && req.factor.is_some_and(|f| f < policy.min_motion_factor)
-            {
+            let absolute = req.max_linear_speed.is_some() || req.max_joint_speed.is_some();
+            // Review finding 3: the planner's limit_motion is a factor; an
+            // absolute cap only comes with a human's approval.
+            if absolute && !matches!(order.origin, Origin::ControlPlane { .. }) {
                 return Err(refuse(
-                    codes::FALL_HAZARD,
-                    format!(
-                        "factor {:?} is below the policy's min_motion_factor {} on a robot that \
-                         balances",
-                        req.factor, policy.min_motion_factor
-                    ),
+                    codes::INVALID_ORDER,
+                    "the on-robot planner restricts motion by a factor only: absolute caps \
+                     (max_linear_speed, max_joint_speed) need a SOC-approved request",
                 ));
+            }
+            if morph.needs_active_balance() {
+                if req.factor.is_some_and(|f| f < policy.min_motion_factor) {
+                    return Err(refuse(
+                        codes::FALL_HAZARD,
+                        format!(
+                            "factor {:?} is below the policy's min_motion_factor {} on a robot \
+                             that balances",
+                            req.factor, policy.min_motion_factor
+                        ),
+                    ));
+                }
+                // Review finding 3: an absolute cap counts as the factor it
+                // is of the envelope; without an envelope it cannot be
+                // judged, and is refused.
+                let env = m.envelope.as_ref();
+                for (what, cap, base) in [
+                    (
+                        "max_linear_speed",
+                        req.max_linear_speed,
+                        env.and_then(|e| e.max_linear_speed),
+                    ),
+                    (
+                        "max_joint_speed",
+                        req.max_joint_speed,
+                        env.and_then(|e| e.max_joint_speed),
+                    ),
+                ] {
+                    let Some(cap) = cap else { continue };
+                    let Some(base) = base else {
+                        return Err(refuse(
+                            codes::FALL_HAZARD,
+                            format!(
+                                "{what} is an absolute cap and motion.envelope.{what} is not \
+                                 configured: it cannot be checked against min_motion_factor \
+                                 on a robot that balances (send a factor)"
+                            ),
+                        ));
+                    };
+                    if cap / base < policy.min_motion_factor {
+                        return Err(refuse(
+                            codes::FALL_HAZARD,
+                            format!(
+                                "{what} {cap} is {:.3} of the envelope's {base}, below the \
+                                 policy's min_motion_factor {} on a robot that balances",
+                                cap / base,
+                                policy.min_motion_factor
+                            ),
+                        ));
+                    }
+                }
             }
             // A planner order names none: the executor's default.
             let ttl = order.ttl_s.unwrap_or(ttl.default_s);

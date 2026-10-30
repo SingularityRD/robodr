@@ -114,6 +114,20 @@ impl SafetyOracle for ConnOracle<'_> {
     }
 }
 
+/// Whether an executor serves `path` now: a socket someone accepts on
+/// (`Ok(true)`), no socket or a stale one (`Ok(false)`); anything else
+/// cannot be told (`Err`). `robodr-executor rearm` works on the journal
+/// only while none runs (review finding 2).
+pub fn serving(path: &Path) -> Result<bool, String> {
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+            Ok(false)
+        }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 fn proto_text(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(200).collect()
 }
@@ -164,7 +178,19 @@ pub fn handle(
             let reason = format!("revert requested: {}", proto_text(&reason));
             Msg::Outcome {
                 outcome: Box::new(if crate::net::id_ok(&id) {
-                    lock(engine).revert_request(&id, &reason, soc.as_deref(), Now::system())
+                    // Lifting a safe_pause asks agentd for the safety
+                    // state now over this connection (review finding 1);
+                    // nothing else does.
+                    let mut g = lock(engine);
+                    let mut oracle = ConnOracle {
+                        reader: &mut reader,
+                        writer: &mut writer,
+                        key,
+                        request_nonce: &req.nonce,
+                        order_id: &id,
+                        nonces,
+                    };
+                    g.revert_request(&id, &reason, soc.as_deref(), &mut oracle, Now::system())
                 } else {
                     bad_id(&id)
                 }),
@@ -218,17 +244,10 @@ pub fn handle(
                     .count(),
             }
         }
-        Msg::Rearm { reason } => {
-            let r =
-                lock(engine).rearm(&format!("operator: {}", proto_text(&reason)), Now::system());
-            match r {
-                Ok(was_disabled) => Msg::Rearmed { was_disabled },
-                Err(e) => Msg::Error {
-                    code: "journal".into(),
-                    message: proto_text(&e),
-                },
-            }
-        }
+        // Review finding 2: there is no `rearm` on this socket. agentd
+        // holds its key; ending an operator's emergency disable is the
+        // operator's, on the host, with the executor stopped
+        // (`robodr-executor rearm`).
         _ => Msg::Error {
             code: "unexpected_message".into(),
             message: "not a request".into(),

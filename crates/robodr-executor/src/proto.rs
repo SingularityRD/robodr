@@ -20,9 +20,14 @@
 //! agentd → safety{state,age}  executor → outcome{...}
 //! agentd → events{since,anchor?} [executor → confirm{"rearm"} → agentd safety{..}, only while
 //!                              actions are held after a reboot]   executor → event_list{events,head}
-//! agentd → revert{id,reason,soc?} / status / ping   executor → outcome / pong
-//! operator (CLI) → rearm{reason}    executor → rearmed{was_disabled}
+//! agentd → revert{id,reason,soc?}  [executor → confirm{id} → agentd safety{..}, only to
+//!                              lift an active safe_pause]   executor → outcome
+//! agentd → status / ping   executor → outcome / pong
 //! ```
+//!
+//! There is no `rearm` message (review finding 2): agentd holds this key,
+//! and ending an operator's emergency disable is the operator's alone
+//! (`robodr-executor rearm`, on the journal, with the executor stopped).
 //!
 //! A request line must arrive whole within [`crate::server::MESSAGE_DEADLINE`]
 //! (an absolute deadline, not one per read), and nonces are remembered on
@@ -90,10 +95,6 @@ pub enum Msg {
         anchor: Option<JournalHead>,
     },
     Ping,
-    /// The operator re-arms the executor after an emergency disable.
-    Rearm {
-        reason: String,
-    },
     // executor → agentd
     Confirm {
         id: String,
@@ -118,9 +119,6 @@ pub enum Msg {
         journal_reset: bool,
         #[serde(default)]
         held: usize,
-    },
-    Rearmed {
-        was_disabled: bool,
     },
     Error {
         code: String,
@@ -264,6 +262,18 @@ pub fn seal(
     msg: &Msg,
 ) -> Result<Vec<u8>, String> {
     let text = serde_json::to_string(msg).map_err(|e| e.to_string())?;
+    seal_text(key, now_ms, nonce, reply_to, text)
+}
+
+/// [`seal`] of a message already encoded (tests send messages no longer
+/// in [`Msg`]).
+pub(crate) fn seal_text(
+    key: &Key,
+    now_ms: u64,
+    nonce: &str,
+    reply_to: &str,
+    text: String,
+) -> Result<Vec<u8>, String> {
     let mac = to_hex(&key.mac(now_ms, nonce, reply_to, &text));
     let env = Envelope {
         v: VERSION.into(),

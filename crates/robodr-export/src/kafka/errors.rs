@@ -69,9 +69,19 @@ pub fn classify(code: i16) -> ErrorClass {
         | FENCED_LEADER_EPOCH
         | UNKNOWN_LEADER_EPOCH => Retriable { refresh: true },
         // UNKNOWN_SERVER_ERROR is not retriable in the Java client; we retry
-        // it (bounded): delivery is at-least-once anyway.
+        // it (bounded): delivery is at-least-once anyway. CORRUPT_MESSAGE
+        // (a CRC mismatch) means the bytes were damaged on the way: the
+        // batch is re-sent as it is, never blamed on its records.
+        // INVALID_TIMESTAMP: the record CreateTime is the producer host's
+        // clock (the publisher stamps every record with the time it sends
+        // it), so a refusal means that clock is off by more than the
+        // broker's `log.message.timestamp.before/after.max.ms` (Kafka 4.0:
+        // 1 h ahead): no record is at fault, every record would be refused
+        // alike. Retried (bounded), then the call fails with a hint
+        // ([`hint`]) and nothing is dead-lettered or committed.
         UNKNOWN_SERVER_ERROR
         | CORRUPT_MESSAGE
+        | INVALID_TIMESTAMP
         | REQUEST_TIMED_OUT
         | NOT_ENOUGH_REPLICAS
         | NOT_ENOUGH_REPLICAS_AFTER_APPEND
@@ -80,11 +90,25 @@ pub fn classify(code: i16) -> ErrorClass {
         | COORDINATOR_LOAD_IN_PROGRESS
         | COORDINATOR_NOT_AVAILABLE
         | NOT_COORDINATOR => Retriable { refresh: false },
-        MESSAGE_TOO_LARGE | RECORD_LIST_TOO_LARGE | INVALID_RECORD | INVALID_TIMESTAMP => Record,
+        MESSAGE_TOO_LARGE | RECORD_LIST_TOO_LARGE | INVALID_RECORD => Record,
         OUT_OF_ORDER_SEQUENCE_NUMBER | UNKNOWN_PRODUCER_ID | INVALID_PRODUCER_EPOCH
         | PRODUCER_FENCED => Sequence,
         DUPLICATE_SEQUENCE_NUMBER => Duplicate,
         _ => Fatal,
+    }
+}
+
+/// What an operator should check for `code`, if it points at something
+/// outside the record (appended to the error / log line).
+pub fn hint(code: i16) -> Option<&'static str> {
+    match code {
+        INVALID_TIMESTAMP => Some(
+            "the broker refused the record timestamps (CreateTime = this host's clock): \
+             check the clock of the publishing host (NTP) against the brokers' \
+             (log.message.timestamp.before.max.ms / after.max.ms; Kafka 4.0 refuses records \
+             more than 1 h ahead by default); nothing was dead-lettered or committed",
+        ),
+        _ => None,
     }
 }
 
@@ -143,6 +167,12 @@ mod tests {
         assert_eq!(classify(6), ErrorClass::Retriable { refresh: true });
         assert_eq!(classify(7), ErrorClass::Retriable { refresh: false });
         assert_eq!(classify(10), ErrorClass::Record);
+        // A skewed publisher clock is not the records' fault: never
+        // per-record (dead-lettering every record), retried then reported.
+        assert_eq!(classify(32), ErrorClass::Retriable { refresh: false });
+        assert!(hint(32).is_some_and(|h| h.contains("clock")));
+        assert_eq!(classify(2), ErrorClass::Retriable { refresh: false });
+        assert_eq!(hint(10), None);
         assert_eq!(classify(29), ErrorClass::Fatal);
         assert_eq!(classify(12345), ErrorClass::Fatal);
         assert_eq!(name(6), "NOT_LEADER_OR_FOLLOWER");

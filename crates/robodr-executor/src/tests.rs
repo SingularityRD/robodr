@@ -3367,3 +3367,67 @@ fn review3_r3_1_addresses_are_cut_whole_and_containment_matches_the_rules() {
     bad.target = target(&[], &many, false);
     assert!(bad.validate().is_err());
 }
+
+/// Review finding 2: the protocol socket accepted `rearm` from any holder
+/// of the link key, which agentd holds, so a compromised agentd could end
+/// the operator's emergency disable. A `rearm` sealed with the right key
+/// is now refused (no answer) and the executor stays disabled; the
+/// operator re-arms on the journal with the executor stopped.
+#[test]
+fn review_finding_2_no_rearm_on_the_agentd_socket() {
+    use std::io::{BufRead as _, Write as _};
+    let (_d, nft, client, stop, server) = served("f2-rearm", |_| {});
+    let i = sign_at(
+        unsigned(
+            "r-f2",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        now_s(),
+    );
+    let out = client
+        .submit(&i, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    nft.0.lock().unwrap().table = None;
+    let i2 = sign_at(
+        unsigned(
+            "r-f2b",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        now_s(),
+    );
+    let out = client
+        .submit(&i2, &mut || Ok((SafetyState::Idle, 3)))
+        .unwrap();
+    assert_eq!(refusal_code(&out), codes::OPERATOR_DISABLED, "{out:?}");
+    assert!(client.health().unwrap().operator_disabled);
+    // What a key holder (agentd) could send before the fix.
+    let key = crate::proto::Key::from_bytes([0x5a; 32]);
+    let n = crate::proto::new_nonce().unwrap();
+    let line = crate::proto::seal_text(
+        &key,
+        crate::proto::wall_ms(),
+        &n,
+        "",
+        r#"{"op":"rearm","reason":"agentd says so"}"#.into(),
+    )
+    .unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(&client.socket).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    s.write_all(&line).unwrap();
+    let mut answer = String::new();
+    let _ = std::io::BufReader::new(s).read_line(&mut answer);
+    assert!(!answer.contains("rearmed"), "{answer}");
+    let h = client.health().unwrap();
+    assert!(h.operator_disabled, "a key holder re-armed the executor");
+    assert!(crate::server::serving(&client.socket).unwrap());
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().unwrap();
+    // Stopped: the operator's journal re-arm (the CLI's path).
+    assert!(!crate::server::serving(&client.socket).unwrap());
+}

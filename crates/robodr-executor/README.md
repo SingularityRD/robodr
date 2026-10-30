@@ -156,8 +156,14 @@ revert / TTL expiry ── journal (reverting) ── re-render without it ─�
    periodic read-back. Every action is dropped as `removed_externally`,
    nothing is re-installed, and **every order is refused**
    (`operator_disabled`), also across restarts, until the operator runs
-   `robodr-executor rearm --config /etc/robodr/executor.json`. So the next
-   order or revert can never re-create the table the operator removed.
+   `robodr-executor rearm --config /etc/robodr/executor.json` as root
+   **with the executor stopped** (it works on the journal and refuses
+   while an executor serves the socket). The protocol socket has no
+   re-arm (review finding 2): agentd holds its key, and a compromised
+   agentd must not lift the operator's fence (nor acknowledge a
+   `journal_reset`). So the next order or revert can never re-create the
+   table the operator removed. A `safe_pause` in force is left paused (see
+   "Motion adapters").
 
 ## Motion adapters (Sprint 8)
 
@@ -184,18 +190,24 @@ Without the gateway, the level is advisory. A restriction limits commands
 decided after it is applied; a joint trajectory the controller already
 accepted keeps executing at its accepted speeds (use `safe_pause`).
 | `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel` | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
-| | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch |
+| | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch, **only** on the SOC's two-person signed revert with the safety state re-checked (never at TTL, restart or emergency disable) |
 | | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
 | `request_safe_state` | `px4` (hold, or RTL when the policy's `safe_state` is `return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
 | `rollback_config` | `rollback` (`config: program`) | the site's OEM-validated program, `--verify` afterwards | not reversible: `applied`; `config: profile` is refused (`not_executor_action`: the profile's anti-rollback chain) |
 
-Gates, in order after the common ones (refusal codes): the action refused
+Gates, in order after the common ones (refusal codes): a
+`restrict_motion` without a human's approval on a robot that falls when
+de-energised (humanoid, unspecified; ADR-0012 rule 3) or with
+`require_approval_for_all_containment` (`needs_approval`; review finding
+4); the action refused
 for the morphology (`fall_hazard`: a pause / safe state on a humanoid,
 a rollback on a robot that balances); **two people** for `safe_pause`,
 `request_safe_state` and `rollback_config` — the SOC-signed body's
 `approved_by` names at least two different people, neither the requester
 (names `[A-Za-z0-9._%+@-]{1,100}`, compared case-insensitively, the
-requester's too; a name outside that grammar refuses the order:
+requester's too (review finding 7: `alice` plus an invisible character
+or a Cyrillic letter is not a requester distinct from `alice`); a name
+outside that grammar refuses the order:
 `approval_missing`; checked when the executor authenticates the order;
 the on-robot planner can never order them; a revert of a `safe_pause`
 needs two too); an adapter configured (`no_adapter`) and validated
@@ -207,8 +219,14 @@ safety system does not own, a pause or safe state not while
 `rollback_config` only `idle` (`requires_idle`); the policy's safe
 behaviour one the adapter can carry out (`behaviour_unsupported`); the
 restriction's parameters (`invalid_order`, also for a `workspace_zone`,
-which no adapter can enforce; a factor below
-`min_motion_factor` on a balancing robot: `fall_hazard`). A control-plane
+which no adapter can enforce; an absolute cap, `max_linear_speed` /
+`max_joint_speed`, from the on-robot planner, which orders a factor
+only; a factor below `min_motion_factor` on a balancing robot:
+`fall_hazard`, and there an absolute cap below `min_motion_factor` of
+`motion.envelope` (the profile envelope's speeds), or with no envelope
+configured: it cannot be converted to a factor; review finding 3). The
+gateway applies the same floor on its own (0.05 of each channel's limit
+on a robot that balances). A control-plane
 order carries the parameters in its target (`{"kind": "motion", ...}`),
 which must equal the signed body's (`order_mismatch`); the planner's
 `limit_motion` becomes a `restrict_motion` with its factor and the
@@ -216,11 +234,28 @@ default TTL.
 
 Lifecycle: a reversible action is journalled (`applying`) before the
 adapter is called and committed (`active`) after its read-back; a failed
-apply is undone and answered `failed`. TTL expiry, a revert, restart
-reconciliation (expired, interrupted or reverting entries), an operator's
-emergency disable and a failed re-arm after a reboot call the adapter's
-undo; a failed undo leaves the action `reverting` and is retried every
-tick. After a reboot a held motion action is re-applied only when re-armed
+apply is undone and answered `failed`. For a `restrict_motion`, TTL
+expiry, a revert, restart reconciliation (expired, interrupted or
+reverting entries), an operator's emergency disable and a failed re-arm
+after a reboot call the adapter's undo; a failed undo leaves the action
+`reverting` and is retried every tick.
+
+**A `safe_pause` is never lifted automatically** (ADR-0006; review
+finding 1): its undo may set the robot moving (ros2_control re-activates
+the motion controllers). At `motion.safe_pause_ttl_s` the executor reports
+it once (event `expired`, detail `HIGH: ...`) and leaves it `active`; a
+restart (expired, interrupted or reverting entries), an operator's
+emergency disable, a failed apply, journal commit or re-arm never call
+its undo either (event `refused` / `reverted` with detail `HIGH: ...`:
+check the platform, an operator restores it). It is lifted only by the
+SOC's signed revert with two approvers, and only when the safety state
+agentd reports at that moment (asked over the revert's connection) is
+known, fresh, not engaged and one the pause's adapter allows; otherwise
+the revert is refused (`safety_system_engaged`,
+`safety_state_unavailable`, `safety_state_stale`,
+`safety_state_not_allowed`) and the pause stays. A lift whose undo fails
+puts it back to `active` (not retried: a new signed revert re-checks the
+safety state). After a reboot a held motion action is re-applied only when re-armed
 (fresh safety state, and one its adapters allow: a `safe_pause` held while
 the robot moves fast stays held until it does not). The periodic read-back re-writes a restriction the
 gateway no longer reports. Non-reversible actions are journalled as an
@@ -241,7 +276,12 @@ socket). PX4: only a `COMMAND_ACK` naming the executor's own
 fields zero is not confirmed: the call fails), and the mode is confirmed
 by the vehicle's `HEARTBEAT`. The rollback program receives the version
 as one `--to-version=<v>` argument; a version starting with `-` is
-refused (`invalid_order`).
+refused (`invalid_order`). It must be a regular file (not a symlink)
+owned by root and not writable by group or others, in a directory with
+the same properties (review finding 8; otherwise the rollback fails and
+nothing runs), and it is started with the executor's ambient capabilities
+cleared (`prctl(PR_CAP_AMBIENT_CLEAR_ALL)` between `fork` and `exec`): it
+never inherits `CAP_NET_ADMIN`.
 
 Protocols (implemented here, std only): a minimal RTPS 2.3 participant
 (`src/motion/rtps.rs`: SPDP / SEDP announcements to one configured peer,
@@ -482,8 +522,11 @@ wrong locator can only make a quarantine miss, refuse, or drop a DDS
 endpoint inside `network.quarantine.cidrs`). It **cannot** obtain an
 action no SOC key holder approved, change what was approved (action,
 target, TTL), use an approval twice, use one signed for another robot,
-turn a planner order into an approved one, or lift an action the SOC
-approved without the SOC's signed revert (F3). It can still let a TTL run
+turn a planner order into an approved one, lift an action the SOC
+approved without the SOC's signed revert (F3), lift a `safe_pause` while
+the safety state it reports forbids it (it can lie about that state, see
+above), or end the operator's emergency disable (there is no `rearm` on
+its socket; review finding 2). It can still let a TTL run
 out (it cannot shorten one) and run the planner's own actions. Everything stays bounded by the executor's own rules
 (reversible, TTL-bounded network restrictions; never a `low_level` entry;
 never an action that may de-energise; never while the safety system is
@@ -506,9 +549,13 @@ reply to its request) and the exact message text. One connection carries
 one exchange: `submit` → `confirm` → `safety` → `outcome`, or `revert`,
 `status`, `events` or `ping`. While actions are held after a reboot,
 `events` (agentd polls every second) is answered with a `confirm` first:
-agentd's safety state then decides whether they are re-armed. The
-operator's `rearm` (CLI) has its own message. Details are in
-`src/proto.rs`.
+agentd's safety state then decides whether they are re-armed. A `revert`
+that would lift an active `safe_pause` is also answered with a `confirm`
+first (after its SOC signature verified): the pause is lifted only with a
+fresh, known safety state that is not engaged and that its adapter allows
+(`Client::revert_with_safety`). There is no `rearm` message (review
+finding 2: the operator re-arms on the journal with the executor
+stopped). Details are in `src/proto.rs`.
 
 Housekeeping (TTL, revert retries, read-back) runs on its own thread,
 independent of every connection. At most 8 connections are served at
@@ -696,8 +743,9 @@ and `src/config.rs` for every field and its limits. agentd's side is the
     wrong key and a changed safety state; orders a key holder forges
     (no SOC request, another SOC key, a stretched TTL) change nothing in
     the kernel's ruleset and the matching signed order is applied; held actions are re-armed only
-    through an event poll with a fresh safety state; `rearm` ends an
-    emergency disable.
+    through an event poll with a fresh safety state; a `rearm` sealed with
+    the protocol key is refused (the operator re-arms on the journal with
+    the executor stopped).
   * Review regressions (`h1_*` … `m6_*`, `l2_*`, `l5_*`): a GUID-only
     protected entry opens nothing (RTPS with that prefix from a host
     outside every allow-list is dropped both ways); a quarantine never
@@ -827,7 +875,8 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   offline); discovery was tested with real UDP multicast to
   239.255.0.1:7400/7401 between namespaces.
 * **Emergency disable** is `nft delete table inet robodr`, followed by
-  `robodr-executor rearm` to execute orders again.
+  `systemctl stop robodr-executor`, `robodr-executor rearm` and a start to
+  execute orders again.
   `systemctl stop robodr-executor` alone keeps the active actions until
   their revert or TTL at the next start. A failed run deletes the table
   (`stop-cleanup`). On package removal, `prerm` deletes the table; a

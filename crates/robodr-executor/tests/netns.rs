@@ -1890,7 +1890,7 @@ fn l4_m3_rearm_through_the_protocol() {
     // Reboot.
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
     let engine = Engine::open(
-        cfgr,
+        cfgr.clone(),
         policy(Morphology::WheeledMobile, &[]),
         Box::new(lab.nft()),
         "boot-2",
@@ -1939,18 +1939,24 @@ fn l4_m3_rearm_through_the_protocol() {
         .unwrap();
     assert_eq!(out.refusal.unwrap().code, codes::OPERATOR_DISABLED);
     assert!(client.health().unwrap().operator_disabled);
-    assert!(client.rearm("lab").unwrap());
-    assert!(!client.health().unwrap().operator_disabled);
-    let q2 = sign_at(
-        order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile),
-        robodr_executor::proto::wall_ms() / 1000,
-    );
-    let out = client
-        .submit(&q2, &mut || Ok((SafetyState::Idle, 2)))
-        .unwrap();
-    assert_eq!(out.status, Status::Verified, "{out:?}");
+    // Review finding 2: the protocol socket has no re-arm (agentd holds its
+    // key); the operator re-arms on the journal with the executor stopped.
+    assert!(robodr_executor::server::serving(&cfgr.config.socket).unwrap());
     stop.store(true, Ordering::SeqCst);
     server.join().unwrap();
+    assert!(!robodr_executor::server::serving(&cfgr.config.socket).unwrap());
+    let mut e = Engine::open(
+        cfgr,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-2",
+        now(),
+    )
+    .unwrap();
+    assert!(e.rearm("lab", now()).unwrap());
+    let q2 = order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let out = submit(&mut e, &q2, &mut idle(), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
 }
 
 /// IPv6 (this kernel may have none: the rules are still loaded and read

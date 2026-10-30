@@ -28,12 +28,17 @@
 //!   at-least-once: a request whose response is lost (time out,
 //!   disconnect) is re-sent, and the broker may then hold it twice.
 //!   Consumers deduplicate on `event-uid` (contract §2) either way.
-//! * Retriable errors (leader moves, timeouts, not enough replicas, I/O)
-//!   are retried with exponential backoff, refreshing metadata when the
-//!   error says leadership may have changed; a call that makes no progress
-//!   for `retries` rounds, or exceeds `delivery_timeout`, fails without
-//!   reporting anything as delivered that was not acknowledged.
-//! * Record-level errors (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`, ...) are
+//! * Retriable errors (leader moves, timeouts, not enough replicas, I/O,
+//!   `CORRUPT_MESSAGE`) are retried with exponential backoff, refreshing
+//!   metadata when the error says leadership may have changed; a call that
+//!   makes no progress for `retries` rounds, or exceeds `delivery_timeout`,
+//!   fails without reporting anything as delivered that was not
+//!   acknowledged. `INVALID_TIMESTAMP` is retried the same way and never
+//!   blamed on a record: the CreateTime is this host's clock, so the
+//!   error means the clock is off (the failure says so; see
+//!   [`super::errors::hint`]).
+//! * Record-level errors (`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`,
+//!   `INVALID_RECORD`) are
 //!   narrowed down by halving that partition's batch until it is accepted
 //!   or holds one record (as the Java client splits a batch on
 //!   `MESSAGE_TOO_LARGE`); the halved size is kept for the rest of the call,
@@ -85,6 +90,13 @@
 //!   in [`ProducerStats::producer_id_resets`]). A batch of another
 //!   partition that was in doubt at that moment (its response lost) may
 //!   then be written twice: at-least-once, never a loss.
+//! * A record-level error on a batch that is being **re-sent** (an earlier
+//!   copy got no decisive answer) also resets the producer id instead of
+//!   giving the batch's sequences back: the earlier copy may have been
+//!   appended (Kafka validates records before it looks for duplicates), and
+//!   a later batch reusing those sequences would be answered
+//!   `DUPLICATE_SEQUENCE_NUMBER`, i.e. reported delivered but never
+//!   written. A batch sent once and refused frees its sequences.
 //! * InitProducerId `CLUSTER_AUTHORIZATION_FAILED` is fatal and says why:
 //!   brokers before Kafka 3.0 require the `IDEMPOTENT_WRITE` cluster ACL
 //!   (3.0+ imply it from `WRITE` on a topic); grant it, or turn
@@ -1547,7 +1559,10 @@ impl Producer {
             .cfg
             .max_request_bytes
             .saturating_sub(self.request_overhead(topic));
-        let mut plan: Vec<(i32, Vec<usize>, ProducerFields)> = Vec::new();
+        // `(partition, record indices, fields, re-send)`: a re-send is a batch
+        // that was sent before without a decisive answer (lost reply, retriable
+        // error, resumed journal), so the broker may already hold it.
+        let mut plan: Vec<(i32, Vec<usize>, ProducerFields, bool)> = Vec::new();
         let mut numbered: Vec<i32> = Vec::new();
         for &p in parts {
             if budget < Self::PART_OVERHEAD {
@@ -1571,6 +1586,7 @@ impl Producer {
                             producer_epoch: f.producer_epoch,
                             base_sequence: f.base_sequence,
                         },
+                        true,
                     ));
                     continue;
                 }
@@ -1631,7 +1647,7 @@ impl Producer {
                 );
                 numbered.push(p);
             }
-            plan.push((p, take, fields));
+            plan.push((p, take, fields, false));
         }
         if plan.is_empty() {
             return Ok(res);
@@ -1653,7 +1669,7 @@ impl Producer {
             }
         }
         let mut batches = Vec::with_capacity(plan.len());
-        for (p, idx, fields) in &plan {
+        for (p, idx, fields, _) in &plan {
             let recs: Vec<ProduceRecord> = idx
                 .iter()
                 .filter_map(|&i| records.get(i))
@@ -1706,7 +1722,7 @@ impl Producer {
                 return Ok(res);
             }
         };
-        for (p, idx, fields) in plan {
+        for (p, idx, fields, resent) in plan {
             let pr = resp
                 .topics
                 .iter()
@@ -1751,17 +1767,21 @@ impl Producer {
                     // that is only too large as a whole (the topic's
                     // `max.message.bytes` below `max_request_bytes`) settles
                     // on a size that fits instead of one record per request.
-                    // Nothing was appended: its sequences are free again.
+                    // This request appended nothing; see `release` for the
+                    // sequences.
                     call.limits.insert(p, idx.len() / 2);
-                    self.unnumber(call, p, fields);
+                    self.release(call, p, fields, resent);
                     res.progress = true;
                 }
                 ErrorClass::Record => {
-                    self.unnumber(call, p, fields);
+                    self.release(call, p, fields, resent);
                     call.remove_from_queue(p, &idx);
                     call.limits.remove(&p);
-                    // `idx` is a non-empty plan entry; a missing slot only
-                    // leaves the record undecided (retried), never aborts.
+                    // A one-record batch (`idx.len() == 1` here), so the
+                    // slot exists. Were it missing, the record would end
+                    // as `Rejected` "internal: no outcome" (it left the
+                    // queue above): reported, never silently dropped, and
+                    // the call is not aborted.
                     if let Some(slot) = idx.first().and_then(|&i| call.out.get_mut(i)) {
                         *slot = Some(Outcome::Rejected {
                             code: pr.error_code,
@@ -1784,8 +1804,11 @@ impl Producer {
                 ErrorClass::Retriable { refresh } => {
                     self.stale |= refresh;
                     res.trouble = Some(format!(
-                        "partition {p} on broker {leader}: {}",
-                        errors::name(pr.error_code)
+                        "partition {p} on broker {leader}: {}{}",
+                        errors::name(pr.error_code),
+                        errors::hint(pr.error_code)
+                            .map(|h| format!(" ({h})"))
+                            .unwrap_or_default()
                     ));
                 }
                 ErrorClass::Sequence if idem_on => {
@@ -1813,9 +1836,51 @@ impl Producer {
         Ok(res)
     }
 
-    /// The batch planned for `p` with `fields` was refused as a whole
-    /// (nothing appended): free its sequences, unless a reset or another
-    /// batch intervened.
+    /// The batch planned for `p` with `fields` was refused with a
+    /// record-level error. This request appended nothing, but a **re-sent**
+    /// batch (`resent`: an earlier copy got no decisive answer) may have
+    /// been appended by that earlier copy: Kafka validates records (size,
+    /// timestamps, ...) before it looks for duplicates, so a topic limit
+    /// lowered in between refuses the copy of a batch it already holds.
+    /// Rewinding its sequences would hand them to the next batch, which the
+    /// broker would then answer `DUPLICATE_SEQUENCE_NUMBER` (reported
+    /// delivered, never written). So a re-sent batch never gives its
+    /// sequences back: the producer id is reset instead (as on a sequence
+    /// error; at worst a duplicate, never a loss). A batch sent once only
+    /// frees its sequences ([`Producer::unnumber`]).
+    fn release(&mut self, call: &mut Call<'_, '_>, p: i32, fields: ProducerFields, resent: bool) {
+        if !resent {
+            self.unnumber(call, p, fields);
+            return;
+        }
+        let ours = call.fixed.get(&p).is_some_and(|f| {
+            (f.producer_id, f.producer_epoch, f.base_sequence)
+                == (
+                    fields.producer_id,
+                    fields.producer_epoch,
+                    fields.base_sequence,
+                )
+        });
+        if !ours {
+            return;
+        }
+        if self
+            .idem
+            .take_if(|s| {
+                (s.producer_id, s.producer_epoch) == (fields.producer_id, fields.producer_epoch)
+            })
+            .is_some()
+        {
+            self.stats.producer_id_resets += 1;
+        }
+        // Every batch numbered under the old id is renumbered under the new
+        // one (as after a sequence error).
+        call.fixed.clear();
+    }
+
+    /// The batch planned for `p` with `fields` was refused as a whole and
+    /// was never sent before (nothing appended): free its sequences, unless
+    /// a reset or another batch intervened.
     fn unnumber(&mut self, call: &mut Call<'_, '_>, p: i32, fields: ProducerFields) {
         let ours = call.fixed.get(&p).is_some_and(|f| {
             (f.producer_id, f.producer_epoch, f.base_sequence)

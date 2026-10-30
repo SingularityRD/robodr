@@ -599,6 +599,91 @@ fn halving_reuses_the_refused_sequences() {
     assert_eq!(next, 40);
 }
 
+/// Review finding: a batch whose reply was lost is re-sent; if the copy is
+/// refused with a record-level error (Kafka validates records before it
+/// looks for duplicates, e.g. after the topic's `max.message.bytes` was
+/// lowered), the first copy may already be in the log. Its sequences must
+/// not be handed to the next batch, which the broker would answer as a
+/// duplicate: reported delivered, never written. The producer id is reset
+/// instead.
+#[test]
+fn record_error_on_a_resent_batch_never_reuses_its_sequences() {
+    for dup_code in [false, true] {
+        let c = Cluster::start(1, 1);
+        c.state.lock().unwrap().dup_error_code = dup_code;
+        // Appended, reply lost; the re-send is refused as a record.
+        c.script([Action::DisconnectAfterAppend, Action::Error(10)]);
+        let mut p = Producer::new(cfg(&c)).unwrap();
+        let out = p.send(TOPIC, &[(0, rec(0, 10))]).unwrap();
+        assert!(matches!(out[0], Outcome::Rejected { code: 10, .. }));
+        assert_eq!(order(&c, 0), vec![0], "the first copy was appended");
+        // The next record must really be written.
+        let out = p.send(TOPIC, &[(0, rec(1, 10))]).unwrap();
+        assert_eq!(delivered(&out), 1);
+        assert_eq!(
+            order(&c, 0),
+            vec![0, 1],
+            "record 1 reported delivered must be in the log (dup_code {dup_code})"
+        );
+        assert_eq!(c.state.lock().unwrap().duplicates, 0);
+        assert_eq!(p.stats().producer_id_resets, 1);
+        assert_eq!(c.init_pid_requests(), 2);
+        assert_eq!(appended(&c)[1], (0, 1001, 0, 0, 1));
+    }
+}
+
+/// The same for a re-sent batch that is halved: no later batch may reuse
+/// the in-doubt sequences either.
+#[test]
+fn halving_a_resent_batch_resets_the_producer_id() {
+    let c = Cluster::start(1, 1);
+    c.script([Action::DisconnectAfterAppend, Action::Error(10)]);
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    let out = p.send(TOPIC, &recs(4, 1)).unwrap();
+    // Halved and sent under a new producer id: a duplicate of what the
+    // first copy appended, never a loss.
+    assert_eq!(delivered(&out), 4);
+    assert_eq!(order(&c, 0), vec![0, 1, 2, 3, 0, 1, 2, 3]);
+    assert_eq!(p.stats().producer_id_resets, 1);
+    let out = p.send(TOPIC, &recs(2, 1)).unwrap();
+    assert_eq!(delivered(&out), 2);
+    assert_eq!(c.total(), 10, "every record reported delivered is written");
+}
+
+/// Review finding: INVALID_TIMESTAMP means the publishing host's clock is
+/// off (it stamps every record): retried, then the call fails with a hint;
+/// no record is reported rejected.
+#[test]
+fn invalid_timestamp_is_never_blamed_on_a_record() {
+    let c = Cluster::start(1, 1);
+    {
+        let mut st = c.state.lock().unwrap();
+        st.timestamp_after_max_ms = Some(3_600_000);
+        // `rec` stamps a fixed time; put the broker's clock 2 h behind it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        st.clock_offset_ms = 1_790_000_000_000 - now - 7_200_000;
+    }
+    let mut cf = cfg(&c);
+    cf.retries = 2;
+    let mut p = Producer::new(cf).unwrap();
+    let e = p.send(TOPIC, &recs(3, 1)).unwrap_err();
+    let m = e.to_string();
+    assert!(matches!(e, ProduceError::RetriesExhausted(_)), "{m}");
+    assert!(
+        m.contains("INVALID_TIMESTAMP") && m.contains("clock"),
+        "{m}"
+    );
+    assert_eq!(p.stats().rejected, 0);
+    assert_eq!(c.total(), 0);
+    // Clock fixed: the same records go through.
+    c.state.lock().unwrap().clock_offset_ms = 0;
+    c.state.lock().unwrap().timestamp_after_max_ms = None;
+    assert_eq!(delivered(&p.send(TOPIC, &recs(3, 1)).unwrap()), 3);
+}
+
 type Saved = std::sync::Arc<std::sync::Mutex<Vec<(IdempotentState, SendJournal)>>>;
 
 fn saver(saved: &Saved) -> impl FnMut(&IdempotentState, &SendJournal) -> Result<(), String> + '_ {

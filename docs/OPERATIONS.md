@@ -1807,11 +1807,20 @@ The executor detects the missing table before its next transaction (a
 new order, a revert, a TTL expiry) or within `verify_interval_s`. It drops
 every action as `removed_externally`, re-installs nothing, also not after a
 restart within the same boot, and **refuses every order**
-(`operator_disabled`) until you re-arm it:
+(`operator_disabled`) until you re-arm it, as root, with the executor
+stopped (the socket agentd uses has no re-arm: agentd holds its key, and
+a compromised agentd must not be able to lift your fence; `rearm` refuses
+while an executor serves the socket):
 
 ```sh
+systemctl stop robodr-executor
 robodr-executor rearm --config /etc/robodr/executor.json --reason "<why>"
+systemctl start robodr-executor
 ```
+
+A `safe_pause` in force is **not** undone by the emergency disable (nor by
+anything else but a two-person signed revert, below): the robot stays
+paused; restore it on the platform once it is safe to move.
 
 To keep it from acting at all:
 
@@ -1961,14 +1970,39 @@ To enable:
    both `unitree_sport` and `gateway` for `restrict_motion`, list
    `unitree_sport` first (enforced).
 
-What to expect: `restrict_motion` and `safe_pause` answer `verified` and
-are lifted at their TTL (`motion.safe_pause_ttl_s` for a pause) or by
-revert; lifting a pause **releases** it and never resumes a mission
-(Nav2 goals are not restored, PX4 stays in hold); `request_safe_state` and
-`rollback_config` answer `applied` and are not reversible. A pause or safe
-state is refused while `moving_fast` unless the adapter lists it in
-`allowed_states`. Watch the executor's events: an adapter undo that fails
-(`revert_failed`) is retried every tick; check the platform by hand.
+7. On a robot that balances (humanoid, quadruped, unspecified), set
+   `motion.envelope` (`max_linear_speed`, `max_joint_speed`: the profile
+   envelope's) if the SOC sends absolute caps: a cap is accepted only when
+   it is at least the policy's `min_motion_factor` of it, and refused
+   (`fall_hazard`) without an envelope. The planner's `limit_motion` is a
+   factor; a planner order with an absolute cap is refused
+   (`invalid_order`). The gateway applies the same floor on its own (0.05
+   of each channel's limit; a restriction file below it is ignored and
+   reported as `restriction_error`).
+8. `rollback.program` must be a regular file owned by root and not
+   writable by group or others, in a directory with the same properties
+   (otherwise the rollback fails and nothing runs). It runs without the
+   executor's ambient `CAP_NET_ADMIN`.
+
+What to expect: `restrict_motion` answers `verified` and is lifted at its
+TTL or by revert. On a humanoid (or unspecified body), and on every robot
+with `require_approval_for_all_containment`, a `restrict_motion` needs
+a human's approval: the planner's is refused (`needs_approval`).
+`safe_pause` answers `verified` and is **never lifted automatically**
+(ADR-0006): when it reaches `motion.safe_pause_ttl_s` the executor reports
+it (event `expired`, detail `HIGH: ...`) and leaves the robot paused; a
+restart, an emergency disable, a failed apply or re-arm leave it paused
+too. It is lifted only by the SOC's signed revert with two approvers, and
+only when agentd's safety state at that moment is known, fresh, not
+engaged and one the adapter allows (otherwise the revert is refused and
+the pause stays). Lifting a pause **releases** it and never resumes a
+mission (Nav2 goals are not restored, PX4 stays in hold);
+`request_safe_state` and `rollback_config` answer `applied` and are not
+reversible. A pause or safe state is refused while `moving_fast` unless
+the adapter lists it in `allowed_states`. Watch the executor's events: an
+adapter undo that fails (`revert_failed`) is retried every tick (a pause's
+failed lift is not retried: it stays in force until the next signed
+revert); check the platform by hand.
 
 ### 6.6 Inline Motion Firewall gateway (`robodr-firewall-gw`)
 
@@ -2378,8 +2412,13 @@ packs one diode batch per step with `robodr-diode-pack`'s format (Ed25519
 key file, section 4.4; `--allow-hmac` only for legacy keys) and moves the
 records to `acked/` only once the batch is durably in the outbox; an intent
 journal makes every crash point recoverable without loss or re-packing.
-Invalid records go to `<spool>/rejected/` with a reason file, kept by
-default; `--rejected-max-age-s`, `--rejected-max-count` and
+Invalid records go to `<spool>/rejected/` with a reason file (written
+before the move, so a crash never leaves a record without one), kept by
+default. A spool file that cannot be read (an I/O error such as `EACCES` or
+`EIO`, three attempts) is moved there too with the error as its reason
+(`quarantined_unreadable` in the JSON report) instead of failing every run:
+fix the cause (permissions, disk) and move it back to `ready/` to re-drive.
+ `--rejected-max-age-s`, `--rejected-max-count` and
 `--rejected-max-bytes` (0 = no bound) delete the oldest ones beyond the
 bounds after each run, each with its reason file (a rejected record is never
 packed again, so only its forensic copy goes).
@@ -2392,7 +2431,16 @@ with, `findings.topic`, and records relabelled to `--topic` are counted),
 upgrades unsigned contract 1.x records to 2.0 and dead-letters signed
 ones (section 7), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
-broker-rejected records go to a dead-letter file. The producer is
+broker-rejected records go to a dead-letter file. A spool file that cannot
+be read (I/O error, three attempts) is dead-lettered with the error and
+moved to `<spool>/rejected/` (`quarantined_unreadable`; move it back to
+`ready/` once fixed). **Clock:** every record is stamped with the
+publishing host's clock (Kafka CreateTime); Kafka 4.0 refuses records more
+than 1 h ahead of the broker (`log.message.timestamp.after.max.ms`) with
+`INVALID_TIMESTAMP`. The publisher never dead-letters for that: the run
+fails with "check the clock of the publishing host (NTP)", nothing is
+committed, and it retries every `--interval-ms` until the clock is fixed.
+Run NTP on the publishing host. The producer is
 **idempotent** by default: it takes a producer id (InitProducerId) and
 numbers every batch, a batch re-sent after a lost acknowledgement is dropped
 by the broker, and the producer id, sequences and the batches of the chunk
@@ -2411,15 +2459,25 @@ consumers drop duplicates on `event-uid`). Without `--once` it loops every
 `--done-max-age-s` (default 2592000 = 30 days; 0 = keep) or beyond
 `--done-max-count` are deleted, but never while their batch is still in
 the importer's `out/` (the marker is what stops it being published again):
-prune `out/` and the markers follow. `dead-letter.jsonl` rotates at
-`--dead-letter-max-bytes` (default 64 MiB; 0 = one growing file) keeping
-`--dead-letter-keep` rotated files (default 4), optionally also bounded by
-`--dead-letter-max-age-s`; a rotated file over the bounds is deleted only
-when none of its entries is still needed for deduplication (diode batch not
+prune `out/` and the markers follow.
+
+Dead letters: **`robodr-kafka-publish` keeps `dead-letter.jsonl` as one
+growing file and never deletes it by default**: its entries are the
+findings Kafka refused or that failed validation, and for diode input they
+are usually the only copy left. Watch its size (it grows only with refused
+records) and archive it off the host as you would `rejected/`. Rotation is
+opt-in there (`--dead-letter-max-bytes N`, e.g. 67108864, with
+`--dead-letter-keep N`, default 4); `robodr-uplink` rotates by default at
+64 MiB keeping 4. With rotation, optionally also bounded by
+`--dead-letter-max-age-s`, a rotated file over the bounds is **deleted**
+once none of its entries is still needed for deduplication (diode batch not
 done, spool file still in `ready/`, re-injected generation not done) and is
 otherwise held and reported (`pruned_dead_letters.held` in the JSON
-report). Copy dead letters off the host before they age out if you need
-them for longer; deleted dead letters can no longer be re-injected.
+report). Every deletion of a file holding entries is logged on stderr
+(`WARNING: deleted rotated dead-letter file ... holding N dead-lettered
+record(s)`) and counted (`pruned_dead_letters.removed_entries`). Copy dead
+letters off the host before they age out if you need them for longer;
+deleted dead letters can no longer be re-injected.
 
 **TLS, mutual TLS, SASL/SCRAM.** TLS is required: `--tls-ca FILE` (PEM,
 the only trust anchors) makes every broker connection TLS and verifies
@@ -2634,8 +2692,9 @@ original and dead-letter copy are both gone.
 
 Dead letters: `dead-letter.jsonl` rotates at 64 MiB, keeping 4 rotated
 files (`--dead-letter-max-bytes`, `--dead-letter-keep`; older rotated files
-are deleted once nothing in them is needed for deduplication, see
-"Retention of the state directory" above); a line torn by a
+are deleted once nothing in them is needed for deduplication, each such
+deletion logged with its entry count, see "Retention of the state
+directory" above); a line torn by a
 power loss is closed and counted (`dead_letter_malformed`), never merged
 with the next entry.
 
@@ -2653,6 +2712,7 @@ Troubleshooting (journal, `journalctl -u robodr-uplink`):
 | dead letters with `robot_mismatch` | the findings name another robot than the key is bound to (a sensor box watching several robots needs a `relay` key, or one uplink per robot); then re-inject |
 | dead letters with `site_mismatch` | a site-scoped `relay` key sent a robot not registered with its site: fix the robot's site or the key's scope, then re-inject |
 | dead letters with code `local` | the record failed RoboDR's own validation before sending (see `reason`) |
+| dead letters with reason `unreadable (I/O error after 3 attempts: ...)`, `quarantined_unreadable` in the status file | a spool file could not be read (permissions, disk error); it was moved to `<spool>/rejected/`: fix the cause, move it back to `ready/` |
 
 ### 8.6 Fleet lifecycle: enrollment, key rotation, SOC profiles (`robodr-enroll`)
 

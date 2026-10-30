@@ -91,6 +91,9 @@ pub struct PruneReport {
     pub removed_bytes: u64,
     /// Files over the bounds kept because they are still needed.
     pub held: u64,
+    /// Dead-letter entries in the deleted files (rotated dead-letter files
+    /// only; each such deletion is also logged).
+    pub removed_entries: u64,
 }
 
 impl PruneReport {
@@ -98,6 +101,7 @@ impl PruneReport {
         self.removed += o.removed;
         self.removed_bytes += o.removed_bytes;
         self.held += o.held;
+        self.removed_entries += o.removed_entries;
     }
 }
 

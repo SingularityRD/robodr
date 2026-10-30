@@ -1570,14 +1570,30 @@ impl Engine {
     /// it in force and answers its status with the refusal. A planner
     /// action, an unknown or finished id, and an action already reverting
     /// are handled as [`Engine::revert`].
+    ///
+    /// Review finding 1: an active `safe_pause` is lifted **only** here,
+    /// after its two-person signed revert verified, and only when the
+    /// safety state now (`oracle`, asked from agentd over the same
+    /// connection) is known, fresh, not engaged and one the pause's
+    /// adapters allow; otherwise the pause stays in force and the refusal
+    /// is answered. No other path undoes a pause.
     pub fn revert_request(
         &mut self,
         id: &str,
         reason: &str,
         soc: Option<&crate::soc::SocRequest>,
+        oracle: &mut dyn SafetyOracle,
         now: impl Into<Now>,
     ) -> Outcome {
         let now = now.into();
+        let pause = self
+            .state
+            .entry(id)
+            .filter(|en| en.phase == Phase::Active)
+            .and_then(|en| match &en.effect {
+                Effect::Motion(spec) if spec.lift_needs_people() => Some(spec.clone()),
+                _ => None,
+            });
         let needs = self.state.entry(id).and_then(|en| match &en.origin {
             crate::order::Origin::ControlPlane { .. } if en.phase != Phase::Reverting => {
                 Some(en.action)
@@ -1599,6 +1615,10 @@ impl Engine {
                 }
                 Ok(())
             });
+            let checked = match (checked, &pause) {
+                (Ok(()), Some(spec)) => self.lift_safety_ok(spec, oracle),
+                (c, _) => c,
+            };
             if let Err(r) = checked {
                 self.state.event(
                     now.wall_ms,
@@ -1613,7 +1633,7 @@ impl Engine {
                 return o;
             }
         }
-        self.revert(id, reason, now)
+        self.revert_inner(id, reason, now, needs.is_some() && pause.is_some())
     }
 
     /// Revert one action (TTL, reconciliation, operator, or a request that
@@ -1621,7 +1641,14 @@ impl Engine {
     /// already finished answers its final status. `reverted` is answered
     /// only once the journal records it (see [`crate::journal`]).
     pub fn revert(&mut self, id: &str, reason: &str, now: impl Into<Now>) -> Outcome {
-        let now_ms = now.into().wall_ms;
+        self.revert_inner(id, reason, now.into(), false)
+    }
+
+    /// [`Engine::revert`]; `lift`: a `safe_pause` may be undone (only
+    /// [`Engine::revert_request`] sets it, after the two-person signed
+    /// revert and the safety re-check).
+    fn revert_inner(&mut self, id: &str, reason: &str, now: Now, lift: bool) -> Outcome {
+        let now_ms = now.wall_ms;
         let Some(pos) = self.state.entries.iter().position(|e| e.id == id) else {
             return self.status(id);
         };
@@ -1660,7 +1687,7 @@ impl Engine {
             self.journal_failed(id, now_ms, &e);
         }
         crash_point!(crate::fault::Point::AfterRevertIntent, id);
-        self.finish_revert(id, reason, now_ms)
+        self.finish_revert(id, reason, now_ms, lift)
     }
 
     fn journal_failed(&mut self, id: &str, now_ms: u64, e: &str) {
@@ -1679,14 +1706,14 @@ impl Engine {
         }
     }
 
-    fn finish_revert(&mut self, id: &str, reason: &str, now_ms: u64) -> Outcome {
+    fn finish_revert(&mut self, id: &str, reason: &str, now_ms: u64, lift: bool) -> Outcome {
         let Some(en) = self.state.entry(id).cloned() else {
             return self.status(id);
         };
         if self.removed_by_operator(now_ms) {
             return self.status(id);
         }
-        if let Err(o) = self.motion_undo(&en, reason, now_ms) {
+        if let Err(o) = self.motion_undo(&en, reason, now_ms, lift) {
             return *o;
         }
         match self.install() {
@@ -1751,7 +1778,7 @@ impl Engine {
             .map(|e| e.id.clone())
             .collect();
         for id in reverting {
-            self.finish_revert(&id, "revert retried", now_ms);
+            self.finish_revert(&id, "revert retried", now_ms, false);
         }
         let expired: Vec<(String, ActionId)> = self
             .state
@@ -1761,6 +1788,9 @@ impl Engine {
             .map(|e| (e.id.clone(), e.action))
             .collect();
         for (id, action) in expired {
+            if self.pause_outlives_ttl(&id, now_ms) {
+                continue;
+            }
             self.state.event(
                 now_ms,
                 EventKind::Expired,
@@ -1830,10 +1860,11 @@ impl Engine {
         // first (while the journal still holds every entry); one whose undo
         // failed stays `reverting` (retried every tick, and at the next
         // start) instead of being reported reverted while the restriction
-        // is still in force.
+        // is still in force. A `safe_pause` is never lifted here (ADR-0006,
+        // `motion_undo` without `lift`): it stays in force.
         let mut stuck = BTreeSet::new();
         for en in self.state.entries.clone() {
-            if self.motion_undo(&en, reason, now_ms).is_err() {
+            if self.motion_undo(&en, reason, now_ms, false).is_err() {
                 stuck.insert(en.id.clone());
             }
         }
@@ -1843,7 +1874,10 @@ impl Engine {
         let mut reverted = 0;
         for mut en in entries {
             if stuck.contains(&en.id) {
-                en.phase = Phase::Reverting;
+                let pause = matches!(&en.effect, Effect::Motion(s) if s.lift_needs_people());
+                if !pause {
+                    en.phase = Phase::Reverting;
+                }
                 self.state.entries.push(en);
                 continue;
             }
@@ -1973,6 +2007,22 @@ pub fn abandon(
             let mut entries = Vec::new();
             for mut en in all {
                 if let Effect::Motion(spec) = &en.effect {
+                    if spec.lift_needs_people() {
+                        // ADR-0006: a pause is never lifted automatically;
+                        // it stays in force (and in the journal).
+                        s.event(
+                            now_ms,
+                            EventKind::Refused,
+                            Some(&en.id),
+                            Some(en.action),
+                            format!(
+                                "HIGH: {why}: the safe_pause is not undone (never \
+                                 automatically): the platform stays paused"
+                            ),
+                        );
+                        s.entries.push(en);
+                        continue;
+                    }
                     match motion.revert(&m, spec) {
                         Ok(note) => s.event(
                             now_ms,

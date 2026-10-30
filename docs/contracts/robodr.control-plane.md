@@ -450,10 +450,14 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     status; the Unitree sport `SpeedLevel`) and `reverted` at its TTL or
     by revert; `safe_pause` reaches `verified` through Nav2 (cancel every
     goal + zero twist), ros2_control (controller switch) or PX4 (hold
-    mode), and `reverted` by a revert (two approvers) or after the
-    executor's `motion.safe_pause_ttl_s`; reverting it **releases** the
-    pause and never resumes a mission (Nav2: goals are not restored; PX4:
-    no mode change; ros2_control: the inverse switch);
+    mode), and `reverted` only by a revert (two approvers), and only when
+    the safety state at that moment is known, fresh, not engaged and one
+    the adapter allows (otherwise the revert is refused with that code
+    and the pause stays `verified`). It is **never lifted automatically**:
+    reaching the executor's `motion.safe_pause_ttl_s` is reported (event
+    `expired`, `HIGH`) and the pause stays in force; reverting it
+    **releases** the pause and never resumes a mission (Nav2: goals are
+    not restored; PX4: no mode change; ros2_control: the inverse switch);
     `request_safe_state` and `rollback_config` (`config: program` only)
     reach `applied` (terminal). The executor's order carries the
     restriction's parameters (`max_linear_speed`, `max_joint_speed`,
@@ -471,9 +475,13 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     `not_executor_action` for `rollback_config` of the `profile` (the
     anti-rollback chain refuses an older profile); `fall_hazard` for a
     restriction factor below `min_motion_factor` on a robot that
-    balances; `invalid_order` for a `restrict_motion` with
-    `workspace_zone` (no adapter enforces a zone: never silently
-    ignored).
+    balances, and there for an absolute cap (`max_linear_speed`,
+    `max_joint_speed`) below `min_motion_factor` of the executor's
+    `motion.envelope` or with no envelope configured; `invalid_order` for
+    a `restrict_motion` with `workspace_zone` (no adapter enforces a
+    zone: never silently ignored); `approval_missing` also when
+    `requested_by` of a two-person action is not a name
+    (`[A-Za-z0-9._%+@-]{1,100}`, like the approvers).
 * **Trust boundary (executor M1).** agentd forwards the SOC's request
   with the order exactly as it was signed (method, target, the four
   credentials of §2, body). The executor verifies it itself, with its own

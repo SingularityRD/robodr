@@ -134,6 +134,13 @@ pub struct State {
     /// A partition's `records` (all its batches) longer than this get
     /// MESSAGE_TOO_LARGE, like a topic's `max.message.bytes`.
     pub max_batch_bytes: usize,
+    /// `log.message.timestamp.after.max.ms`: a record whose CreateTime is
+    /// further ahead of the broker's clock gets INVALID_TIMESTAMP (32), as
+    /// Kafka 4.0 does by default (1 h). `None`: not checked.
+    pub timestamp_after_max_ms: Option<i64>,
+    /// The broker's clock relative to the test host's (ms): -7_200_000
+    /// makes a publisher look 2 h ahead.
+    pub clock_offset_ms: i64,
     /// Close a connection with no request for this long (the broker's
     /// `connections.max.idle.ms`); read when a connection is accepted.
     pub idle_close: Option<Duration>,
@@ -687,6 +694,20 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                         }
                         if code == 0 && bytes.len() > st.max_batch_bytes {
                             code = 10;
+                        }
+                        if let Some(after) = st.timestamp_after_max_ms {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64
+                                + st.clock_offset_ms;
+                            let ahead = batches
+                                .iter()
+                                .flat_map(|b| &b.records)
+                                .any(|r| r.timestamp_ms > now + after);
+                            if code == 0 && ahead {
+                                code = 32;
+                            }
                         }
                         let mut base = -1;
                         if code == 0 && append {

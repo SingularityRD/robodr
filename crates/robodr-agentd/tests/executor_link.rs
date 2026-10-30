@@ -1591,16 +1591,23 @@ fn review_gap1_f1_agentd_follows_an_executor_journal_reset() {
     let s = setup("exec-epoch", &robot_profile(true));
     let exec_sock = s.dir.join("executor.sock");
     let model = Model::default();
-    let exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
-    // A few events (operator re-arms) so the sequence is well above 1.
-    let client = robodr_executor::client::Client::new(
-        exec_sock.clone(),
-        Key::from_bytes(EXEC_KEY),
-        std::time::Duration::from_secs(5),
-    );
-    for _ in 0..5 {
-        client.rearm("test").unwrap();
+    // A journal with a few events, so the sequence is well above 1.
+    let state = s.dir.join("executor-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut st = robodr_executor::journal::State::empty("test-boot");
+    for i in 0..5 {
+        st.event(
+            1_000 + i,
+            robodr_executor::journal::EventKind::Reconciled,
+            None,
+            None,
+            "earlier run",
+        );
     }
+    robodr_executor::journal::Journal::new(&state)
+        .save(&st)
+        .unwrap();
+    let exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
     let spec = robodr_agentd::executor_link::ExecutorSpec {
         socket: exec_sock.clone(),
         key: Key::from_bytes(EXEC_KEY),

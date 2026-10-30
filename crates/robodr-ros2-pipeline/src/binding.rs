@@ -320,7 +320,7 @@ use robodr_rtps::{
     LOCATOR_KIND_UDPV4, LOCATOR_KIND_UDPV6,
 };
 
-use crate::sanitize::MAX_TEXT_CHARS;
+use crate::sanitize::{clip_name, MAX_TEXT_CHARS};
 
 /// Rule ids raised by the binding check.
 pub mod rules {
@@ -974,6 +974,12 @@ impl BindingTable {
     /// Held SEDP announcements.
     pub fn held_len(&self) -> usize {
         self.held.len()
+    }
+
+    /// Is `prefix` a profiled participant (statically, or resolved at run
+    /// time via [`BindingTable::set_profiled`])?
+    pub fn is_profiled(&self, prefix: &GuidPrefix) -> bool {
+        self.profiled.contains(prefix)
     }
 
     /// Is `prefix` currently bound (learned or pinned)?
@@ -1698,7 +1704,7 @@ impl BindingTable {
         } else {
             Severity::High
         };
-        let topic = truncate(topic);
+        let topic = clip_name(topic);
         let amb = if ambiguous {
             " (ambiguous announcement: conflicting duplicate parameters, the topic may differ)"
         } else {
@@ -1740,7 +1746,7 @@ impl BindingTable {
             "{} on {} attributed to {profiled}participant {} was announced from {} but that \
              participant never announced itself (no SPDP {why})",
             kind_str(h.kind),
-            h.topic,
+            clip_name(&h.topic),
             hex12(&h.participant),
             h.src_ip
         );

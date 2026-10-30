@@ -363,7 +363,14 @@ impl ExecutorLink {
                             lock(&sh).put(out);
                         }
                         Ok(Job::Revert(id, reason, soc)) => {
-                            match client.revert_signed(&id, &reason, soc.as_deref()) {
+                            // Lifting a safe_pause needs the safety
+                            // state now (executor review finding 1).
+                            match client.revert_with_safety(
+                                &id,
+                                &reason,
+                                soc.as_deref(),
+                                &mut || cell.get(),
+                            ) {
                                 Ok(out) => lock(&sh).put(out),
                                 Err(e) => {
                                     let mut g = lock(&sh);

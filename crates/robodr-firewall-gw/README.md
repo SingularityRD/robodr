@@ -657,7 +657,14 @@ a restriction ends at its TTL even with the executor down; a malformed,
 symlinked, non-regular, wrongly owned or group / world-writable file is ignored with a warning and status
 `restriction_error` (the restriction in force keeps its own expiry). The
 status file's `restriction.id` is what the executor reads back to verify.
-A forged restriction can only slow the robot down.
+A forged restriction can only slow the robot down, and on a robot that
+balances (platform morphology humanoid, quadruped or other) never below
+the floor: a restriction whose `factor` is below 0.05, or whose absolute
+cap is below 0.05 × a twist channel's linear limit or a trajectory
+joint's velocity bound (or applies to a channel without a finite limit,
+where it cannot be converted to a factor), is ignored the same way
+(`restriction_error`; executor review finding 3, ADR-0012 rule 4: a
+near-stop of a balancing robot's commands makes it fall).
 
 ## Non-motor `LowCmd_` fields
 

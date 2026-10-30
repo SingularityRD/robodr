@@ -145,6 +145,9 @@ pub struct Status {
     pub pending_failed_runs: u64,
     pub next_attempt_at_ms: Option<u64>,
     pub dead_letter_malformed: u64,
+    /// Spool files quarantined as unreadable (I/O error) by this process.
+    #[serde(default)]
+    pub quarantined_unreadable: u64,
     #[serde(flatten)]
     pub snapshot: Snapshot,
 }
@@ -164,6 +167,7 @@ impl Status {
             pending_failed_runs: 0,
             next_attempt_at_ms: None,
             dead_letter_malformed: 0,
+            quarantined_unreadable: 0,
             snapshot: Snapshot::default(),
         }
     }
@@ -326,6 +330,7 @@ pub fn run<T: Transport>(
                 if rep.dead_letter_malformed > 0 {
                     status.dead_letter_malformed = rep.dead_letter_malformed;
                 }
+                status.quarantined_unreadable += rep.quarantined_unreadable;
                 if !rep.is_empty() {
                     (env.report)(rep);
                 }

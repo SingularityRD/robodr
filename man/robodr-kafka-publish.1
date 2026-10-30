@@ -82,7 +82,16 @@ record value byte for byte. An optional per\-finding signature header
 .B robodr\-finding\-sig
 (contract \(sc2a) must be the last header; it is shape\-checked and forwarded
 verbatim, for the consumer to verify. Invalid or broker\-rejected records go to
-a dead\-letter file; progress (committed line count per batch, done markers)
+a dead\-letter file. A broker refusing the record timestamps
+(INVALID_TIMESTAMP) is not blamed on the records: every record carries this
+host's clock as its CreateTime (Kafka 4.0 refuses records more than 1 h ahead
+by default), so the run fails with a hint to check the clock (NTP), nothing
+is dead\-lettered or committed, and it is retried. A spool file that cannot
+be read (I/O error such as EACCES or EIO, 3 attempts) is dead\-lettered with
+the error and moved to the spool's rejected/ (kept for a re\-drive), counted
+as
+.BR quarantined_unreadable ,
+and the run goes on; progress (committed line count per batch, done markers)
 is replaced atomically after each acknowledged chunk.
 .PP
 Producer settings: acks=all, idempotent (InitProducerId, a producer id and
@@ -158,11 +167,20 @@ needed; 3.0 and later imply it from WRITE on a topic). Without this flag
 such a refusal is a fatal error that names the ACL.
 .TP
 .BI \-\-dead\-letter\-max\-bytes " N\fR, " \-\-dead\-letter\-keep " N"
-Rotate the dead\-letter file at N bytes (default 64 MiB, at least 64 KiB, 0 =
-never) and keep N rotated files (default 4). A rotated file beyond them is
-deleted only when none of its entries is still needed for deduplication (its
-diode batch has a done marker or left the importer output; its spool file
-left ready/).
+Opt in to rotation of the dead\-letter file: rotate at N bytes (at least
+64 KiB; default 0 = never: one growing file, nothing ever deleted) and keep N
+rotated files (default 4;
+.B \-\-dead\-letter\-keep
+needs
+.BR \-\-dead\-letter\-max\-bytes ).
+A dead letter may be the only copy of a finding Kafka refused, so the
+default keeps them all; monitor the file's size. With rotation, a rotated
+file beyond them is DELETED once none of its entries is still needed for
+deduplication (its diode batch has a done marker or left the importer
+output; its spool file left ready/); each deletion of a file that held
+entries is logged on stderr with its entry count and reported as
+.B pruned_dead_letters.removed_entries
+in the JSON report.
 .TP
 .BI \-\-dead\-letter\-max\-age\-s " N"
 Also delete rotated dead\-letter files older than N seconds (same rule; 0 or
