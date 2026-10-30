@@ -633,6 +633,55 @@ fn hostile_motion_traffic_never_panics_and_stays_bounded() {
     assert_eq!(o.motion.len(), 1);
 }
 
+/// Review: once the writer table was full, the victim was the least recently
+/// announced entry by `(is_motion, last_seen)`, so fresh rogue writers on
+/// `rt/cmd_vel` evicted the robot's real writer (announced once, at boot):
+/// its commands were then no longer decoded or envelope-checked, silently.
+/// Now a motion writer of a bound / profiled participant is never evicted,
+/// and every motion eviction is a finding naming the victim.
+#[test]
+fn rogue_motion_writer_flood_cannot_evict_the_robots_writer() {
+    let mut r = Run::new(pipeline_with(MotionOptions {
+        max_writers: 8,
+        max_readers: 8,
+        ..Default::default()
+    }));
+    r.feed(&motion_discovery(), &robot_ip());
+    let mut eviction_findings = 0;
+    for i in 0..200u32 {
+        let mut prefix = [0x44; 12];
+        prefix[8..].copy_from_slice(&i.to_be_bytes());
+        let d = datagram(
+            prefix,
+            &[sedp_writer_sub(prefix, CMD_WRITER, "rt/cmd_vel", TWIST)],
+        );
+        let o = r.feed(&d, &ROGUE_IP.to_string());
+        eviction_findings += o
+            .findings
+            .iter()
+            .filter(|f| {
+                f.deviation.rule == rules::MOTION_UNATTRIBUTED_SAMPLE
+                    && f.deviation.detail.contains("evicted from the writer table")
+            })
+            .count();
+    }
+    let st = r.p.stats().motion;
+    assert!(st.writers_known <= 8, "{st:?}");
+    assert!(st.writers_evicted > 0, "{st:?}");
+    // Rogue motion writers evicted each other, each one reported.
+    assert!(eviction_findings > 0);
+    // The robot's writer is still known: its command is decoded, attributed
+    // and checked against the envelope.
+    let o = r.feed(&cmd_vel_datagram(LEGIT, CMD_WRITER, 7, 3.0), &robot_ip());
+    assert_eq!(o.motion.len(), 1, "{:?}", rules_of(&o));
+    assert_eq!(o.motion[0].attribution, SampleAttribution::Bound);
+    assert!(
+        rules_of(&o).contains(&"robot.motion.linear_over_envelope".to_string()),
+        "{:?}",
+        rules_of(&o)
+    );
+}
+
 // --- Sample attribution: only a bound source is trusted --------------------
 
 fn findings_of<'a>(o: &'a ProcessOutput, rule: &str) -> Vec<&'a robodr_ros2_pipeline::Finding> {

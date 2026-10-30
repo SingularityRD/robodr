@@ -843,3 +843,168 @@ fn watch_run_source_output_is_clean_json_lines() {
         .iter()
         .any(|l| l.contains(rules::ENDPOINT_UNANNOUNCED_PARTICIPANT)));
 }
+
+// ------------------------------------------- discovery fragment review ----
+
+/// Review: the discovery reassembler refused SEDP samples above 64 KiB with
+/// only a Medium `discovery_fragment_rejected`, while DDS stacks reassemble
+/// far larger samples: a rogue `cmd_vel` writer padded past 64 KiB escaped
+/// the Critical. The default now takes it in and judges it.
+#[test]
+fn padded_rogue_motion_writer_over_64k_is_still_critical() {
+    let mut p = pipeline();
+    // ~100 KiB: two vendor parameters (a parameter holds at most 64 KiB).
+    let payload = pl_payload(&[
+        param(0x005a, &guid(ROGUE, [0, 0, 0x12, 0x03])),
+        param(0x8001, &[0x5a; 50_000]),
+        param(0x8002, &[0x5a; 50_000]),
+        string_param(0x0005, "rt/cmd_vel"),
+        string_param(0x0007, TWIST),
+    ]);
+    assert!(payload.len() > 64 * 1024);
+    let frag_size = 8000usize;
+    let mut found = Vec::new();
+    for (i, chunk) in payload.chunks(frag_size).enumerate() {
+        let d = datagram(
+            ROGUE,
+            &[data_frag(
+                ENTITY_SEDP_PUB_WRITER,
+                7,
+                i as u32 + 1,
+                frag_size as u16,
+                payload.len() as u32,
+                chunk,
+            )],
+        );
+        found.extend(p.process(&d, XIP));
+    }
+    assert!(
+        with_rule(&found, rules::DISCOVERY_FRAGMENT_REJECTED).is_empty(),
+        "{found:#?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|f| f.deviation.severity == Severity::Critical
+                && f.deviation.detail.contains("cmd_vel")),
+        "{found:#?}"
+    );
+}
+
+/// Review: an SEDP publications sample refused for a reason a DDS stack does
+/// not share (here: over the size cap) is Critical and names the writer
+/// prefix; malformed geometry (stacks drop it too) stays Medium.
+#[test]
+fn refused_sedp_publication_fragments_are_critical() {
+    let mut p = pipeline();
+    let over = (robodr_rtps::HARD_MAX_SAMPLE_BYTES + 8) as u32;
+    let d = datagram(
+        ROGUE,
+        &[data_frag(
+            ENTITY_SEDP_PUB_WRITER,
+            3,
+            1,
+            1024,
+            over,
+            &[0; 1024],
+        )],
+    );
+    let f = p.process(&d, XIP);
+    let r = with_rule(&f, rules::DISCOVERY_FRAGMENT_REJECTED);
+    assert_eq!(r.len(), 1, "{f:#?}");
+    assert_eq!(r[0].deviation.severity, Severity::Critical);
+    assert!(
+        r[0].deviation.detail.contains(ROGUE_HEX),
+        "{}",
+        r[0].deviation.detail
+    );
+    assert!(r[0].deviation.detail.contains("SampleTooLarge"));
+    // Zero fragment size: bad geometry, which every stack drops.
+    let d = datagram(
+        ROGUE,
+        &[data_frag(ENTITY_SEDP_PUB_WRITER, 4, 1, 0, 64, &[0; 4])],
+    );
+    let f = p.process(&d, XIP);
+    let r = with_rule(&f, rules::DISCOVERY_FRAGMENT_REJECTED);
+    assert_eq!(r.len(), 1, "{f:#?}");
+    assert_eq!(r[0].deviation.severity, Severity::Medium);
+}
+
+/// Review: evictions were reported from a diff of the reassembler's
+/// cumulative counter, without naming the victim. Now the victim (source
+/// prefix, writer, sequence number) is named, and a profiled participant's
+/// evicted announcement is High.
+#[test]
+fn evicted_profiled_discovery_sample_is_named_and_high() {
+    let payload = sedp_payload(LEGIT, "rt/cmd_vel", TWIST, 0);
+    let half = payload.len() / 2 / 4 * 4;
+    let mut p = pipeline_with(PipelineOptions {
+        reassembly: robodr_ros2_pipeline::ReassemblyLimits {
+            max_pending_samples: 4,
+            stale_after_fragments: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let first = datagram(
+        LEGIT,
+        &[data_frag(
+            ENTITY_SEDP_PUB_WRITER,
+            9,
+            1,
+            half as u16,
+            payload.len() as u32,
+            &payload[..half],
+        )],
+    );
+    p.process(&first, RIP);
+    let mut subs = Vec::new();
+    for i in 0..12u8 {
+        subs.push(info_src([i + 1; 12]));
+        subs.push(data_frag(ENTITY_SEDP_PUB_WRITER, 1, 1, 4, 8, &[0; 4]));
+    }
+    let f = p.process(&datagram(ROGUE, &subs), XIP);
+    let e = with_rule(&f, rules::DISCOVERY_FRAGMENT_EVICTED);
+    assert_eq!(e.len(), 1, "{f:#?}");
+    assert_eq!(e[0].deviation.severity, Severity::High);
+    let detail = &e[0].deviation.detail;
+    assert!(
+        detail.contains(&format!("sn 9 of writer {LEGIT_HEX}:000003c2")),
+        "{detail}"
+    );
+    assert!(detail.contains("profiled"), "{detail}");
+    assert!(p.stats().fragment_evictions >= 1);
+}
+
+// ------------------------------------------------- finding text review ----
+
+/// Review: findings were deduplicated on the raw detail, but displayed
+/// sanitized and cut to 512 chars, so announcements whose names differed
+/// only in the cut-out part became a flood of identical-looking findings;
+/// and a long topic pushed the participant / source address out of the
+/// displayed detail.
+#[test]
+fn long_names_dedup_on_displayed_text_and_keep_the_attribution() {
+    let mut p = pipeline();
+    let t = Instant::now();
+    bind_legit(&mut p, t);
+    let topic = |mid: char| format!("rt/{}{mid}{}", "a".repeat(1500), "b".repeat(1500));
+    // An endpoint of the profiled participant announced from another IP:
+    // the binding detail names the topic first, then participant and IP.
+    let f1 = p.process_at(&sedp_from(LEGIT, LEGIT, &topic('X')), XIP, t);
+    let m1 = with_rule(&f1, rules::ENDPOINT_SOURCE_MISMATCH);
+    assert_eq!(m1.len(), 1, "{f1:#?}");
+    let shown = m1[0].description();
+    assert!(shown.contains(LEGIT_HEX), "{shown}");
+    assert!(shown.contains(XIP), "{shown}");
+    // Same announcement with a different character in the middle of the
+    // name: displayed identically, so it is a duplicate.
+    let f2 = p.process_at(&sedp_from(LEGIT, LEGIT, &topic('Y')), XIP, t);
+    for f in &f2 {
+        assert!(
+            !f1.iter().any(|g| g.description() == f.description()),
+            "identical-looking finding reported twice: {}",
+            f.description()
+        );
+    }
+}

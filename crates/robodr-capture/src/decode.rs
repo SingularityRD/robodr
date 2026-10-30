@@ -211,6 +211,13 @@ pub struct IpFragment<'a> {
     pub more: bool,
     /// The fragment's bytes.
     pub data: &'a [u8],
+    /// Bytes in front of the fragmentable part that the reassembled packet
+    /// keeps from the offset-0 fragment: the IPv4 header length (IHL x 4,
+    /// options included), or for IPv6 the unfragmentable extension headers
+    /// before the Fragment header (0 when it follows the IPv6 header). Linux
+    /// drops a datagram whose `header_len` (of its offset-0 fragment) plus
+    /// reassembled length exceeds 65 535; the reassembler does the same.
+    pub header_len: usize,
 }
 
 /// Result of decoding a frame down to the transport layer.
@@ -461,6 +468,7 @@ fn decode_ipv4(p: &[u8]) -> Result<Detail<'_>, DecodeError> {
                 offset,
                 more,
                 data,
+                header_len: ihl,
             }),
             ipv4_header,
             udp_segment: None,
@@ -578,6 +586,8 @@ fn walk_ipv6(
                 let offset = usize::from(fo & 0xfff8);
                 let more = fo & 1 != 0;
                 let id = be32(rest, 4).ok_or(DecodeError::Truncated(L))?;
+                // Unfragmentable extension headers before this one.
+                let header_len = off;
                 off += 8;
                 if offset == 0 && !more {
                     // Atomic fragment (RFC 6946): just a header to skip.
@@ -601,6 +611,7 @@ fn walk_ipv6(
                         offset,
                         more,
                         data,
+                        header_len,
                     }),
                     ipv4_header: None,
                     udp_segment: None,
@@ -1194,6 +1205,48 @@ mod tests {
                 &[17, 0, 0, 0, 0, 0, 0, 0]
             ),
             Err(DecodeError::Malformed(Layer::Ipv6, _))
+        ));
+    }
+
+    /// Review: the reassembler needs the offset-0 fragment's header bytes
+    /// (IPv4 header with options; IPv6 unfragmentable extension headers)
+    /// to apply Linux's 65 535-byte limit.
+    #[test]
+    fn fragment_header_len_counts_options_and_unfragmentable_headers() {
+        let ip = v4_packet(b"0123456789abcdef");
+        let mut f = synth::ipv4_fragment(&ip, 8)[0].clone();
+        assert!(matches!(
+            decode_frame(LinkType::RAW, &f).unwrap(),
+            Decoded::Fragment(IpFragment { header_len: 20, .. })
+        ));
+        // Four bytes of NOP options: IHL 6.
+        f.splice(20..20, [1u8; 4]);
+        f[0] = 0x46;
+        let total = u16::from_be_bytes([f[2], f[3]]) + 4;
+        f[2..4].copy_from_slice(&total.to_be_bytes());
+        assert!(matches!(
+            decode_frame(LinkType::RAW, &f).unwrap(),
+            Decoded::Fragment(IpFragment { header_len: 24, .. })
+        ));
+
+        let p = synth::ipv6_udp(src6(), dst6(), 40000, 7410, &[], b"0123456789abcdef");
+        let mut f = synth::ipv6_fragment(&p, 16, 7)[0].clone();
+        assert!(matches!(
+            decode_frame(LinkType::RAW, &f).unwrap(),
+            Decoded::Fragment(IpFragment { header_len: 0, .. })
+        ));
+        // Hop-by-hop options (8 bytes, PadN) in front of the Fragment header.
+        f.splice(40..40, [IP6_FRAGMENT, 0, 1, 4, 0, 0, 0, 0]);
+        f[6] = IP6_HOP_BY_HOP;
+        let plen = u16::from_be_bytes([f[4], f[5]]) + 8;
+        f[4..6].copy_from_slice(&plen.to_be_bytes());
+        assert!(matches!(
+            decode_frame(LinkType::RAW, &f).unwrap(),
+            Decoded::Fragment(IpFragment {
+                header_len: 8,
+                offset: 0,
+                ..
+            })
         ));
     }
 

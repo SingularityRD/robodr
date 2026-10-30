@@ -36,7 +36,7 @@ is tested offline. The same code runs in three places:
 | `robot.ros2.participant_removed` | Medium | a **profiled** participant is announced disposed or unregistered (`relayed by …` when someone else sent it) |
 | `robot.rtps.malformed_discovery` | Low | one per parse-anomaly kind and source IP (`report_anomalies`) |
 | `robot.rtps.fragmented_discovery` | Low | one per source IP sending discovery `DATA_FRAG` (`report_fragmentation`) |
-| `robot.rtps.discovery_fragment_rejected` | Medium | the reassembler refused fragments (over a cap, bad geometry; that announcement was **not** inspected), or fragments overlapped with conflicting content (the first copy was inspected; a stack keeping the other copy sees a different announcement). Always reported. |
+| `robot.rtps.discovery_fragment_rejected` | Medium; **Critical** (SEDP publications) / **High** (SEDP subscriptions) when refused for a reason a DDS stack does not share (size / memory cap, no capacity, geometry or key-flag mismatch with a pending copy) | the reassembler refused fragments (over a cap, bad geometry; that announcement was **not** inspected; an uninspected SEDP writer may be a rogue motion writer), or fragments overlapped with conflicting content (the first copy was inspected; a stack keeping the other copy sees a different announcement). Names the writer prefix. Always reported. |
 | `robot.ros2.profile_refused` | High | once at start, when the profile fails `Profile::validate`, or a locked profile file fails the seal / strict file check |
 | `robot.ros2.endpoint_source_mismatch` | Critical (writer on a motion topic, or any writer in an ambiguous announcement when the profile has motion topics) / High | an SEDP endpoint attributed to a participant was announced from an IP not bound to it (not its SPDP source, an advertised locator, or a `participant_ips` pin), or relayed / GUID-conflicting from a non-discovery-server IP. See `src/binding.rs`. |
 | `robot.ros2.endpoint_unannounced_participant` | Medium (High for a motion-capable writer) | an SEDP endpoint whose participant sent no SPDP within `binding.hold_ms` (or before the end of a replay) |
@@ -44,13 +44,13 @@ is tested offline. The same code runs in three places:
 | `robot.ros2.identity_instances_exceeded` | High | an SPDP matches a profile identity (source IP, RTPS vendor, enclave) whose `max_instances` slots are all held by live participants; the newcomer stays an unknown participant. See `src/identity.rs`. |
 | `robot.ros2.ambiguous_discovery` | High | a discovery sample repeats an identity parameter (topic, type, endpoint/participant GUID, key hash, status) with conflicting values. Stacks differ on first- vs last-wins, so what we inspected may not be what a stack acts on. Never rate limited. |
 | `robot.rtps.discovery_not_inspected` | Medium | the parser dropped content (unsupported protocol version, truncated / malformed submessage or parameter list, undecodable value, announcement without topic, anomaly list overflow). Always reported. |
-| `robot.rtps.discovery_fragment_evicted` | Medium | partial discovery samples evicted by the reassembler to stay within its caps; not inspected |
+| `robot.rtps.discovery_fragment_evicted` | Medium; High when a victim's participant is profiled | partial discovery samples evicted by the reassembler to stay within its caps; not inspected. Names the victims (source prefix, writer, sequence number, reason) |
 | `robot.rtps.discovery_removal` | Low / Medium | other disposes / unregisters (Medium when sent from an IP outside the owner's binding) |
 | `robot.capture.*` | Low / Medium | the capture layer's counters (malformed frames, IP fragment conflicts / drops / evictions) grew |
 | `robot.sensor.findings_capped` | the most severe suppressed, at least Medium | one input produced more than `max_findings_per_datagram` new findings |
 | the profile's motion rules (`robot.motion.linear_over_envelope`, `angular_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) | a `MotionCommand` decoded from user DATA on a profiled motion channel (`motion.evaluate_commands`, default on) |
 | `robot.motion.undecodable_sample` | Medium, rate limited | a sample on a motion / feedback topic was not inspected: undecodable CDR, unknown type, wrong-role type, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap |
-| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP |
+| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP; also a motion writer / reader evicted from (or refused by) the bounded endpoint tables |
 | `robot.motion.sample_source_mismatch` | Critical (command topic) / High (feedback) | a decoded motion sample whose writer prefix is bound (SPDP / `participant_ips`) to other IPs than its source |
 | `robot.motion.command_type_mismatch` | High | a writer announced on a profiled command channel with a type other than the profile's `motion_types` entry, a type no decoder knows, or a feedback type; at the announcement, never rate limited |
 | `robot.unitree.legacy_unknown_sender` | Critical (command, decoded or compressed) / Medium (state, or no legacy length) | a Unitree legacy UDP frame from an IP not in `unitree_legacy.command_senders` (commands) / `robot_addresses` (state); the legacy protocol is unauthenticated. Not in the shared rate limiter: one finding per sender for the first 16 senders of a class |
@@ -84,6 +84,11 @@ eviction can only cause a re-report.
   `robot.rtps.*`, `robot.capture.*`, `robot.sensor.*` and
   `robot.motion.undecodable_sample` only. The profile and
   binding rules (`robot.ros2.*`) are never rate limited.
+- **Discovery reassembly caps** (`ReassemblyLimits::default()`, not
+  configurable in the TOML): samples up to 512 KiB (was 64 KiB; DDS stacks
+  accept far larger SEDP samples, so a padded announcement must not be
+  refused here while the robot takes it), 8 MiB for all partial samples
+  together, 256 partial samples, 64 per source.
 - **Memory**: dedup set, reassembler, binding table (`binding.max_participants`,
   O(log n) eviction, profiled participants evicted last), held-announcement
   queue (1024), per-participant IP / locator lists and the rate limiter are
@@ -172,7 +177,14 @@ joint firewall's clock).
   is re-announced; its samples are not decoded meanwhile (and samples to a
   known motion reader raise `unattributed_sample`).
 - A SEDP dispose does not forget a writer (a spoofed dispose must not blind
-  the decoder); the tables are bounded and evict non-motion entries first.
+  the decoder); the tables are bounded and evict non-motion entries first,
+  then motion entries of participants neither profiled nor bound (least
+  recently announced first, O(log n)). A motion writer / reader of a
+  profiled or bound participant is never evicted: a newcomer that would
+  need it gone is refused (`MotionStats::writers_refused` /
+  `readers_refused`), so a flood of fresh rogue `cmd_vel` writers cannot
+  push out the robot's real writer. Every evicted or refused motion
+  endpoint raises `robot.motion.unattributed_sample` (High) naming it.
 
 ## Go2 WebRTC sessions (`webrtc`)
 
