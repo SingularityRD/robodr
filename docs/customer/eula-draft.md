@@ -35,8 +35,8 @@
 ## Third-party and open-source components
 
 7. Third-party components keep their own licences, as listed in the
-   SBOM and the third-party notices shipped with each release
-   [notices file: planned, GA-ROADMAP S12].
+   SBOM and the third-party notices shipped with each release (the
+   `THIRD_PARTY_NOTICES` file in every package and bundle).
 8. **Pulsar eBPF probes (GPL-2.0).** These kernel programs are licensed
    under GPL-2.0, not under this agreement. The complete corresponding
    source is available from SingularityRD [offer wording, duration,
