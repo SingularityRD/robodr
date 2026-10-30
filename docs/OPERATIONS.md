@@ -1361,6 +1361,7 @@ robodr-blackbox keygen --out /etc/robodr-anchor-receiver/receiver.key --key-id a
     {"unit": "ugv-07", "public_key": "/etc/robodr-anchor-receiver/units/ugv-07.pub"}
   ],
   "max_connections": 64,
+  "max_connections_per_source": 8,
   "io_timeout_ms": 5000,
   "tls": {
     "cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",
@@ -1389,7 +1390,14 @@ Without `tls` the receiver refuses to start unless the config says
 clear: marks and answers stay Ed25519-signed, see below, but hashes and
 sequence numbers are readable on the wire); `tls` together with
 `allow_plaintext` is refused. Failed handshakes are logged (the first 16,
-then at powers of two).
+then at powers of two). `io_timeout_ms` bounds a whole connection, TLS
+handshake included (every read and write is re-armed with the time left,
+so a peer trickling bytes is cut), and the answer gets another one;
+`max_connections_per_source` (default 8, 1..=4096) caps the connections
+one address may hold, authenticated or not, so a single host cannot take
+every one of `max_connections`. Every TLS file (and the robot's and the
+publisher's, below) must be owned by root or by the service's own user
+(`LoadCredential=` files are).
 
 `unit` is the robot's `robot.id`; a public key bound to a device
 (`keygen --device`) must name that robot. Then
@@ -1437,7 +1445,12 @@ no access for others and no group write; give it to agentd through a
 `LoadCredential=anchor-tls.key:/etc/robodr/anchor/ugv-07.key` drop-in
 (section 6.4 explains drop-ins). A TLS failure is an anchor failure (the
 robot keeps recording, `anchor_failures` counts it); there is no fallback
-to plain TCP.
+to plain TCP. Each exchange is bounded as a whole (connect within
+`timeout_ms`, then handshake, request and answer within three times it),
+so an on-path host that trickles bytes produces counted failures, not a
+stalled delivery; a delivery attempt that still has not finished after
+its bound (a hanging name lookup: prefer an IP literal) is reported by the
+next mark as a failure.
 
 **Alerts.** The receiver refuses and records (journal line,
 `/var/lib/robodr-anchor-receiver/alerts.jsonl`, per-robot counter): `lower`
@@ -2078,7 +2091,8 @@ handshake (SASL_SSL listeners; SCRAM only, never `PLAIN`; over TLS only;
 a wrong credential, or a broker that cannot prove it knows it, fails the
 call at once). A broker session lifetime (`connections.max.reauth.ms`) is
 honoured by reconnecting before it ends. Key and password files: no
-access for others, no group write; hand them to the unit with the drop-in
+access for others, no group write, owner root or the service user; hand
+them to the unit with the drop-in
 example `robodr-kafka-publish.service.d/60-tls-credentials.conf.example`
 and set `ROBODR_KAFKA_TLS_ARGS` in `/etc/robodr/kafka-publish.env`. Plain
 TCP needs an explicit `--allow-plaintext` (an isolated SOC network or a

@@ -13,7 +13,8 @@ description = "Exporters for robodr.findings: agentd spool -> diode packer (robo
 # Pure Rust crates + RoboDR crates + serde; the Kafka client is a minimal
 # in-crate implementation (README). rustls (+ ring) is the TLS stack of
 # robodr-uplink (ingest API client) and of the Kafka producer (through
-# robodr_blackbox::tls); sha2 / zeroize serve its SASL/SCRAM.
+# robodr_blackbox::tls); zeroize serves its SASL/SCRAM (hashes: the wiping
+# wrappers of robodr_blackbox::crypto).
 [dependencies]
 robodr-agentd = { workspace = true }
 robodr-blackbox = { workspace = true }
@@ -21,12 +22,13 @@ robodr-diode = { workspace = true }
 robodr-ocsf = { workspace = true }
 rustls = { workspace = true }
 webpki = { workspace = true }
-sha2 = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# The fake broker's side of SCRAM (tests/common).
+sha2 = { workspace = true }
 robodr-agent = { workspace = true }
 robodr-events = { workspace = true }
 # The crate's own tests reproduce a split pack (Exporter::open refuses the

@@ -130,15 +130,13 @@ fn security(a: &Args, p: &mut ProducerConfig) -> Result<(), String> {
     match (mech, user, pw_file) {
         (None, None, None) => {}
         (Some(m), Some(u), Some(f)) => {
+            // `raw` is wiped when dropped; the password is borrowed from it
+            // (no other copy) until SaslConfig takes its own (wiped on drop).
             let raw = tls::read_pem("--sasl-password-file", std::path::Path::new(f), true)?;
-            let mut pw = String::from_utf8(raw)
-                .map_err(|_| "--sasl-password-file: not UTF-8".to_string())?;
-            while pw.ends_with('\n') || pw.ends_with('\r') {
-                pw.pop();
-            }
-            let c = SaslConfig::new(Mechanism::parse(m)?, u, &pw);
-            zeroize::Zeroize::zeroize(&mut pw);
-            p.sasl = Some(c?);
+            let pw = std::str::from_utf8(&raw)
+                .map_err(|_| "--sasl-password-file: not UTF-8".to_string())?
+                .trim_end_matches(['\n', '\r']);
+            p.sasl = Some(SaslConfig::new(Mechanism::parse(m)?, u, pw)?);
         }
         _ => {
             return Err("SASL needs --sasl-mechanism, --sasl-username and \

@@ -6,6 +6,7 @@
     {"unit": "ugv-007", "public_key": "/etc/robodr-anchor-receiver/units/ugv-007.pub"}
   ],
   "max_connections": 64,
+  "max_connections_per_source": 8,
   "io_timeout_ms": 5000,
   "tls": {
     "cert_chain": "/etc/robodr-anchor-receiver/tls/receiver.pem",

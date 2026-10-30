@@ -460,7 +460,12 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   client never retries in plain TCP, a TLS receiver never parses a
   plain request (`tests/remote_anchor_tls.rs`: bad CA, wrong host,
   expired, no `serverAuth`, pins, missing / foreign client certificate,
-  downgrades both ways, key file modes).
+  downgrades both ways, key file modes and owners). Every TLS read and
+  write runs on `tls::DeadlineTcp` (socket timeout re-armed with the time
+  left): the receiver's `io_timeout` bounds a connection handshake
+  included, the client bounds each exchange as a whole, so a peer
+  trickling bytes is cut (regressions for both); the receiver also caps
+  connections per source address (`max_connections_per_source`).
   - *advance*: the mark is the recorder's `Checkpoint` plus `mark_sig`, the
     unit's signature over `robodr-blackbox/remote-anchor/mark/v1\0 ||
     lp(unit) || chain_id || seq || hash || lp(key_id)`. The checkpoint's

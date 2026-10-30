@@ -29,10 +29,12 @@
 //!
 //! # Files
 //!
-//! Every file is a regular file (symlinks are followed), at most
-//! [`MAX_PEM_BYTES`]. A private key file must not be group-writable or
-//! accessible to others at all (`chmod 600` or `640`); a certificate or CA
-//! file must not be writable by group or others.
+//! Every file is a regular file (symlinks are followed; a FIFO or device
+//! is refused without blocking), at most [`MAX_PEM_BYTES`], owned by root
+//! or the process's effective user. A private key file must not be
+//! group-writable or accessible to others at all (`chmod 600` or `640`); a
+//! certificate or CA file must not be writable by group or others. Secret
+//! file contents are read into a buffer that is wiped when dropped.
 //!
 //! # No downgrade
 //!
@@ -168,19 +170,30 @@ pub fn spki_sha256(cert: &CertificateDer<'_>) -> Result<[u8; 32], String> {
 }
 
 /// Read a PEM file (module docs, "Files"); `secret`: a private key.
-pub fn read_pem(what: &str, path: &Path, secret: bool) -> Result<Vec<u8>, String> {
+pub fn read_pem(
+    what: &str,
+    path: &Path,
+    secret: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let shown = path.display();
-    // Checked before opening too, so a FIFO or device never blocks the open.
-    if !std::fs::metadata(path)
-        .map_err(|e| format!("{what} {shown}: {e}"))?
-        .is_file()
-    {
-        return Err(format!("{what} {shown}: not a regular file"));
-    }
-    let f = std::fs::File::open(path).map_err(|e| format!("{what} {shown}: {e}"))?;
+    // O_NONBLOCK: a FIFO (or a device) swapped in never blocks the open;
+    // the fstat below then refuses it. It has no effect on a regular file.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("{what} {shown}: {e}"))?;
     let meta = f.metadata().map_err(|e| format!("{what} {shown}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{what} {shown}: not a regular file"));
+    }
+    let euid = crate::keys::effective_uid();
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(format!(
+            "{what} {shown}: owned by uid {}, not by root or this process's uid {euid}",
+            meta.uid()
+        ));
     }
     let mode = meta.permissions().mode() & 0o777;
     if secret && mode & 0o027 != 0 {
@@ -197,15 +210,21 @@ pub fn read_pem(what: &str, path: &Path, secret: bool) -> Result<Vec<u8>, String
     if meta.len() > MAX_PEM_BYTES {
         return Err(format!("{what} {shown}: larger than {MAX_PEM_BYTES} bytes"));
     }
-    let mut buf = Vec::new();
-    f.take(MAX_PEM_BYTES + 1)
+    // Sized up front and capped at that size plus one, so the buffer never
+    // reallocates (no unwiped copy of a secret is left behind).
+    let cap = meta.len() + 1;
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(cap as usize));
+    f.take(cap)
         .read_to_end(&mut buf)
         .map_err(|e| format!("{what} {shown}: {e}"))?;
-    if buf.len() as u64 > MAX_PEM_BYTES {
-        return Err(format!("{what} {shown}: larger than {MAX_PEM_BYTES} bytes"));
+    if buf.len() as u64 > meta.len() {
+        return Err(format!("{what} {shown}: changed while being read"));
     }
     Ok(buf)
 }
+
+/// `O_NONBLOCK` (Linux: the same value on x86_64 and aarch64).
+const O_NONBLOCK: i32 = 0o4000;
 
 fn certs(what: &str, path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
     let pem = read_pem(what, path, false)?;

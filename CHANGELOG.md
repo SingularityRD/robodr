@@ -51,6 +51,20 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     foreign client certificate, downgrade both ways, plain TCP refused,
     wrong SCRAM credentials, an impostor broker that cannot produce the
     server signature, a downgraded iteration count, key file modes.
+  - Independent review of this work (fixed, each with a regression test):
+    a peer trickling one byte per socket timeout held a TLS handshake
+    open for ever (the timeout was armed once; rustls loops over reads):
+    every anchor-receiver slot (F1), the anchor's delivery thread with no
+    failure counted (F2) and the Kafka producer past all its deadlines
+    (F3). Every TLS read and write now re-arms the timeout with the time
+    left (`tls::DeadlineTcp`); the receiver bounds a connection by
+    `io_timeout` and caps connections per source address
+    (`max_connections_per_source`, default 8); the anchor bounds each
+    exchange as a whole and reports an attempt that outlives its bound.
+    TLS key / CA / password files must now be owned by root or the
+    process's user and are opened without blocking on a FIFO (F5); secret
+    file contents, the SCRAM proof and the SCRAM hash states are wiped
+    (F4).
   - Limits: no CRL / OCSP on these paths; mutual TLS authenticates hosts,
     not robot ids (anchor marks stay bound to units by their Ed25519
     signatures); no `PLAIN` / `GSSAPI` / `OAUTHBEARER`; KIP-368 in-band

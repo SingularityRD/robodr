@@ -632,3 +632,37 @@ fn one_source_cannot_hold_every_slot() {
     let a = anchor(&s.addr, Some(pki.client("ca.pem", None, None, &[])), false).unwrap();
     assert_eq!(round_trip(&a), Ok(Some(5)));
 }
+
+/// Review F5: key, CA and password files must be owned by root or the
+/// effective user (a file another account owns could be swapped by it).
+#[test]
+fn files_owned_by_another_account_are_refused() {
+    use std::os::unix::fs::MetadataExt;
+    let pki = Pki::new();
+    let me = std::fs::metadata(pki.p("ca.pem")).unwrap().uid();
+    if me != 0 {
+        // chown needs root; the rule is exercised in privileged CI only.
+        return;
+    }
+    for f in ["ca.pem", "server.key"] {
+        let st = std::process::Command::new("chown")
+            .arg("4242")
+            .arg(pki.p(f))
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    let e = tls::load_client(&ClientTlsFiles {
+        ca_file: pki.p("ca.pem"),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(e.contains("owned by uid 4242"), "{e}");
+    let e = tls::load_server(&ServerTlsFiles {
+        cert_chain: pki.p("server.pem"),
+        key_file: pki.p("server.key"),
+        client_ca: None,
+    })
+    .unwrap_err();
+    assert!(e.contains("owned by uid 4242"), "{e}");
+}

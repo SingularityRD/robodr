@@ -520,7 +520,10 @@ partitioner all agreed with the real brokers.
   verified with the host it is dialled at (SNI = the verified name;
   `--tls-server-name` overrides it for every broker); optional SPKI pins
   add to the chain check; `--tls-cert` / `--tls-key` give mutual TLS. No
-  fallback: a TLS producer never retries in plain TCP. SASL is
+  fallback: a TLS producer never retries in plain TCP. The handshake and
+  every TLS request are bounded as a whole (`robodr_blackbox::tls::DeadlineTcp`
+  re-arms the socket timeout before every read and write), so a broker or
+  on-path host trickling bytes cannot outlast the request deadline. SASL is
   SCRAM-SHA-256 / -512 only (SaslHandshake v1, SaslAuthenticate v0–v1,
   RFC 5802 without SASLprep, as the Java client): iteration count
   4096..=100000, the server nonce must extend ours, mandatory extensions

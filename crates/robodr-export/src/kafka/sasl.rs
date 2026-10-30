@@ -19,7 +19,7 @@
 //!   re-opened (a fresh authentication) before its next request.
 
 use super::wire::{derr, DecodeError, Reader, Writer};
-use sha2::{Digest, Sha256, Sha512};
+use robodr_blackbox::crypto::{Sha256, Sha512};
 use std::fmt;
 use zeroize::Zeroize;
 
@@ -60,10 +60,20 @@ impl Mechanism {
         }
     }
 
-    fn hash(self, data: &[u8]) -> Vec<u8> {
+    /// `H(parts...)` through the wiping hashers of `robodr_blackbox::crypto`
+    /// (no keyed hash state is left behind).
+    fn hash(self, parts: &[&[u8]]) -> Vec<u8> {
         match self {
-            Self::ScramSha256 => Sha256::digest(data).to_vec(),
-            Self::ScramSha512 => Sha512::digest(data).to_vec(),
+            Self::ScramSha256 => {
+                let mut h = Sha256::new();
+                parts.iter().for_each(|p| h.update(p));
+                h.finalize().to_vec()
+            }
+            Self::ScramSha512 => {
+                let mut h = Sha512::new();
+                parts.iter().for_each(|p| h.update(p));
+                h.finalize().to_vec()
+            }
         }
     }
 
@@ -79,22 +89,19 @@ impl Mechanism {
         let b = self.block_len();
         let mut k0 = vec![0u8; b];
         if key.len() > b {
-            let mut h = self.hash(key);
+            let mut h = self.hash(&[key]);
             k0[..h.len()].copy_from_slice(&h);
             h.zeroize();
         } else {
             k0[..key.len()].copy_from_slice(key);
         }
-        let mut inner: Vec<u8> = k0.iter().map(|k| k ^ 0x36).collect();
-        inner.extend_from_slice(msg);
-        let mut ih = self.hash(&inner);
-        inner.zeroize();
-        let mut outer: Vec<u8> = k0.iter().map(|k| k ^ 0x5c).collect();
+        let mut pad: Vec<u8> = k0.iter().map(|k| k ^ 0x36).collect();
+        let mut ih = self.hash(&[&pad, msg]);
+        pad.iter_mut().zip(&k0).for_each(|(p, k)| *p = k ^ 0x5c);
         k0.zeroize();
-        outer.extend_from_slice(&ih);
+        let out = self.hash(&[&pad, &ih]);
+        pad.zeroize();
         ih.zeroize();
-        let out = self.hash(&outer);
-        outer.zeroize();
         out
     }
 
@@ -305,9 +312,9 @@ impl ScramClient {
         let auth_message = format!("{},{server_first},{without_proof}", self.first_bare);
         let mut salted = m.hi(password.as_bytes(), &salt, iters);
         let mut client_key = m.hmac(&salted, b"Client Key");
-        let mut stored_key = m.hash(&client_key);
+        let mut stored_key = m.hash(&[&client_key]);
         let mut client_sig = m.hmac(&stored_key, auth_message.as_bytes());
-        let proof: Vec<u8> = client_key
+        let mut proof: Vec<u8> = client_key
             .iter()
             .zip(&client_sig)
             .map(|(a, b)| a ^ b)
@@ -323,7 +330,9 @@ impl ScramClient {
         ] {
             v.zeroize();
         }
-        Ok(format!("{without_proof},p={}", b64_encode(&proof)))
+        let out = format!("{without_proof},p={}", b64_encode(&proof));
+        proof.zeroize();
+        Ok(out)
     }
 
     /// Check `server-final-message` (`v=` the server signature).
