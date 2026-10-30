@@ -4,8 +4,10 @@
 //!
 //! * a manifest that parses is exactly its canonical encoding, validates,
 //!   and its directory name is a valid bundle RPK directory; every content
-//!   file's chunk sizes add up to its size; the payload files are the
-//!   content minus at most the SBOM;
+//!   file's chunk sizes add up to its size (less the per-chunk overhead
+//!   for a sealed file, each of whose chunks is used once); the payload
+//!   files are the content minus at most the SBOM; a sealed manifest has
+//!   a seal and a public one none;
 //! * `rpk_digest` is deterministic, 64 hex, never the plain SHA-256;
 //! * a signature set that parses is its canonical encoding;
 //! * a manifest that verifies against the harness site is signed by at
@@ -66,9 +68,27 @@ fn check_manifest(m: &Manifest, doc: &[u8]) {
         "{}",
         m.dir_name()
     );
+    assert_eq!(m.is_sealed(), m.seal.is_some());
     for f in &m.content {
-        let sum: u64 = f.chunks.iter().map(|&i| m.chunks[i as usize].size).sum();
+        let over = if m.is_sealed_file(f) {
+            rpk::SEALED_CHUNK_OVERHEAD
+        } else {
+            0
+        };
+        let sum: u64 = f
+            .chunks
+            .iter()
+            .map(|&i| m.chunks[i as usize].size - over)
+            .sum();
         assert_eq!(sum, f.size);
+    }
+    if m.is_sealed() {
+        let mut seen = std::collections::BTreeSet::new();
+        for f in &m.content {
+            for &i in &f.chunks {
+                assert!(seen.insert(i), "a sealed RPK's chunk used twice");
+            }
+        }
     }
     let n = m.payload_files().count();
     assert!(n + 1 >= m.content.len() && n <= m.content.len());
@@ -146,6 +166,7 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
                 },
             ],
             expires_at: Some(1_900_000_000),
+            seal: None,
         }
     };
     let rel = release();
@@ -171,8 +192,46 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     );
     let ddoc = to_canonical(&deb).expect("canonical");
     let dsig = sign(&ddoc, MANIFEST_SIG_DOMAIN, &[&rel[0]]);
+    // A sealed model: one sealed file (synthetic chunk hashes: the
+    // parser judges sizes and structure, not ciphertext) and a clear SBOM.
+    let mut sealed = mk(
+        Kind::Model,
+        vec![f("model.cdx.json", sbom, 0o644)],
+        Some(sbom),
+    );
+    sealed.confidentiality = Confidentiality::Sealed;
+    sealed.chunks.push(Chunk {
+        sha256: "ee".repeat(32),
+        size: 1000 + SEALED_CHUNK_OVERHEAD,
+    });
+    sealed.content.push(ContentFile {
+        path: "weights.onnx".into(),
+        mode: 0o640,
+        size: 1000,
+        sha256: "dd".repeat(32),
+        chunks: vec![],
+    });
+    sealed.chunks.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let at = |h: &str, c: &[Chunk]| c.iter().position(|x| x.sha256 == h).map(|i| i as u32);
+    let sbom_at = at(&sha256_hex(sbom), &sealed.chunks).into_iter().collect();
+    let ee_at = at(&"ee".repeat(32), &sealed.chunks).into_iter().collect();
+    sealed.content[0].chunks = sbom_at;
+    sealed.content[1].chunks = ee_at;
+    sealed.health.clear();
+    sealed.seal = Some(Seal {
+        scheme: SEAL_SCHEME.into(),
+        seal_id: "aa".repeat(32),
+        ck_commit: "bb".repeat(32),
+        depot_wraps: vec![DepotWrap {
+            recipient: format!("sha256:{}", "cc".repeat(32)),
+            wrap: "01".repeat(105),
+        }],
+    });
+    let sdoc = to_canonical(&sealed).expect("canonical");
+    let ssig = sign(&sdoc, MANIFEST_SIG_DOMAIN, &[&rel[0], &rel[1]]);
     vec![
         ("seed-files-quorum.bin", join(&[&doc, &sig])),
         ("seed-deb-one-sig.bin", join(&[&ddoc, &dsig])),
+        ("seed-sealed-model.bin", join(&[&sdoc, &ssig])),
     ]
 }

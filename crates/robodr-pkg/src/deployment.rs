@@ -31,8 +31,15 @@
 //! * Replay: `deployment_seq` increases per site ([`check_seq`]). A unit
 //!   only sees the deployments that target it, so a gap is normal and not
 //!   reported; an older or equal-but-different sequence number is refused.
-//! * `wrapped_keys` is reserved for sealed items (Sprint 13c) and must be
-//!   empty.
+//! * `wrapped_keys` (Sprint 13c, §7.3): for each sealed item and each unit
+//!   that may install it, `wrap(UWK_unit, CK)` as produced by `robodr-seal`
+//!   (opaque here: lower-case hex of at most [`MAX_WRAP_BYTES`] bytes).
+//!   Entries are sorted by `(unit, rpk_digest)` without duplicates, name an
+//!   item of this deployment, and name a unit the deployment targets
+//!   (any unit label when it also targets groups: the depot expands a
+//!   group's membership, and the unit only ever looks for its own entry).
+//!   Which items are sealed is the manifests' to say, so a missing wrap is
+//!   the unit's refusal, not this parser's.
 
 use crate::common::{
     domain_hash, invalid, is_hex64, is_label, is_pkg_name, parse_canonical, strictly_sorted, Code,
@@ -127,8 +134,33 @@ pub struct Deployment {
     pub expires_at: u64,
     pub rollout: Rollout,
     pub maintenance_window: Option<MaintenanceWindow>,
-    /// Reserved (Sprint 13c); must be empty.
-    pub wrapped_keys: Vec<serde_json::Value>,
+    /// Per-unit content-key wraps of sealed items (Sprint 13c, §7.3).
+    pub wrapped_keys: Vec<WrappedKey>,
+}
+
+/// One per-unit content-key wrap: `wrap(UWK_unit, CK)` of the sealed RPK
+/// `rpk_digest` for `unit` (`robodr-seal`, `docs/SECURE-DELIVERY.md` §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WrappedKey {
+    pub unit: String,
+    pub rpk_digest: String,
+    /// Lower-case hex of the wrap bytes (`robodr-seal` wrap format).
+    pub wrap: String,
+}
+
+/// Most wrapped keys in one deployment (every target unit for every item
+/// would exceed the 1 MiB document cap long before).
+pub const MAX_WRAPPED_KEYS: usize = 8192;
+/// Largest wrap (bytes, before hex).
+pub const MAX_WRAP_BYTES: usize = 256;
+
+/// Lower-case hex of 1..=`max` bytes.
+pub fn is_hex_bytes(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len().is_multiple_of(2)
+        && s.len() <= 2 * max
+        && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Whether `ring` is a production ring (needs the production operator quorum).
@@ -234,12 +266,34 @@ impl Deployment {
             }
             strictly_sorted(&w.days, |d| *d, "maintenance_window.days")?;
         }
-        if !self.wrapped_keys.is_empty() {
-            return Err(Refusal::new(
-                Code::Unsupported,
-                "deployment: wrapped_keys (sealed items) are Sprint 13c",
-            ));
+        if self.wrapped_keys.len() > MAX_WRAPPED_KEYS {
+            return Err(invalid(format!(
+                "deployment: more than {MAX_WRAPPED_KEYS} wrapped keys"
+            )));
         }
+        for w in &self.wrapped_keys {
+            if !is_label(&w.unit)
+                || !is_hex64(&w.rpk_digest)
+                || !is_hex_bytes(&w.wrap, MAX_WRAP_BYTES)
+            {
+                return Err(invalid("deployment: bad wrapped key"));
+            }
+            if !digests.contains(w.rpk_digest.as_str()) {
+                return Err(invalid(
+                    "deployment: a wrapped key for an RPK that is not an item",
+                ));
+            }
+            if t.groups.is_empty() && t.units.binary_search(&w.unit).is_err() {
+                return Err(invalid(
+                    "deployment: a wrapped key for a unit the deployment does not target",
+                ));
+            }
+        }
+        strictly_sorted(
+            &self.wrapped_keys,
+            |w| (w.unit.clone(), w.rpk_digest.clone()),
+            "wrapped_keys (by unit, rpk_digest)",
+        )?;
         Ok(())
     }
 }
@@ -434,6 +488,34 @@ mod tests {
     use crate::trust::Floor;
 
     const NOW: u64 = 1_790_000_100;
+
+    fn wk(unit: &str, digest: &str, wrap: &str) -> WrappedKey {
+        WrappedKey {
+            unit: unit.into(),
+            rpk_digest: digest.into(),
+            wrap: wrap.into(),
+        }
+    }
+
+    #[test]
+    fn wrapped_keys_parse() {
+        let mut d = deployment("lab");
+        d.wrapped_keys = vec![wk("ugv-07", &"ab".repeat(32), &"5a".repeat(150))];
+        let b = to_canonical(&d).unwrap();
+        assert_eq!(parse_deployment(&b).unwrap(), d);
+        // With a group target, a wrap may name any unit (the depot expands
+        // the group).
+        d.targets.groups = vec!["all-ugv".into()];
+        d.wrapped_keys.push(wk("ugv-99", &"ab".repeat(32), "00"));
+        let b = to_canonical(&d).unwrap();
+        assert_eq!(parse_deployment(&b).unwrap(), d);
+        // An empty list is still the 13a/13b encoding.
+        let d = deployment("lab");
+        let b = to_canonical(&d).unwrap();
+        assert!(std::str::from_utf8(&b)
+            .unwrap()
+            .ends_with(",\"wrapped_keys\":[]}"));
+    }
 
     fn signed(d: &Deployment, by: &[&robodr_blackbox::Ed25519SigningKey]) -> (Vec<u8>, Vec<u8>) {
         let b = to_canonical(d).unwrap();
@@ -648,9 +730,46 @@ mod tests {
                 }),
             ),
             (
-                "wrapped keys",
-                Code::Unsupported,
-                Box::new(|d| d.wrapped_keys = vec![serde_json::json!(1)]),
+                "wrap for no item",
+                Code::Invalid,
+                Box::new(|d| d.wrapped_keys = vec![wk("ugv-07", &"cd".repeat(32), "00")]),
+            ),
+            (
+                "wrap for an untargeted unit",
+                Code::Invalid,
+                Box::new(|d| d.wrapped_keys = vec![wk("ugv-99", &"ab".repeat(32), "00")]),
+            ),
+            (
+                "wrap not hex",
+                Code::Invalid,
+                Box::new(|d| d.wrapped_keys = vec![wk("ugv-07", &"ab".repeat(32), "0G")]),
+            ),
+            (
+                "wrap odd hex",
+                Code::Invalid,
+                Box::new(|d| d.wrapped_keys = vec![wk("ugv-07", &"ab".repeat(32), "000")]),
+            ),
+            (
+                "wrap upper hex",
+                Code::Invalid,
+                Box::new(|d| d.wrapped_keys = vec![wk("ugv-07", &"ab".repeat(32), "AB")]),
+            ),
+            (
+                "wrap too long",
+                Code::Invalid,
+                Box::new(|d| {
+                    d.wrapped_keys = vec![wk("ugv-07", &"ab".repeat(32), &"00".repeat(257))]
+                }),
+            ),
+            (
+                "wrap twice",
+                Code::Invalid,
+                Box::new(|d| {
+                    d.wrapped_keys = vec![
+                        wk("ugv-07", &"ab".repeat(32), "00"),
+                        wk("ugv-07", &"ab".repeat(32), "01"),
+                    ]
+                }),
             ),
         ];
         for (name, code, f) in cases {

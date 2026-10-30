@@ -263,6 +263,7 @@ mod tests {
                 },
                 health: vec![],
                 expires_at: None,
+                seal: None,
             },
             blobs,
         )
