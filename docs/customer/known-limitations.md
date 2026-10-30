@@ -15,11 +15,13 @@
   labs, in network namespaces, under qemu, or with synthetic traffic
   ([`README.md`](../../README.md) "Status"). Field validation with a 72 h
   soak is S11.
-- **False-positive rates are unmeasured** beyond lab captures and a
-  benign rule corpus. Thresholds and correlation rules are untuned
-  engineering defaults.
-- **GitHub CI has never run.** All jobs passed in a local step-by-step
-  run ([`docs/BUILD.md`](../BUILD.md), "Local CI verification").
+- **False-positive rates are unmeasured** beyond lab captures, a benign
+  rule corpus and a 2-hour lab soak on a shared VM
+  ([`performance.md`](performance.md)). Thresholds and correlation rules
+  are untuned engineering defaults.
+- **GitHub CI is not green yet.** Its first complete run (2026-10-30)
+  failed several jobs; all jobs had passed in a local step-by-step run
+  ([`docs/BUILD.md`](../BUILD.md), "Local CI verification").
 - **Reviews so far were done by AI agents**, not by independent human
   security reviewers, and there has been no penetration test
   ([`docs/compliance/iec-62443-4-1-sdl-evidence.md`](../compliance/iec-62443-4-1-sdl-evidence.md)).
@@ -30,11 +32,27 @@
   plane answers `recorded_not_executed`, and the executor is off
   (`executor.enabled: false`)
   ([`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md)).
-- **Executor v1 (opt-in) executes only reversible network actions:**
+- **Executor v1 (opt-in)** executes the reversible network actions
   `isolate_network` and `quarantine_node` (nftables, TTL-bounded) and the
-  `record_evidence` mark. `restrict_motion` from the SOC is recorded only;
-  `safe_pause`, `request_safe_state` and `rollback_config` are never
-  executed ([`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md)).
+  `record_evidence` mark. Without a `motion` section in `executor.json`,
+  `restrict_motion` is recorded only and `safe_pause`,
+  `request_safe_state` and `rollback_config` are refused. With one, they
+  run through platform adapters (`gateway`, `unitree_sport`, `nav2`,
+  `ros2_control`, `px4`, `rollback`), each refused until the site sets
+  its `oem_validated: true`, and pause, safe state and rollback only with
+  two distinct human approvers
+  ([`support-matrix.md`](support-matrix.md#response-actions),
+  [`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md)).
+  - Only the `gateway` adapter has run against the real component (the
+    gateway binary, in a lab soak). `unitree_sport`, `nav2`,
+    `ros2_control`, `px4` and `rollback` have run only against in-process
+    simulated peers and test programs, never against a real Unitree
+    robot, Nav2, ros2_control or PX4. Executor service requests use
+    `rmw_cyclonedds` only; MAVLink signing is not supported.
+  - Nav2 and PX4 pauses are not latches: a new goal or a mode change by
+    someone else moves the robot again (combine with the gateway's
+    restriction). Unitree `SpeedLevel` is advisory without the gateway and
+    is reverted to level 0, not to the level before.
   - It has run against real nftables in network namespaces only, not on a
     robot and not under a real systemd (load the nf_tables modules at boot
     on a minimal kernel).
@@ -97,13 +115,16 @@
   - **latency on your sensor box**: measured only on a shared development
     VM; the p99 gate must be measured on the target with the latency
     harness (`crates/robodr-firewall-gw/examples/gw_latency.rs`).
-  The gateway is IPv4 only, does not decide ROS 2 `JointTrajectory`
-  (the loco, arm, hand and ROS 2 twist channels were tested on synthetic
-  frames only), forwards
-  `led` / `fan` / `gpio` fields as sent, and writes its verdicts to a
-  local events file that does not reach agentd or the SOC yet. It has not
-  run on a robot, a real Cyclone DDS stack or a real sensor box. Start in
-  `mode: observe`.
+  The gateway is IPv4 only (it drops IPv6, VLAN-tagged and PPPoE
+  traffic), its loco, arm, hand and ROS 2 channels were tested on
+  synthetic frames only, and it forwards `led` / `fan` / `gpio` fields as
+  sent. Its findings reach agentd (and so the SOC) through agentd's
+  `gateway_feed`; that channel is trusted by uid, so a process running as
+  root or as the gateway's user can claim any gateway finding. On an
+  overloaded host a frame decided late gets the fail-safe verdict and a
+  Critical `robot.firewall.internal_fault` (seen on a shared VM in the
+  lab soak). It has not run on a robot, a real Cyclone DDS stack or a
+  real sensor box. Start in `mode: observe`.
 - **Humanoids and other balancing robots:** RoboDR never executes a pause
   or safe state on a humanoid, never terminates processes on a balancing
   robot, and never emits a damping or limp frame on a humanoid joint
@@ -234,7 +255,8 @@
   no host rules. Debian 12 and Ubuntu 22.04 take the regular package
   (glibc 2.35+, systemd 247+;
   [platform requirements](support-matrix.md#platform-requirements)).
-- **Resource budgets are unmeasured** on target hardware.
+- **Resource budgets are unmeasured** on target hardware. The lab
+  values in [`performance.md`](performance.md) come from a shared VM.
 - **The Kafka exporter** is idempotent by default (exactly-once per
   partition within a producer id's lifetime), tested against an in-process
   fake broker only; a batch can still be written twice after the broker

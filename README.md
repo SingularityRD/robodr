@@ -6,11 +6,13 @@
 
 ---
 
-RoboDR is a detection-and-response platform for robots: industrial arms, AMRs,
-humanoids, drones and defence UGVs. It watches what a robot's software *and its
-motion* are actually doing, catches deviation from a locked model profile, and
-responds in a way that is aware of the robot's physical safety state — never by
-blindly killing a process on a machine that is mid-motion.
+RoboDR is a detection-and-response platform for Linux-based robots that
+use ROS 2 / DDS, including Unitree quadrupeds and humanoids. It watches
+what a robot's software *and its motion* are actually doing, catches
+deviation from a locked model profile, and responds in a way that is aware
+of the robot's physical safety state — never by blindly killing a process
+on a machine that is mid-motion. What is in scope today, and how far each
+part is verified, is under [Scope](#scope).
 
 It is built on [Pulsar](https://github.com/exein-io/pulsar) (eBPF runtime
 security for Linux), vendored under `vendor/pulsar`. RoboDR adds the robot layer
@@ -39,8 +41,41 @@ real (see [`docs/ROADMAP.md`](docs/ROADMAP.md) §0). RoboDR's differentiators:
   envelope before it reaches the motors.
 - **Cyber-Jidoka** — response graded by the robot's safety state, borrowing the
   Toyota *jidoka* idea: stop safely, surface the fault, fix it fleet-wide.
-- **One core, every robot kind** — including closed controllers (via the
-  agentless Sentinel Box) and air-gapped fleets.
+- **Air-gapped fleets** — findings and evidence leave through a data diode
+  or on media as signed batches; releases arrive the same way.
+
+These are design goals; the evidence for each is lab evidence, not field
+evidence (see [Scope](#scope) and [Status](#status)).
+
+## Scope
+
+What RoboDR covers in this release line, with the verification level of
+[`docs/customer/support-matrix.md`](docs/customer/support-matrix.md)
+(V2 lab: real software of that kind in a lab; V1: synthetic vectors,
+emulation or containers; nothing is V3 field-verified):
+
+| In scope | Level | Where to look |
+|---|---|---|
+| ROS 2 / DDS robots: graph, discovery and motion-command detection (Jazzy; Fast DDS 2.14, Cyclone DDS 0.10) | V2 (lab captures) | [support matrix](docs/customer/support-matrix.md#ros-2-and-middleware) |
+| ROS 2 Humble, Foxy | V1 | same |
+| Unitree robots (Go2, B2, H1, G1 and others over SDK2 / DDS; Go1 legacy UDP) | V1 (synthetic traffic, IDL-derived vectors; no real Unitree capture) | [`docs/UNITREE.md`](docs/UNITREE.md) |
+| Linux host runtime security (Pulsar eBPF rules through `robodr-pulsard`) | V2 under WSL2; never on a robot | [support matrix](docs/customer/support-matrix.md#kernel-and-host-monitoring-robodr-pulsard-ebpf) |
+| On-robot agent, or a passive sensor box on a tap / mirror port | V2 (agent in a lab VM), V1 (sensor-box example configuration) | [`docs/customer/quick-start.md`](docs/customer/quick-start.md) |
+| Inline Motion Firewall gateway on a bridged sensor box (Unitree channels, ROS 2 `cmd_vel` and joint trajectories) | V2 (network namespaces, synthetic frames) | [`crates/robodr-firewall-gw/README.md`](crates/robodr-firewall-gw/README.md) |
+| Response actions through `robodr-executor` (off by default; adapters per platform, each gated by `oem_validated`) | V2 network actions and the `gateway` motion adapter; V1 the other motion adapters | [response actions](docs/customer/support-matrix.md#response-actions) |
+| Findings to AutoSecOps (ingest API), Kafka, or across a diode | V2 Kafka; V1 ingest API and diode | [support matrix](docs/customer/support-matrix.md#soc-and-export-paths) |
+
+Every rule RoboDR can report is listed in the
+[detection catalog](docs/customer/detection-catalog.md); measured lab
+figures are in the [performance data sheet](docs/customer/performance.md);
+a POC follows the [POC guide](docs/customer/poc-guide.md).
+
+**Roadmap, not in this release line:** drones and other MAVLink vehicles
+(the executor has a PX4 hold adapter, but nothing detects on MAVLink
+traffic), industrial arms behind closed controllers (KUKA, FANUC, ABB,
+OPC UA) and the agentless *Sentinel Box* appliance for them, fieldbuses
+(CAN, EtherCAT), defence UGV integrations, Zenoh decoding, RTOS / MCU
+targets, remote attestation. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Repository layout
 
@@ -63,7 +98,8 @@ crates/
                           Binary: robodr-commission.
   robodr-firewall/        Motion Firewall decision core: pass / limit / reject a
                           motion command against the locked envelope. Pure,
-                          allocation-free hot path; no ROS 2 gateway yet.
+                          allocation-free hot path; used by agentd (recording)
+                          and by robodr-firewall-gw (inline).
   robodr-motion/          Motion/feedback consistency detector (injected or frozen
                           telemetry, uncommanded motion, GNSS vs odom vs IMU). Pure.
   robodr-responder/       Cyber-Jidoka response *planner*: graded, safety-state-aware
@@ -81,7 +117,7 @@ crates/
                           used for profile signing. Binary: robodr-blackbox
                           (keygen, export-pub, verify, inspect).
   robodr-ocsf/            Deviation -> OCSF Detection Finding in the vendor-neutral
-                          robodr.findings contract (2.0; configurable data source
+                          robodr.findings contract (2.4; configurable data source
                           and topic; 1.x parse-only); Kafka key/partition helpers
                           (no Kafka client); optional detached Ed25519 per-finding
                           signatures (header robodr-finding-sig); rule catalog
@@ -98,6 +134,28 @@ crates/
                           quarantine reports. Binary: robodr-agentd (systemd
                           unit in packaging/). Plans only; tested offline with
                           pcaps and JSONL, never run on a robot.
+  robodr-executor/        Executor v1 (off by default): carries out catalog
+                          actions on the robot after its own precheck and a
+                          live safety-state re-check. Network actions
+                          (nftables, reversible, TTL) and, with a `motion`
+                          section, platform motion adapters (gateway,
+                          Unitree sport, Nav2, ros2_control, PX4, rollback),
+                          each refused unless the site set `oem_validated`.
+                          Binary: robodr-executor (CAP_NET_ADMIN only).
+  robodr-firewall-gw/     Inline Motion Firewall gateway for a bridged sensor
+                          box (NFQUEUE): passes, limits, holds or removes
+                          motion samples; never originates one. Binary:
+                          robodr-firewall-gw.
+  robodr-fleet/           Robot side of the fleet API: enrollment, key
+                          rotation, revocation lists, SOC profiles. Binary:
+                          robodr-enroll.
+  robodr-deliverd/        Secure-delivery unit agent: installs signed,
+                          optionally sealed packages, health gate, rollback,
+                          leases, crypto-erase. Binaries: robodr-deliverd,
+                          robodr-safety-replay.
+  robodr-depot/           Site depot for air-gapped delivery: bundle import
+                          with entry-station report, unit enrolment, staged
+                          rollouts. Binary: robodr-depot.
   robodr-correlate/       Weak-signal correlation engine: declarative JSON rules
                           (sequence, co-occurrence, threshold, distinct sources)
                           combine already-reported findings into
@@ -139,7 +197,8 @@ crates/
                           key quorum, assemble chained bundles with parity,
                           verify anywhere, repair from parity. Binary:
                           robodr-release. Sprint 13a; sealed RPKs
-                          (`build rpk --seal-to`) since 13c; no depot yet.
+                          (`build rpk --seal-to`) since 13c; the site depot is
+                          robodr-depot (14a).
   robodr-seal/            Captured-unit protection (docs/SECURE-DELIVERY.md
                           §7): XChaCha20-Poly1305 sealed chunks, key wraps
                           to depots and units, a TPM-resident unit key
@@ -171,8 +230,10 @@ docs/PULSAR-INTEGRATION.md  Every Pulsar item the Pulsar-bound crates use.
 docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
                         robodr.control-plane contract (v2) + fixtures/
                         test vectors; legacy/ = superseded 1.x.
-docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer drafts.
-fuzz/                   cargo-fuzz targets (RTPS, capture, black box, OCSF,
+docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer
+                        documents (support matrix, detection catalog, performance,
+                        POC guide, quick start, known limitations, drafts).
+fuzz/                   37 cargo-fuzz targets (RTPS, capture, black box, OCSF,
                         commissioning, firewall, pipeline config, control-plane
                         requests; own workspace) + std-only smoke runs in the
                         crates' tests.
@@ -186,12 +247,13 @@ vendor/pulsar/          Pulsar, as a git submodule (the base we build on).
 **Alpha (`0.1.0-alpha.1`), unreleased, not validated on a real robot.**
 Everything below was verified offline: unit and integration tests, real
 ROS 2 lab captures, network namespaces on a development VM, containers and
-qemu. No release has been cut or signed, and GitHub CI has never run
-(every CI job passed in a local run). Plan and per-sprint status:
+qemu. No release has been cut or signed. GitHub CI has run once in full
+(2026-10-30) and was not green; every job had passed in a local run
+([`docs/BUILD.md`](docs/BUILD.md), "Local CI verification"). Plan and per-sprint status:
 [`docs/GA-ROADMAP.md`](docs/GA-ROADMAP.md); blunt list of limits:
 [`docs/customer/known-limitations.md`](docs/customer/known-limitations.md).
 
-**In the code (2026-10-26):**
+**In the code (2026-10-30):**
 
 - **Detection** in `robodr-agentd`: DDS graph against a signed, locked
   profile (participant identities survive GUID changes), RTPS user DATA →
@@ -200,7 +262,7 @@ qemu. No release has been cut or signed, and GitHub CI has never run
   signed and hash-chained black box. Unitree SDK2 topics and Go1 legacy
   UDP decode end to end on synthetic traffic and IDL-derived vectors
   ([`docs/UNITREE.md`](docs/UNITREE.md)).
-- **Findings to a SOC**: `robodr.findings` 2.1 over `robodr-uplink`
+- **Findings to a SOC**: `robodr.findings` 2.4 over `robodr-uplink`
   (signed NDJSON batches, TLS, contract
   [`robodr.ingest-api`](docs/contracts/robodr.ingest-api.md)), the diode,
   or Kafka (TLS, mutual TLS, SASL/SCRAM).
@@ -214,9 +276,18 @@ qemu. No release has been cut or signed, and GitHub CI has never run
   TTL-bounded `isolate_network` and `quarantine_node` (nftables) and
   `record_evidence`, decided again on the robot against its own policy and
   the live safety state; separate process with `CAP_NET_ADMIN` only.
-  `restrict_motion` is recorded only; `safe_pause`, `request_safe_state`
-  and `rollback_config` are never executed
-  ([crate README](crates/robodr-executor/README.md)).
+  Without a `motion` section in `executor.json`, `restrict_motion` is
+  recorded only and `safe_pause`, `request_safe_state` and
+  `rollback_config` are refused. With one, they run through **platform
+  adapters**: `gateway` and `unitree_sport` (`restrict_motion`), `nav2`,
+  `ros2_control` and `px4` (`safe_pause`, `request_safe_state`),
+  `rollback` (`rollback_config`). Each adapter refuses to run until the
+  site sets its `oem_validated: true`; pause, safe state and rollback need
+  two distinct human approvers, and pause and safe state are never
+  executed on a humanoid. Only the `gateway` adapter has run against the
+  real component (lab soak); the others only against in-process simulated
+  peers ([response actions](docs/customer/support-matrix.md#response-actions),
+  [crate README](crates/robodr-executor/README.md)).
 - **In-path gateway** (`robodr-firewall-gw`, optional): a bridged sensor
   box that passes, limits, holds or removes Unitree and ROS 2 motion
   samples (`rt/lowcmd`, sport `Move`, loco requests, arm SDK, hands,
@@ -230,13 +301,16 @@ qemu. No release has been cut or signed, and GitHub CI has never run
 - **Hardening (S10)**: `sha2` (HMAC as a wiping RFC 2104 wrapper over it)
   instead of hand-written crypto,
   `forbid(unsafe_code)` where possible, panic-family calls denied in daemon
-  code, 23 fuzz targets (10 run under libFuzzer for 630 s each, no crash).
+  code, 37 fuzz targets (CI runs each for 60 s; an earlier campaign ran 10
+  of them for 630 s each, no crash).
 
 **Not verified:**
 
 - No real robot, sensor box, controller hardware or hardware TPM. No 72 h
-  soak; false-positive rates and resource budgets are unmeasured. Gateway
-  latency was measured only on a shared VM.
+  soak (a 2 h lab soak ran on a shared VM); false-positive rates on a real
+  robot are unmeasured, and the resource and latency figures are lab
+  values from a shared VM
+  ([performance data sheet](docs/customer/performance.md)).
 - The executor and the gateway have run only in network namespaces with
   synthetic traffic, never under a real systemd on a target, never next to
   a real Cyclone / Fast DDS stack. Unitree's `rt/lowcmd` QoS and the motor
