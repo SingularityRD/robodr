@@ -110,6 +110,12 @@ jobs:
           python3 scripts/ci-check-lockfile.py --self-test
           python3 scripts/ci-pure-excludes.py --self-test
           python3 scripts/check-focal-units.py --self-test
+          python3 scripts/check-packages.py --self-test
+      - name: Package variants consistent (programs, workflows, maintainer scripts)
+        # Every robodr-* program classified per package variant, every
+        # ROBODR_DEB_REQUIRE list complete, deb and rpm scripts stopping and
+        # restarting the same units (scripts/check-packages.py).
+        run: python3 scripts/check-packages.py
       - name: systemd-245 unit variants in step with the regular units
         # packaging/systemd/focal/* (robodr-focal package, Ubuntu 20.04 /
         # JetPack 5): same directives as the regular units except the
@@ -124,9 +130,10 @@ jobs:
         run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict
       - name: shellcheck
         # CI scripts and the packaging scripts that run on the robot
-        # (install-bundle.sh, the maintainer scripts, the focal credential
-        # helper) or build the release (build-deb.sh, make-bundle.sh).
-        run: shellcheck scripts/*.sh packaging/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/focal/robodr-load-credential
+        # (install-bundle.sh, the deb maintainer scripts and rpm scriptlets,
+        # the focal credential helper) or build the release (build-deb.sh,
+        # build-rpm.sh, make-bundle.sh).
+        run: shellcheck scripts/*.sh packaging/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm packaging/rpm/post packaging/rpm/preun packaging/rpm/postun packaging/focal/robodr-load-credential packaging/btf/robodr-btf-check
 
   # ---------------------------------------------------------------------------
   pure:
@@ -452,14 +459,14 @@ jobs:
             sudo apt-get install -y --no-install-recommends qemu-user-static
             run=qemu-aarch64-static
           fi
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor robodr-deliverd robodr-seal; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal; do
             $run "dist/static/$TARGET/$b" --version
           done
           $run "dist/static/$TARGET/robodr-blackbox" keygen --out "$RUNNER_TEMP/k"
           test -s "$RUNNER_TEMP/k.pub"
       - name: robodr-focal .deb (static binaries, systemd 245 units)
         env:
-          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-deliverd robodr-seal
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/focal)
@@ -471,8 +478,16 @@ jobs:
             echo "::error::robodr-focal must not contain robodr-pulsard"
             exit 1
           fi
+          python3 scripts/check-packages.py --deb "$deb"
       - name: Build did not modify tracked files
         run: test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Upload the robodr-focal package (package-smoke)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkg-focal-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/focal/*.deb
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload binary hashes
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -480,3 +495,175 @@ jobs:
           path: dist/static/${{ matrix.target }}/SHA256SUMS
           if-no-files-found: error
           retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  package-deb:
+    # The robodr .deb exactly as release.yml builds it: in an Ubuntu 22.04
+    # container (glibc 2.35, the oldest userland the package supports, so it
+    # installs on Ubuntu 22.04 / NVIDIA JetPack 6, Debian 12 and newer),
+    # natively per architecture, robodr-pulsard included (clang-20 from
+    # apt.llvm.org, key pinned by fingerprint). Reproducibility proof in the
+    # same userland, Depends from dpkg-shlibdeps with the libc6 floor checked
+    # (<= 2.35), package consistency; package-smoke installs it for real.
+    # (scripts/deb-install-smoke.sh needs systemd-analyze verify --root,
+    # systemd >= 250: not in this container.) docs/BUILD.md "Release build
+    # userlands".
+    name: robodr .deb, Ubuntu 22.04 userland (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: docker.io/library/ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: git for actions/checkout (the image has none)
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build userland (base packages, Rust, pinned clang, eBPF toolchain)
+        run: |
+          scripts/ci-container-prep.sh
+          scripts/ci-install-rustup.sh
+          scripts/ci-install-clang.sh
+          scripts/ci-install-ebpf-toolchain.sh
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Reproducibility proof (pure binaries, two paths)
+        env:
+          REPRO_REQUIRE_BINARIES: "1"
+        run: scripts/ci-repro.sh dist/repro
+      - name: Release build (scripts/ci-release-build.sh, as release.yml)
+        run: scripts/ci-release-build.sh
+      - name: Built pure binaries == reproduced binaries
+        run: (cd target/release && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro/SHA256SUMS")
+      - name: robodr .deb (libc6 floor <= 2.35), consistency
+        env:
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          deb=$(packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/pkg)
+          scripts/check-glibc-floor.sh "$deb"
+          python3 scripts/check-packages.py --deb "$deb"
+      - name: Build did not modify tracked files
+        run: test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Upload the package (package-smoke)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkg-deb-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/pkg/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  package-rpm:
+    # The robodr .rpm exactly as release.yml builds it: in a Rocky Linux 9
+    # container (glibc 2.34, OpenSSL 3, SQLite 3.34: the oldest RPM userland
+    # supported, so it installs on RHEL / Rocky / Alma 9 and Fedora),
+    # natively per architecture, robodr-pulsard included (AppStream clang).
+    # Same file tree as the .deb (build-deb.sh --stage-only), rpm's generated
+    # GLIBC requirement checked (<= 2.34), package consistency.
+    name: robodr .rpm, Rocky Linux 9 userland (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: quay.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: git for actions/checkout
+        run: dnf install -y --setopt=install_weak_deps=False git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build userland (base packages, Rust, pinned clang, eBPF toolchain)
+        run: |
+          scripts/ci-container-prep.sh
+          scripts/ci-install-rustup.sh
+          scripts/ci-install-clang.sh
+          scripts/ci-install-ebpf-toolchain.sh
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Reproducibility proof (pure binaries, two paths)
+        env:
+          REPRO_REQUIRE_BINARIES: "1"
+        run: scripts/ci-repro.sh dist/repro
+      - name: Release build (scripts/ci-release-build.sh, as release.yml)
+        run: scripts/ci-release-build.sh
+      - name: Built pure binaries == reproduced binaries
+        run: (cd target/release && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro/SHA256SUMS")
+      - name: robodr .rpm (GLIBC requirement <= 2.34), consistency
+        env:
+          ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          rpm=$(packaging/build-rpm.sh --bin-dir target/release --arch "$ARCH" --out dist/pkg)
+          scripts/check-glibc-floor.sh "$rpm"
+          python3 scripts/check-packages.py --rpm "$rpm"
+      - name: Build did not modify tracked files
+        run: test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Upload the package (package-smoke)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkg-rpm-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/pkg/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  package-smoke:
+    # Every package installed with the target distribution's own package
+    # manager, in a fresh container per distribution (scripts/
+    # pkg-smoke-matrix.sh): robodr .deb on Debian 12 / Ubuntu 22.04 / 24.04,
+    # robodr-focal on Ubuntu 20.04 / 22.04, robodr .rpm on Rocky Linux 9 /
+    # Fedora 42; Depends / Requires resolved by apt / dnf, maintainer
+    # scripts run, every program started on that glibc, units verified by
+    # that systemd, reinstall / remove / purge. Then the three packages of
+    # the architecture are compared with each other (check-packages.py).
+    name: Package install smoke (${{ matrix.arch }})
+    needs: [package-deb, package-rpm, static]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download this architecture's packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pkg-*-${{ matrix.arch }}-${{ github.sha }}
+          merge-multiple: true
+          path: dist/pkgs
+      - name: The three packages agree (paths, modes, content)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
+          ls -l dist/pkgs
+          python3 scripts/check-packages.py --deb dist/pkgs/robodr_*.deb --deb dist/pkgs/robodr-focal_*.deb --rpm dist/pkgs/robodr-*.rpm
+      - name: Install smoke per distribution
+        run: scripts/pkg-smoke-matrix.sh dist/pkgs
