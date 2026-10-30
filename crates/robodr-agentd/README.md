@@ -176,7 +176,8 @@ path:
   `feedback_topics`). A command from an IP not in `command_senders` is
   `robot.unitree.legacy_unknown_sender` (Critical; Medium for state from an
   address not in `robot_addresses`) — also for a compressed v3.8.6
-  `LowCmd`, which is additionally `robot.motion.undecodable_sample`. More
+  `LowCmd` (614 B), which is decoded and checked like the declared one;
+  a compressed `LowState` (807 B) is `robot.motion.undecodable_sample`. More
   than 16 unlisted senders of a class are aggregated
   (`robot.unitree.legacy_sender_flood`); a MAC-bound sender seen with
   another MAC is `robot.unitree.legacy_sender_mac_mismatch` (High); RTPS on

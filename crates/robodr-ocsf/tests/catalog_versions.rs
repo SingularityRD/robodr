@@ -370,3 +370,50 @@ fn a_2_2_seal_message_validates_with_its_own_catalog() {
         assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
     }
 }
+
+/// Unitree WebRTC ids whose catalog entry was added after contract 2.2.0
+/// (2.3, `catalog_2_3_unitree`).
+const IDS_2_3_UNITREE: &[&str] = &[
+    "robot.unitree.webrtc_unknown_controller",
+    "robot.unitree.webrtc_new_peer",
+    "robot.unitree.webrtc_controller_mac_mismatch",
+    "robot.unitree.webrtc_session_in_denied_window",
+    "robot.unitree.webrtc_concurrent_sessions",
+    "robot.unitree.webrtc_relayed_session",
+    "robot.unitree.webrtc_media_without_signalling",
+];
+
+#[test]
+fn unitree_entries_added_after_2_2_are_not_in_2_2_or_earlier() {
+    let g = generic();
+    for id in IDS_2_3_UNITREE {
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert_eq!(full.data_source, "ros2_motion_commands", "{id}");
+        for v in ["1.0.0", "1.3.0", "2.0.0", "2.1.0", "2.2.0", "2.2.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.3.0", "2.3.4", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        assert_eq!(rule_info_for_contract(id, "x"), full);
+        // Not shadowing another 2.3 block.
+        assert!(!IDS_2_3_SEAL.contains(id) && !IDS_2_3_GATEWAY.contains(id));
+    }
+}
+
+#[test]
+fn a_2_2_unitree_message_validates_with_its_own_catalog() {
+    for id in IDS_2_3_UNITREE {
+        let v23 = build(id);
+        robodr_ocsf::parse_and_validate(&v23).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let v22 = seal_as_2_2(&v23, id);
+        assert_ne!(v22, v23);
+        robodr_ocsf::parse_and_validate(&v22).unwrap_or_else(|e| panic!("{id} 2.2: {e:?}"));
+        let up = v22.replace(
+            "\"contract_version\":\"2.2.0\"",
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+        );
+        assert!(robodr_ocsf::parse_and_validate(&up).is_err(), "{id}");
+    }
+}

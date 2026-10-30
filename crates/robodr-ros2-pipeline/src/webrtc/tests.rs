@@ -654,7 +654,7 @@ fn memory_is_bounded_under_a_spoofed_peer_flood() {
             None,
             &req,
         )) {
-            assert!(d.rule_str().starts_with("robot.unitree.webrtc_"));
+            assert!(rules::ALL.iter().any(|(r, _)| *r == d.rule_str()));
             n += 1;
         }
     }

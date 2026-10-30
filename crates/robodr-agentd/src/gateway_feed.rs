@@ -82,7 +82,8 @@ impl GatewayLine {
 fn rule_ok(r: &str) -> bool {
     (r.starts_with("robot.gateway.")
         || r.starts_with("robot.firewall.")
-        || r.starts_with("robot.unitree.webrtc_"))
+        || r.strip_prefix("robot.unitree.")
+            .is_some_and(|x| x.starts_with("webrtc_")))
         && r.len() <= MAX_RULE
         && r.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
@@ -118,6 +119,18 @@ pub fn parse_gateway_line(t: &str) -> Result<Payload, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webrtc_findings_of_the_gateway_are_accepted_other_unitree_ids_not() {
+        let line = |r: &str| {
+            format!(
+                r#"{{"format":"robodr-gateway-finding/v1","rule":"{r}","severity":"critical","detail":"x","mode":"enforce","channel":"webrtc","count":1}}"#
+            )
+        };
+        assert!(parse_gateway_line(&line("robot.unitree.webrtc_unknown_controller")).is_ok());
+        assert!(parse_gateway_line(&line("robot.unitree.legacy_unknown_sender")).is_err());
+        assert!(parse_gateway_line(&line(&["robot", "unitree", "webrtc"].join("."))).is_err());
+    }
 
     #[test]
     fn lines_are_strict() {

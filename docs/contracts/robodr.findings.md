@@ -423,7 +423,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
   | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
-  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c) |
+  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c), and the Unitree WebRTC entries `robot.unitree.webrtc_*`, data source `ros2_motion_commands`, no techniques (§3d) |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -561,6 +561,36 @@ The detail of `robot.seal.unseal_failed` starts with the reason
 `robot.seal.erased` names the trigger (`operator`, `tamper`, ...). A wrap
 that does not authenticate (tampered, or another unit's) is not a sealing
 finding but a `robot.deliver.refused` with reason `unauthentic_key`.
+
+## 3d. Rule catalog 2.3: Unitree WebRTC sessions (`robot.unitree.webrtc_*`)
+
+<!-- 2.3 Unitree block: keep separate from the other 2.3 blocks (§3b, §3c). -->
+
+The 2.3 addition for Go2 WebRTC control sessions
+(`robodr-ros2-pipeline::webrtc`; reported by the in-path gateway's
+`webrtc` section through agentd's `gateway_feed`, channel `webrtc`), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.3.x (or later 2.x). Data source
+`ros2_motion_commands`, no techniques. The session content is DTLS-SRTP
+encrypted and never inspected: these findings say who holds a WebRTC
+session with the robot and when, not what it commands. Details name the
+peer and its flows (`peer ip:port <-> robot ip:port`).
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.unitree.webrtc_unknown_controller` | WebRTC control session from an unlisted host | High (attempt), Critical (established) |
+| `robot.unitree.webrtc_new_peer` | New WebRTC peer of the robot | Medium |
+| `robot.unitree.webrtc_controller_mac_mismatch` | Listed WebRTC controller seen with another link-layer address | High |
+| `robot.unitree.webrtc_session_in_denied_window` | WebRTC control session during a denied window | High |
+| `robot.unitree.webrtc_concurrent_sessions` | More concurrent WebRTC control sessions than allowed | High |
+| `robot.unitree.webrtc_relayed_session` | Remote WebRTC session through a relay | Medium |
+| `robot.unitree.webrtc_media_without_signalling` | WebRTC session without observed signalling | Medium |
+
+Catalog sentences (`finding_info.desc`): see
+`catalog_2_3_unitree` in `crates/robodr-ocsf/src/builder.rs` (one per id,
+in the same order as the table).
+
+<!-- end of the 2.3 Unitree block -->
 
 ## 4. Ordering and partitioning
 
@@ -910,6 +940,19 @@ safely. Nothing here is specific to one product.
     `robot.seal.erased`, `robot.seal.tamper` (`docs/SECURE-DELIVERY.md`
     §9), emitted by `robodr-deliverd` (`lease_expired` from 14b). §3c.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
+
+<!-- 2.3 Unitree block -->
+* **2.3.0** — rule-catalog entries only (minor). Unitree block (other 2.3
+  additions are listed as their own items):
+  - New entries (data source `ros2_motion_commands`, already in the
+    schema's enums): `robot.unitree.webrtc_unknown_controller`,
+    `webrtc_new_peer`, `webrtc_controller_mac_mismatch`,
+    `webrtc_session_in_denied_window`, `webrtc_concurrent_sessions`,
+    `webrtc_relayed_session`, `webrtc_media_without_signalling` (§3d),
+    emitted by `robodr-firewall-gw` (`webrtc` section) and reported by
+    agentd (`gateway_feed`, which now accepts the `robot.unitree.webrtc_*`
+    ids besides `robot.gateway.*` / `robot.firewall.*`).
+<!-- end of the 2.3 Unitree block -->
 
 * **2.2.0** — rule-catalog entries only (minor), Sprint 13b:
   - New entries (data source `robodr_delivery`, added to the schema's

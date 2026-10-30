@@ -61,11 +61,11 @@ matrix". Deployment modes are in [`docs/UNITREE.md`](../UNITREE.md).
 | Model / generation | Level | Notes |
 |---|---|---|
 | Go2, Go2-W, B2, B2-W, H1, H1-2, H2, G1, R1 (SDK2 / DDS) | V1 | Decoders, joint envelopes, rules and the live path are tested with synthetic traffic and IDL-derived vectors. **No real Unitree capture.** Go2 EDU and G1 EDU are the GA design-partner targets. |
-| A2, AS2 | V1 (partial) | Sport state and client only. Motor count and low-level layout are unknown. |
-| Go1 (legacy UDP, `unitree_legged_sdk` v3.8.6) | V1 | High-level frames. Compressed low-level frames are undecodable and are reported. Out of GA scope. |
+| A2, AS2 | V1 (partial) | Sport state and client. Low-level command enforced only as the inferred `unitree_go` layout once confirmed by the learned profile; motor count unknown. |
+| Go1 (legacy UDP, `unitree_legged_sdk` v3.8.6) | V1 | High-level frames and low-level commands (declared and compressed). Compressed state frames are reported, not decoded. Out of GA scope. |
 | A1, Aliengo, B1 | V0 | Known by frame layout only. |
 | Air / Pro variants | Sensor box only | Nothing can be installed on them. |
-| Go2 app channel (WebRTC) | Not supported | Encrypted. Not on the Ethernet link. |
+| Go2 app channel (WebRTC) | Detect / block only (inline gateway) | Encrypted: content never decoded. Sessions on the Ethernet link are detected, attributed and can be quarantined by flow; Wi-Fi / cellular sessions are not on the link. |
 | Sensor-box mode (any model) | V1 | Example configuration only. Not field-tested. The reference image is planned (S7). |
 
 ## SOC and export paths

@@ -232,8 +232,10 @@ segment, `allowed_src_macs`) on every channel.
 | `unitree_hg_lowcmd` | RTPS DATA `unitree_hg::msg::dds_::LowCmd_` on `rt/lowcmd` (G1, H1-2) | joint, 35 slots | `mode_pr` / `mode_machine` passed through (pinnable) |
 | `unitree_go_lowcmd` | RTPS DATA `unitree_go::msg::dds_::LowCmd_` (Go2, B2, H1) | joint, 20 slots | |
 | `unitree_sport_request` | RTPS DATA `unitree_api::msg::dds_::Request_` on `rt/api/sport/request` | twist | `Move` (1008) decided as `(vx, vy, 0)/(0, 0, vyaw)`; a malformed `Move` as non-finite; `StopMove` always allowed; other calls: `allowed_api_ids`, then a zero-velocity check (source, rate); an api id outside `i32` (aliasing) is suppressed |
-| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes: `allowed_high_modes`, then a zero-velocity check |
-| `go1_low_cmd` | UDP uncompressed `LowCmd` (734 octets), default port 8007 | joint, 20 slots | the 614-octet compressed form of v3.8.6 is undecidable (dropped): do not configure this channel for compressed traffic |
+| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes: `allowed_high_modes`, then a zero-velocity check; `bms.off` non-zero refused |
+| `go1_low_cmd` | UDP uncompressed `LowCmd` (734 octets), default port 8007 | joint, 20 slots | `bms.off` non-zero refused (integrity failure); any other length is undecidable (dropped) |
+| `go1_low_cmd_compressed` | UDP compressed `LowCmd` (614 octets, `LOW_CMD_LENGTH` of `unitree_legged_sdk` v3.8.6: what a real Go1 client sends), default port 8007 | joint, 20 slots | layout from the library's `refineCmd` (below, "Go1 compressed `LowCmd`"); `tau` / `Kp` / `Kd` are `i16` fixed point (÷256 / ÷32 / ÷16), a limited value is written as the step on the safe side of the bound and one beyond `i16` is refused (suppressed); holds ride on the last accepted 614-octet frame; any other length is dropped. Cannot share its port with `go1_low_cmd` |
+| `unitree_a2_lowcmd` | RTPS DATA on an A2 / AS2 `rt/lowcmd`, **inferred** `unitree_go::msg::dds_::LowCmd_` | joint, 20 slots | decided exactly as `unitree_go_lowcmd`; refused at start unless the firewall channel has `require_crc`, the profile records the channel's type (learned from the robot's SEDP; any other type than the go `LowCmd_` is refused), and `on_gateway_down` is not `bypass`; `allow_battery_off` refused (below, "A2 / AS2") |
 | `unitree_loco_request` | RTPS DATA `Request_` of a humanoid's locomotion client: `robot_model` `g1` / `h2` / `r1` on `rt/api/sport/request` (ids 7xxx), `h1` on `rt/api/loco/request` (ids 8xxx) | twist | `SetVelocity` limited, duration capped; `SetFsmId` other than `Start` refused unless allowlisted (below, "Loco requests") |
 | `unitree_hg_arm_sdk`, `unitree_go_arm_sdk` | RTPS DATA `LowCmd_` on `rt/arm_sdk` (G1 / H1-2 / H2 / R1 `hg`, H1 `go`) | joint, 35 / 20 slots | every slot with gains or torque decided whatever its mode octet; `weight_slot` bounded, its step and rate limited, its rise from 0 checked against `rt/lowstate` (below, "Arm SDK") |
 | `unitree_dex3_hand_cmd` | RTPS DATA `unitree_hg::msg::dds_::HandCmd_` on `rt/dex3/{left,right}/cmd` (topic required) | joint, one slot per finger motor (`balance_critical: false`) | mode octets checked; decided; passed byte-identical or suppressed (below, "Hands") |
@@ -244,6 +246,87 @@ segment, `allowed_src_macs`) on every channel.
 Every representation the decoder reads is rewritten in kind (CDR / CDR2 /
 D_CDR2, either endianness). Only the plain Unitree CRC is supported for Go1
 (a fleet using the SDK's unpublished `encryptCRC` cannot be enforced).
+
+## Go1 compressed `LowCmd` (`go1_low_cmd_compressed`)
+
+`unitree_legged_sdk` v3.8.6 never sends the `comm.h` `LowCmd`:
+`UDP::SetSend(LowCmd&)` runs `refineCmd(LowCmd_refine&, LowCmd&)` and
+sends `LOW_CMD_LENGTH` = 614 octets. No header declares that struct; its
+layout is read from the machine code of the shipped static library
+(`lib/cpp/amd64/libunitree_legged_sdk.a`, `udp.cpp.o`) and pinned in
+`robodr_cdr::unitree_legacy::compressed_layout`: the `comm.h` 22-octet
+header, 20 motors of 27 octets (`mode` u8 at +0, `q` f32 +1, `dq` f32 +5,
+`tau` i16 +9 = `(int)(tau * 256)`, `Kp` i16 +11 = `(int)(Kp * 32)`, `Kd`
+i16 +13 = `(int)(Kd * 16)`, `reserve[3]` +15), `bms` 562, `wirelessRemote`
+566, `reserve` 606, CRC 610 over the first 152 words. The tests compare the
+decoder with a transcription of `refineCmd` and check every offset; the
+gateway's writer is cross-checked against `robodr-cdr`'s decoder.
+
+Fixed point changes two things against the declared form: a limited
+`tau` / `Kp` / `Kd` is written as the 1/256, 1/32 or 1/16 step on the safe
+side of the firewall's value (`round::fixed_away_from`; a substitute
+truncates toward zero), and a value outside `i16` (|tau| ≥ 128 N·m,
+|Kp| ≥ 1024, |Kd| ≥ 2048) cannot be written, so such a frame is
+suppressed rather than wrapped. The SDK wraps such values on the sender:
+an operator's `Kp = 1100` arrives as a negative gain and is refused by the
+envelope. NaN cannot reach the fixed-point fields (`cvttss2si` makes it 0
+on the sender); `q` / `dq` stay `f32` and a NaN there is refused.
+
+## A2 / AS2 (`unitree_a2_lowcmd`)
+
+`unitree_sdk2`, `unitree_sdk2_python` and `unitree_ros2` ship **no** A2 /
+AS2 low-level type, example or topic: only their sport client and sport
+state (`rt/lf/sportmodestate`, `unitree_go::msg::dds_::SportModeState_`).
+The low-level command is therefore **inferred** to be the `unitree_go`
+`LowCmd_` on `rt/lowcmd` (`robodr_cdr::unitree::ModelInfo::inferred_idl`),
+never assumed silently: the codec starts only when the locked profile
+records the channel's type as learned from the robot's own SEDP and that
+type is the go `LowCmd_`. A 35-slot `hg` frame (another model's layout)
+or anything else on the writer does not decode and is decided as an
+integrity failure. Its motor count is unknown: list the actuated slots
+as enabled in the firewall channel; an energised disabled slot is
+refused (`disabled_motor_energised`).
+
+## Go2 WebRTC sessions (`webrtc`)
+
+The Go2 app and community clients control the robot over WebRTC
+(DTLS-SRTP): the gateway cannot read or limit a command inside a session
+and does not try. With a `webrtc` section it:
+
+- copies controller-side signalling (TCP to `signalling_ports`, default
+  8081 / 9991) and unqueued controller-side UDP to the robot to NFLOG group
+  `webrtc.nflog_group` (default 4175), adds the robot's signalling answers
+  to the observe group, and feeds both sides to
+  `robodr_ros2_pipeline::webrtc::WebRtcMonitor` (STUN / TURN, DTLS record
+  headers, SRTP demultiplexing, the legacy `/offer` plaintext SDP metadata,
+  the `con_notify` / `con_ing_*` steps). Its `robot.unitree.webrtc_*`
+  findings (contract 2.3, §3d) go to the events file and agentd's feed
+  (channel `webrtc`). The copies are never queued or dropped;
+- with `action: block_unlisted`, drops TCP to the signalling ports from
+  any source that is not in `controllers` (nft table `bridge
+  robodr_gw_rtc`);
+- always creates the quarantine sets `blocked_peers` (an address; both
+  directions) and `blocked_flows` (`peer . peer port . robot . robot
+  port`, UDP, both directions), with timeouts.
+  `robodr-firewall-gw webrtc-block --peer <ip> [--flow
+  <peer_port>,<robot_ip>,<robot_port>] [--timeout-s N]` prints the `nft add
+  element` command for the flows a finding names (run it as root, or let
+  the executor run it). Re-applying the ruleset forgets the elements.
+
+```json
+"webrtc": {
+  "action": "block_unlisted",
+  "robot_addresses": ["192.168.123.161"],
+  "controllers": [{ "ip": "192.168.123.20", "mac": "02:00:00:00:00:20", "label": "operator tablet" }],
+  "deny_windows": ["mon-fri 19:00-07:00", "sat,sun 00:00-23:59"],
+  "max_sessions": 1
+}
+```
+
+`observe.enabled` is required. The nft table was loaded and its set
+elements added in a network namespace; the full session path is tested on
+synthetic frames only. What a quarantine does to a robot mid-motion (its
+reaction to a lost controller) is not published by Unitree.
 
 ## Loco requests (`unitree_loco_request`)
 
@@ -847,6 +930,13 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
 `--budget-max-ns` (exit 1 when exceeded) for that gate.
 
 ## Known limits
+
+- **Go1 compressed `LowCmd`, A2 / AS2, WebRTC** (Unitree gaps): the
+  compressed layout is read from the shipped library's machine code, not
+  a header or a capture; the A2 / AS2 low-level type is inferred and must
+  be confirmed by the profile; WebRTC sessions are detected and
+  quarantined by flow, never inspected. None of it has run against a real
+  Go1, A2 / AS2 or Go2.
 
 - **Joint trajectories** (Sprint 8): verified on real Fast DDS and
   Cyclone DDS captures for the decode only, and with synthetic frames for

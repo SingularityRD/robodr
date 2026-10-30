@@ -10,6 +10,47 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Added (Unitree coverage gaps)
+
+- `robodr-cdr`: the Go1 `unitree_legged_sdk` v3.8.6 **compressed
+  `LowCmd`** (614 bytes) is decoded (`LegacyLowCmdCompressed`). Its layout
+  was read from the shipped library's `refineCmd`, with offsets pinned by
+  tests. It expands exactly into the declared `LowCmd`, so the passive
+  path applies the same motion checks. The compressed `LowState` (807
+  bytes) is still reported as not inspected.
+- `robodr-cdr`: `ModelInfo::inferred_idl`. A2 / AS2 low-level commands
+  are inferred to be `unitree_go` and marked as inferred, because the SDK
+  ships no A2 / AS2 low-level type. agentd refuses a profile that recorded
+  another layout on such a robot.
+- `robodr-firewall-gw`: codec `go1_low_cmd_compressed`. Limited
+  fixed-point values round to the safe side. Values outside `i16` are
+  suppressed, and holds use the last accepted frame.
+- `robodr-firewall-gw`: codec `unitree_a2_lowcmd` (the go `LowCmd_` path
+  with `require_crc`, a type recorded in the profile, no bypass and no
+  battery off).
+- `robodr-ros2-pipeline`: `webrtc` monitor for Go2 WebRTC control
+  sessions. It reads the signalling metadata, ICE, TURN and DTLS headers,
+  and attributes peers.
+- `robodr-firewall-gw`: a `webrtc` section. It feeds the monitor from
+  NFLOG copies, can drop unlisted signalling (`block_unlisted`) and
+  provides quarantine sets by peer or flow. `webrtc-block` prints the
+  `nft` command.
+- Findings contract 2.3.0, Unitree block (§3d):
+  `robot.unitree.webrtc_unknown_controller`, `webrtc_new_peer`,
+  `webrtc_controller_mac_mismatch`, `webrtc_session_in_denied_window`,
+  `webrtc_concurrent_sessions`, `webrtc_relayed_session`,
+  `webrtc_media_without_signalling`. agentd's `gateway_feed` accepts them.
+- Fuzz targets `go1_compressed_lowcmd` and `unitree_webrtc`.
+
+### Changed
+
+- `robodr-firewall-gw`: a Go1 `HighCmd` or `LowCmd` with a non-zero
+  `bms.off` (`0xA5` turns the battery off) is now refused like on
+  `unitree_go_lowcmd`. It was forwarded before.
+- `robodr-ros2-pipeline`: a 614-byte legacy `LowCmd` is decoded and
+  checked against the profile; it is no longer reported as
+  `robot.motion.undecodable_sample`.
+
 ### Added (Sprint 8: motion gateway channels and adapters)
 
 - `robodr-firewall-gw`: ROS 2 joint-trajectory channels
