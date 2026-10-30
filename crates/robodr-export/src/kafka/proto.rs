@@ -37,7 +37,10 @@ pub fn frame_request(
         .try_nullable_string(Some(client_id))?;
     w.buf.extend_from_slice(body);
     let n = i32::try_from(w.buf.len() - 4).or_else(|_| derr("request too large"))?;
-    w.buf[..4].copy_from_slice(&n.to_be_bytes());
+    // The size placeholder written first.
+    if let Some(size) = w.buf.first_chunk_mut() {
+        *size = n.to_be_bytes();
+    }
     Ok(w.buf)
 }
 

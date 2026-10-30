@@ -132,9 +132,14 @@ pub fn encode_batch(records: &[ProduceRecord]) -> Result<Vec<u8>, EncodeError> {
         debug_assert_eq!(b.len() - start, body);
     }
     let batch_len = i32::try_from(b.len() - 12).map_err(|_| EncodeError::TooLarge)?;
-    b[8..12].copy_from_slice(&batch_len.to_be_bytes());
-    let crc = crc32c::crc32c(&b[ATTR_OFFSET..]);
-    b[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+    // The fixed header written above holds both fields.
+    if let Some(field) = b.get_mut(8..12) {
+        field.copy_from_slice(&batch_len.to_be_bytes());
+    }
+    let crc = crc32c::crc32c(b.get(ATTR_OFFSET..).unwrap_or_default());
+    if let Some(field) = b.get_mut(CRC_OFFSET..CRC_OFFSET + 4) {
+        field.copy_from_slice(&crc.to_be_bytes());
+    }
     Ok(b)
 }
 
@@ -198,7 +203,9 @@ fn decode_batch_body(base_offset: i64, body: &[u8]) -> Result<DecodedBatch, Deco
         return derr(format!("magic {magic}, only 2 supported"));
     }
     let crc = r.u32()?;
-    let covered = &body[r.position()..];
+    let Some(covered) = body.get(r.position()..) else {
+        return derr("record batch shorter than its header");
+    };
     let actual = crc32c::crc32c(covered);
     if crc != actual {
         return derr(format!(

@@ -305,12 +305,12 @@ fn main() -> ExitCode {
         Ok(v) => v,
         Err(e) => return usage_exit(&e),
     };
-    if v.len() == 1 && v[0] == "--version" {
+    if matches!(v.as_slice(), [only] if only == "--version") {
         println!("robodr-uplink {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    if v.first().map(String::as_str) == Some("reinject") {
-        return main_reinject(v[1..].to_vec());
+    if let Some((_, rest)) = v.split_first().filter(|(first, _)| *first == "reinject") {
+        return main_reinject(rest.to_vec());
     }
     if v.iter().any(|a| a == "--max-retry-after-s") {
         return usage_exit(

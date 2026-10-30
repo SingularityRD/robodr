@@ -837,7 +837,7 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
         };
         let start = body.len();
         body.resize(end, 0);
-        r.read_exact(&mut body[start..])?;
+        r.read_exact(body.get_mut(start..).unwrap_or_default())?;
         let mut crlf = [0u8; 2];
         r.read_exact(&mut crlf)?;
         if &crlf != b"\r\n" {

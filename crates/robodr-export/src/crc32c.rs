@@ -17,7 +17,12 @@ const fn build_table() -> [u32; 256] {
             c = if c & 1 != 0 { (c >> 1) ^ POLY } else { c >> 1 };
             k += 1;
         }
-        t[i] = c;
+        // bound: i < 256 == t.len() (const evaluation; `get_mut` is not
+        // usable in a const fn).
+        #[allow(clippy::indexing_slicing)]
+        {
+            t[i] = c;
+        }
         i += 1;
     }
     t
@@ -30,7 +35,10 @@ static TABLE: [u32; 256] = build_table();
 pub fn update(crc: u32, data: &[u8]) -> u32 {
     let mut c = !crc;
     for &b in data {
-        c = TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
+        // bound: the index is masked to 0..=0xff and TABLE has 256 entries.
+        #[allow(clippy::indexing_slicing)]
+        let t = TABLE[((c ^ u32::from(b)) & 0xff) as usize];
+        c = t ^ (c >> 8);
     }
     !c
 }

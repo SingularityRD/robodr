@@ -76,12 +76,17 @@ pub fn is_valid_generation(g: &str) -> bool {
         return false;
     };
     let b = rest.as_bytes();
+    let Some((time, rest)) = b.split_at_checked(16) else {
+        return false;
+    };
     b.len() == 33
-        && b[16] == b'-'
-        && b[..16].iter().all(u8::is_ascii_digit)
-        && b[17..]
-            .iter()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        && time.iter().all(u8::is_ascii_digit)
+        && rest.split_first().is_some_and(|(&dash, hex)| {
+            dash == b'-'
+                && hex
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        })
 }
 
 /// A generation directory.

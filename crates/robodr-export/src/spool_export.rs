@@ -783,7 +783,7 @@ impl Exporter {
             self.save()?;
             self.fail(FailPoint::AfterIntent)?;
             let published = self.packer.pack(&envs, &[], now_ms)?;
-            if published.len() != 1 || published[0].seq != intent.batch_seq {
+            if !matches!(published.as_slice(), [only] if only.seq == intent.batch_seq) {
                 // All of them are committed and published; acknowledge, but
                 // report the planner mismatch (crash recovery assumes one).
                 self.ack(&intent.spool_seqs, false)?;

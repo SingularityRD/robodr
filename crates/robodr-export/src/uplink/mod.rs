@@ -985,7 +985,7 @@ impl<T: Transport> Uplink<T> {
         if self.dead.contains(context, pos)? {
             return Ok(());
         }
-        let raw = String::from_utf8_lossy(&raw[..raw.len().min(self.cfg.max_record_bytes)]);
+        let raw = String::from_utf8_lossy(raw.get(..self.cfg.max_record_bytes).unwrap_or(raw));
         let mut line = serde_json::to_vec(&serde_json::json!({
             "source": context,
             "position": pos,
@@ -1281,8 +1281,14 @@ impl<T: Transport> Uplink<T> {
         let mut is_rejected = vec![false; p.positions.len()];
         for r in &rejected {
             let idx = (r.line - 1) as usize;
-            is_rejected[idx] = true;
-            let pos = p.positions[idx];
+            // `IngestResponse::parse_checked` bounds the line numbers.
+            let (Some(flag), Some(&pos)) = (is_rejected.get_mut(idx), p.positions.get(idx)) else {
+                return Err(UplinkError::State(format!(
+                    "rejected line {} outside the batch",
+                    r.line
+                )));
+            };
+            *flag = true;
             let raw = match (raws.get(&pos), &self.cfg.source) {
                 (Some(r), _) => r.clone(),
                 (None, Source::Spool(root)) if !stream.is_lines() => {
@@ -1316,7 +1322,11 @@ impl<T: Transport> Uplink<T> {
                 let rej = root.join("rejected");
                 for (i, pos) in p.positions.iter().enumerate() {
                     let f = spool_file(*pos);
-                    let dest = if is_rejected[i] { &rej } else { &acked };
+                    let dest = if is_rejected.get(i) == Some(&true) {
+                        &rej
+                    } else {
+                        &acked
+                    };
                     match fs::rename(ready.join(&f), dest.join(&f)) {
                         Ok(()) => {}
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
