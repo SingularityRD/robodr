@@ -8,7 +8,14 @@
 //! robodr-executor rearm --config /etc/robodr/executor.json [--reason TEXT]
 //! robodr-executor stop-cleanup --config /etc/robodr/executor.json   (systemd ExecStopPost=)
 //! robodr-executor keygen --out /etc/robodr/keys/executor.key
+//! robodr-executor seal-journal --config /etc/robodr/executor.json   once, executor stopped
 //! ```
+//!
+//! The journal and the SOC replay store are sealed (HMAC) under a key
+//! derived from the link key (`key_file`). `seal-journal` is the one-time
+//! upgrade of an executor v1 journal; a v1 journal that was not upgraded is
+//! not trusted at start (table deleted, `journal_reset`, orders refused
+//! until `rearm`).
 //!
 //! Exit 0 clean stop, 1 runtime failure, 2 usage / configuration error.
 //! The process holds no state outside its journal: a stop or crash at any
@@ -63,6 +70,7 @@ const USAGE: &str = "usage: robodr-executor --config FILE [--check-config]\n    
                      robodr-executor rearm --config FILE [--reason TEXT]\n       \
                      robodr-executor stop-cleanup --config FILE\n       \
                      robodr-executor keygen --out FILE\n       \
+                     robodr-executor seal-journal --config FILE\n       \
                      robodr-executor --version";
 
 fn usage(msg: &str) -> ExitCode {
@@ -90,7 +98,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     if let Some(first) = it.peek() {
         if matches!(
             first.as_str(),
-            "status" | "revert-all" | "keygen" | "rearm" | "stop-cleanup"
+            "status" | "revert-all" | "keygen" | "rearm" | "stop-cleanup" | "seal-journal"
         ) {
             a.cmd = (*first).clone();
             it.next();
@@ -222,8 +230,35 @@ fn main() -> ExitCode {
     if a.cmd == "rearm" {
         return rearm(cfg, policy, a.reason.as_deref());
     }
+    if a.cmd == "seal-journal" {
+        // Gap 1: the one-time upgrade of an executor v1 journal (executor
+        // stopped): after it, the journal is sealed under the link key.
+        let j = match sealed_journal(&cfg) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("robodr-executor: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        return match j.seal_legacy() {
+            Ok(m) => {
+                println!("robodr-executor: {m}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("robodr-executor: seal-journal: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     if a.cmd == "status" {
-        let j = robodr_executor::journal::Journal::new(&cfg.config.state_dir);
+        let j = match sealed_journal(&cfg) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("robodr-executor: {e}");
+                return ExitCode::from(2);
+            }
+        };
         return match j.load() {
             robodr_executor::journal::Loaded::State(s) => {
                 if s.operator_disabled {
@@ -245,7 +280,8 @@ fn main() -> ExitCode {
                 println!("no journal: no action has been executed");
                 ExitCode::SUCCESS
             }
-            robodr_executor::journal::Loaded::Corrupt(e) => {
+            robodr_executor::journal::Loaded::Corrupt(e)
+            | robodr_executor::journal::Loaded::Untrusted(e) => {
                 eprintln!("robodr-executor: {e}");
                 ExitCode::from(1)
             }
@@ -308,7 +344,17 @@ fn main() -> ExitCode {
     let socket = cfg.config.socket.clone();
     let mode = cfg.socket_mode;
     let cleanup_cfg = cfg.clone();
-    let mut engine = match Engine::open(cfg, policy, nft, &boot, Now::system()) {
+    let seal = match key.state_seal_key() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("robodr-executor: {e}");
+            if serving {
+                fatal_start(Some(&cleanup_cfg), &e);
+            }
+            return ExitCode::from(2);
+        }
+    };
+    let mut engine = match Engine::open_sealed(cfg, policy, nft, &boot, Now::system(), seal) {
         // Policy and configuration are re-read before every order.
         Ok(e) if a.cmd == "run" => e.with_reload(cfg_path.clone()),
         Ok(e) => e,
@@ -463,6 +509,15 @@ fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
     }
 }
 
+/// The journal sealed under the key derived from the link key (gap 1).
+fn sealed_journal(cfg: &Resolved) -> Result<robodr_executor::journal::Journal, String> {
+    let key = Key::load(&cfg.config.key_file)?;
+    Ok(robodr_executor::journal::Journal::sealed(
+        &cfg.config.state_dir,
+        key.state_seal_key()?,
+    ))
+}
+
 /// `rearm`: through the running executor, or on the journal when none runs.
 fn rearm(
     cfg: Resolved,
@@ -470,14 +525,23 @@ fn rearm(
     reason: Option<&str>,
 ) -> ExitCode {
     let reason = reason.unwrap_or("no reason given");
+    // The journal is sealed under a key derived from the link key (gap 1):
+    // without it neither the socket nor the journal can be used.
     let key = match Key::load(&cfg.config.key_file) {
-        Ok(k) => Some(k),
+        Ok(k) => k,
         Err(e) => {
-            eprintln!("robodr-executor: {e} (re-arming on the journal instead)");
-            None
+            eprintln!("robodr-executor: rearm: {e}");
+            return ExitCode::from(2);
         }
     };
-    if let Some(key) = key {
+    let seal = match key.state_seal_key() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("robodr-executor: rearm: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    {
         let client = robodr_executor::client::Client::new(
             cfg.config.socket.clone(),
             key,
@@ -502,7 +566,7 @@ fn rearm(
     }
     let boot = robodr_executor::boot_id();
     let nft = Box::new(NftCommand::new(&cfg.config.nft));
-    let mut engine = match Engine::open(cfg, policy, nft, &boot, Now::system()) {
+    let mut engine = match Engine::open_sealed(cfg, policy, nft, &boot, Now::system(), seal) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("robodr-executor: rearm: {e}");

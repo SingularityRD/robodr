@@ -1171,6 +1171,31 @@ sudo systemctl restart robodr-agentd
   read, agentd refuses every new request id (503 `state_unavailable`,
   `state.refusing_new_request_ids`) until a restart with a readable black
   box: fix the black box (section 6.4, black-box upkeep) and restart.
+- **Sealed state.** Both journals (format `robodr-cp-journal/v2`) are
+  sealed with an HMAC chain under a key derived from the black-box key
+  (`state.seal_key_id`), and their heads are recorded as signed black-box
+  notes (`robodr.control_plane_state_head`: at start, on heartbeats when
+  they moved, and at a clean stop). At start, an edited, deleted or
+  reordered entry, a journal under another key, or a journal older than
+  (or cut short of) the black box's newest head is never believed: the
+  copy goes to `state_dir/quarantine/`, requests are reconciled with the
+  black box, the replay store is fenced, and agentd raises
+  `robot.agent.control_plane_state_untrusted` (High; Critical for a
+  rollback against the signed head). After a crash (no clean-stop head)
+  the same reconciliation and fence run without a finding. Restoring
+  `state_dir` from a backup therefore reads as a rollback: let agentd
+  start, check the finding names the restore, and carry on (nothing is
+  lost: the black box is the record). **Rotating the black-box key**
+  changes the seal key: expect one High finding (`sealed under another
+  key`) at the next start, with the same fail-safe handling.
+- **Upgrade to sealed state (one time).** The first start of a release
+  that seals finds the v1 (checksummed) journals and no head note in the
+  black box: it adopts them once, rewrites them sealed, reconciles with the
+  black box, fences the replay store and records a
+  `robodr.control_plane_state_upgraded` note. No operator step. Once a head
+  note exists, a v1 file in `state_dir` is a downgrade: refused as damage
+  (Critical). Downgrading agentd below the sealing release is not
+  supported without emptying `state_dir` (first-start fence).
 - **Connections.** TCP connections in the TLS handshake (or not yet
   authenticated) and authenticated ones have separate slots of
   `max_connections` (default 4) each; one source address holds at most
@@ -1696,16 +1721,43 @@ records it. Bridged traffic is isolated only with `br_netfilter` loaded
 * The black-box notes `robodr.executor_event`. `revert_failed`, `drift`,
   `removed_externally` and `journal_reset` are critical. A
   `journal_reset` (detail `HIGH: ...`) means the executor found its
-  journal unreadable, deleted its table and lost the history: treat it
-  as High, find the cause, and acknowledge it with `rearm` (the flag
-  `journal_reset_ms` stays in `robodr-executor status` until then).
+  journal unreadable or failing its seal, deleted its table and lost the
+  history; agentd raises `robot.agent.executor_journal_reset` (High).
+  Find the cause and acknowledge it with `rearm`: until then every order
+  is refused (`journal_reset`; the flag `journal_reset_ms` stays in
+  `robodr-executor status`).
 * `robodr-executor status --config /etc/robodr/executor.json`: the journal
-  of active actions, their deadlines, history and events.
+  of active actions, their deadlines, history and events (it needs the
+  link key to check the journal's seal).
 * `journalctl -u robodr-executor`.
 
-A failed revert is retried every 500 ms until it verifies. Treat
-`revert_failures > 0` as urgent. The finding for it is not in the
-findings contract yet, so watch this counter instead.
+A failed revert is retried every 500 ms until it verifies. agentd raises
+`robot.agent.executor_revert_failed` (High, findings contract 2.4) once
+per request until a revert of it succeeds, naming the action, request,
+TTL and error: the rules may still be in force. Treat it, and
+`revert_failures > 0`, as urgent.
+
+**Sealed journal (upgrade, one time).** The executor's `journal.json` and
+`soc_nonces.json` are sealed (HMAC) under a key derived from its link key
+(`key_file`). A journal of an earlier release is unsealed: after
+upgrading, before the executor first starts (or stop it), run once
+
+```sh
+systemctl stop robodr-executor
+sudo -u robodr-exec robodr-executor seal-journal --config /etc/robodr/executor.json
+systemctl start robodr-executor
+```
+
+(as the unit's user, so the rewritten file stays its own; it needs to read
+`key_file`, which the unit gets as a systemd credential: pass the same key
+file path in `--config`'s `key_file`, or run it with `systemd-run
+--property=LoadCredential=...` like the unit) which keeps the actions in
+force. Without it the executor does not trust
+the old journal at start: table deleted (every action lifted), a
+`journal_reset`, orders refused until `rearm`. The unsealed SOC replay
+store just fences once. A replaced link key has the same effect as an
+edit (the seal names another key). The seal detects edits, not an older
+sealed copy put back (the executor has no black box to anchor to).
 
 **Motion adapters (Sprint 8).** Off unless `executor.json` has a `motion`
 section (example `config/executor.motion.example.json`; contract §6a,

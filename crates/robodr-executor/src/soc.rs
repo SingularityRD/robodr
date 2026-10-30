@@ -777,9 +777,27 @@ pub struct ReplayStore {
     /// into the window, so it fences (as agentd's `ReplayGuard`, control
     /// plane v2 review finding 5).
     high_water_s: u64,
+    /// The state-seal key (gap 1); `None`: unsealed (tests and tools).
+    seal: Option<std::sync::Arc<robodr_blackbox::StateSealKey>>,
 }
 
+/// Format of the sealed SOC replay store ([`crate::journal::seal`]).
+pub const NONCE_SEALED_FORMAT: &str = "robodr-executor-soc-nonces/v2";
+
 impl ReplayStore {
+    /// [`ReplayStore::open`] sealed under `seal` (gap 1): a store whose seal
+    /// does not verify, or an unsealed v1 store, is not believed: it fences
+    /// like a damaged one.
+    pub fn open_sealed(
+        dir: &Path,
+        now_s: u64,
+        skew_s: u64,
+        state_existed: bool,
+        seal: Option<std::sync::Arc<robodr_blackbox::StateSealKey>>,
+    ) -> Self {
+        Self::open_inner(dir, now_s, skew_s, state_existed, seal)
+    }
+
     /// Open the store in `dir`. `state_existed`: the executor's journal is
     /// there, so a missing store was removed (fence). A damaged store
     /// fences too. Never fails: a store that cannot be read or written
@@ -792,6 +810,16 @@ impl ReplayStore {
     /// reads below the persisted high-water mark (the latest second dead
     /// pairs were dropped) fences up to `high-water + skew_s`.
     pub fn open(dir: &Path, now_s: u64, skew_s: u64, state_existed: bool) -> Self {
+        Self::open_inner(dir, now_s, skew_s, state_existed, None)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        now_s: u64,
+        skew_s: u64,
+        state_existed: bool,
+        seal: Option<std::sync::Arc<robodr_blackbox::StateSealKey>>,
+    ) -> Self {
         let fence_at = now_s.saturating_add(skew_s);
         let mut s = ReplayStore {
             dir: dir.to_path_buf(),
@@ -799,9 +827,22 @@ impl ReplayStore {
             fence_s: None,
             fenced_because: None,
             high_water_s: 0,
+            seal,
         };
         let p = s.path();
-        match crate::config::read_small(&p) {
+        let read = crate::config::read_small(&p).and_then(|text| match &s.seal {
+            None => Ok(text),
+            Some(k) => match crate::journal::unseal(k, NONCE_SEALED_FORMAT, text.as_bytes()) {
+                Ok(json) => Ok(String::from_utf8_lossy(json).into_owned()),
+                Err(crate::journal::Unsealed::Legacy) => {
+                    Err(format!("{NONCE_FILE} is unsealed (executor v1)"))
+                }
+                Err(crate::journal::Unsealed::Bad(why)) => {
+                    Err(format!("{NONCE_FILE} failed its seal: {why}"))
+                }
+            },
+        });
+        match read {
             Ok(text) => match serde_json::from_str::<NonceFile>(&text) {
                 Ok(f) if f.schema == NONCE_SCHEMA => {
                     s.fence_s = f.fence_s;
@@ -890,7 +931,11 @@ impl ReplayStore {
                 })
                 .collect(),
         };
-        let data = serde_json::to_vec(&f).map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec(&f).map_err(|e| e.to_string())?;
+        let data = match &self.seal {
+            None => json,
+            Some(k) => crate::journal::seal(k, NONCE_SEALED_FORMAT, &json),
+        };
         let tmp = self.dir.join(format!("{NONCE_FILE}.tmp"));
         let res = (|| -> std::io::Result<()> {
             let mut fh = OpenOptions::new()

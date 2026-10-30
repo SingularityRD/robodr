@@ -21,13 +21,25 @@
 //!
 //! Writes are atomic: a temporary file in the same directory, fsync,
 //! rename, fsync of the directory.
+//!
+//! **Sealed (gap 1).** The daemon's journal ([`Journal::sealed`]) is
+//! written as [`SEALED_FORMAT`]: a seal line, then the JSON ([`seal`]),
+//! under a key derived from the link key. A journal whose seal does not
+//! verify, or an unsealed v1 journal, loads as [`Loaded::Untrusted`]:
+//! never believed (the engine handles it like an unreadable one and refuses
+//! orders until `rearm`). [`Journal::seal_legacy`] is the one-time upgrade
+//! (`robodr-executor seal-journal`). The seal detects edits, not an older
+//! sealed copy put back.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use robodr_blackbox::crypto::{from_hex, to_hex};
+use robodr_blackbox::StateSealKey;
 use robodr_responder::ActionId;
 use serde::{Deserialize, Serialize};
 
@@ -233,10 +245,87 @@ impl State {
     }
 }
 
+/// Format of the sealed journal file (gap 1): one line
+/// `robodr-executor-journal/v2 <key id> <64 hex tag>`, then the JSON state
+/// (schema [`SCHEMA`]). See [`seal`].
+pub const SEALED_FORMAT: &str = "robodr-executor-journal/v2";
+/// Purpose of the state-seal key derived from the executor's link key.
+pub const SEAL_PURPOSE: &str = "executor/state/v1";
+
+/// Seal `json` as a `format` file under `key` (gap 1: the executor's
+/// state files are tamper-evident):
+///
+/// ```text
+/// <format> <key id> <64 hex: HMAC-SHA256(K, format 0x00 | len|key id | len|json)>\n<json>
+/// ```
+///
+/// `K` is the [`robodr_blackbox::StateSealKey`] derived from the executor's
+/// link key (purpose [`SEAL_PURPOSE`]): whoever can write the state
+/// directory but does not hold that key cannot edit the file without the
+/// next load seeing it. A seal does not tell an older sealed file from the
+/// current one (see the crate README, "Trust boundary").
+pub fn seal(key: &StateSealKey, format: &str, json: &[u8]) -> Vec<u8> {
+    let tag = key.tag(format, &[key.key_id().as_bytes(), json]);
+    let mut out = format!("{format} {} {}\n", key.key_id(), to_hex(&tag)).into_bytes();
+    out.extend_from_slice(json);
+    out
+}
+
+/// Why a sealed file was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsealed {
+    /// No seal line at all: a file of a release that did not seal (v1).
+    Legacy,
+    /// The seal line is malformed, names another key, or the tag does not
+    /// verify (reason).
+    Bad(String),
+}
+
+/// The JSON of a [`seal`]ed `format` file, if its seal verifies under
+/// `key`.
+pub fn unseal<'a>(key: &StateSealKey, format: &str, bytes: &'a [u8]) -> Result<&'a [u8], Unsealed> {
+    let prefix = format!("{format} ");
+    if !bytes.starts_with(prefix.as_bytes()) {
+        return Err(if bytes.first() == Some(&b'{') {
+            Unsealed::Legacy
+        } else {
+            Unsealed::Bad(format!("no {format} seal line"))
+        });
+    }
+    let Some(nl) = bytes.iter().position(|b| *b == b'\n') else {
+        return Err(Unsealed::Bad("the seal line is not terminated".into()));
+    };
+    let line = std::str::from_utf8(&bytes[prefix.len()..nl])
+        .map_err(|_| Unsealed::Bad("the seal line is not UTF-8".into()))?;
+    let json = &bytes[nl + 1..];
+    let mut parts = line.split(' ');
+    let (Some(key_id), Some(tag), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(Unsealed::Bad("malformed seal line".into()));
+    };
+    if key_id != key.key_id() {
+        return Err(Unsealed::Bad(format!(
+            "sealed under another key ({}; this executor's is {})",
+            crate::net::clip(key_id),
+            key.key_id()
+        )));
+    }
+    let ok = from_hex(tag).is_some_and(|t| key.check(format, &[key.key_id().as_bytes(), json], &t));
+    if ok {
+        Ok(json)
+    } else {
+        Err(Unsealed::Bad(
+            "the seal does not verify: the file was edited".into(),
+        ))
+    }
+}
+
 /// The journal file.
 #[derive(Debug)]
 pub struct Journal {
     dir: PathBuf,
+    /// The state-seal key (gap 1); `None`: unsealed, as executor v1 wrote it
+    /// (tests and tools only: the daemon always seals).
+    seal: Option<Arc<StateSealKey>>,
 }
 
 /// Outcome of loading.
@@ -246,13 +335,31 @@ pub enum Loaded {
     State(State),
     /// Present but unreadable (reason).
     Corrupt(String),
+    /// Readable but not trusted (gap 1): the seal does not verify, names
+    /// another key, or the file is an unsealed v1 journal that was not
+    /// upgraded with `robodr-executor seal-journal` (reason).
+    Untrusted(String),
 }
 
 impl Journal {
+    /// An unsealed journal (executor v1 format; tests and tools).
     pub fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
+            seal: None,
         }
+    }
+
+    /// A journal sealed under `key` ([`SEALED_FORMAT`]).
+    pub fn sealed(dir: &Path, key: Arc<StateSealKey>) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            seal: Some(key),
+        }
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.seal.is_some()
     }
 
     pub fn path(&self) -> PathBuf {
@@ -269,11 +376,59 @@ impl Journal {
         if text.len() as u64 > MAX_JOURNAL_BYTES {
             return Loaded::Corrupt("journal too large".into());
         }
-        match serde_json::from_str::<State>(&text) {
+        let json = match &self.seal {
+            None => text.as_bytes(),
+            Some(k) => match unseal(k, SEALED_FORMAT, text.as_bytes()) {
+                Ok(j) => j,
+                Err(Unsealed::Legacy) => {
+                    return Loaded::Untrusted(
+                        "the journal is unsealed (executor v1): run `robodr-executor \
+                         seal-journal` once after the upgrade, with the executor stopped"
+                            .into(),
+                    )
+                }
+                Err(Unsealed::Bad(why)) => {
+                    return Loaded::Untrusted(format!("the journal failed its seal: {why}"))
+                }
+            },
+        };
+        match serde_json::from_slice::<State>(json) {
             Ok(s) if s.schema == SCHEMA => Loaded::State(s),
             Ok(_) => Loaded::Corrupt(format!("journal schema is not {SCHEMA}")),
             Err(e) => Loaded::Corrupt(format!("journal: {e}")),
         }
+    }
+
+    /// The one-time upgrade (`robodr-executor seal-journal`, executor
+    /// stopped): read an unsealed v1 journal and write it sealed. Refused
+    /// for a journal that is already sealed, missing, or unreadable.
+    pub fn seal_legacy(&self) -> Result<String, String> {
+        let Some(key) = &self.seal else {
+            return Err("no state-seal key".into());
+        };
+        let p = self.path();
+        let text = crate::config::read_small(&p)?;
+        match unseal(key, SEALED_FORMAT, text.as_bytes()) {
+            Ok(_) => return Err(format!("{} is sealed already", p.display())),
+            Err(Unsealed::Bad(why)) => {
+                return Err(format!(
+                    "{} is not an unsealed v1 journal ({why})",
+                    p.display()
+                ))
+            }
+            Err(Unsealed::Legacy) => {}
+        }
+        let s = match Journal::new(&self.dir).load() {
+            Loaded::State(s) => s,
+            _ => return Err(format!("{} is not a readable v1 journal", p.display())),
+        };
+        self.save(&s)?;
+        Ok(format!(
+            "{} sealed ({} active action(s), key {})",
+            p.display(),
+            s.entries.len(),
+            key.key_id()
+        ))
     }
 
     /// Atomically replace the journal with `s`.
@@ -282,7 +437,11 @@ impl Journal {
         if crate::fault::hit(crate::fault::Point::JournalWrite) {
             return Err("fault injected: journal write".into());
         }
-        let data = serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?;
+        let data = match &self.seal {
+            None => json,
+            Some(k) => seal(k, SEALED_FORMAT, &json),
+        };
         let tmp = self.dir.join(format!("{FILE}.tmp"));
         let res = (|| -> std::io::Result<()> {
             let mut f = OpenOptions::new()

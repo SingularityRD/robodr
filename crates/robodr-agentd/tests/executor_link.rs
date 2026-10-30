@@ -243,12 +243,16 @@ fn wait_status(via: Via<'_>, id: &str, want: &str) -> Value {
 
 /// In-memory `nft -j` model (one `inet robodr` table).
 #[derive(Clone, Default)]
-struct Model(Arc<Mutex<Option<Vec<Value>>>>);
+struct Model(Arc<Mutex<Option<Vec<Value>>>>, Arc<AtomicBool>);
 
 impl Nft for Model {
     fn run(&mut self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>, String> {
         let mut t = self.0.lock().unwrap();
         match args {
+            // The switch in `.1`: every transaction fails (a stuck revert).
+            ["-j", "-f", "-"] if self.1.load(Ordering::SeqCst) => {
+                Err("injected: nft transaction failed".into())
+            }
             ["-j", "-f", "-"] => {
                 let batch: Value = serde_json::from_slice(stdin.unwrap()).unwrap();
                 let mut cur = t.clone();
@@ -409,10 +413,15 @@ fn state_dir(s: &Setup) -> PathBuf {
             30,
             robodr_agentd::control::auth::MAX_NONCES,
             ago,
+            &robodr_agentd::control::journal::Sealing::from_blackbox_key_file(&s.key).unwrap(),
         )
         .unwrap(),
     );
     d
+}
+
+fn state_dir_path(s: &Setup) -> PathBuf {
+    s.dir.join("cp-state")
 }
 
 fn write_exec_key(dir: &Path) -> PathBuf {
@@ -640,6 +649,161 @@ fn accepted_requests_are_executed_verified_and_reverted_through_the_executor() {
     );
     let found = spooled(&s.spool);
     assert_verified(&s.blackbox, Some(sum.finished.checkpoint), &found);
+}
+
+/// GA-ROADMAP S5 (gap 2): a failed (stuck) revert is a High finding
+/// `robot.agent.executor_revert_failed`, not only a black-box note: once per
+/// request while the executor retries, naming the action, the TTL and the
+/// error; the failure is in the black box.
+#[test]
+fn a_failed_revert_is_a_high_finding_with_action_ttl_and_error() {
+    let s = setup("exec-revert-failed", &robot_profile(true));
+    let safety = s.dir.join("safety.sock");
+    let control = s.dir.join("control.sock");
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let cfg = exec_config(&s, &control, None, &safety, &exec_sock);
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let _plc = plc_idle(&s, &safety, &control);
+    let ux = Via::Unix(&control);
+
+    submit(ux, "iso-rf", "isolate_network", json!({}), Some(120));
+    wait_status(ux, "iso-rf", "verified");
+    assert!(model.0.lock().unwrap().is_some());
+    // The table can no longer be changed: the revert fails, and keeps
+    // failing on every retry.
+    model.1.store(true, Ordering::SeqCst);
+    revert(ux, "iso-rf");
+    wait_for(15, "revert_failed events", || {
+        let evs = notes(&s.blackbox, "robodr.executor_event");
+        (evs.iter()
+            .filter(|e| e["event"]["kind"] == "revert_failed")
+            .count()
+            >= 2)
+            .then_some(())
+    });
+    assert!(
+        model.0.lock().unwrap().is_some(),
+        "the rules are still in force"
+    );
+    wait_for(10, "revert-failed finding", || {
+        (notes_with(&s.blackbox, "robot.agent.executor_revert_failed") >= 1).then_some(())
+    });
+    let (_, log) = finish(stop, h);
+    let found = spooled(&s.spool);
+    let f: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.executor_revert_failed")
+        .collect();
+    assert_eq!(f.len(), 1, "once per request, not per retry\n{log}");
+    let env = &f[0].1;
+    assert_eq!(env.severity, robodr_events::Severity::High);
+    assert_eq!(env.entity_context.mode, robodr_ocsf::Mode::Observe);
+    assert_eq!(
+        env.title,
+        robodr_ocsf::rule_info("robot.agent.executor_revert_failed").title
+    );
+    let detail = &env.entity_context.detail.value;
+    for want in [
+        "isolate_network",
+        "iso-rf",
+        "ttl 120s",
+        "injected: nft transaction failed",
+    ] {
+        assert!(detail.contains(want), "{want} missing: {detail}");
+    }
+    // The finding is in the black box too.
+    assert!(
+        notes_with(&s.blackbox, "robot.agent.executor_revert_failed") >= 1,
+        "finding recorded in the black box"
+    );
+}
+
+/// Gap 1 end to end: the request journal and the replay store are sealed
+/// and their heads anchored in the black box. A clean restart verifies
+/// them (no finding); an older copy of the request journal put back is a
+/// Critical `robot.agent.control_plane_state_untrusted`, the forgotten
+/// request is restored from the black box (never judged again); an edited
+/// entry is a High one. Nothing is reset silently.
+#[test]
+fn gap1_a_rolled_back_or_edited_request_journal_is_caught_at_start() {
+    let s = setup("exec-state-seal", &robot_profile(true));
+    let safety = s.dir.join("safety.sock");
+    let control = s.dir.join("control.sock");
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let cfg = exec_config(&s, &control, None, &safety, &exec_sock);
+    let journal = state_dir_path(&s).join("requests.journal");
+    let ux = Via::Unix(&control);
+    let untrusted = |s: &Setup| -> Vec<(robodr_events::Severity, String)> {
+        spooled(&s.spool)
+            .into_iter()
+            .filter(|(_, e)| {
+                e.entity_context.rule_id == "robot.agent.control_plane_state_untrusted"
+            })
+            .map(|(_, e)| (e.severity, e.entity_context.detail.value))
+            .collect()
+    };
+
+    // Run 1: one request; a clean stop anchors both heads.
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let plc = plc_idle(&s, &safety, &control);
+    submit(ux, "ev-a", "record_evidence", json!({}), None);
+    wait_status(ux, "ev-a", "verified");
+    finish(stop, h);
+    drop(plc);
+    let old_copy = std::fs::read(&journal).unwrap();
+    let text = String::from_utf8(old_copy.clone()).unwrap();
+    assert!(text.contains("robodr-cp-journal/v2"), "{text}");
+    let heads = notes(&s.blackbox, "robodr.control_plane_state_head");
+    assert!(heads.iter().any(|n| n["clean"] == true), "{heads:?}");
+
+    // Run 2: verified against the clean head; a second request.
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let plc = plc_idle(&s, &safety, &control);
+    submit(ux, "ev-b", "record_evidence", json!({}), None);
+    wait_status(ux, "ev-b", "verified");
+    finish(stop, h);
+    drop(plc);
+    assert!(untrusted(&s).is_empty(), "a clean restart is not tampering");
+
+    // Run 3: the older copy put back (ev-b forgotten by the file).
+    std::fs::write(&journal, &old_copy).unwrap();
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let plc = plc_idle(&s, &safety, &control);
+    // 200: restored from its black-box note, not unknown.
+    let v = get(ux, "ev-b");
+    assert!(v.to_string().contains("ev-b"), "restored: {v}");
+    let (_, log) = finish(stop, h);
+    drop(plc);
+    let u = untrusted(&s);
+    assert_eq!(u.len(), 1, "{log}");
+    assert_eq!(u[0].0, robodr_events::Severity::Critical);
+    assert!(u[0].1.contains("request journal rolled back"), "{}", u[0].1);
+
+    // Run 4: an entry edited (valid JSON, no key): High.
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let edited = text.replacen("ev-a", "ev-z", 1);
+    assert_ne!(edited, text);
+    std::fs::write(&journal, edited).unwrap();
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let plc = plc_idle(&s, &safety, &control);
+    let (_, log) = finish(stop, h);
+    drop(plc);
+    let u = untrusted(&s);
+    assert_eq!(u.len(), 2, "{log}");
+    assert!(
+        u.iter()
+            .any(|(sev, d)| *sev == robodr_events::Severity::High
+                && d.contains("failing their seal")),
+        "{u:?}"
+    );
+    assert!(std::fs::read_dir(state_dir_path(&s).join("quarantine"))
+        .unwrap()
+        .next()
+        .is_some());
 }
 
 /// Executor states are journalled (control plane v2): a request that read

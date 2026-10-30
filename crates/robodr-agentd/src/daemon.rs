@@ -528,6 +528,12 @@ struct Daemon<'a> {
     /// (unauthenticated, invalid).
     control_reported: [u64; 2],
     control_reported_at_ms: [Option<u64>; 2],
+    /// The control-plane journals' heads last recorded in the black box
+    /// (gap 1: [`crate::control::anchor`]).
+    state_heads_recorded: Option<crate::control::anchor::StateHeads>,
+    /// executor v1: requests whose failed revert was reported (one finding
+    /// per request until a revert of it succeeds).
+    revert_failed_reported: std::collections::BTreeSet<String>,
     /// executor v1: the link to robodr-executor (`None` = off).
     executor: Option<crate::executor_link::ExecutorLink>,
     /// The packet timeline of a pcap replay (`None` for a live capture:
@@ -842,8 +848,42 @@ impl<'a> Daemon<'a> {
                         ids,
                     )
                 };
-                let mut cp = ControlPlane::start(spec, &cfg.robot.id, signer, &bb_dir, &reconcile)
-                    .map_err(DaemonError::Io)?;
+                // Gap 1: the journals are sealed under a key derived from
+                // the black-box key and compared with the newest head the
+                // black box holds for them.
+                let seal_key = crate::control::journal::Sealing::derive_key(&r.key.0)
+                    .map_err(DaemonError::Config)?;
+                let bb_signer =
+                    crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+                        .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
+                let anchors = crate::control::anchor::latest(
+                    &crate::control::evidence::DirSource(bb_dir.clone()),
+                    &robot,
+                    bb_signer.as_ref(),
+                )
+                .map_err(|e| {
+                    DaemonError::Io(format!(
+                        "control plane: reading the black box for the state heads: {e}"
+                    ))
+                })?;
+                if anchors.unverified > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: control plane: {} state head note(s) in the black box \
+                         do not verify under the current key (another key, or tampered): ignored",
+                        anchors.unverified
+                    );
+                }
+                let mut cp = ControlPlane::start(
+                    spec,
+                    &cfg.robot.id,
+                    signer,
+                    &bb_dir,
+                    &reconcile,
+                    seal_key,
+                    &anchors,
+                )
+                .map_err(DaemonError::Io)?;
                 // executor v1: accepted requests go to robodr-executor; the
                 // requests restored from the journal keep the executor's
                 // last journalled word.
@@ -1169,6 +1209,8 @@ impl<'a> Daemon<'a> {
             control,
             control_reported: [0; 2],
             control_reported_at_ms: [None; 2],
+            state_heads_recorded: None,
+            revert_failed_reported: std::collections::BTreeSet::new(),
             executor,
             replay: r
                 .sensor
@@ -1235,6 +1277,7 @@ impl<'a> Daemon<'a> {
                 );
             }
         }
+        d.control_state_at_start();
         d.profile_witness(accepted_ok);
         d.evidence_incidents();
         let names: Vec<String> = d.inputs.iter().map(|i| sanitize(&i.name)).collect();
@@ -1344,6 +1387,7 @@ impl<'a> Daemon<'a> {
                 next_tick = (next_tick + tick).max(now);
                 if now >= next_heartbeat {
                     self.heartbeat("robodr.agentd_heartbeat");
+                    self.record_state_heads("heartbeat");
                     next_heartbeat = now + heartbeat;
                 }
                 if self.r.config.daemon.exit_when_inputs_end
@@ -2019,6 +2063,85 @@ impl<'a> Daemon<'a> {
         self.emit(o);
     }
 
+    /// Gap 1: what the control plane found in its sealed state at start.
+    /// A one-time upgrade of v1 journals is recorded
+    /// (`robodr.control_plane_state_upgraded`); damage, an edit, another
+    /// key or a rollback is a `robot.agent.control_plane_state_untrusted`
+    /// finding (the control plane has already failed safe: replay fence,
+    /// reconciliation with the black box); then the heads are anchored.
+    fn control_state_at_start(&mut self) {
+        let Some(st) = self.control.as_ref().map(|c| c.state_status().clone()) else {
+            return;
+        };
+        if st.journal_upgraded_from_v1 || st.replay.upgraded_from_v1 {
+            let note = serde_json::json!({
+                "kind": crate::control::anchor::STATE_UPGRADED_NOTE,
+                "robot_id": self.r.config.robot.id,
+                "key_id": st.seal_key_id,
+                "requests_upgraded": st.journal_upgraded_from_v1,
+                "nonces_upgraded": st.replay.upgraded_from_v1,
+                "rebuilt_from_blackbox": st.rebuilt_from_blackbox,
+                "replay_fence": st.replay.fence,
+            });
+            let now = self.clock.now();
+            if self
+                .agent
+                .record_note(now, "control-plane state upgrade", &note, true)
+                .is_err()
+            {
+                self.stats.note_errors += 1;
+            }
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: control plane: unsealed v1 state journals upgraded to {} (one \
+                 time): reconciled with the black box, replay store fenced",
+                crate::control::journal::FORMAT
+            );
+        }
+        if let Some((sev, detail)) = crate::control::anchor::integrity_alarm(&st) {
+            let dev = robodr_events::Deviation::new(
+                health_rules::CONTROL_PLANE_STATE_UNTRUSTED,
+                sev,
+                detail,
+            );
+            self.self_health("agentd:control_plane", dev);
+        }
+        self.record_state_heads("start");
+    }
+
+    /// Gap 1: record where the control-plane journals end as a signed
+    /// black-box note (`start`, `stop`, and `heartbeat` when a head moved;
+    /// see [`crate::control::anchor`]).
+    fn record_state_heads(&mut self, reason: &str) {
+        let Some(cp) = self.control.as_ref() else {
+            return;
+        };
+        let heads = cp.state_heads();
+        if reason == "heartbeat" && self.state_heads_recorded.as_ref() == Some(&heads) {
+            return;
+        }
+        let note = crate::control::anchor::head_note(
+            &self.r.config.robot.id,
+            reason,
+            &cp.state_status().seal_key_id,
+            &heads,
+        );
+        let now = self.clock.now();
+        match self
+            .agent
+            .record_note(now, "control-plane state head", &note, true)
+        {
+            Ok(_) => self.state_heads_recorded = Some(heads),
+            Err(e) => {
+                self.stats.note_errors += 1;
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: control-plane state head not recorded: {e:?}"
+                );
+            }
+        }
+    }
+
     /// Raise an observe-only self-health deviation (not an input issue).
     fn self_health(&mut self, source: &str, dev: robodr_events::Deviation) {
         self.stats.health_findings += 1;
@@ -2587,6 +2710,9 @@ impl<'a> Daemon<'a> {
         found.extend(self.pipeline.finish());
         self.sensor_findings(found);
         self.flood_close(true);
+        // Gap 1: the listeners are joined and the queue drained, so nothing
+        // is appended after this head: the next start may verify it exactly.
+        self.record_state_heads("stop");
         self.heartbeat("robodr.agentd_stop");
         self.write_status(false);
         let pipeline = *self.pipeline.stats();
@@ -2833,8 +2959,65 @@ impl Daemon<'_> {
                 sanitize(ev.id.as_deref().unwrap_or("-")),
                 sanitize(&ev.detail)
             );
+            self.executor_event_finding(&ev);
         }
         self.executor = Some(link);
+    }
+
+    /// S5 / gap 2: an executor event that leaves the robot in an unknown
+    /// state is a finding, not only a black-box note: a failed (stuck)
+    /// revert, whose rules may still be in force, is High once per request
+    /// until a revert of it succeeds (the executor retries every tick and
+    /// reports every retry); a journal reset (unreadable, or failing its
+    /// seal) is High each time.
+    fn executor_event_finding(&mut self, ev: &robodr_executor::journal::Event) {
+        use robodr_executor::journal::EventKind;
+        let id = ev.id.as_deref().unwrap_or("-");
+        let action = ev
+            .action
+            .map_or_else(|| "-".to_string(), |a| a.as_str().to_string());
+        let dev = match ev.kind {
+            EventKind::Reverted | EventKind::Expired => {
+                self.revert_failed_reported.remove(id);
+                return;
+            }
+            EventKind::RevertFailed => {
+                if !self.revert_failed_reported.insert(id.to_string()) {
+                    return;
+                }
+                // The TTL the SOC asked for, when it is a control-plane
+                // request (the executor's detail carries its own).
+                let ttl = self
+                    .control
+                    .as_ref()
+                    .and_then(|c| c.engine.get(id))
+                    .and_then(|s| s.request.ttl_seconds)
+                    .map_or_else(|| "-".to_string(), |t| format!("{t}s"));
+                robodr_events::Deviation::new(
+                    health_rules::EXECUTOR_REVERT_FAILED,
+                    robodr_events::Severity::High,
+                    format!(
+                        "robodr-executor could not revert action {action} of request {} (ttl \
+                         {ttl}); its rules may still be in force and the executor retries every \
+                         tick: check `robodr-executor status`; error: {}",
+                        sanitize(id),
+                        sanitize(&ev.detail)
+                    ),
+                )
+            }
+            EventKind::JournalReset => robodr_events::Deviation::new(
+                health_rules::EXECUTOR_JOURNAL_RESET,
+                robodr_events::Severity::High,
+                format!(
+                    "robodr-executor found its journal unreadable or failing its seal and started \
+                     empty: every action it held was lifted and its history is lost; it refuses \
+                     orders until `robodr-executor rearm`: {}",
+                    sanitize(&ev.detail)
+                ),
+            ),
+            _ => return,
+        };
+        self.self_health("agentd:executor", dev);
     }
 }
 

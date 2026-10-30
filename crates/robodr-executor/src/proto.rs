@@ -158,6 +158,16 @@ impl Key {
         Ok(Key(k))
     }
 
+    /// The key that seals the executor's state files (gap 1: journal and
+    /// SOC replay store), derived from this link key with its own purpose
+    /// ([`crate::journal::SEAL_PURPOSE`]): the link key itself never MACs
+    /// state.
+    pub fn state_seal_key(&self) -> Result<std::sync::Arc<robodr_blackbox::StateSealKey>, String> {
+        robodr_blackbox::StateSealKey::derive(&self.0, crate::journal::SEAL_PURPOSE)
+            .map(std::sync::Arc::new)
+            .map_err(|e| format!("executor state key: {e}"))
+    }
+
     /// Load from a file that must be a regular file without group / other
     /// permission bits.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {

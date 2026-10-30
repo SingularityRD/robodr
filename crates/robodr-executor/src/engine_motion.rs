@@ -280,7 +280,11 @@ impl Engine {
                     EventKind::RevertFailed,
                     Some(&en.id),
                     Some(en.action),
-                    format!("{reason}: adapter undo failed ({e}); retried every tick"),
+                    format!(
+                        "{reason}: adapter undo failed ({e}); retried every tick (ttl {}s, \
+                         deadline {} ms)",
+                        en.ttl_s, en.deadline_ms
+                    ),
                 );
                 let _ = self.save();
                 let mut o = self.status(&en.id);

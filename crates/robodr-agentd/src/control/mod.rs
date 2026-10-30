@@ -70,6 +70,7 @@
 //!   authenticated invalid requests as `robot.agent.control_plane_invalid`
 //!   (Medium).
 
+pub mod anchor;
 pub mod api;
 pub mod auth;
 pub mod evidence;
@@ -506,6 +507,22 @@ pub struct StateStatus {
     pub journal_torn_bytes: u64,
     pub journal_damaged: usize,
     pub journal_quarantined: Option<String>,
+    /// The state-seal key's id (derived from the black-box key).
+    pub seal_key_id: String,
+    /// Of `journal_damaged`, lines whose seal did not verify.
+    pub journal_forged: usize,
+    /// The request journal was sealed under this other key.
+    pub journal_wrong_key: Option<String>,
+    /// A v1 request journal was adopted (one-time upgrade).
+    pub journal_upgraded_from_v1: bool,
+    /// A v1 request journal after sealing had started: damage.
+    pub journal_legacy_refused: bool,
+    /// The request journal against the black box's newest head.
+    pub journal_anchor: journal::AnchorCheck,
+    /// The black box's newest head note (`None`: there is none) and its
+    /// head notes that did not verify (ignored).
+    pub anchor_clean: Option<bool>,
+    pub anchor_notes_unverified: usize,
     /// Dangling decisions settled from the black box.
     pub resolved_committed: usize,
     pub resolved_aborted: usize,
@@ -612,32 +629,45 @@ impl ControlPlane {
     /// threads. `answer_signer` (the finding key) signs every answer to an
     /// authenticated request and every evidence manifest. `blackbox_dir`
     /// is read (only) by the evidence API; `reconcile` settles decisions a
-    /// crash left half-journaled.
+    /// crash left half-journaled. `seal_key` seals both journals and
+    /// `anchors` is the black box's newest head note ([`anchor::latest`]).
     pub fn start(
         spec: &ControlPlaneSpec,
         robot_id: &str,
         answer_signer: Box<dyn robodr_blackbox::Signer>,
         blackbox_dir: &Path,
         reconcile: Reconcile<'_>,
+        seal_key: Arc<robodr_blackbox::StateSealKey>,
+        anchors: &anchor::Found,
     ) -> Result<Self, String> {
         let now_s = wall_s().ok_or("control plane: the wall clock is unavailable")?;
         let euid = crate::config::effective_uid();
         let dir = &spec.state_dir;
         fsutil::check_private_dir(dir, euid)
             .map_err(|e| format!("control_plane.state_dir: {e}"))?;
+        let sealing = anchors.sealing(seal_key);
         // The request journal (and the decisions a crash left dangling).
-        let (mut journal, mut restored) = state::open(dir, spec.max_requests).map_err(|e| {
-            format!(
-                "control_plane.state_dir: {}: {e}",
-                dir.join(state::REQUEST_JOURNAL).display()
-            )
-        })?;
+        let (mut journal, mut restored) =
+            state::open(dir, spec.max_requests, &sealing).map_err(|e| {
+                format!(
+                    "control_plane.state_dir: {}: {e}",
+                    dir.join(state::REQUEST_JOURNAL).display()
+                )
+            })?;
         let mut st = StateStatus {
             state_dir: dir.display().to_string(),
             journal_created: restored.created,
             journal_torn_bytes: restored.torn_bytes,
             journal_damaged: restored.damaged,
             journal_quarantined: restored.quarantined.clone(),
+            seal_key_id: sealing.key.key_id().to_string(),
+            journal_forged: restored.forged,
+            journal_wrong_key: restored.wrong_key.clone(),
+            journal_upgraded_from_v1: restored.upgraded_from_v1,
+            journal_legacy_refused: restored.legacy_refused,
+            journal_anchor: restored.anchor.clone(),
+            anchor_clean: anchors.heads.as_ref().map(|_| anchors.clean),
+            anchor_notes_unverified: anchors.unverified,
             ..StateStatus::default()
         };
         if !restored.pending.is_empty() || !restored.pending_reverts.is_empty() {
@@ -657,10 +687,12 @@ impl ControlPlane {
         }
         // Damage (not a torn tail) may have taken committed requests with
         // it: the black box is the record, rebuild from it (review finding
-        // 4). If it cannot be read, refuse every new request id rather than
-        // judge (and maybe execute) a known one again.
+        // 4). So may an edit, a rollback, an unsealed v1 journal or a tail
+        // cut after the black box's newest head (gap 1). If it cannot be
+        // read, refuse every new request id rather than judge (and maybe
+        // execute) a known one again.
         let mut lost: Vec<String> = Vec::new();
-        if restored.damaged > 0 {
+        if restored.untrusted() {
             match evidence::find_request_notes(
                 &evidence::DirSource(blackbox_dir.to_path_buf()),
                 robot_id,
@@ -674,8 +706,8 @@ impl ControlPlane {
                 }
                 Err(e) => {
                     st.refusing_new_request_ids = Some(format!(
-                        "the request journal was damaged and the black box could not be read \
-                         to reconcile it ({e})"
+                        "the request journal cannot be trusted (damaged, edited, rolled back or \
+                         unsealed) and the black box could not be read to reconcile it ({e})"
                     ));
                 }
             }
@@ -694,13 +726,15 @@ impl ControlPlane {
         engine.stats.journal_damaged = st.journal_damaged as u64;
         engine.refuse_ids(lost, st.refusing_new_request_ids.clone());
         // The replay store: fenced if it cannot be trusted.
-        let (replay, rload) = ReplayGuard::persistent(dir, spec.skew_s, auth::MAX_NONCES, now_s)
-            .map_err(|e| {
-                format!(
-                    "control_plane.state_dir: {}: {e}",
-                    dir.join(auth::NONCE_JOURNAL).display()
-                )
-            })?;
+        let (replay, rload) =
+            ReplayGuard::persistent(dir, spec.skew_s, auth::MAX_NONCES, now_s, &sealing).map_err(
+                |e| {
+                    format!(
+                        "control_plane.state_dir: {}: {e}",
+                        dir.join(auth::NONCE_JOURNAL).display()
+                    )
+                },
+            )?;
         st.replay = rload;
         // Evidence exports.
         let evidence = match &spec.evidence {
@@ -857,6 +891,18 @@ impl ControlPlane {
     /// What the persistent state looked like at start.
     pub fn state_status(&self) -> &StateStatus {
         &self.state
+    }
+
+    /// Where both journals end now (what the black box anchors).
+    pub fn state_heads(&self) -> anchor::StateHeads {
+        anchor::StateHeads {
+            requests: self.engine.journal_head(),
+            nonces: self
+                .replay
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .head(),
+        }
     }
 
     pub fn status(&self) -> ControlStatus {

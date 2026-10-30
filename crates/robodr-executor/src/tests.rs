@@ -16,7 +16,7 @@ use crate::config::{ExecutorConfig, Resolved};
 use crate::decision::{codes, precheck, recheck_safety, Current, Effect};
 use crate::engine::{Engine, FixedSafety, Outcome, Status};
 use crate::fault::{self, Point};
-use crate::journal::EventKind;
+use crate::journal::{EventKind, Journal, Loaded};
 use crate::nft::Nft;
 use crate::order::{Locator, Order, Origin, Target};
 
@@ -1379,6 +1379,174 @@ fn corrupt_journal_deletes_the_table_and_starts_empty() {
     assert_eq!(e.state().journal_reset_ms, Some(2_000));
     e.rearm("acknowledged", 4_000).unwrap();
     assert_eq!(e.state().journal_reset_ms, None);
+}
+
+fn seal_key(b: u8) -> std::sync::Arc<robodr_blackbox::StateSealKey> {
+    crate::proto::Key::from_bytes([b; 32])
+        .state_seal_key()
+        .unwrap()
+}
+
+fn sealed_engine(
+    dir: &std::path::Path,
+    nft: &FakeNft,
+    now: u64,
+    key: &std::sync::Arc<robodr_blackbox::StateSealKey>,
+) -> Engine {
+    Engine::open_sealed(
+        cfg(dir.to_str().unwrap()),
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        "b1",
+        now,
+        key.clone(),
+    )
+    .unwrap()
+}
+
+fn reset_reason(e: &Engine) -> String {
+    e.state()
+        .events
+        .iter()
+        .find(|x| x.kind == EventKind::JournalReset)
+        .map(|x| x.detail.clone())
+        .unwrap_or_default()
+}
+
+/// Gap 1: the executor's journal is sealed under a key derived from the
+/// link key. A tampered journal, one under another key (wrong key), an
+/// older sealed copy put back (replayed: accepted, the seal cannot tell; see
+/// the README) and an unsealed v1 file are each handled: never believed when
+/// the seal fails, the table deleted, a High `journal_reset` event, and
+/// every order refused (`journal_reset`) until `rearm`.
+#[test]
+fn gap1_a_sealed_journal_that_fails_its_seal_is_not_believed() {
+    let key = seal_key(7);
+    let nft = FakeNft::default();
+    let iso = |id: &str| {
+        order(
+            id,
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        )
+    };
+    // Sealed on disk; reopened intact.
+    let d = tmpdir("seal-ok");
+    let mut e = sealed_engine(&d, &nft, 1_000, &key);
+    assert_eq!(
+        e.submit(&iso("i1"), &mut idle(), 1_000).status,
+        Status::Verified
+    );
+    drop(e);
+    let text = std::fs::read_to_string(d.join("journal.json")).unwrap();
+    assert!(
+        text.starts_with("robodr-executor-journal/v2 hmac-sha256:"),
+        "{text}"
+    );
+    let soc = std::fs::read_to_string(d.join(crate::soc::NONCE_FILE)).unwrap();
+    assert!(soc.starts_with(crate::soc::NONCE_SEALED_FORMAT), "{soc}");
+    let e = sealed_engine(&d, &nft, 2_000, &key);
+    assert_eq!(e.state().entries.len(), 1);
+    assert!(e.state().journal_reset_ms.is_none());
+    assert!(nft.0.lock().unwrap().table.is_some());
+    drop(e);
+
+    // Tampered: the active action edited out (the JSON is valid, the seal
+    // is not).
+    let tampered = text.replace("\"phase\": \"active\"", "\"phase\": \"reverting\"");
+    assert_ne!(tampered, text);
+    std::fs::write(d.join("journal.json"), &tampered).unwrap();
+    let mut e = sealed_engine(&d, &nft, 3_000, &key);
+    assert!(e.state().entries.is_empty());
+    assert!(
+        nft.0.lock().unwrap().table.is_none(),
+        "fail towards doing nothing"
+    );
+    let why = reset_reason(&e);
+    assert!(why.starts_with("HIGH:") && why.contains("edited"), "{why}");
+    assert_eq!(e.state().journal_reset_ms, Some(3_000));
+    // Orders are refused until the operator re-arms.
+    let o = e.submit(&iso("i2"), &mut idle(), 3_100);
+    assert_eq!(o.status, Status::Refused);
+    assert_eq!(o.refusal.unwrap().code, codes::JOURNAL_RESET);
+    e.rearm("checked", 3_200).unwrap();
+    assert_eq!(
+        e.submit(&iso("i3"), &mut idle(), 3_300).status,
+        Status::Verified
+    );
+    drop(e);
+
+    // Wrong key: the same file under another unit's key.
+    let e = sealed_engine(&d, &nft, 4_000, &seal_key(8));
+    let why = reset_reason(&e);
+    assert!(why.contains("another key"), "{why}");
+    assert!(e.state().journal_reset_ms.is_some());
+    drop(e);
+
+    // Truncated: cut in the middle of the JSON.
+    let d = tmpdir("seal-trunc");
+    let mut e = sealed_engine(&d, &nft, 1_000, &key);
+    e.submit(&iso("t1"), &mut idle(), 1_000);
+    drop(e);
+    let full = std::fs::read(d.join("journal.json")).unwrap();
+    std::fs::write(d.join("journal.json"), &full[..full.len() / 2]).unwrap();
+    let e = sealed_engine(&d, &nft, 2_000, &key);
+    assert!(reset_reason(&e).contains("seal"), "{}", reset_reason(&e));
+    drop(e);
+
+    // An unsealed v1 journal: not trusted until `seal-journal` upgraded it.
+    let d = tmpdir("seal-v1");
+    let mut e = engine(&d, &nft, "b1", 1_000);
+    assert_eq!(
+        e.submit(&iso("v1"), &mut idle(), 1_000).status,
+        Status::Verified
+    );
+    drop(e);
+    let v1 = std::fs::read(d.join("journal.json")).unwrap();
+    let e = sealed_engine(&d, &nft, 2_000, &key);
+    assert!(
+        reset_reason(&e).contains("seal-journal"),
+        "{}",
+        reset_reason(&e)
+    );
+    drop(e);
+    // The documented one-time upgrade keeps the v1 state.
+    std::fs::write(d.join("journal.json"), &v1).unwrap();
+    nft.0.lock().unwrap().table = None;
+    let j = Journal::sealed(&d, key.clone());
+    let m = j.seal_legacy().unwrap();
+    assert!(m.contains("1 active action"), "{m}");
+    assert!(j.seal_legacy().unwrap_err().contains("sealed already"));
+    match j.load() {
+        Loaded::State(s) => assert_eq!(s.entries.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Gap 1: the executor's SOC replay store is sealed too; a store that
+/// fails its seal fences like a damaged one.
+#[test]
+fn gap1_a_soc_replay_store_that_fails_its_seal_fences() {
+    let key = seal_key(9);
+    let d = tmpdir("seal-soc");
+    let mut s = crate::soc::ReplayStore::open_sealed(&d, 1_000, 30, false, Some(key.clone()));
+    assert!(s.fence_s().is_none());
+    assert!(s
+        .check("k", "nonce-aaaaaaaaaaaaaaaa", 1_000, 1_000, 30)
+        .is_ok());
+    drop(s);
+    let p = d.join(crate::soc::NONCE_FILE);
+    let text = std::fs::read_to_string(&p).unwrap();
+    // The nonce removed, the seal line kept: a replay would pass if believed.
+    std::fs::write(
+        &p,
+        text.replace("nonce-aaaaaaaaaaaaaaaa", "nonce-zzzzzzzzzzzzzzzz"),
+    )
+    .unwrap();
+    let s = crate::soc::ReplayStore::open_sealed(&d, 1_005, 30, true, Some(key));
+    assert_eq!(s.fence_s(), Some(1_035));
+    assert!(s.fenced_because.unwrap().contains("seal"));
 }
 
 /// L7: the policy (and configuration) are re-read before every order.

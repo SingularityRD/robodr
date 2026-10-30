@@ -44,7 +44,7 @@ use robodr_responder::SafetyState;
 use serde::{Deserialize, Serialize};
 
 use super::api::{Accepted, ActionRequest, Refusal, RevertRecord, Status, Stored};
-use super::journal::{Journal, Loaded};
+use super::journal::{AnchorCheck, Head, Journal, Loaded, Sealing};
 
 /// The request journal's file name.
 pub const REQUEST_JOURNAL: &str = "requests.journal";
@@ -344,17 +344,56 @@ pub struct Restored {
     pub damaged: usize,
     pub quarantined: Option<String>,
     pub created: bool,
+    /// Of `damaged`, lines whose seal did not verify (an edit or deletion).
+    pub forged: usize,
+    /// The journal is sealed under another key (named).
+    pub wrong_key: Option<String>,
+    /// A v1 journal was adopted (one-time upgrade).
+    pub upgraded_from_v1: bool,
+    /// A v1 journal after sealing had started (a downgrade): damage.
+    pub legacy_refused: bool,
+    /// The comparison with the black box's newest head.
+    pub anchor: AnchorCheck,
+}
+
+impl Restored {
+    /// The journal may have lost committed requests (damage, an edit, a
+    /// rollback, a tail after the black box's newest head, an unsealed v1
+    /// file): the black box is the record, reconcile with it.
+    pub fn untrusted(&self) -> bool {
+        self.damaged > 0
+            || self.upgraded_from_v1
+            || matches!(
+                self.anchor,
+                AnchorCheck::RolledBack(_) | AnchorCheck::Unanchored(_)
+            )
+    }
 }
 
 /// Open the journal in `dir` and replay it (newest `max` requests kept).
-pub fn open(dir: &Path, max: usize) -> std::io::Result<(RequestJournal, Restored)> {
-    let (journal, loaded): (Journal, Loaded<Entry>) =
-        Journal::open(dir, REQUEST_JOURNAL, "requests")?;
+pub fn open(
+    dir: &Path,
+    max: usize,
+    sealing: &Sealing,
+) -> std::io::Result<(RequestJournal, Restored)> {
+    let (journal, loaded): (Journal, Loaded<Entry>) = Journal::open(
+        dir,
+        REQUEST_JOURNAL,
+        "requests",
+        &sealing.key,
+        sealing.requests.as_ref(),
+        sealing.adopt_legacy,
+    )?;
     let mut r = Restored {
         torn_bytes: loaded.torn_bytes,
         damaged: loaded.damaged,
         quarantined: loaded.quarantined.map(|p| p.display().to_string()),
         created: loaded.created,
+        forged: loaded.forged,
+        wrong_key: loaded.wrong_key,
+        upgraded_from_v1: loaded.upgraded_from_v1,
+        legacy_refused: loaded.legacy_refused,
+        anchor: loaded.anchor,
         ..Restored::default()
     };
     let mut store: HashMap<String, Stored> = HashMap::new();
@@ -679,6 +718,11 @@ impl RequestJournal {
     /// Entries in the file.
     pub fn lines(&self) -> usize {
         self.journal.lines()
+    }
+
+    /// Where the journal ends now (anchored in the black box).
+    pub fn head(&self) -> Head {
+        self.journal.head()
     }
 
     /// Rewrite as snapshots of `stored` (oldest first).

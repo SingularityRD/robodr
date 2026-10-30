@@ -1346,6 +1346,13 @@ impl Engine {
         }
     }
 
+    /// Where the request journal ends now (`None`: in memory only).
+    pub fn journal_head(&self) -> Option<super::journal::Head> {
+        self.journal
+            .as_ref()
+            .map(super::state::RequestJournal::head)
+    }
+
     /// Append to the journal (if any); `false` on failure (counted).
     fn journal(&mut self, e: &super::state::Entry) -> bool {
         match self.journal.as_mut() {
@@ -2992,7 +2999,8 @@ mod tests {
 
     /// Restart: open the journal, settle dangling decisions against `h`.
     fn restart(dir: &std::path::Path, h: &FakeHost, max: usize) -> (Engine, (usize, usize)) {
-        let (mut j, mut r) = state::open(dir, max).unwrap();
+        let (mut j, mut r) =
+            state::open(dir, max, &crate::control::journal::tests::sealing()).unwrap();
         let ids: Vec<String> = r
             .pending
             .keys()
@@ -3381,7 +3389,7 @@ mod tests {
         e.handle(&sub("k-1", "safe_pause", json!({}), None), &meta(), &mut h);
         drop(e);
         // A snapshot with a refusal code this code never writes.
-        let (mut j, r) = state::open(&d, 16).unwrap();
+        let (mut j, r) = state::open(&d, 16, &crate::control::journal::tests::sealing()).unwrap();
         let mut p = state::PStored::of(&r.stored[0]);
         p.request.request_id = "k-2".into();
         p.refusal = Some(state::PRefusal {
@@ -3391,7 +3399,7 @@ mod tests {
         });
         j.append(&state::Entry::Stored { stored: p }).unwrap();
         drop(j);
-        let (_, r) = state::open(&d, 16).unwrap();
+        let (_, r) = state::open(&d, 16, &crate::control::journal::tests::sealing()).unwrap();
         assert_eq!(r.stored.len(), 1);
         assert_eq!(r.damaged, 1);
         let _ = std::fs::remove_dir_all(&d);
