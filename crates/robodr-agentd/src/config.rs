@@ -94,6 +94,10 @@
 //!   `{"socket_path": "/run/robodr-agentd/host-threats.sock"}`, the socket
 //!   the `robodr-threat-forward` Pulsar module writes Pulsar threats to (see
 //!   [`crate::host`]). Its path must differ from every other socket input.
+//! * `gateway_feed` (optional, [`crate::gateway_feed::GatewayFeedSection`]):
+//!   the same keys, the socket the in-path gateway `robodr-firewall-gw`
+//!   writes its findings to (`findings_socket` there; see
+//!   [`crate::gateway_feed`]). `allowed_uids` names the gateway's uid.
 //! * `findings` (optional, [`FindingsSection`]): `{"topic":
 //!   "robodr.findings", "data_source": "robodr"}` (the defaults), the
 //!   deployment labels every finding carries (`ocsf.metadata.log_name`, the
@@ -238,6 +242,10 @@ pub struct DaemonConfig {
     /// `None` = no host-side signals.
     #[serde(default)]
     pub host_threats: Option<crate::host::HostThreatsSection>,
+    /// The in-path gateway's findings feed (see [`crate::gateway_feed`]);
+    /// `None` = gateway findings stay in the gateway's events file.
+    #[serde(default)]
+    pub gateway_feed: Option<crate::gateway_feed::GatewayFeedSection>,
     /// The control-plane action API (see [`crate::control`]); `None` (the
     /// default) = no listener.
     #[serde(default)]
@@ -762,6 +770,8 @@ pub struct Resolved {
     pub finding_key: Option<(KeyBytes, String)>,
     /// The validated host-threat socket, if configured.
     pub host_threats: Option<crate::host::HostThreatsSpec>,
+    /// The validated gateway feed socket, if configured.
+    pub gateway_feed: Option<crate::host::HostThreatsSpec>,
     /// The validated control-plane API (listeners, SOC keys), if configured.
     pub control_plane: Option<crate::control::ControlPlaneSpec>,
     /// executor v1: the enabled executor link (`None` = off).
@@ -1336,6 +1346,37 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             Some(spec)
         }
     };
+    let gateway_feed = match &config.gateway_feed {
+        None => None,
+        Some(g) => {
+            let spec = g.resolve()?;
+            let clash = config.event_inputs.iter().any(
+                |i| matches!(i, EventInputConfig::UnixSocket { path, .. } if *path == spec.path),
+            ) || safety_feed
+                .as_ref()
+                .and_then(|f| f.socket.as_ref())
+                .is_some_and(|s| s.path == spec.path)
+                || host_threats.as_ref().is_some_and(|h| h.path == spec.path);
+            if clash {
+                return Err(
+                    "gateway_feed.socket_path is also an event_inputs, safety_feed or \
+                            host_threats socket path"
+                        .into(),
+                );
+            }
+            for (what, d) in [
+                ("spool.dir", &config.spool.dir),
+                ("blackbox.dir", &config.blackbox.dir),
+            ] {
+                if resolve_path(&spec.path).starts_with(resolve_path(d)) {
+                    return Err(format!(
+                        "gateway_feed.socket_path must not be inside {what}"
+                    ));
+                }
+            }
+            Some(spec)
+        }
+    };
     let finding_key = match &config.finding_signing {
         None => None,
         Some(fs) => {
@@ -1558,6 +1599,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         correlation,
         finding_key,
         host_threats,
+        gateway_feed,
         control_plane,
         executor,
         firewall_joint,

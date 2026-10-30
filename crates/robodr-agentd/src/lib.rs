@@ -110,6 +110,7 @@ pub mod daemon;
 pub mod executor_link;
 /// Discovery-flood aggregation of pipeline findings (red team F1).
 pub mod flood;
+pub mod gateway_feed;
 pub mod health;
 pub mod host;
 pub mod input;
