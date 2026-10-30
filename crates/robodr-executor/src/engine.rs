@@ -926,6 +926,19 @@ impl Engine {
                         ),
                     ));
                 }
+                // T67: the key's scope as configured now.
+                let c = &self.cfg.config;
+                crate::soc::check_scope(
+                    &c.soc,
+                    key_id,
+                    order.action,
+                    crate::soc::scoped_ttl(order.action, order.ttl_s, c.ttl.default_s),
+                    "approve",
+                )
+                .map_err(|mut r| {
+                    r.reason = format!("{}: not re-armed", r.reason);
+                    r
+                })?;
             }
         }
         let p = decision::precheck(order, &self.policy, &self.cfg)?;
@@ -1338,6 +1351,17 @@ impl Engine {
                     now_ms,
                 };
                 let approvers = crate::soc::verify(order, &cx, &mut self.soc_replay)?;
+                // T67: what this key may approve, and for how long.
+                if let crate::order::Origin::ControlPlane { key_id, .. } = &order.origin {
+                    let c = &self.cfg.config;
+                    crate::soc::check_scope(
+                        &c.soc,
+                        key_id,
+                        order.action,
+                        crate::soc::scoped_ttl(order.action, order.ttl_s, c.ttl.default_s),
+                        "approve",
+                    )?;
+                }
                 // With a `motion` section the two-person actions can be
                 // executed: their approvers are checked here (without one
                 // they are refused `not_executor_action` by the precheck).
@@ -1610,6 +1634,16 @@ impl Engine {
                 };
                 let (rb, approvers) =
                     crate::soc::verify_revert(id, soc, &cx, &mut self.soc_replay)?;
+                // T67: the revert's key may revert this action.
+                if let Some(s) = soc {
+                    crate::soc::check_scope(
+                        &self.cfg.config.soc,
+                        &s.key_id,
+                        action,
+                        None,
+                        "revert",
+                    )?;
+                }
                 if crate::motion::two_person(action) {
                     crate::motion::approvers_ok(action, &rb, &approvers)?;
                 }

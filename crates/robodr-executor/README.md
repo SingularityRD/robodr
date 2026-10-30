@@ -493,6 +493,24 @@ An action held after a reboot is re-armed only while the SOC key that
 approved it is still configured (`approval_key_removed` otherwise:
 reverted).
 
+**Key scopes** (sales-readiness T67). `soc.key_scopes` maps a SOC key id
+to what that key may approve: `actions` (the actions it may approve
+**and revert**) and `max_ttl_s` (the longest TTL it may approve, counted
+as executed: the signed `ttl_seconds`, or `ttl.default_s` when none is
+named; it bounds `restrict_motion`, `quarantine_node` and
+`isolate_network`). Anything else signed with that key is refused
+`key_scope_denied`, after the signature verified, so a stolen or
+over-shared tier-1 key cannot isolate the robot for a day or pause it. A
+key without an entry approves every action up to `ttl.max_s` (the
+behaviour before scopes), unless `soc.require_key_scopes: true`, which
+makes such a key approve nothing. The executor enforces this itself with
+its own configuration (agentd's check of the same key is not trusted for
+it); a held action is re-armed after a reboot only while the scope of the
+key that approved it, as configured then, still allows it (otherwise
+reverted, `key_scope_denied`). Two-person actions still need two
+`approved_by` names in the body the key signed; a second, independent
+signature is not implemented.
+
 **Site option** `require_approval_for_all_containment` (default `false`;
 `true` in the G1 example): every containment needs the SOC's approval on
 every morphology, so on-robot planner orders are refused
@@ -628,6 +646,10 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   keys, never accepted as SOC keys): see "Trust boundary". Without keys
   every control-plane order is refused; one bad key file refuses them all
   (`soc_keys_unavailable`).
+* `soc.key_scopes` (`{"<key id>": {"actions": [...], "max_ttl_s": N}}`,
+  at most 16 keys; `actions` 1..=7 distinct action names, `max_ttl_s`
+  1..=`ttl.max_s`) and `soc.require_key_scopes` (default `false`): see
+  "Key scopes".
 * `network.quarantine` (`cidrs`, `udp_ports`): where a quarantine may act
   (review F4). `cidrs` may not be `/0` nor overlap a management / uplink
   entry; empty refuses every quarantine.

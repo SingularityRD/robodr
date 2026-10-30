@@ -610,6 +610,123 @@ pub fn verify(
     Ok(approved_by)
 }
 
+/// `soc.key_scopes.<key id>` (sales-readiness T67): what one SOC key may
+/// approve. A key the SOC hands to a shift analyst can then be limited to,
+/// say, `quarantine_node` for at most 15 minutes, while another key approves
+/// an isolation or a pause.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyScope {
+    /// The actions this key may approve **and revert** (1..=7, each once).
+    pub actions: Vec<robodr_responder::ActionId>,
+    /// The longest TTL this key may approve (s, 1..=`ttl.max_s`), counted
+    /// as the executor applies it: the signed `ttl_seconds`, or
+    /// `ttl.default_s` when the request names none. Only the actions that
+    /// carry a TTL (`restrict_motion`, `quarantine_node`,
+    /// `isolate_network`) are bounded by it; absent: `ttl.max_s`.
+    #[serde(default)]
+    pub max_ttl_s: Option<u64>,
+}
+
+impl KeyScope {
+    /// The configuration rules (`ExecutorConfig::validate`).
+    pub fn validate(&self, key_id: &str, max_ttl_s: u64) -> Result<(), String> {
+        let at = format!("soc.key_scopes.{:?}", crate::net::clip(key_id));
+        if key_id.is_empty() || key_id.len() > 128 || !key_id.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(format!("{at}: not a key id (1..=128 printable ASCII)"));
+        }
+        if self.actions.is_empty() {
+            return Err(format!(
+                "{at}.actions: name at least one action (remove the key from soc.keys to \
+                 take its approval away)"
+            ));
+        }
+        let mut seen = self.actions.clone();
+        seen.sort();
+        seen.dedup();
+        if seen.len() != self.actions.len() {
+            return Err(format!("{at}.actions: an action is listed twice"));
+        }
+        if self.max_ttl_s.is_some_and(|t| t == 0 || t > max_ttl_s) {
+            return Err(format!(
+                "{at}.max_ttl_s must be 1..=ttl.max_s ({max_ttl_s})"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The TTL an order runs with, as far as a key scope bounds it (`None`: an
+/// action without a TTL).
+pub fn scoped_ttl(
+    action: robodr_responder::ActionId,
+    ttl_s: Option<u64>,
+    default_s: u64,
+) -> Option<u64> {
+    use robodr_responder::ActionId as A;
+    match action {
+        A::RestrictMotion | A::QuarantineNode | A::IsolateNetwork => {
+            Some(ttl_s.unwrap_or(default_s))
+        }
+        _ => None,
+    }
+}
+
+/// T67: the key `key_id` may approve (or revert: `what`) `action` with
+/// `ttl` ([`scoped_ttl`]). A key without a `soc.key_scopes` entry approves
+/// every action up to `ttl.max_s`, unless `soc.require_key_scopes` is set
+/// (`key_scope_denied` then).
+pub fn check_scope(
+    soc: &crate::config::SocSection,
+    key_id: &str,
+    action: robodr_responder::ActionId,
+    ttl: Option<u64>,
+    what: &str,
+) -> Result<(), Refusal> {
+    let key = crate::net::clip(key_id);
+    let Some(scope) = soc.key_scopes.get(key_id) else {
+        if soc.require_key_scopes {
+            return Err(refuse(
+                codes::KEY_SCOPE_DENIED,
+                format!(
+                    "SOC key {key:?} has no soc.key_scopes entry and soc.require_key_scopes is \
+                     set: it may {what} no action"
+                ),
+            ));
+        }
+        return Ok(());
+    };
+    if !scope.actions.contains(&action) {
+        return Err(refuse(
+            codes::KEY_SCOPE_DENIED,
+            format!(
+                "SOC key {key:?} may not {what} {} (soc.key_scopes allows {}): not executed",
+                action.as_str(),
+                scope
+                    .actions
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    if let (Some(t), Some(max)) = (ttl, scope.max_ttl_s) {
+        if t > max {
+            return Err(refuse(
+                codes::KEY_SCOPE_DENIED,
+                format!(
+                    "SOC key {key:?} may {what} {} for at most {max} s (soc.key_scopes), the \
+                     order runs {t} s: not executed",
+                    action.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Most approvers a signed body may name.
 pub const MAX_APPROVERS: usize = 4;
 

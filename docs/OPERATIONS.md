@@ -1846,6 +1846,12 @@ table.
    * `soc.robot_keys`: the robot's own public keys (the black-box and
      finding keys' public halves, e.g. `robodr-blackbox keygen` public
      files): never accepted as SOC keys.
+   * `soc.key_scopes` (optional): per SOC key id, the `actions` it may
+     approve and revert and its `max_ttl_s`, e.g.
+     `{"soc:tier1": {"actions": ["quarantine_node"], "max_ttl_s": 900}}`;
+     anything else signed with that key is refused `key_scope_denied`.
+     `soc.require_key_scopes: true` makes a key without an entry approve
+     nothing (recommended once every key has one).
    * `network.quarantine.cidrs`: the networks where a participant may be
      quarantined (its SPDP locators must be there, on the robot's DDS
      ports); empty refuses every quarantine (`locator_out_of_scope`).

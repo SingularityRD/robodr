@@ -3431,3 +3431,166 @@ fn review_finding_2_no_rearm_on_the_agentd_socket() {
     // Stopped: the operator's journal re-arm (the CLI's path).
     assert!(!crate::server::serving(&client.socket).unwrap());
 }
+
+/// An engine on `config_json` with `soc` replaced by `soc`.
+fn engine_soc(
+    dir: &std::path::Path,
+    nft: &FakeNft,
+    boot: &str,
+    now: u64,
+    soc: Value,
+) -> Result<Engine, String> {
+    let mut v: Value = serde_json::from_str(&config_json(dir.to_str().unwrap())).unwrap();
+    v["soc"] = soc;
+    let c = ExecutorConfig::parse(&v.to_string())?.validate()?;
+    Engine::open(
+        c,
+        policy(Morphology::WheeledMobile, true, &[]),
+        Box::new(nft.clone()),
+        boot,
+        now,
+    )
+}
+
+/// Sales-readiness T67: a SOC key's scope (`soc.key_scopes`) bounds the
+/// actions it approves and reverts, and their TTL, in the executor itself
+/// (agentd's own check is not trusted for it); a re-arm after a reboot
+/// re-checks the scope as configured then.
+#[test]
+fn t67_soc_key_scope_bounds_actions_ttl_reverts_and_rearm() {
+    let d = tmpdir("t67");
+    let nft = FakeNft::default();
+    let scoped = |actions: Value, max: Value| {
+        json!({"keys": [soc_key_path()],
+               "key_scopes": {SOC_KEY_ID: {"actions": actions, "max_ttl_s": max}}})
+    };
+    let mut e = engine_soc(
+        &d,
+        &nft,
+        "b1",
+        1_000,
+        scoped(json!(["isolate_network"]), json!(900)),
+    )
+    .unwrap();
+    // An action outside the key's scope: refused, nothing installed.
+    let q = order(
+        "t67-q",
+        ActionId::QuarantineNode,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let out = e.submit(&q, &mut idle(), 1_000);
+    assert_eq!(refusal_code(&out), codes::KEY_SCOPE_DENIED, "{out:?}");
+    assert!(nft.0.lock().unwrap().table.is_none());
+    // In scope, but longer than the key may approve.
+    let mut long = unsigned(
+        "t67-long",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    long.ttl_s = Some(901);
+    let out = e.submit(&signed(long), &mut idle(), 1_000);
+    assert_eq!(refusal_code(&out), codes::KEY_SCOPE_DENIED, "{out:?}");
+    assert!(nft.0.lock().unwrap().table.is_none());
+    // No TTL named: the executor's default (600 s) is what is bounded.
+    let mut dflt = unsigned(
+        "t67-default",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    dflt.ttl_s = None;
+    let out = e.submit(&signed(dflt), &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    drop(e);
+    // The scope narrowed (same boot): the key can no longer revert it.
+    let mut e = engine_soc(
+        &d,
+        &nft,
+        "b1",
+        2_000,
+        scoped(json!(["quarantine_node"]), json!(900)),
+    )
+    .unwrap();
+    let rv = crate::soc::SocRequest::sign(
+        &SOC_SEED,
+        "ugv-007",
+        SOC_KEY_ID,
+        "POST",
+        "/api/v2/robots/ugv-007/action-requests/t67-default/revert",
+        2,
+        "t67-revert-nonce-0001",
+        r#"{"requested_by":"analyst"}"#,
+    );
+    let out = e.revert_request("t67-default", "done", Some(&rv), &mut idle(), 2_000);
+    assert_eq!(refusal_code(&out), codes::KEY_SCOPE_DENIED, "{out:?}");
+    assert_eq!(e.status("t67-default").status, Status::Verified);
+    assert!(nft.0.lock().unwrap().table.is_some());
+    drop(e);
+    // After a reboot the held isolation is re-armed only if the key's
+    // scope (as configured now) still allows it.
+    nft.0.lock().unwrap().table = None;
+    let mut e = engine_soc(
+        &d,
+        &nft,
+        "b2",
+        3_000,
+        scoped(json!(["quarantine_node"]), json!(900)),
+    )
+    .unwrap();
+    e.rearm_held(
+        Ok(Current {
+            state: SafetyState::Idle,
+            age_ms: 5,
+        }),
+        3_100,
+    );
+    let st = e.status("t67-default");
+    assert_eq!(st.status, Status::Reverted, "re-armed out of scope: {st:?}");
+    assert!(
+        st.note
+            .as_deref()
+            .unwrap_or("")
+            .contains("key_scope_denied"),
+        "{st:?}"
+    );
+    assert!(nft.0.lock().unwrap().table.is_none());
+    drop(e);
+    // require_key_scopes: a key without an entry approves nothing.
+    let mut e = engine_soc(
+        &d,
+        &nft,
+        "b2",
+        4_000,
+        json!({"keys": [soc_key_path()], "require_key_scopes": true}),
+    )
+    .unwrap();
+    let i = sign_at(
+        unsigned(
+            "t67-unscoped",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        4,
+    );
+    let out = e.submit(&i, &mut idle(), 4_000);
+    assert_eq!(refusal_code(&out), codes::KEY_SCOPE_DENIED, "{out:?}");
+    drop(e);
+    // Configuration rules.
+    for bad in [
+        scoped(json!([]), json!(900)),
+        scoped(json!(["isolate_network", "isolate_network"]), json!(900)),
+        scoped(json!(["isolate_everything"]), json!(900)),
+        scoped(json!(["isolate_network"]), json!(0)),
+        scoped(json!(["isolate_network"]), json!(3601)),
+        json!({"keys": [], "key_scopes": {"": {"actions": ["isolate_network"]}}}),
+        json!({"keys": [], "key_scopes": {SOC_KEY_ID: {"actions": ["isolate_network"], "x": 1}}}),
+    ] {
+        assert!(
+            engine_soc(&d, &nft, "b3", 5_000, bad.clone()).is_err(),
+            "accepted {bad}"
+        );
+    }
+}

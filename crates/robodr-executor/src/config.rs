@@ -28,7 +28,8 @@
 //!   },
 //!   "ttl": {"default_s": 900, "max_s": 86400},
 //!   "soc": {"keys": ["/etc/robodr/soc/soc.pub"], "max_clock_skew_s": 30,
-//!           "robot_keys": ["/etc/robodr/keys/blackbox.pub"]},
+//!           "robot_keys": ["/etc/robodr/keys/blackbox.pub"],
+//!           "key_scopes": {"soc:tier1": {"actions": ["quarantine_node"], "max_ttl_s": 900}}},
 //!   "require_approval_for_all_containment": false
 //! }
 //! ```
@@ -160,6 +161,16 @@ pub struct SocSection {
     /// key must not be able to approve containment.
     #[serde(default)]
     pub robot_keys: Vec<PathBuf>,
+    /// What each SOC key (by key id) may approve and revert, and for how
+    /// long (sales-readiness T67, [`crate::soc::check_scope`]): refused
+    /// `key_scope_denied` otherwise. A key without an entry approves every
+    /// action up to `ttl.max_s` unless `require_key_scopes` is set.
+    #[serde(default)]
+    pub key_scopes: std::collections::BTreeMap<String, crate::soc::KeyScope>,
+    /// Every SOC key must have a `key_scopes` entry (a key without one
+    /// approves nothing).
+    #[serde(default)]
+    pub require_key_scopes: bool,
 }
 
 impl Default for SocSection {
@@ -168,6 +179,8 @@ impl Default for SocSection {
             keys: Vec::new(),
             max_clock_skew_s: default_soc_skew_s(),
             robot_keys: Vec::new(),
+            key_scopes: std::collections::BTreeMap::new(),
+            require_key_scopes: false,
         }
     }
 }
@@ -543,6 +556,15 @@ impl ExecutorConfig {
         }
         if !(1..=300).contains(&self.soc.max_clock_skew_s) {
             return Err("soc.max_clock_skew_s must be 1..=300".into());
+        }
+        if self.soc.key_scopes.len() > crate::soc::MAX_SOC_KEYS {
+            return Err(format!(
+                "soc.key_scopes: at most {} keys",
+                crate::soc::MAX_SOC_KEYS
+            ));
+        }
+        for (k, sc) in &self.soc.key_scopes {
+            sc.validate(k, t.max_s)?;
         }
         if let Some(m) = &self.motion {
             m.validate(t.max_s)?;
