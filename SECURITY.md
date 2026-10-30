@@ -103,7 +103,13 @@ attacker cannot rewind (`blackbox.head_anchor`; details in
   dropped answer is an anchor failure on the signed record, never a clean
   open.
 
-Not claimed: confidentiality of marks (no TLS; hashes and seqs only);
+The transport is TLS by default (receiver certificate verified against
+the configured CA and name, optional SPKI pins, optional mutual TLS);
+plain TCP only when both sides are explicitly configured with
+`allow_plaintext`. Not claimed: confidentiality of marks with
+`allow_plaintext` (hashes and seqs only); binding of a TLS client
+certificate to a unit id (marks are bound to units by their signatures);
+certificate revocation (no CRL / OCSP);
 protection of a unit whose configuration (receiver address and public key)
 an attacker rewrote: then only the receiver's side shows it (marks stop
 arriving, or arrive lower). The receiver's own host, state directory and

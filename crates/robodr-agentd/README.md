@@ -755,7 +755,8 @@ request.
   (spool → diode batches) and `robodr-kafka-publish` (spool or diode output
   → Kafka) implement it and are tested against an in-process fake broker
   and real single-node Apache Kafka 3.9.1 / 4.1.0 (`scripts/kafka-it.sh`);
-  not against a production cluster, and without TLS/SASL.
+  not against a production cluster; TLS, mutual TLS and SASL/SCRAM against
+  a real 3.9.1 broker (`scripts/kafka-tls-it.sh`).
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
   (handed over by systemd `LoadCredential=`); root on the unit can read it
   and sign as the unit. The Ed25519 implementation is the audited

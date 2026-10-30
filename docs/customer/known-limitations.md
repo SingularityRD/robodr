@@ -152,7 +152,10 @@
 
 ## Security of RoboDR itself
 
-- **No TLS** on the Kafka exporter or the anchor receiver. The control
+- **TLS on the Kafka exporter and the anchor receiver** (mutual TLS and,
+  for Kafka, SASL/SCRAM) since 2026-10-30; plain TCP only when explicitly
+  allowed. Tested against a local test PKI and a single-node Apache Kafka
+  3.9.1, not a deployed SOC; no CRL / OCSP on these paths. The control
   plane (v2) uses mutual TLS off loopback, but it has only been tested
   against a local test PKI, not a deployed SOC; SOC client certificates
   cannot be revoked other than by removing the CA or pins and restarting.

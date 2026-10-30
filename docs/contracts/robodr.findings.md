@@ -748,8 +748,8 @@ The two hops around the diode are implemented in `crates/robodr-export`
 * **Producer settings actually used** (std-only client; verified against
   single-node Apache Kafka 3.9.1 and 4.1.0 with `scripts/kafka-it.sh`,
   including the §4 partition against the Java client's partitioner):
-  `acks=all`, **idempotence off**, one request in flight, no compression, **no TLS/SASL** (isolated network or local TLS
-  proxy); a per-request deadline covering writes and reads that exceeds the
+  `acks=all`, **idempotence off**, one request in flight, no compression, TLS (required unless plain TCP is
+  explicitly allowed), optional mutual TLS and SASL/SCRAM-SHA-256/512; a per-request deadline covering writes and reads that exceeds the
   broker-side produce timeout; host names resolved with a timeout (IP
   literals recommended). This deviates from §4's `enable.idempotence=true`: delivery is
   at-least-once and consumers must drop duplicates on `event-uid`.

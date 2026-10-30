@@ -511,12 +511,37 @@ partitioner all agreed with the real brokers.
   shrinkage (`NOT_ENOUGH_REPLICAS`) and a multi-broker bootstrap list are
   covered by the fake broker only; Metadata/Produce versions below v8 (brokers
   older than 2.1) were not run against real brokers.
-* **No TLS, no SASL** (pointed at such a listener it fails with an error
-  that says so). Run the publisher on an isolated SOC network
-  segment, or through a local TLS proxy (stunnel/sidecar) per broker. Kafka
-  clients connect to the hosts in the brokers' *advertised listeners*, so
-  with a proxy the advertised listeners seen by this client must point at
-  the local proxy ports (one per broker), otherwise it bypasses the proxy.
+* **TLS, mutual TLS, SASL/SCRAM** (`src/kafka/client.rs`,
+  `src/kafka/sasl.rs`, `robodr_blackbox::tls`). TLS is the default and
+  plain TCP is refused unless `allow_plaintext` / `--allow-plaintext` is
+  set explicitly (TLS and `allow_plaintext` together are refused; SASL
+  needs TLS). rustls + ring as for the uplink; the only trust anchors are
+  `--tls-ca`; every broker certificate, bootstrap **and advertised**, is
+  verified with the host it is dialled at (SNI = the verified name;
+  `--tls-server-name` overrides it for every broker); optional SPKI pins
+  add to the chain check; `--tls-cert` / `--tls-key` give mutual TLS. No
+  fallback: a TLS producer never retries in plain TCP. SASL is
+  SCRAM-SHA-256 / -512 only (SaslHandshake v1, SaslAuthenticate v0–v1,
+  RFC 5802 without SASLprep, as the Java client): iteration count
+  4096..=100000, the server nonce must extend ours, mandatory extensions
+  refused, the server signature is checked in constant time (a TLS-valid
+  broker that does not know the credential cannot complete it), failures
+  are fatal (not retried). A broker session lifetime
+  (`connections.max.reauth.ms`) is honoured by closing the connection at
+  80 % of it and authenticating a new one (KIP-368 in-band
+  re-authentication is not implemented). Not implemented: `PLAIN`,
+  `GSSAPI`, `OAUTHBEARER`, CRL / OCSP, encrypted private keys. Tests:
+  `tests/kafka_tls.rs` (fake cluster with rustls and the broker side of
+  SCRAM; bad CA, wrong host, expired, no `serverAuth`, pin mismatch,
+  missing / foreign client certificate, downgrades both ways, wrong
+  credentials, impostor broker, downgraded iteration count, session
+  renewal, CLI rules), RFC 7677 / RFC 4231 vectors, and
+  `scripts/kafka-tls-it.sh` against a real Apache Kafka 3.9.1 (SSL, SSL with
+  `ssl.client.auth=required`, SASL_SSL SCRAM-SHA-256/512 with
+  `connections.max.reauth.ms`). Behind a local TLS proxy instead
+  (`--allow-plaintext`), the advertised listeners seen by this client must
+  point at the local proxy ports (one per broker), otherwise it bypasses
+  the proxy.
 * **Idempotence off**, contrary to the contract's producer settings (§4,
   `enable.idempotence=true`): delivery is at-least-once. Ordering per
   partition still holds (one request in flight), but a lost response

@@ -167,6 +167,8 @@ if install_bin robodr-kafka-publish usr/bin 0; then
     install -D -m 0644 "$here/etc/kafka-publish.env.example" "$pkg/$ex/kafka-publish.env.example"
     install -D -m 0644 "$here/systemd/robodr-kafka-publish.service.d/50-brokers.conf.example" \
         "$pkg/$ex/robodr-kafka-publish.service.d/50-brokers.conf.example"
+    install -D -m 0644 "$here/systemd/robodr-kafka-publish.service.d/60-tls-credentials.conf.example" \
+        "$pkg/$ex/robodr-kafka-publish.service.d/60-tls-credentials.conf.example"
 fi
 # Ingest API uplink (connected sites; conflicts with both units above).
 if install_bin robodr-uplink usr/bin 0; then
