@@ -38,6 +38,9 @@ robodr-pkg = { path = "../crates/robodr-pkg" }
 robodr-responder = { path = "../crates/robodr-responder" }
 robodr-ros2-pipeline = { path = "../crates/robodr-ros2-pipeline" }
 robodr-rtps = { path = "../crates/robodr-rtps" }
+robodr-seal = { path = "../crates/robodr-seal" }
+# P-256 scalars of the seal_* harness keys (same version as robodr-seal's).
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
 # Test oracle of the diode_fec target (never shipped; see crates/robodr-diode/src/fec.rs).
 reed-solomon = "0.2.1"
 
@@ -253,6 +256,20 @@ bench = false
 [[bin]]
 name = "deliverd_inputs"
 path = "fuzz_targets/deliverd_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seal_policy"
+path = "fuzz_targets/seal_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seal_wrap"
+path = "fuzz_targets/seal_wrap.rs"
 test = false
 doc = false
 bench = false

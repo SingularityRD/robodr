@@ -33,6 +33,8 @@ violated output invariant (documented at the top of its harness file).
 | `pkg_trust` | robodr-pkg | `trust \0 sig \0 next \0 next sig` to `parse_trust` (disjoint roles, expiry bounds, quorum caps, programme scopes and package ownership), `verify_trust_pinned` (pins, site, expiry) and `verify_trust_update` from the harness site (monotonic revocations, serials and floors; unexpired) | same |
 | `pkg_parity` | robodr-pkg | `k`, `m`, an erasure mask and data files to `parity::layout`, `encode_group`, `rebuild_group` (`robodr-diode`'s RS code): erased members come back byte for byte | same |
 | `deliverd_state` | robodr-deliverd | a selector byte + JSON to the agent's configuration (`Config::parse`: strict members, normalised and disjoint paths) and state file (`State::parse`): accepted documents re-serialise to an equal value, `raise_floor` never lowers a floor | `crates/robodr-deliverd/tests/fuzz_smoke.rs` |
+| `seal_policy` | robodr-seal | a selector byte + a signed PCR policy (`policy::parse` / `verify`: canonical, version and PCR rules, approved policy a pure function of the members, verifies only for the harness authority) or a unit enrolment record (`UnitRecord::parse`: usable recipient, round trip) | `crates/robodr-seal/tests/fuzz_smoke.rs` |
+| `seal_wrap` | robodr-seal | a selector byte + a key wrap (`wrap::parse` / `unwrap` with the harness X25519 and P-256 keys: context binding to unit, RPK and purpose; re-wrap round trip) or a sealed chunk (`chunk::open_chunk`: one ciphertext per plaintext and place, refused at any other place or RPK) | same |
 | `deliverd_inputs` | robodr-deliverd | a selector byte + bytes to agentd's `status.json` as the safety-state gate reads it (`safety::judge`: installs allowed only for a fresh, this-boot, live-feed `idle` / `safe_state_active`), the passwd lookup of probe users, recorded safety reports and their replay schedule, and the structural check of delivered Pulsar rule files | same |
 
 `kafka_wire` got its std-only smoke test after the fact (it was added while
@@ -195,6 +197,14 @@ timeout or invariant violation:**
   harness bug at once (its passwd invariant assumed an `x` password
   field; fixed in the harness, the parser was right); see "libFuzzer runs
   (Sprint 13b)" for the coverage-guided runs.
+
+* `seal_*` (Sprint 13c): the default debug smoke run and a 20 s run per
+  target (`ROBODR_FUZZ_SECS=20`: `seal_policy` 11 585 inputs,
+  `seal_wrap` 19 643), no panic, no invariant violation. **Not yet run
+  under libFuzzer:** the coverage-guided build of the fuzz crate needs
+  more disk than the shared sandbox had free (a release ASan build was
+  started and aborted when the disk filled); the seeds are in
+  `fuzz/corpus/seal_*/` for the first campaign.
 
 The deterministic mutator is not coverage-guided: it finds shallow bugs
 cheaply but is no substitute for libFuzzer runs (CI's `fuzz` job runs every

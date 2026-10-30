@@ -29,7 +29,7 @@ pub const PCRS: [u8; 2] = [0, 7];
 /// for its current PCRs installed.
 pub struct Enrolled {
     pub sw: SwTpm,
-    pub dir: PathBuf,
+    pub dir: Tmp,
     pub seal: PathBuf,
     pub authority: PolicyKey,
     pub unit: Unit,

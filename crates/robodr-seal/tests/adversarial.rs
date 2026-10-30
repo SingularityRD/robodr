@@ -28,7 +28,7 @@ fn ctx(unit: &str) -> WrapContext {
 
 struct Fx {
     sw: SwTpm,
-    dir: std::path::PathBuf,
+    dir: Tmp,
     authority: PolicyKey,
     unit: Unit,
 }

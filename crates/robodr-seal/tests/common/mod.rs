@@ -8,12 +8,36 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
-/// A fresh directory under the system temp dir.
-pub fn tmp(name: &str) -> PathBuf {
+/// A fresh directory under the system temp dir, removed on drop (kept
+/// with `ROBODR_KEEP_TMP=1` for inspection).
+pub struct Tmp(PathBuf);
+
+impl std::ops::Deref for Tmp {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Tmp {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        if std::env::var("ROBODR_KEEP_TMP").as_deref() != Ok("1") {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+pub fn tmp(name: &str) -> Tmp {
     let d = std::env::temp_dir().join(format!("robodr-seal-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Tmp(d)
 }
 
 pub fn have(prog: &str) -> bool {
