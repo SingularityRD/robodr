@@ -74,6 +74,15 @@ pub struct ModelInfo {
     pub generation: Generation,
     /// Low-level IDL family (`None`: no low-level interface in the SDK).
     pub idl: Option<IdlFamily>,
+    /// For a model whose SDK ships no low-level type ([`ModelInfo::idl`]
+    /// `None`): the family its low-level command is **inferred** to use
+    /// from the rest of the SDK, never confirmed. A2 / AS2: `Go` (their
+    /// sport state is `unitree_go::msg::dds_::SportModeState_`, their sport
+    /// client uses the Go2 JSON types; `unitree_sdk2` and
+    /// `unitree_sdk2_python` contain no A2 / AS2 low-level example, IDL or
+    /// topic). Consumers that act on it must confirm it on the robot (the
+    /// type its SEDP announces); see [`ModelInfo::lowcmd_idl`].
+    pub inferred_idl: Option<IdlFamily>,
     pub morphology: Morphology,
     /// Motor slots in the low-level message (20 for go / legacy, 35 for hg).
     pub motor_slots: Option<usize>,
@@ -332,6 +341,11 @@ impl UnitreeModel {
                 "unitree_legged_sdk quadruped.h LeggedType::B1, b1_const.h; frame layout only in release v3.3.1 (not available here)",
             ),
         };
+        // A2 / AS2: inferred, see `ModelInfo::inferred_idl`.
+        let inferred_idl = match self {
+            UnitreeModel::A2 | UnitreeModel::As2 => Some(Go),
+            _ => None,
+        };
         let arm_sdk_weight_slot = match self {
             // example/g1/high_level/g1_arm7_sdk_dds_example.cpp (kNotUsedJoint = 29),
             // dds_wrapper/robots/g1/g1_pub.h (motor_cmd()[29].q()).
@@ -354,6 +368,7 @@ impl UnitreeModel {
             name,
             generation,
             idl,
+            inferred_idl,
             morphology,
             motor_slots,
             actuated_motors: actuated,
@@ -365,6 +380,11 @@ impl UnitreeModel {
             api_services: api,
             source,
         }
+    }
+
+    /// Shorthand for `self.info().lowcmd_idl()`.
+    pub fn lowcmd_idl(self) -> Option<IdlFamily> {
+        self.info().lowcmd_idl()
     }
 
     /// The model for a name as in [`ModelInfo::name`] or the enum variant
@@ -381,5 +401,57 @@ impl UnitreeModel {
         Self::ALL
             .into_iter()
             .find(|m| norm(m.info().name) == want || norm(&format!("{m:?}")) == want)
+    }
+}
+
+impl ModelInfo {
+    /// The low-level family to check a configuration against: the SDK's
+    /// ([`ModelInfo::idl`]) or, where the SDK has none, the inferred one
+    /// ([`ModelInfo::inferred_idl`]).
+    pub fn lowcmd_idl(&self) -> Option<IdlFamily> {
+        self.idl.or(self.inferred_idl)
+    }
+
+    /// Motor slots of [`ModelInfo::lowcmd_idl`]'s message (20 / 35).
+    pub fn lowcmd_motor_slots(&self) -> Option<usize> {
+        match self.lowcmd_idl() {
+            Some(IdlFamily::Go) | Some(IdlFamily::LegacyComm) => {
+                Some(crate::unitree::MOTOR_SLOTS_GO)
+            }
+            Some(IdlFamily::Hg) => Some(crate::unitree::MOTOR_SLOTS_HG),
+            None => None,
+        }
+    }
+
+    /// `true` when the low-level family is inferred, not published.
+    pub fn lowcmd_inferred(&self) -> bool {
+        self.idl.is_none() && self.inferred_idl.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a2_and_as2_low_level_is_inferred_go_and_marked_so() {
+        for m in [UnitreeModel::A2, UnitreeModel::As2] {
+            let i = m.info();
+            assert_eq!(i.idl, None, "{m:?}: no published low-level type");
+            assert_eq!(i.inferred_idl, Some(IdlFamily::Go));
+            assert_eq!(i.lowcmd_idl(), Some(IdlFamily::Go));
+            assert_eq!(i.lowcmd_motor_slots(), Some(crate::unitree::MOTOR_SLOTS_GO));
+            assert!(i.lowcmd_inferred());
+            assert_eq!(i.motor_slots, None);
+            assert_eq!(i.actuated_motors, None);
+        }
+        for m in UnitreeModel::ALL {
+            let i = m.info();
+            if !matches!(m, UnitreeModel::A2 | UnitreeModel::As2) {
+                assert_eq!(i.inferred_idl, None, "{m:?}");
+                assert_eq!(i.lowcmd_idl(), i.idl, "{m:?}");
+                assert!(!i.lowcmd_inferred());
+            }
+        }
     }
 }

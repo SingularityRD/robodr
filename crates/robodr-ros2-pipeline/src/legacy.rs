@@ -11,7 +11,7 @@
 //! | frame | event | channel |
 //! |---|---|---|
 //! | `HighCmd` (129 B) | `MotionCommand`: body velocity in mode 2, every mode's class (`Trick` / `Trajectory` / `Unknown` are flagged by `Profile::evaluate`) | [`channels::HIGH_CMD`] |
-//! | `LowCmd` (734 B, declared layout) | `MotionCommand`: joint speed / torque / kp over all 20 slots, plus the position step against the previous frame | [`channels::LOW_CMD`] |
+//! | `LowCmd` (734 B, declared layout, or 614 B, the v3.8.6 compressed form a real client sends: `LegacyLowCmdCompressed`, expanded with exact values) | `MotionCommand`: joint speed / torque / kp over all 20 slots, plus the position step against the previous frame | [`channels::LOW_CMD`] |
 //! | `HighState` (1087 B) | `MotionFeedback`: body velocity, IMU gyro, max joint speed | [`channels::HIGH_STATE`] |
 //! | `LowState` (937 B, declared layout) | `MotionFeedback`: IMU gyro, max joint speed | [`channels::LOW_STATE`] |
 //!
@@ -23,18 +23,17 @@
 //! # Findings
 //!
 //! The sender check runs on the class the payload's **length** announces,
-//! before decoding: a compressed `LowCmd` (614 B, how every real Go1
-//! low-level command is sent) from an unlisted host is a command from an
-//! unknown sender even though its content cannot be inspected.
+//! before decoding: a `LowCmd` of either form from an unlisted host is a
+//! command from an unknown sender whatever its content.
 //!
 //! | When | Rule | Severity |
 //! |---|---|---|
-//! | a command frame (decoded or compressed) from a source IP not in [`LegacyOptions::command_senders`] | [`rules::LEGACY_UNKNOWN_SENDER`] | Critical (anyone on the robot's LAN can drive a Go1 this way; the protocol has no authentication) |
+//! | a command frame (declared or compressed) from a source IP not in [`LegacyOptions::command_senders`] | [`rules::LEGACY_UNKNOWN_SENDER`] | Critical (anyone on the robot's LAN can drive a Go1 this way; the protocol has no authentication) |
 //! | a state frame from a source IP not in [`LegacyOptions::robot_addresses`], or a payload of no legacy length from a host in neither list | [`rules::LEGACY_UNKNOWN_SENDER`] | Medium (spoofed telemetry, a scan) |
 //! | unlisted senders beyond the first [`MAX_REPORTED_UNKNOWN_SENDERS`] of a class (commands; state / unclassified) | [`rules::LEGACY_SENDER_FLOOD`]: one aggregated finding with the frame count when the count reaches 1, 2, 4, 8, ... | Critical (commands) / Medium |
 //! | a command from a listed sender bound to a MAC ([`LegacyOptions::sender_macs`]) whose link-layer source differs, or that was reassembled from IP fragments (cannot be verified) | [`rules::LEGACY_SENDER_MAC_MISMATCH`] (the frame is not attributed) | High |
 //! | a datagram on a legacy port that also parses as RTPS (inspected on both paths, [`crate::Pipeline::process_legacy_from_at`]) | [`rules::LEGACY_PORT_RTPS`] | High |
-//! | a payload on a legacy port that is no decodable frame: the v3.8.6 "compressed" `LowCmd` / `LowState` (614 / 807 B, layout unpublished) or an unknown length | `robot.motion.undecodable_sample` | Medium, rate limited |
+//! | a payload on a legacy port that is no decodable frame: the v3.8.6 "compressed" `LowState` (807 B, not decoded) or an unknown length | `robot.motion.undecodable_sample` | Medium, rate limited |
 //!
 //! Every finding is deduplicated like every other pipeline finding (rule +
 //! detail; the sender address is in the detail, so one finding per sender).
@@ -55,11 +54,12 @@
 //!   source MAC as easily as its IP, and a capture without link-layer
 //!   sources (raw-IP pcap) cannot check it (counted in
 //!   [`LegacyStats::mac_unverified`], not reported).
-//! * Go1 low-level frames in the v3.8.6 compressed wire form are reported
-//!   (sender, "not inspected"), not inspected: neither the profile envelope
-//!   nor a joint firewall sees their content. Decodable (declared-layout)
-//!   `LowCmd` frames carry their 20-slot joint frame
-//!   ([`crate::MotionSample::joint`]).
+//! * The compressed `LowCmd` layout comes from the shipped library's
+//!   machine code (`refineCmd`), not from a header or a capture; its
+//!   `tau` / `Kp` / `Kd` are 16-bit fixed point (1/256, 1/32, 1/16 steps).
+//!   Both `LowCmd` forms carry their 20-slot joint frame
+//!   ([`crate::MotionSample::joint`]). The compressed `LowState` (807 B)
+//!   is reported ("not inspected") only.
 //! * The CRC is advisory and only reported in the black box via the event;
 //!   `encryptCRC` mode is not verifiable ([`robodr_cdr::unitree_legacy::LegacyCrcMode`]).
 //! * Only synthetic frames built from the published `comm.h` layout have
@@ -403,7 +403,7 @@ pub(crate) fn process(
             // Value-free except the sender (dedup key is rule + detail).
             let what = match e {
                 LegacyFrameError::Compressed { kind, .. } => {
-                    format!("legacy {kind:?} in the unpublished compressed wire form")
+                    format!("legacy {kind:?} in the compressed wire form, which is not decoded")
                 }
                 LegacyFrameError::UnknownLength { .. } => {
                     "a UDP payload whose length matches no legacy frame".to_string()

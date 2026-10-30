@@ -305,7 +305,9 @@ struct Channel {
 impl Channel {
     fn lowcmd_codec(&self) -> Option<LowCmdCodec> {
         match self.codec {
-            Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk => Some(LowCmdCodec::Go),
+            Codec::UnitreeGoLowcmd | Codec::UnitreeA2Lowcmd | Codec::UnitreeGoArmSdk => {
+                Some(LowCmdCodec::Go)
+            }
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => Some(LowCmdCodec::Hg),
             _ => None,
         }
@@ -491,6 +493,32 @@ impl Gateway {
                         return Err(format!(
                             "{at}: weight_slot {w} must be a disabled motor of the firewall \
                              channel (it is the arm-SDK blend weight, not a motor)"
+                        ));
+                    }
+                }
+                if c.codec == Codec::UnitreeA2Lowcmd {
+                    // A2 / AS2: the low-level type is inferred, not
+                    // published (Codec::UnitreeA2Lowcmd); no shortcut that
+                    // would let an unverified frame through.
+                    if !spec.require_crc {
+                        return Err(format!(
+                            "{at}: codec unitree_a2_lowcmd needs require_crc: true on the \
+                             firewall channel (the A2 / AS2 low-level type is inferred; only a \
+                             frame whose CRC verifies is a command)"
+                        ));
+                    }
+                    if cfg.queue.on_gateway_down == OnGatewayDown::Bypass {
+                        return Err(format!(
+                            "{at}: queue.on_gateway_down bypass is refused for unitree_a2_lowcmd: \
+                             the A2 / AS2 behaviour on a lost or unchecked low-level stream is \
+                             not published"
+                        ));
+                    }
+                    if !profile.motion_types.contains_key(&c.firewall_channel) {
+                        return Err(format!(
+                            "{at}: codec unitree_a2_lowcmd needs the profile to record the \
+                             channel's type (learned from the robot's SEDP): the A2 / AS2 \
+                             low-level type is inferred, so it must be confirmed on the robot"
                         ));
                     }
                 }
@@ -946,6 +974,7 @@ impl Gateway {
         let matches = |c: &Channel| -> Option<u8> {
             match c.codec {
                 Codec::UnitreeGoLowcmd
+                | Codec::UnitreeA2Lowcmd
                 | Codec::UnitreeHgLowcmd
                 | Codec::UnitreeGoArmSdk
                 | Codec::UnitreeHgArmSdk => {
@@ -1000,7 +1029,7 @@ impl Gateway {
                     .traj
                     .as_ref()
                     .and_then(|(_, layout)| trajectory::plausible(slot, *layout).then_some(4)),
-                Codec::Go1HighCmd | Codec::Go1LowCmd => None,
+                Codec::Go1HighCmd | Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => None,
             }
         };
         let found = self
@@ -1302,6 +1331,7 @@ impl Gateway {
         match self.channels.get(ci).map(|c| c.codec) {
             Some(
                 Codec::UnitreeGoLowcmd
+                | Codec::UnitreeA2Lowcmd
                 | Codec::UnitreeHgLowcmd
                 | Codec::UnitreeGoArmSdk
                 | Codec::UnitreeHgArmSdk,
@@ -1320,7 +1350,9 @@ impl Gateway {
             Some(Codec::Ros2JointTrajectory | Codec::Ros2FollowJointTrajectoryGoal) => {
                 self.trajectory_sample(ci, slot, source, now, late)
             }
-            Some(Codec::Go1HighCmd | Codec::Go1LowCmd) | None => Outcome::Suppress,
+            Some(Codec::Go1HighCmd | Codec::Go1LowCmd | Codec::Go1LowCmdCompressed) | None => {
+                Outcome::Suppress
+            }
         }
     }
 
@@ -2291,7 +2323,10 @@ impl Gateway {
         }
         let o = match ch.codec {
             Codec::Go1HighCmd => self.legacy_high(ci, frame, source, meta.now_ns, late),
-            Codec::Go1LowCmd => self.legacy_low(ci, frame, source, meta.now_ns, late),
+            Codec::Go1LowCmd => self.legacy_low(ci, frame, source, meta.now_ns, late, false),
+            Codec::Go1LowCmdCompressed => {
+                self.legacy_low(ci, frame, source, meta.now_ns, late, true)
+            }
             _ => Outcome::Suppress,
         };
         self.count(o);
@@ -2311,7 +2346,7 @@ impl Gateway {
         };
         let id = ch.id;
         let allow = ch.allowed_modes.clone();
-        let decoded = legacy::decode_high(frame).filter(|h| h.crc_ok);
+        let decoded = legacy::decode_high(frame).filter(|h| h.crc_ok && h.bms_ok);
         let Some(h) = decoded else {
             self.stats.undecidable += 1;
             let v = self.twist_check(id, source, now, twist(f64::NAN, f64::NAN, f64::NAN), false);
@@ -2398,6 +2433,9 @@ impl Gateway {
         }
     }
 
+    /// A legacy `LowCmd` in the declared (`compressed == false`, 734
+    /// octets) or the compressed (614 octets) form; the same decision, the
+    /// rewrite and the substitute's base in the channel's own form.
     fn legacy_low(
         &mut self,
         ci: usize,
@@ -2405,12 +2443,24 @@ impl Gateway {
         source: SourceId,
         now: u64,
         late: bool,
+        compressed: bool,
     ) -> Outcome {
         let Some(ch) = self.channels.get(ci) else {
             return Outcome::Suppress;
         };
         let id = ch.id;
-        let decoded = legacy::decode_low(frame);
+        let write = |frame: &mut [u8], out: &JointFrame, how: legacy::LowSource<'_>| {
+            if compressed {
+                legacy::write_low_compressed(frame, out, how)
+            } else {
+                legacy::write_low(frame, out, how)
+            }
+        };
+        let decoded = if compressed {
+            legacy::decode_low_compressed(frame)
+        } else {
+            legacy::decode_low(frame)
+        };
         let jf = match decoded {
             Some(f) => f,
             None => {
@@ -2445,7 +2495,7 @@ impl Gateway {
                     self.stats.rewrite_failed += 1;
                     return Outcome::Suppress;
                 }
-                match legacy::write_low(frame, &cmd.frame, legacy::LowSource::Limited) {
+                match write(frame, &cmd.frame, legacy::LowSource::Limited) {
                     Ok(()) => {
                         ch.last_legacy = Some(LegacyLast {
                             frame: Some(cmd.frame),
@@ -2468,7 +2518,11 @@ impl Gateway {
                 let base = last
                     .as_ref()
                     .map(|l| l.bytes.clone())
-                    .unwrap_or_else(legacy::low_template);
+                    .unwrap_or_else(if compressed {
+                        legacy::lowc_template
+                    } else {
+                        legacy::low_template
+                    });
                 if base.len() != frame.len() {
                     self.stats.rewrite_failed += 1;
                     return Outcome::Suppress;
@@ -2477,7 +2531,7 @@ impl Gateway {
                 let held = last
                     .as_ref()
                     .and_then(|l| Some((l.frame.as_ref()?, l.bytes.as_slice())));
-                match legacy::write_low(
+                match write(
                     frame,
                     &sub.cmd.frame,
                     legacy::LowSource::Substitute { held },

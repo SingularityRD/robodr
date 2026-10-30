@@ -214,6 +214,20 @@ pub enum Codec {
     Go1HighCmd,
     /// Legacy UDP uncompressed `LowCmd` (734 octets).
     Go1LowCmd,
+    /// Legacy UDP compressed `LowCmd` (614 octets, `LOW_CMD_LENGTH` of
+    /// `unitree_legged_sdk` v3.8.6: what a real Go1 client sends; layout
+    /// from the library's `refineCmd`, `robodr_cdr::unitree_legacy`).
+    Go1LowCmdCompressed,
+    /// RTPS DATA on an A2 / AS2 `rt/lowcmd`: **inferred** to be
+    /// `unitree_go::msg::dds_::LowCmd_` (20 slots, CRC over the body). The
+    /// SDK ships no A2 / AS2 low-level type or example; their sport state
+    /// is `unitree_go::msg::dds_::SportModeState_`. Decoded exactly as
+    /// `unitree_go_lowcmd`, with stricter rules: the firewall channel must
+    /// have `require_crc`, `allow_battery_off` and
+    /// `queue.on_gateway_down: bypass` are refused, and the profile must
+    /// record the channel's type (learned from the robot's own SEDP), so a
+    /// robot announcing another type never starts in enforce mode.
+    UnitreeA2Lowcmd,
     /// RTPS DATA, `unitree_api::msg::dds_::Request_` of a humanoid's
     /// locomotion client (`robot_model` g1 / h2 / r1: service `sport`,
     /// topic `rt/api/sport/request`, ids 7xxx; h1: service `loco`, topic
@@ -288,7 +302,10 @@ impl LocoModel {
 
 impl Codec {
     pub fn is_rtps(self) -> bool {
-        !matches!(self, Codec::Go1HighCmd | Codec::Go1LowCmd)
+        !matches!(
+            self,
+            Codec::Go1HighCmd | Codec::Go1LowCmd | Codec::Go1LowCmdCompressed
+        )
     }
 
     /// `true` for joint-frame channels (checked with `check_joint`).
@@ -296,8 +313,10 @@ impl Codec {
         matches!(
             self,
             Codec::UnitreeGoLowcmd
+                | Codec::UnitreeA2Lowcmd
                 | Codec::UnitreeHgLowcmd
                 | Codec::Go1LowCmd
+                | Codec::Go1LowCmdCompressed
                 | Codec::UnitreeHgArmSdk
                 | Codec::UnitreeGoArmSdk
                 | Codec::UnitreeDex3HandCmd
@@ -333,7 +352,11 @@ impl Codec {
     /// channel's count).
     pub fn slots(self) -> Option<usize> {
         match self {
-            Codec::UnitreeGoLowcmd | Codec::Go1LowCmd | Codec::UnitreeGoArmSdk => Some(20),
+            Codec::UnitreeGoLowcmd
+            | Codec::UnitreeA2Lowcmd
+            | Codec::Go1LowCmd
+            | Codec::Go1LowCmdCompressed
+            | Codec::UnitreeGoArmSdk => Some(20),
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => Some(35),
             _ => None,
         }
@@ -341,7 +364,9 @@ impl Codec {
 
     pub fn default_topic(self) -> Option<&'static str> {
         match self {
-            Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd => Some("rt/lowcmd"),
+            Codec::UnitreeGoLowcmd | Codec::UnitreeHgLowcmd | Codec::UnitreeA2Lowcmd => {
+                Some("rt/lowcmd")
+            }
             Codec::UnitreeSportRequest => Some("rt/api/sport/request"),
             Codec::UnitreeHgArmSdk | Codec::UnitreeGoArmSdk => Some("rt/arm_sdk"),
             Codec::UnitreeHandSdk => Some("rt/hand_sdk"),
@@ -355,7 +380,7 @@ impl Codec {
     pub fn default_ports(self) -> &'static [u16] {
         match self {
             Codec::Go1HighCmd => &[8082],
-            Codec::Go1LowCmd => &[8007],
+            Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => &[8007],
             _ => &[],
         }
     }
@@ -367,6 +392,8 @@ impl Codec {
             Codec::UnitreeSportRequest => "unitree_sport_request",
             Codec::Go1HighCmd => "go1_high_cmd",
             Codec::Go1LowCmd => "go1_low_cmd",
+            Codec::Go1LowCmdCompressed => "go1_low_cmd_compressed",
+            Codec::UnitreeA2Lowcmd => "unitree_a2_lowcmd",
             Codec::UnitreeLocoRequest => "unitree_loco_request",
             Codec::UnitreeHgArmSdk => "unitree_hg_arm_sdk",
             Codec::UnitreeGoArmSdk => "unitree_go_arm_sdk",
@@ -383,7 +410,9 @@ impl Codec {
     /// The DDS type name the codec decodes.
     pub fn dds_type_name(self) -> &'static str {
         match self {
-            Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk => "unitree_go::msg::dds_::LowCmd_",
+            Codec::UnitreeGoLowcmd | Codec::UnitreeGoArmSdk | Codec::UnitreeA2Lowcmd => {
+                "unitree_go::msg::dds_::LowCmd_"
+            }
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => "unitree_hg::msg::dds_::LowCmd_",
             Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest | Codec::UnitreeArmRequest => {
                 "unitree_api::msg::dds_::Request_"
@@ -393,7 +422,7 @@ impl Codec {
             Codec::Ros2Twist => "geometry_msgs::msg::dds_::Twist_",
             Codec::Ros2TwistStamped => "geometry_msgs::msg::dds_::TwistStamped_",
             Codec::Go1HighCmd => "unitree_legged_sdk::HighCmd",
-            Codec::Go1LowCmd => "unitree_legged_sdk::LowCmd",
+            Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => "unitree_legged_sdk::LowCmd",
             Codec::Ros2JointTrajectory => "trajectory_msgs::msg::dds_::JointTrajectory_",
             Codec::Ros2FollowJointTrajectoryGoal => {
                 "control_msgs::action::dds_::FollowJointTrajectory_SendGoal_Request_"

@@ -70,9 +70,83 @@ pub fn toward_zero(o: f64) -> Option<f32> {
     Some(r)
 }
 
+/// `o` as a signed 16-bit fixed-point value of `scale` (the Go1 compressed
+/// `LowCmd`'s `tau` / `Kp` / `Kd`: `value = q / scale`), on the side of `o`
+/// away from `i` when `o` is not representable (same rule as
+/// [`away_from`]). `None` if the result is outside `i16` (the SDK would
+/// wrap it) or `o` is not finite.
+pub fn fixed_away_from(o: f64, i: f64, scale: f64) -> Option<i16> {
+    if !o.is_finite() || !i.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let x = o * scale;
+    let r = if x == x.trunc() {
+        x
+    } else if i > o {
+        x.floor()
+    } else if i < o {
+        x.ceil()
+    } else {
+        x.trunc()
+    };
+    fixed_i16(r)
+}
+
+/// `o` as a fixed-point `i16` of `scale` whose magnitude does not exceed
+/// `|o|` (substitute fields; see [`toward_zero`]).
+pub fn fixed_toward_zero(o: f64, scale: f64) -> Option<i16> {
+    if !o.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    fixed_i16((o * scale).trunc())
+}
+
+fn fixed_i16(r: f64) -> Option<i16> {
+    if r.is_finite() && r >= f64::from(i16::MIN) && r <= f64::from(i16::MAX) {
+        // Integral and in range: the conversion is exact.
+        Some(r as i16)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_point_never_crosses_the_bound() {
+        // tau_max 23.7 from 40: 23.7 * 256 = 6067.2 -> 6067 (below).
+        let q = fixed_away_from(23.7, 40.0, 256.0).unwrap();
+        assert!(f64::from(q) / 256.0 <= 23.7);
+        // -23.7 from -40: toward zero.
+        let q = fixed_away_from(-23.7, -40.0, 256.0).unwrap();
+        assert!(f64::from(q) / 256.0 >= -23.7);
+        // kp_min 2.01 from 0: rounds up.
+        let q = fixed_away_from(2.01, 0.0, 32.0).unwrap();
+        assert!(f64::from(q) / 32.0 >= 2.01);
+        assert_eq!(fixed_away_from(1.5, 9.0, 16.0), Some(24));
+        assert_eq!(fixed_toward_zero(-0.99, 16.0), Some(-15));
+        assert_eq!(fixed_toward_zero(3000.0, 16.0), None);
+        assert_eq!(fixed_away_from(f64::NAN, 0.0, 16.0), None);
+        assert_eq!(fixed_away_from(1.0, f64::NAN, 16.0), None);
+        assert_eq!(fixed_away_from(128.0, 200.0, 256.0), None);
+        assert_eq!(fixed_away_from(-128.0, -200.0, 256.0), Some(i16::MIN));
+        let mut x = 0.271_828_f64;
+        for _ in 0..10_000 {
+            x = (x * 1.618_033_988 + 0.37).fract() * 200.0 - 100.0;
+            let i = x * 1.5 + 1.0;
+            let q = f64::from(fixed_away_from(x, i, 32.0).unwrap()) / 32.0;
+            if i > x {
+                assert!(q <= x);
+            } else if i < x {
+                assert!(q >= x);
+            }
+            assert!((q - x).abs() < 1.0 / 32.0);
+            let z = f64::from(fixed_toward_zero(x, 32.0).unwrap()) / 32.0;
+            assert!(z.abs() <= x.abs());
+        }
+    }
 
     #[test]
     fn rounding_never_crosses_the_bound() {

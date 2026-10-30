@@ -263,3 +263,10 @@ path = "fuzz_targets/deliverd_inputs.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "go1_compressed_lowcmd"
+path = "fuzz_targets/go1_compressed_lowcmd.rs"
+test = false
+doc = false
+bench = false
