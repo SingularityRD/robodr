@@ -87,8 +87,14 @@ OOMScoreAdjust=-500
 # CAP_BPF/CAP_PERFMON: use the drop-in example), CAP_DAC_OVERRIDE, CAP_FOWNER,
 # CAP_SETUID/SETGID, CAP_SYS_MODULE, CAP_NET_ADMIN, CAP_KILL, CAP_SYS_BOOT.
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_IPC_LOCK CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_MAC_ADMIN
-# Root already has these in its effective set; listing them as ambient is
-# not needed and is omitted on purpose.
+# The same set as ambient capabilities: with SecureBits=noroot-locked (below)
+# a uid-0 execve gets NO capabilities from the bounding set (root is not
+# special any more), only what is ambient. Without this line the daemon
+# would run with an empty permitted / effective set and bpf() /
+# perf_event_open() would fail. Shown with setpriv (CapEff 0 without the
+# ambient set, = the bounding set with it); not yet run on a BTF kernel.
+# scripts/check-packages.py keeps AmbientCapabilities= = this set.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_IPC_LOCK CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_MAC_ADMIN
 # NoNewPrivileges only blocks gaining privileges through execve()
 # (setuid/file caps). It does not affect bpf() or perf_event_open(), and
 # Pulsar never execs, so it is compatible with eBPF.

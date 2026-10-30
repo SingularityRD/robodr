@@ -11,5 +11,8 @@
 #     requires CAP_SYS_ADMIN for a program type Pulsar loads.
 # CAP_SYS_ADMIN is close to full root; record the reason in the robot's
 # commissioning file when you enable this.
+# Bounding AND ambient: the unit sets SecureBits=noroot-locked, so a
+# capability reaches the daemon only through the ambient set.
 [Service]
 CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN

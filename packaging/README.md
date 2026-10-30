@@ -80,6 +80,13 @@ patching Pulsar. The unit confines that root process instead:
   `CAP_SYS_ADMIN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_SETUID` or
   `CAP_SYS_MODULE`. Without `CAP_DAC_OVERRIDE` this root process cannot write
   files it does not own.
+- `AmbientCapabilities=` is the same list. The unit sets
+  `SecureBits=noroot-locked`, under which a uid-0 `execve()` gets no
+  capabilities from the bounding set, only the ambient ones: without the
+  ambient list the daemon would start with an empty effective set and
+  `bpf()` would fail with `EPERM` (shown with `setpriv`; fixed
+  2026-10-30, `scripts/check-packages.py` keeps the two lists equal for
+  every `noroot` unit and drop-in). Not yet run on a BTF kernel.
 - `NoNewPrivileges=yes`. It only affects `execve()` of setuid or file-cap
   binaries, so it does not affect `bpf()` or `perf_event_open()`, and Pulsar
   never execs.

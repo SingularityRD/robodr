@@ -19,6 +19,12 @@ Static checks (no package needed; CI job `scripts`):
      service except robodr-firewall-gw-rules.service, which is never
      stopped on purpose (its ruleset keeps a fail-closed bridge closed).
 
+  5a. Every unit (regular and focal) and every unit with each of its
+     drop-in examples applied: with SecureBits=noroot / noroot-locked, a
+     process of uid 0 gets capabilities on execve only through the ambient
+     set, so AmbientCapabilities= must hold every capability of
+     CapabilityBoundingSet= (else e.g. robodr-pulsard runs without CAP_BPF).
+
 Package checks (`--deb FILE ... --rpm FILE ...`; CI jobs `package-*`):
 
   5. Per package: every entry root:root, nothing setuid/setgid or
@@ -301,12 +307,61 @@ def check_scripts(root: Path) -> list[str]:
     return errs
 
 
+def unit_settings(texts: list[str]) -> dict[str, list[str]]:
+    """SecureBits= / CapabilityBoundingSet= / AmbientCapabilities= of a unit
+    and its drop-ins, applied in order (an empty assignment resets, a
+    leading "~" inverts: treated as "not a plain list", reported)."""
+    out: dict[str, list[str]] = {"SecureBits": [], "CapabilityBoundingSet": [], "AmbientCapabilities": []}
+    for text in texts:
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            k, v = (x.strip() for x in line.split("=", 1))
+            if k in out:
+                if not v:
+                    out[k] = []
+                else:
+                    out[k] += v.split()
+    return out
+
+
+def check_noroot_caps(name: str, texts: list[str]) -> list[str]:
+    st = unit_settings(texts)
+    if not any(b.startswith("noroot") for b in st["SecureBits"]):
+        return []
+    bnd, amb = st["CapabilityBoundingSet"], st["AmbientCapabilities"]
+    if any(c.startswith("~") for c in bnd + amb):
+        return [f"{name}: SecureBits=noroot with an inverted (~) capability list: cannot check"]
+    missing = sorted(set(bnd) - set(amb))
+    if missing:
+        return [
+            f"{name}: SecureBits=noroot* but AmbientCapabilities= lacks {' '.join(missing)} "
+            "(a uid-0 execve gets no capabilities from its bounding set under noroot)"
+        ]
+    return []
+
+
+def check_units_caps(root: Path) -> list[str]:
+    errs = []
+    sysd = root / "packaging" / "systemd"
+    for d in (sysd, sysd / "focal"):
+        for unit in sorted(d.glob("*.service")):
+            base = unit.read_text()
+            rel = unit.relative_to(sysd)
+            errs += check_noroot_caps(str(rel), [base])
+            for drop in sorted((d / f"{unit.name}.d").glob("*")):
+                errs += check_noroot_caps(f"{rel} + {drop.name}", [base, drop.read_text()])
+    return errs
+
+
 def static_checks(root: Path) -> list[str]:
     return (
         check_classified(workspace_programs(root))
         + check_workflows(root)
         + check_build_deb(root)
         + check_scripts(root)
+        + check_units_caps(root)
     )
 
 
@@ -558,7 +613,13 @@ def self_test() -> int:
     expect("program content may differ", compare("c", base, prog_changed, [], [], is_program), True)
     owned = rpm_owned({"/usr": ent("d"), "/usr/share/doc/robodr": ent("d"), "/usr/bin/x": ent()})
     expect("rpm_owned", [] if set(owned) == {"/usr/share/doc/robodr", "/usr/bin/x"} else [str(owned)], True)
-    total = 23
+    nr = "[Service]\nCapabilityBoundingSet=CAP_BPF CAP_PERFMON\nSecureBits=noroot-locked\n"
+    expect("noroot without ambient", check_noroot_caps("u", [nr]), False)
+    expect("noroot with ambient", check_noroot_caps("u", [nr + "AmbientCapabilities=CAP_BPF CAP_PERFMON\n"]), True)
+    expect("drop-in widens bounding only", check_noroot_caps(
+        "u", [nr + "AmbientCapabilities=CAP_BPF CAP_PERFMON\n", "[Service]\nCapabilityBoundingSet=CAP_SYS_ADMIN\n"]), False)
+    expect("no noroot: not required", check_noroot_caps("u", ["[Service]\nCapabilityBoundingSet=CAP_BPF\n"]), True)
+    total = 27
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
