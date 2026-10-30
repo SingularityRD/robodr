@@ -73,6 +73,8 @@ enum Class {
     Undecidable,
     /// A writer known as not enforced sent this channel's motion command.
     Suspicious(usize),
+    /// An unknown writer's api request two services read differently.
+    Ambiguous(usize),
 }
 
 /// What happened to one decided sample.
@@ -341,8 +343,17 @@ impl Channel {
 
     /// The api service and model a request channel decodes for.
     fn api(&self) -> (ApiService, Option<robodr_cdr::unitree::UnitreeModel>) {
-        if self.codec == Codec::UnitreeArmRequest {
-            return (ApiService::Arm, self.robot_model.map(LocoModel::unitree));
+        use robodr_cdr::unitree::UnitreeModel as M;
+        match self.codec {
+            Codec::UnitreeArmRequest => {
+                return (ApiService::Arm, self.robot_model.map(LocoModel::unitree));
+            }
+            // Go2 only (`robodr_cdr`'s tables: obstacles_avoid on Go2 / Go2-W).
+            Codec::UnitreeObstaclesAvoidRequest => {
+                return (ApiService::ObstaclesAvoid, Some(M::Go2));
+            }
+            Codec::UnitreeUwbSwitchRequest => return (ApiService::UwbSwitch, Some(M::Go2)),
+            _ => {}
         }
         match self.robot_model {
             Some(LocoModel::H1) => (ApiService::Loco, Some(LocoModel::H1.unitree())),
@@ -1117,8 +1128,8 @@ impl Gateway {
                         w.unverified
                     }
                 }) {
-                    Some(ci) => Class::Suspicious(ci),
-                    None => Class::Pass,
+                    Ok(Some(ci)) | Err(ci) => Class::Suspicious(ci),
+                    Ok(None) => Class::Pass,
                 },
             };
         }
@@ -1129,8 +1140,9 @@ impl Gateway {
             return Class::Undecidable;
         }
         match self.probe(d, s) {
-            Some(ci) => Class::Channel(ci),
-            None => Class::Pass,
+            Ok(Some(ci)) => Class::Channel(ci),
+            Ok(None) => Class::Pass,
+            Err(ci) => Class::Ambiguous(ci),
         }
     }
 
@@ -1140,8 +1152,10 @@ impl Gateway {
     /// from the length too); the sample is then decided **strictly** on
     /// that channel, so a non-canonical encoding fails closed instead of
     /// being classified as nothing and passed.
-    fn probe(&mut self, d: &[u8], s: &Sample) -> Option<usize> {
-        let found = self.probe_match(d, s, |_| true)?;
+    fn probe(&mut self, d: &[u8], s: &Sample) -> Result<Option<usize>, usize> {
+        let Some(found) = self.probe_match(d, s, |_| true)? else {
+            return Ok(None);
+        };
         self.stats.probed += 1;
         self.discovery.insert(
             s.writer,
@@ -1151,13 +1165,25 @@ impl Gateway {
                 ..WriterInfo::default()
             },
         );
-        Some(found)
+        Ok(Some(found))
     }
 
     /// The channel `s`'s payload matches by content (see [`Self::probe`]),
-    /// among the channels whose codec `consider` accepts.
-    fn probe_match(&self, d: &[u8], s: &Sample, consider: impl Fn(Codec) -> bool) -> Option<usize> {
-        let slot = d.get(s.payload.clone()?)?;
+    /// among the channels whose codec `consider` accepts. `Err(ci)`: an api
+    /// request that two services' channels read with the same priority
+    /// (sport and obstacles_avoid share ids 1001..=1004, and their meaning
+    /// differs: obstacles_avoid 1003 is `Move`, sport 1003 `StopMove`).
+    /// Without the writer's SEDP topic the service is not known: the caller
+    /// fails closed (gateway review, finding 3).
+    fn probe_match(
+        &self,
+        d: &[u8],
+        s: &Sample,
+        consider: impl Fn(Codec) -> bool,
+    ) -> Result<Option<usize>, usize> {
+        let Some(slot) = s.payload.clone().and_then(|r| d.get(r)) else {
+            return Ok(None);
+        };
         // Each channel's content match and its priority (lower first): a
         // payload two channels could read goes to the stricter one
         // (`rt/lowcmd` before `rt/arm_sdk`; the motor board ignores a
@@ -1182,10 +1208,14 @@ impl Gateway {
                 // id does not fit i32 (aliasing): decided (and then refused)
                 // as sport rather than passed unchecked. Loco: the humanoid
                 // locomotion ids (7001..=7199 on service `sport`, 8001..=8299
-                // on H1's `loco`).
+                // on H1's `loco`). Go2 obstacles_avoid 1001..=1004, uwbswitch
+                // 1001..=1003: the same ids as sport calls, so a request two
+                // services could read is ambiguous (`probe_match`).
                 Codec::UnitreeSportRequest
                 | Codec::UnitreeLocoRequest
-                | Codec::UnitreeArmRequest => {
+                | Codec::UnitreeArmRequest
+                | Codec::UnitreeObstaclesAvoidRequest
+                | Codec::UnitreeUwbSwitchRequest => {
                     match decode_unitree(UnitreeKind::ApiRequest, slot, &Limits::default()) {
                         Ok(m) => match m.message {
                             UnitreeMessage::ApiRequest(r) => {
@@ -1194,6 +1224,12 @@ impl Gateway {
                                     || match c.codec {
                                         Codec::UnitreeSportRequest => (1001..=1199).contains(&id),
                                         Codec::UnitreeArmRequest => (7106..=7113).contains(&id),
+                                        Codec::UnitreeObstaclesAvoidRequest => {
+                                            (1001..=1004).contains(&id)
+                                        }
+                                        Codec::UnitreeUwbSwitchRequest => {
+                                            (1001..=1003).contains(&id)
+                                        }
                                         _ => {
                                             (7001..=7199).contains(&id)
                                                 || (8001..=8299).contains(&id)
@@ -1225,13 +1261,33 @@ impl Gateway {
                 Codec::Go1HighCmd | Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => None,
             }
         };
-        self.channels
+        let mut hits = self
+            .channels
             .iter()
             .enumerate()
             .filter(|(_, c)| consider(c.codec))
-            .filter_map(|(i, c)| matches(c).map(|p| (p, i)))
-            .min()
-            .map(|(_, i)| i)
+            .filter_map(|(i, c)| matches(c).map(|p| (p, i, c.codec)));
+        let Some(mut best) = hits.next() else {
+            return Ok(None);
+        };
+        let mut ambiguous = false;
+        for h in hits {
+            if h.0 < best.0 {
+                best = h;
+                ambiguous = false;
+            } else if h.0 == best.0
+                && h.2 != best.2
+                && h.2.is_api_request()
+                && best.2.is_api_request()
+            {
+                ambiguous = true;
+            }
+        }
+        if ambiguous {
+            Err(best.1)
+        } else {
+            Ok(Some(best.1))
+        }
     }
 
     /// `(claimed, source)`: what the writer GUID resolves to in the policy,
@@ -1304,6 +1360,15 @@ impl Gateway {
                         hex(&writer)
                     )),
                     ..Detail::reason("unenforced_writer_motion_payload")
+                });
+                return Outcome::Suppress;
+            }
+            Class::Ambiguous(ci) => {
+                self.stats.unknown_undecidable += 1;
+                self.stats.suppressed += 1;
+                self.note(gw_rules::FRAGMENTED_COMMAND, Some(ci), || Detail {
+                    what: Some("unknown writer".into()),
+                    ..Detail::reason("ambiguous_api_request")
                 });
                 return Outcome::Suppress;
             }
@@ -1545,9 +1610,11 @@ impl Gateway {
                 | Codec::UnitreeGoArmSdk
                 | Codec::UnitreeHgArmSdk,
             ) => self.lowcmd_sample(ci, slot, source, now, late, emit),
-            Some(Codec::UnitreeSportRequest) => {
-                self.sport_sample(ci, slot, source, now, late, emit)
-            }
+            Some(
+                Codec::UnitreeSportRequest
+                | Codec::UnitreeObstaclesAvoidRequest
+                | Codec::UnitreeUwbSwitchRequest,
+            ) => self.sport_sample(ci, slot, source, now, late, emit),
             Some(Codec::UnitreeLocoRequest) => self.loco_sample(ci, slot, source, now, late, emit),
             Some(Codec::UnitreeArmRequest) => self.arm_request_sample(ci, slot, source, now),
             Some(Codec::Ros2Twist | Codec::Ros2TwistStamped) => {
@@ -1900,7 +1967,14 @@ impl Gateway {
         };
         let id = ch.id;
         let allow = ch.allowed_api_ids.clone();
-        let req = match sport::decode_strict(slot, None) {
+        // The service from the channel (its SEDP topic), never assumed to be
+        // sport: obstacles_avoid 1003 is a `Move`, sport 1003 `StopMove`.
+        let (service, model) = match ch.codec {
+            Codec::UnitreeSportRequest => (ApiService::Sport, None),
+            _ => ch.api(),
+        };
+        let strict_default = ch.codec != Codec::UnitreeSportRequest;
+        let req = match sport::decode_strict_for(slot, service, model) {
             Ok(r) => r,
             Err(_) => {
                 self.stats.undecidable += 1;
@@ -1951,7 +2025,16 @@ impl Gateway {
                 }
                 // Not a velocity call: allowlist, then the source / rate
                 // check only (the twist state is not touched, F10 b).
-                if allow.as_ref().is_some_and(|a| !a.contains(&req.api_id)) {
+                // obstacles_avoid / uwbswitch: without an allowlist only
+                // queries pass (their other calls are a position target, a
+                // UWB follow mode or a control handover).
+                let listed = match &allow {
+                    Some(a) => a.contains(&req.api_id),
+                    None => {
+                        !strict_default || req.call.class() == robodr_cdr::unitree::ApiClass::Query
+                    }
+                };
+                if !listed {
                     self.stats.not_allowlisted += 1;
                     return Outcome::Suppress;
                 }
@@ -1965,7 +2048,9 @@ impl Gateway {
         match self.twist_check(id, source, now, motion, late) {
             FwVerdict::Passed { .. } => Outcome::Pass,
             FwVerdict::Limited { cmd, .. } => {
-                match twist_values(&cmd).map(|v| sport::write_move(slot, &req, v, None)) {
+                match twist_values(&cmd)
+                    .map(|v| sport::write_move_for(slot, &req, v, service, model))
+                {
                     Some(Ok(())) => {
                         self.stats.limited += 1;
                         Outcome::Rewritten
@@ -1983,7 +2068,9 @@ impl Gateway {
             FwVerdict::Rejected {
                 substitute: Some(sub),
                 ..
-            } => match twist_values(&sub.cmd).map(|v| sport::write_move(slot, &req, v, None)) {
+            } => match twist_values(&sub.cmd)
+                .map(|v| sport::write_move_for(slot, &req, v, service, model))
+            {
                 Some(Ok(())) => {
                     self.stats.substituted += 1;
                     Outcome::Rewritten

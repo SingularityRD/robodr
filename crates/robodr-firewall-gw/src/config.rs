@@ -266,6 +266,20 @@ pub enum Codec {
     /// a `joint_trajectory_controller`): checked against `trajectory`
     /// (`crate::trajectory`), passed, time-scaled in place or suppressed.
     Ros2JointTrajectory,
+    /// RTPS DATA, `unitree_api::msg::dds_::Request_` of the Go2
+    /// `obstacles_avoid` service (`rt/api/obstacles_avoid/request`,
+    /// `obstacles_avoid_api.hpp`): `Move` 1003 with `mode` 0 is a body
+    /// velocity (decided and limited like the sport `Move`), `mode` 1 / 2 a
+    /// position target, refused unless in `allowed_api_ids`; `SwitchSet`
+    /// and `UseRemoteCommandFromApi` refused unless listed; `SwitchGet`
+    /// passes.
+    UnitreeObstaclesAvoidRequest,
+    /// RTPS DATA, `unitree_api::msg::dds_::Request_` of the Go2 UWB
+    /// tracking service (`rt/api/uwbswitch/request`, `utrack_api.hpp`):
+    /// `SwitchSet` (the robot follows the UWB remote) refused unless in
+    /// `allowed_api_ids`; the queries pass.
+    #[serde(rename = "unitree_uwbswitch_request")]
+    UnitreeUwbSwitchRequest,
     /// RTPS DATA, the `send_goal` request of a ROS 2
     /// `control_msgs/action/FollowJointTrajectory` action
     /// (`rq/<action>/_action/send_goalRequest`): its trajectory checked as
@@ -346,6 +360,18 @@ impl Codec {
         matches!(self, Codec::Ros2Twist | Codec::Ros2TwistStamped)
     }
 
+    /// `true` for the Unitree api request codecs (`Request_`).
+    pub fn is_api_request(self) -> bool {
+        matches!(
+            self,
+            Codec::UnitreeSportRequest
+                | Codec::UnitreeLocoRequest
+                | Codec::UnitreeArmRequest
+                | Codec::UnitreeObstaclesAvoidRequest
+                | Codec::UnitreeUwbSwitchRequest
+        )
+    }
+
     /// `true` for the ROS 2 joint-trajectory codecs (`crate::trajectory`).
     pub fn is_trajectory(self) -> bool {
         matches!(
@@ -378,6 +404,8 @@ impl Codec {
             Codec::UnitreeHandSdk => Some("rt/hand_sdk"),
             Codec::Ros2Twist | Codec::Ros2TwistStamped => Some("rt/cmd_vel"),
             Codec::UnitreeArmRequest => Some("rt/api/arm/request"),
+            Codec::UnitreeObstaclesAvoidRequest => Some("rt/api/obstacles_avoid/request"),
+            Codec::UnitreeUwbSwitchRequest => Some("rt/api/uwbswitch/request"),
             // Loco: by `robot_model`; Dex3: left or right, must be named.
             _ => None,
         }
@@ -408,6 +436,8 @@ impl Codec {
             Codec::Ros2Twist => "ros2_twist",
             Codec::Ros2TwistStamped => "ros2_twist_stamped",
             Codec::UnitreeArmRequest => "unitree_arm_request",
+            Codec::UnitreeObstaclesAvoidRequest => "unitree_obstacles_avoid_request",
+            Codec::UnitreeUwbSwitchRequest => "unitree_uwbswitch_request",
             Codec::Ros2JointTrajectory => "ros2_joint_trajectory",
             Codec::Ros2FollowJointTrajectoryGoal => "ros2_follow_joint_trajectory_goal",
         }
@@ -420,9 +450,11 @@ impl Codec {
                 "unitree_go::msg::dds_::LowCmd_"
             }
             Codec::UnitreeHgLowcmd | Codec::UnitreeHgArmSdk => "unitree_hg::msg::dds_::LowCmd_",
-            Codec::UnitreeSportRequest | Codec::UnitreeLocoRequest | Codec::UnitreeArmRequest => {
-                "unitree_api::msg::dds_::Request_"
-            }
+            Codec::UnitreeSportRequest
+            | Codec::UnitreeLocoRequest
+            | Codec::UnitreeArmRequest
+            | Codec::UnitreeObstaclesAvoidRequest
+            | Codec::UnitreeUwbSwitchRequest => "unitree_api::msg::dds_::Request_",
             Codec::UnitreeDex3HandCmd => "unitree_hg::msg::dds_::HandCmd_",
             Codec::UnitreeHandSdk => "unitree_go::msg::dds_::MotorCmds_",
             Codec::Ros2Twist => "geometry_msgs::msg::dds_::Twist_",
@@ -868,6 +900,50 @@ impl GatewayConfig {
         Self::from_json(&s)
     }
 
+    /// Gateway review, finding 3: in enforce mode a Go2 (`robot_model`
+    /// `go2` / `go2w`, or no `robot_model` and a sport channel: the model
+    /// may be a Go2) must have a channel for every service that moves the
+    /// body (`sport`, `obstacles_avoid`, `uwbswitch`), a B2 (`b2` / `b2w`)
+    /// one for `sport`: a service without a channel is a motion path the
+    /// gateway never decides.
+    fn validate_motion_services(&self) -> Result<(), String> {
+        use robodr_cdr::unitree::UnitreeModel as M;
+        if self.mode != GatewayMode::Enforce {
+            return Ok(());
+        }
+        let has = |c: Codec| self.channels.iter().any(|x| x.codec == c);
+        let model = self.robot_model.as_deref().and_then(M::from_name);
+        let go2 = matches!(model, Some(M::Go2 | M::Go2W))
+            || (model.is_none() && has(Codec::UnitreeSportRequest));
+        let b2 = matches!(model, Some(M::B2 | M::B2W));
+        let mut need: Vec<Codec> = Vec::new();
+        if go2 || b2 {
+            need.push(Codec::UnitreeSportRequest);
+        }
+        if go2 {
+            need.extend([
+                Codec::UnitreeObstaclesAvoidRequest,
+                Codec::UnitreeUwbSwitchRequest,
+            ]);
+        }
+        let missing: Vec<&str> = need
+            .into_iter()
+            .filter(|c| !has(*c))
+            .map(Codec::as_str)
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mode enforce on a {} needs a channel for every motion service; missing codec(s) \
+                 {} (a service without a channel reaches the robot undecided; set robot_model \
+                 if this is not a Go2)",
+                if go2 { "Go2" } else { "B2" },
+                missing.join(", ")
+            ))
+        }
+    }
+
     /// Checks that need nothing but this file.
     pub fn validate(&self) -> Result<(), String> {
         if self.channels.is_empty() {
@@ -904,6 +980,7 @@ impl GatewayConfig {
                 }
             }
         }
+        self.validate_motion_services()?;
         if let Some(w) = &self.webrtc {
             w.monitor_options()?;
             if !self.observe.enabled {
@@ -1059,17 +1136,9 @@ impl GatewayConfig {
                     })?;
                 }
             }
-            if c.allowed_api_ids.is_some()
-                && !matches!(
-                    c.codec,
-                    Codec::UnitreeSportRequest
-                        | Codec::UnitreeLocoRequest
-                        | Codec::UnitreeArmRequest
-                )
-            {
+            if c.allowed_api_ids.is_some() && !c.codec.is_api_request() {
                 return Err(format!(
-                    "{at}: allowed_api_ids is for unitree_sport_request / unitree_loco_request / \
-                     unitree_arm_request only"
+                    "{at}: allowed_api_ids is for the unitree_*_request codecs only"
                 ));
             }
             let loco = c.codec == Codec::UnitreeLocoRequest;

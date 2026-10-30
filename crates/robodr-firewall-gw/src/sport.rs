@@ -234,13 +234,25 @@ fn write_number(out: &mut [u8], v: f64, decimals: u32) -> Option<usize> {
     None
 }
 
-/// Render `{"x":vx,"y":vy,"z":vyaw}` into `out` in at most `max` octets,
-/// with as many decimals (6 down to 0) as fit. Returns the length.
-fn render_move(out: &mut [u8], max: usize, v: [f64; 3]) -> Option<usize> {
+/// The `Move` parameter of a service: its three keys and what follows
+/// them (sport `{"x","y","z"}`; obstacles_avoid `{"x","y","yaw","mode":0}`:
+/// the velocity mode).
+fn move_shape(service: ApiService) -> ([&'static str; 3], &'static str) {
+    match service {
+        ApiService::ObstaclesAvoid => (["x", "y", "yaw"], ",\"mode\":0"),
+        _ => (["x", "y", "z"], ""),
+    }
+}
+
+/// Render `{"x":vx,"y":vy,"z":vyaw}` (or the service's shape,
+/// [`move_shape`]) into `out` in at most `max` octets, with as many
+/// decimals (6 down to 0) as fit. Returns the length.
+fn render_move(out: &mut [u8], max: usize, v: [f64; 3], service: ApiService) -> Option<usize> {
+    let (keys, suffix) = move_shape(service);
     for decimals in [6u32, 5, 4, 3, 2, 1, 0] {
         let mut pos = 0usize;
         let mut ok = true;
-        for (i, (key, val)) in ["x", "y", "z"].iter().zip(v).enumerate() {
+        for (i, (key, val)) in keys.iter().zip(v).enumerate() {
             let pre = if i == 0 { "{\"" } else { ",\"" };
             for part in [pre, key, "\":"] {
                 let b = part.as_bytes();
@@ -267,7 +279,7 @@ fn render_move(out: &mut [u8], max: usize, v: [f64; 3]) -> Option<usize> {
                 }
             }
         }
-        if ok {
+        if ok && put(out, &mut pos, suffix).is_some() {
             if let Some(b) = out.get_mut(pos) {
                 *b = b'}';
                 pos += 1;
@@ -288,6 +300,18 @@ pub fn write_move(
     v: [f64; 3],
     model: Option<UnitreeModel>,
 ) -> Result<(), RewriteError> {
+    write_move_for(slot, req, v, ApiService::Sport, model)
+}
+
+/// [`write_move`] for the velocity `Move` of any service decoded with
+/// [`decode_strict_for`] (obstacles_avoid: `{"x","y","yaw","mode":0}`).
+pub fn write_move_for(
+    slot: &mut [u8],
+    req: &SportRequest,
+    v: [f64; 3],
+    service: ApiService,
+    model: Option<UnitreeModel>,
+) -> Result<(), RewriteError> {
     let len = req
         .param
         .end
@@ -295,7 +319,7 @@ pub fn write_move(
         .ok_or(RewriteError::Length)?;
     let mut text = [0u8; 256];
     let cap = len.min(text.len());
-    let n = render_move(&mut text, cap, v).ok_or(RewriteError::Length)?;
+    let n = render_move(&mut text, cap, v, service).ok_or(RewriteError::Length)?;
     let dst = slot
         .get_mut(req.param.clone())
         .ok_or(RewriteError::Length)?;
@@ -309,7 +333,7 @@ pub fn write_move(
     spaces.fill(b' ');
     *last = b'}';
     // Verify.
-    let back = decode_strict(slot, model).map_err(|_| RewriteError::Verify)?;
+    let back = decode_strict_for(slot, service, model).map_err(|_| RewriteError::Verify)?;
     match back.call {
         ApiCall::Move { vx, vy, vyaw } => {
             for (got, want) in [vx, vy, vyaw].into_iter().zip(v) {

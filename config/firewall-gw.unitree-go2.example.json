@@ -1,5 +1,6 @@
 {
   "mode": "enforce",
+  "robot_model": "go2",
   "profile": "/etc/robodr/profile.json",
   "profile_trust": {
     "trusted_keys": "/etc/robodr/profile-trust.json",
@@ -30,6 +31,18 @@
       "codec": "unitree_sport_request",
       "allowed_src_ips": ["192.168.123.164"],
       "allowed_api_ids": [1001, 1002, 1003, 1004, 1005, 1006, 1008, 1015]
+    },
+    {
+      "firewall_channel": "/api/obstacles_avoid/request",
+      "codec": "unitree_obstacles_avoid_request",
+      "allowed_src_ips": ["192.168.123.164"],
+      "allowed_api_ids": []
+    },
+    {
+      "firewall_channel": "/api/uwbswitch/request",
+      "codec": "unitree_uwbswitch_request",
+      "allowed_src_ips": ["192.168.123.164"],
+      "allowed_api_ids": []
     }
   ],
   "max_queue_delay_ns": 5000000,

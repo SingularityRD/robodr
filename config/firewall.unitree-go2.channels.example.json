@@ -240,6 +240,24 @@
       "max_linear_accel": 2.0,
       "max_angular_accel": 3.0
     },
+    "/api/obstacles_avoid/request": {
+      "kind": "twist",
+      "allowed_sources": [
+        "0123456789abcdef0123456700000c03"
+      ],
+      "max_linear_speed": 1.0,
+      "max_angular_speed": 1.0,
+      "max_linear_accel": 2.0,
+      "max_angular_accel": 3.0
+    },
+    "/api/uwbswitch/request": {
+      "kind": "twist",
+      "allowed_sources": [
+        "0123456789abcdef0123456700000d03"
+      ],
+      "max_linear_speed": 1.0,
+      "max_angular_speed": 1.0
+    },
     "/cmd_vel": {
       "kind": "twist",
       "allowed_sources": [

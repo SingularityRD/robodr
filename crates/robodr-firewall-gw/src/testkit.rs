@@ -33,6 +33,9 @@ pub const PREFIX: GuidPrefix = [
 pub const WRITER: [u8; 4] = [0, 0, 0x01, 0x03];
 /// The sport request writer entity of the fixtures.
 pub const SPORT_WRITER: [u8; 4] = [0, 0, 0x02, 0x03];
+/// The Go2 fixture's `obstacles_avoid` / `uwbswitch` request writers.
+pub const OBSTACLES_WRITER: [u8; 4] = [0, 0, 0x0c, 0x03];
+pub const UWB_WRITER: [u8; 4] = [0, 0, 0x0d, 0x03];
 /// A participant nobody authorised.
 pub const FOREIGN: GuidPrefix = [0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8];
 pub const CONTROLLER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 123, 164);
@@ -100,7 +103,12 @@ pub fn profile(fx: Fixture) -> Profile {
         },
     );
     if fx == Fixture::Go2 {
-        for name in ["/api/sport/request", "/legacy/high_cmd"] {
+        for name in [
+            "/api/sport/request",
+            "/legacy/high_cmd",
+            "/api/obstacles_avoid/request",
+            "/api/uwbswitch/request",
+        ] {
             add(
                 name,
                 Envelope {
@@ -139,6 +147,14 @@ pub fn firewall(fx: Fixture) -> FirewallConfig {
                 "/api/sport/request".into(),
                 twist(guid_hex(&PREFIX, SPORT_WRITER)),
             );
+            f.channels.insert(
+                "/api/obstacles_avoid/request".into(),
+                twist(guid_hex(&PREFIX, OBSTACLES_WRITER)),
+            );
+            f.channels.insert(
+                "/api/uwbswitch/request".into(),
+                twist(guid_hex(&PREFIX, UWB_WRITER)),
+            );
             f.channels.insert("/legacy/high_cmd".into(), twist(src));
             let Some(low) = f.joint_channels.get("/lowcmd").cloned() else {
                 panic!("fixture firewall: the Go2 example has no /lowcmd joint channel");
@@ -169,6 +185,16 @@ pub fn gateway_config(fx: Fixture) -> GatewayConfig {
             "firewall_channel": "/api/sport/request",
             "codec": "unitree_sport_request",
             "allowed_api_ids": [1003, 1008, 1001, 1004],
+        }));
+        // Go2's other motion services (gateway review, finding 3): no
+        // allowlist, so only their velocity `Move` and queries pass.
+        channels.push(serde_json::json!({
+            "firewall_channel": "/api/obstacles_avoid/request",
+            "codec": "unitree_obstacles_avoid_request",
+        }));
+        channels.push(serde_json::json!({
+            "firewall_channel": "/api/uwbswitch/request",
+            "codec": "unitree_uwbswitch_request",
         }));
         channels.push(serde_json::json!({
             "firewall_channel": "/legacy/high_cmd",

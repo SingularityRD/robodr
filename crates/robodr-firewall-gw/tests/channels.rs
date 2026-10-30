@@ -278,6 +278,7 @@ fn h1_loco_on_its_own_topic() {
 #[test]
 fn sport_codec_is_refused_for_a_humanoid() {
     let cfg = g1_channels_config(|v| {
+        v["robot_model"] = serde_json::json!("g1");
         v["channels"][2] = serde_json::json!(
             {"firewall_channel": "/loco", "codec": "unitree_sport_request"});
     });

@@ -1,5 +1,6 @@
 {
   "mode": "enforce",
+  "robot_model": "go2",
   "profile": "/etc/robodr/profile.json",
   "profile_trust": {
     "trusted_keys": "/etc/robodr/profile-trust.json",
@@ -52,6 +53,24 @@
         "192.168.123.164"
       ],
       "note": "ROS 2 geometry_msgs/Twist on rt/cmd_vel (a ROS 2 driver on the robot): decided as a twist, limited in place."
+    },
+    {
+      "firewall_channel": "/api/obstacles_avoid/request",
+      "codec": "unitree_obstacles_avoid_request",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "allowed_api_ids": [],
+      "note": "rt/api/obstacles_avoid/request (Go2): Move 1003 mode 0 is a velocity, limited like the sport Move; mode 1 / 2 (position targets), SwitchSet and UseRemoteCommandFromApi are refused unless listed; SwitchGet passes. Required in enforce mode on a Go2."
+    },
+    {
+      "firewall_channel": "/api/uwbswitch/request",
+      "codec": "unitree_uwbswitch_request",
+      "allowed_src_ips": [
+        "192.168.123.164"
+      ],
+      "allowed_api_ids": [],
+      "note": "rt/api/uwbswitch/request (Go2 UWB tracking): SwitchSet (the robot follows the UWB remote) refused unless listed; the queries pass. Required in enforce mode on a Go2."
     }
   ],
   "max_queue_delay_ns": 5000000,

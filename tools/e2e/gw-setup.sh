@@ -52,6 +52,13 @@ cfg = {
     {"firewall_channel": "/lowcmd", "codec": "unitree_go_lowcmd", "allowed_src_ips": [ctrl]},
     {"firewall_channel": "/api/sport/request", "codec": "unitree_sport_request",
      "allowed_src_ips": [ctrl], "allowed_api_ids": [1003, 1008, 1001, 1004, 1015]},
+    # Go2's other motion services: required in enforce mode (velocity Move
+    # and queries only).
+    {"firewall_channel": "/api/obstacles_avoid/request",
+     "codec": "unitree_obstacles_avoid_request", "allowed_src_ips": [ctrl],
+     "allowed_api_ids": []},
+    {"firewall_channel": "/api/uwbswitch/request", "codec": "unitree_uwbswitch_request",
+     "allowed_src_ips": [ctrl], "allowed_api_ids": []},
     {"firewall_channel": "/arm_trajectory", "codec": "ros2_joint_trajectory",
      "topic": "rt/arm_controller/joint_trajectory", "allowed_src_ips": [ctrl],
      "trajectory": {"joints": joints, "max_points": 64, "max_duration_s": 20.0}},
