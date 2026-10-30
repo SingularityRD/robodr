@@ -77,7 +77,8 @@ fn write_config(dir: &Path, k: &Keys, state: &Path, listen: &str) -> PathBuf {
         "key_file": k.recv_secret,
         "units": [{"unit": UNIT, "public_key": k.unit_pub}],
         "max_connections": 8,
-        "io_timeout_ms": 2000
+        "io_timeout_ms": 2000,
+        "allow_plaintext": true
     });
     std::fs::write(&p, c.to_string()).unwrap();
     p
@@ -126,6 +127,7 @@ fn start(config: &Path) -> Receiver {
 fn anchor(k: &Keys, addr: &str) -> Arc<RemoteHeadAnchor> {
     let mut c = RemoteAnchorConfig::new(addr, UNIT);
     c.timeout = Duration::from_secs(2);
+    c.allow_plaintext = true;
     Arc::new(RemoteHeadAnchor::new(c, k.receiver_verifier(), k.unit_signer()).unwrap())
 }
 
@@ -383,4 +385,98 @@ fn one_way_marks_detect_a_rollback_on_the_far_side() {
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
+}
+
+/// A private copy of `fixtures/tls/` with key files 0600.
+fn tls_fixtures(d: &TestDir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = d.sub("pki");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tls");
+    for n in [
+        "ca.pem",
+        "server.pem",
+        "server.key",
+        "client.pem",
+        "client.key",
+    ] {
+        std::fs::copy(src.join(n), dir.join(n)).unwrap();
+        let mode = if n.ends_with(".key") { 0o600 } else { 0o644 };
+        std::fs::set_permissions(dir.join(n), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn receiver_binary_serves_mutual_tls_and_refuses_plain_tcp_by_default() {
+    let k = keys();
+    let d = TestDir::new("ra-tls-bin");
+    let pki = tls_fixtures(&d);
+    let state = d.sub("receiver-state");
+    let config = write_config(d.path(), &k, &state, "127.0.0.1:0");
+    let mut c: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+
+    // Neither tls nor allow_plaintext: serve refuses to start (exit 2).
+    c.as_object_mut().unwrap().remove("allow_plaintext");
+    std::fs::write(&config, c.to_string()).unwrap();
+    let o = bin("receiver")
+        .args(["serve", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("allow_plaintext"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // Both: ambiguous, refused.
+    c["allow_plaintext"] = true.into();
+    c["tls"] = serde_json::json!({
+        "cert_chain": pki.join("server.pem"),
+        "key_file": pki.join("server.key"),
+        "client_ca": pki.join("ca.pem"),
+    });
+    std::fs::write(&config, c.to_string()).unwrap();
+    let o = bin("receiver")
+        .args(["serve", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+
+    // Mutual TLS.
+    c.as_object_mut().unwrap().remove("allow_plaintext");
+    std::fs::write(&config, c.to_string()).unwrap();
+    let recv = start(&config);
+    let tls = robodr_blackbox::tls::load_client(&robodr_blackbox::tls::ClientTlsFiles {
+        ca_file: pki.join("ca.pem"),
+        cert_chain: Some(pki.join("client.pem")),
+        key_file: Some(pki.join("client.key")),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut rc = RemoteAnchorConfig::new(recv.addr.clone(), UNIT);
+    rc.tls = Some(tls);
+    let a = Arc::new(RemoteHeadAnchor::new(rc, k.receiver_verifier(), k.unit_signer()).unwrap());
+    let log = d.sub("log");
+    let mut r = open_with(base_cfg(&log, Some(Arc::clone(&a))), &k);
+    for i in 0..8 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    let last = r.close().unwrap().seq;
+    assert!(
+        a.flush(Duration::from_secs(10)),
+        "marks delivered over mTLS"
+    );
+    assert_eq!(a.delivered_seq(), Some(last));
+    assert_eq!(a.current().unwrap().map(|h| h.seq), Some(last));
+
+    // A plain-TCP client is refused at the handshake: nothing reaches the
+    // receiver, and the unit counts an anchor failure.
+    let mut pc = RemoteAnchorConfig::new(recv.addr.clone(), UNIT);
+    pc.allow_plaintext = true;
+    let p = RemoteHeadAnchor::new(pc, k.receiver_verifier(), k.unit_signer()).unwrap();
+    assert!(p.current().is_err());
 }

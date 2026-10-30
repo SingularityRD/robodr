@@ -2370,6 +2370,8 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "ed25519-dalek",
  "robodr-events",
+ "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",
@@ -2480,6 +2482,8 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

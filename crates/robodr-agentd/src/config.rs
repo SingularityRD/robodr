@@ -427,11 +427,38 @@ pub enum HeadAnchorConfig {
         /// The receiver's Ed25519 public key file (absolute; outside
         /// `blackbox.dir` and `spool.dir`).
         receiver_public_key: PathBuf,
-        /// Bound on connect, write and read each; default 2000,
-        /// 100..=30000.
+        /// Bound on connect, TLS handshake, write and read each; default
+        /// 2000, 100..=30000.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// TLS to the receiver (required unless `allow_plaintext`).
+        #[serde(default)]
+        tls: Option<AnchorTlsConfig>,
+        /// Plain TCP to the receiver (lab / private link only; marks and
+        /// answers stay Ed25519-signed). Default `false`: without `tls`
+        /// the configuration is refused.
+        #[serde(default)]
+        allow_plaintext: bool,
     },
+}
+
+/// `blackbox.head_anchor.tls` (kind `remote`): see
+/// `robodr_blackbox::tls`. The receiver's certificate is always verified
+/// (chain to `ca_file`, validity, `serverAuth`, the address's host or
+/// `server_name`); `server_spki_sha256` pins add to that; `cert_chain` +
+/// `key_file` present a client certificate (mutual TLS).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorTlsConfig {
+    pub ca_file: PathBuf,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub server_spki_sha256: Vec<String>,
+    #[serde(default)]
+    pub cert_chain: Option<PathBuf>,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
 }
 
 impl HeadAnchorConfig {
@@ -463,6 +490,8 @@ impl HeadAnchorConfig {
             address,
             receiver_public_key,
             timeout_ms,
+            tls,
+            allow_plaintext,
         } = self
         else {
             return None;
@@ -489,6 +518,52 @@ impl HeadAnchorConfig {
                 }
                 Some(ms) => c.timeout = std::time::Duration::from_millis(ms),
                 None => {}
+            }
+            match (tls, *allow_plaintext) {
+                (Some(_), true) => {
+                    return Err(
+                        "blackbox.head_anchor: tls and allow_plaintext are both set: remove one"
+                            .into(),
+                    )
+                }
+                (None, false) => {
+                    return Err(
+                        "blackbox.head_anchor kind remote: set tls (the receiver's CA file; \
+                         plain TCP needs an explicit \"allow_plaintext\": true, lab or \
+                         private link only)"
+                            .into(),
+                    )
+                }
+                (None, true) => c.allow_plaintext = true,
+                (Some(t), false) => {
+                    for (f, p) in [
+                        ("ca_file", Some(&t.ca_file)),
+                        ("cert_chain", t.cert_chain.as_ref()),
+                        ("key_file", t.key_file.as_ref()),
+                    ] {
+                        if let Some(p) = p {
+                            require_abs(&format!("blackbox.head_anchor.tls.{f}"), p)?;
+                        }
+                    }
+                    let files = robodr_blackbox::tls::ClientTlsFiles {
+                        ca_file: t.ca_file.clone(),
+                        cert_chain: t.cert_chain.clone(),
+                        key_file: t.key_file.clone(),
+                        server_name: t.server_name.clone(),
+                        spki_sha256: t.server_spki_sha256.clone(),
+                    };
+                    let loaded = robodr_blackbox::tls::load_client(&files).map_err(|e| {
+                        format!(
+                            "blackbox.head_anchor.tls: {}",
+                            robodr_ros2_pipeline::sanitize(&e)
+                        )
+                    })?;
+                    // The name verified must be a valid TLS name.
+                    loaded
+                        .name_for(robodr_blackbox::tls::host_of(address))
+                        .map_err(|e| format!("blackbox.head_anchor: {e}"))?;
+                    c.tls = Some(loaded);
+                }
             }
             Ok((c, key))
         })())
