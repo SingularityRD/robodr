@@ -171,6 +171,10 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // robodr-agentd control-plane API (observe-only self-health)
     "robot.agent.control_plane_unauthenticated",
     "robot.agent.control_plane_invalid",
+    "robot.agent.control_plane_state_untrusted",
+    // robodr-agentd executor link (failed revert, executor journal reset)
+    "robot.agent.executor_revert_failed",
+    "robot.agent.executor_journal_reset",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",
