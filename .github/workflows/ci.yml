@@ -127,6 +127,10 @@ jobs:
         # Runs a copy of the helper whose /run/credentials is a temporary
         # directory; root because the helper requires it and chowns.
         run: sudo sh scripts/test-load-credential.sh
+      - name: exporter / gateway user migration (deb postinst, rpm post)
+        # Runs a copy of migrate_exporter_users against a temporary
+        # /var/lib/robodr with stand-in users; root because it chowns.
+        run: sudo sh scripts/test-exporter-migration.sh
       - name: robodr-pulsard's external-BTF guard (robodr-btf-check)
         run: sh scripts/test-btf-check.sh
       - name: Validate Pulsar rules (rules/) against vendor/pulsar

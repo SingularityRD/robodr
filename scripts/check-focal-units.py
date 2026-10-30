@@ -85,6 +85,8 @@ KNOWN_245 = {
     "User", "Group", "SupplementaryGroups", "DynamicUser",  # 235
     "AmbientCapabilities", "CapabilityBoundingSet", "NoNewPrivileges", "UMask",
     "InaccessiblePaths", "ReadWritePaths", "ReadOnlyPaths",  # 231
+    "BindReadOnlyPaths",  # 233
+    "TemporaryFileSystem",  # 238
     "ProtectSystem", "ProtectHome", "PrivateTmp", "PrivateDevices",
     "PrivateNetwork", "DevicePolicy", "DeviceAllow",
     "RuntimeDirectory", "RuntimeDirectoryMode", "StateDirectory",  # 235

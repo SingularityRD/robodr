@@ -46,7 +46,7 @@
 #     0600 by default, or 0660 with socket_group = the robodr-safety gid,
 #     and every connection is checked with SO_PEERCRED against root, this
 #     daemon's uid and safety_feed.socket.allowed_uids / allowed_gids, so
-#     the exporters (User=robodr) cannot report a safety state; give this
+#     the exporters (their own users) cannot report a safety state; give this
 #     unit and the gateway SupplementaryGroups=robodr-safety for that: a
 #     supplementary group counts (SO_PEERGROUPS), and agentd refuses to
 #     start with the exporters' group robodr as socket_group or in

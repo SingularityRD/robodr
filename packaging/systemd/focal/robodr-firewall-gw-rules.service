@@ -24,6 +24,9 @@
 # Motion Firewall gateway": maintenance bypass), never by stopping the
 # gateway.
 #
+# Verify after editing: systemd-analyze verify robodr-firewall-gw-rules.service
+#                       systemd-analyze security robodr-firewall-gw-rules.service
+#
 # Ordering: before the gateway and before the bridge carries traffic
 # (network-pre.target), so no motion datagram crosses the bridge unchecked
 # between boot and the gateway's start.
@@ -40,7 +43,60 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '/usr/sbin/robodr-firewall-gw ruleset --config /etc/robodr/firewall-gw.json | /bin/sh -eu'
+# Render, then apply exactly what was rendered (review: the renderer's
+# output used to be piped into a root shell with every capability, so a
+# renderer failing half-way still "succeeded" with a partial ruleset):
+#   1. the ruleset is rendered into a private file; a renderer that fails
+#      fails the unit before anything is applied (and the gateway, which
+#      Requires= this unit, does not start);
+#   2. that file is run by sh -eu, sandboxed below, with only the
+#      capabilities its commands need: CAP_NET_ADMIN (nft, iptables, the
+#      net.bridge.* sysctls), CAP_NET_RAW (iptables-legacy's raw socket),
+#      CAP_SYS_MODULE (modprobe br_netfilter).
+RuntimeDirectory=robodr-firewall-gw-rules
+RuntimeDirectoryMode=0700
+# iptables-legacy's lock file; /run is read-only in this sandboxed unit.
+ExecStartPre=+/bin/sh -c 'touch /run/xtables.lock'
+ExecStartPre=/bin/sh -c 'umask 077 && exec /usr/sbin/robodr-firewall-gw ruleset --config /etc/robodr/firewall-gw.json >/run/robodr-firewall-gw-rules/ruleset.sh'
+ExecStart=/bin/sh -eu /run/robodr-firewall-gw-rules/ruleset.sh
+
+# --- Identity and capabilities ---------------------------------------------
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE
+NoNewPrivileges=yes
+UMask=0077
+
+# --- Filesystem --------------------------------------------------------------
+# Not ProtectKernelTunables= (it writes net.bridge.* sysctls) and not
+# ProtectKernelModules= (it loads br_netfilter).
+ProtectSystem=strict
+ReadWritePaths=-/run/xtables.lock
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+TemporaryFileSystem=/run/credentials:ro
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# --- Network -----------------------------------------------------------------
+# Netlink (nft, iptables-nft) and iptables-legacy's AF_INET raw socket; it
+# never sends traffic.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+IPAddressDeny=any
+
+# --- Kernel interfaces / syscalls -------------------------------------------
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @module
+SystemCallFilter=~@obsolete @mount @swap @reboot @raw-io @cpu-emulation @clock @debug
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

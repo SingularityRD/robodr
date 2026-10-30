@@ -13,9 +13,11 @@
 #
 #   install-bundle.sh verify  [--pubkey robodr-release.pub --tarball T]
 #   install-bundle.sh install [--pubkey robodr-release.pub --tarball T]
-#                             [--allow-downgrade] [--accept-unreadable SEG]...
+#                             [--allow-downgrade] [--allow-variant-switch]
+#                             [--accept-unreadable SEG]...
 #   install-bundle.sh list                 (releases kept for rollback)
-#   install-bundle.sh rollback <version>   (reinstall a kept release)
+#   install-bundle.sh rollback <version> [--allow-variant-switch]
+#                                          (reinstall a kept release)
 #   install-bundle.sh ring                 (SOC update-ring information)
 #
 # Options of install / rollback: --blackbox-dir DIR (repeatable; default
@@ -27,9 +29,18 @@
 # signature (<tarball>.minisig) is checked against the pinned release key;
 # when the release's SHA256SUMS and SHA256SUMS.minisig lie next to the
 # tarball, that signature is checked too and the tarball must be listed in
-# it with its hash. The verified tarball is then extracted into a private
-# directory (mktemp -d, 0700) and everything is checked and installed FROM
-# THERE: nothing is taken from an already extracted directory. If this
+# it with its hash. The tarball must be a regular file (no symlink, FIFO
+# or device). It is COPIED ONCE, with its signature and the release's
+# SHA256SUMS(.minisig), into a private directory (mktemp -d, 0700), and
+# every check (signature, trusted comment, checksum, listing) and the
+# extraction run on that private copy only: the file named by --tarball is
+# never read again, so swapping it after the check (another process of the
+# same user, removable media) cannot change what is installed. The
+# signature's trusted comment must name the tarball's file name (release.yml
+# signs with "robodr <version> <file>"; minisign's default comment
+# "file:<file>" is accepted too): a signed bundle renamed to look like
+# another one is refused. Everything is installed FROM THE PRIVATE
+# EXTRACTION: nothing is taken from an already extracted directory. If this
 # script itself runs from an extracted bundle directory, that directory
 # must be identical to the signed tarball's content, otherwise it was
 # modified after extraction and the run is REFUSED. The public key must
@@ -65,6 +76,13 @@
 # (versions would no longer compare as written). A bundle of one format is
 # refused on a host where robodr is installed through the other one.
 #
+# Variants. robodr and robodr-focal (.deb) conflict: installing one removes
+# the other (robodr-focal has no robodr-pulsard). A signed bundle must hold
+# the variant its signed file name names (robodr-focal-* holds
+# robodr-focal, robodr-* holds robodr), and install / rollback REFUSE to
+# replace the installed variant with the other one unless
+# --allow-variant-switch is given.
+#
 # Downgrades and the security floor. `install` of a release older than the
 # installed one is a downgrade and is REFUSED unless --allow-downgrade
 # (rollback to a kept release is the usual way back). No install and no
@@ -79,13 +97,21 @@
 # e.g. blackbox_read=RBF1:1; a release without the file is a legacy release
 # that reads RBF1:1 only). Before dpkg runs, the first frame of every
 # segment file in the black-box directories is read (magic + record format
-# version). A segment in a recognised format (RBF1:<v>) the release cannot
-# read REFUSES the release, with the segment named: it could neither verify
-# nor extend that evidence. Export and archive the chain first
-# (OPERATIONS.md 7), or install a release that reads it, or accept that
-# exact segment with --accept-unreadable SEG. A file that does not start
-# with a RoboDR frame (damaged, or not RoboDR's) is reported and does not
-# block. Only segment files (seg-*.rbb) are judged: the other state
+# version). The segment files are writable by robodr-agentd, so a first
+# frame is only a claim: it blocks only when it is VERIFIED, i.e. its
+# format is one that a release installed on this unit writes, by records
+# root keeps and agentd cannot write (blackbox_write= of the installed
+# package's /usr/share/robodr/formats and of every kept release's formats
+# file under /var/lib/robodr/releases; RBF1:1, the legacy format, always).
+# A verified segment in a format the release cannot read REFUSES the
+# release, with the segment named: it could neither verify nor extend that
+# evidence. Export and archive the chain first (OPERATIONS.md 7), or
+# install a release that reads it, or accept that exact segment with
+# --accept-unreadable SEG. A segment claiming a format no release here
+# ever wrote (forged, damaged, or carried over from another unit) is
+# reported as UNKNOWN and does not block, nor does a file that does not
+# start with a RoboDR frame: a compromised agentd cannot block updates by
+# writing such a file. Only segment files (seg-*.rbb) are judged: the other state
 # journals on the unit (robodr-executor-journal/v1 under
 # /var/lib/robodr/executor, robodr-cp-journal/v1 and the RBBXBND1 evidence
 # exports under /var/lib/robodr/control-plane, the gateway's and
@@ -117,6 +143,8 @@ legacy_read="RBF1:1"
 nl='
 '
 stage=""
+# The private copy of the signed tarball (set by stage_inputs).
+tarcopy=""
 # Temporary formats file of install / rollback (removed on every exit path).
 fmt=""
 
@@ -145,29 +173,89 @@ valid_path() {
     case "$1" in '' | *[[:space:]]* | *[*?[]*) return 1 ;; esac
 }
 
-verify_sig() { # pubkey file
-    command -v minisign >/dev/null 2>&1 || die 2 "minisign not installed; cannot check the signature"
-    [ -f "$1" ] || die 2 "public key $1 not found"
-    [ -f "$2" ] || die 2 "$2 not found"
-    [ -f "$2.minisig" ] || die 1 "signature $2.minisig not found"
-    minisign -V -q -p "$1" -m "$2" || die 1 "SIGNATURE CHECK FAILED for $2"
-    echo "install-bundle: signature OK ($2)"
+# Whether PATH is a regular file (not a symlink, FIFO, device or directory).
+regular_file() { # path
+    [ -f "$1" ] && [ ! -L "$1" ]
 }
 
-# The release's SHA256SUMS next to the tarball, if it is shipped signed.
-verify_release_sums() { # pubkey tarball
-    s=$(dirname "$2")/SHA256SUMS
-    if [ -f "$s.minisig" ]; then
-        [ -f "$s" ] || die 1 "$s.minisig without $s"
-        verify_sig "$1" "$s"
-        want=$(awk -v f="$(basename "$2")" '{ h = $1; sub(/^[0-9a-f]+ [ *]/, "") } $0 == f { print h; exit }' "$s")
-        [ -n "$want" ] || die 1 "$(basename "$2") is not listed in the signed $s"
-        [ "$(sha256sum "$2" | cut -d' ' -f1)" = "$want" ] ||
-            die 1 "CHECKSUM MISMATCH: $2 is not the tarball the signed $s lists"
-        echo "install-bundle: the tarball is listed in the signed release SHA256SUMS"
-    elif [ -f "$s" ]; then
+# Copy SRC once into the private staging directory as NAME; the copy must be
+# a regular file (cp -RP copies a symlink or FIFO swapped in after the check
+# as what it is, never through it, and the check below refuses it).
+stage_copy() { # src name
+    regular_file "$1" || die 1 "REFUSED: $1 is not a regular file (symlink, FIFO, device or directory)"
+    cp -RP -- "$1" "$stage/in/$2" 2>/dev/null || die 1 "cannot copy $1"
+    regular_file "$stage/in/$2" || die 1 "REFUSED: $1 changed while it was copied (no longer a regular file)"
+    chmod 0600 "$stage/in/$2"
+}
+
+# The private staging directory (0700): in/ the copied inputs, x/ the
+# extraction. Sets $stage.
+make_stage() {
+    stage=$(mktemp -d "${TMPDIR:-/tmp}/robodr-bundle.XXXXXXXX") || die 2 "mktemp failed"
+    chmod 0700 "$stage"
+    mkdir -m 0700 "$stage/in" "$stage/x"
+}
+
+# Copy the tarball, its signature and (if shipped signed) the release's
+# SHA256SUMS next to it into the private directory, each read exactly once.
+# Every later check reads the copies only. Sets $tname, $tarcopy and
+# $sumscopy.
+stage_inputs() { # tarball
+    tname=$(basename "$1")
+    case "$tname" in
+    '' | . | .. | SHA256SUMS* | *[!A-Za-z0-9._+~-]*) die 1 "REFUSED: unexpected tarball file name '$tname'" ;;
+    esac
+    make_stage
+    stage_copy "$1" "$tname"
+    tarcopy=$stage/in/$tname
+    if [ -e "$1.minisig" ] || [ -L "$1.minisig" ]; then
+        stage_copy "$1.minisig" "$tname.minisig"
+    fi
+    sumscopy=""
+    s=$(dirname "$1")/SHA256SUMS
+    if [ -e "$s.minisig" ] || [ -L "$s.minisig" ]; then
+        if [ ! -e "$s" ] && [ ! -L "$s" ]; then die 1 "$s.minisig without $s"; fi
+        stage_copy "$s" SHA256SUMS
+        stage_copy "$s.minisig" SHA256SUMS.minisig
+        sumscopy=$stage/in/SHA256SUMS
+    elif [ -e "$s" ]; then
         echo "install-bundle: note: $s has no SHA256SUMS.minisig next to it; not used"
     fi
+}
+
+# Check FILE (a private copy) against FILE.minisig with the pinned key, and
+# that the signature's trusted comment names NAME: "robodr <version> NAME"
+# (release.yml) or minisign's default "...file:NAME...". The comment is
+# signed too (minisign -V checks the global signature over it), so a
+# signed file renamed to pass for another one is refused.
+verify_sig() { # pubkey file name
+    command -v minisign >/dev/null 2>&1 || die 2 "minisign not installed; cannot check the signature"
+    [ -f "$1" ] || die 2 "public key $1 not found"
+    [ -f "$2" ] || die 2 "$3 not found"
+    [ -f "$2.minisig" ] || die 1 "signature $3.minisig not found"
+    tc=$(minisign -V -Q -p "$1" -m "$2" -x "$2.minisig") || die 1 "SIGNATURE CHECK FAILED for $3"
+    ok_name=0
+    set -f
+    for w in $(printf '%s
+' "$tc" | head -n1 | tr '	' ' '); do
+        case "$w" in "$3" | "file:$3") ok_name=1 ;; esac
+    done
+    set +f
+    [ "$ok_name" -eq 1 ] ||
+        die 1 "REFUSED: the signature of $3 is valid but its trusted comment ('$tc') names another file: a signed file renamed to pass for $3"
+    echo "install-bundle: signature OK ($3; trusted comment: $tc)"
+}
+
+# The release's SHA256SUMS next to the tarball, if it is shipped signed
+# (both read from the private copies).
+verify_release_sums() { # pubkey
+    [ -n "$sumscopy" ] || return 0
+    verify_sig "$1" "$sumscopy" SHA256SUMS
+    want=$(awk -v f="$tname" '{ h = $1; sub(/^[0-9a-f]+ [ *]/, "") } $0 == f { print h; exit }' "$sumscopy")
+    [ -n "$want" ] || die 1 "$tname is not listed in the signed release SHA256SUMS"
+    [ "$(sha256sum "$tarcopy" | cut -d' ' -f1)" = "$want" ] ||
+        die 1 "CHECKSUM MISMATCH: $tname is not the tarball the signed release SHA256SUMS lists"
+    echo "install-bundle: the tarball is listed in the signed release SHA256SUMS"
 }
 
 # Whether every file of DIR is listed in DIR/SHA256SUMS with its hash and
@@ -189,20 +277,18 @@ verify_sums() { # dir
     echo "install-bundle: checksums OK"
 }
 
-# Extract the verified tarball into a private directory; sets $bundle.
-stage_tarball() { # tarball
-    stage=$(mktemp -d "${TMPDIR:-/tmp}/robodr-bundle.XXXXXXXX") || die 2 "mktemp failed"
-    chmod 0700 "$stage"
+# Extract the verified private copy into the private directory; sets $bundle.
+stage_tarball() { # copy name
     tops=$(tar -tzf "$1" | sed 's|^\./||; s|/.*||' | LC_ALL=C sort -u) ||
-        die 1 "$1 is not a readable tar.gz"
+        die 1 "$2 is not a readable tar.gz"
     case "$tops" in
     *"$nl"* | '' | . | .. | *[!A-Za-z0-9._+~-]*)
-        die 1 "$1 must hold exactly one top-level directory (found: $(echo "$tops" | tr '\n' ' '))"
+        die 1 "$2 must hold exactly one top-level directory (found: $(echo "$tops" | tr '\n' ' '))"
         ;;
     esac
-    tar -xzf "$1" -C "$stage" --no-same-owner || die 1 "extracting $1 failed"
-    bundle=$stage/$tops
-    if [ ! -d "$bundle" ] || [ -L "$bundle" ]; then die 1 "$1: $tops is not a directory"; fi
+    tar -xzf "$1" -C "$stage/x" --no-same-owner || die 1 "extracting $2 failed"
+    bundle=$stage/x/$tops
+    if [ ! -d "$bundle" ] || [ -L "$bundle" ]; then die 1 "$2: $tops is not a directory"; fi
 }
 
 # The directory this script runs from, if it claims to be a bundle, must be
@@ -278,6 +364,11 @@ ver_lt() { # a b
 }
 
 # The installed robodr packages: "<name> <version>" lines (none, or one).
+# A package counts as installed in every dpkg state but not-installed and
+# config-files: half-installed, unpacked, half-configured and
+# triggers-awaiting/pending packages too (a failed or interrupted upgrade
+# must not let the next install pass as a first install, skipping the
+# downgrade and variant checks).
 installed_pkgs() { # format
     case "$1" in
     deb)
@@ -285,7 +376,10 @@ installed_pkgs() { # format
         for p in robodr robodr-focal; do
             # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
             v=$(dpkg_query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
-            case "$v" in ii*) echo "$p ${v##* }" ;; esac
+            case "$v" in
+            '' | ?n* | ?c*) ;;
+            *) echo "$p ${v##* }" ;;
+            esac
         done
         ;;
     rpm)
@@ -352,6 +446,19 @@ ondisk_formats() {
     done
 }
 
+# The formats releases installed on this unit write (one per line): the
+# installed package's formats file and every kept release's, both written
+# by root only, plus the legacy format. A segment may block only in one of
+# these (see "Black-box format gate" above).
+written_formats() {
+    echo "$legacy_read"
+    for f in "$root/usr/share/robodr/formats" "$releases"/*/formats; do
+        if [ -f "$f" ] && [ ! -L "$f" ]; then
+            sed -n 's/^blackbox_write=//p' "$f" | tr ',' '\n'
+        fi
+    done
+}
+
 # Whether SEG was named by --accept-unreadable.
 accepted() { # segment
     a=$(readlink -f "$1" 2>/dev/null || echo "$1")
@@ -373,11 +480,19 @@ check_formats() { # formats-file version
         case "$r" in RBF1:*) v=${r#RBF1:}; [ "$v" -gt "$maxv" ] 2>/dev/null && maxv=$v ;; esac
     done
     set +f
+    written=" $(written_formats | tr '\n' ' ') "
     report=$(ondisk_formats | while read -r fmt seg; do
         case " $reads " in *" $fmt "*) continue ;; esac
         case "$fmt" in
         RBF1:*)
-            if [ -n "$(accepted "$seg")" ]; then echo "ACCEPTED $fmt $seg"; else echo "BAD $fmt $seg"; fi
+            if [ -n "$(accepted "$seg")" ]; then
+                echo "ACCEPTED $fmt $seg"
+            else
+                case "$written" in
+                *" $fmt "*) echo "BAD $fmt $seg" ;;
+                *) echo "UNVERIFIED $fmt $seg" ;;
+                esac
+            fi
             ;;
         *) echo "UNKNOWN $fmt $seg" ;;
         esac
@@ -385,6 +500,7 @@ check_formats() { # formats-file version
     printf '%s\n' "$report" | while read -r kind fmt seg; do
         case "$kind" in
         UNKNOWN) echo "install-bundle: WARNING: $seg is not a RoboDR black-box frame ($fmt): damaged, or not a RoboDR segment; the format gate cannot judge it and it does not block. Check it: robodr-blackbox verify $(dirname "$seg")" ;;
+        UNVERIFIED) echo "install-bundle: WARNING: UNKNOWN: $seg claims $fmt, which no release installed on this unit writes (installed and kept releases write: $(written_formats | LC_ALL=C sort -u | tr '\n' ' ')): forged, damaged or from another unit; the claim cannot be verified and does not block. Check it: robodr-blackbox verify $(dirname "$seg")" ;;
         ACCEPTED) echo "install-bundle: WARNING: $seg is $fmt, which $2 does not read; accepted by --accept-unreadable: $2 will neither verify nor extend it" ;;
         esac
     done
@@ -457,8 +573,8 @@ ring_note() { # [deb-version]
         fi
     fi
     bs=$(sed -n 's/^bundle_sha256=//p' "$ring_env")
-    if [ -n "${tarball:-}" ] && [ -n "$bs" ] && [ -f "$tarball" ]; then
-        if [ "$(sha256sum "$tarball" | cut -d' ' -f1)" = "$bs" ]; then
+    if [ -n "$tarcopy" ] && [ -n "$bs" ] && [ -f "$tarcopy" ]; then
+        if [ "$(sha256sum "$tarcopy" | cut -d' ' -f1)" = "$bs" ]; then
             echo "install-bundle: the tarball is the ring's bundle ($bs)"
         else
             echo "install-bundle: note: the tarball is not the ring's bundle $bs (information only)"
@@ -484,11 +600,31 @@ find_pkg() { # dir
     case "$pkgfmt:$pkg" in deb:robodr | deb:robodr-focal | rpm:robodr) ;; *) die 1 "unexpected package $pkg in $pkgfile" ;; esac
 }
 
+# The variant a signed tarball's name names: robodr-focal-* holds
+# robodr-focal, any other robodr-* holds robodr.
+variant_of_name() { # tarball file name
+    case "$1" in robodr-focal-*) echo robodr-focal ;; *) echo robodr ;; esac
+}
+
+# Refuse to replace the installed variant (robodr / robodr-focal) with the
+# other one unless --allow-variant-switch: robodr-focal has no
+# robodr-pulsard, so a switch silently removes a detection layer.
+check_variant() { # package installed-lines
+    others=$(printf '%s\n' "$2" | awk -v p="$1" 'NF && $1 != p { print $1 }')
+    [ -n "$others" ] || return 0
+    o=$(echo "$others" | head -n1)
+    if [ "$allow_variant_switch" -ne 1 ]; then
+        die 1 "REFUSED: $o is installed and this release is $1: installing it REPLACES $o (dpkg removes it; robodr-focal has no robodr-pulsard). Pass --allow-variant-switch if this switch is deliberate."
+    fi
+    echo "install-bundle: WARNING: switching from $o to $1 (--allow-variant-switch)"
+}
+
 pubkey=""
 tarball=""
 bb_dirs=""
 accept_unreadable=""
 allow_downgrade=0
+allow_variant_switch=0
 cmd=${1:-}
 [ -n "$cmd" ] || die 2 "usage: $0 verify|install|list|rollback|ring ..."
 shift
@@ -511,6 +647,7 @@ while [ $# -gt 0 ]; do
         shift 2
         ;;
     --allow-downgrade) allow_downgrade=1; shift ;;
+    --allow-variant-switch) allow_variant_switch=1; shift ;;
     -*) die 2 "unknown option $1" ;;
     *)
         [ "$have_version" -eq 0 ] || die 2 "unexpected argument $1"
@@ -528,9 +665,10 @@ do_verify() {
         if [ -z "$pubkey" ] || [ -z "$tarball" ]; then
             die 2 "--pubkey and --tarball go together"
         fi
-        verify_sig "$pubkey" "$tarball"
-        verify_release_sums "$pubkey" "$tarball"
-        stage_tarball "$tarball"
+        stage_inputs "$tarball"
+        verify_sig "$pubkey" "$tarcopy" "$tname"
+        verify_release_sums "$pubkey"
+        stage_tarball "$tarcopy" "$tname"
         verify_sums "$bundle"
         check_running_copy "$bundle" "$tarball"
         signed=1
@@ -555,9 +693,14 @@ install)
         die 1 "refusing to install without a signature check (--pubkey/--tarball); ROBODR_ALLOW_UNSIGNED=1 for lab use"
     fi
     find_pkg "$bundle"
+    if [ "$signed" -eq 1 ] && [ "$pkgfmt" = deb ] && [ "$pkg" != "$(variant_of_name "$tname")" ]; then
+        die 1 "REFUSED: the signed tarball $tname names the $(variant_of_name "$tname") variant but holds $pkg"
+    fi
     ver=$(pkg_version "$pkgfile")
     valid_version "$ver" || die 1 "the package version $ver is malformed"
     check_other_format "$pkgfmt"
+    have=$(installed_pkgs "$pkgfmt")
+    check_variant "$pkg" "$have"
     prev=""
     cur=""
     while read -r p v; do
@@ -565,7 +708,7 @@ install)
         prev="$prev $p $v"
         cur=$v
     done <<EOF
-$(installed_pkgs "$pkgfmt")
+$have
 EOF
     echo "install-bundle: installing $pkg $ver ($pkgfmt; currently installed:${prev:- none})"
     if [ -n "$cur" ] && ver_lt "$ver" "$cur"; then
@@ -628,6 +771,7 @@ rollback)
     [ "$(pkg_version "$pkgfile")" = "$version_arg" ] ||
         die 1 "the kept package in $dir is not version $version_arg"
     check_other_format "$pkgfmt"
+    check_variant "$pkg" "$(installed_pkgs "$pkgfmt")"
     floor_from_ring
     check_floor "$version_arg"
     fmt=$(mktemp)

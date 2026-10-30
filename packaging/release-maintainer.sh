@@ -15,6 +15,13 @@ check_release_maintainer() {
         return 0
     fi
     local v="$1" addr re='^[^<>]*[^<> ] <([^<> ]+@[^<> ]+\.[^<> ]+)>$'
+    # No control character anywhere (newline, CR, tab, ...): [^<>] would
+    # match them, and a newline would add fields to DEBIAN/control or
+    # lines to the RPM spec.
+    if [[ "$v" == *[[:cntrl:]]* ]]; then
+        echo "$3: ROBODR_RELEASE=1: $2 must be one line of printable characters, 'Name <address>' (it contains a control character such as a newline; release.yml takes it from the repository variable ROBODR_MAINTAINER)" >&2
+        exit 2
+    fi
     if [[ ! "$v" =~ $re ]]; then
         echo "$3: ROBODR_RELEASE=1: $2 must be 'Name <address>' (got '$v'; release.yml takes it from the repository variable ROBODR_MAINTAINER)" >&2
         exit 2

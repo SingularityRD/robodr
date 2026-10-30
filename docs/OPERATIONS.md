@@ -84,17 +84,27 @@ an unverified extraction can be modified to skip every check. So **verify
 the tarball before extracting it**, and run the verifier from a trusted
 copy.
 
-*First installation* (no RoboDR on the unit yet):
+*First installation* (no RoboDR on the unit yet). Copy the tarball and its
+signature **once** into a root-owned 0700 directory and verify, extract and
+install **that copy** only: a file on removable media, or in a directory
+another user can write, can be swapped between the check and the
+extraction (the extraction then unpacks something that was never verified,
+and the package's scripts run as root):
 
 ```sh
-minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
-sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+sudo install -d -m 0700 -o root -g root /root/robodr-$V
+sudo cp -- robodr-$V-$A-offline.tar.gz robodr-$V-$A-offline.tar.gz.minisig /root/robodr-$V/
+sudo minisign -V -p /etc/robodr-trust/robodr-release.pub -m /root/robodr-$V/robodr-$V-$A-offline.tar.gz
+#   the "Trusted comment" printed must name robodr-$V-$A-offline.tar.gz
+sudo tar -xzf /root/robodr-$V/robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
 sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
     --pubkey /etc/robodr-trust/robodr-release.pub \
-    --tarball robodr-$V-$A-offline.tar.gz
+    --tarball /root/robodr-$V/robodr-$V-$A-offline.tar.gz
 ```
 
-*Upgrades* use the copy the previous, verified release installed:
+*Upgrades* use the copy the previous, verified release installed (it makes
+its own private copy of the tarball, step 1 below, so the tarball may stay
+on the media):
 
 ```sh
 sudo sh /usr/lib/robodr/install-bundle.sh install \
@@ -104,30 +114,45 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
 
 `install-bundle.sh install --pubkey … --tarball …`:
 
-1. checks the tarball's minisign signature against the pinned key; if the
-   release's `SHA256SUMS` and `SHA256SUMS.minisig` lie next to the tarball,
-   checks that signature too and that the tarball is listed in it with its
+1. refuses a tarball that is not a regular file (symlink, FIFO, device),
+   then **copies** it, its `.minisig` and (if present) the release's
+   `SHA256SUMS` / `SHA256SUMS.minisig` next to it **once** into a
+   **private** directory (`mktemp -d`, 0700; removed afterwards). Every
+   check and the extraction below read that copy only; the file named by
+   `--tarball` is never opened again, so swapping it afterwards changes
+   nothing;
+2. checks the copy's minisign signature against the pinned key, and that
+   the signature's **trusted comment** names the tarball's file name
+   (releases sign with `robodr <version> <file>`): a signed bundle renamed
+   to pass for another one (e.g. a `robodr-focal` bundle named like a
+   `robodr` one) is refused. If the release's `SHA256SUMS` was signed, its
+   signature is checked too and the tarball must be listed in it with its
    hash. Without `--pubkey`/`--tarball` it refuses unless
    `ROBODR_ALLOW_UNSIGNED=1` (labs only; the bundle is then the directory
    the script runs from);
-2. extracts the verified tarball into a **private** directory (`mktemp -d`,
-   0700; removed afterwards) and checks every file there against the inner
-   `SHA256SUMS` (any unlisted file fails). Everything below uses that copy,
-   never an already extracted directory. If the script runs from an
-   extracted bundle directory, that directory must be identical to the
-   signed content, otherwise it was modified after extraction and the run
-   is **refused**;
-3. refuses a **downgrade** (a release older than the installed one) unless
-   `--allow-downgrade`, and anything below the unit's **security floor**
-   (section 7), with no override;
-4. runs the black-box format gate (section 7);
-5. runs `dpkg -i`. The package creates the users `robodr` (exporters),
-   `robodr-agentd` (agentd), `robodr-exec` and the group `robodr-safety`
-   (sysusers) and the
+3. extracts the verified copy in the private directory and checks every
+   file there against the inner `SHA256SUMS` (any unlisted file fails).
+   Everything below uses that extraction, never an already extracted
+   directory. If the script runs from an extracted bundle directory, that
+   directory must be identical to the signed content, otherwise it was
+   modified after extraction and the run is **refused**;
+4. refuses a **downgrade** (a release older than the installed one,
+   including a half-installed or half-configured one left by a failed
+   upgrade) unless `--allow-downgrade`, and anything below the unit's
+   **security floor** (section 7), with no override. A signed tarball must
+   hold the variant its name names, and replacing the installed variant
+   (`robodr` / `robodr-focal`; the focal variant has no `robodr-pulsard`)
+   is **refused** unless `--allow-variant-switch`;
+5. runs the black-box format gate (section 7);
+6. runs `dpkg -i`. The package creates the users `robodr` (owner of the
+   shared group, runs nothing), `robodr-agentd` (agentd), `robodr-exec`
+   (executor), one user per network-facing service (`robodr-spool`,
+   `robodr-kafka`, `robodr-uplink`, `robodr-gw`; section 11.6) and the
+   group `robodr-safety` (sysusers) and the
    directories (tmpfiles), installs the units **disabled**, and installs
    `/usr/lib/robodr/install-bundle.sh`, the trusted verifier for the next
    upgrade;
-6. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
+7. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
    rollback.
 
 If `minisign` is not on the robot, verify on the entry station (section 2),
@@ -2159,7 +2184,15 @@ frame of every segment in `/var/lib/robodr/blackbox` and
 `/var/lib/robodr/fleet/journal` (or the `--blackbox-dir` given) and
 **refuses** a release that cannot read a segment in a recognised format
 (`RBF1:<version>`), naming the segment and its format: an older agent could
-neither verify nor extend that chain. To roll back across a format change,
+neither verify nor extend that chain. The segments are writable by
+`robodr-agentd`, so their first frame is only a claim: it blocks only when
+it is **verified**, i.e. its format is one that a release installed on this
+unit writes, by records only root writes (`blackbox_write=` of the
+installed package's formats file and of every kept release under
+`/var/lib/robodr/releases/`; `RBF1:1` always). A segment claiming a format
+no release here ever wrote is reported as `UNKNOWN` (logged with the
+segment, non-blocking): a compromised agent cannot block every update by
+forging one. Check such a segment with `robodr-blackbox verify`. To roll back across a format change,
 export the chain (section 8.2) and archive the directory as in a key
 rotation (section 4.3, "Alternative, new chain") first, then roll back; or install a release
 that reads the format; or, knowingly, accept that one segment with
@@ -2173,8 +2206,11 @@ journal (6.5), the control plane's request journal and evidence exports
 black-box chains; each daemon checks its own journal's format when it
 opens it. Tested against the real `dpkg` (install, upgrade, rollback,
 a refused rollback across a simulated format change, a refused downgrade,
-the security floor, unknown frames, a fleet-journal segment, a signed install from a tampered
-extracted directory refused, a tampered kept release) in
+the security floor, unknown frames, an unverifiable segment that does not
+block, a fleet-journal segment, a signed install from a tampered
+extracted directory refused, a tarball swapped after its signature check,
+a renamed signed tarball, a variant switch, a half-configured package, a
+tampered kept release) in
 `crates/robodr-fleet/tests/packaging.rs`; not yet on a robot.
 
 **RPM hosts** (RHEL / Rocky / Alma 9, Fedora). The release ships
@@ -2282,7 +2318,7 @@ exactly one.
 
 ```sh
 # Air-gapped / diode site, robot side (low side): spool -> signed diode
-# batches in /var/lib/robodr/export/diode. Runs as robodr (it renames
+# batches in /var/lib/robodr/export/diode. Runs as robodr-spool, group robodr (it renames
 # ready/ -> acked/ in agentd's spool), with no network at all.
 sudo robodr-blackbox keygen --out /etc/robodr/keys/diode.key   # .pub -> SOC importer
 sudo install -m 0640 -o root -g robodr \
@@ -2506,8 +2542,8 @@ store (no double processing).
 `/var/lib/robodr/export/uplink/uplink.lock` while it runs (also between
 runs). A manual `robodr-uplink --once` or `robodr-uplink reinject` on the
 same state directory exits 1 ("held by another robodr-uplink"): stop the
-service first, run as user `robodr`
-(`sudo -u robodr robodr-uplink ...`), start it again.
+service first, run as its user `robodr-uplink` (group `robodr`)
+(`sudo -u robodr-uplink -g robodr robodr-uplink ...`), start it again.
 
 #### Is the queue moving? (status, blocked batch)
 
@@ -2565,9 +2601,9 @@ come back by themselves. After fixing the registration:
 ```bash
 sudo systemctl stop robodr-uplink
 cd /var/lib/robodr/export/uplink
-sudo -u robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
+sudo -u robodr-uplink -g robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
     $(ls dead-letter.jsonl* | sed 's/^/--dead-letter /') --dry-run     # check the counts
-sudo -u robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
+sudo -u robodr-uplink -g robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
     $(ls dead-letter.jsonl* | sed 's/^/--dead-letter /')
 sudo systemctl start robodr-uplink
 ```
@@ -3114,6 +3150,48 @@ or other permissions, as for `--key`.
   is accepted from this release on; remove any workaround such as
   `allowed_gids` = the `robodr` gid (agentd now refuses to start with
   it).
+
+### 11.6 Upgrading from a release where the exporters and the gateway ran as `robodr`
+
+Earlier releases ran `robodr-spool-export`, `robodr-kafka-publish`,
+`robodr-uplink` and `robodr-firewall-gw` as one shared user, `robodr`.
+Any of them could therefore read the others' credential copies under
+`/run/credentials/<unit>/` (on `robodr-focal`, 0400 files owned by
+`robodr`), e.g. the diode signing key or the uplink key, and rewrite the
+others' state. Each now runs as a user of its own, with `Group=robodr`
+for agentd's spool and `/etc/robodr`:
+
+| unit | user |
+|------|------|
+| `robodr-spool-export` | `robodr-spool` |
+| `robodr-kafka-publish` | `robodr-kafka` |
+| `robodr-uplink` | `robodr-uplink` |
+| `robodr-firewall-gw` | `robodr-gw` |
+
+and sees only its own credentials directory (`TemporaryFileSystem=` over
+`/run/credentials`, its own directory bound back read-only).
+
+* The package (deb `postinst`, RPM `%post`) creates the users (sysusers)
+  and moves the state those releases wrote as `robodr` once:
+  `/var/lib/robodr/export/{diode,spool-export}` to `robodr-spool`,
+  `export/kafka-publish` to `robodr-kafka`, `export/uplink` to
+  `robodr-uplink`, `/var/lib/robodr/firewall-gw` to `robodr-gw`. It stops
+  the four units for that and starts what it stopped again. The
+  migration follows no symlink (it removes symlinks, FIFOs and devices
+  from those trees), replaces hardlinked files by copies, removes
+  group/other write and setuid/setgid bits, and is repeated until it has
+  completed (marker `/var/lib/robodr/.exporter-users-migrated`).
+* `robodr` keeps owning the shared group and runs nothing.
+* Drop-ins you wrote yourself: a `User=robodr` in a drop-in of one of
+  these units undoes the separation; remove it. On `robodr-focal`, a
+  drop-in that still passes `robodr` to `robodr-load-credential` (e.g. a
+  copy of the old `60-tls-credentials.conf.example`) is mapped to the
+  unit's own user with a warning in the journal; update it to
+  `robodr-kafka` (or the unit's user above).
+* Manual runs of the tools on a unit's state directory use its user, e.g.
+  `sudo -u robodr-uplink -g robodr robodr-uplink reinject ...` (section 8.5).
+* A host that installs with `adduser` instead of `systemd-sysusers` gets
+  the four users from the postinst too.
 
 ## 12. Sealed delivery: captured-unit protection (`robodr-seal`, Sprint 13c)
 
