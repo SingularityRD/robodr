@@ -739,8 +739,45 @@ sprint, AC'leri karşılanmadan kapanmaz.
   red-team kritik bulgu 0 açık, soak'ta veri kaybı/sızıntı yok, RC sürümü (`v1.0.0-rc.1`)
   imzalı yayınlandı.
 
-> **Durum (2026-10-26):** başlanmadı. Saha doğrulaması, soak, FP ölçümü,
-> red-team ve harici pentest yok; gerçek robot ve sensör kutusu yok.
+> **Durum (2026-10-30):** 🟡 Laboratuvar düzeyinde başladı (tek VM,
+> paylaşılan ve yüklü CPU; gerçek robot, sensör kutusu, RT çekirdek ve
+> donanım TPM yok). Ayrıntılar: `tools/e2e/RESULTS.md` ("Wave-2 soak and
+> red team") ve `tools/e2e/REDTEAM.md`.
+> - ✅ 2026-10-26: AutoSecOps'a uçtan uca akış (10 ingest doğrulaması) ve
+>   17 satırlık S11-lite red-team; F1 / F3 düzeltmeleri ve üç bağımsız
+>   inceleme turu.
+> - ✅ 2026-10-30, wave-2 başı (`1356263`): **2 saatlik simüle soak**,
+>   gerçek ikililerle: agentd (canlı yakalama, mTLS kontrol düzlemi,
+>   executor + motion adapter'ları, `gateway_feed`, mTLS uzak kafa
+>   çapası), netns köprüsünde NFQUEUE ile `robodr-firewall-gw` (Go2
+>   LowCmd 500 Hz, sport, JointTrajectory), mTLS Kafka'ya
+>   `robodr-kafka-publish`, 15 dakikada bir SOC `restrict_motion`.
+>   Çökme / yeniden başlama yok, sızıntı görülmedi (agentd tabanı
+>   ~11.9 MiB, gateway 4.2 MiB), veri kaybı yok (2946 bulgu = Kafka'ya
+>   2946, 0 dead-letter; kara kutu INTACT, CLEAN; çapa alarmı 0); 3.6 M
+>   LowCmd'den 12'si kayıp, köprü gecikmesi p50 166 µs / p99 1.7 ms.
+> - ✅ swtpm ile depo → **`robodr-deliverd` ikilisine** 12 sürümlük
+>   rollout (16 kurulum, kira yenileme), erase tetik sahteciliği, hareket
+>   halinde ertelenen / idle'da yürütülen erase, kira tekrarı: hepsi
+>   beklendiği gibi.
+> - ✅ Red-team (ikililer üzerinden): önceki R1–R6 yeniden (R6e artık
+>   yürütülüyor, `guid_only`) ve wave-2 için ~60 yeni senaryo
+>   (trajectory overshoot / stamp hileleri, gateway feed sahteciliği,
+>   WebRTC flood, onaylayıcı takma adları, kısıtlama dosyası
+>   kurcalama, executor sahteciliği, TLS slowloris, erase / kira).
+>   Bulunan 3 kusur düzeltildi (testler önce): gateway feed'de katalog
+>   dışı kural kimliği (W2-1), WebRTC flood özetinin gecikmesi (W2-2),
+>   sessiz gateway için `input_silent` yanlış alarmı (W2-3).
+> - 🟡 Açık: çok kaynaklı TLS slowloris kontrol düzlemine SOC erişimini
+>   saldırı süresince kesiyor (W2-4, Orta; `IPAddressAllow=` ile
+>   azaltılır, ürün düzeltmesi yok); bu hostta gateway paketlerin
+>   %0.46'sını 5 ms'den geç okudu → `internal_fault` Critical gürültüsü
+>   (O1, gerçek donanımda yeniden ölçülmeli; kural adı / toplama ürün
+>   kararı).
+> - ❌ 72 saat soak, gerçek robot / sensör kutusu, RT çekirdek, arm64,
+>   donanım TPM, Pulsar / eBPF, Nav2 / PX4 / Unitree eşleriyle motion
+>   adapter'ları, AutoSecOps ingest'in (R7) yeniden koşusu, harici
+>   pentest, FP < 1/robot/gün kanıtı yok; Kapı 3 AC karşılanmadı.
 
 ### Sprint 12 — Paketleme, kurulum, gözlemlenebilirlik
 
