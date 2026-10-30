@@ -7,7 +7,7 @@
 //!   "state_dir": "/var/lib/robodr/fleet",
 //!   "agentd_config": "/etc/robodr/agentd.json",
 //!   "soc": { "url": "https://soc.example.org/api", "ca_bundle": "/etc/robodr/uplink-ca.pem",
-//!            "spki_sha256": [], "keys": ["/etc/robodr/fleet-soc.pub"],
+//!            "spki_sha256": [], "crl_files": [], "keys": ["/etc/robodr/fleet-soc.pub"],
 //!            "approval_keys": ["/etc/robodr/fleet-approval.pub"] },
 //!   "workspace": null,
 //!   "keys": { "uplink": "/etc/robodr/keys/uplink.key",
@@ -19,6 +19,11 @@
 //! Every key is optional except `format`; the defaults are the values
 //! above (`soc.url`, `soc.keys`, `soc.approval_keys` and `workspace` have
 //! none). Unknown keys are refused. Paths must be absolute.
+//!
+//! `soc.crl_files`: CRLs (PEM or DER) of the CAs in `soc.ca_bundle`; a
+//! revoked SOC server certificate is refused, and so is every server when
+//! a CA has no CRL in them or its CRL is expired or unusable (fail closed,
+//! `robodr_blackbox::crl`). OCSP is not used (air-gapped fleets).
 //!
 //! `soc.keys` are the SOC's online **fleet keys** (tokens, answers, ring
 //! information); `soc.approval_keys` are its **approval keys**, the only
@@ -52,6 +57,8 @@ struct SocJson {
     ca_bundle: Option<PathBuf>,
     #[serde(default)]
     spki_sha256: Vec<String>,
+    #[serde(default)]
+    crl_files: Vec<PathBuf>,
     #[serde(default)]
     keys: Vec<PathBuf>,
     #[serde(default)]
@@ -95,6 +102,8 @@ pub struct Config {
     pub soc_url: Option<String>,
     pub ca_bundle: PathBuf,
     pub spki_sha256: Vec<String>,
+    /// CRLs of the SOC server's CAs (empty: no revocation check).
+    pub crl_files: Vec<PathBuf>,
     /// SOC fleet public keys (sign tokens, answers, ring info).
     pub soc_keys: Vec<PathBuf>,
     /// SOC approval public keys (sign profile approvals only; distinct
@@ -115,6 +124,7 @@ impl Default for Config {
             soc_url: None,
             ca_bundle: "/etc/robodr/uplink-ca.pem".into(),
             spki_sha256: Vec::new(),
+            crl_files: Vec::new(),
             soc_keys: Vec::new(),
             approval_keys: Vec::new(),
             workspace: None,
@@ -140,6 +150,7 @@ impl Config {
             soc_url: j.soc.url,
             ca_bundle: j.soc.ca_bundle.unwrap_or(d.ca_bundle),
             spki_sha256: j.soc.spki_sha256,
+            crl_files: j.soc.crl_files,
             soc_keys: j.soc.keys,
             approval_keys: j.soc.approval_keys,
             workspace: j.workspace,
@@ -182,6 +193,9 @@ impl Config {
         }
         for k in &self.approval_keys {
             paths.push(("soc.approval_keys[]", k));
+        }
+        for k in &self.crl_files {
+            paths.push(("soc.crl_files[]", k));
         }
         for (what, p) in paths {
             if !p.is_absolute() {

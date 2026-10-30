@@ -11,8 +11,8 @@
 //! missing or foreign client certificate, downgrades in both directions, a
 //! wrong password or user, an impostor broker that cannot prove it knows
 //! the credential, a downgraded iteration count, a broker without the
-//! mechanism, SASL over plain TCP. Nothing is delivered in any refused
-//! case.
+//! mechanism, SASL over plain TCP, a revoked broker certificate (CRL), an
+//! expired CRL. Nothing is delivered in any refused case.
 
 mod common;
 
@@ -59,6 +59,7 @@ impl Pki {
             cert_chain: self.p(&format!("{leaf}.pem")),
             key_file: self.p(&format!("{leaf}.key")),
             client_ca: client_ca.then(|| self.p("ca.pem")),
+            crl_files: Vec::new(),
         })
         .unwrap()
     }
@@ -75,6 +76,7 @@ impl Pki {
             key_file: cert.map(|c| self.p(&format!("{c}.key"))),
             server_name: name.map(str::to_string),
             spki_sha256: pins.to_vec(),
+            crl_files: Vec::new(),
         })
         .unwrap()
     }
@@ -492,4 +494,80 @@ fn a_trickled_tls_handshake_cannot_outlast_the_deadlines() {
     });
     let r = rx.recv_timeout(Duration::from_secs(8));
     assert_eq!(r, Ok(true), "still connecting after {:?}", t0.elapsed());
+}
+
+fn crl_client(pki: &Pki, crl: &str) -> ClientTls {
+    tls::load_client(&ClientTlsFiles {
+        ca_file: pki.p("crl-ca.pem"),
+        crl_files: vec![pki.p(crl)],
+        ..ClientTlsFiles::default()
+    })
+    .unwrap()
+}
+
+/// `crl_files` (`--tls-crl-file`): a revoked broker certificate is refused
+/// and counted, its unrevoked sibling of the same CA delivers; an expired
+/// CRL refuses every broker it covers (fail closed).
+#[test]
+fn crl_files_refuse_a_revoked_broker() {
+    let pki = Pki::new();
+    let c = tls_cluster(&pki, "crl-revoked-server", false);
+    let t = crl_client(&pki, "crl-ca.crl.pem");
+    let stats = t.crl.clone().unwrap();
+    let e = send(with_tls(&c, t), 2).unwrap_err();
+    assert!(e.to_string().contains("Revoked"), "{e}");
+    assert_eq!(c.total(), 0);
+    assert!(stats.status().revoked_rejections >= 1);
+    // Without the CRL the same broker is trusted (the CRL did the refusing).
+    let t = tls::load_client(&ClientTlsFiles {
+        ca_file: pki.p("crl-ca.pem"),
+        ..ClientTlsFiles::default()
+    })
+    .unwrap();
+    assert_eq!(send(with_tls(&c, t), 2).unwrap(), 2);
+    let c = tls_cluster(&pki, "crl-server", false);
+    assert_eq!(
+        send(with_tls(&c, crl_client(&pki, "crl-ca.crl.pem")), 2).unwrap(),
+        2
+    );
+    // An expired CRL: nothing is delivered, even to the unrevoked broker.
+    let c = tls_cluster(&pki, "crl-server", false);
+    let t = crl_client(&pki, "crl-ca-expired.crl.pem");
+    let stats = t.crl.clone().unwrap();
+    let e = send(with_tls(&c, t), 2).unwrap_err();
+    assert!(e.to_string().contains("ExpiredRevocationList"), "{e}");
+    assert_eq!(c.total(), 0);
+    assert!(stats.status().expired_crl_rejections >= 1);
+}
+
+#[test]
+fn cli_tls_crl_file() {
+    let pki = Pki::new();
+    let t = TempDir::new("kafka-tls-crl-cli");
+    let spool = spool_with(&t, 2);
+    let run = |c: &Cluster, extra: &[&str]| {
+        Command::new(PUBLISH)
+            .args(["--bootstrap", &c.bootstrap()[0], "--once"])
+            .args(["--spool".as_ref(), spool.as_os_str()])
+            .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let (ca, crl) = (pki.p("crl-ca.pem"), pki.p("crl-ca.crl.pem"));
+    let (ca, crl) = (ca.to_str().unwrap(), crl.to_str().unwrap());
+    // Without --tls-ca it is a usage error.
+    let c = tls_cluster(&pki, "crl-revoked-server", false);
+    let o = run(&c, &["--tls-crl-file", crl]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("need --tls-ca"));
+    // A revoked broker: nothing delivered.
+    let o = run(&c, &["--tls-ca", ca, "--tls-crl-file", crl]);
+    assert!(!o.status.success());
+    assert_eq!(c.total(), 0);
+    // An unrevoked one: delivered.
+    let c = tls_cluster(&pki, "crl-server", false);
+    let o = run(&c, &["--tls-ca", ca, "--tls-crl-file", crl]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(c.total(), 2);
 }

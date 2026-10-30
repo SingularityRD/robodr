@@ -1063,6 +1063,7 @@ impl Pki {
             key_file: cert.map(|c| p(&format!("{c}.key"))),
             server_name: name.map(str::to_string),
             spki_sha256: vec![],
+            crl_files: vec![],
         })
         .unwrap()
     }

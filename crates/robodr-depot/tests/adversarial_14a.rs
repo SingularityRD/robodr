@@ -333,6 +333,7 @@ fn tls(
             key_file: None,
             server_name: Some("depot.site-a".into()),
             spki_sha256: vec![],
+            crl_files: vec![],
         },
         sign,
     )?;

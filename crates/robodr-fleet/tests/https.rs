@@ -20,10 +20,15 @@ use std::sync::{Arc, Mutex};
 
 const BIN: &str = env!("CARGO_BIN_EXE_robodr-enroll");
 
+/// `fx/<name>`: the shared `fixtures/tls/` (its CRL set, `gen.sh crl`).
 fn tls_data(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../robodr-export/tests/data/uplink-tls")
-        .join(name)
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    match name.strip_prefix("fx/") {
+        Some(n) => root.join("../../fixtures/tls").join(n),
+        None => root
+            .join("../robodr-export/tests/data/uplink-tls")
+            .join(name),
+    }
 }
 
 struct Server {
@@ -51,11 +56,17 @@ fn now_ms() -> u64 {
 
 /// Serve `soc` over TLS; the SOC clock follows the system clock.
 fn serve(soc: Soc) -> Server {
-    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(tls_data("server.pem"))
-        .unwrap()
-        .map(|c| c.unwrap())
-        .collect();
-    let key = PrivateKeyDer::from_pem_file(tls_data("server.key")).unwrap();
+    serve_as(soc, "server")
+}
+
+/// [`serve`] with the certificate `<leaf>.pem` / `<leaf>.key`.
+fn serve_as(soc: Soc, leaf: &str) -> Server {
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(tls_data(&format!("{leaf}.pem")))
+            .unwrap()
+            .map(|c| c.unwrap())
+            .collect();
+    let key = PrivateKeyDer::from_pem_file(tls_data(&format!("{leaf}.key"))).unwrap();
     let cfg = Arc::new(
         rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -459,4 +470,42 @@ fn cli_never_takes_the_token_from_argv() {
     let o = child.wait_with_output().unwrap();
     assert_eq!(code(&o), 0, "{}", txt(&o));
     assert!(String::from_utf8_lossy(&o.stdout).contains("enrolled: robot ugv-001"));
+}
+
+/// `soc.crl_files`: a revoked SOC server certificate is refused before any
+/// request is sent; the unrevoked server of the same CA is reached.
+#[test]
+fn crl_files_refuse_a_revoked_soc_server() {
+    use robodr_fleet::client::{Https, SocTransport};
+    let u = Unit::new("https-crl");
+    let ca = u.root.join("crl-ca.pem");
+    let crl = u.root.join("crl-ca.crl.pem");
+    for (from, to) in [("fx/crl-ca.pem", &ca), ("fx/crl-ca.crl.pem", &crl)] {
+        std::fs::copy(tls_data(from), to).unwrap();
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let crls = vec![crl.clone()];
+    let revoked = serve_as(live_soc(), "fx/crl-revoked-server");
+    let mut t = Https::with_crls(&revoked.url(), Some(&ca), &[], &crls).unwrap();
+    let e = t.send("GET", "/x", Vec::new(), b"").unwrap_err();
+    assert!(e.to_string().contains("Revoked"), "{e}");
+    // Without the CRL the same server is reached (any HTTP answer will do).
+    let mut t = Https::new(&revoked.url(), Some(&ca), &[]).unwrap();
+    assert!(t.send("GET", "/x", Vec::new(), b"").is_ok());
+    let good = serve_as(live_soc(), "fx/crl-server");
+    let mut t = Https::with_crls(&good.url(), Some(&ca), &[], &crls).unwrap();
+    assert!(t.send("GET", "/x", Vec::new(), b"").is_ok());
+    // CRLs make no sense without TLS.
+    assert!(Https::with_crls("http://127.0.0.1:1/api", None, &[], &crls).is_err());
+    // The configuration takes them (absolute paths only).
+    let cfg = robodr_fleet::config::Config::parse(&format!(
+        r#"{{"format": "robodr-fleet-config/v1", "soc": {{"crl_files": [{:?}]}}}}"#,
+        crl.display().to_string()
+    ))
+    .unwrap();
+    assert_eq!(cfg.crl_files, crls);
+    assert!(robodr_fleet::config::Config::parse(
+        r#"{"format": "robodr-fleet-config/v1", "soc": {"crl_files": ["rel.crl"]}}"#
+    )
+    .is_err());
 }

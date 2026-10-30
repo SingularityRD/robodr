@@ -18,12 +18,17 @@
 //!   addition to** (never instead of) the chain check.
 //! * Optional client certificate (mutual TLS): `cert_chain` + `key_file`,
 //!   both or neither.
+//! * Optional `crl_files`: the server's chain is also checked against
+//!   these CRLs ([`crate::crl`]: whole chain, unknown status and an expired
+//!   CRL fail closed, files reloaded when they change).
 //!
 //! # Server ([`ServerTlsFiles`], [`load_server`])
 //!
 //! * `cert_chain` (end-entity first) + `key_file`.
 //! * Optional `client_ca`: then a client certificate chaining to it (validity,
 //!   `clientAuth` EKU) is **mandatory**; a handshake without one fails.
+//! * Optional `crl_files` (needs `client_ca`): client certificates are also
+//!   checked against these CRLs ([`crate::crl`]).
 //! * No session resumption (no tickets, no cache): every connection
 //!   authenticates afresh.
 //!
@@ -44,10 +49,9 @@
 //! caller's explicit configuration (`allow_plaintext`), never a fallback.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
+use rustls::server::NoServerSessionStorage;
 use rustls::{
     CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, OtherError,
     RootCertStore, ServerConfig, ServerConnection, SignatureScheme, StreamOwned,
@@ -80,6 +84,9 @@ pub struct ClientTlsFiles {
     /// SHA-256 pins of the server's end-entity SubjectPublicKeyInfo (64 hex
     /// digits each), checked in addition to the chain.
     pub spki_sha256: Vec<String>,
+    /// CRLs (PEM or DER) the server's chain is checked against
+    /// ([`crate::crl`]); empty: no revocation check.
+    pub crl_files: Vec<PathBuf>,
 }
 
 /// A loaded client configuration.
@@ -92,6 +99,8 @@ pub struct ClientTls {
     pub client_auth: bool,
     /// Number of SPKI pins.
     pub pins: usize,
+    /// Revocation counters (with `crl_files`).
+    pub crl: Option<Arc<crate::crl::CrlStats>>,
 }
 
 impl fmt::Debug for ClientTls {
@@ -100,6 +109,7 @@ impl fmt::Debug for ClientTls {
             .field("server_name", &self.server_name)
             .field("client_auth", &self.client_auth)
             .field("pins", &self.pins)
+            .field("crl", &self.crl.as_ref().map(|c| c.status()))
             .finish_non_exhaustive()
     }
 }
@@ -125,6 +135,25 @@ pub struct ServerTlsFiles {
     /// When set, clients must present a certificate chaining to one of
     /// these CAs (mutual TLS).
     pub client_ca: Option<PathBuf>,
+    /// CRLs (PEM or DER) client certificates are checked against
+    /// ([`crate::crl`]; needs `client_ca`).
+    pub crl_files: Vec<PathBuf>,
+}
+
+/// A loaded server configuration.
+#[derive(Clone)]
+pub struct ServerTls {
+    pub config: Arc<ServerConfig>,
+    /// Revocation counters (with `crl_files`).
+    pub crl: Option<Arc<crate::crl::CrlStats>>,
+}
+
+impl fmt::Debug for ServerTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerTls")
+            .field("crl", &self.crl.as_ref().map(|c| c.status()))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Parse a TLS server name: a DNS name or an IP literal (`[v6]` brackets
@@ -270,9 +299,11 @@ pub fn load_client(f: &ClientTlsFiles) -> Result<ClientTls, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let name = f.server_name.as_deref().map(server_name).transpose()?;
     let provider = provider();
-    let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-        .build()
-        .map_err(|e| format!("TLS: {e}"))?;
+    let (inner, crl) = crate::crl::server_verifier(
+        roots,
+        provider.clone(),
+        crate::crl::CrlFiles::new("crl_files", &f.crl_files)?,
+    )?;
     // `dangerous()` is rustls' name for "custom verifier"; this one runs the
     // full WebPKI verification first and only adds the pins (if any).
     let b = ClientConfig::builder_with_provider(provider)
@@ -283,7 +314,7 @@ pub fn load_client(f: &ClientTlsFiles) -> Result<ClientTls, String> {
             inner,
             pins: pins.clone(),
         }));
-    let (config, client_auth) = match (&f.cert_chain, &f.key_file) {
+    let (mut config, client_auth) = match (&f.cert_chain, &f.key_file) {
         (None, None) => (b.with_no_client_auth(), false),
         (Some(c), Some(k)) => {
             let chain = certs("cert_chain", c)?;
@@ -300,11 +331,13 @@ pub fn load_client(f: &ClientTlsFiles) -> Result<ClientTls, String> {
             )
         }
     };
+    no_resumption_with_crls(&mut config, &crl);
     Ok(ClientTls {
         config: Arc::new(config),
         server_name: name,
         client_auth,
         pins: pins.len(),
+        crl,
     })
 }
 
@@ -340,23 +373,36 @@ pub fn load_client_with_signer(
         .map(|p| parse_pin(p))
         .collect::<Result<Vec<_>, _>>()?;
     let provider = provider();
-    let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-        .build()
-        .map_err(|e| format!("TLS: {e}"))?;
+    let (inner, crl) = crate::crl::server_verifier(
+        roots,
+        provider.clone(),
+        crate::crl::CrlFiles::new("crl_files", &f.crl_files)?,
+    )?;
     let key: Arc<dyn rustls::sign::SigningKey> = Arc::new(ExternalP256 { sign });
     let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, key));
-    let config = ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("TLS: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinningVerifier { inner, pins }))
         .with_client_cert_resolver(Arc::new(FixedClientCert(certified)));
+    no_resumption_with_crls(&mut config, &crl);
     Ok(ClientTls {
         config: Arc::new(config),
         server_name: base.server_name,
         client_auth: true,
         pins: base.pins,
+        crl,
     })
+}
+
+/// With CRLs, every connection is a full handshake: a resumed session
+/// skips certificate verification, so a server revoked after the first
+/// connection would otherwise still be accepted.
+pub fn no_resumption_with_crls(config: &mut ClientConfig, crl: &Option<Arc<crate::crl::CrlStats>>) {
+    if crl.is_some() {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
 }
 
 #[derive(Debug)]
@@ -432,22 +478,30 @@ pub fn spki_der(cert: &CertificateDer<'_>) -> Result<Vec<u8>, String> {
 
 /// Load the server settings (module docs, "Server").
 pub fn load_server(f: &ServerTlsFiles) -> Result<Arc<ServerConfig>, String> {
+    load_server_tls(f).map(|t| t.config)
+}
+
+/// As [`load_server`], with the revocation counters.
+pub fn load_server_tls(f: &ServerTlsFiles) -> Result<ServerTls, String> {
     let chain = certs("cert_chain", &f.cert_chain)?;
     let key = private_key("key_file", &f.key_file)?;
     let provider = provider();
     let b = ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("TLS: {e}"))?;
-    let b = match &f.client_ca {
-        None => b.with_no_client_auth(),
+    let (b, crl) = match &f.client_ca {
+        None if !f.crl_files.is_empty() => {
+            return Err("crl_files needs client_ca (they check client certificates)".into())
+        }
+        None => (b.with_no_client_auth(), None),
         Some(ca) => {
-            let v = WebPkiClientVerifier::builder_with_provider(
+            let (v, crl) = crate::crl::client_verifier(
                 Arc::new(roots("client_ca", ca)?),
                 provider,
+                crate::crl::CrlFiles::new("crl_files", &f.crl_files)?,
             )
-            .build()
             .map_err(|e| format!("client_ca {}: {e}", ca.display()))?;
-            b.with_client_cert_verifier(v)
+            (b.with_client_cert_verifier(v), crl)
         }
     };
     let mut cfg = b
@@ -455,13 +509,17 @@ pub fn load_server(f: &ServerTlsFiles) -> Result<Arc<ServerConfig>, String> {
         .map_err(|e| format!("certificate / key: {e}"))?;
     cfg.session_storage = Arc::new(NoServerSessionStorage {});
     cfg.send_tls13_tickets = 0;
-    Ok(Arc::new(cfg))
+    Ok(ServerTls {
+        config: Arc::new(cfg),
+        crl,
+    })
 }
 
-/// Full WebPKI verification, then the SPKI pin check (no pins: WebPKI only).
+/// Full WebPKI verification (and CRLs), then the SPKI pin check (no pins:
+/// WebPKI only).
 #[derive(Debug)]
 struct PinningVerifier {
-    inner: Arc<WebPkiServerVerifier>,
+    inner: Arc<dyn ServerCertVerifier>,
     pins: Vec<[u8; 32]>,
 }
 

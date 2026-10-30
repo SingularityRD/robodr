@@ -55,7 +55,7 @@ level, and every path must be absolute.
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `gateway_feed` | Optional. Same keys as `host_threats`: the socket the in-path gateway writes its findings to. See "In-path gateway feed" below. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
-| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `client_crl` (PEM CRLs of the client CAs), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
+| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `crl_files` (PEM or DER CRLs of the client CAs, reloaded when they change; `client_crl` is the older single-file spelling), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
 | `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
@@ -364,7 +364,7 @@ accepted request is `recorded_not_executed` (`"executed": false`),
     "cert_chain": "/etc/robodr/control-plane/robot.pem",
     "key_file": "/run/credentials/robodr-agentd.service/cp-tls.key",
     "client_ca": "/etc/robodr/control-plane/soc-ca.pem",
-    "client_crl": "/etc/robodr/control-plane/soc-ca.crl.pem",
+    "crl_files": ["/etc/robodr/control-plane/soc-ca.crl.pem"],
     "client_spki_sha256": ["<64 hex>"]
   },
   "unix_socket": "/run/robodr-agentd/control.sock",
@@ -377,8 +377,11 @@ accepted request is `recorded_not_executed` (`"executed": false`),
 - **Transport (`src/control/tls.rs`).** A TCP listener with `tls` is mutual
   TLS (rustls + ring, the uplink's crates): the SOC's client certificate
   must chain to `client_ca`, be valid and permit `clientAuth`, and — with
-  pins — have a pinned SPKI; with `client_crl`, not be revoked (an issuer
-  without a CRL in the file fails closed); no session resumption. Without `tls`,
+  pins — have a pinned SPKI; with `crl_files`, not be revoked (an issuer
+  without a CRL, an expired CRL or an unusable replacement fails closed;
+  the files are re-read when they change, no restart; counters in
+  `status.json` `control_plane.tls.crl`, `robodr_blackbox::crl`); no
+  session resumption. Without `tls`,
   `listen_tcp` must be loopback (plain HTTP, tests / a local relay); the
   unix socket is plain too. `allow_remote` (v1) is gone and refused with a
   pointer to `tls`. A failed handshake is a failed authentication.
@@ -780,9 +783,10 @@ request.
 - **Control plane: tested locally only.** mTLS, signatures, the journal
   and the evidence API were exercised with an in-process client and an
   OpenSSL test PKI over loopback, not against a deployed SOC or across a
-  real network. TLS material is read at start (rotation = restart); SOC
-  certificate revocation is by CRL file only (`tls.client_crl`, no OCSP,
-  `nextUpdate` not enforced). The journal is checksummed, not
+  real network. TLS material is read at start (rotation = restart), CRLs
+  are reloaded when they change; SOC certificate revocation is by CRL file
+  only (`tls.crl_files`, `nextUpdate` enforced, no OCSP: air-gapped
+  fleets cannot reach a responder). The journal is checksummed, not
   signed (the black box is the signed record). The replay window needs NTP
   on robot and SOC. The `control_plane_request` fuzz target has run under
   the std-only smoke driver (about 90 000 inputs), not under libFuzzer.

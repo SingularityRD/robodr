@@ -17,6 +17,11 @@
 //!   `SubjectPublicKeyInfo` (DER, the whole SEQUENCE) must hash to one of
 //!   the pins, else the handshake is aborted. Several pins allow a key
 //!   rotation (current + next).
+//! * Optional CRLs (`--crl-file`, [`client_config_with_crls`]): the server's
+//!   chain is also checked for revocation (`robodr_blackbox::crl`: an
+//!   issuer without a CRL, an expired or an unusable CRL fail closed; the
+//!   files are reloaded when they change, no restart). OCSP is not used
+//!   (air-gapped fleets cannot reach a responder).
 //! * There is no switch that disables verification.
 //!
 //! # HTTP
@@ -243,7 +248,7 @@ pub fn spki_sha256(cert: &CertificateDer<'_>) -> Result<[u8; 32], String> {
 /// Full WebPKI verification, then the SPKI pin check.
 #[derive(Debug)]
 struct PinningVerifier {
-    inner: Arc<WebPkiServerVerifier>,
+    inner: Arc<dyn ServerCertVerifier>,
     pins: Vec<[u8; 32]>,
 }
 
@@ -341,6 +346,45 @@ pub fn load_ca_bundle(path: &Path) -> Result<RootCertStore, String> {
 /// The rustls client configuration: ring provider, TLS 1.3 and 1.2 (rustls'
 /// safe defaults), `roots` only, pins if any.
 pub fn client_config(roots: RootCertStore, pins: &[[u8; 32]]) -> Result<ClientConfig, String> {
+    client_config_with_crls(roots, pins, &[]).map(|(c, _)| c)
+}
+
+/// [`client_config`] with CRL files (PEM or DER; empty: none) and their
+/// live revocation counters.
+pub fn client_config_with_crls(
+    roots: RootCertStore,
+    pins: &[[u8; 32]],
+    crl_files: &[std::path::PathBuf],
+) -> Result<(ClientConfig, Option<Arc<robodr_blackbox::crl::CrlStats>>), String> {
+    let crls = robodr_blackbox::crl::CrlFiles::new("CRL file", crl_files)?;
+    if crls.is_none() {
+        return plain_client_config(roots, pins).map(|c| (c, None));
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let (inner, stats) =
+        robodr_blackbox::crl::server_verifier(Arc::new(roots), provider.clone(), crls)?;
+    // WebPKI + CRLs, then the pins (if any).
+    let verifier: Arc<dyn ServerCertVerifier> = if pins.is_empty() {
+        inner
+    } else {
+        Arc::new(PinningVerifier {
+            inner,
+            pins: pins.to_vec(),
+        })
+    };
+    let mut cfg = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    // A resumed session is not verified again: with CRLs every connection
+    // is a full handshake.
+    robodr_blackbox::tls::no_resumption_with_crls(&mut cfg, &stats);
+    Ok((cfg, stats))
+}
+
+fn plain_client_config(roots: RootCertStore, pins: &[[u8; 32]]) -> Result<ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()

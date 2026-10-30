@@ -34,10 +34,13 @@ use std::time::{Duration, Instant};
 const SENDER_SEED: [u8; 32] = [0x61; 32];
 const OTHER_ROBOT: &str = "ugv-008";
 
+/// `fx/<name>`: the shared `fixtures/tls/` (its CRL set, `gen.sh crl`).
 fn data(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/uplink-tls")
-        .join(name)
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    match name.strip_prefix("fx/") {
+        Some(n) => root.join("../../fixtures/tls").join(n),
+        None => root.join("tests/data/uplink-tls").join(name),
+    }
 }
 
 fn sender() -> Ed25519SigningKey {
@@ -853,4 +856,91 @@ fn cli_lock_status_and_reinject() {
         serde_json::from_str(String::from_utf8_lossy(&o.stdout).lines().next().unwrap()).unwrap();
     assert_eq!(rep["rejected"], 1);
     assert_eq!(rep["reinjected_done"].as_array().unwrap().len(), 1);
+}
+
+/// Put fixture `from` at `dir/to` (0644, atomic rename: a CRL update).
+fn put_crl(dir: &Path, from: &str, to: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = dir.join(format!(".{to}"));
+    fs::copy(data(from), &tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::rename(&tmp, dir.join(to)).unwrap();
+    dir.join(to)
+}
+
+/// `--crl-file`: a revoked SOC server certificate is refused (nothing
+/// sent), its unrevoked sibling accepted; a CRL replaced on disk applies
+/// to the running uplink's next connection (no restart); an expired CRL
+/// refuses every server of that CA.
+#[test]
+fn crl_files_refuse_a_revoked_server_and_reload() {
+    let dir = TempDir::new("uplink-crl");
+    let crl = put_crl(dir.path(), "fx/crl-ca-empty.crl.pem", "soc-ca.crl");
+    let roots = || http::load_ca_bundle(&data("fx/crl-ca.pem")).unwrap();
+    let (cfg, stats) =
+        http::client_config_with_crls(roots(), &[], std::slice::from_ref(&crl)).unwrap();
+    let stats = stats.unwrap();
+    let revoked = Server::start(
+        "127.0.0.1",
+        Some(("fx/crl-revoked-server.pem", "fx/crl-revoked-server.key")),
+        consumer(),
+    );
+    let url = format!("https://127.0.0.1:{}/api/", revoked.port);
+    // Not revoked yet: delivered.
+    let site = Site::new("crl-before");
+    site.spool(UNIT, 0, 1);
+    let rep = site
+        .uplink(transport(&url, Some(cfg.clone())), None)
+        .run_once()
+        .unwrap();
+    assert_eq!(rep.created, 1);
+    // The CRL now revokes it: the same (cloned) configuration refuses it.
+    put_crl(dir.path(), "fx/crl-ca.crl.pem", "soc-ca.crl");
+    let site = Site::new("crl-after");
+    site.spool(UNIT, 0, 1);
+    let before = revoked.request_count();
+    match site
+        .uplink(transport(&url, Some(cfg.clone())), None)
+        .run_once()
+    {
+        Err(UplinkError::GaveUp { last, .. }) => assert!(last.contains("Revoked"), "{last}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(revoked.request_count(), before);
+    assert_eq!(site.count("ready"), 1);
+    let st = stats.status();
+    assert_eq!(st.reloads, 1);
+    assert!(st.revoked_rejections >= 1);
+    // The unrevoked server of the same CA is fine.
+    let good = Server::start(
+        "127.0.0.1",
+        Some(("fx/crl-server.pem", "fx/crl-server.key")),
+        consumer(),
+    );
+    let rep = site
+        .uplink(
+            transport(
+                &format!("https://127.0.0.1:{}/api/", good.port),
+                Some(cfg.clone()),
+            ),
+            None,
+        )
+        .run_once()
+        .unwrap();
+    assert_eq!(rep.created, 1);
+    // An expired CRL: refused, revoked or not.
+    put_crl(dir.path(), "fx/crl-ca-expired.crl.pem", "soc-ca.crl");
+    let site = Site::new("crl-expired");
+    site.spool(UNIT, 0, 1);
+    let t = transport(&format!("https://127.0.0.1:{}/api/", good.port), Some(cfg));
+    match site.uplink(t, None).run_once() {
+        Err(UplinkError::GaveUp { last, .. }) => {
+            assert!(last.contains("revocation list expired"), "{last}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(stats.status().expired_crl_rejections >= 1);
+    // A file without a CRL is refused at load.
+    let e = http::client_config_with_crls(roots(), &[], &[data("fx/crl-ca.pem")]).unwrap_err();
+    assert!(e.contains("no X509 CRL"), "{e}");
 }

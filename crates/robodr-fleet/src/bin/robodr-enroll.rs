@@ -248,7 +248,13 @@ fn transport(ctx: &Ctx) -> Result<Https, Fail> {
             "no SOC URL (--soc-url or fleet.json soc.url); offline: use request/accept".into(),
         )
     })?;
-    Https::new(url, Some(&ctx.cfg.ca_bundle), &ctx.cfg.spki_sha256).map_err(Fail::Usage)
+    Https::with_crls(
+        url,
+        Some(&ctx.cfg.ca_bundle),
+        &ctx.cfg.spki_sha256,
+        &ctx.cfg.crl_files,
+    )
+    .map_err(Fail::Usage)
 }
 
 /// The enrollment token: from a root-only file or standard input, never
