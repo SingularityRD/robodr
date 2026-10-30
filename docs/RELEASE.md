@@ -14,13 +14,22 @@ Pushing a tag `v<VERSION>` runs `release.yml`:
 | Job | Runner | Does |
 |---|---|---|
 | `prepare` | ubuntu-24.04 | tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed. Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
-| `build` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm (native) | pinned clang-18 for ring, `scripts/ci-repro.sh` (two builds, two paths, must be bit-identical), release build (pure workspace, then the Pulsar-bound members incl. `robodr-pulsard`), released == reproduced, `Cargo.lock` unchanged, CycloneDX SBOM, `robodr_<debver>_<arch>.deb`, offline bundle, SBOM tarball, `SHA256SUMS-<arch>`; uploads to the draft |
-| `build-static` (amd64, arm64) | ubuntu-24.04 (both cross-linked with rust-lld) | musl repro + `scripts/build-static.sh`, built == reproduced, smoke run (qemu for arm64), SBOM, `robodr-focal_<debver>_<arch>.deb` + bundle, `SHA256SUMS-focal-<arch>`; uploads to the draft |
-| `publish` | ubuntu-24.04, environment `release` | re-checks every `SHA256SUMS-*`, writes `SHA256SUMS`, signs every asset with minisign, self-verifies with the public key variable, uploads signatures, publishes the draft |
+| `build` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm (native), in an **Ubuntu 22.04 container** (digest-pinned) | pinned clang-14 for ring, clang-20 (apt.llvm.org, key fingerprint pinned) for Pulsar's eBPF, `scripts/ci-repro.sh` (two builds, two paths, must be bit-identical), release build (`scripts/ci-release-build.sh`: pure workspace, then the Pulsar-bound members incl. `robodr-pulsard`), released == reproduced, `Cargo.lock` unchanged, CycloneDX SBOM, `robodr_<debver>_<arch>.deb` (`Depends:` from `dpkg-shlibdeps`, libc6 floor <= 2.35 checked), offline bundle, SBOM tarball, `SHA256SUMS-<arch>` |
+| `build-rpm` (amd64, arm64) | the same runners, in a **Rocky Linux 9 container** (digest-pinned) | pinned AppStream clang for ring and eBPF, `ci-repro.sh`, release build, released == reproduced, `robodr-<rpmver>-1.<x86_64\|aarch64>.rpm` (`packaging/build-rpm.sh`; generated GLIBC requirement <= 2.34 checked), `SHA256SUMS-rpm-<arch>` |
+| `build-static` (amd64, arm64) | ubuntu-24.04 (both cross-linked with rust-lld) | musl repro + `scripts/build-static.sh`, built == reproduced, smoke run (qemu for arm64), SBOM, `robodr-focal_<debver>_<arch>.deb` + bundle, `SHA256SUMS-focal-<arch>` |
+| `smoke` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm | `scripts/check-packages.py` on the three packages of the architecture, then `scripts/pkg-smoke-matrix.sh`: each package installed with apt / dnf in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky Linux 9 and Fedora 42 containers |
+| `publish` | ubuntu-24.04, environment `release` | downloads the build jobs' workflow artifacts, re-checks every `SHA256SUMS-*`, writes `SHA256SUMS`, signs every asset with minisign, self-verifies with the public key variable, uploads assets, sums and signatures to the draft, publishes it |
 
-15 assets + 15 `.minisig` per release (amd64 and arm64 each: `.deb`,
-offline bundle, SBOM tarball, focal `.deb`, focal bundle, two per-arch
-hash files; plus `SHA256SUMS`).
+The build jobs have `contents: read` only and hand their assets over as
+workflow artifacts; only `prepare` (creates the draft) and `publish`
+(behind the `release` environment) can write the release. Nothing is
+signed before `smoke` passed.
+
+19 assets + 19 `.minisig` per release (amd64 and arm64 each: `.deb`,
+offline bundle, SBOM tarball, `.rpm`, focal `.deb`, focal bundle, three
+per-arch hash files; plus `SHA256SUMS`). The RPM has no offline bundle
+(`install-bundle.sh` drives dpkg) and no SBOM tarball of its own (same
+`Cargo.lock` and crates as the `.deb`'s).
 
 ## 2. Signing keys: ceremony and where secrets live
 
@@ -96,13 +105,16 @@ repository.
    on that commit (it then skips its own release commit).
 4. Tag and push: `git tag -s v<version> -m "RoboDR <version>"` then
    `git push origin v<version>`.
-5. Watch `prepare`, `build` x2, `build-static` x2. Check in the logs:
-   `repro: N binary(ies) reproducible` for each target, the `sha256sum -c`
-   of released vs reproduced, `Depends:` lines of the `.deb`s.
+5. Watch `prepare`, `build` x2, `build-rpm` x2, `build-static` x2,
+   `smoke` x2. Check in the logs: `repro: N binary(ies) reproducible` for
+   each target, the `sha256sum -c` of released vs reproduced, the
+   `check-glibc-floor` lines (`.deb` `Depends:`, RPM `GLIBC_` requirement),
+   and the `pkg-smoke-matrix` summary (every row `ok`).
 6. Approve the `release` environment for `publish` (second maintainer).
 7. After publish: download the release on a clean machine, verify with the
    pinned release key as in `OPERATIONS.md` section 2, and run
-   `scripts/deb-install-smoke.sh` on the four `.deb`s.
+   `scripts/deb-install-smoke.sh` on the four `.deb`s (systemd >= 250 for
+   its `verify --root`).
 8. If a job fails after the draft exists: fix on main, delete the draft
    release and the tag, re-tag the fixed commit. Never re-tag a version
    that was **published**: bump instead.
@@ -114,14 +126,35 @@ repository.
 - [ ] security floor / formats reviewed
 - [ ] dry run passed on the release commit (optional)
 - [ ] signed tag pushed
-- [ ] reproducibility lines present in all four build jobs
-- [ ] draft reviewed: 15 assets, per-arch `SHA256SUMS-*`
+- [ ] reproducibility lines present in all six build jobs
+- [ ] `smoke` green on both architectures
+- [ ] 19 assets + `.minisig` each in the published release, per-arch `SHA256SUMS-*`
 - [ ] `release` environment approved by a second maintainer
 - [ ] published release verified offline with the pinned key
 - [ ] `deb-install-smoke.sh` on the published `.deb`s
 - [ ] release-key statement and root public key unchanged (or rotation announced)
 
+### RPM signatures
+
+The `.rpm` is signed like every other asset: a minisign signature and its
+line in `SHA256SUMS`, verified on the entry station before
+`dnf install ./robodr-*.rpm` (dnf does not check signatures of a local
+file by default on RHEL 9). An OpenPGP signature inside the RPM
+(`rpmsign --addsign`), needed for a dnf repository with `gpgcheck=1`, is
+**not** produced: it needs an OpenPGP release key, its own ceremony
+(section 2) and a secret in the `release` environment. Hook for it: after
+`build-rpm` and before `publish` hashes the assets (an `rpmsign` step in
+`publish`, before "Check per-arch hashes", re-hashing the RPMs into
+`SHA256SUMS-rpm-<arch>`).
+
 ## 4. Dry run
+
+**Not updated for the 2026-10-30 release workflow.**
+`scripts/gha-local-run.py` refuses `container:` jobs and
+`actions/download-artifact`, which `build`, `build-rpm`, `smoke` and
+`publish` now use; the dry run below describes the previous workflow.
+Extending it (run container jobs with `docker run`, emulate the artifact
+hand-over with a local directory) is open work.
 
 `scripts/release-dry-run.sh [--tag v0.1.0-rc.0-dryrun] [--out DIR]`
 replays `release.yml` on one Ubuntu 24.04 amd64 host without GitHub:

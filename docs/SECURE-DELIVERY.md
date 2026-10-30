@@ -1268,7 +1268,7 @@ block of their own); `unseal_failed` (High), `erased` and `tamper`
 `lease_expired` (Medium) from 14b. 14a/14b: the five `robot.depot.*` ids
 and `robot.seal.erase_deferred` are catalogued in contract
 `robodr.findings` **2.3.0** in a block of their own (`catalog_2_3_depot`,
-data source `robodr_delivery`, `docs/contracts/robodr.findings.md` §3d);
+data source `robodr_delivery`, `docs/contracts/robodr.findings.md` §3e);
 the depot writes its findings into the agentd spool of its own box with
 `robodr-deliverd`'s writer, so they leave the site through the same
 exporters and diode. `lease_expired` is now emitted (Medium, once per

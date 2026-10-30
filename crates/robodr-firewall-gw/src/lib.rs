@@ -152,6 +152,7 @@ pub mod sys;
 #[doc(hidden)]
 pub mod testkit;
 pub mod trajectory;
+pub mod webrtc;
 
 pub use config::{Codec, GatewayConfig, GatewayMode, LocoModel, OnGatewayDown};
 pub use gateway::{Gateway, GatewayStats, PacketMeta, Verdict};

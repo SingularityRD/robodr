@@ -10,6 +10,119 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Added (packaging and platforms)
+
+- The `robodr` `.deb` is built in an **Ubuntu 22.04** userland (glibc
+  2.35), natively for amd64 and arm64, `robodr-pulsard` included (clang-20
+  from apt.llvm.org, archive key pinned by fingerprint): it installs on
+  Ubuntu 22.04 / NVIDIA JetPack 6, Debian 12 and newer. Before, it was
+  built on Ubuntu 24.04 and needed glibc 2.39. `Depends:` now comes from
+  `dpkg-shlibdeps` plus a soname table (an unknown library fails the
+  build), with the libc6 floor checked (`scripts/check-glibc-floor.sh`).
+- **RPM** for RHEL / Rocky / Alma 9 and Fedora (`packaging/build-rpm.sh`,
+  `packaging/rpm/`): built on Rocky Linux 9 (glibc 2.34), the `.deb`'s file
+  tree (`build-deb.sh --stage-only`), `%config(noreplace)` for
+  `pulsar.toml`, scriptlets equivalent to the maintainer scripts, rpm's
+  generated ELF requirements. Released with its own `SHA256SUMS-rpm-<arch>`
+  and minisign signatures; no offline bundle, no OpenPGP signature yet.
+- External BTF for kernels without it (NVIDIA L4T): the
+  `robodr-pulsard` unit accepts `/etc/robodr/btf/vmlinux` (Pulsar's
+  `[pulsar] btf_path`, commented in `pulsar.toml`) instead of
+  `/sys/kernel/btf/vmlinux`, and `robodr-btf-check` refuses to start with
+  any other `btf_path`, or a file whose stamp names another kernel build
+  or another SHA-256. Generation with `pahole`:
+  `docs/UNITREE.md` 3.2.1.
+- `robodr-focal`: a systemd 245 variant of the Kafka TLS / SASL credential
+  drop-in example (`robodr-load-credential` instead of `LoadCredential=`).
+- CI: `package-deb`, `package-rpm` (container jobs per architecture, with
+  the reproducibility proof in the build userland) and `package-smoke`
+  (apt / dnf installs in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky
+  Linux 9 and Fedora 42 containers, `scripts/pkg-install-smoke.sh`).
+  `release.yml` builds the same way, smoke-installs before signing, and
+  its build jobs no longer hold `contents: write`.
+- `scripts/check-packages.py`: every workspace program classified per
+  package variant, every `ROBODR_DEB_REQUIRE` list complete, deb and rpm
+  scripts handling the same units, and built packages compared (paths,
+  modes, content, ownership, no setuid / group-writable file, no private
+  key material). `scripts/check-focal-units.py` also checks the regular
+  drop-in examples that `robodr-focal` ships unchanged.
+
+### Fixed (packaging)
+
+- CI's `robodr-focal` build did not require `robodr-executor` and
+  `robodr-firewall-gw` (the release did): a CI package could lack them.
+- `robodr-focal` shipped the Kafka credential drop-in example with
+  `LoadCredential=`, which systemd 245 ignores.
+- `build-deb.sh` created man pages with the caller's umask: under umask
+  000 (as in a container) they were world-writable in the package. It now
+  sets umask 022 and the mode explicitly.
+- The `.deb`'s `prerm` did not stop `robodr-deliverd` on removal.
+- `scripts/deb-install-smoke.sh` used `cp --update=none` (coreutils >= 9.3).
+- Removal left services enabled, so a reinstall started them at the next
+  boot before commissioning: RPM erase now disables them, deb purge
+  removes their `.wants` / `.requires` links (masks and drop-ins stay).
+- `robodr-pulsard.service` set `SecureBits=noroot-locked` without
+  `AmbientCapabilities=`, so the daemon would have run without any
+  capability (no `CAP_BPF`): the ambient set now equals the bounding set.
+- The pinned clang of ring now also pins the LLVM libraries that hold its
+  code generator (`libllvm*`, `libclang-cpp*`, ...), not only the driver.
+
+### Added (Unitree coverage gaps)
+
+- `robodr-cdr`: the Go1 `unitree_legged_sdk` v3.8.6 **compressed
+  `LowCmd`** (614 bytes) is decoded (`LegacyLowCmdCompressed`). Its layout
+  was read from the shipped library's `refineCmd`, with offsets pinned by
+  tests. It expands exactly into the declared `LowCmd`, so the passive
+  path applies the same motion checks. The compressed `LowState` (807
+  bytes) is still reported as not inspected.
+- `robodr-cdr`: `ModelInfo::inferred_idl`. A2 / AS2 low-level commands
+  are inferred to be `unitree_go` and marked as inferred, because the SDK
+  ships no A2 / AS2 low-level type. agentd refuses a profile that recorded
+  another layout on such a robot.
+- `robodr-firewall-gw`: codec `go1_low_cmd_compressed`. Limited
+  fixed-point values round to the safe side. Values outside `i16` are
+  suppressed, and holds use the last accepted frame.
+- `robodr-firewall-gw`: codec `unitree_a2_lowcmd` (the go `LowCmd_` path
+  with `require_crc`, a type recorded in the profile, no bypass and no
+  battery off).
+- `robodr-ros2-pipeline`: `webrtc` monitor for Go2 WebRTC control
+  sessions. It reads the signalling metadata, ICE, TURN and DTLS headers,
+  and attributes peers.
+- `robodr-firewall-gw`: a `webrtc` section. It feeds the monitor from
+  NFLOG copies, can drop unlisted signalling (`block_unlisted`) and
+  provides quarantine sets by peer or flow. `webrtc-block` prints the
+  `nft` command.
+- Findings contract 2.3.0, Unitree block (§3d):
+  `robot.unitree.webrtc_unknown_controller`, `webrtc_new_peer`,
+  `webrtc_controller_mac_mismatch`, `webrtc_session_in_denied_window`,
+  `webrtc_concurrent_sessions`, `webrtc_relayed_session`,
+  `webrtc_media_without_signalling`. agentd's `gateway_feed` accepts them.
+- Fuzz targets `go1_compressed_lowcmd` and `unitree_webrtc`.
+- Review fixes, WebRTC monitor:
+  - Findings are deduplicated per peer session, so a returning peer is
+    reported again.
+  - Non-Critical findings are rate limited per minute with an aggregate
+    count. The Critical established-session finding is never suppressed.
+  - Eviction prefers single-packet, non-established peers.
+- Review fixes, gateway:
+  - It passes `NFULA_HWADDR` to the monitor, so the MAC binding of
+    controllers is now checked.
+  - `block_unlisted` also refuses a MAC-bound controller's IP from
+    another MAC, and logs every drop so the refused host is still
+    reported as a `TcpConnect` attempt.
+  - A top-level `robot_model` cross-checks the A2 / AS2 channel.
+- Review fixes, agentd: the feed accepts exactly the monitor's WebRTC
+  ids.
+
+### Changed
+
+- `robodr-firewall-gw`: a Go1 `HighCmd` or `LowCmd` with a non-zero
+  `bms.off` (`0xA5` turns the battery off) is now refused like on
+  `unitree_go_lowcmd`. It was forwarded before.
+- `robodr-ros2-pipeline`: a 614-byte legacy `LowCmd` is decoded and
+  checked against the profile; it is no longer reported as
+  `robot.motion.undecodable_sample`.
+
 ### Added (Sprint 8: motion gateway channels and adapters)
 
 - `robodr-firewall-gw`: ROS 2 joint-trajectory channels
@@ -98,7 +211,7 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
     `robot.depot.import_refused`, `robot.depot.enrolment_refused`,
     `robot.depot.unit_enrolled`, `robot.depot.rollout_halted`,
     `robot.depot.locked`, `robot.seal.erase_deferred`
-    (`docs/contracts/robodr.findings.md` §3d); also in `robodr-correlate`'s
+    (`docs/contracts/robodr.findings.md` §3e); also in `robodr-correlate`'s
     catalog. `robot.seal.lease_expired` is now emitted.
   - Fuzz targets `pkg_entry` and `seal_attest`.
   - Verified against software TPMs (swtpm) on loopback only; not on a

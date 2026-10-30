@@ -1,0 +1,25 @@
+#!/bin/sh
+# robodr postun scriptlet (RPM). The counterpart of packaging/deb/postrm.
+#
+# Evidence and keys are NEVER deleted by the package manager: /var/lib/robodr
+# holds the signed black box (possibly the only record of an incident) and
+# /etc/robodr/keys the material needed to verify it. Deleting them is a
+# deliberate, documented operator action (OPERATIONS.md, "Decommissioning").
+# RPM has no purge: an erase is the deb's "remove", so the executor journal
+# (removed by the deb's purge) is kept too; delete
+# /var/lib/robodr/executor/journal.json by hand before a reinstall that
+# must not re-validate the old installation's actions.
+#
+# $1: 0 = removal, >= 1 = upgrade (this is the old package's scriptlet).
+set -e
+
+if [ "${1:-0}" -eq 0 ]; then
+    if [ -d /var/lib/robodr ] || [ -d /etc/robodr ]; then
+        echo "robodr: removal keeps /var/lib/robodr (evidence) and /etc/robodr (keys, profile)."
+        echo "robodr: export and archive them first; see OPERATIONS.md, 'Decommissioning'."
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || :
+    fi
+fi
+exit 0

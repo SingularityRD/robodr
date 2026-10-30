@@ -392,8 +392,9 @@ fn request(api_id: i64, param: &str) -> Vec<u8> {
 }
 
 /// The legacy UDP path at the pipeline: ignored (counted) while off; on, a
-/// command from an unlisted sender is Critical, a compressed frame
-/// undecodable, and every finding is deduplicated.
+/// command from an unlisted sender is Critical, a compressed `LowState`
+/// undecodable (a compressed `LowCmd` decodes), and every finding is
+/// deduplicated.
 #[test]
 fn legacy_udp_at_the_pipeline() {
     use robodr_cdr::unitree_legacy::channels;
@@ -467,7 +468,7 @@ fn legacy_udp_at_the_pipeline() {
             assert!(o.findings.is_empty(), "deduplicated: {:?}", o.findings);
         }
     }
-    let o = on.process_legacy_at(&[0x5a; 614], "192.168.123.15", &udp, t0, 9);
+    let o = on.process_legacy_at(&[0x5a; 807], "192.168.123.10", &udp, t0, 9);
     assert_eq!(o.findings.len(), 1);
     assert_eq!(
         o.findings[0].deviation.rule,

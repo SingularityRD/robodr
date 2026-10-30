@@ -1,0 +1,34 @@
+#!/bin/sh
+# robodr post scriptlet (RPM). The counterpart of packaging/deb/postinst: creates the
+# RoboDR users (sysusers) and directories (tmpfiles), reloads systemd.
+# Services are NOT enabled or started on first install: an uncommissioned
+# robot must not start enforcing (OPERATIONS.md, "Commissioning"). On
+# upgrade, services that were running are restarted on the new binaries.
+#
+# $1: 1 = first install, >= 2 = upgrade (RPM runs the new package's post scriptlet
+# after its files are in place, before the old package's preun / postun).
+#
+# Not here, on purpose: the deb's agentd-tree migration (review H1). It
+# moves trees written by releases where robodr-agentd ran as robodr; no RPM
+# of such a release exists. Requires(post): systemd guarantees
+# systemd-sysusers and systemd-tmpfiles (no adduser fallback needed).
+set -e
+
+systemd-sysusers /usr/lib/sysusers.d/robodr.conf
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/robodr.conf
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || :
+    if [ "${1:-1}" -ge 2 ]; then
+        # Upgrade: restart only what was running.
+        for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
+            robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
+            robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service \
+            robodr-depot.service; do
+            systemctl try-restart "$u" || :
+        done
+    else
+        echo "robodr: installed. Services are disabled until commissioning is"
+        echo "robodr: complete: see /usr/share/doc/robodr/OPERATIONS.md"
+    fi
+fi
+exit 0

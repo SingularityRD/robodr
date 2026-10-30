@@ -259,7 +259,8 @@ valid seal if locked.
   capture diagnostics list the command senders' IPs
   (`unitree_legacy_command_senders`) for the sensor's
   `unitree_legacy.command_senders`, to be confirmed by the operator.
-  Compressed v3.8.6 low-level frames are counted, not learned.
+  Compressed v3.8.6 `LowCmd` frames (614 B) are learned like the declared
+  ones; compressed `LowState` frames (807 B) are counted, not learned.
 * **Multi-mission**: repeat `--events` in `learn`. The runs are unioned inside
   one `Learner`, so percentiles and warnings cover every sample and the margin
   is applied once. `merge` unions profiles that were already learned: per

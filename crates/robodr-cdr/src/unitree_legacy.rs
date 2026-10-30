@@ -21,14 +21,21 @@
 //! decode directly. For `LowCmd` / `LowState` the header comments say the
 //! wire length is "shorter than sizeof(...), bytes compressed"
 //! (`LOW_CMD_LENGTH = 614`, `LOW_STATE_LENGTH = 807`, against packed
-//! `sizeof` 734 / 937). The compressed wire layout is not published in the
-//! headers, so this module decodes the **declared** (uncompressed) `comm.h`
-//! layout: a [`LegacyLowCmd`] / [`LegacyLowState`] decode succeeds on a
-//! buffer of the packed `sizeof` and is rejected on a 614 / 807-byte
-//! compressed frame (reported by [`LegacyKind::for_len`] as the compressed
-//! form). The README records this limitation; the capture-side wiring that
-//! another agent adds should treat a 614 / 807-byte payload as a Go1
-//! low-level frame this crate cannot yet decode.
+//! `sizeof` 734 / 937).
+//!
+//! **Compressed `LowCmd` (614 bytes).** Its layout is not in any header,
+//! but it is in the shipped static library: `UDP::SetSend(LowCmd&)` calls
+//! `refineCmd(LowCmd_refine&, LowCmd&)` and sends the first
+//! `LOW_CMD_LENGTH` bytes of the result. [`LegacyLowCmdCompressed`]
+//! decodes it as read from that function's machine code (offsets in
+//! [`compressed_layout`], scales in [`compressed_scale`]; the tests pin
+//! every offset, and the same code confirms the `comm.h` offsets of the
+//! declared struct it reads from). [`LegacyFrame::decode`] expands a
+//! 614-byte payload into a [`LegacyLowCmd`] with exact values, so it gets
+//! the same motion checks as the declared layout.
+//!
+//! **Compressed `LowState` (807 bytes)** is still not decoded (state, not a
+//! command; [`LegacyFrameError::Compressed`]).
 //!
 //! # Ports
 //!
@@ -430,6 +437,268 @@ impl LegacyLowCmd {
     }
 }
 
+/// One motor of the v3.8.6 compressed `LowCmd` (the library's internal
+/// `MotorCmd_refine`, 27 bytes packed): `mode`, `q` and `dq` as in
+/// `comm.h`, `tau` / `Kp` / `Kd` as signed 16-bit fixed point.
+///
+/// Recovered from `UNITREE_LEGGED_SDK::refineCmd(LowCmd_refine&, LowCmd&)`
+/// in the shipped `libunitree_legged_sdk.a` (v3.8.6, amd64 `udp.cpp.o`;
+/// no header declares it): for each motor the library copies `mode`, `q`,
+/// `dq` and the three reserve words and stores `(int)(tau * 256.0f)`,
+/// `(int)(Kp * 32.0f)`, `(int)(Kd * 16.0f)` (`cvttss2si`: truncation
+/// toward zero, the low 16 bits kept). `refineState` reads the
+/// corresponding `int16` fields of the state sign-extended (`movswl`), so
+/// the three fields are decoded as `i16`. A `Kp` / `Kd` beyond the 16-bit
+/// range wraps on the sender; what the robot receives is what is decoded
+/// here.
+///
+/// The sender's conversion depends on its CPU for `|value × scale| ≥ 2^31`
+/// or NaN: amd64 `cvttss2si` gives `0x80000000` (low half 0), arm64
+/// `fcvtzs` saturates (`0x7FFFFFFF` → low half -1, `0x80000000` → 0; NaN →
+/// 0). Only the amd64 object was disassembled. This changes what a sender
+/// puts on the wire, not how it is decoded: the decoder (and the gateway)
+/// read the wire value, so there is no safety impact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LegacyMotorCmdCompressed {
+    /// Servo `0x0A`, damping `0x00` (`comm.h`).
+    pub mode: u8,
+    /// `q` (rad), IEEE f32 bits (kept as bits so `Eq` holds for NaN).
+    pub q_bits: u32,
+    /// `dq` (rad/s), IEEE f32 bits.
+    pub dq_bits: u32,
+    /// `tau * 256` (N·m, Q8).
+    pub tau_q: i16,
+    /// `Kp * 32` (Q5).
+    pub kp_q: i16,
+    /// `Kd * 16` (Q4).
+    pub kd_q: i16,
+    pub reserve: [u32; 3],
+}
+
+/// Fixed-point scales of [`LegacyMotorCmdCompressed`] (`.rodata.cst4` of
+/// `udp.cpp.o`: `0x43800000` = 256, `0x42000000` = 32, `0x41800000` = 16).
+pub mod compressed_scale {
+    /// `tau` (Q8: 1/256 N·m steps, range about ±128 N·m).
+    pub const TAU: f32 = 256.0;
+    /// `Kp` (Q5: 1/32 steps, range about ±1024).
+    pub const KP: f32 = 32.0;
+    /// `Kd` (Q4: 1/16 steps, range about ±2048).
+    pub const KD: f32 = 16.0;
+}
+
+/// Byte offsets of the compressed `LowCmd` (`LowCmd_refine`), as read from
+/// `refineCmd`'s stores; the tests pin them, and the gateway's own writer
+/// (`robodr-firewall-gw`) is cross-checked against them.
+pub mod compressed_layout {
+    /// First motor (after `head[2]`, `levelFlag`, `frameReserve`, `SN[2]`,
+    /// `version[2]`, `bandWidth`: the same 22-byte header as `comm.h`).
+    pub const MOTOR_AT: usize = 22;
+    /// Bytes per motor (`add $0x1b` in the loop).
+    pub const MOTOR_LEN: usize = 27;
+    /// Within a motor: `mode` u8, `q` f32, `dq` f32, `tau` i16, `Kp` i16,
+    /// `Kd` i16, `reserve[3]` u32.
+    pub const M_MODE: usize = 0;
+    pub const M_Q: usize = 1;
+    pub const M_DQ: usize = 5;
+    pub const M_TAU: usize = 9;
+    pub const M_KP: usize = 11;
+    pub const M_KD: usize = 13;
+    pub const M_RESERVE: usize = 15;
+    /// `BmsCmd bms` (`0x232`).
+    pub const BMS_AT: usize = 562;
+    /// `wirelessRemote[40]` (`0x236`).
+    pub const WIRELESS_AT: usize = 566;
+    /// `reserve` u32 (`0x25e`).
+    pub const RESERVE_AT: usize = 606;
+    /// `crc` u32 (`0x262`).
+    pub const CRC_AT: usize = 610;
+    /// `crc32(frame, 0x98)`: 152 words = the first 608 bytes (the last two
+    /// bytes of `reserve` are not covered, as for every legacy frame whose
+    /// length is not a multiple of 4: `frame_crc`).
+    pub const CRC_WORDS: usize = 152;
+}
+
+impl LegacyMotorCmdCompressed {
+    fn read(r: &mut Le<'_>) -> Self {
+        LegacyMotorCmdCompressed {
+            mode: r.u8(),
+            q_bits: r.u32(),
+            dq_bits: r.u32(),
+            tau_q: r.i16(),
+            kp_q: r.i16(),
+            kd_q: r.i16(),
+            reserve: r.arr(Le::u32),
+        }
+    }
+
+    pub fn q(&self) -> f32 {
+        f32::from_bits(self.q_bits)
+    }
+
+    pub fn dq(&self) -> f32 {
+        f32::from_bits(self.dq_bits)
+    }
+
+    /// `tau` in N·m (exact: an `i16` over a power of two).
+    pub fn tau(&self) -> f32 {
+        f32::from(self.tau_q) / compressed_scale::TAU
+    }
+
+    pub fn kp(&self) -> f32 {
+        f32::from(self.kp_q) / compressed_scale::KP
+    }
+
+    pub fn kd(&self) -> f32 {
+        f32::from(self.kd_q) / compressed_scale::KD
+    }
+
+    /// The motor as the declared `comm.h` `MotorCmd` (values exact).
+    pub fn expand(&self) -> LegacyMotorCmd {
+        LegacyMotorCmd {
+            mode: self.mode,
+            q: self.q(),
+            dq: self.dq(),
+            tau: self.tau(),
+            kp: self.kp(),
+            kd: self.kd(),
+            reserve: self.reserve,
+        }
+    }
+}
+
+/// The v3.8.6 on-wire `LowCmd` ("compressed", [`LEGACY_LOW_CMD_COMPRESSED_LEN`]
+/// = `LOW_CMD_LENGTH` = 614 bytes): the library's `LowCmd_refine`, which
+/// `UDP::SetSend(LowCmd&)` builds with `refineCmd` and sends instead of the
+/// `comm.h` struct. Same header and trailer as [`LegacyLowCmd`]; each motor
+/// is a [`LegacyMotorCmdCompressed`]. Offsets: [`compressed_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyLowCmdCompressed {
+    pub head: [u8; 2],
+    pub level_flag: u8,
+    pub frame_reserve: u8,
+    pub sn: [u32; 2],
+    pub version: [u32; 2],
+    pub band_width: u16,
+    pub motor_cmd: [LegacyMotorCmdCompressed; LEGACY_MOTORS],
+    pub bms: LegacyBmsCmd,
+    pub wireless_remote: [u8; 40],
+    pub reserve: u32,
+    pub crc: u32,
+}
+
+/// `LOW_CMD_LENGTH` of the shipped v3.8.6 library (`.rodata` of
+/// `udp.cpp.o`: `0x266`): the compressed `LowCmd`.
+pub const LEGACY_LOW_CMD_COMPRESSED_LEN: usize = 614;
+
+/// `LOW_STATE_LENGTH` of the shipped v3.8.6 library (`0x327`): the
+/// compressed `LowState`, not decoded (see the module docs).
+pub const LEGACY_LOW_STATE_COMPRESSED_LEN: usize = 807;
+
+impl LegacyLowCmdCompressed {
+    fn read(r: &mut Le<'_>) -> Self {
+        LegacyLowCmdCompressed {
+            head: r.bytes(),
+            level_flag: r.u8(),
+            frame_reserve: r.u8(),
+            sn: r.arr(Le::u32),
+            version: r.arr(Le::u32),
+            band_width: r.u16(),
+            motor_cmd: r.arr(LegacyMotorCmdCompressed::read),
+            bms: LegacyBmsCmd::read(r),
+            wireless_remote: r.bytes(),
+            reserve: r.u32(),
+            crc: r.u32(),
+        }
+    }
+
+    /// Decodes a buffer of exactly [`LEGACY_LOW_CMD_COMPRESSED_LEN`] bytes.
+    /// Never panics; every byte pattern of that length is a frame (the
+    /// protocol has no type tag), so a caller that needs integrity checks
+    /// the CRC ([`LegacyLowCmdCompressed::crc_check`]).
+    pub fn decode(buf: &[u8]) -> Result<Self, LegacyError> {
+        check_len(LegacyKind::LowCmd, buf.len(), LEGACY_LOW_CMD_COMPRESSED_LEN)?;
+        Ok(Self::read(&mut Le::new(buf)))
+    }
+
+    /// The CRC under `mode` (`crc32_core` over the first 608 bytes, stored
+    /// at 610); `None` when it cannot be checked.
+    pub fn crc_check(buf: &[u8], mode: LegacyCrcMode) -> Option<bool> {
+        crc_check(buf, mode)
+    }
+
+    /// The frame as the declared `comm.h` `LowCmd` (every value exact; the
+    /// `crc` field is copied, it is the compressed frame's CRC).
+    pub fn expand(&self) -> LegacyLowCmd {
+        LegacyLowCmd {
+            head: self.head,
+            level_flag: self.level_flag,
+            frame_reserve: self.frame_reserve,
+            sn: self.sn,
+            version: self.version,
+            band_width: self.band_width,
+            motor_cmd: self.motor_cmd.map(|m| m.expand()),
+            bms: self.bms,
+            wireless_remote: self.wireless_remote,
+            reserve: self.reserve,
+            crc: self.crc,
+        }
+    }
+
+    /// Serialise (the inverse of [`LegacyLowCmdCompressed::decode`]; the
+    /// `crc` field is written as stored, not recomputed).
+    pub fn encode(&self) -> [u8; LEGACY_LOW_CMD_COMPRESSED_LEN] {
+        let mut w = LeOut::new();
+        w.put(&self.head);
+        w.put(&[self.level_flag, self.frame_reserve]);
+        for v in self.sn.iter().chain(self.version.iter()) {
+            w.put(&v.to_le_bytes());
+        }
+        w.put(&self.band_width.to_le_bytes());
+        for m in &self.motor_cmd {
+            w.put(&[m.mode]);
+            w.put(&m.q_bits.to_le_bytes());
+            w.put(&m.dq_bits.to_le_bytes());
+            w.put(&m.tau_q.to_le_bytes());
+            w.put(&m.kp_q.to_le_bytes());
+            w.put(&m.kd_q.to_le_bytes());
+            for r in &m.reserve {
+                w.put(&r.to_le_bytes());
+            }
+        }
+        w.put(&[self.bms.off]);
+        w.put(&self.bms.reserve);
+        w.put(&self.wireless_remote);
+        w.put(&self.reserve.to_le_bytes());
+        w.put(&self.crc.to_le_bytes());
+        w.buf
+    }
+}
+
+/// A bounds-checked writer over a fixed compressed-`LowCmd` buffer (bytes
+/// past the end are ignored; `encode` writes exactly the frame length).
+struct LeOut {
+    buf: [u8; LEGACY_LOW_CMD_COMPRESSED_LEN],
+    pos: usize,
+}
+
+impl LeOut {
+    fn new() -> Self {
+        LeOut {
+            buf: [0; LEGACY_LOW_CMD_COMPRESSED_LEN],
+            pos: 0,
+        }
+    }
+
+    fn put(&mut self, b: &[u8]) {
+        for x in b {
+            if let Some(slot) = self.buf.get_mut(self.pos) {
+                *slot = *x;
+            }
+            self.pos = self.pos.saturating_add(1);
+        }
+    }
+}
+
 /// `comm.h` `LowState` (declared / uncompressed layout).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LegacyLowState {
@@ -767,22 +1036,22 @@ impl LegacyKind {
     }
 
     /// The v3.8.6 on-wire ("compressed") length for the low-level frames,
-    /// `None` for the high-level frames (which are not compressed). The
-    /// compressed layout is not published in the SDK headers, so a frame of
-    /// this length cannot be decoded by this module (see the module docs).
+    /// `None` for the high-level frames (which are not compressed).
     pub fn compressed_wire_len(self) -> Option<usize> {
         match self {
             // LOW_CMD_LENGTH / LOW_STATE_LENGTH from the shipped library.
-            LegacyKind::LowCmd => Some(614),
-            LegacyKind::LowState => Some(807),
+            LegacyKind::LowCmd => Some(LEGACY_LOW_CMD_COMPRESSED_LEN),
+            LegacyKind::LowState => Some(LEGACY_LOW_STATE_COMPRESSED_LEN),
             LegacyKind::HighCmd | LegacyKind::HighState => None,
         }
     }
 
     /// The frame kind a payload of `len` bytes is, by its length alone
     /// (the legacy protocol has no type tag). `Some((kind, decodable))`:
-    /// `decodable` is false for the compressed low-level lengths this
-    /// module cannot decode. Lengths matching nothing return `None`.
+    /// `decodable` is false only for the compressed `LowState` (807 bytes),
+    /// whose layout this module does not decode; the compressed `LowCmd`
+    /// (614 bytes) is decodable ([`LegacyLowCmdCompressed`]). Lengths
+    /// matching nothing return `None`.
     pub fn for_len(len: usize) -> Option<(LegacyKind, bool)> {
         for k in [
             LegacyKind::HighCmd,
@@ -794,11 +1063,33 @@ impl LegacyKind {
                 return Some((k, true));
             }
             if k.compressed_wire_len() == Some(len) {
-                return Some((k, false));
+                return Some((k, k == LegacyKind::LowCmd));
             }
         }
         None
     }
+
+    /// The wire form a payload of `len` bytes of this kind is in.
+    pub fn wire_form(self, len: usize) -> Option<LegacyWireForm> {
+        if len == self.declared_len() {
+            Some(LegacyWireForm::Declared)
+        } else if self.compressed_wire_len() == Some(len) {
+            Some(LegacyWireForm::Compressed)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which of the two v3.8.6 encodings a low-level frame was in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LegacyWireForm {
+    /// The packed `comm.h` struct (734 / 937 bytes for `LowCmd` /
+    /// `LowState`; the only form of `HighCmd` / `HighState`).
+    Declared,
+    /// The library's compressed form (614 / 807 bytes), what a v3.8.6
+    /// client actually sends.
+    Compressed,
 }
 
 /// The motion channels the legacy UDP frames are mapped onto. The legacy
@@ -835,8 +1126,9 @@ pub enum LegacyFrame {
 /// Why a UDP payload on a legacy port is not a decodable legacy frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyFrameError {
-    /// A v3.8.6 "compressed" low-level frame (614 / 807 bytes): its layout
-    /// is not published, so it cannot be inspected.
+    /// A v3.8.6 "compressed" `LowState` (807 bytes): not decoded (its
+    /// layout is only in the shipped library, and it is state, not a
+    /// command). A compressed `LowCmd` (614 bytes) decodes.
     Compressed { kind: LegacyKind, len: usize },
     /// No legacy frame has this length.
     UnknownLength { len: usize },
@@ -847,8 +1139,8 @@ impl std::fmt::Display for LegacyFrameError {
         match self {
             LegacyFrameError::Compressed { kind, len } => write!(
                 f,
-                "legacy {kind:?} in the compressed {len}-byte wire form, whose layout is not \
-                 published (not inspected)"
+                "legacy {kind:?} in the compressed {len}-byte wire form, which is not decoded \
+                 (not inspected)"
             ),
             LegacyFrameError::UnknownLength { len } => {
                 write!(f, "{len}-byte UDP payload is no legacy Unitree frame")
@@ -873,6 +1165,11 @@ impl LegacyFrame {
             Some((LegacyKind::HighState, true)) => LegacyHighState::decode(buf)
                 .map(LegacyFrame::HighState)
                 .map_err(|_| unknown),
+            Some((LegacyKind::LowCmd, true)) if len == LEGACY_LOW_CMD_COMPRESSED_LEN => {
+                LegacyLowCmdCompressed::decode(buf)
+                    .map(|c| LegacyFrame::LowCmd(c.expand()))
+                    .map_err(|_| unknown)
+            }
             Some((LegacyKind::LowCmd, true)) => LegacyLowCmd::decode(buf)
                 .map(LegacyFrame::LowCmd)
                 .map_err(|_| unknown),
@@ -1215,9 +1512,9 @@ mod tests {
             LegacyKind::for_len(LEGACY_LOW_STATE_LEN),
             Some((LegacyKind::LowState, true))
         );
-        // The compressed v3.8.6 low-level lengths are recognised but not
-        // decodable.
-        assert_eq!(LegacyKind::for_len(614), Some((LegacyKind::LowCmd, false)));
+        // The compressed v3.8.6 LowCmd decodes; the compressed LowState is
+        // recognised but not decoded.
+        assert_eq!(LegacyKind::for_len(614), Some((LegacyKind::LowCmd, true)));
         assert_eq!(
             LegacyKind::for_len(807),
             Some((LegacyKind::LowState, false))
@@ -1304,13 +1601,9 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
-        assert_eq!(
-            LegacyFrame::decode(&[0; 614]),
-            Err(LegacyFrameError::Compressed {
-                kind: LegacyKind::LowCmd,
-                len: 614
-            })
-        );
+        let c = LegacyFrame::decode(&[0; 614]).unwrap();
+        assert_eq!(c.kind(), LegacyKind::LowCmd);
+        assert_eq!(c.channel(), channels::LOW_CMD);
         assert_eq!(
             LegacyFrame::decode(&[0; 807]),
             Err(LegacyFrameError::Compressed {
@@ -1323,5 +1616,289 @@ mod tests {
             Err(LegacyFrameError::UnknownLength { len: 100 })
         );
         assert!(LegacyFrame::decode(&[]).is_err());
+    }
+
+    // ---- compressed LowCmd (v3.8.6 LowCmd_refine) ---------------------
+
+    /// What `refineCmd` does to one f32 field: `mulss` in f32, then
+    /// `cvttss2si` (truncation; NaN / out of i32 range gives 0x80000000),
+    /// then a 16-bit store (low half).
+    fn sdk_fixed(v: f32, scale: f32) -> i16 {
+        let x = v * scale;
+        let i = if x.is_finite() && x > -2_147_483_649.0 && x < 2_147_483_648.0 {
+            x as i32
+        } else {
+            i32::MIN
+        };
+        i as i16
+    }
+
+    /// Reference encoder: a byte-for-byte transcription of
+    /// `refineCmd(LowCmd_refine&, LowCmd&)` (udp.cpp.o, v3.8.6), reading the
+    /// declared struct at the offsets the machine code uses (`0x16 + 33 i`
+    /// motors, `0x2aa` bms, `0x2ae` wireless, `0x2d6` reserve) and writing
+    /// the compressed one at `0x16 + 27 i`, `0x232`, `0x236`, `0x25e`, CRC of
+    /// 0x98 words at `0x262`.
+    fn sdk_refine(declared: &[u8]) -> Vec<u8> {
+        assert_eq!(declared.len(), LEGACY_LOW_CMD_LEN);
+        let mut out = vec![0u8; LEGACY_LOW_CMD_COMPRESSED_LEN];
+        out[..0x16].copy_from_slice(&declared[..0x16]);
+        let f = |b: &[u8], at: usize| f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        for i in 0..LEGACY_MOTORS {
+            let s = 0x16 + 33 * i;
+            let d = 0x16 + 27 * i;
+            out[d] = declared[s];
+            out[d + 1..d + 9].copy_from_slice(&declared[s + 1..s + 9]); // q, dq
+            let tau = sdk_fixed(f(declared, s + 9), 256.0);
+            let kp = sdk_fixed(f(declared, s + 13), 32.0);
+            let kd = sdk_fixed(f(declared, s + 17), 16.0);
+            out[d + 9..d + 11].copy_from_slice(&tau.to_le_bytes());
+            out[d + 11..d + 13].copy_from_slice(&kp.to_le_bytes());
+            out[d + 13..d + 15].copy_from_slice(&kd.to_le_bytes());
+            out[d + 15..d + 27].copy_from_slice(&declared[s + 21..s + 33]);
+        }
+        out[0x232..0x236].copy_from_slice(&declared[0x2aa..0x2ae]);
+        out[0x236..0x25e].copy_from_slice(&declared[0x2ae..0x2d6]);
+        out[0x25e..0x262].copy_from_slice(&declared[0x2d6..0x2da]);
+        let words: Vec<u8> = out[..0x98 * 4].to_vec();
+        let crc = crate::unitree::crc::crc32_core_le_bytes(&words);
+        out[0x262..0x266].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    fn declared_low(motors: &[(u8, [f32; 5])], bms_off: u8) -> Vec<u8> {
+        let mut b = Build::default();
+        b.u8(0xFE).u8(0xEF).u8(level::LOW).u8(0);
+        b.zeros(8 + 8).u16(0);
+        for i in 0..LEGACY_MOTORS {
+            let (m, v) = motors.get(i).copied().unwrap_or((0, [0.0; 5]));
+            b.u8(m);
+            for x in v {
+                b.f32(x);
+            }
+            b.zeros(12);
+        }
+        b.u8(bms_off).zeros(3).zeros(40 + 4);
+        b.with_crc()
+    }
+
+    #[test]
+    fn compressed_offset_table_matches_the_sdk_machine_code() {
+        use compressed_layout as L;
+        // Sizes: 22-byte header + 20 x 27 + BmsCmd 4 + wireless 40 +
+        // reserve 4 + crc 4 = 614 = LOW_CMD_LENGTH (0x266).
+        assert_eq!(
+            22 + LEGACY_MOTORS * 27 + 4 + 40 + 4 + 4,
+            LEGACY_LOW_CMD_COMPRESSED_LEN
+        );
+        assert_eq!(LEGACY_LOW_CMD_COMPRESSED_LEN, 0x266);
+        assert_eq!(LEGACY_LOW_STATE_COMPRESSED_LEN, 0x327);
+        // (offset, value from the disassembly of refineCmd)
+        for (ours, sdk) in [
+            (L::MOTOR_AT, 0x16),
+            (L::MOTOR_LEN, 0x1b),
+            (L::M_Q, 1),
+            (L::M_DQ, 5),
+            (L::M_TAU, 9),
+            (L::M_KP, 11),
+            (L::M_KD, 13),
+            (L::M_RESERVE, 15),
+            (L::MOTOR_AT + LEGACY_MOTORS * L::MOTOR_LEN, 0x232),
+            (L::BMS_AT, 0x232),
+            (L::WIRELESS_AT, 0x236),
+            (L::RESERVE_AT, 0x25e),
+            (L::CRC_AT, 0x262),
+            (L::CRC_WORDS, 0x98),
+        ] {
+            assert_eq!(ours, sdk);
+        }
+        // The CRC covers the 152 words before it, as frame_crc computes.
+        assert_eq!(
+            (LEGACY_LOW_CMD_COMPRESSED_LEN / 4 - 1) * 4,
+            L::CRC_WORDS * 4
+        );
+        // Per-field probe: a marker written at each offset lands in exactly
+        // that field.
+        let mut buf = vec![0u8; LEGACY_LOW_CMD_COMPRESSED_LEN];
+        let m = L::MOTOR_AT + 7 * L::MOTOR_LEN;
+        buf[m + L::M_MODE] = 0x0A;
+        buf[m + L::M_Q..m + L::M_Q + 4].copy_from_slice(&0.5f32.to_le_bytes());
+        buf[m + L::M_DQ..m + L::M_DQ + 4].copy_from_slice(&(-1.25f32).to_le_bytes());
+        buf[m + L::M_TAU..m + L::M_TAU + 2].copy_from_slice(&(-640i16).to_le_bytes());
+        buf[m + L::M_KP..m + L::M_KP + 2].copy_from_slice(&1280i16.to_le_bytes());
+        buf[m + L::M_KD..m + L::M_KD + 2].copy_from_slice(&24i16.to_le_bytes());
+        buf[m + L::M_RESERVE..m + L::M_RESERVE + 4].copy_from_slice(&7u32.to_le_bytes());
+        buf[L::BMS_AT] = 0xA5;
+        buf[L::WIRELESS_AT + 39] = 0x77;
+        buf[L::RESERVE_AT..L::RESERVE_AT + 4].copy_from_slice(&9u32.to_le_bytes());
+        buf[L::CRC_AT..L::CRC_AT + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let c = LegacyLowCmdCompressed::decode(&buf).unwrap();
+        let mc = c.motor_cmd[7];
+        assert_eq!(mc.mode, 0x0A);
+        assert_eq!((mc.q(), mc.dq()), (0.5, -1.25));
+        assert_eq!((mc.tau(), mc.kp(), mc.kd()), (-2.5, 40.0, 1.5));
+        assert_eq!(mc.reserve, [7, 0, 0]);
+        assert_eq!(c.motor_cmd[6], LegacyMotorCmdCompressed::default());
+        assert_eq!(c.motor_cmd[8], LegacyMotorCmdCompressed::default());
+        assert_eq!(
+            (c.bms.off, c.wireless_remote[39], c.reserve),
+            (0xA5, 0x77, 9)
+        );
+        assert_eq!(c.crc, 0xdead_beef);
+        // encode is the exact inverse.
+        assert_eq!(c.encode().to_vec(), buf);
+    }
+
+    #[test]
+    fn compressed_matches_the_sdk_encoder_and_expands_exactly() {
+        let mut motors = vec![(0x0Au8, [0.0f32; 5]); 12];
+        motors[0] = (0x0A, [0.1, 0.2, 1.5, 20.0, 0.5]);
+        motors[5] = (0x0A, [-1.3, 16000.0, -3.75, 60.0, 2.0]);
+        motors[11] = (0x0A, [2.146e9, 0.0, 0.3, 33.3, 0.7]);
+        let declared = declared_low(&motors, 0);
+        let wire = sdk_refine(&declared);
+        assert_eq!(
+            LegacyLowCmdCompressed::crc_check(&wire, LegacyCrcMode::Plain),
+            Some(true)
+        );
+        let c = LegacyLowCmdCompressed::decode(&wire).unwrap();
+        let d = LegacyLowCmd::decode(&declared).unwrap();
+        let x = c.expand();
+        for i in 0..LEGACY_MOTORS {
+            let (a, b) = (x.motor_cmd[i], d.motor_cmd[i]);
+            assert_eq!(a.mode, b.mode);
+            assert_eq!(a.q.to_bits(), b.q.to_bits(), "{i}");
+            assert_eq!(a.dq.to_bits(), b.dq.to_bits(), "{i}");
+            // Fixed point: truncation toward zero, at most one step off.
+            for (got, want, step) in [
+                (a.tau, b.tau, 1.0 / 256.0),
+                (a.kp, b.kp, 1.0 / 32.0),
+                (a.kd, b.kd, 1.0 / 16.0),
+            ] {
+                assert!(
+                    got.abs() <= want.abs() && (want - got).abs() < step,
+                    "{i} {got} {want}"
+                );
+            }
+        }
+        // Exactly representable values round-trip bit for bit.
+        assert_eq!(x.motor_cmd[0].tau, 1.5);
+        assert_eq!(x.motor_cmd[5].tau, -3.75);
+        assert_eq!(x.motor_cmd[5].kp, 60.0);
+        assert_eq!(x.motor_cmd[0].kd, 0.5);
+        // Legacy frame dispatch gives the same frame and the same events.
+        let f = LegacyFrame::decode(&wire).unwrap();
+        assert_eq!(f, LegacyFrame::LowCmd(x));
+        assert_eq!(
+            LegacyKind::LowCmd.wire_form(614),
+            Some(LegacyWireForm::Compressed)
+        );
+        assert_eq!(
+            LegacyKind::LowCmd.wire_form(734),
+            Some(LegacyWireForm::Declared)
+        );
+        assert_eq!(LegacyKind::LowCmd.wire_form(733), None);
+        let jf = f.joint_command_frame().unwrap();
+        assert_eq!(jf.joints.len(), LEGACY_MOTORS);
+    }
+
+    #[test]
+    fn compressed_adversarial_inputs() {
+        let declared = declared_low(&[(0x0A, [0.0, 0.0, 1.0, 10.0, 1.0])], 0);
+        let wire = sdk_refine(&declared);
+        // Truncation / extension: exact length only.
+        for n in [0, 1, 22, 613, 615, 733] {
+            let mut b = wire.clone();
+            b.resize(n, 0);
+            assert!(LegacyLowCmdCompressed::decode(&b).is_err(), "{n}");
+        }
+        assert!(LegacyFrame::decode(&wire[..613]).is_err());
+        // CRC mismatch is reported (and not under encryptCRC).
+        let mut bad = wire.clone();
+        bad[100] ^= 1;
+        assert_eq!(
+            LegacyLowCmdCompressed::crc_check(&bad, LegacyCrcMode::Plain),
+            Some(false)
+        );
+        assert_eq!(
+            LegacyLowCmdCompressed::crc_check(&bad, LegacyCrcMode::EncryptCrc),
+            None
+        );
+        // Bytes 608..610 (the last half of `reserve`) are outside the CRC,
+        // as on the SDK: flipping them keeps the CRC valid.
+        let mut tail = wire.clone();
+        tail[608] ^= 0xff;
+        assert_eq!(
+            LegacyLowCmdCompressed::crc_check(&tail, LegacyCrcMode::Plain),
+            Some(true)
+        );
+        // NaN / inf in the f32 fields survive decoding (the motion checks
+        // reject them); the fixed-point fields cannot be NaN.
+        let mut nan = wire.clone();
+        let q = compressed_layout::MOTOR_AT + compressed_layout::M_Q;
+        nan[q..q + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let d = LegacyLowCmdCompressed::decode(&nan).unwrap().expand();
+        assert!(d.motor_cmd[0].q.is_nan());
+        assert!(d.joint_frame().as_slice()[0].q.is_nan());
+        assert!(!d.joint_frame().is_finite());
+        // A NaN torque on the sender becomes 0 on the wire (cvttss2si
+        // gives 0x80000000, the low half is 0): the SDK cannot send NaN in
+        // the fixed-point fields.
+        assert_eq!(sdk_fixed(f32::NAN, 256.0), 0);
+        // Out of range: the sender's value wraps, the decoder reports what
+        // is on the wire (a Kp of 1100 arrives as a negative gain).
+        assert_eq!(sdk_fixed(1100.0, 32.0), (35200i32 as i16));
+        let big = declared_low(&[(0x0A, [0.0, 0.0, 0.0, 1100.0, 0.0])], 0);
+        let c = LegacyLowCmdCompressed::decode(&sdk_refine(&big)).unwrap();
+        assert!(c.motor_cmd[0].kp() < 0.0);
+        // Extreme fixed-point values stay finite and exact.
+        let mut ext = wire.clone();
+        let t = compressed_layout::MOTOR_AT + compressed_layout::M_TAU;
+        ext[t..t + 2].copy_from_slice(&i16::MIN.to_le_bytes());
+        let c = LegacyLowCmdCompressed::decode(&ext).unwrap();
+        assert_eq!(c.motor_cmd[0].tau(), -128.0);
+        // Aliasing between lengths: a compressed LowCmd is never read as
+        // another legacy kind and vice versa.
+        assert_eq!(LegacyKind::for_len(614), Some((LegacyKind::LowCmd, true)));
+        for len in [
+            LEGACY_HIGH_CMD_LEN,
+            LEGACY_LOW_CMD_LEN,
+            LEGACY_HIGH_STATE_LEN,
+            LEGACY_LOW_STATE_LEN,
+            807,
+        ] {
+            assert!(LegacyLowCmdCompressed::decode(&vec![0u8; len]).is_err());
+        }
+        // BMS off survives expansion (the firewall's battery-off check).
+        let off = sdk_refine(&declared_low(&[], 0xA5));
+        assert_eq!(
+            LegacyLowCmdCompressed::decode(&off)
+                .unwrap()
+                .expand()
+                .bms
+                .off,
+            0xA5
+        );
+    }
+
+    #[test]
+    fn compressed_decoder_never_panics() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut buf = vec![0u8; LEGACY_LOW_CMD_COMPRESSED_LEN];
+        for _ in 0..2000 {
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
+            let c = LegacyLowCmdCompressed::decode(&buf).unwrap();
+            assert_eq!(c.encode().to_vec(), buf);
+            let e = c.expand();
+            for m in &e.motor_cmd {
+                assert!(m.tau.is_finite() && m.kp.is_finite() && m.kd.is_finite());
+            }
+            let _ = LegacyFrame::decode(&buf);
+        }
     }
 }

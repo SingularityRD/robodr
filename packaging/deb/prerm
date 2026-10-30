@@ -12,7 +12,8 @@ remove | deconfigure)
         # gateway out of the path explicitly (OPERATIONS.md 6.6).
         for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
             robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
-            robodr-executor.service robodr-firewall-gw.service robodr-depot.service; do
+            robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service \
+            robodr-depot.service; do
             systemctl stop "$u" 2>/dev/null || true
         done
     fi

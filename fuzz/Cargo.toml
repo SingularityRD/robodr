@@ -282,8 +282,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "go1_compressed_lowcmd"
+path = "fuzz_targets/go1_compressed_lowcmd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pkg_entry"
 path = "fuzz_targets/pkg_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unitree_webrtc"
+path = "fuzz_targets/unitree_webrtc.rs"
 test = false
 doc = false
 bench = false

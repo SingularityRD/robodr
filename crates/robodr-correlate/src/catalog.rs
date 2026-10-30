@@ -129,6 +129,15 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.seal.lease_expired",
     "robot.seal.erased",
     "robot.seal.tamper",
+    // Go2 WebRTC sessions (robodr-ros2-pipeline::webrtc via the in-path
+    // gateway's `webrtc` section and agentd's gateway feed; contract 2.3).
+    "robot.unitree.webrtc_unknown_controller",
+    "robot.unitree.webrtc_new_peer",
+    "robot.unitree.webrtc_controller_mac_mismatch",
+    "robot.unitree.webrtc_session_in_denied_window",
+    "robot.unitree.webrtc_concurrent_sessions",
+    "robot.unitree.webrtc_relayed_session",
+    "robot.unitree.webrtc_media_without_signalling",
     // Sprints 14a / 14b (contract 2.3): the executed erase's deferral
     // (robodr-deliverd) and the site depot's own findings (robodr-depot),
     // spooled directly like the delivery agent's.

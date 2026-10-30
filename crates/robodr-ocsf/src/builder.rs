@@ -1056,6 +1056,7 @@ fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
 fn catalog_2_3(rule: &str) -> Option<RuleInfo> {
     catalog_2_3_seal(rule)
         .or_else(|| catalog_2_3_gateway(rule))
+        .or_else(|| catalog_2_3_unitree(rule))
         .or_else(|| catalog_2_3_depot(rule))
 }
 
@@ -1204,6 +1205,59 @@ fn catalog_2_3_gateway(rule: &str) -> Option<RuleInfo> {
         "robot.gateway.findings_dropped" => e(
             "In-path gateway findings lost",
             "The in-path motion gateway had more distinct findings in one reporting period than it can hold; some were counted but not reported individually.",
+        ),
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Contract 2.3 block: Unitree coverage (Go2 WebRTC control sessions,
+// `robodr-ros2-pipeline::webrtc`, reported by the in-path gateway's
+// `webrtc` section through agentd's gateway feed), data source
+// `ros2_motion_commands`.
+// ---------------------------------------------------------------------------
+
+/// The `robot.unitree.webrtc_*` ids. Not in 2.2 or earlier: a 2.2
+/// validator applies the generic entry to these ids, and so does a 2.3
+/// validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_unitree(rule: &str) -> Option<RuleInfo> {
+    const MOTION: &str = "ros2_motion_commands";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: MOTION,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.unitree.webrtc_unknown_controller" => e(
+            "WebRTC control session from an unlisted host",
+            "A host that is not a listed controller signalled, started or established a WebRTC session with the robot (Go2 app channel). The session content is encrypted and not inspected; the finding names the peer and its flows so the session can be quarantined.",
+        ),
+        "robot.unitree.webrtc_new_peer" => e(
+            "New WebRTC peer of the robot",
+            "A host opened a WebRTC session with the robot for the first time while no controller list is configured. Informational for learning the controllers; list them to turn unlisted peers into unknown-controller findings.",
+        ),
+        "robot.unitree.webrtc_controller_mac_mismatch" => e(
+            "Listed WebRTC controller seen with another link-layer address",
+            "WebRTC traffic to the robot came from a listed controller's IP address but with another source MAC than the one it is bound to: another host may be using the controller's address.",
+        ),
+        "robot.unitree.webrtc_session_in_denied_window" => e(
+            "WebRTC control session during a denied window",
+            "A WebRTC session with the robot was attempted or active during a time window in which the site policy allows none.",
+        ),
+        "robot.unitree.webrtc_concurrent_sessions" => e(
+            "More concurrent WebRTC control sessions than allowed",
+            "More WebRTC sessions with the robot were established at the same time than the site allows: a second controller next to the operator's.",
+        ),
+        "robot.unitree.webrtc_relayed_session" => e(
+            "Remote WebRTC session through a relay",
+            "The robot exchanges WebRTC traffic through a TURN relay or with a peer outside the local networks: a remote control path (for example a cloud relay) that bypasses the local controller list.",
+        ),
+        "robot.unitree.webrtc_media_without_signalling" => e(
+            "WebRTC session without observed signalling",
+            "A WebRTC session with the robot was established without any signalling on the watched link: it was signalled over another path (Wi-Fi, a relay) or by an unknown method.",
         ),
         _ => return None,
     })

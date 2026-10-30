@@ -144,14 +144,14 @@ entry carries its `source`.
 | Go2-W | SDK2 DDS | go (20) | wheeled quadruped | 16 | — | low cmd/state, `rt/lf/sportmodestate`; `sport` |
 | B2 | SDK2 DDS | go (20) | quadruped | 12 | — | low cmd/state; `sport`, `motion_switcher`, `robot_state` |
 | B2-W | SDK2 DDS | go (20) | wheeled quadruped | 16 | — | low cmd/state; `sport` |
-| A2 | SDK2 DDS | — (no low-level example) | quadruped | ? | — | `rt/lf/sportmodestate`; `sport` |
-| AS2 | SDK2 DDS | — (no low-level example) | quadruped | ? | — | `rt/lf/sportmodestate`; `sport` |
+| A2 | SDK2 DDS | — published; go (20) **inferred** (`inferred_idl`) | quadruped | ? | — | `rt/lf/sportmodestate`; `sport`; `rt/lowcmd` only as the inferred go `LowCmd_` |
+| AS2 | SDK2 DDS | — published; go (20) **inferred** (`inferred_idl`) | quadruped | ? | — | `rt/lf/sportmodestate`; `sport`; `rt/lowcmd` only as the inferred go `LowCmd_` |
 | H1 | SDK2 DDS | go (20) | humanoid | ? | slot 9 | low cmd/state, `rt/arm_sdk`; `loco` |
 | H1-2 | SDK2 DDS | hg (35) | humanoid | 27 | slot 27 | low cmd/state, `rt/arm_sdk` |
 | H2 | SDK2 DDS | hg (35) | humanoid | 31 | slot 31 | low cmd/state, `rt/arm_sdk`, IMU; `sport`, `arm` |
 | G1 | SDK2 DDS | hg (35) | humanoid | 29 | slot 29 | low cmd/state, `rt/arm_sdk`, `rt/user_lowcmd`, `rt/hand_sdk`, Dex3, `rt/waistpitch*`, IMU; `sport`, `arm`, `agv`, `motion_switcher` |
 | R1 | SDK2 DDS | hg (35) | humanoid | 26 | `mode_pr` × 100 | low cmd/state, `rt/arm_sdk`, IMU; `sport` |
-| Go1 | legacy UDP | comm.h (20) | quadruped | 12 | — | `HighCmd` / `HighState` (129 / 1087 B), `LowCmd` / `LowState` declared layout only |
+| Go1 | legacy UDP | comm.h (20) | quadruped | 12 | — | `HighCmd` / `HighState` (129 / 1087 B), `LowCmd` declared (734 B) **and compressed (614 B)**, `LowState` declared (937 B) only |
 | A1, Aliengo, B1 | legacy UDP | — | quadruped | 12 (nominal) | — | none: frame layout only in release v3.3.1 (not in these sources) |
 
 Topics found in `unitree_sdk2/example`, `include/unitree/dds_wrapper` and
@@ -162,14 +162,25 @@ Topics found in `unitree_sdk2/example`, `include/unitree/dds_wrapper` and
 
 **Uncertainties (not guessed):**
 
-- A2 / AS2 ship no low-level example, so their motor count and IDL family
-  are unknown; only the sport-state and sport client are confirmed.
+- A2 / AS2 ship no low-level type, example or topic in `unitree_sdk2`,
+  `unitree_sdk2_python` or `unitree_ros2`. Their sport state is
+  `unitree_go::msg::dds_::SportModeState_` and their sport client uses
+  the Go2 JSON types, so `ModelInfo::inferred_idl` is `Go` (20 slots).
+  This is inferred, never published: `ModelInfo::idl` stays `None`, the
+  motor count is unknown, and consumers must confirm the type the robot
+  announces in SEDP (the gateway's `unitree_a2_lowcmd` requires it in the
+  profile).
 - H1's actuated motor count is not stated in its example.
 - A1 / Aliengo / B1 frame layouts are only in release v3.3.1, not in these
   sources; the legacy decoders target the v3.8.6 `comm.h` layout.
 - v3.8.6 sends `LowCmd` / `LowState` in a "compressed" wire form (614 / 807
-  bytes) whose layout is not published; `LegacyKind::for_len` flags it as
-  undecodable.
+  bytes) whose layout is in no header. The `LowCmd` form is decoded
+  (`LegacyLowCmdCompressed`) from the layout of the shipped library's
+  `refineCmd` (machine code of `libunitree_legged_sdk.a`, amd64; offsets in
+  `compressed_layout`, pinned by tests that compare with a transcription
+  of that function). It has not been compared with a capture from a real
+  Go1. The 807-byte `LowState` is not decoded (`LegacyKind::for_len` flags
+  it).
 - The model-specific API tables apply only when the caller passes the
   model (`robodr-agentd` `robot.robot_model`); without it the pipeline
   reports a model-specific id as `Unknown` (see "API interpretation").

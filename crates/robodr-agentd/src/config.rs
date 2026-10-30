@@ -1785,7 +1785,7 @@ pub fn check_robot_model(
             }
         }
     }
-    if let (Some(j), Some(slots)) = (joint, info.motor_slots) {
+    if let (Some(j), Some(slots)) = (joint, info.lowcmd_motor_slots()) {
         for (ch, spec) in &j.joint_channels {
             let low = matches!(ch.as_str(), "/lowcmd" | "/arm_sdk" | "/user_lowcmd");
             if low && info.generation == Generation::Sdk2Dds && spec.motors.len() != slots {
@@ -1900,11 +1900,20 @@ pub fn check_profile_channels(
             }
             if let Some(m) = model {
                 let info = m.info();
-                if info.idl.is_some_and(|idl| idl != layout.0) {
+                // A2 / AS2: the inferred family counts too (a profile
+                // that learned another layout on such a robot is a model
+                // alias or a wrong model, never silently accepted).
+                if info.lowcmd_idl().is_some_and(|idl| idl != layout.0) {
                     return Err(format!(
                         "firewall.joint_config channel {ch:?}: the profile records its type as \
-                         {t}, which is not the low-level layout of robot.robot_model {}",
-                        info.name
+                         {t}, which is not the low-level layout of robot.robot_model {}{}",
+                        info.name,
+                        if info.lowcmd_inferred() {
+                            " (inferred: the SDK publishes no low-level type for this model; \
+                             confirm the type on the robot and report it)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
             }

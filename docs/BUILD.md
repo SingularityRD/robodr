@@ -26,6 +26,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 | Edition (RoboDR crates) | 2021 | `[workspace.package]` |
 | Targets | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `rust-toolchain.toml` |
 | Static targets (`robodr-focal`) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (`rustup target add`; not in `rust-toolchain.toml`) | `scripts/build-static.sh` |
+| Release build userlands | `robodr` .deb: Ubuntu 22.04 container (glibc 2.35); `robodr` .rpm: Rocky Linux 9 container (glibc 2.34); `robodr-focal`: Ubuntu 24.04 runner (static musl) | [Release build userlands](#release-build-userlands) |
 
 `pulsar-core` is compiled *inside* this workspace (path dependency on the
 `vendor/pulsar` submodule), so RoboDR pins exactly the compiler Pulsar is tested
@@ -100,14 +101,20 @@ toolchain. The C toolchain is therefore pinned like Rust is
 
 | Tool | Pin | Used for | Enforced |
 |---|---|---|---|
-| clang | **`clang-18` 18.1.3**, Ubuntu 24.04 package `clang-18=1:18.1.3-1ubuntu1` (release pocket: amd64 and arm64) | ring, every target: `x86_64`/`aarch64` `-linux-gnu` and `-linux-musl` (`CC_<triple>`) | yes: `scripts/ci-repro.sh`, `scripts/build-static.sh` and `release.yml` fail (exit 1) when `clang-18` is missing or reports another version; a `CC_<triple>` you set is checked the same way. No fallback to `cc`. |
-| gcc | 13.3.0 (Ubuntu 24.04 `gcc-13`) | the link driver of the `-linux-gnu` builds (`cc`) | documented, recorded |
-| binutils | 2.42 (Ubuntu 24.04) | GNU `ld` behind gcc (`-linux-gnu`); `ar` archives ring's objects before rustc reads them | documented, recorded |
+| clang, Ubuntu 24.04 (noble) | **`clang-18` 18.1.3**, `clang-18=1:18.1.3-1ubuntu1` (noble-updates; amd64 and arm64), with `libllvm18`, `libclang-cpp18`, `libclang-common-18-dev`, `libclang1-18`, `llvm-18-linker-tools` at the same version | ring of the musl builds (`robodr-focal`) and of the CI jobs on the runner (`CC_<triple>`) | yes: `scripts/ci-repro.sh`, `scripts/build-static.sh`, `scripts/ci-release-build.sh` fail (exit 1) when the pinned clang of the build userland is missing or reports another version; a `CC_<triple>` you set is checked the same way. No fallback to `cc`. |
+| clang, Ubuntu 22.04 (jammy) | **`clang-14` 14.0.0**, `clang-14=1:14.0.0-1ubuntu1` (release pocket), with `libllvm14`, `libclang-cpp14`, `libclang-common-14-dev`, `libclang1-14`, `llvm-14-linker-tools` at the same version | ring of the `robodr` .deb (release container) | same |
+| clang, Rocky Linux 9 | **`clang` 21.1.8**, `clang-21.1.8-2.el9` with `clang-libs`, `llvm-libs` (AppStream) | ring of the `robodr` .rpm (release container) | same. AppStream carries one version at a time: when Rocky moves on, the build fails until the pin is bumped |
+| gcc | 13.3.0 (noble), 11.4.0 (jammy), 11.5.0 (Rocky 9) | the link driver of the `-linux-gnu` builds (`cc`) | documented, recorded |
+| binutils | 2.42 (noble), 2.38 (jammy), 2.35.2 (Rocky 9) | GNU `ld` behind gcc (`-linux-gnu`); `ar` archives ring's objects before rustc reads them | documented, recorded |
 | rust-lld | from the Rust 1.98.1 toolchain | the linker of the musl builds | with the Rust pin |
 
-CI and release jobs install the pin with `scripts/ci-install-clang.sh`
-(`apt-get install clang-18=1:18.1.3-1ubuntu1`, `apt-mark hold`, then the
-version check). Each build writes the versions it actually used to
+`scripts/c-toolchain.sh` picks the pin from the build userland
+(`VERSION_CODENAME`, or `rocky9`; `ROBODR_BUILD_USERLAND` overrides; any
+other host gets the noble pin). CI and release jobs install it with
+`scripts/ci-install-clang.sh` (exact `apt-get install` / `dnf install`
+versions of the driver and the LLVM libraries that hold the code
+generator, `apt-mark hold`, then the version check; as root in the
+container jobs, through sudo on the runner). Each build writes the versions it actually used to
 `TOOLCHAIN.txt` next to its `SHA256SUMS` (`dist/repro/`,
 `dist/static/<triple>/`). `ROBODR_ALLOW_UNPINNED_CC=1` accepts another
 clang for local experiments only: the scripts then say "NOT a release
@@ -143,10 +150,14 @@ The `.deb` files are signed through Ubuntu's archive (`Release.gpg` →
 air-gapped site, does to confirm the published binaries come from the
 tagged source):
 
-1. Ubuntu 24.04 (amd64, or arm64 for the arm64 assets), clean user, the
-   pinned C toolchain above, `rustup` with the toolchain of
+1. The release job's userland, same architecture as the assets: the
+   Ubuntu 22.04 container image at the digest in `release.yml` for the
+   `robodr` `.deb`, the Rocky Linux 9 one for the `.rpm`, Ubuntu 24.04 for
+   `robodr-focal`; clean user, the pinned C toolchain of that userland
+   (above; `scripts/ci-install-clang.sh`), `rustup` with the toolchain of
    `rust-toolchain.toml` (1.98.1) and, for `robodr-focal`, the musl
-   targets.
+   targets. `scripts/ci-container-prep.sh` and `scripts/ci-install-rustup.sh`
+   set a container up as the workflow does.
 2. `git clone --recurse-submodules` the repository and check out the
    release tag; do **not** regenerate `Cargo.lock`.
 3. `scripts/ci-repro.sh dist/repro` (glibc binaries of the main `.deb`) and,
@@ -187,13 +198,26 @@ From `vendor/pulsar/README.md` and Pulsar's own CI (`vendor/pulsar/Cross.toml`,
   feature. `pkg-config`.
 - Ubuntu 24.04:
   `sudo apt-get install clang-20 lld-20 llvm-20 libssl-dev libsqlite3-dev pkg-config`.
+- Ubuntu 22.04 (the `robodr` .deb release container) has no clang-20:
+  `scripts/ci-install-ebpf-toolchain.sh` adds `apt.llvm.org`'s
+  `llvm-toolchain-jammy-20` with its archive key checked against a pinned
+  fingerprint (`6084F3CF814B57C1CF12EFD515CF4D18AF4F7421`), for that source
+  only (`signed-by`).
+- Rocky Linux 9 (the `.rpm` release container): AppStream's clang/llvm/lld
+  (21.1.8 in 2026-10: one major ahead of Pulsar's pin; the eBPF objects
+  compiled and the RPM's `robodr-pulsard` starts, but they have not been
+  loaded into a kernel), `sqlite-devel`, `openssl-devel`.
 
 **To run** (`pulsard` with RoboDR modules on the robot companion computer):
 
 - Linux kernel **5.5 or newer** with BPF and **BTF** enabled
   (`CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`; check that
   `/sys/kernel/btf/vmlinux` exists). Full list:
-  <https://pulsar.sh/docs/faq/kernel-requirements/>.
+  <https://pulsar.sh/docs/faq/kernel-requirements/>. A kernel built without
+  BTF (NVIDIA L4T) can use an external BTF file generated for exactly that
+  kernel: Pulsar's `[pulsar] btf_path` (aya `Btf::parse_file`, raw BTF),
+  installed as `/etc/robodr/btf/vmlinux` with its kernel stamp, which the
+  unit checks (`docs/UNITREE.md` section 3.2.1).
 - Root (or the equivalent capabilities) for the daemon.
 - Pulsar's integration CI exercises kernels 5.13 to 6.12 on amd64/arm64; the
   RoboDR module has not been run on a kernel yet (see verification status).
@@ -371,15 +395,15 @@ checked separately.
 
 ## Static (musl) build
 
-**Why.** The release `.deb` is built on Ubuntu 24.04 and its binaries need
-glibc 2.39 (see [arm64](#arm64-cross-compiled-2026-10-18)); its units need
-systemd 247. Robot computers on older images cannot run it: NVIDIA JetPack 5
-(Ubuntu 20.04: glibc 2.31, systemd 245), the image of current Unitree EDU
-computers, and JetPack 6 / Ubuntu 22.04 (glibc 2.35). For them the pure
-binaries are built as **static musl executables** and shipped in the
-`robodr-focal` package (packaging/README.md), with systemd 245 units.
-`robodr-pulsard` is not built this way (it links libsqlite3/OpenSSL, embeds
-clang-built eBPF objects, and needs a BTF kernel that JetPack 5 lacks).
+**Why.** The release `robodr` package needs glibc 2.35 (it is built in
+Ubuntu 22.04, [Release build userlands](#release-build-userlands)) and its
+units need systemd 247. Robot computers on older images cannot run it:
+NVIDIA JetPack 5 (Ubuntu 20.04: glibc 2.31, systemd 245), the image of
+current Unitree EDU computers. For them the pure binaries are built as
+**static musl executables** and shipped in the `robodr-focal` package
+(packaging/README.md), with systemd 245 units. `robodr-pulsard` is not
+built this way (it links libsqlite3, embeds clang-built eBPF objects, and
+needs BTF, which JetPack 5 kernels lack).
 
 ```bash
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -454,6 +478,69 @@ OpenSSL-based (Python `ssl`) HTTPS server through the test CA, a host name
 and an SPKI pin. `cargo +1.87.0 check -p robodr-export --all-targets`
 passes (MSRV).
 
+## Release build userlands
+
+A dynamically linked binary needs at least the newest glibc symbol version
+it was linked against (Rust std references e.g. `pidfd_spawnp@GLIBC_2.39`
+weakly on a 2.39 host, but the version need is hard: ld.so refuses the
+binary on an older glibc). So each glibc package is built in the **oldest
+userland it supports**, natively per architecture (`container:` jobs on
+the amd64 and arm64 runners), and the result is checked:
+
+| Package | Build userland (container image, pinned by digest) | Needs | Installs on | Check |
+|---|---|---|---|---|
+| `robodr` .deb | Ubuntu 22.04 (`ubuntu:22.04`) | glibc 2.35 (`hypot@GLIBC_2.35` in four binaries, the rest 2.34), libsqlite3 | Ubuntu 22.04 / 24.04, NVIDIA JetPack 6, Debian 12 / 13 | `Depends:` from `dpkg-shlibdeps` (`libc6 (>= 2.35), libgcc-s1 (>= 4.2), libsqlite3-0 (>= 3.20.0), systemd (>= 247)` on amd64), `scripts/check-glibc-floor.sh` fails above 2.35 |
+| `robodr` .rpm | Rocky Linux 9 (`quay.io/rockylinux/rockylinux:9`) | glibc 2.34, libsqlite3 | RHEL / Rocky / Alma 9, Fedora | rpm's generated `libc.so.6(GLIBC_x.y)(64bit)` requirements, `check-glibc-floor.sh` fails above 2.34 |
+| `robodr-focal` .deb | Ubuntu 24.04 runner, static musl | nothing (no `PT_INTERP`, no `DT_NEEDED`) | Ubuntu 20.04, JetPack 5 (systemd >= 245); also 22.04 and newer | `build-deb.sh --variant focal` refuses a dynamic binary |
+
+Why one `.deb` for Ubuntu 22.04 and Debian 12 and not a bookworm build as
+well: glibc 2.35 < 2.36, and every library the binaries link (`libc6`,
+`libgcc-s1`, `libsqlite3-0`) has the same package name in both (and in
+Ubuntu 24.04 / Debian 13), so the jammy build installs on all of them;
+`scripts/pkg-smoke-matrix.sh` proves it on each. Why the RPM has its own
+build: the jammy binaries need `GLIBC_2.35` (`hypot`), RHEL 9 has 2.34.
+
+**Depends of the `.deb`.** `build-deb.sh` maps every `DT_NEEDED` soname
+of the packaged programs to a package (`soname_package`: an unknown
+library fails the build), takes the versions from `dpkg-shlibdeps` when it
+runs on the package's architecture (always, in the release), raises the
+`libc6` floor to the newest `GLIBC_x.y` need read with `readelf -V`, and
+appends `systemd (>= 247)`. Off the build architecture it falls back to
+unversioned library dependencies plus the `readelf` floor.
+`DEB_DEPENDS` still overrides everything (experiments only).
+
+**The RPM** (`packaging/build-rpm.sh`, `packaging/rpm/`) is built from the
+same file tree as the `.deb` (`build-deb.sh --stage-only`): units,
+tmpfiles/sysusers fragments, man pages, docs, examples, rules and modes
+are the `.deb`'s, only the programs differ. `%config(noreplace)` for the
+`.deb`'s conffiles, scriptlets that do what the maintainer scripts do
+(sysusers, tmpfiles, daemon-reload, `try-restart` on upgrade, stop,
+`disable` and the executor's nft table on erase; licence files as
+`%license`, so `tsflags=nodocs` keeps them; no agentd-tree migration, which only
+concerns `.deb` releases older than any RPM), no strip / debuginfo /
+build-id links, `SOURCE_DATE_EPOCH` for every mtime and the build time.
+
+## Package matrix
+
+| Package | Debian 12 | Ubuntu 20.04 / JetPack 5 | Ubuntu 22.04 / JetPack 6 | Ubuntu 24.04 | RHEL / Rocky 9 | Fedora 42 |
+|---|---|---|---|---|---|---|
+| `robodr` .deb (amd64, arm64) | yes | no (glibc 2.31, systemd 245) | yes | yes | — | — |
+| `robodr-focal` .deb (amd64, arm64) | expected | yes | yes (agentd-only) | expected | — | — |
+| `robodr` .rpm (x86_64, aarch64) | — | — | — | — | yes | yes |
+
+"yes" cells are what `scripts/pkg-smoke-matrix.sh` installs in CI
+(`package-smoke`) and before signing (`release.yml` `smoke`): the
+distribution's own `apt-get` / `dnf` resolves the dependencies, the
+maintainer scripts / scriptlets run, every program starts (`--version`)
+on that glibc, `systemd-analyze verify` passes with that systemd,
+reinstall / remove (/ purge) keep evidence and keys
+(`scripts/pkg-install-smoke.sh`). `scripts/check-packages.py` keeps the
+three packages consistent (same programs per variant, same paths, modes
+and content apart from the programs, no setuid or group/other-writable
+file, nothing outside `/usr` and `/etc/robodr`, no private key material,
+every `ROBODR_DEB_REQUIRE` list complete, deb and rpm scripts handling the
+same units).
+
 ## Licensing
 
 - RoboDR crates: `license = "LicenseRef-Proprietary"` (`[workspace.package]`;
@@ -477,7 +564,7 @@ passes (MSRV).
 | Job | Required | What |
 |---|---|---|
 | `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload the bootstrap lock and **fail** (every other job also fails without it) |
-| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants in step), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts and the focal credential helper |
+| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants and the drop-in examples `robodr-focal` ships in step), `scripts/check-packages.py` (programs per variant, `ROBODR_DEB_REQUIRE` lists, deb/rpm scripts), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts, the rpm scriptlets and the focal / BTF helpers |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
 | `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, `robodr-pulsard`). No kernel load |
 | `msrv` | informational | `cargo +1.87.0 check` of the pure crates |
@@ -485,11 +572,16 @@ passes (MSRV).
 | `sbom` | yes | CycloneDX via cargo-cyclonedx **and** the std-only fallback; uploaded as artifact |
 | `fuzz` | yes | If `fuzz/` exists: every `cargo fuzz` target for 60 s on a pinned nightly; crashes uploaded |
 | `reproducible` | yes | `scripts/ci-repro.sh`; hashes uploaded |
-| `static` | yes | Per musl target: `ci-repro.sh` for the target, `scripts/build-static.sh`, built == reproduced, smoke run (arm64 under qemu-user), `robodr-focal` `.deb` (`Depends: systemd (>= 245)`, helper present, no `robodr-pulsard`); hashes uploaded. `release.yml`'s `build-static` job does the same and publishes `robodr-focal` debs and bundles with `SHA256SUMS-focal-<arch>` |
+| `static` | yes | Per musl target: `ci-repro.sh` for the target, `scripts/build-static.sh`, built == reproduced, smoke run (arm64 under qemu-user), `robodr-focal` `.deb` (`Depends: systemd (>= 245)`, helper present, no `robodr-pulsard`, `check-packages.py`); hashes and the `.deb` uploaded. `release.yml`'s `build-static` job does the same and hands `robodr-focal` debs and bundles with `SHA256SUMS-focal-<arch>` to `publish` |
+| `package-deb` | yes | Per architecture (native runner), in the Ubuntu 22.04 container: pinned clang-14, clang-20 from apt.llvm.org, `ci-repro.sh`, `scripts/ci-release-build.sh` (with `robodr-pulsard`), built == reproduced, `robodr` `.deb`, `check-glibc-floor.sh` (libc6 floor <= 2.35), `check-packages.py`; `.deb` uploaded |
+| `package-rpm` | yes | The same in the Rocky Linux 9 container: `robodr` `.rpm` (`build-rpm.sh`), GLIBC requirement <= 2.34, `check-packages.py`; `.rpm` uploaded |
+| `package-smoke` | yes | Per architecture: the three packages compared (`check-packages.py --deb --deb --rpm`), then `scripts/pkg-smoke-matrix.sh`: real installs in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky Linux 9, Fedora 42 containers ([Package matrix](#package-matrix)) |
 
 All third-party actions are pinned by full commit SHA (resolved with
 `git ls-remote --tags` from the upstream repositories), with the tag in a
-comment. Workflow token permissions are `contents: read`.
+comment; container images by multi-arch index digest (resolved with
+`docker buildx imagetools inspect`). Workflow token permissions are
+`contents: read`.
 
 ## Local CI verification
 
@@ -669,6 +761,8 @@ Fixes made by the arm64 run:
   the packaged binaries need (at least 2.35), read with `readelf -V`.
   Supporting glibc < 2.39 robots needs a build on an older runner
   (ubuntu-22.04); that is a release decision, not made here.
+  *(2026-10-30: done, the release builds `robodr` in an Ubuntu 22.04
+  container: [Release build userlands](#release-build-userlands).)*
 - `packaging/build-deb.sh`: checks every binary's ELF `e_machine` against
   `--arch` (62 x86-64, 183 AArch64), so an amd64 `target/release` cannot be
   packaged as arm64 by mistake.
@@ -768,6 +862,76 @@ Not covered by the dry run: see [docs/RELEASE.md](RELEASE.md), "What only
 a real CI run can prove". Commits after `04663a0` (the executor/firewall-gw
 merge `6dc3613` and later) were not re-run; they change no packaging
 script, unit or workflow.
+
+### Package userlands, local run (2026-10-30)
+
+Run on a 4-core amd64 host with Docker, not on GitHub (Actions are
+blocked by billing; **none of the new CI or release jobs has run**).
+Source: the commit that introduced the jobs, plus this record.
+
+Verified locally, **amd64 only**:
+
+- Ubuntu 22.04 container (`ubuntu:22.04`, glibc 2.35): pinned clang-14
+  (`scripts/ci-install-clang.sh` on a fresh container, all six packages
+  at `1:14.0.0-1ubuntu1`), clang-20 20.1.8 from apt.llvm.org
+  (`scripts/ci-install-ebpf-toolchain.sh`, key fingerprint checked),
+  `scripts/ci-install-rustup.sh` (rustup-init 1.29.2 SHA-256 matched,
+  Rust 1.98.1). Release build of the pure workspace and the Pulsar-bound
+  members (`robodr-pulsard` included). GLIBC needs: 2.35 for
+  `robodr-agentd`, `-commission`, `-replay`, `-ros2-watch`, `-pulsard`
+  (`hypot@GLIBC_2.35`), 2.34 for the rest. `build-deb.sh`:
+  `dpkg-shlibdeps` gave `libc6 (>= 2.35), libgcc-s1 (>= 4.2),
+  libsqlite3-0 (>= 3.20.0)`; `robodr-pulsard` links `libsqlite3.so.0`
+  and no OpenSSL.
+- Rocky Linux 9.8 container: pinned clang 21.1.8 (fresh-container install
+  path of `ci-install-clang.sh` / `ci-container-prep.sh` too), release
+  build including `robodr-pulsard` (eBPF objects compiled with clang 21,
+  a warning says Pulsar pins 20); every binary needs at most `GLIBC_2.34`.
+  `build-rpm.sh`: `robodr-0.1.0~alpha.1-1.x86_64.rpm`, generated
+  requirements up to `libc.so.6(GLIBC_2.34)(64bit)`, `libsqlite3.so.0`,
+  `systemd >= 247`, provides `config(robodr)`.
+- `robodr-focal` from `scripts/build-static.sh x86_64-unknown-linux-musl`
+  on the Ubuntu 24.04 host.
+- `scripts/check-packages.py --deb robodr --deb robodr-focal --rpm robodr`
+  on the three: 0 errors. `scripts/check-glibc-floor.sh` on each.
+- `scripts/pkg-smoke-matrix.sh` (through a registry mirror and the host's
+  proxy, same image digests): **all seven rows passed**: `robodr` on
+  Debian 12 (systemd 252), Ubuntu 22.04 (249) and 24.04 (255);
+  `robodr-focal` on Ubuntu 20.04 (**systemd 245**: the focal units pass
+  245's own `systemd-analyze verify`) and 22.04; the RPM on Rocky Linux
+  9.8 (252) and Fedora 42 (257). In each: apt / dnf resolved the
+  dependencies, the scripts ran (users, groups, tmpfiles modes), every
+  program started with `--version` (17 in `robodr`, 15 in `robodr-focal`),
+  `dpkg --verify` / `rpm -V` clean, reinstall, remove and purge kept the
+  black box and keys and purge removed the executor journal.
+- Found and fixed on the way: world-writable man pages and bundle
+  directories when `build-deb.sh` / `make-bundle.sh` run under umask 000
+  (the containers here do); the RPM's `config(robodr)` requirement without
+  a provider (`AutoProv`); `cp --update=none` in `deb-install-smoke.sh`;
+  `apt-get install clang-14=<pin>` failing until the `=`-dependencies are
+  pinned too; Rocky's `curl` / `curl-minimal` conflict; CI's focal build
+  not requiring `robodr-executor` / `robodr-firewall-gw`; the focal Kafka
+  credential example using `LoadCredential=`; `robodr-deliverd` not
+  stopped by `prerm`.
+- Workflows: `actionlint` 1.7.7 (no new findings beyond the existing
+  SC2086 / SC2155 style of the scripts), every `uses:` a 40-hex SHA,
+  every `container:` image a digest, no `pull_request_target`.
+
+arm64, cross-checked only: `robodr-agentd`, `-blackbox` and
+`-commission` cross-built in the Ubuntu 22.04 container
+(`gcc-aarch64-linux-gnu`, `libc6-dev-arm64-cross` 2.35, clang-14 for
+ring) need at most `GLIBC_2.35` (`hypot`), the same as amd64, so the
+`libc6 (>= 2.35)` floor holds for the arm64 `.deb` as far as these show.
+
+Not verified (CI configuration only): the native arm64 builds of both
+containers (Pulsar on arm64 included) and their installs, the
+`container:` jobs on GitHub's runners (checkout inside the container,
+artifact hand-over), `release.yml` end to end (the local dry run does
+not support container jobs yet, RELEASE.md section 4), the RPM scriptlets
+and the units under a booted systemd, `deb-install-smoke.sh` in the
+Ubuntu 22.04 container (its `systemd-analyze verify --root` needs systemd
+>= 250; the release no longer runs it there), and anything on a Jetson
+or with an external BTF file.
 
 ## Verification status
 
