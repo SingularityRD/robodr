@@ -25,8 +25,24 @@ committed Cargo.lock, crate sources already in CARGO_HOME: `cargo fetch
 sources and vendor/pulsar; no network, stdlib only. Crates are those reached
 from the workspace members over normal and build dependencies (never
 dev-dependencies) on the Linux targets RoboDR ships (x86_64 / aarch64, gnu
-and musl). A crate that ships no license file gets the canonical text of a
-license its expression allows (LICENSES/, packaging/licenses/), marked so.
+and musl; deny.toml [graph] targets must name the same four).
+
+License texts. Every term of an AND must be covered by a text: the texts a
+crate ships are recognised by their wording (MIT, Apache-2.0, BSD, ISC,
+Unicode, ...); a term no shipped text covers gets a canonical text, marked
+so: Apache-2.0 (LICENSES/, names no copyright holder), or a license whose
+text names its copyright holders (MIT, BSD-*, ISC) ONLY from a per-crate
+entry in OVERRIDES with the real holders (from the crate's Cargo.toml
+authors / repository), never a "<copyright holders>" placeholder. A crate
+whose expression cannot be covered fails the run. WITH exceptions are kept
+in the reported expression.
+
+Statically linked code that is not a crate of Cargo.lock is listed too
+(RUNTIME): the Rust standard library of the pinned toolchain
+(rust-toolchain.toml) in every program, and in robodr-focal's static musl
+builds musl libc and LLVM's libunwind as shipped in that toolchain's
+*-unknown-linux-musl targets (MUSL_FOR_RUST pins the musl version per
+toolchain; a toolchain bump fails until it is updated).
 
 Every crate's license is checked against deny.toml ([licenses] allow, the
 per-crate exceptions and the [[licenses.clarify]] entries): a crate whose
@@ -57,11 +73,51 @@ PLATFORMS = (
     "aarch64-unknown-linux-musl",
 )
 LICENSE_FILE = re.compile(r"^(LICEN[CS]E|COPYING|UNLICENSE|NOTICE|COPYRIGHT)([-._].*)?$", re.I)
-# Canonical texts for crates that ship no license file.
+# Canonical texts that name no copyright holder: usable for any crate.
 CANONICAL = {
     "Apache-2.0": "LICENSES/LICENSE-APACHE-2.0",
+}
+# Texts that name the copyright holders (@COPYRIGHT@): only through OVERRIDES.
+TEMPLATES = {
     "MIT": "packaging/licenses/MIT.txt",
 }
+HOLDER = "@COPYRIGHT@"
+# Per-crate texts for a crate that ships no text for a license term that
+# names its copyright holders: (name, version) -> {license id: (holders,
+# where they come from)}. Only real holders, from the crate's own metadata.
+OVERRIDES = {
+    ("poolcache", "0.1.1"): {
+        "MIT": (
+            "Jon Allie <jon@jonallie.com>",
+            "Cargo.toml authors; https://github.com/ja30278/poolcache (the crate states no year)",
+        ),
+    },
+}
+# Recognising a shipped text: every pattern must match (white space and
+# comment markers normalised).
+SIGNATURES = (
+    ("MIT", (r"Permission is hereby granted, free of charge, to any person obtaining a copy",)),
+    ("Apache-2.0", (r"Apache License", r"Version 2\.0")),
+    ("ISC", (r"Permission to use, copy, modify, and(/or)? distribute this software for any purpose with or "
+             r"without fee is hereby granted",)),
+    ("BSD-3-Clause", (r"Redistribution and use in source and binary forms",
+                      r"(Neither the name|names of (its|the) contributors may (not )?be used)")),
+    ("BSD-2-Clause", (r"Redistribution and use in source and binary forms",)),
+    ("Unicode-3.0", (r"UNICODE LICENSE V3",)),
+    ("Unicode-DFS-2016", (r"UNICODE, INC\. LICENSE AGREEMENT",)),
+    ("Unlicense", (r"This is free and unencumbered software released into the public domain",)),
+    ("Zlib", (r"altered source versions must be plainly marked",)),
+    ("BSL-1.0", (r"Boost Software License",)),
+    ("MPL-2.0", (r"Mozilla Public License,? [Vv]ersion 2\.0",)),
+    ("CC0-1.0", (r"CC0 1\.0 Universal",)),
+    ("CDLA-Permissive-2.0", (r"Community Data License Agreement - Permissive - Version 2\.0",)),
+)
+# musl version of the self-contained musl in each pinned Rust toolchain's
+# *-unknown-linux-musl targets (src/ci/docker/scripts/musl.sh of that Rust).
+MUSL_FOR_RUST = {
+    "1.98.1": "1.2.5",
+}
+RUST_HOLDER = "The Rust Project Developers (see https://thanks.rust-lang.org)"
 PULSAR = "vendor/pulsar"
 
 
@@ -232,6 +288,50 @@ def license_files(pkg: dict) -> list[tuple[str, str]]:
     return [(n, p.read_text(errors="replace")) for n, p in files]
 
 
+def text_ids(text: str) -> set[str]:
+    """The licenses a license text is recognisably the text of."""
+    lines = [re.sub(r"^\s*(//+|#+|\*+|/\*+|;+)\s?", "", ln) for ln in text.splitlines()]
+    flat = " ".join(" ".join(lines).split())
+    out = set()
+    for lic, pats in SIGNATURES:
+        if all(re.search(pat, flat, re.I) for pat in pats):
+            if lic == "BSD-2-Clause" and "BSD-3-Clause" in out:
+                continue
+            out.add(lic)
+    return out
+
+
+def fallback(lic: str, key: tuple[str, str]) -> str | None:
+    """A canonical text for license LIC of crate KEY, or None."""
+    if lic in OVERRIDES.get(key, {}) and lic in TEMPLATES:
+        holders, _ = OVERRIDES[key][lic]
+        return (ROOT / TEMPLATES[lic]).read_text().replace(HOLDER, holders)
+    if lic in CANONICAL:
+        return (ROOT / CANONICAL[lic]).read_text()
+    return None
+
+
+def needed(tree, have: set[str], key: tuple[str, str]) -> list[str] | None:
+    """License ids whose canonical text must be added so that every AND term
+    of TREE is covered by a text (one alternative of each OR); None if that
+    is impossible. Prefers what the crate ships, then Apache-2.0."""
+    kind, v = tree
+    if kind == "lic":
+        lic = v.split(" WITH ")[0]
+        if lic in have:
+            return []
+        return [lic] if fallback(lic, key) is not None else None
+    parts = [needed(x, have, key) for x in v]
+    if kind == "and":
+        if any(p is None for p in parts):
+            return None
+        return sorted({i for p in parts for i in p})
+    ok = [p for p in parts if p is not None]
+    if not ok:
+        return None
+    return min(ok, key=lambda p: (len(p), [0 if i in CANONICAL else 1 for i in p]))
+
+
 def texts_for(pkg: dict, tree) -> tuple[list[tuple[str, str]], str]:
     """The license texts of a crate and a note on where they come from."""
     path = Path(pkg["manifest_path"]).resolve()
@@ -243,16 +343,66 @@ def texts_for(pkg: dict, tree) -> tuple[list[tuple[str, str]], str]:
             ("Pulsar LICENSES/LICENSE-APACHE-2.0", (pulsar / "LICENSES/LICENSE-APACHE-2.0").read_text()),
         ], "Pulsar (vendor/pulsar)"
     files = license_files(pkg)
-    if files:
-        return files, ""
-    have = ids(tree)
-    for i in CANONICAL:  # Apache-2.0 first: a complete text, no copyright line to fill
-        if i in have:
-            return [(i, (ROOT / CANONICAL[i]).read_text())], (
-                f"the crate ships no license file; canonical {i} text"
-            )
-    sys.exit(f"third_party_notices: {pkg['name']} {pkg['version']} ships no license file and no canonical text "
-             f"is known for {render(tree)} (add one to CANONICAL)")
+    key = (pkg["name"], pkg["version"])
+    have = set().union(*(text_ids(t) for _, t in files)) if files else set()
+    add = needed(tree, have, key)
+    if add is None:
+        sys.exit(f"third_party_notices: {pkg['name']} {pkg['version']}: {render(tree)} needs a license text for "
+                 f"every AND term, but the crate ships texts of {sorted(have) or 'nothing'} and no canonical text "
+                 "without a copyright holder covers the rest. Add an OVERRIDES entry with the real copyright "
+                 "holders (the crate's Cargo.toml authors / repository); never a placeholder.")
+    out = list(files)
+    notes = []
+    for lic in add:
+        out.append((lic, fallback(lic, key)))
+        if lic in OVERRIDES.get(key, {}):
+            notes.append(f"canonical {lic} text, copyright holders from {OVERRIDES[key][lic][1]}")
+        else:
+            notes.append(f"canonical {lic} text")
+    if not notes:
+        return out, ""
+    what = "no license file" if not files else f"no {'/'.join(add)} text"
+    return out, f"the crate ships {what}; " + "; ".join(notes)
+
+
+def toolchain() -> str:
+    m = re.search(r'^channel\s*=\s*"([^"]+)"', (ROOT / "rust-toolchain.toml").read_text(), re.M)
+    if not m:
+        sys.exit("third_party_notices: no channel in rust-toolchain.toml")
+    return m.group(1)
+
+
+def runtime_rows() -> list[tuple[str, str, str, list[tuple[str, str]]]]:
+    """(name, license, note, texts) of the statically linked code that is not
+    a Cargo.lock crate: Rust's standard library, and for robodr-focal musl and
+    LLVM libunwind from the toolchain's musl targets."""
+    rust = toolchain()
+    if rust not in MUSL_FOR_RUST:
+        sys.exit(f"third_party_notices: rust-toolchain.toml pins Rust {rust}; add its musl version to MUSL_FOR_RUST "
+                 "(src/ci/docker/scripts/musl.sh of that release) and its COPYRIGHT to packaging/licenses/")
+    musl = MUSL_FOR_RUST[rust]
+    lic = ROOT / "packaging" / "licenses"
+    apache = (ROOT / CANONICAL["Apache-2.0"]).read_text()
+    mit = (ROOT / TEMPLATES["MIT"]).read_text().replace(HOLDER, RUST_HOLDER)
+    llvm = (lic / "LLVM-exception.txt").read_text()
+    return [
+        (f"Rust standard library {rust} (std, core, alloc, panic_abort, compiler_builtins and the crates std links)",
+         "(MIT OR Apache-2.0) AND Unicode-3.0 AND Apache-2.0 WITH LLVM-exception",
+         "statically linked into every RoboDR program; core's Unicode tables are Unicode-3.0, compiler_builtins "
+         "carries LLVM compiler-rt code (Apache-2.0 WITH LLVM-exception); per-file and per-crate notices: "
+         f"share/doc/rust/COPYRIGHT-library.html of Rust {rust}",
+         [("Rust LICENSE-MIT", mit), ("Apache-2.0", apache), ("Unicode-3.0", (lic / "Unicode-3.0.txt").read_text()),
+          ("LLVM-exception", llvm)]),
+        (f"musl libc {musl}",
+         "MIT",
+         f"robodr-focal only: statically linked into its *-unknown-linux-musl programs (the self-contained musl of "
+         f"Rust {rust})",
+         [(f"musl {musl} COPYRIGHT", (lic / f"musl-{musl}-COPYRIGHT").read_text())]),
+        (f"LLVM libunwind (Rust {rust}, *-unknown-linux-musl)",
+         "Apache-2.0 WITH LLVM-exception",
+         "robodr-focal only: the unwinder Rust's musl targets link statically",
+         [("Apache-2.0", apache), ("LLVM-exception", llvm)]),
+    ]
 
 
 def check_license(pkg: dict, deny: dict) -> tuple[object, str]:
@@ -287,6 +437,20 @@ def notices(meta: dict, deny: dict) -> str:
             texts[h][2].append(f"{p['name']} {p['version']}")
             refs.append(h)
         rows.append((p, render(tree), note, origin, refs))
+    runtime = []
+    for name, expr, note, files in runtime_rows():
+        refs = []
+        for fname, t in files:
+            t = normalise(t)
+            h = hashlib.sha256(t.encode()).hexdigest()
+            if h not in texts:
+                texts[h] = [fname, t, []]
+            texts[h][2].append(name.split(" (")[0])
+            refs.append(h)
+        runtime.append((name, expr, note, refs))
+    for h, (fname, t, _) in texts.items():
+        if HOLDER in t or "<copyright holders>" in t:
+            sys.exit(f"third_party_notices: text {fname} still has a copyright-holder placeholder")
     num = {h: i + 1 for i, h in enumerate(texts)}
     out = [
         "RoboDR third-party notices",
@@ -299,6 +463,9 @@ def notices(meta: dict, deny: dict) -> str:
         "([T<n>], with the crates that carry it). Where an expression offers a choice",
         "(\"MIT OR Apache-2.0\"), RoboDR uses the crate under any one of the licenses",
         "offered; every text the crate ships is reproduced.",
+        "",
+        "Statically linked code that is not a crate (the Rust standard library; musl libc",
+        "and LLVM libunwind in robodr-focal's static builds) is listed after the crates.",
         "",
         "The Pulsar eBPF probes that robodr-pulsard loads into the kernel are not Rust",
         "crates: they are GPL-2.0 programs, see GPL-2.0-SOURCE-OFFER next to this file.",
@@ -316,6 +483,13 @@ def notices(meta: dict, deny: dict) -> str:
             out.append(f"    Note:    {note}")
         if origin:
             out.append(f"    Texts:   {origin}")
+        out.append("    See:     " + ", ".join(f"[T{num[h]}]" for h in refs))
+    head = f"Statically linked runtime code ({len(runtime)})"
+    out += ["", head, "-" * len(head), ""]
+    for name, expr, note, refs in runtime:
+        out.append(name)
+        out.append(f"    License: {expr}")
+        out.append(f"    Note:    {note}")
         out.append("    See:     " + ", ".join(f"[T{num[h]}]" for h in refs))
     out += ["", f"License texts ({len(texts)})", "-" * len(f"License texts ({len(texts)})"), ""]
     for h, (fname, t, users) in texts.items():
@@ -450,6 +624,52 @@ def self_test() -> int:
         bad += 1
     if normalise("\r\n a \r\nb  \n\n") != " a\nb\n":
         print("FAIL normalise")
+        bad += 1
+    # License texts: recognised in comments too; every AND term covered; a
+    # holder-naming license only through OVERRIDES; WITH keeps its base id.
+    isc = ("// Copyright 2015 X.\n//\n// Permission to use, copy, modify, and/or distribute this software for any\n"
+           "// purpose with or without fee is hereby granted, provided that ...\n")
+    if text_ids(isc) != {"ISC"}:
+        print(f"FAIL text_ids ISC: {text_ids(isc)}")
+        bad += 1
+    k = ("nobody-crate", "1.0.0")
+    for expr, have, want in [
+        ("MIT OR Apache-2.0", set(), ["Apache-2.0"]),
+        ("MIT", set(), None),
+        ("ISC", set(), None),
+        ("BSD-3-Clause", set(), None),
+        ("MIT AND BSD-3-Clause", {"MIT"}, None),
+        ("MIT AND BSD-3-Clause", {"MIT", "BSD-3-Clause"}, []),
+        ("(MIT OR Apache-2.0) AND Unicode-3.0", {"MIT"}, None),
+        ("(MIT OR Apache-2.0) AND Unicode-3.0", {"Unicode-3.0"}, ["Apache-2.0"]),
+        ("Apache-2.0 WITH LLVM-exception", {"Apache-2.0"}, []),
+        ("Apache-2.0 AND ISC", {"Apache-2.0", "ISC"}, []),
+    ]:
+        got = needed(parse(expr), have, k)
+        if got != want:
+            print(f"FAIL needed({expr!r}, {sorted(have)}): {got}, want {want}")
+            bad += 1
+    if needed(parse("MIT"), set(), ("poolcache", "0.1.1")) != ["MIT"]:
+        print("FAIL poolcache override")
+        bad += 1
+    t = fallback("MIT", ("poolcache", "0.1.1")) or ""
+    if HOLDER in t or "<copyright holders>" in t or "Jon Allie" not in t:
+        print("FAIL MIT template rendering")
+        bad += 1
+    if fallback("MIT", k) is not None:
+        print("FAIL MIT without an override must have no fallback")
+        bad += 1
+    try:
+        import tomllib
+
+        targets = tomllib.loads((ROOT / "deny.toml").read_text())["graph"]["targets"]
+        if sorted(targets) != sorted(PLATFORMS):
+            print(f"FAIL deny.toml [graph] targets {targets} != {list(PLATFORMS)}")
+            bad += 1
+    except ImportError:
+        pass
+    if toolchain() not in MUSL_FOR_RUST:
+        print(f"FAIL MUSL_FOR_RUST lacks Rust {toolchain()}")
         bad += 1
     print("third_party_notices self-test:", "FAIL" if bad else "ok")
     return 1 if bad else 0
