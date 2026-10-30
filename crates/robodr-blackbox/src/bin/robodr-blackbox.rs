@@ -1,25 +1,36 @@
 //! `robodr-blackbox`: key and evidence tooling for the black-box recorder.
 //!
 //! ```text
-//! robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
-//!                            [--device ID]
+//! robodr-blackbox keygen     --out FILE [--alg ed25519|hmac --allow-hmac] [--key-id ID]
+//!                            [--pub-out FILE] [--device ID]
 //! robodr-blackbox export-pub KEYFILE [--out FILE]
 //! robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-//!                            [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
+//!                            [--device ID] [--allow-hmac] [--allow-mixed-algorithms]
+//!                            [--strict] [--json]
 //! robodr-blackbox verify     BUNDLE --keyring FILE [--keyring FILE]... [--device ID]
-//!                            [--signing-key ID] [--allow-mixed-algorithms] [--strict] [--json]
+//!                            [--signing-key ID] [--allow-hmac] [--allow-mixed-algorithms]
+//!                            [--strict] [--json]
+//! robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
+//!                            [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+//!                            [--allow-hmac]
 //! robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 //! robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
 //!                            [--owner-auth-file FILE] [--index-auth-file FILE]
 //! robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
 //!                            [--index-auth-file FILE]
-//! robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE]
+//! robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE] [--allow-hmac]
 //! ```
+//!
+//! **Legacy HMAC keys are refused by default** (symmetric: whoever can
+//! verify can also forge). Every subcommand that loads a key accepts one
+//! only with `--allow-hmac` (and then warns): `keygen --alg hmac`, `verify`
+//! with an HMAC key in a `--keyring`, `rotate` from an HMAC key (the way
+//! off it), `anchor-mark`. `rotate` never rotates *to* an HMAC key.
 //!
 //! - `keygen` writes a new key. Default `--alg ed25519`: the secret seed
 //!   file (`robodr-blackbox-key/v2`, mode 0600) at `--out` and the public
 //!   key file (mode 0644, safe to distribute) at `--pub-out`, default
-//!   `<out>.pub`. `--alg hmac` writes a legacy symmetric HMAC-SHA256 key
+//!   `<out>.pub`. `--alg hmac --allow-hmac` writes a legacy symmetric HMAC-SHA256 key
 //!   (`robodr-blackbox-key/v1`, 0600, no public half) and warns. Nothing
 //!   is ever overwritten or written through a symlink; if either target
 //!   exists nothing is written. It prints the key id, never the secret.
@@ -45,6 +56,21 @@
 //!   `chain.signing_key.key_id`; needed only for a bundle that starts after
 //!   a key rotation; its algorithm is the keyring entry's). The anchor is
 //!   reported as unverified (info): compare it with what you already hold.
+//! - `rotate` rotates the black-box key **in place**, with the recorder's
+//!   writer stopped (`robodr-agentd` holds the directory lock otherwise):
+//!   it opens the log `DIR` of unit `--device` with the current secret key
+//!   `--old-key` (records signed by keys retired earlier need
+//!   `--previous-keys`, public key or keyring files), writes a
+//!   `KeyRotation` record signed by the old key that names the new one
+//!   (`--new-key`, an Ed25519 secret key file with another key id), and a
+//!   seal under the new key (`Recorder::rotate_key`). The chain continues;
+//!   nothing is archived or rewritten. Afterwards the writer must open the
+//!   log with the new key **and** the old public key as a previous key
+//!   (`robodr-agentd`: `blackbox.key_file` = the new key,
+//!   `blackbox.previous_keys` += the old `.pub`); verifiers need both
+//!   public keys (`verify --keyring old.pub --keyring new.pub`). Re-running
+//!   it after a successful rotation reports "already rotated" (exit 0).
+//!   `--boot-id` defaults to this boot's id; `--reason` is recorded.
 //! - `inspect` lists frames (seq, kind, flags, time, payload) without
 //!   checking any signature: it is a viewer, not a verdict.
 //! - `tpm-anchor-init` provisions the TPM 2.0 NV counter behind
@@ -87,27 +113,43 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const USAGE: &str = "usage:
-  robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
-                             [--device ID]
+  robodr-blackbox keygen     --out FILE [--alg ed25519|hmac --allow-hmac] [--key-id ID]
+                             [--pub-out FILE] [--device ID]
   robodr-blackbox export-pub KEYFILE [--out FILE]
   robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-                             [--device ID] [--allow-mixed-algorithms] [--strict] [--json]
+                             [--device ID] [--allow-hmac] [--allow-mixed-algorithms]
+                             [--strict] [--json]
   robodr-blackbox verify     BUNDLE --keyring FILE [--keyring FILE]... [--device ID]
-                             [--signing-key ID] [--allow-mixed-algorithms] [--strict] [--json]
+                             [--signing-key ID] [--allow-hmac] [--allow-mixed-algorithms]
+                             [--strict] [--json]
+  robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
+                             [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+                             [--allow-hmac]
   robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
   robodr-blackbox tpm-anchor-init  --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--owner-auth-file FILE] [--index-auth-file FILE]
   robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--index-auth-file FILE]
-  robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE]
+  robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE] [--allow-hmac]
   robodr-blackbox --version
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
-files (any mode).
+files (any mode). Legacy hmac-sha256 keys are refused unless --allow-hmac.
 exit: 0 intact, 1 verification failed, 2 usage/IO/key error";
 
 const HMAC_WARNING: &str = "warning: hmac-sha256 is the legacy symmetric placeholder: every \
 holder of this key can also forge evidence. Use ed25519 for production.";
+
+/// The legacy-HMAC gate: `kf` passes if it is not HMAC, or with
+/// `--allow-hmac` (then warns).
+fn hmac_gate(kf: &KeyFile, shown: &str, allow_hmac: bool) -> Result<(), String> {
+    kf.check_hmac_policy(allow_hmac)
+        .map_err(|e| format!("{shown}: {e}"))?;
+    if kf.is_symmetric() {
+        eprintln!("{HMAC_WARNING} [{shown}, allowed by --allow-hmac]");
+    }
+    Ok(())
+}
 
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
 /// Largest bundle file `verify` reads.
@@ -199,6 +241,7 @@ fn main() -> ExitCode {
         Some("keygen") => keygen(&argv[1..]),
         Some("export-pub") => export_pub(&argv[1..]),
         Some("verify") => verify(&argv[1..]),
+        Some("rotate") => rotate(&argv[1..]),
         Some("inspect") => inspect(&argv[1..]),
         Some("tpm-anchor-init") => tpm_anchor_init(&argv[1..]),
         Some("tpm-anchor-check") => tpm_anchor_check(&argv[1..]),
@@ -224,7 +267,11 @@ fn main() -> ExitCode {
 }
 
 fn keygen(raw: &[String]) -> Result<(), Fail> {
-    let a = Args::parse(raw, &["out", "key-id", "alg", "pub-out", "device"], &[])?;
+    let a = Args::parse(
+        raw,
+        &["out", "key-id", "alg", "pub-out", "device"],
+        &["allow-hmac"],
+    )?;
     if !a.positional.is_empty() {
         return Err("keygen takes no positional arguments".to_string().into());
     }
@@ -237,6 +284,15 @@ fn keygen(raw: &[String]) -> Result<(), Fail> {
         "hmac" | "hmac-sha256" => "hmac-sha256",
         other => return Err(format!("--alg {other:?}: expected ed25519 or hmac").into()),
     };
+    if alg == "hmac-sha256" && !a.flag("allow-hmac") {
+        return Err(
+            "--alg hmac: legacy hmac-sha256 keys are refused by default (symmetric: \
+             whoever can verify can also forge); use ed25519, or add --allow-hmac to write one \
+             knowingly"
+                .to_string()
+                .into(),
+        );
+    }
     let pub_out = match (alg, a.one("pub-out")?) {
         ("ed25519", Some(p)) => Some(PathBuf::from(p)),
         ("ed25519", None) => Some(public_key_path(out)),
@@ -306,7 +362,7 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     let a = Args::parse(
         raw,
         &["keyring", "checkpoint", "device", "signing-key"],
-        &["strict", "json", "allow-mixed-algorithms"],
+        &["strict", "json", "allow-mixed-algorithms", "allow-hmac"],
     )?;
     let dir = PathBuf::from(a.single_positional("log directory or bundle file")?);
     let files = a.all("keyring");
@@ -315,6 +371,7 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     }
     let mut ring = Keyring::new();
     ring.set_allow_mixed_algorithms(a.flag("allow-mixed-algorithms"));
+    ring.set_refuse_hmac(!a.flag("allow-hmac"));
     for f in files {
         ring.load_file(Path::new(f))
             .map_err(|e| format!("{f}: {e}"))?;
@@ -322,7 +379,8 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     let symmetric = ring.symmetric_key_ids();
     if !symmetric.is_empty() {
         eprintln!(
-            "warning: symmetric (hmac-sha256) key(s) {}: anyone holding them can also forge",
+            "warning: symmetric (hmac-sha256) key(s) {} (allowed by --allow-hmac): anyone \
+             holding them can also forge",
             symmetric.join(", ")
         );
     }
@@ -414,6 +472,151 @@ fn verify(raw: &[String]) -> Result<(), Fail> {
     } else {
         Err(Fail::Verify)
     }
+}
+
+/// Largest number of `--previous-keys` files.
+const MAX_PREVIOUS_KEY_FILES: usize = 32;
+
+fn rotate(raw: &[String]) -> Result<(), Fail> {
+    let a = Args::parse(
+        raw,
+        &[
+            "old-key",
+            "new-key",
+            "device",
+            "previous-keys",
+            "boot-id",
+            "reason",
+        ],
+        &["allow-hmac"],
+    )?;
+    let dir = PathBuf::from(a.single_positional("log directory")?);
+    let req = |n: &str| -> Result<String, String> {
+        a.one(n)?
+            .map(str::to_string)
+            .ok_or_else(|| format!("--{n} is required"))
+    };
+    let (old_p, new_p, device) = (req("old-key")?, req("new-key")?, req("device")?);
+    let allow_hmac = a.flag("allow-hmac");
+    // Never start a new chain by mistake: the log must exist.
+    let segments = robodr_blackbox::store::list_segments(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    if segments.is_empty() {
+        return Err(format!(
+            "{}: no black-box segments: nothing to rotate (a new log is simply started with the \
+             new key)",
+            dir.display()
+        )
+        .into());
+    }
+    let old = KeyFile::load_secret(Path::new(&old_p)).map_err(|e| format!("{old_p}: {e}"))?;
+    hmac_gate(&old, &old_p, allow_hmac)?;
+    let new = KeyFile::load_secret(Path::new(&new_p)).map_err(|e| format!("{new_p}: {e}"))?;
+    if new.algorithm != robodr_blackbox::sign_ed25519::ED25519 {
+        return Err(format!(
+            "{new_p}: the new key must be ed25519 (got {}); rotating to a legacy hmac key is \
+             refused",
+            new.algorithm
+        )
+        .into());
+    }
+    if new.key_id == old.key_id {
+        return Err(
+            "--new-key has the same key id as --old-key: rotation needs a new key id \
+             (robodr-blackbox keygen --key-id ...)"
+                .to_string()
+                .into(),
+        );
+    }
+    let prev_files = a.all("previous-keys");
+    if prev_files.len() > MAX_PREVIOUS_KEY_FILES {
+        return Err(format!("at most {MAX_PREVIOUS_KEY_FILES} --previous-keys files").into());
+    }
+    let mut prev = Vec::new();
+    for f in prev_files {
+        let keys =
+            robodr_blackbox::keys::load_key_files(Path::new(f)).map_err(|e| format!("{f}: {e}"))?;
+        for k in &keys {
+            hmac_gate(k, f, allow_hmac)?;
+        }
+        prev.extend(keys);
+    }
+    let prev = robodr_blackbox::PreviousKeys::from_key_files(&prev, allow_hmac)
+        .map_err(|e| format!("--previous-keys: {e}"))?;
+    if prev.key_ids().contains(&new.key_id.as_str()) {
+        return Err(format!(
+            "--previous-keys holds the new key id {:?}: a retired key id is never reused",
+            new.key_id
+        )
+        .into());
+    }
+    let boot_id = match a.one("boot-id")? {
+        Some(b) => b.to_string(),
+        None => std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown-boot".into()),
+    };
+    let reason = a.one("reason")?.unwrap_or("robodr-blackbox rotate");
+    let cfg = robodr_blackbox::RecorderConfig::new(&dir, &device, &boot_id);
+    let old_signer = old.signer().map_err(|e| format!("{old_p}: {e}"))?;
+    let new_signer = new.signer().map_err(|e| format!("{new_p}: {e}"))?;
+    let prev_box: Option<Box<dyn robodr_blackbox::Verifier>> =
+        (!prev.is_empty()).then(|| Box::new(prev.clone()) as Box<dyn robodr_blackbox::Verifier>);
+    let clock = robodr_blackbox::SystemClock::new(robodr_blackbox::TimeSource::Unknown);
+    let mut r = match robodr_blackbox::Recorder::open_with_keys(
+        cfg,
+        old_signer,
+        None,
+        prev_box,
+        Box::new(clock),
+    ) {
+        Ok(r) => r,
+        Err(robodr_blackbox::Error::KeyMismatch { log_key_id, .. })
+            if log_key_id == format!("{}/{}", new.algorithm, new.key_id) =>
+        {
+            eprintln!(
+                "robodr-blackbox: {}: already rotated to {} (nothing written)",
+                dir.display(),
+                new.key_id
+            );
+            println!("{}", new.key_id);
+            return Ok(());
+        }
+        Err(e @ robodr_blackbox::Error::KeyMismatch { .. }) => {
+            return Err(format!(
+                "{}: {e}: --old-key must be the key the log is signed with now",
+                dir.display()
+            )
+            .into())
+        }
+        Err(e) => {
+            return Err(format!(
+                "{}: {e} (stop the writer first; keys retired by an earlier rotation go in \
+                 --previous-keys)",
+                dir.display()
+            )
+            .into())
+        }
+    };
+    let cp = r
+        .rotate_key(new_signer, None, reason)
+        .map_err(|e| format!("{}: rotation failed: {e}", dir.display()))?;
+    r.close()
+        .map_err(|e| format!("{}: closing after the rotation: {e}", dir.display()))?;
+    eprintln!(
+        "robodr-blackbox: {}: rotated {} -> {} (seal seq {}); the writer now needs the new key \
+         and {}'s public key as a previous key (robodr-agentd: blackbox.previous_keys); \
+         verifiers need both public keys",
+        dir.display(),
+        old.key_id,
+        new.key_id,
+        cp.seq,
+        old.key_id
+    );
+    println!("{}", new.key_id);
+    Ok(())
 }
 
 /// The counter named by `--index`, reached with `--tcti` / `--tools-dir`.
@@ -508,7 +711,7 @@ fn tpm_anchor_check(raw: &[String]) -> Result<(), Fail> {
 }
 
 fn anchor_mark(raw: &[String]) -> Result<(), Fail> {
-    let a = Args::parse(raw, &["key", "unit", "out"], &[])?;
+    let a = Args::parse(raw, &["key", "unit", "out"], &["allow-hmac"])?;
     let dir = Path::new(a.single_positional("DIR")?);
     let key = a
         .one("key")?
@@ -517,6 +720,7 @@ fn anchor_mark(raw: &[String]) -> Result<(), Fail> {
         .one("unit")?
         .ok_or_else(|| "--unit ID is required".to_string())?;
     let k = KeyFile::load_secret(Path::new(key)).map_err(|e| format!("{key}: {e}"))?;
+    hmac_gate(&k, key, a.flag("allow-hmac"))?;
     let signer = k.signer().map_err(|e| format!("{key}: {e}"))?;
     let text = read_bounded(&dir.join(HEAD_FILE), MAX_CHECKPOINT_BYTES)?;
     let cp = Checkpoint::from_json(&text)

@@ -698,8 +698,12 @@ impl<'a> Daemon<'a> {
                 let signer =
                     crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
                         .map_err(bad)?;
-                let a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
+                let mut a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
                     .map_err(|e| bad(e.to_string()))?;
+                // A sidecar written before an in-place key rotation.
+                if let Some(p) = &r.previous_keys {
+                    a = a.with_previous_keys(p.clone());
+                }
                 bcfg.head_anchor = Some(Arc::new(a));
             }
             Some(a @ crate::config::HeadAnchorConfig::Remote { .. }) => {
@@ -766,8 +770,26 @@ impl<'a> Daemon<'a> {
         }
         let signer = crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
             .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
-        let mut agent =
-            Agent::new(acfg, signer, Box::new(clock.clone())).map_err(DaemonError::Agent)?;
+        // Records signed before an in-place key rotation verify under
+        // `blackbox.previous_keys`; without the key that signed a retained
+        // record the black box is refused (fail closed), with the remedy.
+        let mut agent = Agent::new_with_keys(
+            acfg,
+            signer,
+            None,
+            r.previous_keys.clone(),
+            Box::new(clock.clone()),
+        )
+        .map_err(|e| match e {
+            robodr_agent::AgentError::BlackBox(b) if b.to_string().contains("previous key") => {
+                DaemonError::Config(format!(
+                    "black box {}: {b}. If the black-box key was rotated, list the retired \
+                     key's public file in blackbox.previous_keys (OPERATIONS 4.3)",
+                    cfg.blackbox.dir.display()
+                ))
+            }
+            e => DaemonError::Agent(e),
+        })?;
         if let Some((key, key_id)) = &r.finding_key {
             let fs = crate::config::signer_for(
                 robodr_blackbox::sign_ed25519::ED25519,

@@ -25,10 +25,6 @@ fn relocate(text: &str, s: &Setup) -> String {
             s.policy.to_str().unwrap(),
         )
         .replace(
-            "/run/credentials/robodr-agentd.service/blackbox.key",
-            s.key.to_str().unwrap(),
-        )
-        .replace(
             "/run/credentials/robodr-agentd.service/",
             &format!("{root}/credentials/"),
         )
@@ -56,6 +52,12 @@ fn setup_root(tag: &str) -> Setup {
     for d in ["run", "var", "etc", "credentials"] {
         std::fs::create_dir_all(s.dir.join(d)).unwrap();
     }
+    // The shipped unit's black-box credential is an Ed25519 key (legacy
+    // HMAC keys, like the fixture's, are refused without allow_hmac).
+    robodr_blackbox::KeyFile::ed25519_from_seed(&[0x21; 32], Some("bb-example"))
+        .unwrap()
+        .write_new(&s.dir.join("credentials/blackbox.key"))
+        .unwrap();
     s
 }
 

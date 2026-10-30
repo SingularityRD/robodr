@@ -35,8 +35,13 @@ unit can still copy it (see the threat model).
 
 **HMAC-SHA256** (`sign.rs`, `HmacSha256Key`) remains as the legacy
 *shared-key* placeholder: anyone who can verify a tag can also forge one. It
-is still accepted (old chains, old key files), but `keygen` produces it only
-with `--alg hmac`, and the tools warn whenever it is used. The `Signer` and
+is still *usable* (old chains, old key files), but **refused by default**:
+every tool that loads a key accepts an HMAC key only with an explicit
+`--allow-hmac` (`robodr-agentd`: `blackbox.allow_hmac: true`) and then warns
+(`KeyFile::check_hmac_policy`, `Keyring::set_refuse_hmac`, error
+`KeyFileError::LegacyHmac`). The library constructors stay
+algorithm-agnostic. Migrate with `robodr-blackbox rotate --allow-hmac`
+(below). The `Signer` and
 `Verifier` traits (`src/sign.rs`) are the seam: format, chain, storage and
 verifier are the same for both. Signatures are length-prefixed, up to 1024
 bytes.
@@ -44,10 +49,15 @@ bytes.
 ## Keys and the `robodr-blackbox` tool
 
 ```
-robodr-blackbox keygen     --out FILE [--alg ed25519|hmac] [--key-id ID] [--pub-out FILE]
+robodr-blackbox keygen     --out FILE [--alg ed25519|hmac --allow-hmac] [--key-id ID]
+                           [--pub-out FILE] [--device ID]
 robodr-blackbox export-pub KEYFILE [--out FILE]
-robodr-blackbox verify     DIR --keyring FILE [--keyring FILE]... [--checkpoint FILE]
-                           [--device ID] [--strict] [--json]
+robodr-blackbox verify     DIR|BUNDLE --keyring FILE [--keyring FILE]... [--checkpoint FILE]
+                           [--device ID] [--allow-hmac] [--allow-mixed-algorithms]
+                           [--strict] [--json]
+robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
+                           [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+                           [--allow-hmac]
 robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 ```
 
@@ -103,6 +113,22 @@ from the command line (argv is readable by every process via `/proc`).
   alone works. Verify a log, directory or bundle spanning a rotation with a
   keyring holding both keys (`verify DIR --keyring old.key.pub --keyring
   new.key.pub`). Rotation is also the HMAC-to-Ed25519 migration path.
+- **`rotate`** does that rotation in place on a stopped log (the writer
+  holds the directory lock otherwise): it opens `DIR` of unit `--device`
+  with `--old-key` (the current secret key; keys retired by an earlier
+  rotation go in `--previous-keys`, public key or keyring files), rotates
+  to `--new-key` (an Ed25519 secret key file with a new key id; an HMAC
+  target is refused) and closes. The chain continues; nothing is archived.
+  It refuses a directory without segments (nothing to rotate), the wrong
+  old key (`KeyMismatch`), and a log with records it cannot authenticate;
+  re-running it after success reports "already rotated" (exit 0).
+  `PreviousKeys` (`keys.rs`) is the `Send + Sync` set of retired keys a
+  long-running writer passes to `Recorder::open_with_keys` on every
+  (re)open (`robodr-agentd`'s `blackbox.previous_keys`), and
+  `TpmNvCounterAnchor::with_previous_keys` accepts a sidecar written under
+  a retired key (checked under the key the sidecar names) until the next
+  mark rewrites it. `keys::load_key_files` loads a key or keyring file with
+  the permission rule.
 - **Limit:** `Keyring::verify` (used for records, which do not name their
   key) accepts a signature from *any* key in the ring. Keep one keyring per
   unit (or fleet trust domain). With HMAC every key file is a forging key on

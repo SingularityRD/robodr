@@ -133,7 +133,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use robodr_blackbox::crypto::to_hex;
 use robodr_blackbox::sign::SignError;
 use robodr_blackbox::{
-    AppendOutcome, Checkpoint, Clock, Recorder, RecorderConfig, Signer, Timestamp, Verifier,
+    AppendOutcome, Checkpoint, Clock, PreviousKeys, Recorder, RecorderConfig, Signer, Timestamp,
+    Verifier,
 };
 use robodr_events::profile::Profile;
 use robodr_events::{Deviation, Mode, MotionCommand, RobotEvent, Severity};
@@ -288,26 +289,25 @@ impl Verifier for SharedVerifier {
 
 /// Open (or resume) the black box with the agent's key. A signer that can
 /// check its own signatures needs no verifier; otherwise the configured one
-/// is used ([`Recorder::open_with_verifier`]).
+/// is used. Records signed before a key rotation are authenticated with
+/// `previous` ([`Recorder::open_with_keys`]); without it a log that holds
+/// such records is refused (fail closed).
 fn open_recorder(
     cfg: &RecorderConfig,
     signer: &SharedSigner,
     verifier: Option<&SharedVerifier>,
+    previous: Option<&PreviousKeys>,
     clock: &FollowClock,
 ) -> Result<Recorder, robodr_blackbox::Error> {
-    match verifier {
-        None => Recorder::open(
-            cfg.clone(),
-            Box::new(signer.clone()),
-            Box::new(clock.clone()),
-        ),
-        Some(v) => Recorder::open_with_verifier(
-            cfg.clone(),
-            Box::new(signer.clone()),
-            Box::new(v.clone()),
-            Box::new(clock.clone()),
-        ),
-    }
+    Recorder::open_with_keys(
+        cfg.clone(),
+        Box::new(signer.clone()),
+        verifier.map(|v| Box::new(v.clone()) as Box<dyn Verifier>),
+        previous
+            .filter(|p| !p.is_empty())
+            .map(|p| Box::new(p.clone()) as Box<dyn Verifier>),
+        Box::new(clock.clone()),
+    )
 }
 
 /// Message signed by a would-be finding key to prove it is not the
@@ -423,6 +423,8 @@ pub struct Agent {
     signer: SharedSigner,
     /// Explicit verifier for `signer`'s key, if the signer cannot verify.
     verifier: Option<SharedVerifier>,
+    /// Retired black-box keys (after a key rotation), for every (re)open.
+    previous_keys: Option<PreviousKeys>,
     /// Monotonic time of the first failure of the current outage.
     blackbox_down_since: Option<u64>,
     last_reopen_attempt: Option<u64>,
@@ -476,7 +478,28 @@ impl Agent {
         signer: Box<dyn Signer>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, AgentError> {
-        Self::build(cfg, signer, None, clock)
+        Self::build(cfg, signer, None, None, clock)
+    }
+
+    /// [`Agent::new`] / [`Agent::new_with_verifier`] for a black box whose
+    /// key was rotated: `previous_keys` (this unit's retired keys, public
+    /// halves suffice) authenticate the records signed before the rotation
+    /// at open and at every reopen ([`Recorder::open_with_keys`]). Without
+    /// the key that signed a retained record, the black box is refused.
+    pub fn new_with_keys(
+        cfg: AgentConfig,
+        signer: Box<dyn Signer>,
+        verifier: Option<Arc<dyn Verifier + Send + Sync>>,
+        previous_keys: Option<PreviousKeys>,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, AgentError> {
+        Self::build(
+            cfg,
+            signer,
+            verifier.map(SharedVerifier),
+            previous_keys,
+            clock,
+        )
     }
 
     /// [`Agent::new`] for a signer that cannot verify its own signatures:
@@ -488,13 +511,14 @@ impl Agent {
         verifier: Arc<dyn Verifier + Send + Sync>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, AgentError> {
-        Self::build(cfg, signer, Some(SharedVerifier(verifier)), clock)
+        Self::build(cfg, signer, Some(SharedVerifier(verifier)), None, clock)
     }
 
     fn build(
         cfg: AgentConfig,
         signer: Box<dyn Signer>,
         verifier: Option<SharedVerifier>,
+        previous_keys: Option<PreviousKeys>,
         clock: Box<dyn Clock>,
     ) -> Result<Self, AgentError> {
         cfg.validate()?;
@@ -570,8 +594,14 @@ impl Agent {
         probe_finding(&ocsf, start, cfg.kafka_partitions).map_err(AgentError::Config)?;
         let follow = FollowClock::new(start);
         let signer = SharedSigner::new(signer);
-        let recorder = open_recorder(&cfg.blackbox, &signer, verifier.as_ref(), &follow)
-            .map_err(AgentError::BlackBox)?;
+        let recorder = open_recorder(
+            &cfg.blackbox,
+            &signer,
+            verifier.as_ref(),
+            previous_keys.as_ref(),
+            &follow,
+        )
+        .map_err(AgentError::BlackBox)?;
         let context = OperationalContext {
             profile_locked: cfg.profile.locked,
             ..cfg.context
@@ -588,6 +618,7 @@ impl Agent {
             blackbox_cfg: cfg.blackbox,
             signer,
             verifier,
+            previous_keys,
             blackbox_down_since: None,
             last_reopen_attempt: None,
             lost_while_down: 0,
@@ -1246,6 +1277,7 @@ impl Agent {
             &self.blackbox_cfg,
             &self.signer,
             self.verifier.as_ref(),
+            self.previous_keys.as_ref(),
             &self.follow,
         ) {
             Ok(r) => {

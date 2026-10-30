@@ -191,10 +191,12 @@ impl Root {
         )
         .unwrap();
         std::fs::write(dir.join("etc/response-policy.json"), example(policy)).unwrap();
-        let key = dir.join("credentials/blackbox.key");
-        std::fs::write(&key, robodr_blackbox::crypto::to_hex(&KEY)).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // An Ed25519 black-box key, as a commissioned unit has (legacy
+        // HMAC keys are refused without blackbox.allow_hmac).
+        robodr_blackbox::KeyFile::ed25519_from_seed(&KEY, Some("bb-unitree"))
+            .unwrap()
+            .write_new(&dir.join("credentials/blackbox.key"))
+            .unwrap();
         Root { dir }
     }
 

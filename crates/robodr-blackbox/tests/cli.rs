@@ -58,7 +58,14 @@ fn keygen_writes_a_private_key_and_never_overwrites() {
     // Derived key id when none is given (ed25519 by default).
     let o = run(&["keygen", "--out", s(&d.sub("b.key"))]);
     assert!(String::from_utf8_lossy(&o.stdout).starts_with("ed25519:"));
-    let o = run(&["keygen", "--alg", "hmac", "--out", s(&d.sub("c.key"))]);
+    let o = run(&[
+        "keygen",
+        "--alg",
+        "hmac",
+        "--allow-hmac",
+        "--out",
+        s(&d.sub("c.key")),
+    ]);
     assert!(String::from_utf8_lossy(&o.stdout).starts_with("hmac-sha256:"));
     assert_eq!(run(&["keygen"]).status.code(), Some(2));
     assert_eq!(run(&["frobnicate"]).status.code(), Some(2));
@@ -201,8 +208,20 @@ fn verify_across_a_rotation_with_a_keyring_file() {
     let pb = d.sub("b.key");
     ka.write_new(&pa).unwrap();
     kb.write_new(&pb).unwrap();
-    // Two key files ...
+    // Legacy HMAC keys are refused without the explicit opt-in ...
     let o = run(&["verify", s(&dir), "--keyring", s(&pa), "--keyring", s(&pb)]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("legacy hmac-sha256"), "{}", text(&o));
+    // ... two key files with it ...
+    let o = run(&[
+        "verify",
+        s(&dir),
+        "--keyring",
+        s(&pa),
+        "--keyring",
+        s(&pb),
+        "--allow-hmac",
+    ]);
     assert!(o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("signing key rotated a -> b"));
     // ... or one keyring file.
@@ -220,18 +239,23 @@ fn verify_across_a_rotation_with_a_keyring_file() {
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
         o.open(&ring).unwrap().write_all(json.as_bytes()).unwrap();
     }
-    assert!(run(&["verify", s(&dir), "--keyring", s(&ring)])
-        .status
-        .success());
+    assert!(
+        run(&["verify", "--allow-hmac", s(&dir), "--keyring", s(&ring)])
+            .status
+            .success()
+    );
     // One key alone fails.
     assert_eq!(
-        run(&["verify", s(&dir), "--keyring", s(&pa)]).status.code(),
+        run(&["verify", "--allow-hmac", s(&dir), "--keyring", s(&pa)])
+            .status
+            .code(),
         Some(1)
     );
     // The same key twice is ambiguous: refused.
     assert_eq!(
         run(&[
             "verify",
+            "--allow-hmac",
             s(&dir),
             "--keyring",
             s(&pa),
@@ -374,7 +398,12 @@ fn keygen_ed25519_writes_a_secret_and_a_public_file() {
 fn keygen_hmac_is_legacy_and_warns() {
     let d = TestDir::new("cli-keygen-hmac");
     let k = d.sub("h.key");
+    // Refused by default: nothing is written.
     let o = run(&["keygen", "--alg", "hmac", "--out", s(&k)]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("--allow-hmac"), "{}", text(&o));
+    assert!(!k.exists());
+    let o = run(&["keygen", "--alg", "hmac", "--allow-hmac", "--out", s(&k)]);
     assert!(o.status.success(), "{}", text(&o));
     assert!(String::from_utf8_lossy(&o.stderr).contains("symmetric"));
     assert!(!d.sub("h.key.pub").exists());
@@ -511,11 +540,20 @@ fn verify_mixing_hmac_and_ed25519_needs_an_explicit_flag() {
     let (pa, pb) = (d.sub("a.key"), d.sub("b.pub"));
     ka.write_new(&pa).unwrap();
     kb.to_public().unwrap().write_new(&pb).unwrap();
-    let o = run(&["verify", s(&dir), "--keyring", s(&pa), "--keyring", s(&pb)]);
+    let o = run(&[
+        "verify",
+        "--allow-hmac",
+        s(&dir),
+        "--keyring",
+        s(&pa),
+        "--keyring",
+        s(&pb),
+    ]);
     assert_eq!(o.status.code(), Some(2), "{}", text(&o));
     assert!(text(&o).contains("mixed algorithms"), "{}", text(&o));
     let o = run(&[
         "verify",
+        "--allow-hmac",
         s(&dir),
         "--keyring",
         s(&pa),
@@ -654,4 +692,170 @@ fn version_and_help_exit_0() {
             assert!(o.stdout.is_empty(), "{name} {bad:?}");
         }
     }
+}
+
+/// Write `k` (secret) and its public half next to it; returns both paths.
+fn write_pair(d: &TestDir, name: &str, k: &KeyFile) -> (std::path::PathBuf, std::path::PathBuf) {
+    let sk = d.sub(&format!("{name}.key"));
+    let pk = d.sub(&format!("{name}.key.pub"));
+    k.write_new(&sk).unwrap();
+    if !k.is_symmetric() {
+        k.to_public().unwrap().write_new(&pk).unwrap();
+    }
+    (sk, pk)
+}
+
+fn rotate_args<'a>(dir: &'a Path, old: &'a Path, new: &'a Path) -> Vec<&'a str> {
+    vec![
+        "rotate",
+        s(dir),
+        "--old-key",
+        s(old),
+        "--new-key",
+        s(new),
+        "--device",
+        "ugv-01",
+        "--boot-id",
+        "boot-rot",
+    ]
+}
+
+/// `rotate`: a log signed with key A, rotated in place to key B, continues
+/// with B and verifies with both public keys; the writer reopens it only
+/// with A as a previous key (without it: refused, naming the remedy); a
+/// second rotation B -> C needs A in `--previous-keys`; re-running is a
+/// no-op.
+#[test]
+fn rotate_continues_the_chain_under_the_new_key() {
+    let d = TestDir::new("cli-rotate");
+    let ka = KeyFile::generate_ed25519(Some("bb-a")).unwrap();
+    let kb = KeyFile::generate_ed25519(Some("bb-b")).unwrap();
+    let kc = KeyFile::generate_ed25519(Some("bb-c")).unwrap();
+    let (sa, pa) = write_pair(&d, "a", &ka);
+    let (sb, pb) = write_pair(&d, "b", &kb);
+    let (_, pc) = write_pair(&d, "c", &kc);
+    let sc = d.sub("c.key");
+    let dir = d.sub("log");
+    let mut r = Recorder::open(cfg(&dir, big()), ka.signer().unwrap(), clock()).unwrap();
+    for i in 0..5 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    let chain = r.chain_id();
+    r.close().unwrap();
+
+    let o = run(&rotate_args(&dir, &sa, &sb));
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "bb-b");
+    assert!(text(&o).contains("previous_keys"), "{}", text(&o));
+    // Idempotent: the log is keyed bb-b now.
+    let o = run(&rotate_args(&dir, &sa, &sb));
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("already rotated"), "{}", text(&o));
+
+    // The writer with B alone fails closed ...
+    let e = Recorder::open(cfg(&dir, big()), kb.signer().unwrap(), clock()).unwrap_err();
+    assert!(e.to_string().contains("previous key"), "{e}");
+    // ... with A as a previous key it continues the same chain.
+    let prev = PreviousKeys::from_key_files(&[KeyFile::load(&pa).unwrap()], false).unwrap();
+    let mut r = Recorder::open_with_keys(
+        cfg(&dir, big()),
+        kb.signer().unwrap(),
+        None,
+        Some(Box::new(prev)),
+        clock(),
+    )
+    .unwrap();
+    assert_eq!(r.chain_id(), chain);
+    assert_eq!(r.key_id(), "bb-b");
+    recorded(r.append_note(&note(99), false).unwrap());
+    r.close().unwrap();
+
+    // Verifiers need both public keys.
+    let o = run(&["verify", s(&dir), "--keyring", s(&pa), "--keyring", s(&pb)]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        text(&o).contains("signing key rotated bb-a -> bb-b"),
+        "{}",
+        text(&o)
+    );
+    assert_eq!(
+        run(&["verify", s(&dir), "--keyring", s(&pb)]).status.code(),
+        Some(1)
+    );
+
+    // Second rotation: the records of A need A as a previous key.
+    let o = run(&rotate_args(&dir, &sb, &sc));
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("--previous-keys"), "{}", text(&o));
+    let mut args = rotate_args(&dir, &sb, &sc);
+    args.extend(["--previous-keys", s(&pa), "--reason", "scheduled"]);
+    let o = run(&args);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(&[
+        "verify",
+        s(&dir),
+        "--keyring",
+        s(&pa),
+        "--keyring",
+        s(&pb),
+        "--keyring",
+        s(&pc),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("bb-b -> bb-c"), "{}", text(&o));
+}
+
+/// `rotate` refusals: legacy HMAC old key without `--allow-hmac` (with it:
+/// the migration to ed25519 works), an HMAC target, the same key id, the
+/// wrong old key, a missing log.
+#[test]
+fn rotate_refusals_and_the_hmac_migration() {
+    let d = TestDir::new("cli-rotate-refuse");
+    let kh = KeyFile::generate_hmac(Some("bb-h")).unwrap();
+    let ke = KeyFile::generate_ed25519(Some("bb-e")).unwrap();
+    let kh2 = KeyFile::generate_hmac(Some("bb-h2")).unwrap();
+    let (sh, _) = write_pair(&d, "h", &kh);
+    let (se, pe) = write_pair(&d, "e", &ke);
+    let (sh2, _) = write_pair(&d, "h2", &kh2);
+    let dir = d.sub("log");
+    let mut r = Recorder::open(cfg(&dir, big()), kh.signer().unwrap(), clock()).unwrap();
+    recorded(r.append_note(&note(0), false).unwrap());
+    r.close().unwrap();
+
+    let nolog = d.sub("nolog");
+    let o = run(&rotate_args(&nolog, &sh, &se));
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    let o = run(&rotate_args(&dir, &sh, &se));
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("--allow-hmac"), "{}", text(&o));
+    let mut a = rotate_args(&dir, &sh, &sh2);
+    a.push("--allow-hmac");
+    let o = run(&a);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("must be ed25519"), "{}", text(&o));
+    assert_eq!(run(&rotate_args(&dir, &se, &se)).status.code(), Some(2));
+    // Wrong old key: the log is keyed bb-h.
+    let ke2 = KeyFile::generate_ed25519(Some("bb-e2")).unwrap();
+    let (se2, _) = write_pair(&d, "e2", &ke2);
+    let o = run(&rotate_args(&dir, &se2, &se));
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("--old-key must be"), "{}", text(&o));
+
+    // The migration off HMAC, explicitly allowed.
+    let mut a = rotate_args(&dir, &sh, &se);
+    a.push("--allow-hmac");
+    let o = run(&a);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(&[
+        "verify",
+        s(&dir),
+        "--keyring",
+        s(&sh),
+        "--keyring",
+        s(&pe),
+        "--allow-hmac",
+        "--allow-mixed-algorithms",
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("bb-h -> bb-e"), "{}", text(&o));
 }

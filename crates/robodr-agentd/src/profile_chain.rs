@@ -33,10 +33,11 @@
 //! # Trust in what is read
 //!
 //! A record counts only if its hash matches its fields and its signature
-//! verifies under the daemon's current key (`Signer::verify_own`): a forger
-//! without the key cannot plant one. Records signed by a key the daemon no
-//! longer holds (after a rotation) are skipped and counted; so are frames
-//! that do not parse. Chain linkage is checked where it is available
+//! verifies under the daemon's current key (`Signer::verify_own`) or one
+//! of its configured retired keys (`blackbox.previous_keys`, after an
+//! in-place key rotation): a forger without a key cannot plant one. Records
+//! signed by a key the daemon does not know are skipped and counted; so
+//! are frames that do not parse. Chain linkage is checked where it is available
 //! (consecutive hash-valid records in file order: sequence numbers must
 //! grow, and `seq + 1` must link by `prev_hash`); breaks are counted in
 //! [`ChainScan::linkage_breaks`] (an alarm), the full verification remains
@@ -63,7 +64,7 @@ use std::path::Path;
 
 use robodr_blackbox::record::{scan_frames, signing_message, Hash, ScanItem};
 use robodr_blackbox::store::list_segments;
-use robodr_blackbox::{RecordKind, Signer};
+use robodr_blackbox::{PreviousKeys, RecordKind, Signer, Verifier};
 use robodr_commission::trust::{accepted_from_note, AcceptedState, RollbackDecision};
 
 pub use robodr_commission::trust::accepted_note;
@@ -118,9 +119,14 @@ struct Seen {
 }
 
 /// The accepted-profile baseline from the black-box directory `dir`,
-/// counting only records signed by `signer`'s key (see the module docs). A
-/// missing directory is an empty scan; an unlistable one is an error.
-pub fn latest_accepted(dir: &Path, signer: &dyn Signer) -> Result<ChainScan, String> {
+/// counting only records signed by `signer`'s key or one of `previous`
+/// (the unit's retired keys; see the module docs). A missing directory is
+/// an empty scan; an unlistable one is an error.
+pub fn latest_accepted(
+    dir: &Path,
+    signer: &dyn Signer,
+    previous: Option<&PreviousKeys>,
+) -> Result<ChainScan, String> {
     let mut scan = ChainScan::default();
     let segments = match list_segments(dir) {
         Ok(s) => s,
@@ -157,8 +163,10 @@ pub fn latest_accepted(dir: &Path, signer: &dyn Signer) -> Result<ChainScan, Str
             let Some(state) = accepted_from_note(&rec.payload) else {
                 continue;
             };
-            let authentic =
-                hash_ok && signer.verify_own(&signing_message(&rec.hash), &rec.sig) == Some(true);
+            let msg = signing_message(&rec.hash);
+            let authentic = hash_ok
+                && (signer.verify_own(&msg, &rec.sig) == Some(true)
+                    || previous.is_some_and(|p| p.verify_any(&msg, &rec.sig)));
             if !authentic {
                 scan.unverified += 1;
                 continue;
@@ -303,7 +311,10 @@ mod tests {
     #[test]
     fn baseline_is_the_highest_version_unless_the_operator_rolled_back() {
         let d = tmpdir("newest");
-        assert_eq!(latest_accepted(&d, &key()).unwrap(), ChainScan::default());
+        assert_eq!(
+            latest_accepted(&d, &key(), None).unwrap(),
+            ChainScan::default()
+        );
         use RollbackDecision::*;
         // A drop to 2 recorded by a heartbeat alone: not a rollback the
         // operator named, so 3 stays the baseline and the drop is an alarm.
@@ -317,7 +328,7 @@ mod tests {
                 hb(2),
             ],
         );
-        let s = latest_accepted(&d, &key()).unwrap();
+        let s = latest_accepted(&d, &key(), None).unwrap();
         assert_eq!(s.latest, Some(st(3)));
         assert_eq!(s.drops.len(), 1, "{:?}", s.drops);
         assert!(s.drops[0].contains("without an operator rollback"));
@@ -339,14 +350,24 @@ mod tests {
                 note(2, Same),
             ],
         );
-        let s = latest_accepted(&d, &key()).unwrap();
+        let s = latest_accepted(&d, &key(), None).unwrap();
         assert_eq!(s.latest, Some(st(2)));
         assert!(s.alarms().is_empty(), "{:?}", s.alarms());
         // Another key (e.g. a forger's, or after rotation): nothing counts.
         let other = Ed25519SigningKey::from_seed("bb", &[6; 32]).unwrap();
-        let s = latest_accepted(&d, &other).unwrap();
+        let s = latest_accepted(&d, &other, None).unwrap();
         assert_eq!(s.latest, None);
         assert_eq!(s.unverified, 4);
+        // After a rotation to `other`, the retired key (public half only)
+        // in `blackbox.previous_keys` keeps the old records as witnesses.
+        let old_pub = robodr_blackbox::KeyFile::ed25519_from_seed(&[5; 32], Some("bb"))
+            .unwrap()
+            .to_public()
+            .unwrap();
+        let prev = PreviousKeys::from_key_files(&[old_pub], false).unwrap();
+        let s = latest_accepted(&d, &other, Some(&prev)).unwrap();
+        assert_eq!(s.latest, Some(st(2)));
+        assert_eq!(s.unverified, 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -369,7 +390,7 @@ mod tests {
                 with(2, None, Some(1)),
             ],
         );
-        let s = latest_accepted(&d, &key()).unwrap();
+        let s = latest_accepted(&d, &key(), None).unwrap();
         let l = s.latest.unwrap();
         assert_eq!(l.revocation_serial, Some(3));
         assert_eq!(l.revocation_digest, Some(file_digest(b"list3")));
@@ -387,7 +408,7 @@ mod tests {
             Box::new(h()),
             &[serde_json::to_value(accepted_note(&st(4), None, None)).unwrap()],
         );
-        assert_eq!(latest_accepted(&d, &h()).unwrap().latest, Some(st(4)));
+        assert_eq!(latest_accepted(&d, &h(), None).unwrap().latest, Some(st(4)));
         // Rewrite the version digit in place (same length): hash mismatch.
         let (_, seg) = list_segments(&d).unwrap().pop().unwrap();
         let mut b = std::fs::read(&seg).unwrap();
@@ -395,12 +416,12 @@ mod tests {
         let i = b.windows(needle.len()).position(|w| w == needle).unwrap();
         b[i + needle.len() - 1] = b'9';
         std::fs::write(&seg, &b).unwrap();
-        let s = latest_accepted(&d, &h()).unwrap();
+        let s = latest_accepted(&d, &h(), None).unwrap();
         assert_eq!(s.latest, None);
         assert_eq!(s.unverified, 1);
         // Garbage segments never panic.
         std::fs::write(&seg, b"\x00\xffgarbage").unwrap();
-        assert_eq!(latest_accepted(&d, &h()).unwrap().latest, None);
+        assert_eq!(latest_accepted(&d, &h(), None).unwrap().latest, None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -420,14 +441,17 @@ mod tests {
         let (_, first_seg) = list_segments(&live).unwrap().pop().unwrap();
         let captured = std::fs::read(&first_seg).unwrap();
         record(&live, Box::new(key()), &[n(3)]);
-        assert_eq!(latest_accepted(&live, &key()).unwrap().latest, Some(st(3)));
+        assert_eq!(
+            latest_accepted(&live, &key(), None).unwrap().latest,
+            Some(st(3))
+        );
         let (top, _) = list_segments(&live).unwrap().pop().unwrap();
         std::fs::write(
             live.join(robodr_blackbox::store::segment_file_name(top + 100)),
             &captured,
         )
         .unwrap();
-        let s = latest_accepted(&live, &key()).unwrap();
+        let s = latest_accepted(&live, &key(), None).unwrap();
         assert_eq!(s.latest, Some(st(3)), "baseline not lowered by a replay");
         assert!(s.linkage_breaks > 0, "the replay is reported");
         assert!(!s.alarms().is_empty());
@@ -455,7 +479,7 @@ mod tests {
             live.join(robodr_blackbox::store::segment_file_name(top + 100)),
         )
         .unwrap();
-        let s = latest_accepted(&live, &key()).unwrap();
+        let s = latest_accepted(&live, &key(), None).unwrap();
         assert_eq!(s.latest, Some(st(3)));
         assert!(!s.alarms().is_empty());
         let _ =
@@ -467,7 +491,7 @@ mod tests {
             live.join(robodr_blackbox::store::segment_file_name(top + 1)),
         )
         .unwrap();
-        let s = latest_accepted(&live, &key()).unwrap();
+        let s = latest_accepted(&live, &key(), None).unwrap();
         assert_eq!(s.latest, Some(st(3)));
         assert!(s.drops.is_empty());
         assert!(s.linkage_breaks > 0);

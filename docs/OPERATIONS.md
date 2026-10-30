@@ -192,7 +192,8 @@ short:
 
 `robodr-enroll` (8.6) generates the uplink, finding and black-box keys on
 the unit at enrollment and rotates the uplink and finding keys with the
-SOC; the black-box key is rotated as in 4.3.
+SOC; the black-box key is rotated in place with `robodr-blackbox rotate`
+(4.3).
 
 Services never read `/etc/robodr/keys` themselves. systemd hands each one a
 private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
@@ -209,8 +210,10 @@ private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
 >
 > **Legacy HMAC-SHA256 keys** (`keygen --alg hmac`, and every key made
 > before this release) are a *shared secret*: whoever can verify can also
-> **forge**. They still work (the tools print a warning; the diode needs
-> `--allow-hmac`), but migrate at the next rotation (4.3). The Ed25519 code
+> **forge**. They are **refused by default**: `robodr-agentd` needs
+> `blackbox.allow_hmac: true`, and `robodr-blackbox`, the diode tools and
+> `robodr-spool-export` need `--allow-hmac`; each use then prints a
+> warning. Migrate with `robodr-blackbox rotate --allow-hmac` (4.3). The Ed25519 code
 > is the audited `ed25519-dalek` crate; a TPM-held, non-exportable key is
 > still planned.
 
@@ -244,12 +247,14 @@ excepted), and refuses a `.pub` where a signing key is needed. Verifiers
 (`robodr-blackbox verify --keyring`, `robodr-replay verify --key-file`)
 take the **`.pub`** file, whatever its mode.
 
-*Legacy key files*: HMAC JSON key files (`robodr-blackbox-key/v1`) are still
-accepted by `robodr-agentd`, `robodr-replay` and `robodr-blackbox`, with a
-warning. Bare hex (0.1.0-alpha.1, made with `od ... /dev/urandom`) is still
-accepted by `robodr-agentd` only (key id from `blackbox.key_id`, else derived
-from the key). Replace either with an Ed25519 key at the next rotation (4.3);
-do not hand-write JSON around an old secret on a shared terminal.
+*Legacy key files*: HMAC JSON key files (`robodr-blackbox-key/v1`) and bare
+hex (0.1.0-alpha.1, made with `od ... /dev/urandom`; `robodr-agentd` only)
+are refused unless explicitly allowed: `blackbox.allow_hmac: true` in
+`/etc/robodr/agentd.json`, `--allow-hmac` for `robodr-blackbox`
+(`robodr-replay` still accepts them with a warning). **Upgrading a unit that
+still has an HMAC key:** agentd will not start until you either set
+`blackbox.allow_hmac: true` (a stopgap) or migrate to Ed25519 with 4.3; do
+not hand-write JSON around an old secret on a shared terminal.
 
 Then copy the **public** key file to each verifier (fleet console, the SOC's
 evidence store) using vetted media. The diode is one-way, so nothing comes
@@ -258,31 +263,91 @@ verifier's protected store.
 
 ### 4.3 Rotate a key
 
-The recorder refuses to append to an existing chain with a different key
-(`KeyMismatch`). Rotation therefore **closes the old chain and starts a new
-one**. No evidence is lost or rewritten.
+**available**: `robodr-blackbox rotate` rotates the black-box key **in
+place**. With agentd stopped it writes a `KeyRotation` record, signed by the
+old key, that names the new key, and seals under the new key; the chain
+(and its chain id) continues, nothing is archived or rewritten. agentd then
+signs with the new key and authenticates the older records with the
+retired key's **public** file listed in `blackbox.previous_keys`. This is
+also how an HMAC unit moves to Ed25519.
 
 1. Export all pending evidence (section 8) and confirm on the far side that
    the last bundle verified.
-2. Stop the agent: `sudo systemctl stop robodr-agentd`. The recorder writes
-   a shutdown seal when it is closed cleanly, and `checkpoint.json` holds the
-   final seal. Check the journal for a clean stop.
-3. Archive the closed chain and retire the old key:
+2. Generate the new key (4.2) with a **new key id**, next to the old one:
 
    ```sh
-   ts=$(date -u +%Y%m%dT%H%M%SZ); old=<old-key-id>
-   sudo mv /var/lib/robodr/blackbox/agentd /var/lib/robodr/archive/blackbox-agentd-$old-$ts
-   sudo mv /etc/robodr/keys/agentd-blackbox.key /etc/robodr/keys/retired/agentd-blackbox-$old.key
-   sudo mv /etc/robodr/keys/agentd-blackbox.key.pub /etc/robodr/keys/retired/agentd-blackbox-$old.key.pub
-   sudo systemd-tmpfiles --create robodr.conf   # recreates blackbox/agentd with the right owner
+   old=<old-key-id>; new=ugv-07-bb-2027q1
+   sudo robodr-blackbox keygen --out /etc/robodr/keys/agentd-blackbox-$new.key \
+       --key-id $new --device <robot.id>
    ```
 
-4. Generate the new key (4.2) with a new key id (if `blackbox.key_id` is set
-   in `/etc/robodr/agentd.json`, update it to match), and copy its `.pub` to
-   the verifiers. This is also how an HMAC unit moves to Ed25519.
-5. `sudo systemctl start robodr-agentd`, then check the journal for the new
-   chain's genesis.
-6. **Units running `robodr-deliverd`** (§11): the delivery agent signs its
+3. Stop the agent (`sudo systemctl stop robodr-agentd`; the recorder seals
+   on a clean stop) and rotate:
+
+   ```sh
+   sudo robodr-blackbox rotate /var/lib/robodr/blackbox/agentd \
+       --device <robot.id> \
+       --old-key /etc/robodr/keys/agentd-blackbox.key \
+       --new-key /etc/robodr/keys/agentd-blackbox-$new.key \
+       --reason "scheduled rotation"
+   # add --previous-keys <each earlier retired .pub> if the log still holds
+   # records of keys retired before; add --allow-hmac when the old key is HMAC
+   ```
+
+   It refuses a log that is open (agentd still running), the wrong old key,
+   an HMAC new key, a reused key id, and a log holding records no given key
+   authenticates. Re-running it after success prints "already rotated".
+4. Retire the old key and install the new one:
+
+   ```sh
+   sudo install -d -m 0700 /etc/robodr/keys/retired
+   sudo mv /etc/robodr/keys/agentd-blackbox.key /etc/robodr/keys/retired/agentd-blackbox-$old.key
+   sudo mv /etc/robodr/keys/agentd-blackbox.key.pub /etc/robodr/keys/retired/agentd-blackbox-$old.key.pub
+   sudo mv /etc/robodr/keys/agentd-blackbox-$new.key /etc/robodr/keys/agentd-blackbox.key
+   sudo mv /etc/robodr/keys/agentd-blackbox-$new.key.pub /etc/robodr/keys/agentd-blackbox.key.pub
+   ```
+
+   agentd cannot read `/etc/robodr/keys` (`InaccessiblePaths=`), so put the
+   retired **public** key where it can (it is not secret):
+
+   ```sh
+   sudo install -d -m 0755 /etc/robodr/blackbox-previous
+   sudo install -m 0644 /etc/robodr/keys/retired/agentd-blackbox-$old.key.pub /etc/robodr/blackbox-previous/
+   ```
+
+   In `/etc/robodr/agentd.json` add it and, if `blackbox.key_id` is set,
+   update it:
+
+   ```json
+   "blackbox": { "dir": "/var/lib/robodr/blackbox/agentd",
+                 "key_file": "/run/credentials/robodr-agentd.service/blackbox.key",
+                 "previous_keys": [ "/etc/robodr/blackbox-previous/agentd-blackbox-<old>.key.pub" ] }
+   ```
+
+   A retired **HMAC** key has no `.pub`: hand the retired secret to agentd
+   as a credential (a drop-in with
+   `LoadCredential=blackbox-previous.key:/etc/robodr/keys/retired/agentd-blackbox-<old>.key`),
+   list `/run/credentials/robodr-agentd.service/blackbox-previous.key` and
+   set `"allow_hmac": true` until its records have rotated out of the black
+   box.
+   `robodr-agentd --check-config` validates the list: absolute paths, at most
+   16, public files (an Ed25519 secret is refused), ids distinct and not the
+   current key's, a device binding must name `robot.id`.
+5. Copy the new `.pub` to the verifiers (fleet console, SOC evidence store)
+   on vetted media; verifiers keep the old `.pub` too. With a **remote head
+   anchor** (`head_anchor.kind remote`), replace the unit's public key on
+   the anchor receiver before the next step (its marks are signed with the
+   current key); a TPM anchor's sidecar written under the old key is
+   accepted through `previous_keys` and rewritten at the next mark.
+6. `sudo systemctl start robodr-agentd` and check the journal: no black-box
+   error, and `robodr-blackbox verify /var/lib/robodr/blackbox/agentd
+   --keyring <old>.key.pub --keyring /etc/robodr/keys/agentd-blackbox.key.pub`
+   reports `signing key rotated <old> -> <new>` and `INTACT`.
+   **Without `previous_keys` agentd refuses to start** ("record N signature
+   does not verify ... list the retired key's public file in
+   blackbox.previous_keys"): the black box fails closed rather than chain
+   onto records it cannot authenticate.
+7. **Units running `robodr-deliverd`** (§11): the delivery agent signs its
    journal (`blackbox/deliverd`) and its high-water record with the same
    key. Keep the retired secret key file until this step is done; do not
    move or delete `blackbox/deliverd`. With `robodr-deliverd` stopped:
@@ -300,14 +365,20 @@ one**. No evidence is lost or rewritten.
    new record, signed with the new key, that carry the floors, the
    deployment sequence, the chain heads and the time floor (§11.3).
    Without it the agent cannot open its journal and locks itself. Verify
-   the archive like agentd's (step 7) and keep it with the same retention.
-7. Verify the archived chain once more with the retired key
-   (`robodr-blackbox verify <archive dir> --keyring <retired key>.pub`, or
-   the retired HMAC key file). The key id is read from the key file. Then
-   follow the site's retention rule: keep the retired public key (HMAC: the
-   key) as long as the archived evidence has to remain verifiable. An
-   Ed25519 secret that is retired can be destroyed (`shred -u`); its public
-   key still verifies the archive.
+   the archive with the retired key and keep it with the same retention.
+8. Retention: keep the retired public key (HMAC: the key) in
+   `previous_keys` while the black box still holds segments it signed, and
+   with the verifiers as long as the evidence must remain verifiable. Once
+   those segments have rotated out (cyclic retention or export pruning),
+   the entry can be removed from `previous_keys`. An Ed25519 secret that is
+   retired (after step 7) can be destroyed (`shred -u`).
+
+*Alternative, new chain:* instead of `rotate`, archive the closed chain
+(stop agentd, `mv /var/lib/robodr/blackbox/agentd
+/var/lib/robodr/archive/blackbox-agentd-$old-$ts`, `systemd-tmpfiles
+--create robodr.conf`) and start agentd with the new key and no
+`previous_keys`; verify the archive with the retired key. Use this after a
+suspected compromise (below), where the chain should not continue.
 
 **Suspected key compromise:** follow the same steps, but treat every record
 signed after the suspected time as unauthenticated. With Ed25519 only the
@@ -1463,10 +1534,13 @@ chain: a replaced store, stored). `state_unusable` means a state file in
 nothing resets it silently. Treat every alert as tamper evidence until
 explained.
 
-**Key rotation** (section 4.3) is a new chain: when a robot's black-box key
-changes, replace its `.pub` on the receiver and move
-`/var/lib/robodr-anchor-receiver/units/<robot>.json` into the archive with
-the old chain (with the service stopped). Replacing the receiver key: give
+**Key rotation** (section 4.3): when a robot's black-box key changes,
+replace its `.pub` on the receiver. With the in-place rotation
+(`robodr-blackbox rotate`) the chain continues and the unit's state file
+stays; only the alternative "new chain" procedure also needs
+`/var/lib/robodr-anchor-receiver/units/<robot>.json` moved into the archive
+with the old chain (with the service stopped). The in-place rotation with a
+remote anchor is not covered by an end-to-end test yet. Replacing the receiver key: give
 every robot the new `.pub` at the same time.
 
 **Detect-only through the diode** (no reverse channel at all). On the robot,
@@ -1997,7 +2071,7 @@ frame of every segment in `/var/lib/robodr/blackbox` and
 (`RBF1:<version>`), naming the segment and its format: an older agent could
 neither verify nor extend that chain. To roll back across a format change,
 export the chain (section 8.2) and archive the directory as in a key
-rotation (section 4.3, step 3) first, then roll back; or install a release
+rotation (section 4.3, "Alternative, new chain") first, then roll back; or install a release
 that reads the format; or, knowingly, accept that one segment with
 `--accept-unreadable <segment path>` (the release will neither verify nor
 extend it). A file that does not start with a RoboDR frame at all (damaged,
