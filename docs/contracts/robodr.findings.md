@@ -423,7 +423,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
   | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
-  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c) |
+  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c) + the depot entries `robot.depot.import_refused` (High), `robot.depot.enrolment_refused` (High), `robot.depot.unit_enrolled` (Low), `robot.depot.rollout_halted` (High), `robot.depot.locked` (Critical) and `robot.seal.erase_deferred` (Medium), data source `robodr_delivery`, no techniques (§3d) |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -561,6 +561,44 @@ The detail of `robot.seal.unseal_failed` starts with the reason
 `robot.seal.erased` names the trigger (`operator`, `tamper`, ...). A wrap
 that does not authenticate (tampered, or another unit's) is not a sealing
 finding but a `robot.deliver.refused` with reason `unauthentic_key`.
+
+## 3d. Rule catalog 2.3: site depot and executed erase (`robot.depot.*`)
+
+The 2.3 addition of the site depot and the executed crypto-erase
+(`docs/SECURE-DELIVERY.md` §5, §7.6, §8, §9; Sprints 14a / 14b), in a
+block of its own (`catalog_2_3_depot` in `robodr-ocsf`), as
+`robodr_ocsf::rule_info_for_contract` applies it to a message whose
+`contract_version` is 2.3.x (or later 2.x); a 2.2 validator, and a 2.3
+validator given a 2.2 message, apply the generic entry. Like §3a: data
+source `robodr_delivery` (`finding_info.data_sources` exactly
+`["robodr_delivery"]`, `types` exactly `["robot_deviation",
+"robodr_delivery"]`), no techniques. Producers: `robodr-depot` for
+`robot.depot.*` (its `robot` is the depot's `depot_id`; written into the
+agentd spool of the depot box with `robodr-deliverd`'s writer) and
+`robodr-deliverd` for `robot.seal.erase_deferred`.
+
+| Rule id | Title | Severity emitted |
+| --- | --- | --- |
+| `robot.depot.import_refused` | Depot refused a release bundle | High |
+| `robot.depot.enrolment_refused` | Depot refused a unit enrolment | High |
+| `robot.depot.unit_enrolled` | Unit enrolled at the depot | Low |
+| `robot.depot.rollout_halted` | Staged rollout halted | High |
+| `robot.depot.locked` | Depot database failed its anti-rollback check | Critical |
+| `robot.seal.erase_deferred` | Crypto-erase deferred by the safety state | Medium |
+
+Catalog sentences (`finding_info.desc`):
+
+* `robot.depot.import_refused`: The site depot refused to import a release bundle: no passing entry-station report for exactly that bundle, a signature, quorum, chain, revocation, floor or hash check failed. Nothing of the bundle can be deployed.
+* `robot.depot.enrolment_refused`: The site depot refused to enrol a unit: its EK certificate does not chain to a TPM vendor CA the site trusts, the attestation key or a certified key is not resident in that TPM, the unit's keys are not bound to the site's policy, its boot measurements do not match the signed policy, or the credential challenge was not answered by the unit's TPM. No key is wrapped for it.
+* `robot.depot.unit_enrolled`: A unit was enrolled at the site depot after TPM credential activation and the operator quorum; the depot may now deliver and wrap keys for it.
+* `robot.depot.rollout_halted`: A unit of the current ring reported a failed health gate or a refusal beyond the rollout's failure threshold; the site depot halted the rollout and serves nothing more of it until operators resume it.
+* `robot.depot.locked`: The site depot's database is older than its TPM anti-rollback counter says, or the counter was recreated: the database was restored or replaced. The depot signs, serves and imports nothing until operators re-anchor it.
+* `robot.seal.erase_deferred`: A crypto-erase trigger fired, and the responder deferred the erase because the robot is moving (or its safety state is unknown); it runs as soon as the robot is idle or its safety system holds it.
+
+`robot.seal.lease_expired` (§3c) is emitted from Sprint 14b: Medium, once
+per reason, while a sealed item waits for a site lease. The executed erase
+reports `robot.seal.tamper` and `robot.seal.erased` as in §3c, with
+`robot.seal.erase_deferred` between them when the robot was moving.
 
 ## 4. Ordering and partitioning
 
@@ -910,6 +948,15 @@ safely. Nothing here is specific to one product.
     `robot.seal.erased`, `robot.seal.tamper` (`docs/SECURE-DELIVERY.md`
     §9), emitted by `robodr-deliverd` (`lease_expired` from 14b). §3c.
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
+
+* **2.3.0** — rule-catalog entries only (minor). Depot block, Sprints
+  14a / 14b (other 2.3 additions are listed as their own items):
+  - New entries (data source `robodr_delivery`): `robot.depot.import_refused`,
+    `robot.depot.enrolment_refused`, `robot.depot.unit_enrolled`,
+    `robot.depot.rollout_halted`, `robot.depot.locked` (emitted by
+    `robodr-depot`) and `robot.seal.erase_deferred` (emitted by
+    `robodr-deliverd`). §3d. `robot.seal.lease_expired` is now emitted.
+  - Schema `$id` unchanged (`.../findings/2.3.0`).
 
 * **2.2.0** — rule-catalog entries only (minor), Sprint 13b:
   - New entries (data source `robodr_delivery`, added to the schema's

@@ -48,7 +48,73 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `limit_motion` becomes a `restrict_motion` order. **Upgrade the
   executor before agentd** (new order target `motion`).
 
+### Added (Sprints 14a and 14b: site depot, leases, executed erase)
+
+- Secure delivery, Sprints 14a and 14b (site depot, leases, executed
+  erase; `docs/SECURE-DELIVERY.md` §7.5, §7.6, §8, §10 "14a status" and
+  "14b status"; `docs/OPERATIONS.md` §12.8, §12.9, §13):
+  - `robodr-depot` (new crate and binary, `man robodr-depot(8)`): entry
+    station scan and signed entry report (`robodr-entry-report/1`,
+    CycloneDX SBOMs against an offline `robodr-vulndb/1`); import only
+    with a passing report for exactly that bundle; inventory; TPM
+    enrolment (EK certificate chain to a vendor CA listed by digest in the
+    trust file, AK credential activation, AK-certified UWK and unit
+    identity key, quote of the signed policy's PCRs, two operators);
+    staged rollouts lab -> canary -> ring-n with per-ring operator
+    quorums, soak and halt-on-failure (`rollout create|advance|resume|
+    abort`, `deploy approve`); per-unit re-wrapping of sealed content
+    keys; mutual-TLS LAN serving (`serve`; the unit's client key stays in
+    its TPM, a client is identified by its key) and per-unit media packs
+    (`pack`); unit reports and leases; a single-writer lock; the
+    database anchored in a TPM NV counter (`reanchor`).
+  - `robodr-depot.service` (user `robodr-depot`, no capabilities,
+    `ProtectSystem=strict`) and its focal variant, sysusers / tmpfiles
+    entries, `config/depot.example.json`, drop-in examples
+    `robodr-depot.service.d/50-tpm-anchor.conf.example` and
+    `robodr-deliverd.service.d/50-depot-lan.conf.example`.
+  - `robodr-pkg`: trust file members `entry_keys`, `depot_wrap_keys`,
+    `ek_ca_certs` (omitted when empty; earlier trust files unchanged);
+    sealed RPKs wrapped to unlisted depot keys refused; the entry report;
+    the LAN framing (`wire.rs`).
+  - `robodr-seal`: `keygen lease`, `enroll --lease-key`, `enrol-request`,
+    `enrol-activate`, `lease install`, `counter define|read`; TPM-enforced
+    site leases (`PolicyAuthorize` by the lease key, `PolicyCounterTimer`
+    on the TPM clock and reset count; error kind `lease_expired`); unit
+    reports signed by the TPM-resident identity key with an AK time
+    attestation.
+  - `robodr-deliverd`: `pull`, `report`, `lease`, `tamper`; the `depot`,
+    `erase` and `seal.anti_rollback_nv` configuration; LAN delivery from
+    the depot; executed crypto-erase from the platform's trigger socket
+    (feeders by `SO_PEERCRED`), planned by the responder and deferred
+    while the robot moves, also across restarts; the anti-rollback record
+    anchored in a TPM NV counter, with a one-time migration of the 13b
+    record.
+  - `robodr-responder`: the `crypto_erase` plan (`erase.rs`): executes in
+    `idle`, `safe_state_active`, `estop_active`; defers otherwise;
+    two-person for a signed command or an operator's erase.
+  - `robodr-blackbox::tls`: client keys behind an external signer
+    (`load_client_with_signer`), `spki_der`.
+  - Findings contract 2.3.0, block `catalog_2_3_depot`:
+    `robot.depot.import_refused`, `robot.depot.enrolment_refused`,
+    `robot.depot.unit_enrolled`, `robot.depot.rollout_halted`,
+    `robot.depot.locked`, `robot.seal.erase_deferred`
+    (`docs/contracts/robodr.findings.md` §3d); also in `robodr-correlate`'s
+    catalog. `robot.seal.lease_expired` is now emitted.
+  - Fuzz targets `pkg_entry` and `seal_attest`.
+  - Verified against software TPMs (swtpm) on loopback only; not on a
+    hardware TPM, a vendor EK CA or a robot.
+
 ### Security
+
+- Adversarial self-review of Sprints 14a / 14b (`docs/SECURE-DELIVERY.md`
+  §10 "Adversarial self-review of 14a/14b"): leases are based on the TPM
+  time the unit's AK attests, not on the time a report claims (root on a
+  unit could otherwise obtain a lease that never expires); the depot's
+  handshake, request head and report body share one deadline (a trickling
+  client held a connection slot indefinitely); trust files signed before
+  14a keep parsing; a lease renewed in a media pack next to a known
+  deployment is installed; units no longer download an unchanged pack
+  every pass.
 
 - **Kafka export and remote head anchor over TLS** (R2 / GAP-03). New
   `robodr_blackbox::tls` (rustls + ring, the stack `robodr-uplink` and the

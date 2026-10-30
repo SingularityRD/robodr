@@ -36,6 +36,8 @@ violated output invariant (documented at the top of its harness file).
 | `deliverd_state` | robodr-deliverd | a selector byte + JSON to the agent's configuration (`Config::parse`: strict members, normalised and disjoint paths) and state file (`State::parse`): accepted documents re-serialise to an equal value, `raise_floor` never lowers a floor | `crates/robodr-deliverd/tests/fuzz_smoke.rs` |
 | `seal_policy` | robodr-seal | a selector byte + a signed PCR policy (`policy::parse` / `verify`: canonical, version and PCR rules, approved policy a pure function of the members, verifies only for the harness authority) or a unit enrolment record (`UnitRecord::parse`: usable recipient, round trip) | `crates/robodr-seal/tests/fuzz_smoke.rs` |
 | `seal_wrap` | robodr-seal | a selector byte + a key wrap (`wrap::parse` / `unwrap` with the harness X25519 and P-256 keys: context binding to unit, RPK and purpose; re-wrap round trip) or a sealed chunk (`chunk::open_chunk`: one ciphertext per plaintext and place, refused at any other place or RPK) | same |
+| `pkg_entry` | robodr-pkg | a selector byte + an entry report `report \0 report.sig` (`parse_entry_report` / `verify_entry_report` against the harness site and bundle: canonical, lifetime at most 30 days, sorted lists; a verified report is for that site, bundle and RPK list, signed by an entry key, passing, nothing at or above `fail_on`), a pack-stream listing line (`wire::parse_listing`: media-pack paths only, sorted, size cap), a request head or a response head (`wire::parse_request` / `parse_response`) | `crates/robodr-pkg/tests/fuzz_smoke.rs` |
+| `seal_attest` | robodr-seal | a selector byte + a `TPM2B_PUBLIC`, a `TPMS_ATTEST`, an enrolment request (verified against the harness authority and nonce), a site lease (against the harness lease key) or a signed unit report (against the harness identity key): names a pure function of the bytes, P-256 points on the curve, the TPM-generated magic, no request verifies for another nonce, an expired lease is `LeaseExpired` | `crates/robodr-seal/tests/fuzz_smoke.rs` |
 | `deliverd_inputs` | robodr-deliverd | a selector byte + bytes to agentd's `status.json` as the safety-state gate reads it (`safety::judge`: installs allowed only for a fresh, this-boot, live-feed `idle` / `safe_state_active`), the passwd lookup of probe users, recorded safety reports and their replay schedule, and the structural check of delivered Pulsar rule files | same |
 
 `kafka_wire` got its std-only smoke test after the fact (it was added while
@@ -207,6 +209,12 @@ timeout or invariant violation:**
   started and aborted when the disk filled); the seeds are in
   `fuzz/corpus/seal_*/` for the first campaign.
 
+* `pkg_entry`, `seal_attest` (Sprints 14a / 14b): the default debug smoke
+  run (20 005 inputs each from 5 seeds), no panic, no invariant
+  violation. Not yet run under libFuzzer (as `seal_*` above: the shared
+  sandbox's disk); seeds in `fuzz/corpus/pkg_entry/` and
+  `fuzz/corpus/seal_attest/`.
+
 The deterministic mutator is not coverage-guided: it finds shallow bugs
 cheaply but is no substitute for libFuzzer runs (CI's `fuzz` job runs every
 target for 60 s; longer campaigns should run on a machine with network).
@@ -297,6 +305,10 @@ All seeds are SYNTHETIC (no real robot data):
 * `kafka_wire/`: responses and requests (one per decoder and version class)
   written by `fuzz/seedgen/kafka_wire.py` from the layouts the encoders in
   `robodr-export` use.
+* `pkg_entry/`, `seal_attest/` (14a / 14b): a signed passing entry
+  report, a pack listing, both requests and a response; a public area,
+  an attestation, an enrolment request, a lease and a signed unit report,
+  all from the harnesses' fixed keys (`regenerate_seeds`, as below).
 * `pkg_rpk/`, `pkg_bundle/`, `pkg_deployment/`, `pkg_trust/`,
   `pkg_parity/`: built by each harness's `seeds()` and signed with the
   harness site's fixed Ed25519 keys (`fuzz/harness/pkg_common.rs`): a

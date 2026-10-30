@@ -2940,16 +2940,18 @@ a robot or with device-mapper.
 | Key | Command | Kept |
 |---|---|---|
 | Policy authority (P-256) | `robodr-seal keygen policy --out authority.key` | offline with the delivery roots; signs PCR policies |
-| Depot wrapping key (X25519), one per site depot | `robodr-seal keygen depot --out depot.key` | the site depot (TPM / HSM from 14a); `depot.key.pub` goes to the release station |
+| Depot wrapping key (X25519), one per site depot | `robodr-seal keygen depot --out depot.key` | the site depot (`keys.wrap`; a file today, TPM / HSM planned); `depot.key.pub` goes to the release station and into the trust file's `depot_wrap_keys` (14a) |
+| Lease key (P-256), one per site depot (14b) | `robodr-seal keygen lease --out lease.key` | the site depot (`keys.lease`); `lease.key.pub` is given to `enroll --lease-key` on every unit of a site that uses leases (§13.5) |
+| Entry-station key (Ed25519, 14a) | `robodr-blackbox keygen` format, listed in the trust file's `entry_keys` | the entry station only; signs entry reports (§13.2) |
 
 ### 12.3 Enrol, sign the policy, create the runtime volume
 
 1. On the unit: `robodr-seal enroll --seal-dir /var/lib/robodr-seal
    --unit ugv-07 --platform ugv-x1 --policy-authority authority.key.pub`
    creates the UWK **inside the TPM** and prints the enrolment record
-   (public). Carry the record to the depot. (Until 14a the depot cannot
-   verify that the key is in a real TPM: carry the record on trusted
-   media.)
+   (public). With a site depot, enrol through it instead (§13.3): it
+   verifies the TPM's EK certificate and that the UWK is in that TPM. At
+   a site that uses leases, add `--lease-key lease.key.pub` (§13.5).
 2. The policy authority signs the platform's reference boot measurements
    (from the golden image, e.g. `tpm2_pcrread sha256:0,2,4,7` on a
    reference unit booted with it):
@@ -3013,12 +3015,14 @@ it. Do not commit before that boot: the old policy is what still works.
   depot). Only `files`, `model` and `config` can be sealed; every file
   but the SBOM is encrypted; the content key is written only wrapped to
   the depots. Sign and bundle as usual.
-* Depot (until `robodr-depot`, 14a): for each unit and sealed item,
+* Depot: `robodr-depot` re-wraps every sealed item for each enrolled
+  unit of a stage when it makes the stage's deployment (§13.4); each
+  unit's pack carries only its own wraps. Without a depot (labs),
   `robodr-seal rewrap --depot-key depot.key --rpk <imported RPK dir>
-  --unit-record ugv-07.json` prints the deployment's `wrapped_keys`
-  entry; put all entries, sorted by unit and digest, into the deployment
-  before it is signed. A media pack moved to another unit gives it
-  nothing: the wraps are bound to the unit's own TPM key.
+  --unit-record ugv-07.json` prints one `wrapped_keys` entry; put all
+  entries, sorted by unit and digest, into the deployment before it is
+  signed. A media pack moved to another unit gives it nothing: the wraps
+  are bound to the unit's own TPM key.
 
 ### 12.5 Units without a TPM (fallback)
 
@@ -3067,9 +3071,8 @@ as for `reanchor`; `--device` overrides `seal.device`):
 The JSON report lists `destroyed` and `incomplete`; `robot.seal.erased`
 (Critical; with `--trigger tamper` also `robot.seal.tamper`) says the
 same in words. It is final: recovery is re-enrolment (a new seal
-directory) and re-delivery. Erase is not yet triggered automatically
-(tamper input, attestation failures, lease): that is
-`robodr-responder`'s, Sprint 14b. `robodr-seal erase` (`--device`,
+directory) and re-delivery. Automatic erase from the platform's inputs
+is §12.8. `robodr-seal erase` (`--device`,
 `--mapper`, `--mount`, `--stop-unit`) does the same without the agent's
 journal and findings.
 
@@ -3081,3 +3084,183 @@ journal and findings.
 | `robot.seal.unseal_failed` (`erased`) | the unit's keys were erased | re-enrol and re-deliver, if the unit is trusted again |
 | `robot.deliver.refused` (`unauthentic_key`) | a wrap in the deployment is not this unit's (another unit's, tampered) | check the depot's re-wrapping |
 | `robot.seal.erased`, `robot.seal.tamper` | crypto-erase ran (trigger, what was destroyed and the volume's state in the detail) | investigate the trigger; if the volume is "STILL OPEN", power the unit off |
+| `robot.seal.lease_expired` | a sealed item waits for a site lease (none yet, or the TPM's clock or reboot budget passed it) | bring the unit back into LAN reach of the depot, or give it a media pack with a fresh lease (§13.5) |
+| `robot.seal.erase_deferred` | an erase trigger fired while the robot moved (or its state was unknown); the erase runs as soon as it is idle, safe-state or e-stopped | treat as tamper in progress; bring the robot to a safe state |
+
+### 12.8 Executed crypto-erase from platform inputs (Sprint 14b)
+
+The platform's enclosure-tamper input, repeated attestation failure and
+repeated failed operator authentication can erase the unit without an
+operator: `robodr-deliverd` plans the erase with the responder and runs it
+only when agentd's live safety state is `idle`, `safe_state_active` or
+`estop_active`; in any other state (also `unknown`) it waits, also across
+restarts, and runs as soon as the state allows.
+
+1. In `/etc/robodr/deliverd.json`:
+
+   ```json
+   "erase": {
+     "trigger_socket": "/run/robodr-deliverd/erase.sock",
+     "feeder_uids": [],
+     "feeder_gids": [<gid of the platform's tamper-input service>]
+   }
+   ```
+
+   and the drop-in
+   `/usr/share/doc/robodr/examples/robodr-deliverd.service.d/50-depot-lan.conf.example`
+   (its `RuntimeDirectory=` creates the socket's directory).
+2. The platform's input service (root, or a feeder uid / gid) sends one
+   line per event: `robodr-deliverd tamper --socket
+   /run/robodr-deliverd/erase.sock --trigger tamper` (or
+   `attestation_failed`, `auth_failures`). Anything from another peer, or
+   a trigger a person must approve (`operator`, `signed_command`), is
+   journaled and ignored.
+3. Test it on a bench unit with a disposable enrolment: the erase is
+   final.
+
+### 12.9 Anti-rollback floors in a TPM NV counter (Sprint 14b)
+
+Without it, the floors live in the state file, the signed high-water
+record and the black box: restoring all three from an old disk image
+rolls them back unnoticed. With an NV counter the record names the
+counter value it was written at, and an older record is detected:
+
+1. `robodr-seal counter define --index 0x01500042 --owner-auth-file
+   /root/owner.auth` (owner authorization, as §12.1).
+2. `"seal": {..., "anti_rollback_nv": "0x01500042"}` in deliverd.json, then
+   restart the agent: the existing record is migrated into the counter
+   once (`robodr.deliver.anchor_migrated` in the journal).
+3. From then on a restored disk image, a deleted black box and state, or
+   an undefined and redefined counter lock the agent (no import, no
+   install; `robot.deliver.refused`). Recovery is `robodr-deliverd
+   reanchor` as §11.3, after finding out why.
+
+The counter detects a restored **older** record; it does not stop root,
+who holds the black-box key, from writing a new record with lower floors.
+
+---
+
+## 13. Site depot (`robodr-depot`, Sprints 14a and 14b)
+
+The single-box control plane inside the air gap
+(`docs/SECURE-DELIVERY.md` §4-§6, §8, §10; `man robodr-depot(8)`): a
+bundle enters only with a passing entry report, units enrol with their
+TPM and two operators, rollouts go ring by ring and halt on a failing
+report, and each unit fetches only its own pack (mutual TLS) or gets a
+per-unit media pack. Verified with software TPMs on loopback only.
+
+### 13.1 Set up the depot box
+
+1. Install the `robodr` package; the depot runs as `robodr-depot`
+   (`/var/lib/robodr/depot`, `/etc/robodr-depot`, created by the package).
+   Run every command below as that user:
+   `runuser -u robodr-depot -- robodr-depot --config /etc/robodr-depot/depot.json ...`.
+2. Keys in `/etc/robodr-depot/keys` (0600, owned by `robodr-depot`):
+   `depot-signing.key` (`robodr-blackbox keygen`, the trust file's depot
+   key), `depot-wrap.key` (`robodr-seal keygen depot`), `unit-ca.key`
+   (`robodr-seal keygen policy`: the unit CA), and with leases `lease.key`
+   (`robodr-seal keygen lease`).
+3. The trust file (root-signed, as §11.1) lists the depot's signing key,
+   its wrapping key (`depot_wrap_keys`), the entry stations' keys
+   (`entry_keys`), the SHA-256 of the TPM vendors' EK CA certificates the
+   site accepts (`ek_ca_certs`), and the units' rings. Put those CA
+   certificates (PEM or DER) into `enrolment.ek_cas` and their
+   intermediates into `enrolment.ek_intermediates`; a certificate whose
+   digest the trust file does not list is ignored.
+4. `/etc/robodr-depot/depot.json` from
+   `/usr/share/doc/robodr/examples/depot.example.json`, then
+   `robodr-depot ... init --trust trust.json`. With `anchor` (recommended),
+   define the counter first: `robodr-seal counter define --index
+   0x01500050 --owner-auth-file ... --tcti device:/dev/tpmrm0` on the depot
+   box, and install the drop-in `50-tpm-anchor.conf.example`
+   (group `tss`).
+5. `systemctl enable --now robodr-depot` (the LAN server). Restrict who
+   can connect with `IPAddressAllow=` in a drop-in.
+
+### 13.2 Bring a bundle in
+
+1. On the entry station: `robodr-depot entry scan --bundle DIR --trust
+   trust.json --trust-anchor anchor.json --root ... --site SITE --station
+   entry-1 --key entry.key --history DIR [--vulndb vulndb.json]
+   --out report.json` (the report and `report.json.sig`). A verdict
+   `fail` lists what was found at or above `--fail-on`.
+2. On the depot: `robodr-depot ... import --bundle DIR --report
+   report.json`. Refused (`robot.depot.import_refused`): no or another
+   bundle's report, a failing or expired report, a chain gap, a revoked or
+   below-floor RPK, a sealed RPK for a depot key the trust file does not
+   list.
+
+### 13.3 Enrol a unit
+
+1. Depot: `enrol begin --unit ugv-07` prints a nonce.
+2. Unit (root): `robodr-seal enrol-request --seal-dir /var/lib/robodr-seal
+   --nonce <hex> --out req.json` (after `provision` and `enroll`, §12).
+3. Depot: `enrol verify --request req.json --out challenge.json`.
+4. Unit: `robodr-seal enrol-activate --seal-dir ... --challenge
+   challenge.json --out resp.json`.
+5. Depot: `enrol finish --response resp.json`, then two different
+   operators: `enrol approve --unit ugv-07 --key op1.key` and again with
+   `op2.key`. `enrol export --unit ugv-07 --out DIR` writes `client.pem`
+   and `depot-ca.pem` for the unit.
+6. Unit: copy both to `/etc/robodr/depot/`, add to deliverd.json
+
+   ```json
+   "depot": {
+     "address": "192.0.2.10:8443",
+     "server_name": "depot.site-a.internal",
+     "ca_file": "/etc/robodr/depot/depot-ca.pem",
+     "cert_file": "/etc/robodr/depot/client.pem"
+   }
+   ```
+
+   and install the drop-in `50-depot-lan.conf.example` with the depot's
+   address in `IPAddressAllow=`. The TLS key is the identity key inside
+   the TPM; it never leaves it.
+
+Any refusal is `robot.depot.enrolment_refused` with the reason (EK chain,
+credential activation, certification, quote, nonce, lease key); after a
+wrong challenge answer start again with `enrol begin`.
+
+### 13.4 Roll out
+
+1. `rollout create --id r1 --rpk <digest> [--rpk ...] --stages
+   lab,canary,ring-1 [--soak-s 600] [--max-failures 0]` makes the first
+   stage's deployment.
+2. `deploy approve --seq N --key op1.key` (and a second operator for a
+   production ring) activates it; units pull it within a minute and
+   report.
+3. `inventory` shows each unit's reports; `rollout advance --id r1` makes
+   the next stage only when every unit of this one reported its items
+   installed and healthy for the soak time.
+4. A failing report beyond `--max-failures` halts the rollout
+   (`robot.depot.rollout_halted`): nothing more of it is served. Fix the
+   release, then `rollout abort` (two operators) and start a new rollout,
+   or `rollout resume` (two operators) to deploy the stage again.
+5. Units without LAN: `pack --unit ugv-07 --out DIR` writes that unit's
+   media pack; carry the unit's report back with `robodr-deliverd report
+   --out FILE` and `report import --report FILE`.
+
+### 13.5 Leases (Sprint 14b)
+
+With `keys.lease` and `lease` (`lifetime_s` of TPM powered-on time,
+`reboots`) in depot.json, every unit must be enrolled with
+`robodr-seal enroll --lease-key lease.key.pub`; the depot refuses others.
+Each accepted report renews the unit's lease from its TPM-attested time;
+it travels in the answer (LAN) or the media pack. A unit carried off site
+keeps running what it has unsealed, but after the lease's time or reboot
+budget its TPM refuses every unseal (`robot.seal.lease_expired`). Choose
+`reboots` and `lifetime_s` for the longest legitimate time out of LAN
+reach.
+
+### 13.6 Recovery
+
+* `robot.depot.locked` (with `anchor`): the database is older than the
+  NV counter (a restored backup or disk image) or the counter was
+  redefined. Find out why first; then `reanchor --min-deployment-seq N
+  --key op1.key --key op2.key`, with `N` the highest deployment sequence
+  any unit has seen (`inventory`, units' `status`), so no sequence number
+  is reused.
+* `unit revoke --unit U --key op1.key --key op2.key`: a lost or retired
+  unit is served nothing more and gets no new wraps.
+* The depot's keys and database are the site's crown jewels: back up the
+  keys offline; a database backup restored later locks the depot (above).

@@ -1,7 +1,7 @@
 # Secure delivery: air-gapped fleet distribution, updates and captured-unit protection
 
-> **Status: design; Sprints 13a, 13b and 13c implemented** (13a/13b
-> 2026-10-26, 13c 2026-10-30). The
+> **Status: design; Sprints 13a, 13b, 13c, 14a and 14b implemented**
+> (13a/13b 2026-10-26, 13c, 14a and 14b 2026-10-30). The
 > formats of §3 and release signing exist as `robodr-pkg` (pure parsers
 > and validators) and `robodr-release` (build, sign, verify, repair), with
 > the decisions of §3.5. The on-unit agent `robodr-deliverd` (13b, §10)
@@ -15,14 +15,24 @@
 > floor and an erase epoch (`tpm2-tools`), the LUKS2 runtime volume and the
 > Clevis/Tang fallback; `robodr-deliverd` installs sealed RPKs and models
 > only into the runtime volume and crypto-erases; the `robot.seal.*`
-> findings are catalogued (contract 2.3). The exit criteria of all three
-> are demonstrated by tests (§10). Verified offline only: on synthetic
+> findings are catalogued (contract 2.3). The site depot (14a) exists as
+> `robodr-depot` (library and CLI): import behind a signed entry report,
+> inventory, TPM enrolment with EK certificate chains and credential
+> activation, staged rollouts with operator quorums and halt-on-failure,
+> per-unit re-wrapping, mutual-TLS LAN serving with TPM-held client keys,
+> media packs. 14b adds TPM-enforced site leases, crypto-erase executed
+> from the platform's tamper input under the responder's safety grading,
+> anti-rollback floors anchored in TPM NV counters, and the
+> `robot.depot.*` / `robot.seal.erase_deferred` findings (contract 2.3,
+> block `catalog_2_3_depot`). The exit criteria of all five are
+> demonstrated by tests (§10). Verified offline only: on synthetic
 > payloads in temporary directories (13b: the host's dpkg against a
-> separate dpkg root, a real agentd fed by the replay helper; 13c: a
-> software TPM (swtpm), a real Tang server, `cryptsetup` on LUKS2 image
-> files without device-mapper), never on a hardware TPM, an air-gapped
+> separate dpkg root, a real agentd fed by the replay helper; 13c-14b:
+> software TPMs (swtpm) with EK certificates from swtpm's local CA, a real
+> Tang server, `cryptsetup` on LUKS2 image files without device-mapper,
+> the depot served on loopback), never on a hardware TPM, an air-gapped
 > site, an entry station or a robot.
-> **Everything else in this document (14a onward) is not implemented.**
+> **Everything else in this document (14c onward) is not implemented.**
 > It expands ROADMAP Phase 3 ("Air-gapped deployment") and splits the
 > one-line Sprint 13 / Sprint 14 items in `docs/SPRINTS.md` with a
 > buildable plan. Every component named here that does not already exist
@@ -162,8 +172,8 @@ both directions.
 | `robodr-pkg` `[P]` | pure library | RPK, bundle, deployment and trust-file formats (§3): parse, validate, verify, hash. No I/O beyond reading bytes it is given. Fuzzed like `robodr-rtps`. Sprint 13a. |
 | `robodr-seal` `[P]` | library + CLI | Key wrapping, payload encryption, TPM sealing via `tpm2-tools` (same approach as `robodr-blackbox/src/tpm_anchor.rs`), software fallback (§7). Sprint 13c: everything in this row, tested against swtpm; decisions in §7.9. |
 | `robodr-release` `[P]` | CLI, connected side | Build RPKs from `.deb` / OCI / files / models, encrypt, sign (quorum), assemble bundles, add Reed-Solomon parity. Sprint 13a: builds every kind from a payload directory (kind shape and SBOM checked; a `.deb` or OCI archive is carried as a file, not inspected), quorum signing, chained bundles, parity, verify, repair. 13c: sealed RPKs (`build rpk --seal-to`). |
-| `robodr-depot` `[ ]` | service, site | Single-box control plane: import bundles, inventory, deployments and rings, per-unit key wrapping, serve units, lease server. This is the air-gapped instance of the planned `robodr-fleet` (ROADMAP §2) and the "single-box control plane" of Sprint 14. |
-| `robodr-deliverd` `[P]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. Sprint 13b: from per-unit media packs, kinds `files`, `config`, `deb`, `robodr-rules`; no LAN, no OS A/B. 13c: sealed `files` / `model` / `config` and every `model` into the runtime volume, `erase`. |
+| `robodr-depot` `[P]` | service, site | Single-box control plane: import bundles, inventory, deployments and rings, per-unit key wrapping, serve units, lease server. This is the air-gapped instance of the planned `robodr-fleet` (ROADMAP §2) and the "single-box control plane" of Sprint 14. Sprints 14a / 14b: everything in this row plus the entry scan and the TPM enrolment, tested against swtpm on loopback; keys are files (not TPM / HSM). |
+| `robodr-deliverd` `[P]` | service, unit | The on-unit agent: reconcile desired vs installed, verify, stage, gate on safety state, install, health-check, roll back, report. Runs separately from `robodr-agentd` so a delivery bug cannot stop detection. Sprint 13b: from per-unit media packs, kinds `files`, `config`, `deb`, `robodr-rules`; no LAN, no OS A/B. 13c: sealed `files` / `model` / `config` and every `model` into the runtime volume, `erase`. 14a / 14b: LAN pulls and reports, leases, executed erase from platform triggers, NV-counter floors; no OS A/B. |
 
 ### 2.2 Reused, unchanged or extended
 
@@ -877,6 +887,25 @@ lease lifetime it can no longer unseal anything. Lease lifetime is per site
 policy (hours to weeks), because air-gapped units may be legitimately out of
 LAN reach on deployment. With no lease configured, behaviour is as in §7.4.
 
+**14b implementation.** The lease is enforced by the TPM, not by the unit's
+software. A UWK enrolled with `--lease-key` has the authPolicy
+`PolicyAuthorize(lease key, H("robodr-seal/lease-ref/v1\0" || unit))`
+AND `PolicyNV(epoch)`: the only policies that satisfy it are ones the
+depot's lease key signed for this unit. A lease (`robodr-lease/1`, P-256
+ECDSA) approves the 13c authority chain followed by
+`PolicyCounterTimer(clock < X)` and `PolicyCounterTimer(resetCount <= R)`,
+so the TPM refuses the unseal once its own clock passes `X` or after more
+than the allowed reboots (error kind `lease_expired`, finding
+`robot.seal.lease_expired`). The depot issues a lease with every accepted
+report: `X` = the unit's TPM clock + `lease.lifetime_s`, `R` = its reset
+count + `lease.reboots`, both taken from a **TPM attestation** of that
+time in the report (§10, 14b review). Setting the TPM clock back is refused
+by the TPM; an older lease is refused by the unit as a replay. TPM time is
+powered-on time: a unit kept switched off does not use up its lease, so
+the reboot budget is the bound for units carried away and powered up
+elsewhere. Leases reach the unit in the depot's answer to a report (LAN)
+or in a media pack.
+
 ### 7.6 Cryptographic erase
 
 `UWK` and the runtime-volume key are bound to an **erase epoch**: an NV
@@ -930,6 +959,22 @@ safety-state grading as every other action; and a real `Executor` in
 `executor.rs`, extended to admit it. Crypto-erase is proposed as the
 **first** executed response because it touches no actuator and is safe in
 every `SafetyState`.
+
+**14b implementation.** `robodr-responder` gained the `crypto_erase` plan
+(`src/erase.rs`, outside the SOC action catalog): `idle`,
+`safe_state_active` and `estop_active` execute; `moving_slow`,
+`moving_fast`, `collaborative_human_nearby` and `unknown` defer; a signed
+command or an operator's erase needs two distinct approvers. The executor
+is `robodr-deliverd` on the unit, under the rules of
+`robodr-agent/src/executor.rs` (re-derive the plan, nothing for a replay,
+the live safety state read again immediately before acting, the intent
+journaled first, the effect read back). The platform's tamper,
+attestation-failure and authentication-failure inputs reach it through
+its trigger socket, accepted only from root or configured feeders
+(`SO_PEERCRED`); a deferred erase stays pending in the state file across
+restarts (`robot.seal.erase_deferred`, Medium, once per state) and runs as
+soon as the state allows. Not routed yet: the lease-expiry trigger (the
+TPM already refuses every unseal) and a signed remote command (§11 item 7).
 
 ### 7.7 Units without a TPM (software fallback)
 
@@ -1029,7 +1074,12 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
    imported deployment, with every unit's entries, stays in its state.
    `rewrap` wraps to whatever UWK the enrolment record names: until the
    record is certified by the TPM's endorsement key (14a, item 12), the
-   depot must receive records over a trusted channel.
+   depot must receive records over a trusted channel. **14a:**
+   `robodr-depot` does this step for enrolled units only (their UWK
+   certified by an AK that credential activation tied to an EK the vendor
+   CA certified); each unit's pack carries only its own wraps, and the
+   release's depot wraps must name keys the trust file lists
+   (`depot_wrap_keys`).
 
 **TPM**
 
@@ -1085,7 +1135,7 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
     epoch, authority and its TPM name). The EK / AK certification and
     credential activation that keep a depot from wrapping to a
     software-emulated TPM are 14a; until then the depot trusts the
-    record's channel.
+    record's channel. **14a:** done (§8, 14a implementation).
 
 **Runtime volume and fallback**
 
@@ -1139,6 +1189,38 @@ Where §7.1–§7.7 left room, 13c took these decisions (code:
 4. The unit's black box records enrolment; its public keys go to the SOC
    through the outbound diode like other evidence.
 
+**14a implementation** (`robodr-seal enrol-request` / `enrol-activate` on
+the unit, `robodr-depot enrol begin|verify|finish|approve|export`;
+`robodr_seal::enrol`, `robodr_seal::attest`, `robodr_depot::x509`):
+
+1. `enrol begin`: the depot draws a 32-byte nonce for a unit the trust
+   file assigns to a ring.
+2. The unit reads its RSA EK certificate (NV `0x01c00002`), creates an AK
+   under the EK (`tpm2_createak`, restricted signing, endorsement
+   hierarchy) and a unit identity key (UIK, P-256, `fixedtpm`, under the
+   SRK: the TLS client and report-signing key), certifies the UWK and the
+   UIK with the AK (`TPM2_Certify`) and quotes the signed policy's PCRs
+   with the nonce as qualifying data.
+3. `enrol verify`: the EK certificate must chain (webpki, EKU checked only
+   where present) to a vendor EK CA certificate whose SHA-256 the trust
+   file lists (`ek_ca_certs`), and its RSA key must be the EK public area's;
+   the certified UWK and UIK must be TPM-resident (`fixedtpm`,
+   `fixedparent`, `sensitivedataorigin`, no `userwithauth` on the UWK),
+   the UWK's authPolicy must be the site's authority / epoch (and lease
+   key) policy computed offline; the quote must match the signed policy.
+   The depot then makes a credential (`TPM2_MakeCredential` in software)
+   to the EK for the AK's name.
+4. `enrol-activate` on the unit (`TPM2_ActivateCredential`): only the TPM
+   that holds both keys recovers the secret; `enrol finish` checks it, and
+   one wrong answer closes the enrolment.
+5. Two distinct operators approve (`enrol approve`); the depot issues the
+   unit's client certificate from its unit CA for the UIK
+   (`enrol export`).
+
+A unit without a TPM enrols only with `enrolment.allow_without_tpm`, as
+`unattested`. Refusals are `robot.depot.enrolment_refused`, success
+`robot.depot.unit_enrolled`.
+
 ---
 
 ## 9. New findings (OCSF catalog additions)
@@ -1163,6 +1245,12 @@ both sides of the diode (`docs/contracts/robodr.findings.md`).
 | `robot.seal.lease_expired` | Medium | lease expired; sealed payloads unavailable after reboot |
 | `robot.seal.erased` | Critical | crypto-erase executed, with trigger |
 | `robot.seal.tamper` | Critical | enclosure tamper or erase trigger fired |
+| `robot.seal.erase_deferred` | Medium | crypto-erase planned but deferred by the safety state (14b) |
+| `robot.depot.import_refused` | High | a bundle refused at the depot: entry report, signatures, chain, revocation, floor, depot wrap keys (14a) |
+| `robot.depot.enrolment_refused` | High | an enrolment refused: EK chain, credential activation, certification, quote, nonce, lease key (14a) |
+| `robot.depot.unit_enrolled` | Low | a unit enrolled after the operator quorum (14a) |
+| `robot.depot.rollout_halted` | High | a stage's failures exceeded its threshold; nothing more of the rollout is served (14a) |
+| `robot.depot.locked` | Critical | the depot's database is behind its NV-counter anchor (a restored backup or disk image) and refuses to work until re-anchored (14b) |
 
 13b: the seven `robot.deliver.*` ids are catalogued in contract
 `robodr.findings` **2.2** (data source `robodr_delivery`) and emitted by
@@ -1177,7 +1265,14 @@ unit, §3.5 item 27). 13c: the four `robot.seal.*` ids are catalogued in
 contract `robodr.findings` **2.3** (data source `robodr_delivery`, in a
 block of their own); `unseal_failed` (High), `erased` and `tamper`
 (Critical) are emitted by `robodr-deliverd` (§7.9 item 16),
-`lease_expired` (Medium) from 14b.
+`lease_expired` (Medium) from 14b. 14a/14b: the five `robot.depot.*` ids
+and `robot.seal.erase_deferred` are catalogued in contract
+`robodr.findings` **2.3.0** in a block of their own (`catalog_2_3_depot`,
+data source `robodr_delivery`, `docs/contracts/robodr.findings.md` §3d);
+the depot writes its findings into the agentd spool of its own box with
+`robodr-deliverd`'s writer, so they leave the site through the same
+exporters and diode. `lease_expired` is now emitted (Medium, once per
+reason) while a sealed item waits for a lease.
 
 ---
 
@@ -1192,8 +1287,8 @@ nothing else renumbers.
 | **13a — Formats and release signing** (implemented, see below) | `robodr-pkg` (RPK, bundle, deployment, trust file parsers, pure, fuzzed); `robodr-release build/sign/verify` with 2-of-N quorum; parity via `robodr-diode` fec. | A bundle built on one host verifies on another; every manifest mutation, missing signature, wrong quorum, revoked key and chain gap is refused in tests; fuzz targets in `fuzz/`. |
 | **13b — Unit agent, local** (implemented, see below) | `robodr-deliverd` installing `files`, `config`, `deb`, `robodr-rules` from a per-unit media pack; store; health gate; auto-rollback; floors in a state file; safety-state gate, tested with recorded JSONL safety reports replayed into agentd's live `safety_feed` socket (a small replay helper is new work). | Demo: bad release auto-rolls back; downgrade below floor refused; install deferred while the replayed safety state is `MovingSlow`. All recorded in the black box. |
 | **13c — Sealing** (implemented, see below) | `robodr-seal`: XChaCha20-Poly1305 chunks; `UWK` in TPM via `tpm2-tools`; signed PCR policy; erase epoch; LUKS2 runtime volume; Clevis/Tang fallback. Tested against `swtpm`, like `TpmNvCounterAnchor`. | Disk image of an enrolled (swtpm) unit yields no plaintext; changed PCR → unseal refused; epoch increment → every sealed key dead; fallback unit cannot unlock without Tang. |
-| **14a — Depot and rollout** | `robodr-depot`: import with entry report, inventory, enrolment with credential activation, deployments with operator quorum, rings, per-unit re-wrapping, LAN serving (mTLS), media packs, halt-on-failure. | Demo on ≥ 3 units (VMs with swtpm acceptable): staged rollout lab → canary → ring-1; injected failing release halts at canary; captured-unit VM cannot decrypt a model assigned only to another unit. |
-| **14b — Lease, erase execution, evidence** | Lease tokens; crypto-erase as the first executed responder action; `robot.deliver.*` / `robot.seal.*` findings through the existing diode; floors moved to TPM NV counters. | Lease expiry blocks unseal after reboot; erase triggered by a simulated tamper input while state is `Idle`, deferred while `MovingFast`; SOC sees the full chain of findings. |
+| **14a — Depot and rollout** (implemented, see below) | `robodr-depot`: import with entry report, inventory, enrolment with credential activation, deployments with operator quorum, rings, per-unit re-wrapping, LAN serving (mTLS), media packs, halt-on-failure. | Demo on ≥ 3 units (VMs with swtpm acceptable): staged rollout lab → canary → ring-1; injected failing release halts at canary; captured-unit VM cannot decrypt a model assigned only to another unit. |
+| **14b — Lease, erase execution, evidence** (implemented, see below) | Lease tokens; crypto-erase as the first executed responder action; `robot.deliver.*` / `robot.seal.*` findings through the existing diode; floors moved to TPM NV counters. | Lease expiry blocks unseal after reboot; erase triggered by a simulated tamper input while state is `Idle`, deferred while `MovingFast`; SOC sees the full chain of findings. |
 | **14c — OS A/B and hardware** | `os-image` kind with one A/B updater (decision §11); first run on real TPM hardware (not swtpm) and a real robot computer. | A/B OS update with forced boot failure falls back; sealing survives an authorised OS update (new signed policy) and fails for an unauthorised one. |
 
 Each sub-sprint ends, as `docs/SPRINTS.md` requires, in a demo that runs.
@@ -1530,6 +1625,175 @@ erase **triggers** executed by `robodr-responder` (14b; 13c erases on an
 operator's command), floors moved to TPM NV (14b), OS A/B and a hardware
 TPM (14c). No run on a hardware TPM, a robot or with device-mapper.
 
+**14a status (2026-10-30): implemented; exit criteria demonstrated by
+tests against software TPMs, offline.** `crates/robodr-depot` (library and
+binary `robodr-depot`, `#![deny(unsafe_code)]` with one local allow for
+`flock(2)`, no panicking calls outside tests); the 14a members of the trust
+file, the entry report and the LAN framing in `robodr-pkg` (`trust.rs`,
+`entry.rs`, `wire.rs`); enrolment evidence in `robodr-seal` (`attest.rs`,
+`enrol.rs`, `tpm_ident.rs`); the unit side in `robodr-deliverd`
+(`lan.rs`); the TPM-held TLS client key in `robodr-blackbox::tls`
+(`load_client_with_signer`). Decisions:
+
+1. **Entry report** (`robodr-entry-report/1`, §6.1): written by `robodr-depot
+   entry scan` on the entry station, which verifies the bundle like the
+   release tool and matches each RPK's CycloneDX SBOM against an offline
+   vulnerability database (`robodr-vulndb/1`); signed by an `entry_keys`
+   key of the trust file (a new role, disjoint from every other); bound to
+   the site, the bundle hash and the RPK list; valid at most 30 days; a
+   finding at or above `fail_on` makes the verdict `fail`. Import refuses a
+   missing, foreign, expired, failing or wrongly signed report.
+2. **Trust file members** `entry_keys`, `depot_wrap_keys`, `ek_ca_certs`
+   (format still `robodr-delivery-trust/1`): omitted when empty, so files
+   signed before 14a keep their bytes and meaning. With `depot_wrap_keys`
+   listed, every station refuses a sealed RPK wrapped to another depot key
+   (`wrong_scope`).
+3. **Enrolment** as §8 (14a implementation). The depot keeps the AK public
+   area, the UIK, the EK digest and the unit record; the operator approvals
+   are a `robodr-sigset/1` over the enrolment digest.
+4. **Rollouts.** Stages are rings in ascending order starting at `lab` or
+   `canary`; a production ring needs a `canary` stage before it; one
+   deployment per stage, signed by the depot and active only at the
+   quorum of its ring (§5.3). A stage passes when every unit of it
+   reported every item installed and healthy, and again at least `soak_s`
+   after the first such report; only then does `rollout advance` make the
+   next stage. A report with a failed or refused item of the current stage
+   beyond `max_failures` (capped below the stage's unit count) halts the
+   rollout (its deployment stops being served) until operators resume it
+   (a new deployment, approved again) or abort it. Each unit is served the
+   newest active deployment that targets it; least distribution with
+   `--unit`.
+5. **Per-unit re-wrapping**: at stage deployment, for the stage's
+   enrolled, non-revoked, non-erased units only.
+6. **LAN serving** (`robodr_pkg::wire`, an HTTP/1.1 subset): `GET /v1/pack`
+   streams a canonical JSON listing line (paths of the media-pack grammar,
+   sizes, SHA-256) and the files; `POST /v1/report` takes a signed unit
+   report and answers with a lease. TLS is rustls with mandatory client
+   certificates from the depot's unit CA (hand-written X.509 builder,
+   checked with webpki); the unit's private key never leaves its TPM
+   (`tpm2_sign` behind rustls' signer). A client is a unit only if its
+   **key** is an enrolled unit's UIK; the request names no unit, so client
+   confusion is not expressible. The unit verifies the stream against the
+   listing, then imports it like a media pack. Units pull at most once a
+   minute and skip an unchanged pack after the listing.
+7. **Single writer**: `flock` on `state_dir/depot.lock`; the server opens
+   the depot per request.
+
+| Exit criterion | Demonstrated by | Against |
+|---|---|---|
+| Staged rollout lab → canary → ring-1 on ≥ 3 units | `robodr-depot/tests/exit_14a.rs` `staged_rollout_halt_at_canary_and_captured_unit`: four units (lab, canary, two in ring-1), each a swtpm with an EK certificate from a local vendor CA, its own seal directory and delivery agent; every unit enrols with credential activation and two operators; the bundle enters only with its passing entry report (none, or another bundle's, refused); each stage is approved by its ring's quorum (one operator does not activate ring-1), delivered over mutual TLS, installed, reported, and advanced only after the stage passed | swtpm 0.7 + tpm2-tools 5.6 (`ROBODR_SWTPM=1`), loopback TLS |
+| An injected failing release halts at canary | same test: release 2 is healthy on the lab unit and fails its health check on the canary; the canary's report halts the rollout (`robot.depot.rollout_halted`), `rollout advance` is refused, the ring-1 units still receive release 1's pack | swtpm |
+| A captured unit cannot decrypt a model assigned only to another unit | same test: a sealed model deployed to one ring-1 unit (through its canary stage); the other ring-1 unit's LAN pack has no model and no wrap; given the first unit's media pack (every wrap of the deployment), it refuses the pack and its TPM cannot unwrap that unit's wrap; no plaintext of the model anywhere on it | swtpm |
+
+Adversarial tests (`robodr-depot/tests/adversarial_14a.rs`): forged entry
+reports (signed by an operator key instead of an entry key), a report
+replayed for another bundle, a bundle out of chain order, a failing
+verdict (each a `robot.depot.import_refused`); enrolment
+impersonation: an EK certificate from a CA the trust file does not list, a
+TPM without an EK certificate, a stale nonce, another TPM's certified UWK,
+a non-resident (`userwithauth`) UWK-shaped key, the AK of another TPM (the
+challenge cannot be answered by either TPM; a guessed answer closes the
+enrolment), changed boot measurements, one operator, the same operator
+twice, a release key as an operator; a unit whose UWK names a rogue policy
+authority; mutual TLS: another unit's certificate with this unit's TPM
+key (handshake fails), a CA-signed certificate for a key that is no
+enrolled unit's (403), a request naming another unit (400), a report
+sent over another unit's connection or replayed (refused), a revoked unit
+(403), a client trickling a TLS record to hold a connection slot (closed
+at the request deadline); wrong quorum (depot, release and entry keys
+never count); ring skipping; a rolled-back depot database (14b anchor).
+
+**14b status (2026-10-30): implemented; exit criteria demonstrated by
+tests against software TPMs, offline.** Decisions:
+
+1. **Lease** as §7.5 (14b implementation): `robodr-seal keygen lease`,
+   `enroll --lease-key`, `lease install`; the depot's `lease` section
+   (`lifetime_s` of TPM time, `reboots`); `robodr-deliverd` installs leases
+   from the depot's report answers and from media packs (also a renewed
+   lease next to a deployment it already has).
+2. **Erase execution** as §7.6 (14b implementation), with
+   `robodr-deliverd tamper` as the platform side of the trigger socket.
+3. **Findings through the diode**: the unit's `robot.deliver.*` /
+   `robot.seal.*` records and the depot's `robot.depot.*` records are
+   written into agentd spools and leave through the existing spool
+   exporter, diode pack and import; the tests run that path end to end.
+4. **Floors in a TPM NV counter** (`robodr-deliverd`
+   `seal.anti_rollback_nv`; the depot's `anchor`): the signed record
+   (deliverd's `highwater.json`, the depot's database anchor) names the
+   counter value it belongs to; a write stores value + 1 first and then
+   increments, so a crash between the two is completed on the next start
+   and a record behind the counter is a restored older one: the agent
+   locks itself, the depot refuses to work (`robot.depot.locked`) until
+   `reanchor` by the operator quorum. A record from before the anchor is
+   migrated once, while the counter is still unwritten
+   (`robodr.deliver.anchor_migrated` in the journal); an undefined or
+   redefined counter locks. The counter is defined with the owner
+   authorization (`robodr-seal counter define`) and written only by
+   increments.
+
+| Exit criterion | Demonstrated by | Against |
+|---|---|---|
+| Lease expiry blocks unseal after reboot | `robodr-depot/tests/exit_14b.rs` `lease_expiry_blocks_unseal_after_reboot`: a site with leases refuses a UWK enrolled without the lease key; with no lease the sealed model waits (`robot.seal.lease_expired`), the report's answer brings one and it installs; the TPM clock moved past the lease and a reboot: the unit's probe fails with `lease_expired`, and the TPM itself refuses; a renewed lease (LAN, then by media with an unchanged deployment) opens it again. `robodr-seal/tests/lease_14b.rs`: the TPM refuses after the clock or the reboot budget passed, a lease for another unit or by another key, an older lease (replay), a lengthened lease (signature) and setting the clock back | swtpm (`tpm2_setclock`, `Shutdown(CLEAR)` + restart) |
+| Erase from a simulated tamper input: `Idle` executes, `MovingFast` defers | `erase_from_a_tamper_input_is_graded_by_safety_and_cannot_be_spoofed`: the tamper line on the trigger socket while agentd's live safety state is `moving_fast`: planned, deferred (`robot.seal.erase_deferred`), still pending after a restart of the agent; `idle`: executed (epoch incremented, `robot.seal.tamper`, `robot.seal.erased`), nothing unseals. Spoofing does nothing: a process of another uid on the socket, a person's trigger (`operator`) on the platform socket, a `robot.seal.tamper` record dropped into the spool | swtpm, a real agentd status socket |
+| The SOC sees the full chain of findings | the same tests export the unit's and the depot's spools with `robodr-spool-export`'s exporter into diode batches, carry and import them with `robodr-diode`, and find `robot.seal.lease_expired`, `robot.deliver.installed`, `robot.seal.erase_deferred`, `robot.seal.tamper`, `robot.seal.erased`, `robot.depot.enrolment_refused` and `robot.depot.unit_enrolled` on the far side, validated against contract 2.3 | in-process exporter / diode |
+| Floors moved to TPM NV counters | `floors_in_a_tpm_nv_counter_survive_disk_rollback_and_counter_recreation`: a 13b unit (no anchor) migrates to the counter on its next start; a restored disk image (state, black box and record together), a deleted state and black box, and a recreated counter all lock the agent; `adversarial_14a.rs` `a_rolled_back_depot_database_locks_the_depot`: a restored or deleted depot database and a recreated counter lock the depot | swtpm |
+
+**Adversarial self-review of 14a/14b (2026-10-30)**, each fix with a test
+that failed before it:
+
+* High: a lease was computed from the TPM clock and reset count the unit
+  report **claims**. Root on a unit can have the TPM-resident identity key
+  sign any clock, and so get a lease that never runs out before carrying
+  the unit away. A TPM unit's report now carries a quote by its AK
+  (restricted: it signs only TPM-generated structures; endorsement
+  hierarchy, so the reset count is not obfuscated) qualified by the
+  report's digest; the depot verifies it with the AK public area kept
+  from enrolment and bases the lease on the attested reset count, with
+  the reported clock at most 60 s behind the attested one
+  (`exit_14b.rs`: a forged clock with the original attestation, without
+  one, and with a fresh AK attestation are all refused).
+* Medium: the depot's read timeout was per read, so a client trickling one
+  byte of a TLS record at a time (no certificate needed) held one of the
+  `max_connections` slots indefinitely. The handshake, the request head
+  and a report body now share one deadline (30 s, or `deadline_s` if
+  shorter) (`adversarial_14a.rs`).
+* Medium: a 14a trust file required the three new members, so a trust
+  file signed earlier (a unit's stored anchor) no longer parsed after an
+  upgrade. They are omitted when empty (`trust.rs`
+  `pre_14a_trust_files_keep_their_bytes`).
+* Medium: a lease renewed in a media pack next to a deployment the unit
+  had already seen was ignored (the pack was skipped as seen). Leases in
+  media packs are now read whatever the deployment, once per distinct
+  file (`exit_14b.rs`).
+* Low: the agent's loop downloaded its whole pack on every pass (every
+  `interval_ms`). It now pulls at most once a minute and stops after the
+  listing when the pack is unchanged (`exit_14a.rs`). Also: an overflowing
+  `lease.lifetime_s` is refused instead of wrapped; the depot no longer
+  serves a unit whose report said it was erased.
+* Documented, not fixed: the NV anchor detects a **restored older**
+  record; root holding the black-box key (it is on the unit) can still
+  write a new record with lower floors, as in 13b. The unit's LAN client
+  bounds each read by `depot.deadline_s`, not the whole exchange (the
+  depot is authenticated). A pack being streamed holds a connection slot
+  for as long as an authenticated unit keeps reading.
+
+Fuzzing: `pkg_entry` (entry reports, pack listings, request and response
+heads) and `seal_attest` (TPM public areas, attestations, enrolment
+requests and challenges, unit reports, leases); std-only smoke runs in
+the crate tests with committed seeds (`fuzz/README.md`); no libFuzzer
+campaign yet.
+
+**Gated, not run here:** everything above needs `ROBODR_SWTPM=1` (swtpm,
+`swtpm_setup` with `swtpm_localca` for EK certificates, tpm2-tools); without
+it the TPM tests skip. No vendor EK CA, hardware TPM, real tamper input,
+entry station or robot was involved.
+
+Not in 14a/14b: OS A/B and hardware (14c); keys of the depot in its TPM or
+an HSM (files today, §5.1); a second depot (§11 item 6); the lease-expiry
+erase trigger and a signed remote erase command (§11 item 7); event-log
+based attestation (the quote is compared with the signed policy's PCR
+values).
+
 ---
 
 ## 11. Open questions
@@ -1574,6 +1838,26 @@ What Sprint 13c settled or narrowed (§7.9):
   depots' X25519 keys itself (`--seal-to`); carrying them in the
   root-signed trust file would let every station check them (a format
   change).
+
+What Sprints 14a and 14b settled or narrowed:
+
+* **Depot wrapping keys in the trust file** (13c's new question):
+  resolved. `depot_wrap_keys` in the root-signed trust file; when listed,
+  every station refuses a sealed RPK wrapped to another key.
+* **EK / AK certification and credential activation** (§7.9 item 12):
+  resolved (§8, 14a implementation). EK CAs are accepted by digest from
+  the trust file (`ek_ca_certs`).
+* (5) Narrowed: the mechanism and its defaults exist (`lease.lifetime_s`
+  in TPM powered-on time, `lease.reboots`; the shipped example: 30 days,
+  64 reboots); the depot renews with every accepted report, so only the
+  depot extends a lease. Per-mission-profile values remain a site
+  decision.
+* (6) Open: one depot per site.
+* (7) Narrowed: platform triggers execute (tamper, attestation failure,
+  authentication failures); the plan requires two people for a signed
+  command or an operator's erase, but no signed remote command is routed
+  to the unit yet, from the depot or the SOC.
+* (4) Unchanged: still swtpm only.
 
 ---
 

@@ -458,6 +458,31 @@ destroyed nothing, an open volume left readable, session contexts on
 disk) is fixed with regression tests; `robodr-seal` is packaged and the
 agent's unit reaches the TPM.
 
+**Status as of 2026-10-30 — Sprints 14a and 14b: site depot, leases and
+executed erase done, against software TPMs**
+([`SECURE-DELIVERY.md`](SECURE-DELIVERY.md) §10 "14a status", "14b
+status"). `robodr-depot` (library, CLI and `robodr-depot.service`):
+import only with a passing signed entry report, inventory, TPM enrolment
+(EK certificate chain to a vendor CA listed in the trust file, AK
+credential activation, AK-certified UWK and identity key, quote, two
+operators), staged rollouts with per-ring quorums, soak and
+halt-on-failure, per-unit re-wrapping, mutual-TLS LAN serving with the
+unit's key in its TPM, media packs; TPM-enforced site leases; crypto-erase
+from the platform's tamper input, planned by the responder and deferred
+while the robot moves; anti-rollback floors (unit and depot) anchored in
+TPM NV counters; `robot.depot.*` and `robot.seal.erase_deferred`
+(contract 2.3). Exit criteria shown by tests against swtpm 0.7 +
+tpm2-tools 5.6 on loopback: lab → canary → ring-1 on four units, a
+failing release halts at canary, a captured unit cannot decrypt a model
+assigned only to another unit; lease expiry blocks unseal after reboot;
+erase from a tamper input deferred at `moving_fast` and executed at
+`idle`; the full chain of findings through the diode path. An adversarial
+self-review fixed a lease based on self-reported TPM time (now
+AK-attested), a connection-slot exhaustion and trust-file compatibility.
+Not done: 14c (OS A/B, hardware TPM, a robot), depot keys in a TPM / HSM,
+a signed remote erase command, libFuzzer runs of `pkg_entry` and
+`seal_attest`.
+
 ---
 
 ## Phase 4 — AI-robot security + the frontier lab (Sprints 18–21)
