@@ -52,6 +52,24 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .RB [ \-\-key
 .IR KEYFILE ]
 .br
+.B robodr\-deliverd pull \-\-config
+.I FILE
+.br
+.B robodr\-deliverd report \-\-config
+.I FILE
+.RB [ \-\-out
+.IR FILE ]
+.br
+.B robodr\-deliverd lease \-\-config
+.I FILE
+.B \-\-lease
+.I FILE
+.br
+.B robodr\-deliverd tamper \-\-socket
+.I PATH
+.RB [ \-\-trigger
+.IR tamper | attestation_failed | auth_failures ]
+.br
 .B robodr\-deliverd \-\-version
 .SH DESCRIPTION
 The on-unit delivery agent of RoboDR's secure delivery (Sprint 13b). It
@@ -266,6 +284,60 @@ Final: recovery is re-enrolment and re-delivery. Stop the service first;
 .B \-\-key
 as for
 .BR reanchor .
+.TP
+.B pull
+Fetch this unit's pack from the site depot over mutual TLS (the
+.B depot
+section, Sprint 14a): the depot's unit CA
+.RB ( depot.ca_file )
+is the only trust anchor, the client certificate is the one from
+enrolment and its key is the unit identity key inside the TPM (signed
+with
+.BR tpm2_sign ;
+the key never leaves the TPM). The pack goes to
+.IR media_dir/depot\-lan
+and is imported like a media pack (every signature, the deployment, the
+unit's wrapped keys). A lease in the pack is installed.
+.B run
+pulls every pass when the section is set.
+.TP
+.B report
+Send this unit's install report (installed items, health verdicts, TPM
+clock and reset count), signed with the identity key, to the depot; with
+.B \-\-out
+write it for a media round trip
+.RB ( "robodr\-depot report import" ).
+A lease in the depot's answer is installed.
+.B run
+reports every 60 seconds when the section is set.
+.TP
+.B lease
+Install a site lease file (Sprint 14b), checked against the lease key the
+UWK was enrolled with. Sealed payloads of a unit enrolled with a lease
+key unseal only while the lease is current in the TPM's own clock and
+reset count; otherwise the item waits
+.RB ( robot.seal.lease_expired ,
+Medium) until the depot renews the lease.
+.TP
+.B tamper
+The platform's side of the erase trigger socket
+.RB ( erase.trigger_socket ):
+send one trigger line. The agent accepts it only from root or a feeder
+listed in
+.BR erase.feeder_uids " / " feeder_gids
+.RB ( SO_PEERCRED ;
+anything else is journaled and ignored), plans the crypto-erase with the
+responder and executes it when the live safety state is
+.BR idle ", " safe_state_active " or " estop_active ;
+in any other state, including unknown, it is deferred
+.RB ( robot.seal.erase_deferred ,
+Medium, once per state) and kept pending in the state file, across
+restarts, until the state allows it. The state is read again immediately
+before acting; the intent is journaled first. A
+.B tamper
+trigger reports
+.B robot.seal.tamper
+(Critical) at once.
 .SH SEALED PACKAGES
 With the optional
 .B seal
@@ -344,6 +416,25 @@ a maintenance window never opens.
 (default 4096) bounds the bytes hashed to recognise a media pack by its
 content. Paths must be absolute and normalised; the state, media and
 install trees must be disjoint.
+.PP
+Optional sections of Sprints 14a and 14b:
+.B depot
+.RB ( address ", " server_name ", " ca_file ", " cert_file ,
+.BR deadline_s ", " max_pack_mb )
+for LAN delivery;
+.B erase
+.RB ( trigger_socket ", " feeder_uids ", " feeder_gids )
+for executed crypto-erase;
+.B seal.anti_rollback_nv
+(an NV counter index defined with
+.BR "robodr\-seal counter define" )
+moves the anti-rollback anchor into the TPM: the signed high-water record
+carries the counter value it was written at, and the counter is
+incremented after each write. A record behind the counter (a restored
+disk) locks the agent; on the first start with the counter, the floors of
+the 13b state file and record are migrated into it
+.RB ( robodr.deliver.anchor_migrated
+in the journal).
 .SH HEALTH CHECKS
 .B probe
 argv are executed directly
@@ -410,15 +501,21 @@ the black-box key arrives as
 .IR /run/credentials/robodr\-deliverd.service/blackbox.key .
 Enable after commissioning and
 .BR init\-anchor .
+LAN delivery and the erase trigger socket need the drop-in example
+.I /usr/share/doc/robodr/examples/robodr\-deliverd.service.d/50\-depot\-lan.conf.example
+(TCP to the depot's address only; a runtime directory for the socket).
 .SH LIMITS
 Kinds
 .BR oci\-image ", " robodr\-profile ", " os\-image
 are refused, and sealed RPKs and models without a
 .B seal
-section. Floors live in the state file, the signed
-high-water record and the black box, not in a TPM: root deleting the
+section. Without
+.BR seal.anti_rollback_nv ,
+floors live in the state file, the signed
+high-water record and the black box only: root deleting the
 black box together with the other two, or flooding it and putting an
-older record back, is not detected. The safety state is
+older record back, is not detected (with it, the TPM counter detects
+it). The safety state is
 taken from agentd's user only; whoever controls root, that user or a
 configured safety feeder can still claim
 .BR idle .
@@ -428,6 +525,7 @@ packages: the unit's hardening does not contain approved content.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-seal (8),
+.BR robodr\-depot (8),
 .BR robodr\-blackbox (1),
 .BR robodr\-spool\-export (1),
 /usr/share/doc/robodr/OPERATIONS.md,

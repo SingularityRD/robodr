@@ -104,6 +104,10 @@ pub struct Engine {
     anchor: Option<VerifiedTrust>,
     /// Transient import problems already recorded this run.
     reported: BTreeSet<String>,
+    /// SHA-256 of the lease files of media packs already tried this run
+    /// (Sprint 14b): a renewed lease in a pack whose deployment is
+    /// unchanged is still installed, an unchanged one is not re-read.
+    pub(crate) leases_tried: BTreeSet<String>,
     /// Media entry name -> (tree stamp, content digest) of the last pass,
     /// so an unchanged pack is not hashed again (review L4).
     media_cache: std::collections::BTreeMap<String, (String, String)>,
@@ -349,6 +353,7 @@ impl Engine {
             findings,
             anchor: None,
             reported: BTreeSet::new(),
+            leases_tried: BTreeSet::new(),
             media_cache: std::collections::BTreeMap::new(),
             sealing: cfg_seal,
             hw_key,
@@ -748,13 +753,9 @@ impl Engine {
 
     fn scan_media(&mut self, sys: u64, rep: &mut TickReport) -> R<()> {
         for (name, path) in media::list_media(&self.cfg.media_dir) {
-            let Some(key) = self.pack_key(&name, &path) else {
-                continue;
-            };
-            if self.state.seen_pack(&key) {
-                continue;
-            }
-            // Sprint 14b: a lease in the pack (whatever the deployment).
+            // Sprint 14b: a lease in the pack (whatever the deployment,
+            // also in a pack whose deployment was already seen: a lease
+            // renewal may come with an unchanged deployment).
             if self.sealing.is_some() {
                 if let Err(e) = crate::lan::lease_from_pack(self, &path) {
                     let k = format!("lease-media:{name}:{e}");
@@ -765,6 +766,12 @@ impl Engine {
                         )?;
                     }
                 }
+            }
+            let Some(key) = self.pack_key(&name, &path) else {
+                continue;
+            };
+            if self.state.seen_pack(&key) {
+                continue;
             }
             match media::import(&self.cfg, &self.state, &path, sys) {
                 Ok(Outcome::AlreadyAccepted) => {
@@ -1236,7 +1243,8 @@ impl Engine {
                     rules::SEAL_ERASE_DEFERRED,
                     Severity::Medium,
                     format!(
-                        "erase_deferred: crypto-erase ({}) deferred in safety state {st}: it runs                          as soon as the state is {until}",
+                        "erase_deferred: crypto-erase ({}) deferred in safety state {st}: it runs \
+                         as soon as the state is {until}",
                         p.trigger
                     ),
                     Some(ev),

@@ -42,6 +42,10 @@
 #             robodr-seal (pure; sealing: TPM provisioning, enrolment,
 #             signed PCR policies, runtime volume, crypto-erase; usr/sbin,
 #             root-only tool, no unit)
+#             robodr-depot (pure; the site depot, Sprint 14a: operator
+#             commands and the mutual-TLS LAN server, usr/sbin, with its
+#             unit (User=robodr-depot), installed disabled; for the depot
+#             box, never enabled on a robot)
 # A unit file is only installed together with its binary. ROBODR_DEB_REQUIRE
 # (space separated) makes optional binaries mandatory; the release workflow
 # sets it so a release can never silently ship without the daemon.
@@ -257,10 +261,20 @@ fi
 # disabled; enabled after commissioning and enrolment (init-anchor).
 if install_bin robodr-deliverd usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-deliverd.service" "$pkg/$units/robodr-deliverd.service"
+    install -D -m 0644 "$here/systemd/robodr-deliverd.service.d/50-depot-lan.conf.example" \
+        "$pkg/$ex/robodr-deliverd.service.d/50-depot-lan.conf.example"
 fi
 # Sealing (Sprint 13c, docs/SECURE-DELIVERY.md 7.9): the operator's tool for
 # the unit's TPM and runtime volume (OPERATIONS.md section 12); root-only.
 install_bin robodr-seal usr/sbin 0 || true
+# The site depot (Sprint 14a, docs/SECURE-DELIVERY.md 4-6, 8): installed
+# disabled, for the depot box (OPERATIONS.md section 13).
+# (config/depot.example.json goes to the examples with the other configs.)
+if install_bin robodr-depot usr/sbin 0; then
+    install -D -m 0644 "$unit_src/robodr-depot.service" "$pkg/$units/robodr-depot.service"
+    install -D -m 0644 "$here/systemd/robodr-depot.service.d/50-tpm-anchor.conf.example" \
+        "$pkg/$ex/robodr-depot.service.d/50-tpm-anchor.conf.example"
+fi
 # Fleet lifecycle (Sprint 9): robodr-enroll and its configuration example.
 # (config/fleet.example.json goes to the examples with the other configs.)
 install_bin robodr-enroll usr/sbin 0 || true
@@ -300,7 +314,7 @@ done
 install -D -m 0644 "$root/docs/contracts/robodr.control-plane.md" \
     "$doc/contracts/robodr.control-plane.md"
 # The delivery design (man robodr-deliverd(8) points here), when the agent is in.
-if [[ -e "$pkg/usr/sbin/robodr-deliverd" ]]; then
+if [[ -e "$pkg/usr/sbin/robodr-deliverd" || -e "$pkg/usr/sbin/robodr-depot" ]]; then
     install -D -m 0644 "$root/docs/SECURE-DELIVERY.md" "$doc/SECURE-DELIVERY.md"
 fi
 # The fleet contract (man robodr-enroll(8) points here), when the tool is in.

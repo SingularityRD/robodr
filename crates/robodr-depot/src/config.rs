@@ -170,7 +170,8 @@ impl Config {
             if self.keys.lease.is_none() {
                 return Err(err("config: lease needs keys.lease"));
             }
-            if l.lifetime_s == 0 || l.lifetime_s * 1000 > robodr_seal::lease::MAX_LEASE_MS {
+            let ms = l.lifetime_s.checked_mul(1000);
+            if l.lifetime_s == 0 || ms.is_none_or(|ms| ms > robodr_seal::lease::MAX_LEASE_MS) {
                 return Err(err("config: lease.lifetime_s in 1..=366 days"));
             }
         }
@@ -192,5 +193,42 @@ impl Config {
 
     pub fn anchor_path(&self) -> PathBuf {
         self.state_dir.join("trust").join("anchor.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped example parses and names the packaged paths.
+    #[test]
+    fn example_parses() {
+        let c = Config::parse(include_bytes!("../../../config/depot.example.json")).unwrap();
+        assert_eq!(c.state_dir, Path::new("/var/lib/robodr/depot"));
+        assert!(c.keys.signing.starts_with("/etc/robodr-depot/keys"));
+        assert_eq!(
+            c.anchor.as_ref().map(|a| a.work_dir.clone()),
+            Some(PathBuf::from("/run/robodr-depot"))
+        );
+    }
+
+    #[test]
+    fn refuses_bad_values() {
+        let base: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../config/depot.example.json")).unwrap();
+        let bad = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = base.clone();
+            f(&mut v);
+            Config::parse(&serde_json::to_vec(&v).unwrap()).unwrap_err()
+        };
+        bad(&|v| v["lease"]["lifetime_s"] = u64::MAX.into());
+        bad(&|v| v["lease"]["lifetime_s"] = 0.into());
+        bad(&|v| v["keys"]["lease"] = serde_json::Value::Null);
+        bad(&|v| v["state_dir"] = "var/lib/robodr/depot".into());
+        bad(&|v| v["roots"] = serde_json::json!([]));
+        bad(&|v| v["anchor"]["index"] = "0x81000001".into());
+        bad(&|v| v["serve"]["max_connections"] = 0.into());
+        bad(&|v| v["unknown"] = 1.into());
+        bad(&|v| v["format"] = "robodr-depot-config/2".into());
     }
 }

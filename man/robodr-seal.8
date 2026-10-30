@@ -5,7 +5,7 @@
 .SH NAME
 robodr\-seal \- seal delivered software to a unit's TPM: keys, signed PCR policies, runtime volume, crypto-erase
 .SH SYNOPSIS
-.B robodr\-seal keygen depot|policy \-\-out
+.B robodr\-seal keygen depot|policy|lease \-\-out
 .I FILE
 .br
 .B robodr\-seal policy sign \-\-key
@@ -33,7 +33,37 @@ robodr\-seal \- seal delivered software to a unit's TPM: keys, signed PCR polici
 .I P
 .B \-\-policy\-authority
 .I FILE.pub
+.RB [ \-\-lease\-key
+.IR FILE.pub ]
 .I TPM
+.br
+.B robodr\-seal enrol\-request \-\-seal\-dir
+.I DIR
+.B \-\-nonce
+.I HEX
+.B \-\-out
+.I FILE
+.RI [ TPM ]
+.br
+.B robodr\-seal enrol\-activate \-\-seal\-dir
+.I DIR
+.B \-\-challenge
+.I FILE
+.B \-\-out
+.I FILE TPM
+.br
+.B robodr\-seal lease install \-\-seal\-dir
+.I DIR
+.B \-\-lease
+.I FILE TPM
+.br
+.B robodr\-seal counter define \-\-index
+.I 0x01NNNNNN
+.B \-\-owner\-auth\-file
+.I FILE TPM
+.br
+.B robodr\-seal counter read \-\-index
+.I 0x01NNNNNN TPM
 .br
 .B robodr\-seal enroll\-fallback \-\-seal\-dir
 .I DIR
@@ -148,6 +178,12 @@ needs
 .BR \-\-last\-version ;
 the update after it needs a new enrolment.
 .TP
+.B keygen lease
+The depot's P-256 lease key (Sprint 14b): its public file goes to
+.B enroll \-\-lease\-key
+and the secret to the depot's
+.BR keys.lease .
+.TP
 .B provision
 Define the erase-epoch counter, the policy-floor bit field and the
 persistent SRK (idempotent; an index with other attributes is refused,
@@ -162,6 +198,44 @@ tools on stdin.
 .B enroll
 Create the UWK in the TPM and print the enrolment record (public) for
 the depot.
+With
+.BR \-\-lease\-key ,
+the UWK is also bound to a current
+.B site lease
+(Sprint 14b, SECURE-DELIVERY 7.5): its TPM policy authorizes only a lease
+signed by that key for this unit, and the lease's own policy compares the
+TPM's clock and reset count
+.RB ( PolicyCounterTimer ).
+After the lease's powered-on time or reboot budget has passed, the TPM
+refuses the unseal (error kind
+.BR lease_expired ,
+finding
+.BR robot.seal.lease_expired );
+setting the TPM clock back is refused by the TPM itself.
+.TP
+.B enrol\-request
+The unit's side of the depot's enrolment (Sprint 14a, SECURE-DELIVERY 8):
+reads the EK certificate (NV 0x01c00002), creates the attestation key
+(AK) under the EK and the unit identity key (UIK, P-256, the TLS client
+key) under the SRK, certifies the UWK and the UIK with the AK and quotes
+the signed policy's PCRs over the depot's
+.BR \-\-nonce .
+Writes the request for
+.BR "robodr\-depot enrol verify" .
+.TP
+.B enrol\-activate
+Activates the depot's credential challenge with the EK (TPM2_ActivateCredential):
+only the TPM that holds both the EK and the AK can answer.
+.TP
+.B lease install
+Checks a lease file against the enrolled lease key and installs it (the
+TPM checks it again at every unseal).
+.TP
+.B counter define|read
+An NV counter for anti-rollback floors (robodr-deliverd's
+.BR seal.anti_rollback_nv ,
+Sprint 14b) or the depot's database anchor: owner-authorized, written
+only by increments, never redefined.
 .TP
 .B enroll\-fallback
 Create an X25519 UWK in
@@ -240,12 +314,15 @@ volume.wrap, erased.json.
 Tested against swtpm only, not on a hardware TPM; the dm-crypt open path
 is tested only where device-mapper is available. The policy authority is
 one key (the TPM cannot enforce the roots' quorum). Erase destroys keys,
-not plaintext already in memory. The UWK is not yet
-certified by the TPM's endorsement key (Sprint 14a): a depot must get
-enrolment records over a trusted channel. Erase is final and not yet
-triggered automatically (Sprint 14b).
+not plaintext already in memory. EK certificates are checked against the
+vendor CAs the site's trust file lists; a TPM vendor without EK
+certificates cannot enrol attested. A lease bounds powered-on time and
+reboots, not wall time: a unit kept powered off does not use its lease up.
+Erase is final; robodr-deliverd runs it automatically from its trigger
+socket (Sprint 14b), graded by the safety state.
 .SH SEE ALSO
 .BR robodr\-deliverd (8),
+.BR robodr\-depot (8),
 .BR tpm2_createprimary (1),
 .BR cryptsetup (8),
 .BR clevis (1),

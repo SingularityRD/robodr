@@ -177,7 +177,41 @@ fn lease_expiry_blocks_unseal_after_reboot() {
         u.current("runtime/model", "nav-model").as_deref(),
         Some("2")
     );
+    let unit_id = e.config().unit.id.clone();
     drop(e);
+    // A renewal by media: this lease runs out too; the unit's report goes
+    // to the depot by media and the depot's media pack carries the new
+    // lease with the deployment the unit already has (a pack it has seen):
+    // the lease is still installed.
+    let t = u.seal().tpm_time().unwrap();
+    let o = u.sw.tool(
+        "tpm2_setclock",
+        &[
+            "-c",
+            "o",
+            "-p",
+            "file:-",
+            &(t.clock + 3_700_000).to_string(),
+        ],
+        Some(seal::OWNER_AUTH),
+    );
+    assert!(o.ok(), "{}", o.error_line());
+    u.sw.restart();
+    let err = u.seal().probe().unwrap_err();
+    assert_eq!(err.kind, robodr_seal::ErrorKind::LeaseExpired, "{err}");
+    let e = u.open();
+    let rep = e.unit_report().unwrap();
+    drop(e);
+    assert!(s
+        .with(|d| d.accept_report(None, &rep, now()))
+        .unwrap()
+        .is_some());
+    s.with(|d| d.write_pack(&unit_id, &u.dir.join("media").join("renewal")))
+        .unwrap();
+    let mut e = u.open();
+    u.run(&mut e, 4);
+    drop(e);
+    u.seal().probe().unwrap();
     // The SOC sees the unit's chain through the diode, and the depot's.
     let ids = through_diode(
         &u.dir.join("spool"),

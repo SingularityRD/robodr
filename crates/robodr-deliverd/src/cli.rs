@@ -379,6 +379,7 @@ fn run_loop(cfg: Config) -> Result<(), String> {
     };
     let lan = cfg.depot.is_some();
     let mut last_report: Option<Instant> = None;
+    let mut last_pull: Option<Instant> = None;
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
     let notifier = robodr_agentd::notify::Notifier::from_env();
     notifier.notify("READY=1");
@@ -405,9 +406,11 @@ fn run_loop(cfg: Config) -> Result<(), String> {
                 }
             }
         }
-        // Sprint 14a: LAN delivery (failures are retried next loop).
-        if lan {
-            if let Err(err) = crate::lan::pull(e.config()) {
+        // Sprint 14a: LAN delivery, at most once a minute (failures are
+        // retried then; an unchanged pack is not downloaded again).
+        if lan && last_pull.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60)) {
+            last_pull = Some(Instant::now());
+            if let Err(err) = crate::lan::pull_if_changed(e.config()) {
                 eprintln!("robodr-deliverd: pull: {err}");
             }
         }

@@ -452,14 +452,14 @@ jobs:
             sudo apt-get install -y --no-install-recommends qemu-user-static
             run=qemu-aarch64-static
           fi
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor robodr-deliverd robodr-seal; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-enroll robodr-executor robodr-deliverd robodr-seal robodr-depot; do
             $run "dist/static/$TARGET/$b" --version
           done
           $run "dist/static/$TARGET/robodr-blackbox" keygen --out "$RUNNER_TEMP/k"
           test -s "$RUNNER_TEMP/k.pub"
       - name: robodr-focal .deb (static binaries, systemd 245 units)
         env:
-          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-deliverd robodr-seal
+          ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-deliverd robodr-seal robodr-depot
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/focal)

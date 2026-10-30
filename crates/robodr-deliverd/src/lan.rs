@@ -92,9 +92,24 @@ fn sealing_of(cfg: &Config) -> Result<(DepotCfg, Sealing), String> {
     Ok((d, Sealing::new(s, &cfg.unit.id)))
 }
 
+/// The listing line of the last pack pulled (a dot name: never a media
+/// entry).
+const LAN_LISTING: &str = ".depot-lan.listing";
+
 /// Fetch this unit's pack from the depot into `media_dir/depot-lan`.
 /// Returns its path.
 pub fn pull(cfg: &Config) -> Result<PathBuf, String> {
+    pull_with(cfg, false)?.ok_or_else(|| "nothing pulled".into())
+}
+
+/// As [`pull`], but the transfer stops after the listing when it equals
+/// the last one pulled and that pack is still in place (the agent's loop:
+/// an unchanged pack is not downloaded again). `None`: unchanged.
+pub fn pull_if_changed(cfg: &Config) -> Result<Option<PathBuf>, String> {
+    pull_with(cfg, true)
+}
+
+fn pull_with(cfg: &Config, skip_same: bool) -> Result<Option<PathBuf>, String> {
     let (d, sealing) = sealing_of(cfg)?;
     let mut s = connect(&d, &sealing)?;
     s.write_all(&wire::encode_request(Request::Pack, &d.server_name))
@@ -120,6 +135,14 @@ pub fn pull(cfg: &Config) -> Result<PathBuf, String> {
         line.push(b[0]);
     }
     let (listing, total) = wire::parse_listing(&line).map_err(|e| e.to_string())?;
+    let dst = cfg.media_dir.join(LAN_PACK);
+    let saved = cfg.media_dir.join(LAN_LISTING);
+    if skip_same
+        && crate::fsx::is_real_dir(&dst)
+        && robodr_release::fsio::read_capped(&saved, wire::MAX_LISTING).is_ok_and(|b| b == line)
+    {
+        return Ok(None);
+    }
     if total > d.max_pack_mb.saturating_mul(1024 * 1024) {
         return Err(format!(
             "pack of {total} bytes is larger than depot.max_pack_mb"
@@ -166,10 +189,12 @@ pub fn pull(cfg: &Config) -> Result<PathBuf, String> {
         let _ = crate::fsx::remove_any(&stage);
         return Err(e);
     }
-    let dst = cfg.media_dir.join(LAN_PACK);
     let _ = crate::fsx::remove_any(&dst);
+    let _ = std::fs::remove_file(&saved);
     std::fs::rename(&stage, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-    Ok(dst)
+    // Best effort: without it the next loop downloads the pack again.
+    let _ = std::fs::write(&saved, &line);
+    Ok(Some(dst))
 }
 
 fn rand8() -> [u8; 8] {
@@ -226,6 +251,12 @@ pub fn lease_from_pack(engine: &mut Engine, pack: &Path) -> Result<bool, String>
     }
     let b = robodr_release::fsio::read_capped(&p, robodr_seal::lease::MAX_LEASE_BYTES)
         .map_err(|e| e.to_string())?;
+    // Each distinct lease file once per run (refused ones too: the
+    // refusal is journaled once).
+    let h = robodr_blackbox::crypto::to_hex(&robodr_blackbox::crypto::sha256(&b));
+    if !engine.leases_tried.insert(h) {
+        return Ok(false);
+    }
     engine.install_lease(&b).map_err(|e| e.to_string())?;
     Ok(true)
 }

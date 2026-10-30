@@ -1,0 +1,22 @@
+# robodr-deliverd.service drop-in: LAN delivery from the site depot and the
+# crypto-erase trigger socket (Sprints 14a / 14b; deliverd.json "depot" and
+# "erase"; docs/OPERATIONS.md sections 11 and 13). Copy to
+#   /etc/systemd/system/robodr-deliverd.service.d/50-depot-lan.conf
+# set the depot's address, then `systemctl daemon-reload`.
+#
+# The unit has no network at all by default (media packs only). LAN pulls
+# need TCP to the depot and nothing else: every exchange is mutual TLS
+# against the depot's unit CA with the unit's TPM-resident identity key,
+# and what comes back is verified like a media pack.
+[Service]
+PrivateNetwork=no
+# Added to the unit's AF_UNIX (allow-lists are merged).
+RestrictAddressFamilies=AF_INET AF_INET6
+# IPAddressDeny=any stays from the unit; only the depot is reachable.
+IPAddressAllow=192.0.2.10
+# The erase trigger socket ("erase.trigger_socket":
+# /run/robodr-deliverd/erase.sock, created 0660 by the agent; the platform's
+# tamper / attestation / authentication inputs connect as root or as a
+# uid / gid listed in "feeder_uids" / "feeder_gids").
+RuntimeDirectory=robodr-deliverd
+RuntimeDirectoryMode=0755

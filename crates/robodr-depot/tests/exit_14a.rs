@@ -31,6 +31,11 @@ fn params() -> RolloutParams {
 /// Pull over the LAN, install, report: one unit's delivery round.
 fn round(u: &UnitH) -> robodr_deliverd::Engine {
     robodr_deliverd::lan::pull(&u.cfg()).unwrap();
+    // The agent's loop does not download an unchanged pack again.
+    assert_eq!(
+        robodr_deliverd::lan::pull_if_changed(&u.cfg()).unwrap(),
+        None
+    );
     let mut e = u.open();
     u.run(&mut e, 12);
     robodr_deliverd::lan::report(&mut e).unwrap();
