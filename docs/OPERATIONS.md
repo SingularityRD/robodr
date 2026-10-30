@@ -1881,7 +1881,12 @@ while the chain is flushed.
   gateway's user in agentd's group) and the gateway's `findings_socket` to
   the same path. `status.json` `findings_feed` shows `connected`, `sent`,
   `pending`, `dropped`, `last_error`; agentd counts
-  `daemon.gateway_findings`.
+  `daemon.gateway_findings`. An idle gateway writes a heartbeat line
+  every 5 s (`daemon.gateway_heartbeats`), so a quiet gateway is not
+  reported as a silent input; a gateway that stops writing still is
+  (`robot.agent.input_silent` after `daemon.silence_ms`). Upgrade agentd
+  before the gateway: an older agentd counts the heartbeat as a
+  malformed line.
 * `restrict_motion`: with `restriction_path`, `status.json` `restriction`
   is the restriction in force (`null`: none) and `restriction_error` why a
   file was ignored. Removing the file lifts it at the next housekeeping

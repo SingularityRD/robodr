@@ -31,6 +31,14 @@ use serde::Serialize;
 
 /// The line format tag.
 pub const FORMAT: &str = "robodr-gateway-finding/v1";
+/// The heartbeat line's format tag: `{"format":"robodr-gateway-heartbeat/v1",
+/// "sent":N,"dropped":N}` (lines sent and dropped so far), written while no
+/// finding was written for [`HEARTBEAT`], so agentd can tell a quiet gateway
+/// from a dead one (its `daemon.silence_ms`).
+pub const HEARTBEAT_FORMAT: &str = "robodr-gateway-heartbeat/v1";
+/// Heartbeat interval of an idle feed (well below agentd's default
+/// `silence_ms`, 30 s).
+pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// Most lines waiting for agentd.
 pub const MAX_BACKLOG: usize = 1024;
 /// Reconnect interval.
@@ -78,10 +86,21 @@ pub struct Feed {
     pub dropped: u64,
     /// The last connect / write error.
     pub last_error: Option<String>,
+    /// Heartbeat interval of an idle feed.
+    heartbeat: Duration,
+    /// When a line was last written (or a heartbeat queued).
+    last_write: Option<Instant>,
+    /// Heartbeat lines queued.
+    pub heartbeats: u64,
 }
 
 impl Feed {
     pub fn new(path: PathBuf) -> Self {
+        Self::with_heartbeat(path, HEARTBEAT)
+    }
+
+    /// A feed whose idle heartbeat comes every `every` (tests).
+    pub fn with_heartbeat(path: PathBuf, every: Duration) -> Self {
         Self {
             path,
             conn: None,
@@ -90,7 +109,32 @@ impl Feed {
             sent: 0,
             dropped: 0,
             last_error: None,
+            heartbeat: every,
+            last_write: None,
+            heartbeats: 0,
         }
+    }
+
+    /// Queue a heartbeat line when nothing is waiting and nothing was
+    /// written for the heartbeat interval (housekeeping, before
+    /// [`Feed::flush`]).
+    pub fn heartbeat_if_idle(&mut self, now: Instant) {
+        if !self.backlog.is_empty()
+            || self
+                .last_write
+                .is_some_and(|t| now.saturating_duration_since(t) < self.heartbeat)
+        {
+            return;
+        }
+        let line = serde_json::json!({
+            "format": HEARTBEAT_FORMAT, "sent": self.sent, "dropped": self.dropped,
+        })
+        .to_string();
+        self.backlog.push_back(line);
+        self.heartbeats = self.heartbeats.saturating_add(1);
+        // Counted as a write attempt: a missing agentd is retried by
+        // `flush` (RETRY), not by a heartbeat per tick.
+        self.last_write = Some(now);
     }
 
     pub fn push(&mut self, line: String) {
@@ -146,8 +190,11 @@ impl Feed {
                 self.next_try = Some(now + RETRY);
                 return;
             }
+            if !l.contains(HEARTBEAT_FORMAT) {
+                self.sent = self.sent.saturating_add(1);
+            }
             self.backlog.pop_front();
-            self.sent = self.sent.saturating_add(1);
+            self.last_write = Some(now);
         }
     }
 }
@@ -194,6 +241,7 @@ impl FeedThread {
                     while let Ok(l) = rx.try_recv() {
                         f.push(l);
                     }
+                    f.heartbeat_if_idle(Instant::now());
                     f.flush(Instant::now());
                     if let Ok(mut s) = st.lock() {
                         s.connected = f.connected();
@@ -262,6 +310,51 @@ mod tests {
         }
         f.push("x".into());
         assert!(f.backlog.len() <= MAX_BACKLOG + 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use std::io::BufRead as _;
+
+    /// Soak 2026-10-30: with no findings the feed wrote nothing at all, and
+    /// agentd reported it silent (the agent "blind" on the gateway). An idle
+    /// feed now sends a heartbeat line; a busy one does not.
+    #[test]
+    fn an_idle_feed_sends_heartbeats_a_busy_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("robodr-gw-feed-hb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feed.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut f = Feed::with_heartbeat(path.clone(), Duration::from_millis(100));
+        let t0 = Instant::now();
+        f.heartbeat_if_idle(t0);
+        f.flush(t0);
+        let (c, _) = l.accept().unwrap();
+        let mut r = std::io::BufReader::new(c);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"format": HEARTBEAT_FORMAT, "sent": 0, "dropped": 0}),
+            "{line}"
+        );
+        // Within the interval: nothing more.
+        f.heartbeat_if_idle(t0 + Duration::from_millis(50));
+        assert_eq!(f.pending(), 0);
+        // A finding resets the idle clock; the heartbeat waits.
+        f.push("{}".into());
+        f.flush(t0 + Duration::from_millis(90));
+        f.heartbeat_if_idle(t0 + Duration::from_millis(150));
+        assert_eq!(f.pending(), 0);
+        f.heartbeat_if_idle(t0 + Duration::from_millis(200));
+        assert_eq!(f.pending(), 1);
+        assert_eq!(f.heartbeats, 2);
+        assert_eq!(f.sent, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

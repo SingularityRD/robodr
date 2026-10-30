@@ -142,6 +142,8 @@ pub enum Payload {
     Host(crate::host::HostLine),
     /// A line of the in-path gateway's feed (see [`crate::gateway_feed`]).
     Gateway(Box<crate::gateway_feed::GatewayLine>),
+    /// The gateway's idle heartbeat (see [`crate::gateway_feed`]).
+    GatewayHeartbeat(crate::gateway_feed::GatewayHeartbeat),
 }
 
 /// Turns one trimmed, non-empty, non-comment line into a payload, or says
@@ -294,9 +296,11 @@ impl Feed {
     pub fn send(&self, payload: Payload) -> bool {
         let size = match &payload {
             Payload::Datagram(d) => d.payload.capacity().saturating_add(d.src_ip.capacity()),
-            Payload::Event(_) | Payload::Safety(_) | Payload::Host(_) | Payload::Gateway(_) => {
-                EVENT_ESTIMATE_BYTES
-            }
+            Payload::Event(_)
+            | Payload::Safety(_)
+            | Payload::Host(_)
+            | Payload::Gateway(_)
+            | Payload::GatewayHeartbeat(_) => EVENT_ESTIMATE_BYTES,
         };
         self.send_sized(payload, size)
     }

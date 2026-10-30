@@ -14,7 +14,11 @@
 //! The socket has the same shape and peer check as `host_threats`
 //! ([`crate::host::bind_host_socket`]: root and `allowed_uids`, the
 //! gateway's service user, may connect; the daemon's own uid too). A line
-//! is parsed strictly ([`parse_gateway_line`]): unknown keys, another
+//! is parsed strictly ([`parse_gateway_line`]). An idle gateway also
+//! writes a heartbeat line ([`HEARTBEAT_FORMAT`]): valid data on the input
+//! (a quiet gateway is not a silent input), never a finding; a gateway
+//! that stops writing is still reported silent after `daemon.silence_ms`.
+//! For a finding line, unknown keys, another
 //! format, a rule outside `robot.gateway.*` / `robot.firewall.*` (the
 //! gateway cannot speak for any other detector) or not in the findings
 //! catalog (`robodr_ocsf::builder::rule_known`), or oversized fields are
@@ -28,6 +32,35 @@ use crate::input::Payload;
 
 /// The line format tag (`robodr_firewall_gw::feed::FORMAT`).
 pub const FORMAT: &str = "robodr-gateway-finding/v1";
+/// The heartbeat line's tag (`robodr_firewall_gw::feed::HEARTBEAT_FORMAT`):
+/// `{"format":"robodr-gateway-heartbeat/v1","sent":N,"dropped":N}`, written
+/// by an idle gateway so that a quiet feed is not read as a silent input.
+pub const HEARTBEAT_FORMAT: &str = "robodr-gateway-heartbeat/v1";
+
+/// A gateway heartbeat: the feed's cumulative lines sent and dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayHeartbeat {
+    #[serde(rename = "format")]
+    _format: HeartbeatTag,
+    pub sent: u64,
+    pub dropped: u64,
+}
+
+/// Only [`HEARTBEAT_FORMAT`] deserializes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeartbeatTag;
+
+impl<'de> Deserialize<'de> for HeartbeatTag {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s == HEARTBEAT_FORMAT {
+            Ok(HeartbeatTag)
+        } else {
+            Err(serde::de::Error::custom("not a gateway heartbeat"))
+        }
+    }
+}
 /// Longest accepted detail (characters).
 pub const MAX_DETAIL: usize = 1024;
 /// Longest accepted rule id / channel name.
@@ -97,6 +130,18 @@ fn rule_ok(r: &str) -> bool {
 
 /// [`crate::input::LineParser`] of the gateway feed.
 pub fn parse_gateway_line(t: &str) -> Result<Payload, String> {
+    // By the `format` member itself, never by a substring: a finding's
+    // detail may quote attacker-chosen text.
+    #[derive(Deserialize)]
+    struct Tag<'a> {
+        #[serde(borrow)]
+        format: std::borrow::Cow<'a, str>,
+    }
+    if serde_json::from_str::<Tag<'_>>(t).is_ok_and(|g| g.format == HEARTBEAT_FORMAT) {
+        let h: GatewayHeartbeat =
+            serde_json::from_str(t).map_err(|e| format!("not a gateway heartbeat: {e}"))?;
+        return Ok(Payload::GatewayHeartbeat(h));
+    }
     let l: GatewayLine =
         serde_json::from_str(t).map_err(|e| format!("not a gateway finding: {e}"))?;
     if l.format != FORMAT {
@@ -167,6 +212,34 @@ mod tests {
             good.replace("\"/arm\",\"count\"", "\"\",\"count\""),
             good.replace("\"count\":1}", "\"count\":1,\"x\":1}"),
             good.replace("channel /arm: 1", &"x".repeat(MAX_DETAIL + 1)),
+        ] {
+            assert!(parse_gateway_line(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Soak 2026-10-30: the gateway's heartbeat line keeps a quiet feed
+    /// alive; it is as strict as a finding line.
+    #[test]
+    fn heartbeat_lines_are_strict() {
+        let hb = r#"{"format":"robodr-gateway-heartbeat/v1","sent":7,"dropped":2}"#;
+        match parse_gateway_line(hb) {
+            Ok(Payload::GatewayHeartbeat(h)) => assert_eq!((h.sent, h.dropped), (7, 2)),
+            other => panic!("{other:?}"),
+        }
+        // A finding whose detail quotes the heartbeat tag stays a finding.
+        let quoted = r#"{"format":"robodr-gateway-finding/v1","rule":"robot.gateway.trajectory_rejected","severity":"high","detail":"robodr-gateway-heartbeat/v1","mode":"enforce","channel":"/arm","count":1}"#;
+        assert!(matches!(
+            parse_gateway_line(quoted),
+            Ok(Payload::Gateway(_))
+        ));
+        for bad in [
+            hb.replace(
+                "\"dropped\":2}",
+                "\"dropped\":2,\"rule\":\"robot.gateway.x\"}",
+            ),
+            hb.replace("heartbeat/v1", "heartbeat/v2"),
+            hb.replace(",\"dropped\":2", ""),
+            hb.replace("7", "-1"),
         ] {
             assert!(parse_gateway_line(&bad).is_err(), "{bad}");
         }

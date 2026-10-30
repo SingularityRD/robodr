@@ -122,3 +122,75 @@ fn gateway_findings_become_findings() {
         .any(|(_, e)| e.entity_context.rule_id == "robot.safety_state.estop_engaged"));
     assert_verified(&s.blackbox, None, &found);
 }
+
+/// Soak 2026-10-30: a quiet, healthy gateway (no findings for a while)
+/// made agentd report its feed silent (`robot.agent.input_silent`, High,
+/// "the agent is blind on it", daemon state unknown) after every
+/// `silence_ms`: eight times in 75 minutes of soak, and permanently on a
+/// gateway that never has anything to report. The gateway's feed writer
+/// now sends a heartbeat line while idle; a feed that stops (a dead
+/// gateway) is still reported silent.
+#[test]
+fn gateway_heartbeats_keep_a_quiet_feed_alive() {
+    let s = setup("gw-heartbeat", &robot_profile(true));
+    let run = s.dir.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = run.join("gateway-feed.sock");
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "unix_socket", "path": run.join("events.sock")}]),
+        serde_json::json!({"silence_ms": 1500}),
+    );
+    cfg["gateway_feed"] = serde_json::json!({
+        "socket_path": sock,
+        "allowed_uids": [robodr_agentd::config::effective_uid()],
+    });
+    let r = s.resolve(&cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    let h = std::thread::spawn(move || {
+        let mut log = Vec::new();
+        let res = robodr_agentd::run(&r, &|| s2.load(Ordering::SeqCst), &mut log)
+            .map_err(|e| e.to_string());
+        (res, String::from_utf8_lossy(&log).into_owned())
+    });
+    wait_for(10, "socket", || sock.exists().then_some(()));
+    let gateway_silent = |spool: &std::path::Path| {
+        spooled(spool).iter().any(|(_, e)| {
+            e.entity_context.rule_id == "robot.agent.input_silent"
+                && e.entity_context.detail.value.contains("gateway:")
+        })
+    };
+    // 4 s of a quiet gateway: heartbeats only (the gateway's own writer).
+    let mut f = Feed::with_heartbeat(sock.clone(), std::time::Duration::from_millis(300));
+    let t0 = Instant::now();
+    while t0.elapsed() < std::time::Duration::from_secs(4) {
+        f.heartbeat_if_idle(Instant::now());
+        f.flush(Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        f.heartbeats >= 5,
+        "{} heartbeats, {:?}",
+        f.heartbeats,
+        f.last_error
+    );
+    assert_eq!(f.sent, 0, "heartbeats are not counted as findings sent");
+    assert!(
+        !gateway_silent(&s.spool),
+        "a heartbeating gateway reported silent"
+    );
+    // The gateway stops: silent again after silence_ms.
+    drop(f);
+    let st = wait_for(10, "gateway silence", || {
+        gateway_silent(&s.spool).then(|| status(&s.spool)).flatten()
+    });
+    stop.store(true, Ordering::SeqCst);
+    let (res, log) = h.join().unwrap();
+    res.unwrap_or_else(|e| panic!("{e}\n{log}"));
+    assert!(
+        st["daemon"]["gateway_heartbeats"].as_u64().unwrap_or(0) >= 5,
+        "{st}"
+    );
+}

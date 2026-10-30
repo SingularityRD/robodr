@@ -316,11 +316,14 @@ With `gateway_feed` (the `host_threats` keys: `socket_path`,
 `robodr-firewall-gw` reports its findings (`robot.gateway.*`, contract
 2.3) and the Motion Firewall's deviations (`robot.firewall.*`) over this
 socket (`src/gateway_feed.rs`). Each line (`robodr-gateway-finding/v1`) is
-parsed strictly — another format, a rule outside those two prefixes,
-oversized fields: malformed, dropped and counted — and becomes a finding
-of the normal pipeline (`Agent::handle_external`, source
-`gateway:<channel>`, subject topic the channel). Status:
-`daemon.gateway_findings`. Point the gateway's `findings_socket` at the
+parsed strictly — another format, a rule outside those two prefixes or
+not in the findings catalog, oversized fields: malformed, dropped and
+counted — and becomes a finding of the normal pipeline
+(`Agent::handle_external`, source `gateway:<channel>`, subject topic the
+channel). An idle gateway writes a heartbeat line
+(`robodr-gateway-heartbeat/v1`, every 5 s): activity on the input, never a
+finding, so a quiet gateway is not reported silent. Status:
+`daemon.gateway_findings`, `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
 same path; with `socket_mode: "0660"` give the gateway's user the daemon's
 group. Test: `tests/gateway_feed.rs` (the gateway's own writer against a
 running daemon).

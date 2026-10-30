@@ -228,6 +228,12 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   suppressed" aggregate once its minute is over
   (`WebRtcMonitor::tick`); before, it waited for the next packet, so a
   flood followed by silence was reported as its first 32 findings only.
+- The inline gateway's findings feed sends a heartbeat line
+  (`robodr-gateway-heartbeat/v1`) every 5 s while idle and agentd accepts
+  it as activity (`daemon.gateway_heartbeats`): before, a quiet, healthy
+  gateway made agentd report `robot.agent.input_silent` (High, daemon
+  state `unknown`) after every `silence_ms` (8 times in the 75-minute
+  soak). Upgrade agentd before the gateway.
 
 - Adversarial self-review of Sprints 14a / 14b (`docs/SECURE-DELIVERY.md`
   §10 "Adversarial self-review of 14a/14b"): leases are based on the TPM

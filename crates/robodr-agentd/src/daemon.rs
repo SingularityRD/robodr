@@ -298,6 +298,8 @@ pub struct DaemonStats {
     pub gateway_findings: u64,
     /// Forwarder heartbeats received.
     pub host_heartbeats: u64,
+    /// In-path gateway feed heartbeats received.
+    pub gateway_heartbeats: u64,
     /// Host threats of `robodr-sensor-ros2` dropped (seen via the pipeline).
     pub host_threats_own_skipped: u64,
 }
@@ -1462,6 +1464,12 @@ impl<'a> Daemon<'a> {
             }
             Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
             Payload::Gateway(g) => self.gateway_finding(&g),
+            Payload::GatewayHeartbeat(hb) => {
+                // Activity on the input (it is not silent); the gateway's
+                // own drops count as upstream drops, as a forwarder's.
+                self.stats.gateway_heartbeats += 1;
+                self.upstream_dropped(m.input, hb.dropped);
+            }
             Payload::Event(ev) => {
                 self.stats.events += 1;
                 if let Some(link) = self.executor.as_mut() {
@@ -1794,18 +1802,25 @@ impl<'a> Daemon<'a> {
     /// (a smaller count than last time = the forwarder restarted).
     fn host_heartbeat(&mut self, input: usize, hb: crate::host::HostHeartbeat) {
         self.stats.host_heartbeats += 1;
+        self.upstream_dropped(input, hb.dropped);
+    }
+
+    /// A forwarder's cumulative `dropped` (host-threat forwarder, gateway
+    /// feed): the increase since its last heartbeat is added to the
+    /// input's `upstream_dropped`.
+    fn upstream_dropped(&mut self, input: usize, dropped: u64) {
         if self.host_upstream_seen.len() < self.inputs.len() {
             self.host_upstream_seen.resize(self.inputs.len(), 0);
         }
         let Some(seen) = self.host_upstream_seen.get_mut(input) else {
             return;
         };
-        let delta = if hb.dropped >= *seen {
-            hb.dropped - *seen
+        let delta = if dropped >= *seen {
+            dropped - *seen
         } else {
-            hb.dropped
+            dropped
         };
-        *seen = hb.dropped;
+        *seen = dropped;
         if delta > 0 {
             if let Some(i) = self.inputs.get(input) {
                 i.stats.upstream_dropped.fetch_add(delta, Ordering::Relaxed);
