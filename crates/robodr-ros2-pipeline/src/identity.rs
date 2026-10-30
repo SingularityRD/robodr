@@ -228,7 +228,8 @@ impl IdentityResolver {
         self.held
             .get(prefix)
             .filter(|h| h.confirmed)
-            .map(|h| self.ids[h.idx].name.as_str())
+            .and_then(|h| self.ids.get(h.idx))
+            .map(|m| m.name.as_str())
     }
 
     /// Live confirmed holders, prefix -> identity name.
@@ -236,7 +237,7 @@ impl IdentityResolver {
         self.held
             .iter()
             .filter(|(_, h)| h.confirmed)
-            .map(|(p, h)| (p, self.ids[h.idx].name.as_str()))
+            .filter_map(|(p, h)| Some((p, self.ids.get(h.idx)?.name.as_str())))
     }
 
     fn live_holders(&self, idx: usize, now: Instant) -> Vec<GuidPrefix> {
@@ -253,7 +254,11 @@ impl IdentityResolver {
         let Some(h) = self.held.get(prefix).copied() else {
             return NodeEvidence::Nothing;
         };
-        if self.ids[h.idx].nodes.contains(node) {
+        // Holdings only ever index `ids`, which is fixed at construction.
+        let Some(from) = self.ids.get(h.idx) else {
+            return NodeEvidence::Nothing;
+        };
+        if from.nodes.contains(node) {
             if h.confirmed {
                 return NodeEvidence::Nothing;
             }
@@ -262,7 +267,7 @@ impl IdentityResolver {
             }
             self.stats.confirmed += 1;
             return NodeEvidence::Confirmed {
-                identity: self.ids[h.idx].name.clone(),
+                identity: from.name.clone(),
             };
         }
         if h.confirmed {
@@ -270,15 +275,15 @@ impl IdentityResolver {
             // process that the identity does not list changes nothing here.
             return NodeEvidence::Nothing;
         }
-        let target = self
-            .ids
-            .iter()
-            .position(|m| m.nodes.contains(node) && m.ips.contains(&h.ip) && m.vendor == h.vendor);
-        let Some(to) = target else {
+        let target =
+            self.ids.iter().enumerate().find(|(_, m)| {
+                m.nodes.contains(node) && m.ips.contains(&h.ip) && m.vendor == h.vendor
+            });
+        let Some((to, target)) = target else {
             return NodeEvidence::Unmatched;
         };
         let holders = self.live_holders(to, now);
-        if holders.len() >= self.ids[to].max {
+        if holders.len() >= target.max {
             // Swap with an unconfirmed holder of the target, if any.
             let Some(other) = holders
                 .iter()
@@ -298,8 +303,8 @@ impl IdentityResolver {
         self.stats.moved += 1;
         self.stats.confirmed += 1;
         NodeEvidence::Moved {
-            from: self.ids[h.idx].name.clone(),
-            to: self.ids[to].name.clone(),
+            from: from.name.clone(),
+            to: target.name.clone(),
         }
     }
 
@@ -320,7 +325,7 @@ impl IdentityResolver {
             .clamp(MIN_LEASE, MAX_LEASE);
         if let Some(h) = self.held.get_mut(&p) {
             // Refresh only from one of the identity's own addresses.
-            if self.ids[h.idx].ips.contains(&ip) {
+            if self.ids.get(h.idx).is_some_and(|m| m.ips.contains(&ip)) {
                 h.last = now;
                 h.lease = lease;
             }
@@ -377,7 +382,7 @@ impl IdentityResolver {
     pub fn release(&mut self, prefix: &GuidPrefix) -> Option<String> {
         let h = self.held.remove(prefix)?;
         self.stats.released += 1;
-        Some(self.ids[h.idx].name.clone())
+        self.ids.get(h.idx).map(|m| m.name.clone())
     }
 
     /// Free the slots whose lease expired; returns them.
@@ -392,7 +397,7 @@ impl IdentityResolver {
             .filter_map(|p| {
                 let h = self.held.remove(&p)?;
                 self.stats.expired += 1;
-                Some((p, self.ids[h.idx].name.clone()))
+                Some((p, self.ids.get(h.idx)?.name.clone()))
             })
             .collect()
     }
