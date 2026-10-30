@@ -80,7 +80,7 @@ fn libc_nofollow() -> i32 {
     crate::O_NOFOLLOW
 }
 
-fn read_bounded(path: &Path, secret: bool) -> Result<Zeroizing<Vec<u8>>, SealError> {
+pub(crate) fn read_bounded(path: &Path, secret: bool) -> Result<Zeroizing<Vec<u8>>, SealError> {
     let mut f = OpenOptions::new()
         .read(true)
         .custom_flags(libc_nofollow())

@@ -18,6 +18,7 @@
 //! through the site's Tang server (§7.7).
 
 use crate::keys;
+use crate::luks::Luks;
 use crate::policy::{self, CheckedPolicy};
 use crate::tpm::{Tpm, WorkDir};
 use crate::wrap::{self, Recipient, Unwrapper, WrapContext, X25519Secret};
@@ -144,10 +145,51 @@ pub struct EraseReport {
     pub epoch_before: Option<u64>,
     pub epoch_after: Option<u64>,
     pub volume_header_erased: bool,
-    /// Steps after the essential one that failed (the erase itself
-    /// happened).
+    /// What was destroyed, in order ([`DESTROYED_EPOCH`] ...).
+    #[serde(default)]
+    pub destroyed: Vec<String>,
+    /// What happened to the open runtime volume.
+    #[serde(default)]
+    pub lockdown: Option<crate::luks::Lockdown>,
+    /// Steps after the essential one that failed or could not be done (the
+    /// erase itself happened).
     #[serde(default)]
     pub incomplete: Vec<String>,
+}
+
+/// [`EraseReport::destroyed`]: the TPM's erase epoch moved on (every key
+/// sealed to the unit is dead).
+pub const DESTROYED_EPOCH: &str = "tpm_erase_epoch";
+/// The UWK's TPM blobs were deleted.
+pub const DESTROYED_UWK_BLOBS: &str = "uwk_tpm_blobs";
+/// The runtime volume's key wrap was deleted.
+pub const DESTROYED_VOLUME_WRAP: &str = "volume_key_wrap";
+/// The fallback UWK file was overwritten and deleted.
+pub const DESTROYED_FALLBACK_UWK: &str = "fallback_uwk_file";
+/// Every LUKS2 keyslot of the runtime volume was wiped.
+pub const DESTROYED_KEYSLOTS: &str = "volume_keyslots";
+
+/// What erase acts on besides the keys in the seal directory.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EraseTarget<'a> {
+    /// The runtime volume's LUKS2 device: its keyslots are wiped.
+    /// Required for a unit without a TPM.
+    pub device: Option<&'a Path>,
+    /// The open mapping (`/dev/mapper/NAME`): closed, or suspended.
+    pub mapper: Option<&'a str>,
+    /// The runtime root, if mounted: unmounted first.
+    pub mount: Option<&'a Path>,
+    /// Units that use the runtime volume: stopped first.
+    pub stop_units: &'a [String],
+}
+
+/// Where [`Unit::enroll_fallback`] may write the UWK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLocation {
+    /// Only on a mounted dm-crypt mapping (the runtime volume).
+    DmCrypt,
+    /// Anywhere: tests and labs only.
+    Unchecked,
 }
 
 /// Status of a unit's sealing.
@@ -160,6 +202,10 @@ pub struct Status {
     pub epoch_now: Option<u64>,
     pub policy_version: Option<u32>,
     pub floor_bits: Option<u64>,
+    pub owner_auth_set: Option<bool>,
+    pub lockout_auth_set: Option<bool>,
+    /// What weakens this unit's protection now.
+    pub warnings: Vec<String>,
 }
 
 fn ensure_dir(p: &Path) -> Result<(), SealError> {
@@ -301,7 +347,7 @@ impl Unit {
             )));
         }
         let epoch = tpm.epoch()?;
-        let w = WorkDir::new(dir)?;
+        let w = tpm.work()?;
         let name = tpm.external_key_name(&w, authority)?;
         let auth = policy::uwk_auth_policy(&name, platform, tpm.cfg.epoch_nv, epoch);
         let (pu, pr, point) = tpm.create_uwk(&w, &auth)?;
@@ -335,12 +381,15 @@ impl Unit {
     }
 
     /// Enrol a unit without a TPM: an X25519 UWK written to `key_path`,
-    /// which must be inside the (open) runtime volume.
+    /// which must be inside the (open) runtime volume: with
+    /// [`KeyLocation::DmCrypt`] its directory must be on a dm-crypt
+    /// mapping, or nothing is written.
     pub fn enroll_fallback(
         dir: &Path,
         unit: &str,
         platform: &str,
         key_path: &Path,
+        location: KeyLocation,
     ) -> Result<Self, SealError> {
         if !robodr_pkg::common::is_label(unit) || !robodr_pkg::common::is_label(platform) {
             return Err(invalid("bad unit or platform label"));
@@ -352,9 +401,21 @@ impl Unit {
         if fs::symlink_metadata(dir.join(UNIT_FILE)).is_ok() {
             return Err(invalid(format!("{}: already enrolled", dir.display())));
         }
-        if let Some(parent) = key_path.parent() {
-            ensure_dir(parent)?;
+        let parent = key_path
+            .parent()
+            .ok_or_else(|| invalid("fallback key path has no directory"))?;
+        if location == KeyLocation::DmCrypt {
+            // The volume's mount point exists; only check where the key
+            // directory is (or would be), never create it on a plain disk.
+            let mut probe = parent;
+            while fs::symlink_metadata(probe).is_err() {
+                probe = probe
+                    .parent()
+                    .ok_or_else(|| invalid("fallback key path has no existing ancestor"))?;
+            }
+            crate::mounts::check_on_dm_crypt(probe)?;
         }
+        ensure_dir(parent)?;
         let k = X25519Secret::generate()?;
         keys::x25519_write(key_path, &k)?;
         let rec = UnitRecord {
@@ -378,6 +439,9 @@ impl Unit {
     /// Open an enrolled seal directory. A TPM unit needs `tpm` (whose
     /// handles must be the enrolled ones).
     pub fn open(dir: &Path, tpm: Option<Tpm>) -> Result<Self, SealError> {
+        // Work directories of earlier releases (session contexts, in the
+        // persistent seal directory) are never live now.
+        crate::tpm::sweep_stale(dir);
         let rec = UnitRecord::parse(&read_small(&dir.join(UNIT_FILE))?)?;
         if rec.mode == Mode::Tpm {
             let t = rec.tpm.as_ref().ok_or_else(|| invalid("no TPM record"))?;
@@ -506,7 +570,10 @@ impl Unit {
     /// but only after the policy in force has unsealed on this boot
     /// ([`Unit::probe`]): a policy that does not match this boot never
     /// revokes the one that does.
+    /// Refused while the TPM's owner or lockout authorization is empty: a
+    /// revocation that root can undo by redefining the floor is none.
     pub fn commit_policy(&self) -> Result<u32, SealError> {
+        self.tpm()?.require_ownership()?;
         let p = self.policy()?;
         self.probe()?;
         self.tpm()?.revoke_below(p.doc.version)?;
@@ -549,7 +616,7 @@ impl Unit {
         match self.rec.mode {
             Mode::Tpm => {
                 let pol = self.policy()?;
-                let work = WorkDir::new(&self.dir)?;
+                let work = self.tpm()?.work()?;
                 let u = TpmUnwrapper {
                     unit: self,
                     tpm: self.tpm()?,
@@ -636,17 +703,57 @@ impl Unit {
         )
     }
 
-    /// Crypto-erase (§7.6, §7.7). TPM: increment the erase epoch (every key
-    /// sealed under the old one is dead in the TPM), then remove the UWK
-    /// blobs and the volume wrap. Fallback: overwrite and delete the UWK
-    /// file. With `volume`, also wipe every keyslot of the LUKS2 header
-    /// (`cryptsetup erase`), which defeats a later Tang recovery too. The
-    /// erase is reported only once the epoch moved (TPM) or the key file
-    /// is gone (fallback).
+    /// Overwrite and delete the fallback UWK file. `Ok(false)`: not there
+    /// (the runtime volume, which holds it, is not open). Opened with
+    /// `O_NOFOLLOW` and checked on the descriptor: a symlink put in its
+    /// place never makes erase overwrite another file.
+    fn destroy_fallback_key(&self) -> Result<bool, SealError> {
+        let Some(p) = &self.rec.fallback_key else {
+            return Ok(false);
+        };
+        let p = Path::new(p);
+        let mut f = match OpenOptions::new()
+            .write(true)
+            .custom_flags(crate::O_NOFOLLOW)
+            .open(p)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io_err(p, e)),
+        };
+        let md = f.metadata().map_err(|e| io_err(p, e))?;
+        if !md.is_file() {
+            return Err(invalid(format!("{}: not a regular file", p.display())));
+        }
+        f.write_all(&vec![0u8; md.len() as usize])
+            .and_then(|()| f.sync_all())
+            .map_err(|e| io_err(p, e))?;
+        drop(f);
+        fs::remove_file(p).map_err(|e| io_err(p, e))?;
+        Ok(true)
+    }
+
+    /// Crypto-erase (§7.6, §7.7). The **essential step**, without which
+    /// nothing is reported as erased:
+    ///
+    /// * TPM unit: the erase epoch is incremented (every key sealed under
+    ///   the old value is dead in the TPM). Then the UWK blobs and the
+    ///   volume wrap are deleted, and with `target.device` the runtime
+    ///   volume's LUKS2 keyslots are wiped.
+    /// * Unit without a TPM: the runtime volume's LUKS2 keyslots are wiped
+    ///   (`target.device` is required: the volume key exists nowhere
+    ///   else, and the UWK file is inside the volume). Then the UWK file
+    ///   is destroyed if the volume is open.
+    ///
+    /// Then the open runtime volume is locked down ([`Luks::lockdown`]:
+    /// units stopped, unmounted, closed or at least suspended). The report
+    /// lists exactly what was destroyed (`destroyed`) and every later step
+    /// that failed (`incomplete`).
     pub fn erase(
         &self,
         trigger: &str,
-        volume: Option<(&crate::luks::Luks, &Path)>,
+        luks: &Luks,
+        target: &EraseTarget<'_>,
     ) -> Result<EraseReport, SealError> {
         if trigger.is_empty()
             || trigger.len() > 64
@@ -664,54 +771,119 @@ impl Unit {
             epoch_before: None,
             epoch_after: None,
             volume_header_erased: false,
+            destroyed: Vec::new(),
+            lockdown: None,
             incomplete: Vec::new(),
+        };
+        let wipe_keyslots = |dev: &Path, rep: &mut EraseReport| match luks.erase(dev) {
+            Ok(()) => {
+                rep.volume_header_erased = true;
+                rep.destroyed.push(DESTROYED_KEYSLOTS.into());
+                Ok(())
+            }
+            Err(e) => Err(e),
         };
         match self.rec.mode {
             Mode::Tpm => {
-                // The essential step: once the epoch moved, every key
-                // sealed to the unit is dead. Everything after it is
-                // hygiene and reported, never a reason to say "not erased".
                 let tpm = self.tpm()?;
-                let before = tpm.epoch()?;
-                let after = tpm.increment_epoch()?;
-                if after <= before {
-                    return Err(SealError::new(
-                        ErrorKind::Unavailable,
-                        "the erase epoch did not move",
-                    ));
+                match tpm.epoch() {
+                    Ok(v) => rep.epoch_before = Some(v),
+                    Err(e) => rep
+                        .incomplete
+                        .push(format!("erase epoch before the increment: {e}")),
                 }
-                rep.epoch_before = Some(before);
-                rep.epoch_after = Some(after);
-                for f in [UWK_PRIV_FILE, UWK_PUB_FILE, VOLUME_WRAP_FILE] {
+                tpm.increment_epoch().map_err(|e| {
+                    SealError::new(
+                        e.kind,
+                        format!(
+                            "not erased: the erase epoch was not incremented: {}",
+                            e.detail
+                        ),
+                    )
+                })?;
+                match tpm.epoch() {
+                    Ok(v) => rep.epoch_after = Some(v),
+                    Err(e) => rep.incomplete.push(format!(
+                        "erase epoch read back after the increment failed: {e} (the TPM \
+                         accepted the increment)"
+                    )),
+                }
+                if let (Some(b), Some(a)) = (rep.epoch_before, rep.epoch_after) {
+                    if a <= b {
+                        return Err(SealError::new(
+                            ErrorKind::Unavailable,
+                            format!("not erased: the erase epoch did not move ({b} -> {a})"),
+                        ));
+                    }
+                }
+                rep.destroyed.push(DESTROYED_EPOCH.into());
+                for (f, what) in [
+                    (UWK_PRIV_FILE, DESTROYED_UWK_BLOBS),
+                    (UWK_PUB_FILE, ""),
+                    (VOLUME_WRAP_FILE, DESTROYED_VOLUME_WRAP),
+                ] {
                     let p = self.dir.join(f);
-                    if let Err(e) = fs::remove_file(&p) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            rep.incomplete.push(format!("{}: {e}", p.display()));
-                        }
+                    match fs::remove_file(&p) {
+                        Ok(()) if !what.is_empty() => rep.destroyed.push(what.into()),
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => rep.incomplete.push(format!("{}: {e}", p.display())),
+                    }
+                }
+                if let Some(dev) = target.device {
+                    if let Err(e) = wipe_keyslots(dev, &mut rep) {
+                        rep.incomplete
+                            .push(format!("volume keyslots of {}: {e}", dev.display()));
                     }
                 }
             }
             Mode::Fallback => {
-                // The essential step: the UWK file is gone.
-                if let Some(p) = &self.rec.fallback_key {
-                    let p = Path::new(p);
-                    if let Ok(md) = fs::symlink_metadata(p) {
-                        if md.is_file() {
-                            if let Ok(mut f) = OpenOptions::new().write(true).open(p) {
-                                let _ = f.write_all(&vec![0u8; md.len() as usize]);
-                                let _ = f.sync_all();
-                            }
-                        }
-                        fs::remove_file(p).map_err(|e| io_err(p, e))?;
-                    }
+                let dev = target.device.ok_or_else(|| {
+                    invalid(
+                        "not erased: a unit without a TPM is erased by wiping its runtime \
+                         volume's LUKS2 keyslots (its UWK lives inside that volume), and no \
+                         device was given (--device, seal.device); nothing was destroyed",
+                    )
+                })?;
+                wipe_keyslots(dev, &mut rep).map_err(|e| {
+                    SealError::new(
+                        e.kind,
+                        format!(
+                            "not erased: wiping the keyslots of {} failed: {}; nothing was \
+                             destroyed",
+                            dev.display(),
+                            e.detail
+                        ),
+                    )
+                })?;
+                match self.destroy_fallback_key() {
+                    Ok(true) => rep.destroyed.push(DESTROYED_FALLBACK_UWK.into()),
+                    Ok(false) => rep.incomplete.push(format!(
+                        "the UWK file {} is not present (the runtime volume is not open): not \
+                         destroyed; it stays inside the volume, whose keyslots are wiped",
+                        self.rec.fallback_key.as_deref().unwrap_or("")
+                    )),
+                    Err(e) => rep.incomplete.push(format!("UWK file: {e}")),
                 }
             }
         }
-        if let Some((luks, dev)) = volume {
-            match luks.erase(dev) {
-                Ok(()) => rep.volume_header_erased = true,
-                Err(e) => rep.incomplete.push(format!("volume header: {e}")),
+        if target.mapper.is_some() || target.mount.is_some() || !target.stop_units.is_empty() {
+            let l = luks.lockdown(target.stop_units, target.mount, target.mapper);
+            if target.mapper.is_some() && !l.volume_locked() {
+                rep.incomplete.push(
+                    "the runtime volume is still open: its plaintext stays readable through \
+                     the mapping until power-off"
+                        .into(),
+                );
             }
+            rep.incomplete.extend(l.notes.iter().cloned());
+            rep.lockdown = Some(l);
+        } else {
+            rep.incomplete.push(
+                "the runtime volume was not closed (no mapper name given): if it is open, its \
+                 plaintext stays readable until it is closed or the unit powers off"
+                    .into(),
+            );
         }
         match serde_json::to_vec(&rep) {
             Ok(bytes) => {
@@ -728,6 +900,11 @@ impl Unit {
     pub fn status(&self) -> Status {
         let tpm_rec = self.rec.tpm.as_ref();
         let tpm = self.tpm.as_ref();
+        let own = tpm.and_then(|t| t.ownership().ok());
+        let mut warnings = Vec::new();
+        if own.is_some_and(|o| !o.ok()) {
+            warnings.push(crate::tpm::OWNERSHIP_REQUIRED.to_string());
+        }
         Status {
             unit: self.rec.unit.clone(),
             mode: self.rec.mode,
@@ -736,6 +913,9 @@ impl Unit {
             epoch_now: tpm.and_then(|t| t.epoch().ok()),
             policy_version: self.policy().ok().map(|p| p.doc.version),
             floor_bits: tpm.and_then(|t| t.floor_bits().ok()),
+            owner_auth_set: own.map(|o| o.owner_auth_set),
+            lockout_auth_set: own.map(|o| o.lockout_auth_set),
+            warnings,
         }
     }
 }
@@ -755,4 +935,96 @@ pub fn seal_id(seal: &robodr_pkg::rpk::Seal) -> Result<[u8; 32], SealError> {
     b.as_slice()
         .try_into()
         .map_err(|_| invalid("seal_id must be 32 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::{Output, Runner};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A TPM whose epoch counter increments, but whose read-back after the
+    /// increment fails (L2 of the review).
+    #[derive(Debug, Default)]
+    struct ReadbackFails {
+        incremented: Mutex<bool>,
+    }
+
+    impl Runner for ReadbackFails {
+        fn run(
+            &self,
+            program: &Path,
+            _args: &[String],
+            _env: &[(&str, &str)],
+            _stdin: Option<&[u8]>,
+            _timeout: Duration,
+        ) -> Result<Output, SealError> {
+            let name = program.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let mut inc = self.incremented.lock().unwrap();
+            let ok = |stdout: Vec<u8>| Output {
+                status: Some(0),
+                stdout: Zeroizing::new(stdout),
+                stderr: Zeroizing::new(Vec::new()),
+            };
+            Ok(match name {
+                "tpm2_nvread" if !*inc => ok(5u64.to_be_bytes().to_vec()),
+                "tpm2_nvread" => Output {
+                    status: Some(1),
+                    stdout: Zeroizing::new(Vec::new()),
+                    stderr: Zeroizing::new(b"ERROR: bus glitch".to_vec()),
+                },
+                "tpm2_nvincrement" => {
+                    *inc = true;
+                    ok(Vec::new())
+                }
+                _ => ok(Vec::new()),
+            })
+        }
+    }
+
+    fn tpm_unit(dir: &Path, runner: Box<dyn Runner>) -> Unit {
+        let rec = UnitRecord {
+            format: UNIT_FORMAT.into(),
+            unit: "ugv-07".into(),
+            platform: "ugv-x1".into(),
+            mode: Mode::Tpm,
+            uwk_public: String::new(),
+            tpm: Some(TpmRecord {
+                srk: "0x81000001".into(),
+                epoch_nv: "0x01500040".into(),
+                epoch: 5,
+                floor_nv: "0x01500041".into(),
+                policy_authority: String::new(),
+                policy_authority_name: String::new(),
+                auth_policy: String::new(),
+            }),
+            fallback_key: None,
+        };
+        let tpm = Tpm::new(crate::tpm::TpmConfig::default(), runner).unwrap();
+        Unit {
+            dir: dir.to_path_buf(),
+            rec,
+            tpm: Some(tpm),
+        }
+    }
+
+    #[test]
+    fn a_successful_increment_is_the_erase_even_if_the_readback_fails() {
+        let d = std::env::temp_dir().join(format!("robodr-seal-l2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let u = tpm_unit(&d, Box::<ReadbackFails>::default());
+        let r = u.erase("operator", &Luks::system(), &EraseTarget::default());
+        let _ = fs::remove_dir_all(&d);
+        let rep = r.expect("the epoch moved: that is the erase");
+        assert_eq!(rep.destroyed, [DESTROYED_EPOCH]);
+        assert_eq!(rep.epoch_before, Some(5));
+        assert_eq!(rep.epoch_after, None);
+        assert!(
+            rep.incomplete.iter().any(|n| n.contains("read back")),
+            "{:?}",
+            rep.incomplete
+        );
+    }
 }

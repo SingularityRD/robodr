@@ -14,10 +14,11 @@ usage:
   robodr-seal keygen depot --out FILE          X25519 depot wrapping key (FILE, FILE.pub)
   robodr-seal keygen policy --out FILE         P-256 policy authority key (FILE, FILE.pub)
   robodr-seal policy sign --key FILE --platform P --version N --pcr I=HEX [--pcr I=HEX]...
-        [--floor-nv 0xNNNNNNNN] --out FILE
-  robodr-seal provision TPM [--owner-auth-file FILE]
+        [--floor-nv 0xNNNNNNNN] [--last-version] --out FILE
+  robodr-seal provision --owner-auth-file FILE TPM
   robodr-seal enroll --seal-dir DIR --unit U --platform P --policy-authority FILE.pub TPM
   robodr-seal enroll-fallback --seal-dir DIR --unit U --platform P --key FILE
+        [--unchecked-key-location]
   robodr-seal policy install --seal-dir DIR --policy FILE TPM
   robodr-seal policy commit --seal-dir DIR TPM
   robodr-seal rewrap --depot-key FILE --rpk RPK_DIR --unit-record UNIT.json
@@ -26,13 +27,15 @@ usage:
   robodr-seal volume format-tang --device DEV --tang-url URL --tang-thp THUMBPRINT
   robodr-seal volume open-tang --device DEV --name NAME [--slot N]
   robodr-seal volume close --name NAME
-  robodr-seal erase --seal-dir DIR --trigger TRIGGER [--device DEV] [TPM]
+  robodr-seal erase --seal-dir DIR --trigger TRIGGER [--device DEV] [--mapper NAME]
+        [--mount DIR] [--stop-unit UNIT]... [TPM]
   robodr-seal status --seal-dir DIR [TPM]
   robodr-seal --version
 
 TPM is [--tcti TCTI] [--tools-dir DIR] [--srk 0x81NNNNNN] [--epoch-nv 0x01NNNNNN]
-       [--floor-nv 0x01NNNNNN] [--timeout-ms MS]
-(defaults: device:/dev/tpmrm0, /usr/bin, 0x81000001, 0x01500040, 0x01500041, 10000).
+       [--floor-nv 0x01NNNNNN] [--timeout-ms MS] [--work-dir DIR]
+(defaults: device:/dev/tpmrm0, /usr/bin, 0x81000001, 0x01500040, 0x01500041, 10000,
+/run/robodr-seal; the work directory holds TPM session contexts and must be on tmpfs).
 
 docs/SECURE-DELIVERY.md §7. A unit's UWK is created inside its TPM by enroll
 and is usable only under a policy signed by the policy authority for the
@@ -42,6 +45,14 @@ to the unit is dead. Units without a TPM keep an X25519 UWK inside a
 runtime volume that only the site's Tang server unlocks. rewrap is the
 depot's step (§7.3): it prints the deployment wrapped_keys entry for one
 unit. Keys and passphrases never appear on the command line.
+
+erase of a unit without a TPM needs --device (its keyslots are what is
+destroyed). With --mapper (and --mount, --stop-unit) erase also stops the
+units, unmounts and closes the open runtime volume, or suspends it.
+provision refuses a TPM whose owner or lockout authorization is empty.
+The policy floor has 64 versions (0..=63); version 63 can never be revoked,
+so signing it needs --last-version, and the update after it needs a new
+enrolment (docs/OPERATIONS.md section 12.3).
 
 Exit codes: 0 ok, 1 refused or error, 2 usage.";
 
@@ -73,13 +84,14 @@ pub fn main_with_env() -> i32 {
     }
 }
 
-const TPM_FLAGS: [&str; 6] = [
+const TPM_FLAGS: [&str; 7] = [
     "tcti",
     "tools-dir",
     "srk",
     "epoch-nv",
     "floor-nv",
     "timeout-ms",
+    "work-dir",
 ];
 
 /// Run one command line (without the program name).
@@ -154,11 +166,15 @@ fn sub(args: Vec<String>, table: &[(&str, Handler)]) -> Result<(), Cmd> {
 }
 
 fn parse(args: Vec<String>, known: &[&str], tpm: bool) -> Result<Args, Cmd> {
+    parse_sw(args, known, &[], tpm)
+}
+
+fn parse_sw(args: Vec<String>, known: &[&str], switches: &[&str], tpm: bool) -> Result<Args, Cmd> {
     let mut k: Vec<&str> = known.to_vec();
     if tpm {
         k.extend_from_slice(&TPM_FLAGS);
     }
-    parse_args_with_switches(args, &k, &[]).map_err(Cmd::Usage)
+    parse_args_with_switches(args, &k, switches).map_err(Cmd::Usage)
 }
 
 fn req<'a>(a: &'a Args, f: &str) -> Result<&'a str, Cmd> {
@@ -180,6 +196,9 @@ fn tpm(a: &Args) -> Result<Tpm, Cmd> {
     }
     if let Some(d) = opt(a, "tools-dir")? {
         c.tools_dir = d.into();
+    }
+    if let Some(d) = opt(a, "work-dir")? {
+        c.work_dir = d.into();
     }
     let h = |f: &str, top: u32| -> Result<Option<u32>, Cmd> {
         opt(a, f)?
@@ -249,15 +268,24 @@ fn parse_pcr(s: &str) -> Result<(u8, [u8; 32]), Cmd> {
 }
 
 fn policy_sign(args: Vec<String>) -> Result<(), Cmd> {
-    let a = parse(
+    let a = parse_sw(
         args,
         &["key", "platform", "version", "pcr", "floor-nv", "out"],
+        &["last-version"],
         false,
     )?;
     let version: u32 = a
         .num("version")
         .map_err(Cmd::Usage)?
         .ok_or_else(|| Cmd::Usage("--version is required".into()))?;
+    if version == policy::MAX_VERSION && !a.flag("last-version") {
+        return Err(Cmd::Fail(crate::invalid(format!(
+            "version {v} is the policy floor's last: it can never be revoked, and the next \
+             boot-chain update needs a new enrolment (erase, redefine the floor with the owner \
+             authorization, enrol again). Pass --last-version to sign it anyway.",
+            v = policy::MAX_VERSION
+        ))));
+    }
     let pcrs = a
         .all("pcr")
         .into_iter()
@@ -281,28 +309,17 @@ fn policy_sign(args: Vec<String>) -> Result<(), Cmd> {
     Ok(())
 }
 
+/// A secret file: opened with `O_NOFOLLOW`, then checked on the open
+/// descriptor (regular, not group/other accessible), bounded.
 fn read_secret_file(p: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, Cmd> {
-    use std::os::unix::fs::MetadataExt;
-    let md = std::fs::symlink_metadata(p).map_err(|e| crate::io_err(p, e))?;
-    if !md.is_file() || md.mode() & 0o077 != 0 {
-        return Err(Cmd::Fail(crate::invalid(format!(
-            "{}: must be a regular file only its owner can access",
-            p.display()
-        ))));
-    }
-    Ok(zeroize::Zeroizing::new(
-        std::fs::read(p).map_err(|e| crate::io_err(p, e))?,
-    ))
+    Ok(keys::read_bounded(p, true)?)
 }
 
 fn provision(args: Vec<String>) -> Result<(), Cmd> {
     let a = parse(args, &["owner-auth-file"], true)?;
     let t = tpm(&a)?;
-    let auth = match opt(&a, "owner-auth-file")? {
-        Some(p) => Some(read_secret_file(Path::new(p))?),
-        None => None,
-    };
-    let p = t.provision(auth.as_ref().map(|v| v.as_slice()))?;
+    let auth = read_secret_file(&path(&a, "owner-auth-file")?)?;
+    let p = t.provision(&auth)?;
     print(json!({
         "defined_epoch": p.defined_epoch,
         "defined_floor": p.defined_floor,
@@ -336,12 +353,23 @@ fn enroll(args: Vec<String>) -> Result<(), Cmd> {
 }
 
 fn enroll_fallback(args: Vec<String>) -> Result<(), Cmd> {
-    let a = parse(args, &["seal-dir", "unit", "platform", "key"], false)?;
+    let a = parse_sw(
+        args,
+        &["seal-dir", "unit", "platform", "key"],
+        &["unchecked-key-location"],
+        false,
+    )?;
+    let location = if a.flag("unchecked-key-location") {
+        crate::unit::KeyLocation::Unchecked
+    } else {
+        crate::unit::KeyLocation::DmCrypt
+    };
     let u = Unit::enroll_fallback(
         &path(&a, "seal-dir")?,
         req(&a, "unit")?,
         req(&a, "platform")?,
         &path(&a, "key")?,
+        location,
     )?;
     print(record_json(u.record()));
     Ok(())
@@ -447,11 +475,32 @@ fn volume_close(args: Vec<String>) -> Result<(), Cmd> {
 }
 
 fn erase(args: Vec<String>) -> Result<(), Cmd> {
-    let a = parse(args, &["seal-dir", "trigger", "device"], true)?;
+    let a = parse(
+        args,
+        &[
+            "seal-dir",
+            "trigger",
+            "device",
+            "mapper",
+            "mount",
+            "stop-unit",
+        ],
+        true,
+    )?;
     let u = open_unit(&a)?;
     let luks = Luks::system();
     let dev = opt(&a, "device")?.map(PathBuf::from);
-    let r = u.erase(req(&a, "trigger")?, dev.as_deref().map(|d| (&luks, d)))?;
+    let mount = opt(&a, "mount")?
+        .map(PathBuf::from)
+        .filter(|m| crate::mounts::is_mount_point(m));
+    let units: Vec<String> = a.all("stop-unit").into_iter().map(String::from).collect();
+    let target = crate::unit::EraseTarget {
+        device: dev.as_deref(),
+        mapper: opt(&a, "mapper")?,
+        mount: mount.as_deref(),
+        stop_units: &units,
+    };
+    let r = u.erase(req(&a, "trigger")?, &luks, &target)?;
     print(serde_json::to_value(&r).unwrap_or_default());
     Ok(())
 }

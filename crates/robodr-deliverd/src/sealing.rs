@@ -19,7 +19,7 @@ use robodr_pkg::rpk::{Kind, Manifest};
 use robodr_seal::chunk::ContentKey;
 use robodr_seal::unit::Unit;
 use robodr_seal::{ErrorKind, SealError};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Directory of a kind inside the runtime volume.
 pub fn kind_dir(kind: Kind) -> &'static str {
@@ -39,33 +39,8 @@ pub fn in_volume(m: &Manifest) -> bool {
 /// The device (`major:minor`) mounted exactly at `mount_point`, from
 /// `/proc/self/mountinfo` text.
 pub fn mounted_device(mountinfo: &str, mount_point: &Path) -> Option<String> {
-    let want = mount_point.to_str()?;
-    mountinfo.lines().rev().find_map(|l| {
-        let f: Vec<&str> = l.split(' ').collect();
-        // id parent major:minor root mount-point ...
-        (f.len() > 4 && unescape(f[4]) == want).then(|| f[2].to_string())
-    })
-}
-
-fn unescape(s: &str) -> String {
-    // mountinfo escapes space, tab, newline and backslash as \ooo.
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
-        {
-            let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
-            out.push(v);
-            i += 4;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    let ms = robodr_seal::mounts::parse(mountinfo);
+    robodr_seal::mounts::at(&ms, mount_point).map(|m| m.dev.clone())
 }
 
 /// Check that `runtime_root` is a mounted dm-crypt mapping (or nothing,
@@ -73,31 +48,7 @@ fn unescape(s: &str) -> String {
 pub fn check_volume(cfg: &SealCfg) -> Result<(), String> {
     match cfg.volume_check {
         VolumeCheck::Unchecked => Ok(()),
-        VolumeCheck::DmCrypt => {
-            let mi = std::fs::read_to_string("/proc/self/mountinfo")
-                .map_err(|e| format!("/proc/self/mountinfo: {e}"))?;
-            let dev = mounted_device(&mi, &cfg.runtime_root).ok_or_else(|| {
-                format!(
-                    "{} is not a mount point: the sealed runtime volume is not open",
-                    cfg.runtime_root.display()
-                )
-            })?;
-            let uuid = PathBuf::from(format!("/sys/dev/block/{dev}/dm/uuid"));
-            let u = std::fs::read_to_string(&uuid).map_err(|_| {
-                format!(
-                    "{} is mounted from {dev}, which is not a device-mapper device",
-                    cfg.runtime_root.display()
-                )
-            })?;
-            if u.starts_with("CRYPT-") {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} is mounted from a device-mapper device that is not dm-crypt",
-                    cfg.runtime_root.display()
-                ))
-            }
-        }
+        VolumeCheck::DmCrypt => robodr_seal::mounts::check_mounted_dm_crypt(&cfg.runtime_root),
     }
 }
 
@@ -173,13 +124,15 @@ mod tests {
             Some("8:1")
         );
         assert_eq!(mounted_device(mi, Path::new("/run/robodr")), None);
-        assert_eq!(unescape("a\\134b"), "a\\b");
         // A directory that is not a mount point fails the dm-crypt check.
         let cfg = SealCfg {
             seal_dir: "/var/lib/robodr-seal".into(),
             runtime_root: "/nonexistent-robodr-runtime".into(),
             volume_check: VolumeCheck::DmCrypt,
             tpm: None,
+            device: None,
+            mapper_name: None,
+            stop_units: Vec::new(),
         };
         assert!(check_volume(&cfg).is_err());
         let ok = SealCfg {

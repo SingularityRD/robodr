@@ -101,7 +101,8 @@ fn unit_lifecycle_on_a_software_tpm() {
     let d = tmp("cli-tpm");
     let sw = SwTpm::start(&d.join("swtpm"));
     let tcti = sw.tcti();
-    let t = ["--tcti", tcti.as_str()];
+    let wd = sw.work_dir();
+    let t = ["--tcti", tcti.as_str(), "--work-dir", wd.to_str().unwrap()];
     let with = |args: &[&str]| -> Vec<String> {
         args.iter().chain(t.iter()).map(|x| x.to_string()).collect()
     };
@@ -109,10 +110,29 @@ fn unit_lifecycle_on_a_software_tpm() {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         seal(&a)
     };
-    let (c, v, e) = run(with(&["provision"]));
+    let auth = d.join("owner.auth");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&auth)
+            .unwrap();
+        std::io::Write::write_all(&mut f, OWNER_AUTH).unwrap();
+    }
+    let prov = || with(&["provision", "--owner-auth-file", s(&auth)]);
+    // Refused while the TPM's owner authorization is empty (review H1).
+    let (c, _, e) = run(prov());
+    assert_eq!(c, 1, "provisioned an unowned TPM");
+    assert!(e.contains("owner and lockout authorizations"), "{e}");
+    let (c, _, _) = run(with(&["provision"]));
+    assert_eq!(c, 2, "--owner-auth-file is required");
+    sw.take_ownership();
+    let (c, v, e) = run(prov());
     assert_eq!(c, 0, "{e}");
     assert_eq!(v["defined_epoch"], true);
-    let (c, v, _) = run(with(&["provision"]));
+    let (c, v, _) = run(prov());
     assert_eq!(c, 0);
     assert_eq!(v["defined_epoch"], false, "idempotent");
     seal(&["keygen", "policy", "--out", s(&d.join("auth.key"))]);

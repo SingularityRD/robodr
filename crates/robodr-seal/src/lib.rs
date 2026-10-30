@@ -55,6 +55,7 @@ pub mod cli;
 pub mod cmd;
 pub mod keys;
 pub mod luks;
+pub mod mounts;
 pub mod policy;
 pub mod rpk;
 pub mod tpm;

@@ -102,6 +102,9 @@ fn wait_port(port: u16, what: &str) {
     }
 }
 
+/// The owner and lockout authorization of every test TPM.
+pub const OWNER_AUTH: &[u8] = b"test-owner-auth";
+
 /// A running software TPM, killed on drop. Its state directory survives
 /// [`SwTpm::restart`] (a reboot: PCRs reset, NV kept).
 pub struct SwTpm {
@@ -158,6 +161,21 @@ impl SwTpm {
             .expect("swtpm")
     }
 
+    /// Set the owner and lockout authorizations ([`OWNER_AUTH`]), as a
+    /// site does before provisioning (OPERATIONS §12.1).
+    pub fn take_ownership(&self) {
+        for h in ["o", "l"] {
+            let o = self.tool("tpm2_changeauth", &["-c", h, "file:-"], Some(OWNER_AUTH));
+            assert!(o.ok(), "{}", o.error_line());
+        }
+    }
+
+    /// Take ownership and provision RoboDR's indices and SRK.
+    pub fn provision(&self) -> robodr_seal::tpm::Provisioned {
+        self.take_ownership();
+        self.tpm().provision(OWNER_AUTH).unwrap()
+    }
+
     /// Power-cycle: PCRs back to their reset values, NV and keys kept.
     pub fn restart(&mut self) {
         let _ = self.child.kill();
@@ -172,9 +190,15 @@ impl SwTpm {
         format!("swtpm:host=127.0.0.1,port={}", self.port)
     }
 
+    /// The TPM work directory of this test (tmpfs: `/dev/shm`).
+    pub fn work_dir(&self) -> PathBuf {
+        PathBuf::from(format!("/dev/shm/robodr-seal-it-work-{}", self.port))
+    }
+
     pub fn cfg(&self) -> TpmConfig {
         TpmConfig {
             tcti: self.tcti(),
+            work_dir: self.work_dir(),
             ..TpmConfig::default()
         }
     }
@@ -242,9 +266,28 @@ impl SwTpm {
 
 impl Drop for SwTpm {
     fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.work_dir());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Whether a Tang server answers `GET /adv` on `port` with a JWS.
+fn tang_adv(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+    if c.write_all(b"GET /adv HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut b = Vec::new();
+    let _ = c.take(1 << 16).read_to_end(&mut b);
+    let t = String::from_utf8_lossy(&b);
+    t.starts_with("HTTP/1.") && t.contains(" 200 ") && t.contains("\"payload\"")
 }
 
 /// A Tang server (tangd -l), killed on drop.
@@ -302,20 +345,22 @@ impl Tang {
                 .spawn()
                 .expect("tangd");
             let t1 = Instant::now();
-            while t1.elapsed() < Duration::from_secs(2) {
-                if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                    self.child = Some(c);
-                    return;
-                }
+            while t1.elapsed() < Duration::from_secs(10) {
+                // Our tangd, not another process on the port: alive, and
+                // /adv answers with a JWS.
                 if c.try_wait().unwrap().is_some() {
                     break;
+                }
+                if tang_adv(self.port) {
+                    self.child = Some(c);
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(30));
             }
             let _ = c.kill();
             let _ = c.wait();
             assert!(
-                t0.elapsed() < Duration::from_secs(60),
+                t0.elapsed() < Duration::from_secs(120),
                 "tangd did not start"
             );
             std::thread::sleep(Duration::from_millis(500));

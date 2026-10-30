@@ -38,7 +38,7 @@ pub struct Enrolled {
 pub fn enrolled(name: &str) -> Enrolled {
     let dir = tmp(name);
     let sw = SwTpm::start(&dir.join("swtpm"));
-    sw.tpm().provision(None).unwrap();
+    sw.provision();
     let authority = PolicyKey::generate().unwrap();
     let seal = dir.join("seal");
     let unit = Unit::enroll_tpm(&seal, "ugv-07", PLATFORM, &authority.public(), sw.tpm()).unwrap();
@@ -156,7 +156,7 @@ fn a_disk_image_of_an_enrolled_unit_yields_no_plaintext() {
     // the same way, same handles): the UWK blob does not load there.
     let a_dir = tmp("disk-image-attacker");
     let other = SwTpm::start(&a_dir.join("swtpm"));
-    other.tpm().provision(None).unwrap();
+    other.provision();
     let copy = a_dir.join("seal");
     let st = std::process::Command::new("cp")
         .args(["-a", seal.to_str().unwrap(), copy.to_str().unwrap()])
@@ -288,9 +288,20 @@ fn an_epoch_increment_kills_every_sealed_key() {
         std::fs::copy(e.seal.join(f), backup.join(f)).unwrap();
     }
     let t0 = std::time::Instant::now();
-    let rep = e.unit.erase("operator", None).unwrap();
+    let rep = e
+        .unit
+        .erase(
+            "operator",
+            &robodr_seal::luks::Luks::system(),
+            &Default::default(),
+        )
+        .unwrap();
     let took = t0.elapsed();
     assert!(rep.epoch_after.unwrap() > rep.epoch_before.unwrap());
+    assert_eq!(
+        rep.destroyed,
+        ["tpm_erase_epoch", "uwk_tpm_blobs", "volume_key_wrap"]
+    );
     eprintln!("erase took {took:?} (one NV increment plus reads)");
     for (w, c) in wraps.iter().zip(&ctxs) {
         assert_eq!(e.unit.unwrap(w, c).unwrap_err().kind, ErrorKind::Erased);
@@ -308,19 +319,24 @@ fn an_epoch_increment_kills_every_sealed_key() {
     let pu = std::fs::read(backup.join("uwk.pub")).unwrap();
     let pr = std::fs::read(backup.join("uwk.priv")).unwrap();
     let tpm = e.sw.tpm();
-    let w = robodr_seal::tpm::WorkDir::new(&e.dir).unwrap();
+    let w = tpm.work().unwrap();
     let eph = wrap::p256_public_bytes(&wrap::p256_random().unwrap().public_key());
     let err = tpm
         .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph)
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Erased, "{err}");
-    // Epoch rollback: undefine the counter (owner authorization is empty
-    // in this test) and define it again. A counter never starts below the
-    // highest value any counter of the TPM held: still dead.
+    // Epoch rollback by the strongest attacker, one who holds the owner
+    // authorization: undefine the counter and define it again. A counter
+    // never starts below the highest value any counter of the TPM held:
+    // still dead.
     let idx = format!("0x{:08x}", robodr_seal::tpm::DEFAULT_EPOCH_NV);
-    let o = e.sw.tool("tpm2_nvundefine", &[&idx, "-C", "o"], None);
+    let o = e.sw.tool(
+        "tpm2_nvundefine",
+        &[&idx, "-C", "o", "-P", "file:-"],
+        Some(OWNER_AUTH),
+    );
     assert!(o.ok(), "{}", o.error_line());
-    tpm.provision(None).unwrap();
+    tpm.provision(OWNER_AUTH).unwrap();
     let now = tpm.epoch().unwrap();
     assert!(
         now > t.epoch,
@@ -361,6 +377,7 @@ fn a_fallback_unit_cannot_unlock_without_tang() {
         "ugv-09",
         PLATFORM,
         &runtime.join(".robodr-seal/uwk.key"),
+        robodr_seal::unit::KeyLocation::Unchecked,
     )
     .unwrap();
     let depot = X25519Secret::generate().unwrap();
@@ -403,9 +420,29 @@ fn a_fallback_unit_cannot_unlock_without_tang() {
     assert!(luks
         .test_key(&img, &luks.tang_pass(&img, 1).unwrap())
         .unwrap());
-    // Crypto-erase of a fallback unit with its volume: the header's
-    // keyslots are wiped, so even Tang cannot unlock it any more.
-    unit.erase("tamper", Some((&luks, &img))).unwrap();
+    // Crypto-erase of a fallback unit: without the device nothing is
+    // erased (review H2) ...
+    assert!(unit.erase("tamper", &luks, &Default::default()).is_err());
+    assert!(!unit.is_erased());
+    // ... with it the header's keyslots are wiped, so even Tang cannot
+    // unlock it any more. The volume is closed here (the UWK file is not
+    // reachable), and the report says exactly that.
+    let rep = unit
+        .erase(
+            "tamper",
+            &luks,
+            &robodr_seal::unit::EraseTarget {
+                device: Some(&img),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(rep.destroyed, ["volume_keyslots"]);
+    assert!(
+        rep.incomplete.iter().any(|n| n.contains("not destroyed")),
+        "{:?}",
+        rep.incomplete
+    );
     assert!(luks.tang_pass(&img, 1).is_err());
     assert!(!luks.test_key(&img, &pass).unwrap());
 }

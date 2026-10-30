@@ -36,7 +36,7 @@ struct Fx {
 fn fx(name: &str) -> Fx {
     let dir = tmp(name);
     let sw = SwTpm::start(&dir.join("swtpm"));
-    sw.tpm().provision(None).unwrap();
+    sw.provision();
     let authority = PolicyKey::generate().unwrap();
     let unit = Unit::enroll_tpm(
         &dir.join("seal"),
@@ -127,19 +127,13 @@ fn the_floor_and_epoch_cannot_be_undefined_without_owner_authorization() {
         return;
     }
     let f = fx("owner-auth");
-    let o = f.sw.tool(
-        "tpm2_changeauth",
-        &["-c", "o", "file:-"],
-        Some(b"site-owner-secret"),
-    );
-    assert!(o.ok(), "{}", o.error_line());
     for idx in [DEFAULT_FLOOR_NV, DEFAULT_EPOCH_NV] {
         let i = format!("0x{idx:08x}");
         let o = f.sw.tool("tpm2_nvundefine", &[&i, "-C", "o"], None);
         assert!(!o.ok(), "undefined {i} without owner auth");
     }
     // Provisioning again with the authorization is idempotent.
-    let p = f.sw.tpm().provision(Some(b"site-owner-secret")).unwrap();
+    let p = f.sw.tpm().provision(OWNER_AUTH).unwrap();
     assert_eq!(p, Default::default());
 }
 
@@ -292,7 +286,7 @@ fn the_tpm_refuses_a_foreign_authority() {
     let pu = std::fs::read(seal.join("uwk.pub")).unwrap();
     let pr = std::fs::read(seal.join("uwk.priv")).unwrap();
     let tpm = f.sw.tpm();
-    let w = robodr_seal::tpm::WorkDir::new(&f.dir).unwrap();
+    let w = tpm.work().unwrap();
     let eph = wrap::p256_public_bytes(&wrap::p256_random().unwrap().public_key());
     let e = tpm
         .ecdh(&w, &pu, &pr, &pol, &authority, &name, t.epoch, &eph)

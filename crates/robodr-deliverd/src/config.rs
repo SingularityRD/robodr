@@ -493,6 +493,10 @@ pub struct SealTpmCfg {
     /// Bound on one tpm2-tools run, milliseconds (100..=120000).
     #[serde(default = "d_tpm_timeout")]
     pub timeout_ms: u64,
+    /// Parent of the TPM work directories (session contexts): must be on
+    /// tmpfs (checked at use).
+    #[serde(default = "d_tpm_work_dir")]
+    pub work_dir: PathBuf,
 }
 
 fn d_tcti() -> String {
@@ -509,6 +513,9 @@ fn d_epoch_nv() -> String {
 }
 fn d_floor_nv() -> String {
     format!("0x{:08x}", robodr_seal::tpm::DEFAULT_FLOOR_NV)
+}
+fn d_tpm_work_dir() -> PathBuf {
+    robodr_seal::tpm::DEFAULT_WORK_DIR.into()
 }
 fn d_tpm_timeout() -> u64 {
     10_000
@@ -528,6 +535,7 @@ impl SealTpmCfg {
                 .map_err(|e| format!("seal.tpm.epoch_nv: {}", e.detail))?,
             floor_nv: parse_handle(&self.floor_nv, 0x01)
                 .map_err(|e| format!("seal.tpm.floor_nv: {}", e.detail))?,
+            work_dir: self.work_dir.clone(),
         };
         c.validate()
             .map_err(|e| format!("seal.tpm: {}", e.detail))?;
@@ -550,6 +558,19 @@ pub struct SealCfg {
     /// Absent: a unit without a TPM (its UWK is on the runtime volume).
     #[serde(default)]
     pub tpm: Option<SealTpmCfg>,
+    /// The runtime volume's LUKS2 device (a stable path, e.g.
+    /// `/dev/disk/by-partlabel/...`). Erase wipes its keyslots. Required on
+    /// a unit without a TPM: that wipe is its erase.
+    #[serde(default)]
+    pub device: Option<PathBuf>,
+    /// The open mapping's name (`/dev/mapper/NAME`): erase unmounts
+    /// `runtime_root` and closes it, or suspends it when it is busy.
+    #[serde(default)]
+    pub mapper_name: Option<String>,
+    /// systemd units that run delivered software from the runtime volume:
+    /// erase stops them first.
+    #[serde(default)]
+    pub stop_units: Vec<String>,
 }
 
 fn d_pack_digest_max_mb() -> u64 {
@@ -690,10 +711,32 @@ impl Config {
             paths.push(("seal.runtime_root", &sc.runtime_root));
             if let Some(t) = &sc.tpm {
                 paths.push(("seal.tpm.tools_dir", &t.tools_dir));
+                paths.push(("seal.tpm.work_dir", &t.work_dir));
                 if !(100..=120_000).contains(&t.timeout_ms) {
                     return Err("seal.tpm.timeout_ms: 100..=120000".into());
                 }
                 t.tpm_config()?;
+            }
+            match &sc.device {
+                Some(d) => paths.push(("seal.device", d)),
+                None if sc.tpm.is_none() => {
+                    return Err(
+                        "seal.device is required on a unit without a TPM: erase wipes \
+                                its runtime volume's keyslots, the only key it has"
+                            .into(),
+                    )
+                }
+                None => {}
+            }
+            if let Some(n) = &sc.mapper_name {
+                if !robodr_seal::luks::is_mapper_name(n) {
+                    return Err("seal.mapper_name: [a-z0-9][a-z0-9_-]{0,31}".into());
+                }
+            }
+            for u in &sc.stop_units {
+                if !robodr_seal::luks::is_unit_name(u) {
+                    return Err(format!("seal.stop_units: {u:?} is not a unit name"));
+                }
             }
         }
         for (what, p) in &paths {
@@ -837,6 +880,41 @@ mod tests {
         assert!(c.is_denied_user("root"));
         assert!(c.is_denied_user("robodr"));
         assert!(!c.is_denied_user("probe"));
+    }
+
+    /// Review H2: a unit without a TPM is erased by wiping its runtime
+    /// volume's keyslots, so its device must be configured.
+    #[test]
+    fn seal_section_device_mapper_and_units() {
+        let mut v = minimal();
+        v["seal"] = serde_json::json!({
+            "seal_dir": "/var/lib/robodr-seal",
+            "runtime_root": "/run/robodr-sealed"
+        });
+        let e = parse(&v).unwrap_err();
+        assert!(e.contains("seal.device is required"), "{e}");
+        v["seal"]["device"] = "/dev/disk/by-partlabel/robodr-sealed".into();
+        v["seal"]["mapper_name"] = "robodr-sealed".into();
+        v["seal"]["stop_units"] = serde_json::json!(["planner.service"]);
+        let c = parse(&v).unwrap();
+        assert_eq!(c.seal.unwrap().stop_units, ["planner.service"]);
+        for (k, bad) in [
+            ("mapper_name", serde_json::json!("../x")),
+            ("stop_units", serde_json::json!(["--now"])),
+            ("device", serde_json::json!("dev/sda")),
+        ] {
+            let mut w = v.clone();
+            w["seal"][k] = bad;
+            assert!(parse(&w).is_err(), "{k}");
+        }
+        // A TPM unit may leave the device out (the epoch is its erase).
+        v["seal"]["tpm"] = serde_json::json!({});
+        v["seal"].as_object_mut().unwrap().remove("device");
+        let c = parse(&v).unwrap();
+        assert_eq!(
+            c.seal.unwrap().tpm.unwrap().work_dir,
+            Path::new("/run/robodr-seal")
+        );
     }
 
     #[test]

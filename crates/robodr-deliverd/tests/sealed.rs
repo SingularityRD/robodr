@@ -94,10 +94,29 @@ fn seal_cfg(d: &Path, tpm: Option<String>) -> serde_json::Value {
         "runtime_root": d.join("runtime"),
         "volume_check": "unchecked"
     });
-    if let Some(t) = tpm {
-        s["tpm"] = serde_json::json!({"tcti": t});
+    match tpm {
+        Some(t) => s["tpm"] = serde_json::json!({"tcti": t, "work_dir": tpm_work_dir()}),
+        // Required without a TPM: erase wipes the volume's keyslots.
+        None => s["device"] = "/dev/disk/by-partlabel/robodr-sealed".into(),
     }
     s
+}
+
+/// The TPM work directory of this test process (tmpfs).
+fn tpm_work_dir() -> PathBuf {
+    PathBuf::from(format!(
+        "/dev/shm/robodr-deliverd-it-{}",
+        std::process::id()
+    ))
+}
+
+/// Removes [`tpm_work_dir`] on drop.
+struct WorkDirGuard;
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(tpm_work_dir());
+    }
 }
 
 /// A fallback unit (no TPM): its UWK is on the runtime volume.
@@ -114,6 +133,7 @@ fn fallback_unit(tag: &str) -> (Unit, SealUnit) {
         UNIT,
         "ugv-x1",
         &u.dir().join("runtime/.robodr-seal/uwk.key"),
+        robodr_seal::unit::KeyLocation::Unchecked,
     )
     .unwrap();
     (u, su)
@@ -243,6 +263,7 @@ fn missing_foreign_or_tampered_wraps_are_refused() {
         "ugv-08",
         "ugv-x1",
         &u.dir().join("seal-08/uwk.key"),
+        robodr_seal::unit::KeyLocation::Unchecked,
     )
     .unwrap();
     sealed_pack(
@@ -340,6 +361,7 @@ fn a_volume_that_is_not_a_mounted_dm_crypt_device_is_never_written() {
         UNIT,
         "ugv-x1",
         &u.dir().join("runtime/.robodr-seal/uwk.key"),
+        robodr_seal::unit::KeyLocation::Unchecked,
     )
     .unwrap();
     let depot = X25519Secret::generate().unwrap();
@@ -436,13 +458,27 @@ fn a_tpm_unit_installs_refuses_after_a_pcr_change_and_erases() {
             .to_path_buf();
         v["seal"] = seal_cfg(&d, Some(t2));
     });
+    let _wd = WorkDirGuard;
     let cfg = robodr_seal::tpm::TpmConfig {
         tcti: tcti.clone(),
+        work_dir: tpm_work_dir(),
         ..Default::default()
     };
     let tpm =
         || robodr_seal::tpm::Tpm::new(cfg.clone(), Box::new(robodr_seal::cmd::System)).unwrap();
-    tpm().provision(None).unwrap();
+    // Ownership first (OPERATIONS §12.1): provisioning refuses an empty
+    // owner or lockout authorization.
+    for h in ["o", "l"] {
+        let o = tpm()
+            .run(
+                "tpm2_changeauth",
+                &["-c".into(), h.into(), "file:-".into()],
+                Some(b"test-owner-auth"),
+            )
+            .unwrap();
+        assert!(o.ok(), "{}", o.error_line());
+    }
+    tpm().provision(b"test-owner-auth").unwrap();
     let authority = robodr_seal::keys::PolicyKey::generate().unwrap();
     let su = SealUnit::enroll_tpm(
         &u.dir().join("seal"),
@@ -539,6 +575,18 @@ fn a_tpm_unit_installs_refuses_after_a_pcr_change_and_erases() {
     // Tamper: crypto-erase. Both Critical findings; the keys are dead.
     let rep = e.erase("tamper", None).unwrap();
     assert!(rep["epoch_after"].as_u64() > rep["epoch_before"].as_u64());
+    // The finding says exactly what was destroyed, and that the runtime
+    // volume (no mapper configured here) was not closed (review H2, M1).
+    let erased: Vec<String> = u
+        .findings()
+        .into_iter()
+        .filter(|f| f.0 == "robot.seal.erased")
+        .map(|f| f.2.to_string())
+        .collect();
+    assert_eq!(erased.len(), 1);
+    assert!(erased[0].contains("TPM erase epoch moved"), "{}", erased[0]);
+    assert!(erased[0].contains("UWK blobs deleted"), "{}", erased[0]);
+    assert!(erased[0].contains("not closed"), "{}", erased[0]);
     let rules = u.rules_found();
     assert!(rules.contains(&"robot.seal.tamper".to_string()));
     assert!(rules.contains(&"robot.seal.erased".to_string()));

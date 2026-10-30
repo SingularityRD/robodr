@@ -56,6 +56,9 @@ pub const DEFAULT_FLOOR_NV: u32 = 0x0150_0041;
 pub const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
 /// Default tools directory.
 pub const DEFAULT_TOOLS_DIR: &str = "/usr/bin";
+/// Default directory of the per-operation work directories (TPM session
+/// contexts, which hold session keys): must be on tmpfs.
+pub const DEFAULT_WORK_DIR: &str = "/run/robodr-seal";
 /// Default bound on one tool run.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `tpm2_create -a` of the UWK.
@@ -70,6 +73,9 @@ pub struct TpmConfig {
     pub srk: u32,
     pub epoch_nv: u32,
     pub floor_nv: u32,
+    /// Parent of the per-operation work directories: tmpfs only (checked),
+    /// never the seal directory or a disk.
+    pub work_dir: PathBuf,
 }
 
 impl Default for TpmConfig {
@@ -81,6 +87,7 @@ impl Default for TpmConfig {
             srk: DEFAULT_SRK,
             epoch_nv: DEFAULT_EPOCH_NV,
             floor_nv: DEFAULT_FLOOR_NV,
+            work_dir: PathBuf::from(DEFAULT_WORK_DIR),
         }
     }
 }
@@ -89,6 +96,9 @@ impl TpmConfig {
     pub fn validate(&self) -> Result<(), SealError> {
         if !self.tools_dir.is_absolute() {
             return Err(invalid("tpm tools_dir must be absolute"));
+        }
+        if !self.work_dir.is_absolute() {
+            return Err(invalid("tpm work_dir must be absolute"));
         }
         if self.tcti.is_empty() || self.tcti.len() > 512 || self.tcti.chars().any(char::is_control)
         {
@@ -116,15 +126,44 @@ fn hx(v: u32) -> String {
     format!("0x{v:08x}")
 }
 
-/// A private working directory (contexts, policy files, the ephemeral
-/// point; never a secret): created `0700`, removed on drop.
+/// A private working directory of one operation (TPM object and session
+/// contexts, policy files, the ephemeral point): created `0700` under
+/// [`TpmConfig::work_dir`] (tmpfs, checked by [`Tpm::work`]), removed on
+/// drop. A session context holds the session's key, so it never goes to a
+/// disk; one left by a killed process is swept by the next operation.
 pub struct WorkDir(PathBuf);
 
+/// Remove `.work-*` directories of processes that no longer run (and every
+/// `.work-*` without a process id: left by releases that kept them in the
+/// seal directory).
+pub fn sweep_stale(parent: &Path) {
+    let Ok(rd) = fs::read_dir(parent) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".work-")) else {
+            continue;
+        };
+        let live = rest
+            .split_once('-')
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+        if !live && e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 impl WorkDir {
-    pub fn new(parent: &Path) -> Result<Self, SealError> {
+    fn new(parent: &Path) -> Result<Self, SealError> {
         let mut nonce = [0u8; 8];
         robodr_blackbox::crypto::fill_random(&mut nonce).map_err(|e| io_err(parent, e))?;
-        let p = parent.join(format!(".work-{}", crate::to_hex(&nonce)));
+        let p = parent.join(format!(
+            ".work-{}-{}",
+            std::process::id(),
+            crate::to_hex(&nonce)
+        ));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&p)
@@ -159,6 +198,58 @@ pub struct Tpm {
 /// A created UWK: public blob, private blob (encrypted by the SRK), SEC1
 /// public point.
 pub type UwkBlobs = (Vec<u8>, Vec<u8>, [u8; 65]);
+
+/// Whether the TPM's owner and lockout hierarchies have an authorization
+/// (`TPM_PT_PERMANENT`: `ownerAuthSet`, `lockoutAuthSet`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ownership {
+    pub owner_auth_set: bool,
+    pub lockout_auth_set: bool,
+}
+
+impl Ownership {
+    pub fn ok(&self) -> bool {
+        self.owner_auth_set && self.lockout_auth_set
+    }
+}
+
+/// Why an empty owner or lockout authorization is refused.
+pub const OWNERSHIP_REQUIRED: &str = "the TPM's owner and lockout authorizations must be set (to \
+     secrets kept off the unit) before RoboDR relies on its NV indices: with an empty owner \
+     authorization root on the unit can undefine and redefine the policy floor, which revives \
+     every revoked policy (tpm2_changeauth -c o, -c l; docs/OPERATIONS.md section 12.1)";
+
+/// `TPM_PT_PERMANENT` from `tpm2_getcap properties-variable` output.
+pub fn parse_ownership(text: &str) -> Option<Ownership> {
+    let mut in_block = false;
+    let (mut owner, mut lockout) = (None, None);
+    for l in text.lines() {
+        if !l.starts_with(' ') {
+            in_block = l.trim_end() == "TPM2_PT_PERMANENT:";
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        let Some((k, v)) = l.trim().split_once(':') else {
+            continue;
+        };
+        let v = match v.trim() {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        match k.trim() {
+            "ownerAuthSet" => owner = Some(v),
+            "lockoutAuthSet" => lockout = Some(v),
+            _ => {}
+        }
+    }
+    Some(Ownership {
+        owner_auth_set: owner?,
+        lockout_auth_set: lockout?,
+    })
+}
 
 /// What [`Tpm::provision`] did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -199,6 +290,30 @@ impl Tpm {
     pub fn new(cfg: TpmConfig, runner: Box<dyn Runner>) -> Result<Self, SealError> {
         cfg.validate()?;
         Ok(Self { cfg, runner })
+    }
+
+    /// A fresh work directory under [`TpmConfig::work_dir`], which is
+    /// created `0700` if missing and must be a real directory on tmpfs;
+    /// stale work directories are swept first.
+    pub fn work(&self) -> Result<WorkDir, SealError> {
+        use std::os::unix::fs::PermissionsExt;
+        let d = &self.cfg.work_dir;
+        match fs::symlink_metadata(d) {
+            Ok(m) if m.is_dir() => {
+                if m.permissions().mode() & 0o077 != 0 {
+                    fs::set_permissions(d, fs::Permissions::from_mode(0o700))
+                        .map_err(|e| io_err(d, e))?;
+                }
+            }
+            Ok(_) => return Err(invalid(format!("{}: not a directory", d.display()))),
+            Err(_) => fs::DirBuilder::new()
+                .mode(0o700)
+                .create(d)
+                .map_err(|e| io_err(d, e))?,
+        }
+        crate::mounts::check_tmpfs(d)?;
+        sweep_stale(d);
+        WorkDir::new(d)
     }
 
     /// Run a tool; `Ok` with the output whether or not it succeeded.
@@ -260,20 +375,45 @@ impl Tpm {
             .map_err(|e| SealError::new(ErrorKind::Unavailable, e))
     }
 
-    fn owner_args(owner_auth: Option<&[u8]>) -> Vec<String> {
-        if owner_auth.is_some() {
-            vec!["-P".into(), "file:-".into()]
+    fn owner_args() -> Vec<String> {
+        vec!["-P".into(), "file:-".into()]
+    }
+
+    /// Whether the owner and lockout authorizations are set.
+    pub fn ownership(&self) -> Result<Ownership, SealError> {
+        let o = self.must(
+            "tpm2_getcap",
+            &["properties-variable".into()],
+            None,
+            ErrorKind::Unavailable,
+            "read TPM_PT_PERMANENT",
+        )?;
+        parse_ownership(&String::from_utf8_lossy(&o.stdout)).ok_or_else(|| {
+            SealError::new(
+                ErrorKind::Unavailable,
+                "tpm2_getcap: no TPM_PT_PERMANENT owner / lockout state",
+            )
+        })
+    }
+
+    /// Refuse unless the owner and lockout authorizations are set.
+    pub fn require_ownership(&self) -> Result<(), SealError> {
+        if self.ownership()?.ok() {
+            Ok(())
         } else {
-            vec![]
+            Err(invalid(OWNERSHIP_REQUIRED))
         }
     }
 
     /// Define (once) the erase-epoch counter, the policy-floor bit field
     /// and the persistent SRK. Idempotent; an index that exists with other
-    /// attributes is an error, never redefined. `owner_auth` is the owner
-    /// hierarchy's authorization if one is set (it should be, so nobody on
-    /// the unit can undefine the floor; `docs/OPERATIONS.md`).
-    pub fn provision(&self, owner_auth: Option<&[u8]>) -> Result<Provisioned, SealError> {
+    /// attributes is an error, never redefined. Refused, before anything
+    /// is defined, unless the TPM's owner and lockout authorizations are
+    /// set ([`OWNERSHIP_REQUIRED`]); `owner_auth` is the owner
+    /// authorization (passed to the tools on stdin).
+    pub fn provision(&self, owner_auth: &[u8]) -> Result<Provisioned, SealError> {
+        self.require_ownership()?;
+        let owner_auth = Some(owner_auth);
         let mut p = Provisioned::default();
         for (index, define, attrs, is_epoch) in [
             (
@@ -300,7 +440,7 @@ impl Tpm {
                     "-a".into(),
                     define.into(),
                 ];
-                args.extend(Self::owner_args(owner_auth));
+                args.extend(Self::owner_args());
                 self.must(
                     "tpm2_nvdefine",
                     &args,
@@ -353,7 +493,7 @@ impl Tpm {
         let srk = self.run("tpm2_readpublic", &["-c".into(), hx(self.cfg.srk)], None)?;
         self.flush();
         if !srk.ok() {
-            let w = WorkDir::new(&std::env::temp_dir())?;
+            let w = self.work()?;
             let ctx = w.path("srk.ctx").display().to_string();
             let mut args = vec![
                 "-C".into(),
@@ -365,7 +505,7 @@ impl Tpm {
                 "-c".into(),
                 ctx.clone(),
             ];
-            args.extend(Self::owner_args(owner_auth));
+            args.extend(Self::owner_args());
             self.must(
                 "tpm2_createprimary",
                 &args,
@@ -374,7 +514,7 @@ impl Tpm {
                 "provision SRK",
             )?;
             let mut args = vec!["-C".into(), "o".into(), "-c".into(), ctx, hx(self.cfg.srk)];
-            args.extend(Self::owner_args(owner_auth));
+            args.extend(Self::owner_args());
             self.must(
                 "tpm2_evictcontrol",
                 &args,
@@ -414,8 +554,10 @@ impl Tpm {
     }
 
     /// Crypto-erase: increment the erase-epoch counter once. Every key
-    /// whose policy names the previous value is dead from now on.
-    pub fn increment_epoch(&self) -> Result<u64, SealError> {
+    /// whose policy names the previous value is dead from now on. `Ok`
+    /// means the TPM accepted the increment; reading the new value back is
+    /// the caller's (a failed read-back does not undo the erase).
+    pub fn increment_epoch(&self) -> Result<(), SealError> {
         let i = hx(self.cfg.epoch_nv);
         self.must(
             "tpm2_nvincrement",
@@ -423,8 +565,8 @@ impl Tpm {
             None,
             ErrorKind::Unavailable,
             "erase",
-        )?;
-        self.epoch()
+        )
+        .map(|_| ())
     }
 
     /// Revoke every signed policy version below `version` (set floor bits
@@ -755,6 +897,26 @@ impl Tpm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_parser() {
+        let t = "TPM2_PT_PERMANENT:\n  ownerAuthSet:              1\n  endorsementAuthSet:        0\n  lockoutAuthSet:            0\n  disableClear:              0\nTPM2_PT_STARTUP_CLEAR:\n  phEnable:                  1\n";
+        assert_eq!(
+            parse_ownership(t),
+            Some(Ownership {
+                owner_auth_set: true,
+                lockout_auth_set: false
+            })
+        );
+        assert_eq!(
+            parse_ownership("TPM2_PT_STARTUP_CLEAR:\n  phEnable: 1\n"),
+            None
+        );
+        assert_eq!(
+            parse_ownership("TPM2_PT_PERMANENT:\n  ownerAuthSet: x\n"),
+            None
+        );
+    }
 
     #[test]
     fn config_and_points() {

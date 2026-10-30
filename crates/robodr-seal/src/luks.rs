@@ -25,6 +25,7 @@
 
 use crate::cmd::{tool, Output, Runner};
 use crate::{invalid, ErrorKind, SealError};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -37,6 +38,48 @@ pub fn is_mapper_name(s: &str) -> bool {
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
+}
+
+/// A systemd unit name: `[A-Za-z0-9:_.@\\-]{1,255}` with a type suffix.
+pub fn is_unit_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && !s.starts_with('-')
+        && s.bytes().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, b':' | b'_' | b'.' | b'@' | b'-' | b'\\')
+        })
+        && s.rsplit_once('.').is_some_and(|(n, t)| {
+            !n.is_empty() && matches!(t, "service" | "scope" | "socket" | "target" | "mount")
+        })
+}
+
+/// What [`Luks::lockdown`] did to the open runtime volume at erase. A
+/// crypto-erase destroys keys; the plaintext of a volume that is still
+/// open stays readable through its mount (and the kernel keeps its volume
+/// key) until it is closed or the unit powers off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lockdown {
+    /// Units stopped (`systemctl stop`).
+    pub stopped_units: Vec<String>,
+    /// The runtime root was unmounted.
+    pub unmounted: bool,
+    /// The mapping was closed (`cryptsetup close`): the kernel dropped the
+    /// volume key.
+    pub closed: bool,
+    /// Not closable (busy): suspended instead (`cryptsetup luksSuspend`):
+    /// the kernel wiped the volume key and blocks all I/O; pages already
+    /// cached stay in memory until power-off.
+    pub suspended: bool,
+    /// What failed.
+    pub notes: Vec<String>,
+}
+
+impl Lockdown {
+    /// Whether the volume's key is out of the kernel.
+    pub fn volume_locked(&self) -> bool {
+        self.closed || self.suspended
+    }
 }
 
 /// `cryptsetup` / `clevis` front end.
@@ -182,6 +225,68 @@ impl Luks {
         Self::must(o, "cryptsetup close").map(|_| ())
     }
 
+    fn bin_tool(&self, name: &str, args: &[String]) -> Result<Output, SealError> {
+        self.runner
+            .run(&tool(&self.bin, name)?, args, &[], None, self.timeout)
+    }
+
+    /// Lock the open runtime volume down at erase: stop `units` (they hold
+    /// files open), unmount `mount`, close mapping `mapper`, or, if it
+    /// cannot be closed, suspend it. Best effort, every failure noted;
+    /// never fails.
+    pub fn lockdown(
+        &self,
+        units: &[String],
+        mount: Option<&Path>,
+        mapper: Option<&str>,
+    ) -> Lockdown {
+        let mut l = Lockdown::default();
+        for u in units {
+            if !is_unit_name(u) {
+                l.notes.push(format!("{u:?}: not a unit name, not stopped"));
+                continue;
+            }
+            match self.bin_tool("systemctl", &["stop".into(), "--".into(), u.clone()]) {
+                Ok(o) if o.ok() => l.stopped_units.push(u.clone()),
+                Ok(o) => l
+                    .notes
+                    .push(format!("systemctl stop {u}: {}", o.error_line())),
+                Err(e) => l.notes.push(format!("systemctl stop {u}: {e}")),
+            }
+        }
+        if let Some(m) = mount {
+            match dev(m).and_then(|m| self.bin_tool("umount", &["--".into(), m])) {
+                Ok(o) if o.ok() => l.unmounted = true,
+                Ok(o) => l
+                    .notes
+                    .push(format!("umount {}: {}", m.display(), o.error_line())),
+                Err(e) => l.notes.push(format!("umount {}: {e}", m.display())),
+            }
+        }
+        if let Some(n) = mapper {
+            if !is_mapper_name(n) {
+                l.notes.push(format!("{n:?}: not a mapper name"));
+                return l;
+            }
+            if mount.is_none() || l.unmounted {
+                match self.close(n) {
+                    Ok(()) => l.closed = true,
+                    Err(e) => l.notes.push(e.detail),
+                }
+            }
+            if !l.closed {
+                match self.cryptsetup(&["luksSuspend".into(), n.into()], None) {
+                    Ok(o) if o.ok() => l.suspended = true,
+                    Ok(o) => l
+                        .notes
+                        .push(format!("cryptsetup luksSuspend: {}", o.error_line())),
+                    Err(e) => l.notes.push(format!("cryptsetup luksSuspend: {e}")),
+                }
+            }
+        }
+        l
+    }
+
     /// Wipe every keyslot of `device` (`cryptsetup erase`): the volume key
     /// is unrecoverable afterwards, whatever passphrase or Tang binding
     /// existed.
@@ -306,5 +411,114 @@ mod tests {
         assert!(Luks::tang_config("http://x\"}", "a").is_err());
         assert!(Luks::tang_config("http://x", "a b").is_err());
         assert!(dev(Path::new("rel.img")).is_err());
+        assert!(is_unit_name("robot-planner.service"));
+        assert!(is_unit_name("model-runner@1.service"));
+        assert!(!is_unit_name("--now.service"));
+        assert!(!is_unit_name("planner"));
+        assert!(!is_unit_name("a b.service"));
+    }
+
+    /// Records every call; fails the programs (and arguments) listed.
+    #[derive(Debug)]
+    struct Script {
+        fail: Vec<&'static str>,
+        calls: Calls,
+    }
+
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    impl Runner for Script {
+        fn run(
+            &self,
+            program: &Path,
+            args: &[String],
+            _env: &[(&str, &str)],
+            _stdin: Option<&[u8]>,
+            _timeout: Duration,
+        ) -> Result<Output, SealError> {
+            let line = format!(
+                "{} {}",
+                program.file_name().unwrap().to_str().unwrap(),
+                args.join(" ")
+            );
+            let failed = self.fail.iter().any(|f| line.starts_with(f));
+            self.calls.lock().unwrap().push(line);
+            Ok(Output {
+                status: Some(if failed { 32 } else { 0 }),
+                stdout: Zeroizing::new(Vec::new()),
+                stderr: Zeroizing::new(if failed { b"busy".to_vec() } else { Vec::new() }),
+            })
+        }
+    }
+
+    fn luks(fail: Vec<&'static str>) -> (Luks, Calls) {
+        let calls = Calls::default();
+        let l = Luks::new(
+            "/usr/sbin".into(),
+            "/usr/bin".into(),
+            Duration::from_secs(1),
+            Box::new(Script {
+                fail,
+                calls: calls.clone(),
+            }),
+        );
+        (l, calls)
+    }
+
+    fn calls(c: &Calls) -> Vec<String> {
+        c.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn lockdown_stops_unmounts_and_closes() {
+        let (l, c) = luks(vec![]);
+        let units = vec!["planner.service".to_string()];
+        let r = l.lockdown(
+            &units,
+            Some(Path::new("/run/robodr-sealed")),
+            Some("robodr-sealed"),
+        );
+        assert_eq!(r.stopped_units, units);
+        assert!(r.unmounted && r.closed && !r.suspended, "{r:?}");
+        assert!(r.volume_locked() && r.notes.is_empty());
+        assert_eq!(
+            calls(&c),
+            [
+                "systemctl stop -- planner.service",
+                "umount -- /run/robodr-sealed",
+                "cryptsetup close robodr-sealed"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_busy_volume_is_suspended_and_said_so() {
+        let (l, c) = luks(vec!["umount", "systemctl"]);
+        let units = vec!["planner.service".to_string()];
+        let r = l.lockdown(
+            &units,
+            Some(Path::new("/run/robodr-sealed")),
+            Some("robodr-sealed"),
+        );
+        assert!(r.stopped_units.is_empty() && !r.unmounted && !r.closed);
+        assert!(r.suspended && r.volume_locked());
+        assert_eq!(r.notes.len(), 2, "{:?}", r.notes);
+        let c = calls(&c);
+        assert!(
+            !c.iter().any(|x| x.starts_with("cryptsetup close")),
+            "{c:?}"
+        );
+        assert!(c
+            .iter()
+            .any(|x| x == "cryptsetup luksSuspend robodr-sealed"));
+        // Nothing works at all: still open, and noted.
+        let (l, _) = luks(vec!["umount", "cryptsetup"]);
+        let r = l.lockdown(
+            &[],
+            Some(Path::new("/run/robodr-sealed")),
+            Some("robodr-sealed"),
+        );
+        assert!(!r.volume_locked());
+        assert_eq!(r.notes.len(), 2, "{:?}", r.notes);
     }
 }

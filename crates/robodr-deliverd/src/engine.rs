@@ -951,17 +951,22 @@ impl Engine {
         }
     }
 
-    /// Crypto-erase this unit's sealing keys (§7.6): the TPM's erase epoch
-    /// moves on (or, without a TPM, the UWK file is destroyed), and with
-    /// `volume` the runtime volume's LUKS2 keyslots are wiped too. Noted
-    /// in the journal; `robot.seal.erased` (Critical), and
-    /// `robot.seal.tamper` (Critical) first when the trigger is a tamper
-    /// input. Executing an erase is not gated here: the trigger's planner
-    /// (an operator now, `robodr-responder` from 14b) decides when.
+    /// Crypto-erase this unit's sealing keys (§7.6, `robodr-seal`'s
+    /// `Unit::erase`): with a TPM the erase epoch moves on (every key
+    /// sealed to the unit is dead); without one the runtime volume's
+    /// LUKS2 keyslots are wiped (`seal.device`, or `device`). Then the
+    /// open runtime volume is locked down (`seal.stop_units` stopped,
+    /// `runtime_root` unmounted, `seal.mapper_name` closed or suspended).
+    /// Noted in the journal; `robot.seal.erased` (Critical) says exactly
+    /// what was destroyed and what was not, and `robot.seal.tamper`
+    /// (Critical) comes first when the trigger is a tamper input. An erase
+    /// whose essential step failed reports nothing as erased. Executing an
+    /// erase is not gated here: the trigger's planner (an operator now,
+    /// `robodr-responder` from 14b) decides when.
     pub fn erase(
         &mut self,
         trigger: &str,
-        volume: Option<&std::path::Path>,
+        device: Option<&std::path::Path>,
     ) -> R<serde_json::Value> {
         let s = self
             .sealing
@@ -980,19 +985,24 @@ impl Engine {
         }
         let unit = s.unit().map_err(|e| EngineError(e.to_string()))?;
         let luks = robodr_seal::luks::Luks::system();
+        let device = device.or(s.cfg.device.as_deref());
+        let mount = robodr_seal::mounts::is_mount_point(&s.cfg.runtime_root)
+            .then_some(s.cfg.runtime_root.as_path());
+        let target = robodr_seal::unit::EraseTarget {
+            device,
+            mapper: s.cfg.mapper_name.as_deref(),
+            mount,
+            stop_units: &s.cfg.stop_units,
+        };
         let rep = unit
-            .erase(trigger, volume.map(|v| (&luks, v)))
+            .erase(trigger, &luks, &target)
             .map_err(|e| EngineError(format!("erase failed: {e}")))?;
         let v = serde_json::to_value(&rep).map_err(|e| EngineError(e.to_string()))?;
         let ev = self.journal.note(kinds::ERASED, v.clone())?;
         self.finding(
             rules::SEAL_ERASED,
             Severity::Critical,
-            format!(
-                "erased: trigger {}: the unit's sealing keys are destroyed; its sealed payloads \
-                 are unreadable until re-enrolment and re-delivery",
-                rep.trigger
-            ),
+            erase_summary(&rep),
             Some(ev),
         );
         Ok(v)
@@ -2221,4 +2231,41 @@ pub fn confirm_path(cfg: &Config, deployment_digest: &str, name: &str) -> PathBu
         "{}-{name}",
         &deployment_digest[..deployment_digest.len().min(64)]
     ))
+}
+
+/// The `robot.seal.erased` text: what was destroyed, and what was not.
+pub fn erase_summary(rep: &robodr_seal::unit::EraseReport) -> String {
+    use robodr_seal::unit as u;
+    let what: Vec<String> = rep
+        .destroyed
+        .iter()
+        .map(|d| match d.as_str() {
+            u::DESTROYED_EPOCH => match (rep.epoch_before, rep.epoch_after) {
+                (Some(b), Some(a)) => format!("TPM erase epoch moved {b} -> {a}"),
+                _ => "TPM erase epoch incremented".into(),
+            },
+            u::DESTROYED_UWK_BLOBS => "UWK blobs deleted".into(),
+            u::DESTROYED_VOLUME_WRAP => "volume key wrap deleted".into(),
+            u::DESTROYED_FALLBACK_UWK => "UWK file destroyed".into(),
+            u::DESTROYED_KEYSLOTS => "runtime volume keyslots wiped".into(),
+            other => other.to_string(),
+        })
+        .collect();
+    let volume = match &rep.lockdown {
+        Some(l) if l.closed => "runtime volume closed".to_string(),
+        Some(l) if l.suspended => {
+            "runtime volume suspended (busy: not closed; its key is out of the kernel)".into()
+        }
+        Some(_) => "runtime volume STILL OPEN: its plaintext is readable until power-off".into(),
+        None => "runtime volume not closed (no seal.mapper_name)".into(),
+    };
+    let mut t = format!(
+        "erased: trigger {}: {}; {volume}",
+        rep.trigger,
+        what.join(", ")
+    );
+    if !rep.incomplete.is_empty() {
+        t.push_str(&format!("; not done: {}", rep.incomplete.join("; ")));
+    }
+    t
 }

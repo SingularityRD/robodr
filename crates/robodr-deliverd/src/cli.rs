@@ -57,10 +57,13 @@ confirm       record a local operator's confirmation for an RPK that
               requires one (install.requires_operator_present).
 erase         crypto-erase the unit's sealing keys (docs/SECURE-DELIVERY.md
               §7.6; needs the seal section): the TPM's erase epoch moves
-              on, so every key sealed to the unit is dead (without a TPM:
-              the UWK file is destroyed); --device also wipes the runtime
-              volume's LUKS2 keyslots. Final: recovery is re-enrolment and
-              re-delivery. TRIGGER is [a-z0-9_]{1,64} (operator, tamper,
+              on, so every key sealed to the unit is dead; without a TPM
+              the runtime volume's LUKS2 keyslots are wiped (seal.device or
+              --device, required). With a TPM, a device wipes them too.
+              Then seal.stop_units are stopped, runtime_root unmounted and
+              seal.mapper_name closed (or suspended when busy). The report
+              and robot.seal.erased say what was destroyed and what was
+              not. Final: recovery is re-enrolment and re-delivery. TRIGGER is [a-z0-9_]{1,64} (operator, tamper,
               attestation, lease, auth_failures, remote); tamper also
               reports robot.seal.tamper. --key as for reanchor.
 
