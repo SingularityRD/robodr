@@ -593,6 +593,7 @@ fn undecidable_payloads() {
         robodr_firewall_gw::discovery::WriterInfo {
             channel: Some(0),
             probed: false,
+            ..Default::default()
         },
     );
     let short = Datagram::new(PREFIX)
@@ -621,6 +622,7 @@ fn undecidable_payloads() {
         robodr_firewall_gw::discovery::WriterInfo {
             channel: Some(0),
             probed: false,
+            ..Default::default()
         },
     );
     let d = Datagram::new(FOREIGN)
@@ -712,7 +714,12 @@ fn sedp_classification_and_other_topics() {
         ),
     );
     run(&mut gw, &sedp, T0);
-    // A LowCmd-shaped sample on another topic (rt/arm_sdk) is not decided.
+    // A LowCmd-shaped sample of a writer announced on another topic
+    // (rt/arm_sdk, not a channel here) is not decided as `rt/lowcmd`, but
+    // a CRC-valid `LowCmd_` from a writer known as not enforced is the
+    // shape of a discovery differential (gateway review, finding 1):
+    // suppressed. A same-type topic the robot acts on needs its own
+    // channel.
     let mut bad = frame(fx, 0.0);
     let mut w = bad.motor(0).unwrap();
     w.tau = 1e4;
@@ -726,12 +733,20 @@ fn sedp_classification_and_other_topics() {
             &lowcmd::encode_payload(&bad, Representation::CdrLe),
         )
         .finish();
+    let (v, out) = run(&mut gw, &packet(CONTROLLER_IP, DDS_PORT, &d), T0 + MS);
+    assert_eq!(v, Verdict::AcceptModified);
+    assert!(out_lowcmd(&out, LowCmdCodec::Hg).is_none());
+    assert_eq!(gw.stats.samples, 0);
+    assert_eq!(gw.stats.suspicious_writer, 1);
+    assert_eq!(gw.discovery().len(), 1);
+    // A non-motion payload of the same writer still passes.
+    let d = Datagram::new(PREFIX)
+        .data(other_writer, 2, &[], &[0, 1, 0, 0, 1, 2, 3, 4])
+        .finish();
     assert_eq!(
-        run(&mut gw, &packet(CONTROLLER_IP, DDS_PORT, &d), T0 + MS).0,
+        run(&mut gw, &packet(CONTROLLER_IP, DDS_PORT, &d), T0 + 2 * MS).0,
         Verdict::Accept
     );
-    assert_eq!(gw.stats.samples, 0);
-    assert_eq!(gw.discovery().len(), 1);
 }
 
 #[test]

@@ -8,8 +8,28 @@
 //!   writer GUID to that channel: where DDS stacks would disagree on which
 //!   topic a writer writes, the gateway enforces. Other writers are
 //!   remembered as "not enforced" so their samples are not probed.
-//! - Endpoint and participant removals (dispose / unregister) forget the
-//!   writers.
+//! - **Enforced is forever** (gateway review, findings 1 and 2): a writer
+//!   once classified as enforced is kept in its own table, never evicted
+//!   and never removed. A dispose / unregister, a participant removal or an
+//!   announcement of the same GUID on another topic leaves it enforced
+//!   (`enforced_kept`). The table is bounded (`rtps.max_enforced_writers`);
+//!   when it is full a new enforced writer is refused (`enforced_refused`,
+//!   a gateway finding) and stays unknown, so its samples are probed.
+//!   Other writers live in a least-recently-used table (`rtps.max_writers`):
+//!   evicting one only makes it unknown again.
+//! - **INFO_DST is obeyed**: a robot drops a submessage addressed (INFO_DST)
+//!   to another participant, so an announcement or removal addressed to
+//!   anyone but the robot's participants (learned from the robot's own
+//!   observed SPDP / SEDP, [`Discovery::observe_robot`]) or
+//!   `GUIDPREFIX_UNKNOWN` is ignored (`misaddressed`). Until the robot's
+//!   participants are known such a destination cannot be checked: the
+//!   announcement is learned but marked `unverified`, and a removal is
+//!   ignored.
+//! - **Only the owner speaks for a writer**: a not-enforced announcement or
+//!   a removal whose sender (RTPS header / INFO_SRC prefix) is not the
+//!   writer's own participant is ignored (`relayed_ignored`). An
+//!   announcement on an enforced topic is learned from anyone (the safe
+//!   direction).
 //! - SPDP announcements feed `robodr-ros2-pipeline`'s
 //!   [`IdentityResolver`] (participant identity from source IP, vendor and
 //!   enclave), for `identity:<name>` sources. Only an SPDP sent by the
@@ -34,41 +54,64 @@
 //!   robot reader of `rt/lowcmd` at a port outside the queued ranges is
 //!   exactly where a controller-side stack would send motion samples the
 //!   queue never sees. Robot-side announcements never change the writer
-//!   map (robot writers are not controller-side motion sources).
-//! - The map is bounded ([`Discovery::new`]'s `max_writers`; the oldest
-//!   entry is evicted first) and can be persisted
-//!   ([`Discovery::save`] / [`Discovery::load`]) so a restarted gateway,
-//!   which will not see the robot's earlier SEDP again, keeps classifying
-//!   the existing writers. A persisted entry is only a classification hint:
-//!   source authorisation is still decided per sample.
+//!   map (robot writers are not controller-side motion sources); they only
+//!   name the robot's participants (INFO_DST check).
+//! - The map can be persisted ([`Discovery::save`] / [`Discovery::load`])
+//!   so a restarted gateway, which will not see the robot's earlier SEDP
+//!   again, keeps classifying the existing writers (the enforced table
+//!   included). A persisted entry is only a classification hint: source
+//!   authorisation is still decided per sample. The file is read without
+//!   following a symlink and only if it is a regular file owned by root or
+//!   the directory's owner and not group / world writable; it is written
+//!   through a fresh `O_EXCL` 0600 temporary file and renamed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::time::Instant;
 
 use robodr_ros2_pipeline::{IdentityResolver, Resolution};
-use robodr_rtps::{EndpointKind, FragmentReassembler, ReassemblyLimits};
+use robodr_rtps::{EndpointKind, FragmentReassembler, ReassemblyLimits, GUIDPREFIX_UNKNOWN};
 use serde::{Deserialize, Serialize};
 
 use crate::rtps::{Guid, GuidPrefix};
 
 /// What is known about one writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WriterInfo {
     /// Index of the enforced channel it writes, if any.
     pub channel: Option<usize>,
     /// Learned from a content probe rather than SEDP.
     pub probed: bool,
+    /// Not enforced, but announced with the DDS type of an enforced
+    /// channel ([`Discovery::with_channel_types`]).
+    pub same_type: bool,
+    /// Not enforced, and announced under an INFO_DST the gateway could not
+    /// check (the robot's participants were not known yet).
+    pub unverified: bool,
 }
+
+/// Most robot participant prefixes remembered (INFO_DST check).
+pub const MAX_ROBOT_PREFIXES: usize = 64;
 
 /// Discovery state.
 pub struct Discovery {
-    writers: HashMap<Guid, WriterInfo>,
-    order: VecDeque<Guid>,
+    /// Writers ever classified as enforced (SEDP or the state file):
+    /// writer -> channel. Never evicted, never removed (module docs).
+    enforced: HashMap<Guid, usize>,
+    max_enforced: usize,
+    /// Every other writer (SEDP on another topic, probe results), with its
+    /// last use; `lru` orders them (least recently used first).
+    others: HashMap<Guid, (WriterInfo, u64)>,
+    lru: BTreeMap<u64, Guid>,
+    clock: u64,
     max_writers: usize,
     /// Enforced topics, index = channel index (None for non-RTPS channels).
     topics: Vec<Option<String>>,
+    /// DDS type names of the enforced channels (`same_type`).
+    types: Vec<&'static str>,
+    /// The robot's participant prefixes (most recent last).
+    robot_prefixes: VecDeque<GuidPrefix>,
     reasm: FragmentReassembler,
     identities: IdentityResolver,
     /// Bumped whenever identities change, so cached source resolutions are
@@ -117,6 +160,18 @@ pub struct DiscoveryStats {
     /// Robot-side locators outside every queued range (also counted in
     /// `unqueued_locators`).
     pub robot_unqueued_locators: u64,
+    /// Announcements / removals ignored because their INFO_DST addressed
+    /// another participant than the robot's (or, for a removal, one that
+    /// could not be checked yet).
+    pub misaddressed: u64,
+    /// Not-enforced announcements and removals ignored because another
+    /// participant than the writer's own sent them.
+    pub relayed_ignored: u64,
+    /// Removals, or announcements on another topic, of a writer ever
+    /// classified as enforced: the classification was kept.
+    pub enforced_kept: u64,
+    /// New enforced writers refused because the enforced table was full.
+    pub enforced_refused: u64,
 }
 
 /// Persisted form.
@@ -124,13 +179,28 @@ pub struct DiscoveryStats {
 #[serde(deny_unknown_fields)]
 struct StateFile {
     format: String,
-    /// writer GUID (32 hex) -> topic.
+    /// writer GUID (32 hex) -> topic (empty: not enforced).
     writers: Vec<(String, String)>,
+    /// v2: not-enforced writers announced with an enforced channel's type.
+    #[serde(default)]
+    same_type: Vec<String>,
+    /// v2: not-enforced writers announced under an unverified INFO_DST.
+    #[serde(default)]
+    unverified: Vec<String>,
 }
 
-const STATE_FORMAT: &str = "robodr-firewall-gw-writers/v1";
+const STATE_FORMAT: &str = "robodr-firewall-gw-writers/v2";
+/// Still read (it has no `same_type` / `unverified` lists).
+const STATE_FORMAT_V1: &str = "robodr-firewall-gw-writers/v1";
 /// Largest state file read.
 const MAX_STATE_BYTES: u64 = 4 << 20;
+/// `O_NOFOLLOW` (Linux; differs between architectures).
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+const O_NOFOLLOW: i32 = 0o400000;
+/// `O_NONBLOCK` (Linux).
+const O_NONBLOCK: i32 = 0o4000;
 
 fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -151,10 +221,28 @@ fn unhex16(s: &str) -> Option<Guid> {
     Some(g)
 }
 
+fn prefix_of(g: &Guid) -> GuidPrefix {
+    let mut p = [0u8; 12];
+    p.copy_from_slice(&g[..12]);
+    p
+}
+
+/// How an INFO_DST destination relates to the robot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressed {
+    /// Every receiver, or one of the robot's participants.
+    Robot,
+    /// Another participant: the robot ignores the submessage.
+    Elsewhere,
+    /// A specific participant, but the robot's are not known yet.
+    Unverified,
+}
+
 impl std::fmt::Debug for Discovery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Discovery")
-            .field("writers", &self.writers.len())
+            .field("enforced", &self.enforced.len())
+            .field("others", &self.others.len())
             .field("epoch", &self.epoch)
             .field("stats", &self.stats)
             .finish()
@@ -162,16 +250,24 @@ impl std::fmt::Debug for Discovery {
 }
 
 impl Discovery {
+    /// `max_writers`: the not-enforced (least recently used) table;
+    /// the enforced table holds as many (see
+    /// [`Discovery::with_max_enforced`]).
     pub fn new(
         topics: Vec<Option<String>>,
         max_writers: usize,
         identities: IdentityResolver,
     ) -> Self {
         Self {
-            writers: HashMap::new(),
-            order: VecDeque::new(),
+            enforced: HashMap::new(),
+            max_enforced: max_writers.max(1),
+            others: HashMap::new(),
+            lru: BTreeMap::new(),
+            clock: 0,
             max_writers: max_writers.max(1),
             topics,
+            types: Vec::new(),
+            robot_prefixes: VecDeque::new(),
             reasm: FragmentReassembler::new(ReassemblyLimits::default()),
             identities,
             epoch: 0,
@@ -182,6 +278,19 @@ impl Discovery {
             port_bypass: None,
             robot_reasm: FragmentReassembler::new(ReassemblyLimits::default()),
         }
+    }
+
+    /// The size of the never-evicted enforced table.
+    pub fn with_max_enforced(mut self, n: usize) -> Self {
+        self.max_enforced = n.max(1);
+        self
+    }
+
+    /// The enforced channels' DDS type names (a not-enforced writer
+    /// announced with one of them is marked `same_type`).
+    pub fn with_channel_types(mut self, types: Vec<&'static str>) -> Self {
+        self.types = types;
+        self
     }
 
     /// The queued UDP port ranges the locator check compares with (none:
@@ -225,18 +334,48 @@ impl Discovery {
         }
     }
 
+    fn add_robot_prefix(&mut self, p: GuidPrefix) {
+        if p == GUIDPREFIX_UNKNOWN || self.robot_prefixes.contains(&p) {
+            return;
+        }
+        self.robot_prefixes.push_back(p);
+        while self.robot_prefixes.len() > MAX_ROBOT_PREFIXES {
+            self.robot_prefixes.pop_front();
+        }
+    }
+
+    /// The robot's participants seen so far (INFO_DST check).
+    pub fn robot_prefixes(&self) -> impl Iterator<Item = &GuidPrefix> {
+        self.robot_prefixes.iter()
+    }
+
+    fn addressed(&self, dest: GuidPrefix) -> Addressed {
+        if dest == GUIDPREFIX_UNKNOWN || self.robot_prefixes.contains(&dest) {
+            Addressed::Robot
+        } else if self.robot_prefixes.is_empty() {
+            Addressed::Unverified
+        } else {
+            Addressed::Elsewhere
+        }
+    }
+
     /// Robot-side discovery (observed, never queued; module docs, F7):
     /// the locator check on the robot's participants and on its endpoints
-    /// of enforced topics. Returns the report (the observer learns the
-    /// robot's `rt/lowstate` writers from it); `None` if not RTPS.
+    /// of enforced topics, and the robot's participant prefixes. Returns
+    /// the report (the observer learns the robot's `rt/lowstate` writers
+    /// from it); `None` if not RTPS.
     pub fn observe_robot(&mut self, datagram: &[u8]) -> Option<robodr_rtps::DatagramReport> {
         let report = self.robot_reasm.parse_datagram_detailed(datagram)?;
         if report.participants.is_empty() && report.endpoints.is_empty() {
             return Some(report);
         }
         self.stats.robot_datagrams += 1;
+        self.add_robot_prefix(report.header.guid_prefix);
         let before = self.stats.unqueued_locators;
         for p in &report.participants {
+            if p.guid_prefix == p.source {
+                self.add_robot_prefix(p.guid_prefix);
+            }
             let what = format!("robot participant {}", hex(&p.guid_prefix));
             self.check_locators(
                 &what,
@@ -288,38 +427,117 @@ impl Discovery {
         })
     }
 
-    /// Record a writer (also from a probe).
-    pub fn insert(&mut self, guid: Guid, info: WriterInfo) {
-        if self.writers.insert(guid, info).is_none() {
-            self.order.push_back(guid);
-            while self.order.len() > self.max_writers {
-                if let Some(old) = self.order.pop_front() {
-                    self.writers.remove(&old);
-                    self.stats.writers_evicted += 1;
+    /// Classify `guid` as enforced on `channel` (module docs: never
+    /// evicted). `false`: the enforced table is full, the writer was
+    /// refused (and forgotten, so it is unknown and probed).
+    fn set_enforced(&mut self, guid: Guid, channel: usize) -> bool {
+        self.forget_other(&guid);
+        let full = self.enforced.len() >= self.max_enforced;
+        match self.enforced.get_mut(&guid) {
+            Some(c) => {
+                if *c != channel {
+                    *c = channel;
+                    self.dirty = true;
                 }
+                true
+            }
+            None if full => {
+                self.stats.enforced_refused += 1;
+                false
+            }
+            None => {
+                self.enforced.insert(guid, channel);
+                self.dirty = true;
+                true
             }
         }
-        self.dirty = true;
     }
 
-    fn remove(&mut self, guid: &Guid) {
-        if self.writers.remove(guid).is_some() {
-            self.order.retain(|g| g != guid);
-            self.stats.writers_removed += 1;
+    /// The enforced table is full: new enforced writers are refused (and
+    /// must then be probed whatever `rtps.unknown_writers` says).
+    pub fn enforced_full(&self) -> bool {
+        self.enforced.len() >= self.max_enforced
+    }
+
+    /// Record a not-enforced writer or a probe result (least recently used
+    /// table). An enforced writer is never downgraded by it.
+    pub fn insert(&mut self, guid: Guid, info: WriterInfo) {
+        if self.enforced.contains_key(&guid) {
+            return;
+        }
+        self.clock += 1;
+        let now = self.clock;
+        if let Some((old_info, used)) = self.others.insert(guid, (info, now)) {
+            self.lru.remove(&used);
+            if old_info != info {
+                self.dirty = true;
+            }
+        } else {
             self.dirty = true;
+        }
+        self.lru.insert(now, guid);
+        while self.others.len() > self.max_writers {
+            let Some((_, old)) = self.lru.pop_first() else {
+                break;
+            };
+            self.others.remove(&old);
+            self.stats.writers_evicted += 1;
         }
     }
 
-    pub fn writer(&self, guid: &Guid) -> Option<WriterInfo> {
-        self.writers.get(guid).copied()
+    fn forget_other(&mut self, guid: &Guid) -> bool {
+        match self.others.remove(guid) {
+            Some((_, used)) => {
+                self.lru.remove(&used);
+                self.dirty = true;
+                true
+            }
+            None => false,
+        }
     }
 
+    /// What is known about `guid`, without marking it used.
+    pub fn writer(&self, guid: &Guid) -> Option<WriterInfo> {
+        if let Some(&ch) = self.enforced.get(guid) {
+            return Some(WriterInfo {
+                channel: Some(ch),
+                ..WriterInfo::default()
+            });
+        }
+        self.others.get(guid).map(|(w, _)| *w)
+    }
+
+    /// What is known about `guid`, marking a not-enforced entry used (the
+    /// decision path).
+    pub fn lookup(&mut self, guid: &Guid) -> Option<WriterInfo> {
+        if let Some(&ch) = self.enforced.get(guid) {
+            return Some(WriterInfo {
+                channel: Some(ch),
+                ..WriterInfo::default()
+            });
+        }
+        self.clock += 1;
+        let now = self.clock;
+        let (w, used) = self.others.get_mut(guid)?;
+        let old = std::mem::replace(used, now);
+        let w = *w;
+        self.lru.remove(&old);
+        self.lru.insert(now, *guid);
+        Some(w)
+    }
+
+    /// Writers known (enforced and not).
     pub fn len(&self) -> usize {
-        self.writers.len()
+        self.enforced.len() + self.others.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.writers.is_empty()
+        self.enforced.is_empty() && self.others.is_empty()
+    }
+
+    /// Writers in the enforced table.
+    pub fn enforced_len(&self) -> usize {
+        self.enforced.len()
     }
 
     /// The confirmed identity a participant prefix holds.
@@ -381,6 +599,16 @@ impl Discovery {
             }
         }
         for r in &report.removed_participants {
+            // Only a removal the robot acts on, sent by the participant
+            // itself, forgets anything.
+            if self.addressed(r.destination) != Addressed::Robot {
+                self.stats.misaddressed += 1;
+                continue;
+            }
+            if r.source != r.guid_prefix {
+                self.stats.relayed_ignored += 1;
+                continue;
+            }
             self.stats.participants_removed += 1;
             let mut guid = [0u8; 16];
             guid[..12].copy_from_slice(&r.guid_prefix);
@@ -391,18 +619,30 @@ impl Discovery {
             if self.identities.release(&r.guid_prefix).is_some() {
                 self.epoch += 1;
             }
+            self.stats.enforced_kept += self
+                .enforced
+                .keys()
+                .filter(|g| g[..12] == r.guid_prefix)
+                .count() as u64;
             let gone: Vec<Guid> = self
-                .writers
+                .others
                 .keys()
                 .filter(|g| g[..12] == r.guid_prefix)
                 .copied()
                 .collect();
             for g in gone {
-                self.remove(&g);
+                if self.forget_other(&g) {
+                    self.stats.writers_removed += 1;
+                }
             }
         }
         for e in &report.endpoints {
             if e.kind != EndpointKind::Writer {
+                continue;
+            }
+            let addressed = self.addressed(e.destination);
+            if addressed == Addressed::Elsewhere {
+                self.stats.misaddressed += 1;
                 continue;
             }
             // Every (GUID, topic) reading, alternates included: an
@@ -416,14 +656,17 @@ impl Discovery {
                     pairs.push((g, a.topic.as_str()));
                 }
             }
+            let same_type = e
+                .type_names
+                .iter()
+                .map(String::as_str)
+                .chain(e.alternates.iter().map(|a| a.type_name.as_str()))
+                .any(|t| self.types.contains(&t));
             let mut guids: Vec<Guid> = pairs.iter().map(|(g, _)| *g).collect();
             guids.sort_unstable();
             guids.dedup();
             for guid in guids {
-                self.announced.push(Announced {
-                    guid,
-                    whole_participant: false,
-                });
+                let own = prefix_of(&guid) == e.source;
                 let topics: Vec<String> = pairs
                     .iter()
                     .filter(|(g, _)| *g == guid)
@@ -431,30 +674,58 @@ impl Discovery {
                     .collect();
                 let channel = self.channel_of(&topics);
                 self.stats.writers_learned += 1;
-                if channel.is_some() {
-                    self.stats.writers_enforced += 1;
+                if own {
+                    self.announced.push(Announced {
+                        guid,
+                        whole_participant: false,
+                    });
                 }
-                // An enforced classification is never downgraded by a later
-                // announcement of the same GUID on another topic.
-                let channel = channel.or(self.writers.get(&guid).and_then(|w| w.channel));
-                self.insert(
-                    guid,
-                    WriterInfo {
-                        channel,
-                        probed: false,
-                    },
-                );
+                match channel {
+                    // Enforcing is the safe direction: from anyone.
+                    Some(ch) => {
+                        self.stats.writers_enforced += 1;
+                        self.set_enforced(guid, ch);
+                    }
+                    None if self.enforced.contains_key(&guid) => {
+                        // Never downgraded (module docs).
+                        self.stats.enforced_kept += 1;
+                    }
+                    None if !own => self.stats.relayed_ignored += 1,
+                    None => self.insert(
+                        guid,
+                        WriterInfo {
+                            channel: None,
+                            probed: false,
+                            same_type,
+                            unverified: addressed == Addressed::Unverified,
+                        },
+                    ),
+                }
             }
         }
         for r in &report.removed_endpoints {
-            if r.kind == EndpointKind::Writer {
-                if let Some(g) = r.guid {
-                    self.announced.push(Announced {
-                        guid: g,
-                        whole_participant: false,
-                    });
-                    self.remove(&g);
-                }
+            if r.kind != EndpointKind::Writer {
+                continue;
+            }
+            let Some(g) = r.guid else {
+                continue;
+            };
+            if self.addressed(r.destination) != Addressed::Robot {
+                self.stats.misaddressed += 1;
+                continue;
+            }
+            if prefix_of(&g) != r.source {
+                self.stats.relayed_ignored += 1;
+                continue;
+            }
+            self.announced.push(Announced {
+                guid: g,
+                whole_participant: false,
+            });
+            if self.enforced.contains_key(&g) {
+                self.stats.enforced_kept += 1;
+            } else if self.forget_other(&g) {
+                self.stats.writers_removed += 1;
             }
         }
     }
@@ -470,42 +741,106 @@ impl Discovery {
     /// topic, writers SEDP announced on another topic with an empty topic
     /// (so a restarted gateway does not run them through the lenient
     /// content probe, which may classify a non-motion sample of plausible
-    /// shape as a motion channel and suppress it). Probed writers are not
-    /// persisted.
+    /// shape as a motion channel and suppress it) and their `same_type` /
+    /// `unverified` marks. Probed writers are not persisted. Written to a
+    /// fresh `O_EXCL` 0600 temporary file (a symlink or file planted at its
+    /// name is removed, never followed), then renamed.
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
-        let writers: Vec<(String, String)> = self
-            .order
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut writers: Vec<(String, String)> = self
+            .enforced
             .iter()
-            .filter_map(|g| {
-                let w = self.writers.get(g)?;
-                match w.channel {
-                    Some(ch) => Some((hex(g), self.topics.get(ch)?.clone()?)),
-                    None if !w.probed => Some((hex(g), String::new())),
-                    None => None,
-                }
-            })
+            .filter_map(|(g, ch)| Some((hex(g), self.topics.get(*ch)?.clone()?)))
             .collect();
+        let mut same_type = Vec::new();
+        let mut unverified = Vec::new();
+        for (g, (w, _)) in &self.others {
+            if w.channel.is_some() || w.probed {
+                continue;
+            }
+            writers.push((hex(g), String::new()));
+            if w.same_type {
+                same_type.push(hex(g));
+            }
+            if w.unverified {
+                unverified.push(hex(g));
+            }
+        }
+        writers.sort_unstable();
+        same_type.sort_unstable();
+        unverified.sort_unstable();
         let s = StateFile {
             format: STATE_FORMAT.to_string(),
             writers,
+            same_type,
+            unverified,
         };
         let text = serde_json::to_string(&s).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, text)?;
+        // unlink(2) removes a planted symlink itself, never its target.
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)?;
         self.dirty = false;
         Ok(())
     }
 
     /// Load a persisted map (entries for topics no longer enforced are
-    /// skipped). A missing file is not an error.
+    /// skipped). A missing file is not an error. Opened without following
+    /// a symlink and without blocking; refused unless a regular file, not
+    /// writable by group or others, owned by root or by the owner of its
+    /// directory (as the restriction file).
     pub fn load(&mut self, path: &Path) -> Result<usize, String> {
         use std::io::Read as _;
-        let f = match std::fs::File::open(path) {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(path)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Err(e) => return Err(format!("{}: {e} (a symlink is refused)", path.display())),
         };
+        let meta = f
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if !meta.file_type().is_file() {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!("{}: writable by group or others", path.display()));
+        }
+        let dir_owner = path
+            .parent()
+            .map(|d| {
+                if d.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    d
+                }
+            })
+            .and_then(|d| std::fs::metadata(d).ok())
+            .map(|m| m.uid());
+        if meta.uid() != 0 && Some(meta.uid()) != dir_owner {
+            return Err(format!(
+                "{}: owned by uid {}, neither root nor the directory's owner",
+                path.display(),
+                meta.uid()
+            ));
+        }
         let mut text = String::new();
         f.take(MAX_STATE_BYTES + 1)
             .read_to_string(&mut text)
@@ -515,29 +850,34 @@ impl Discovery {
         }
         let s: StateFile =
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        if s.format != STATE_FORMAT {
+        if s.format != STATE_FORMAT && s.format != STATE_FORMAT_V1 {
             return Err(format!("{}: unknown format {:?}", path.display(), s.format));
         }
+        let same_type: std::collections::HashSet<String> = s.same_type.into_iter().collect();
+        let unverified: std::collections::HashSet<String> = s.unverified.into_iter().collect();
         let mut n = 0;
         for (g, topic) in s.writers {
             let Some(guid) = unhex16(&g) else {
                 continue;
             };
-            let channel = self.channel_of(std::slice::from_ref(&topic));
-            if channel.is_none() && !topic.is_empty() {
-                // A topic no longer enforced: let the writer be learned or
-                // probed again.
+            if topic.is_empty() {
+                self.insert(
+                    guid,
+                    WriterInfo {
+                        channel: None,
+                        probed: false,
+                        same_type: same_type.contains(&g),
+                        unverified: unverified.contains(&g),
+                    },
+                );
                 continue;
             }
-            self.insert(
-                guid,
-                WriterInfo {
-                    channel,
-                    probed: false,
-                },
-            );
-            if channel.is_some() {
-                n += 1;
+            // A topic no longer enforced: let the writer be learned or
+            // probed again.
+            if let Some(ch) = self.channel_of(std::slice::from_ref(&topic)) {
+                if self.set_enforced(guid, ch) {
+                    n += 1;
+                }
             }
         }
         self.dirty = false;

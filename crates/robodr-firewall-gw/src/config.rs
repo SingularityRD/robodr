@@ -157,8 +157,13 @@ pub struct RtpsConfig {
     pub domain_ids: Vec<u16>,
     pub malformed_datagram: MalformedPolicy,
     pub unknown_writers: UnknownWriters,
-    /// Most writers remembered from SEDP (oldest evicted first).
+    /// Most not-enforced writers remembered (SEDP on other topics, probe
+    /// results; least recently used evicted first).
     pub max_writers: usize,
+    /// Most writers ever classified as enforced (never evicted; when full,
+    /// a new enforced writer is refused, reported, and probed instead).
+    /// `1..=65536`, default 1024.
+    pub max_enforced_writers: usize,
     /// Writers per enforced channel with sequence / replay state.
     pub max_writers_per_channel: usize,
     /// Where the learned writer -> channel map is persisted (so a gateway
@@ -191,6 +196,7 @@ impl Default for RtpsConfig {
             malformed_datagram: MalformedPolicy::Drop,
             unknown_writers: UnknownWriters::Probe,
             max_writers: 4096,
+            max_enforced_writers: 1024,
             max_writers_per_channel: 16,
             state_file: None,
             max_sn_jump: 64,
@@ -959,6 +965,9 @@ impl GatewayConfig {
         }
         if self.rtps.max_writers == 0 || self.rtps.max_writers_per_channel == 0 {
             return Err("rtps.max_writers and rtps.max_writers_per_channel must be >= 1".into());
+        }
+        if !(1..=65_536).contains(&self.rtps.max_enforced_writers) {
+            return Err("rtps.max_enforced_writers must be 1..=65536".into());
         }
         if !(1..=1 << 20).contains(&self.rtps.max_sn_jump) {
             return Err("rtps.max_sn_jump must be in 1..=1048576".into());

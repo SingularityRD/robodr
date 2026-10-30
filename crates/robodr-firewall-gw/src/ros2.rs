@@ -129,10 +129,11 @@ pub fn decode_strict(slot: &[u8], stamped: bool) -> Result<WireTwist, Undecidabl
 /// reader might accept (XCDR1 or XCDR2, either endianness, `DHEADER`s,
 /// non-zero padding, trailing octets)? Only decides channel membership:
 /// the sample is then decided with [`decode_strict`] and fails closed.
-/// `Twist`: a body of 48..=80 octets (six `float64`, plus up to three
-/// `DHEADER`s and slack). `TwistStamped`: a stamp, a `frame_id` length of
-/// 1..=256 and its text, then six `float64` with at most 48 octets of
-/// headers / padding / trailing data, with or without a leading
+/// `Twist`: a body of at least 48 octets (six `float64`; `DHEADER`s,
+/// padding and **any** trailing octets after them, which a CDR reader
+/// ignores: gateway review, finding 2, a padded twist must not miss the
+/// probe). `TwistStamped`: a stamp, a `frame_id` length of 1..=256 and its
+/// text, then at least six `float64`, with or without a leading
 /// `DHEADER`.
 pub fn plausible(slot: &[u8], stamped: bool) -> bool {
     let Some(r) = slot
@@ -147,7 +148,7 @@ pub fn plausible(slot: &[u8], stamped: bool) -> bool {
     let big = r.endian() == Some(Endian::Big);
     let body = slot.get(4..).unwrap_or_default();
     if !stamped {
-        return (48..=80).contains(&body.len());
+        return body.len() >= 48;
     }
     [0usize, 4].iter().any(|&start| {
         let Some(len) = u32_at(body, start + 8, big).map(|l| l as usize) else {
@@ -157,7 +158,7 @@ pub fn plausible(slot: &[u8], stamped: bool) -> bool {
             return false;
         }
         let end = start + 12 + len;
-        body.len() >= end + 48 && body.len() <= end + 48 + 48
+        body.len() >= end + 48
     })
 }
 

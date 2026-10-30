@@ -56,6 +56,25 @@ pub struct PacketMeta {
     pub src_mac: Option<[u8; 6]>,
 }
 
+/// Why [`Gateway::rtps`] did not decide a datagram sample by sample.
+enum RtpsError {
+    /// Not decidable as a whole (`rtps.malformed_datagram` applies).
+    Malformed,
+    /// A sample to suppress could not be turned into a PAD: dropped.
+    SuppressFailed,
+}
+
+enum Class {
+    /// Decided on this enforced channel.
+    Channel(usize),
+    /// Not a motion command of an enforced channel.
+    Pass,
+    /// An unknown writer's sample the probe cannot read.
+    Undecidable,
+    /// A writer known as not enforced sent this channel's motion command.
+    Suspicious(usize),
+}
+
 /// What happened to one decided sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
@@ -120,6 +139,13 @@ pub struct GatewayStats {
     /// Unknown-writer DATA_FRAG / key-only / non-standard samples that
     /// cannot be probed (suppressed in enforce mode).
     pub unknown_undecidable: u64,
+    /// Samples of a writer known as not enforced whose payload is a motion
+    /// channel's command (suppressed in enforce mode; gateway review,
+    /// finding 1).
+    pub suspicious_writer: u64,
+    /// Datagrams dropped because a sample decided "suppress" could not be
+    /// removed in place.
+    pub suppress_failed: u64,
     /// `LowCmd_` frames refused for a non-motor field (`bms_cmd.off`).
     pub non_motor_rejected: u64,
     /// Loco requests refused before the firewall: a `SetFsmId` that is not
@@ -717,6 +743,14 @@ impl Gateway {
             max_sn_jump: i64::try_from(cfg.rtps.max_sn_jump).unwrap_or(i64::MAX),
             binding_takeover_ns: cfg.rtps.binding_takeover_ns,
             discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile))
+                .with_max_enforced(cfg.rtps.max_enforced_writers)
+                .with_channel_types(
+                    cfg.channels
+                        .iter()
+                        .filter(|c| c.codec.is_rtps())
+                        .map(|c| c.codec.dds_type_name())
+                        .collect(),
+                )
                 .with_queued_ranges(cfg.rtps_port_ranges()),
             samples: Vec::with_capacity(rtps::MAX_SAMPLES),
             scratch: Vec::with_capacity(65_536),
@@ -850,7 +884,14 @@ impl Gateway {
             };
             match self.rtps(payload, ip.src, meta) {
                 Ok(m) => m,
-                Err(()) => {
+                Err(RtpsError::SuppressFailed) => {
+                    // A sample decided "suppress" could not be removed in
+                    // place: the whole datagram goes (fail closed), whatever
+                    // `malformed_datagram` says (gateway review, finding 9).
+                    self.stats.suppress_failed += 1;
+                    return Verdict::Drop;
+                }
+                Err(RtpsError::Malformed) => {
                     self.stats.rtps_malformed += 1;
                     return match self.malformed {
                         MalformedPolicy::Drop => Verdict::Drop,
@@ -965,22 +1006,34 @@ impl Gateway {
 
     // ------------------------------------------------------------- RTPS
 
-    /// `Ok(modified)`, or `Err` if the datagram is undecidable as a whole.
-    fn rtps(&mut self, d: &mut [u8], src: Ipv4Addr, meta: PacketMeta) -> Result<bool, ()> {
+    /// `Ok(modified)`, or `Err` if the datagram is undecidable as a whole
+    /// or a suppression could not be applied.
+    fn rtps(&mut self, d: &mut [u8], src: Ipv4Addr, meta: PacketMeta) -> Result<bool, RtpsError> {
         let mut samples = std::mem::take(&mut self.samples);
         let r = rtps::walk(d, WalkOptions::default(), &mut samples);
         let out = match r {
-            Err(_) => Err(()),
+            Err(_) => Err(RtpsError::Malformed),
             Ok(sum) => {
                 if sum.has_builtin {
                     self.stats.discovery_datagrams += 1;
+                    let refused = self.discovery.stats.enforced_refused;
                     self.discovery.learn(d, src, meta.instant);
+                    let n = self.discovery.stats.enforced_refused - refused;
+                    if n > 0 {
+                        let limit = self.discovery.enforced_len();
+                        self.note(gw_rules::FRAGMENTED_COMMAND, None, || Detail {
+                            what: Some(format!("{n} enforced writer(s) refused")),
+                            limit: Some(limit as f64),
+                            ..Detail::reason("enforced_writer_table_full")
+                        });
+                    }
                     self.arm_restarts(Binding {
                         ip: src,
                         mac: meta.src_mac,
                     });
                 }
                 let mut modified = false;
+                let mut failed = false;
                 for s in samples.iter().filter(|s| !s.builtin) {
                     match self.rtps_sample(d, s, src, meta) {
                         Outcome::Pass => {}
@@ -988,11 +1041,17 @@ impl Gateway {
                         Outcome::Suppress => {
                             if rtps::suppress(d, &s.sub, s.little_endian) {
                                 modified = true;
+                            } else {
+                                failed = true;
                             }
                         }
                     }
                 }
-                Ok(modified)
+                if failed {
+                    Err(RtpsError::SuppressFailed)
+                } else {
+                    Ok(modified)
+                }
             }
         };
         self.samples = samples;
@@ -1031,20 +1090,48 @@ impl Gateway {
     }
 
     /// The enforced channel of a user sample's writer: its SEDP / persisted
-    /// classification, else (`unknown_writers: probe`) a content probe.
-    /// `Err(())`: an unknown writer's sample that cannot be probed
-    /// (DATA_FRAG, key-only, non-standard): suppressed in enforce mode.
-    fn classify(&mut self, d: &[u8], s: &Sample) -> Result<Option<usize>, ()> {
-        if let Some(w) = self.discovery.writer(&s.writer) {
-            return Ok(w.channel);
+    /// classification, else (`unknown_writers: probe`, or always while the
+    /// enforced table is full) a content probe. A writer known as not
+    /// enforced whose payload probes as a motion channel is
+    /// [`Class::Suspicious`] (gateway review, finding 1: a discovery
+    /// differential that hides a motion writer behind another topic).
+    fn classify(&mut self, d: &[u8], s: &Sample) -> Class {
+        let unprobeable =
+            s.kind == SampleKind::DataFrag || s.non_standard || s.content == Content::Key;
+        if let Some(w) = self.discovery.lookup(&s.writer) {
+            return match w.channel {
+                Some(ci) => Class::Channel(ci),
+                None if unprobeable || w.probed => Class::Pass,
+                None => match self.probe_match(d, s, |c| {
+                    // A CRC-checked `LowCmd_`, a hand frame, a trajectory:
+                    // whatever the writer announced. Shapes many messages
+                    // share (a twist's six `float64`): only when the writer
+                    // announced a motion channel's type, or under an
+                    // INFO_DST that could not be checked. Every Unitree
+                    // service shares `Request_`, so only the latter there.
+                    if c.is_joint() || c.is_trajectory() {
+                        true
+                    } else if c.is_ros2_twist() {
+                        w.same_type || w.unverified
+                    } else {
+                        w.unverified
+                    }
+                }) {
+                    Some(ci) => Class::Suspicious(ci),
+                    None => Class::Pass,
+                },
+            };
         }
-        if self.unknown_writers == UnknownWriters::Pass {
-            return Ok(None);
+        if self.unknown_writers == UnknownWriters::Pass && !self.discovery.enforced_full() {
+            return Class::Pass;
         }
-        if s.kind == SampleKind::DataFrag || s.non_standard || s.content == Content::Key {
-            return Err(());
+        if unprobeable {
+            return Class::Undecidable;
         }
-        Ok(self.probe(d, s))
+        match self.probe(d, s) {
+            Some(ci) => Class::Channel(ci),
+            None => Class::Pass,
+        }
     }
 
     /// Classify an unknown writer's sample by content. **Lenient** (review
@@ -1054,6 +1141,22 @@ impl Gateway {
     /// that channel, so a non-canonical encoding fails closed instead of
     /// being classified as nothing and passed.
     fn probe(&mut self, d: &[u8], s: &Sample) -> Option<usize> {
+        let found = self.probe_match(d, s, |_| true)?;
+        self.stats.probed += 1;
+        self.discovery.insert(
+            s.writer,
+            WriterInfo {
+                channel: Some(found),
+                probed: true,
+                ..WriterInfo::default()
+            },
+        );
+        Some(found)
+    }
+
+    /// The channel `s`'s payload matches by content (see [`Self::probe`]),
+    /// among the channels whose codec `consider` accepts.
+    fn probe_match(&self, d: &[u8], s: &Sample, consider: impl Fn(Codec) -> bool) -> Option<usize> {
         let slot = d.get(s.payload.clone()?)?;
         // Each channel's content match and its priority (lower first): a
         // payload two channels could read goes to the stricter one
@@ -1110,8 +1213,10 @@ impl Gateway {
                 Codec::UnitreeDex3HandCmd | Codec::UnitreeHandSdk => {
                     hand::plausible(slot, c.codec, c.hand_slots).then_some(2)
                 }
+                // After the trajectories: a twist's shape (six `float64`) is
+                // the loosest.
                 Codec::Ros2Twist | Codec::Ros2TwistStamped => {
-                    ros2::plausible(slot, c.codec == Codec::Ros2TwistStamped).then_some(3)
+                    ros2::plausible(slot, c.codec == Codec::Ros2TwistStamped).then_some(5)
                 }
                 Codec::Ros2JointTrajectory | Codec::Ros2FollowJointTrajectoryGoal => c
                     .traj
@@ -1120,22 +1225,13 @@ impl Gateway {
                 Codec::Go1HighCmd | Codec::Go1LowCmd | Codec::Go1LowCmdCompressed => None,
             }
         };
-        let found = self
-            .channels
+        self.channels
             .iter()
             .enumerate()
+            .filter(|(_, c)| consider(c.codec))
             .filter_map(|(i, c)| matches(c).map(|p| (p, i)))
             .min()
-            .map(|(_, i)| i)?;
-        self.stats.probed += 1;
-        self.discovery.insert(
-            s.writer,
-            WriterInfo {
-                channel: Some(found),
-                probed: true,
-            },
-        );
-        Some(found)
+            .map(|(_, i)| i)
     }
 
     /// `(claimed, source)`: what the writer GUID resolves to in the policy,
@@ -1194,9 +1290,24 @@ impl Gateway {
         meta: PacketMeta,
     ) -> Outcome {
         let ci = match self.classify(d, s) {
-            Ok(Some(ci)) => ci,
-            Ok(None) => return Outcome::Pass,
-            Err(()) => {
+            Class::Channel(ci) => ci,
+            Class::Pass => return Outcome::Pass,
+            Class::Suspicious(ci) => {
+                // Known as writing another topic, but its payload is this
+                // channel's motion command: fail closed.
+                self.stats.suspicious_writer += 1;
+                self.stats.suppressed += 1;
+                let writer = s.writer;
+                self.note(gw_rules::FRAGMENTED_COMMAND, Some(ci), || Detail {
+                    what: Some(format!(
+                        "writer {} announced on another topic",
+                        hex(&writer)
+                    )),
+                    ..Detail::reason("unenforced_writer_motion_payload")
+                });
+                return Outcome::Suppress;
+            }
+            Class::Undecidable => {
                 // An unknown writer's fragment / key-only / non-standard
                 // sample: the probe cannot read it, so it could be a motion
                 // command nobody checked (see the crate docs).

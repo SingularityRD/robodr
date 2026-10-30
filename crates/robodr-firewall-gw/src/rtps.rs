@@ -76,9 +76,34 @@ const PID_SENTINEL: u16 = 0x0001;
 pub type GuidPrefix = [u8; 12];
 pub type Guid = [u8; 16];
 
-/// Is this writer entity a builtin one (entityKind `0xc0..=0xff`)?
+/// The standard builtin writer entity ids (DDSI-RTPS 2.5 §9.3.1.3,
+/// DDS-Security 1.1 §7.4.7.1, DDS-XTypes 1.3 §7.6.3.3.4): SPDP, SEDP
+/// topics / publications / subscriptions, participant message, their
+/// secure variants, the stateless / volatile-secure message writers and
+/// the type-lookup request / reply writers.
+pub const BUILTIN_WRITERS: [[u8; 4]; 13] = [
+    [0x00, 0x01, 0x00, 0xc2], // SPDP
+    [0x00, 0x00, 0x02, 0xc2], // SEDP topics
+    [0x00, 0x00, 0x03, 0xc2], // SEDP publications
+    [0x00, 0x00, 0x04, 0xc2], // SEDP subscriptions
+    [0x00, 0x02, 0x00, 0xc2], // participant message
+    [0xff, 0x00, 0x03, 0xc2], // secure publications
+    [0xff, 0x00, 0x04, 0xc2], // secure subscriptions
+    [0xff, 0x02, 0x00, 0xc2], // secure participant message
+    [0xff, 0x01, 0x01, 0xc2], // SPDP reliable secure
+    [0x00, 0x02, 0x01, 0xc3], // stateless message
+    [0xff, 0x02, 0x02, 0xc3], // volatile message secure
+    [0x00, 0x03, 0x00, 0xc3], // type lookup request
+    [0x00, 0x03, 0x01, 0xc3], // type lookup reply
+];
+
+/// Is this writer entity one of the standard builtin (discovery) writers?
+/// Only those: a writer whose entity merely has the builtin kind bits
+/// (`0xc0`) but another id is a user writer for the gateway (gateway
+/// review, finding 7: a receiver matches it like any writer its SEDP
+/// announced), so its samples are decided.
 pub fn is_builtin_entity(entity: [u8; 4]) -> bool {
-    entity[3] & 0xc0 == 0xc0
+    BUILTIN_WRITERS.contains(&entity)
 }
 
 /// DATA or DATA_FRAG.
