@@ -9,7 +9,9 @@
 //!   control-handover motion ids, the Unitree legacy UDP sender ids, the
 //!   motion command type id and the discovery-flood aggregate;
 //! * 2.2: + the secure-delivery ids of `robodr-deliverd` (`robot.deliver.*`,
-//!   data source `robodr_delivery`, `docs/SECURE-DELIVERY.md` §9).
+//!   data source `robodr_delivery`, `docs/SECURE-DELIVERY.md` §9);
+//! * 2.3: + the in-path gateway ids of `robodr-firewall-gw`
+//!   (`robot.gateway.*`, data source `ros2_motion_commands`, Sprint 8).
 
 mod common;
 
@@ -103,16 +105,87 @@ fn as_2_0(json: &str, id: &str) -> String {
     empty_array(&empty_array(&out, "mitre_predictions"), "attacks")
 }
 
+/// Ids whose catalog entry was added after contract 2.2.0 by the in-path
+/// gateway (2.3).
+const IDS_2_3_GATEWAY: &[&str] = &[
+    "robot.gateway.trajectory_rejected",
+    "robot.gateway.trajectory_time_scaled",
+    "robot.gateway.undecodable_command",
+    "robot.gateway.fragmented_command",
+    "robot.gateway.writer_binding_conflict",
+    "robot.gateway.sequence_jump",
+    "robot.gateway.port_bypass_risk",
+    "robot.gateway.restriction_changed",
+    "robot.gateway.findings_dropped",
+];
+
 #[test]
-fn current_contract_is_2_2() {
-    assert_eq!(CONTRACT_VERSION, "2.2.0");
+fn entries_added_after_2_2_are_not_in_2_2_or_earlier() {
+    let g = generic();
+    for id in IDS_2_3_GATEWAY {
+        let full = rule_info(id);
+        assert_ne!(full, g, "{id} has its own entry in the current catalog");
+        assert_eq!(full.data_source, "ros2_motion_commands", "{id}");
+        for v in ["1.0.0", "1.3.0", "2.0.0", "2.1.0", "2.2.0", "2.2.9"] {
+            assert_eq!(rule_info_for_contract(id, v), g, "{id} @ {v}");
+        }
+        for v in ["2.3.0", "2.3.5", "2.9.0"] {
+            assert_eq!(rule_info_for_contract(id, v), full, "{id} @ {v}");
+        }
+        assert_eq!(rule_info_for_contract(id, "x"), full);
+    }
+    for id in IDS_2_1.iter().chain(IDS_2_2) {
+        assert_eq!(
+            rule_info_for_contract(id, "2.3.0"),
+            rule_info_for_contract(id, "2.2.0")
+        );
+    }
+}
+
+#[test]
+fn a_2_2_message_validates_with_its_own_catalog() {
+    for id in IDS_2_3_GATEWAY {
+        let v23 = build(id);
+        robodr_ocsf::parse_and_validate(&v23).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        let new = rule_info(id);
+        let old = rule_info_for_contract(id, "2.2.0");
+        assert!(old.techniques.is_empty() && new.techniques.is_empty());
+        let v22 = v23
+            .replace(new.title, old.title)
+            .replace(new.desc, old.desc)
+            .replace(
+                &format!("\"{}\"", new.data_source),
+                &format!("\"{}\"", old.data_source),
+            )
+            .replace(
+                &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+                "\"contract_version\":\"2.2.0\"",
+            );
+        assert_ne!(v22, v23);
+        robodr_ocsf::parse_and_validate(&v22).unwrap_or_else(|e| panic!("{id} 2.2: {e:?}"));
+        let up = v22.replace(
+            "\"contract_version\":\"2.2.0\"",
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+        );
+        assert!(robodr_ocsf::parse_and_validate(&up).is_err(), "{id}");
+        let down = v23.replace(
+            &format!("\"contract_version\":\"{CONTRACT_VERSION}\""),
+            "\"contract_version\":\"2.2.0\"",
+        );
+        assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
+    }
+}
+
+#[test]
+fn current_contract_is_2_3() {
+    assert_eq!(CONTRACT_VERSION, "2.3.0");
     let schema: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/contracts/robodr-finding.schema.json"
     ))
     .unwrap();
     assert_eq!(
         schema["$id"],
-        "https://schemas.singularityrd.com/robodr/findings/2.2.0"
+        "https://schemas.singularityrd.com/robodr/findings/2.3.0"
     );
 }
 

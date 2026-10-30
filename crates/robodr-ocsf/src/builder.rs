@@ -194,6 +194,8 @@ pub const CATALOG_1_3_MINOR: u64 = 3;
 pub const CATALOG_2_1_MINOR: u64 = 1;
 /// Contract 2.x minor that added [`catalog_2_2`]'s entries.
 pub const CATALOG_2_2_MINOR: u64 = 2;
+/// Contract 2.x minor that added [`catalog_2_3_gateway`]'s entries.
+pub const CATALOG_2_3_MINOR: u64 = 3;
 
 /// The trusted rule catalog of the current contract
 /// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
@@ -204,6 +206,7 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         .or_else(|| catalog_1_3(rule))
         .or_else(|| catalog_2_1(rule))
         .or_else(|| catalog_2_2(rule))
+        .or_else(|| catalog_2_3_gateway(rule))
         .unwrap_or(GENERIC)
 }
 
@@ -217,7 +220,8 @@ pub fn rule_info(rule: &str) -> RuleInfo {
 /// | 1.0 - 1.2 | base ([`catalog_1_0`]) |
 /// | 1.3+ (1.x), 2.0 | base + 1.3 ([`catalog_1_3`], exactly as released in 1.3) |
 /// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
-/// | 2.2+ | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+/// | 2.2 | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
+/// | 2.3+ | base + 1.3 + 2.1 + 2.2 + 2.3 ([`catalog_2_3_gateway`]) |
 ///
 /// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
@@ -231,10 +235,13 @@ pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_1_MINOR);
     let with_2_2 =
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_2_MINOR);
+    let with_2_3 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_3_MINOR);
     catalog_1_0(rule)
         .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
         .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
         .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
+        .or_else(|| with_2_3.then(|| catalog_2_3_gateway(rule)).flatten())
         .unwrap_or(GENERIC)
 }
 
@@ -1038,6 +1045,67 @@ fn catalog_2_2(rule: &str) -> Option<RuleInfo> {
             "The unit's delivery agent saw a release bundle that skips bundles it never received, or two different bundles with the same sequence number, or one that does not follow the accepted bundle.",
             DELIVERY,
             &[],
+        ),
+        _ => return None,
+    })
+}
+
+// --- Contract 2.3: in-path gateway (robot.gateway.*) -------------------------
+// Kept in its own function and block: other 2.3 additions (e.g. sealing)
+// live in their own `catalog_2_3_*` function, chained the same way.
+
+/// Entries added in contract **2.3** for the in-path Motion Firewall
+/// gateway `robodr-firewall-gw` (its own decisions, fed to agentd through
+/// the `gateway_feed` socket; Sprint 8), data source
+/// `ros2_motion_commands` (like the firewall's own entries). Not in 2.2 or
+/// earlier: a 2.2 validator applies the generic entry to these ids, and so
+/// does a 2.3 validator to a 2.2 message ([`rule_info_for_contract`]).
+fn catalog_2_3_gateway(rule: &str) -> Option<RuleInfo> {
+    const MOTION: &str = "ros2_motion_commands";
+    const fn e(title: &'static str, desc: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source: MOTION,
+            techniques: &[],
+        }
+    }
+    Some(match rule {
+        "robot.gateway.trajectory_rejected" => e(
+            "Joint trajectory blocked by the in-path gateway",
+            "The in-path motion gateway suppressed a ROS 2 joint trajectory or FollowJointTrajectory goal that was outside the channel's bounds: an unknown or repeated joint name, a non-finite value, time not increasing, too many points or too long, or a position, velocity, acceleration or effort beyond its joint limit. It never reached the robot.",
+        ),
+        "robot.gateway.trajectory_time_scaled" => e(
+            "Joint trajectory slowed down by the in-path gateway",
+            "The in-path motion gateway forwarded a ROS 2 joint trajectory slowed down in place, because its velocities or accelerations exceeded the channel's limits; the path is unchanged.",
+        ),
+        "robot.gateway.undecodable_command" => e(
+            "Undecodable motion command blocked by the in-path gateway",
+            "The in-path motion gateway could not decode a sample of an enforced motion channel strictly (truncated, non-canonical or unsupported encoding) and decided it as an integrity failure: it was suppressed or replaced by the firewall's substitute.",
+        ),
+        "robot.gateway.fragmented_command" => e(
+            "Fragmented motion command blocked by the in-path gateway",
+            "The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify; such a sample cannot be decided in place.",
+        ),
+        "robot.gateway.writer_binding_conflict" => e(
+            "Authorised motion writer seen from another address",
+            "The in-path motion gateway received samples under an authorised writer's GUID from another source address or MAC than the one the writer's stream is bound to, while the bound side was live: a spoofing attempt, suppressed.",
+        ),
+        "robot.gateway.sequence_jump" => e(
+            "Motion command sequence jump held back",
+            "The in-path motion gateway held back a sample whose RTPS sequence number jumped far past the writer's stream until the writer confirmed it: a forged high sequence number could otherwise make the robot drop the genuine commands.",
+        ),
+        "robot.gateway.port_bypass_risk" => e(
+            "Motion traffic may bypass the in-path gateway",
+            "DDS discovery announced a locator on a UDP port the in-path motion gateway does not inspect: commands sent there would reach the robot unchecked until the gateway's port ranges are fixed.",
+        ),
+        "robot.gateway.restriction_changed" => e(
+            "Motion restriction changed on the in-path gateway",
+            "A restrict_motion restriction was applied, changed, lifted or expired on the in-path motion gateway. Informational: the evidence trail of the robot's effective motion limits.",
+        ),
+        "robot.gateway.findings_dropped" => e(
+            "In-path gateway findings lost",
+            "The in-path motion gateway had more distinct findings in one reporting period than it can hold; some were counted but not reported individually.",
         ),
         _ => return None,
     })

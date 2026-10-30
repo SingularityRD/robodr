@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Contract | `robodr.findings`, version **2.2.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
-| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings into the same spool), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
+| Contract | `robodr.findings`, version **2.3.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings into the same spool; since 2.3 the in-path gateway `robodr-firewall-gw` reports its `robot.gateway.*` findings through agentd's `gateway_feed` socket), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
-| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.2.0`; it also describes 2.0.x and 2.1.x messages, whose only difference is the rule catalog the validator applies, §3) |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`; it also describes 2.0.x, 2.1.x and 2.2.x messages, whose only difference is the rule catalog the validator applies, §3) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 | Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
@@ -71,7 +71,7 @@ each one against the robot's current safety state and may refuse it.
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | the value's own `contract_version` (`2.2.0` from this producer; a forwarded or replayed 2.0 or 2.1 message keeps its version) |
+| `robodr-contract-version` | the value's own `contract_version` (`2.3.0` from this producer; a forwarded or replayed 2.0, 2.1 or 2.2 message keeps its version) |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -86,7 +86,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "2.2.0",
+  "contract_version": "2.3.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robodr",
@@ -422,7 +422,8 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.0 – 1.2 | base catalog |
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
-  | 2.2 and later | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
+  | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
+  | 2.3 and later | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) |
 
   A finding of an older minor for a rule that only gained an entry in a
   later minor carries the generic entry and stays valid; a finding of that
@@ -484,6 +485,52 @@ content), `state_restored` (the state file was missing or behind and was
 restored from the signed high-water record), `state_lost` (it could not
 be restored completely: the unit refuses imports and installs until it is
 re-anchored), `highwater_invalid` (the high-water record did not verify).
+
+## 3b. Rule catalog 2.3: in-path gateway (`robot.gateway.*`)
+
+<!-- 2.3 gateway block: keep separate from other 2.3 additions (e.g. robot.seal.*). -->
+
+Added in 2.3 for the in-path Motion Firewall gateway `robodr-firewall-gw`
+(Sprint 8). The gateway counts its own decisions per (rule, channel) and
+reports one aggregated deviation per housekeeping period (detail: `channel
+<name>: <n> time(s) since the last report; first: <reason> (<what>),
+value <v>, limit <l>`) to agentd's `gateway_feed` socket; agentd turns
+each line into a finding of its normal pipeline (black box, spool,
+responder, correlation). The Motion Firewall's own deviations from the
+gateway keep their `robot.firewall.*` ids (2.0 / 2.1 entries). Every entry
+has data source `ros2_motion_commands` and no techniques.
+
+| Id | Title | Severity |
+| --- | --- | --- |
+| `robot.gateway.trajectory_rejected` | Joint trajectory blocked by the in-path gateway | High |
+| `robot.gateway.trajectory_time_scaled` | Joint trajectory slowed down by the in-path gateway | Medium |
+| `robot.gateway.undecodable_command` | Undecodable motion command blocked by the in-path gateway | High |
+| `robot.gateway.fragmented_command` | Fragmented motion command blocked by the in-path gateway | Medium |
+| `robot.gateway.writer_binding_conflict` | Authorised motion writer seen from another address | High |
+| `robot.gateway.sequence_jump` | Motion command sequence jump held back | Medium |
+| `robot.gateway.port_bypass_risk` | Motion traffic may bypass the in-path gateway | High |
+| `robot.gateway.restriction_changed` | Motion restriction changed on the in-path gateway | Low (informational) |
+| `robot.gateway.findings_dropped` | In-path gateway findings lost | Medium |
+
+Catalog sentences (`description`):
+
+* `robot.gateway.trajectory_rejected`: The in-path motion gateway suppressed a ROS 2 joint trajectory or FollowJointTrajectory goal that was outside the channel's bounds: an unknown or repeated joint name, a non-finite value, time not increasing, too many points or too long, or a position, velocity, acceleration or effort beyond its joint limit. It never reached the robot.
+* `robot.gateway.trajectory_time_scaled`: The in-path motion gateway forwarded a ROS 2 joint trajectory slowed down in place, because its velocities or accelerations exceeded the channel's limits; the path is unchanged.
+* `robot.gateway.undecodable_command`: The in-path motion gateway could not decode a sample of an enforced motion channel strictly (truncated, non-canonical or unsupported encoding) and decided it as an integrity failure: it was suppressed or replaced by the firewall's substitute.
+* `robot.gateway.fragmented_command`: The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify; such a sample cannot be decided in place.
+* `robot.gateway.writer_binding_conflict`: The in-path motion gateway received samples under an authorised writer's GUID from another source address or MAC than the one the writer's stream is bound to, while the bound side was live: a spoofing attempt, suppressed.
+* `robot.gateway.sequence_jump`: The in-path motion gateway held back a sample whose RTPS sequence number jumped far past the writer's stream until the writer confirmed it: a forged high sequence number could otherwise make the robot drop the genuine commands.
+* `robot.gateway.port_bypass_risk`: DDS discovery announced a locator on a UDP port the in-path motion gateway does not inspect: commands sent there would reach the robot unchecked until the gateway's port ranges are fixed.
+* `robot.gateway.restriction_changed`: A restrict_motion restriction was applied, changed, lifted or expired on the in-path motion gateway. Informational: the evidence trail of the robot's effective motion limits.
+* `robot.gateway.findings_dropped`: The in-path motion gateway had more distinct findings in one reporting period than it can hold; some were counted but not reported individually.
+
+Reasons a `robot.gateway.trajectory_rejected` finding names (`first:`):
+`unknown_joint`, `duplicate_joint`, `too_many_points`, `no_joints`,
+`point_shape`, `non_finite`, `negative_time`, `time_not_increasing`,
+`too_long`, `position`, `velocity`, `acceleration`, `effort`,
+`tolerance`, `time_scale_failed`.
+
+<!-- end of the 2.3 gateway block -->
 
 ## 4. Ordering and partitioning
 
@@ -811,6 +858,20 @@ safely. Nothing here is specific to one product.
 
 ## 10. Changelog
 
+<!-- 2.3 gateway block (merge with other 2.3 entries, e.g. robot.seal.*). -->
+* **2.3.0** — rule-catalog entries only (minor), Sprint 8:
+  - New entries (data source `ros2_motion_commands`, already in the
+    schema's enums): `robot.gateway.trajectory_rejected`,
+    `robot.gateway.trajectory_time_scaled`,
+    `robot.gateway.undecodable_command`,
+    `robot.gateway.fragmented_command`,
+    `robot.gateway.writer_binding_conflict`,
+    `robot.gateway.sequence_jump`, `robot.gateway.port_bypass_risk`,
+    `robot.gateway.restriction_changed`,
+    `robot.gateway.findings_dropped` (§3b), emitted by
+    `robodr-firewall-gw` and reported by agentd (`gateway_feed`).
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.3.0`.
+<!-- end of the 2.3 gateway block -->
 * **2.2.0** — rule-catalog entries only (minor), Sprint 13b:
   - New entries (data source `robodr_delivery`, added to the schema's
     `types` / `data_sources` enums): `robot.deliver.installed`,
