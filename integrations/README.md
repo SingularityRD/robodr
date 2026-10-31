@@ -8,7 +8,7 @@ Everything here consumes the `robodr.findings` contract
 | Directory | What | For |
 |---|---|---|
 | `schemas/` | contract + strict OCSF 1.1.0 schemas, `validate_findings.py`, ATT&CK for ICS table | any consumer (T61) |
-| `verify/` | `robodr_verify.py`: per-finding Ed25519 signature check, for pipelines that cannot run the Rust verifier | Logstash, Splunk, Sentinel forwarders |
+| `verify/` | `robodr_verify.py`: per-finding Ed25519 signature check, for pipelines that cannot run the Rust verifier | the Logstash path (`logstash/`); any forwarder you build around it |
 | `splunk/TA-robodr/` | Splunk add-on: sourcetype, CIM (Intrusion Detection) aliases, event types, alert searches | Splunk Enterprise / Cloud |
 | `elastic/` | ingest pipeline (ECS mapping), index template, detection rules | Elastic Security 8.x |
 | `logstash/` | Kafka -> verify -> Elasticsearch pipeline | Elastic, or any Logstash output |
@@ -18,8 +18,10 @@ Everything here consumes the `robodr.findings` contract
 JSON/YAML well-formed, every finding field the content reads exists in the
 schema, every rule id it names is in the detection catalog
 (`docs/customer/detection-catalog.md`), the Elastic pipeline produces the
-expected ECS document from real findings, and the Sentinel DCR's columns
-match its table. `crates/robodr-ocsf/tests/integrations_content.rs` runs it.
+expected ECS document from real findings, the Elastic index template does
+not index any of their attacker-controlled locations, every shared detection
+carries the verification filter below, and the Sentinel DCR's columns match
+its table. `crates/robodr-ocsf/tests/integrations_content.rs` runs it.
 
 **What is and is not verified.** The checks above run in RoboDR's tests.
 None of this content has been loaded into a running Splunk, Elastic or
@@ -34,7 +36,8 @@ not Elasticsearch itself.
    the record value is the finding JSON, the key the finding id, the header
    `robodr-finding-sig` its Ed25519 signature. Use Splunk Connect for Kafka,
    Logstash's `kafka` input (`logstash/`), or Azure Event Hubs' Kafka
-   endpoint for Sentinel.
+   endpoint for Sentinel. Only the Logstash path has a signature check
+   (below); the other two deliver findings unverified.
 2. **AutoSecOps ingest API** (`robodr-uplink`, `docs/contracts/robodr.ingest-api.md`):
    batches of NDJSON signed per batch and per finding; AutoSecOps forwards
    to the SIEM.
@@ -51,15 +54,39 @@ object: any re-formatting breaks the signature on purpose).
 * Rust consumers: `robodr_ocsf::parse_and_validate_signed` (strict policy).
 * Pipelines: `verify/robodr_verify.py` reads NDJSON lines
   `{"value": "<raw value string>", "headers": [["robodr-finding-sig", "<header>"]]}`
-  (what Logstash's Kafka input gives with `decorate_events => "extended"`,
-  see `logstash/robodr-kafka.conf`), checks the header, the schema-level
-  identity and the signature, and emits the finding with a
+  (what the ruby filter in `logstash/robodr-kafka.conf` writes from
+  Logstash's Kafka input with `decorate_events => "extended"`), checks the
+  header, the finding's identity fields (robot, `external_id`,
+  `finding_id`) and the signature (with the strict-verification checks:
+  no weak or non-canonical keys or R), and emits the finding with a
   `robodr_verification` object (`status`: `verified` or, under
   `--policy optional`, `unsigned`; `key_id`). Records that fail are written
-  to the reject file with the reason and never forwarded.
-* The SIEM content below keys alerts on `robodr_verification.status`
-  where the field exists; an unverified finding must not trigger an
-  automated response.
+  to the reject file with the reason and never forwarded. It does **not**
+  run the strict content validator (contract §2a step 2): run
+  `schemas/validate_findings.py` as well (schema-level only). On the
+  Logstash path a duplicated `robodr-finding-sig` header is collapsed to one
+  by Logstash before the script sees it, so the contract's duplicate-header
+  rejection cannot fire there (the remaining header must still verify).
+
+**Which delivery paths verify.** Only the Logstash path ships a verifier,
+and it is a file spool (`/var/spool/robodr-verify/`) plus a run of
+`robodr_verify.py` that you schedule; its output feeds Elasticsearch.
+Splunk Connect for Kafka and the Event Hubs / data collection rule path for
+Sentinel have no verification step: findings arrive without
+`robodr_verification`, anyone able to produce to the topic can forge them,
+and nothing here wires a verifier into those paths. To verify for Splunk or
+Sentinel, run `robodr_verify.py` on your own Kafka consumer and send its
+output by HEC or the Logs Ingestion API; that is not shipped or tested.
+
+**How the detections use the status.** Each of the five shared detections
+(below) drops findings whose `robodr_verification.status` is present and not
+`verified` (Splunk: `NOT robodr_verification.status=* OR
+robodr_verification.status="verified"`; Elastic: `robodr.verification.status`;
+Sentinel: `VerificationStatus`). Findings with no status, i.e. every finding
+on a path without a verifier, still raise them. A sixth, low-severity
+detection, **Unverified findings**, reports every finding that is not
+verified, including those with no status, so an unverified path shows up in
+each SIEM. An unverified finding must not trigger an automated response.
 
 Keyring for `robodr_verify.py`: JSON `{"<robot id>": {"<key id>": "<64 hex public key>"}}`,
 built from the finding keys registered at commissioning (one per robot,
@@ -98,7 +125,8 @@ per emission. Deduplicate on `ocsf.metadata.uid`, group on `finding_id`.
 
 ## Detections shipped
 
-Each SIEM gets the same five, keyed on rule ids from the catalog:
+Each SIEM gets the same five, keyed on rule ids from the catalog, plus
+"Unverified findings" (above):
 
 | Detection | Rule ids | Why |
 |---|---|---|

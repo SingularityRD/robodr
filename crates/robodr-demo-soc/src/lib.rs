@@ -17,9 +17,11 @@
 //!   `GET /api/metrics` (counts, **time to SOC** percentiles: arrival minus
 //!   the finding's own detection time `ocsf.time`, T64) are JSON.
 //!
-//! Demo only: one process, in-memory replay state, plain HTTP (run it on
-//! loopback or behind TLS; `robodr-uplink` sends plain HTTP only to a
-//! loopback address). Not a production SOC.
+//! Demo only: one process, unbounded in-memory replay state, plain HTTP,
+//! and a test-grade ingest consumer compiled in with the panic lints
+//! relaxed. Keep it on loopback or an isolated lab network, never exposed
+//! further (README.md). `robodr-uplink` sends plain HTTP only to a
+//! loopback address. Not a production SOC.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(

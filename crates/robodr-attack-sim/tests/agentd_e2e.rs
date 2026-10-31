@@ -10,6 +10,7 @@
 
 use robodr_attack_sim::{generate, read_capture, score, write_capture, Params, Scenario};
 use robodr_commission::{LearnConfig, Learner, PcapSource};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -144,6 +145,59 @@ fn params() -> Params {
     }
 }
 
+/// The rule ids that credit a scenario as detected in the Pulsar-only
+/// comparison (`EVIDENCE` in `tools/e2e/compare_pulsar_only.py`; keep the
+/// two equal). Each is counted on that scenario's own capture only.
+fn comparison_evidence(s: Scenario) -> &'static [&'static str] {
+    match s {
+        Scenario::RogueParticipant => &[
+            "robot.ros2.unknown_participant",
+            "robot.ros2.identity_instances_exceeded",
+        ],
+        Scenario::GuidSpray => &[
+            "robot.ros2.discovery_flood",
+            "robot.ros2.unknown_participant",
+        ],
+        Scenario::MalformedRtps => &[
+            "robot.rtps.malformed_discovery",
+            "robot.rtps.discovery_not_inspected",
+        ],
+        Scenario::CmdVelEnvelope => &[
+            "robot.motion.linear_over_envelope",
+            "robot.firewall.rejected_over_hard_limit",
+        ],
+        Scenario::LowcmdTorque => &[
+            "robot.unitree.legacy_unknown_sender",
+            "robot.firewall.joint_torque_out_of_envelope",
+            "robot.motion.unprofiled_channel",
+            "robot.firewall.rejected_unknown_channel",
+        ],
+    }
+}
+
+#[test]
+fn comparison_evidence_matches_the_comparison_script() {
+    let py = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/e2e/compare_pulsar_only.py"),
+    )
+    .unwrap();
+    let start = py.find("EVIDENCE = {").unwrap();
+    let block = &py[start..start + py[start..].find("\n}\n").unwrap()];
+    for s in Scenario::ALL {
+        let line = block
+            .split(&format!("\"{}\": [", s.name()))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{s} missing from EVIDENCE"));
+        let list = &line[..line.find(']').unwrap()];
+        let ids: Vec<&str> = list
+            .split(',')
+            .map(|x| x.trim().trim_matches('"'))
+            .filter(|x| !x.is_empty())
+            .collect();
+        assert_eq!(ids, comparison_evidence(s), "{s}");
+    }
+}
+
 #[test]
 fn the_clean_carrier_raises_no_expected_rule() {
     let dir = tmpdir("clean-pcap");
@@ -153,7 +207,9 @@ fn the_clean_carrier_raises_no_expected_rule() {
     let (seen, bad) = score::load(&spool).unwrap();
     assert_eq!(bad, 0);
     for s in Scenario::ALL {
-        for r in s.expected() {
+        // Neither the scenario's own ids nor the ids the comparison credits
+        // it with may appear without the attack.
+        for r in s.expected().iter().chain(comparison_evidence(s)) {
             assert!(
                 !seen.iter().any(|x| x.rule_id == *r),
                 "{s}: {r} without the attack: {:?}",
@@ -163,22 +219,62 @@ fn the_clean_carrier_raises_no_expected_rule() {
     }
 }
 
+/// Scenario `s` alone in its own capture, from `attacker_ip`: what the
+/// daemon reported.
+fn run_alone(placement: &str, attacker_ip: Ipv4Addr, s: Scenario) -> Vec<score::Seen> {
+    let tag = format!("{s}-{placement}");
+    let dir = tmpdir(&format!("{tag}-pcap"));
+    let pcap = dir.join("attack.pcap");
+    let p = Params {
+        attacker_ip,
+        ..params()
+    };
+    let frames = generate(s, &carrier(), &p).unwrap();
+    write_capture(&pcap, &frames).unwrap();
+    let spool = run_daemon(&tag, &pcap);
+    let (seen, bad) = score::load(&spool).unwrap();
+    assert_eq!(bad, 0);
+    seen
+}
+
 #[test]
 fn every_scenario_produces_its_expected_findings() {
-    let base = carrier();
     let mut failures = Vec::new();
     for s in Scenario::ALL {
-        let dir = tmpdir(&format!("{s}-pcap"));
-        let pcap = dir.join("attack.pcap");
-        let frames = generate(s, &base, &params()).unwrap();
-        write_capture(&pcap, &frames).unwrap();
-        let spool = run_daemon(s.name(), &pcap);
-        let (seen, bad) = score::load(&spool).unwrap();
-        assert_eq!(bad, 0);
+        let seen = run_alone("foreign", Params::default().attacker_ip, s);
         let r = score::report(&[s], &seen, None);
-        eprintln!("{s}: {}", r);
+        eprintln!("foreign {s}: {r}");
         if r["pass"] != true {
             failures.push(format!("{s}: {r:#}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The insider placement of the Pulsar-only comparison
+/// (`demo/scripts/compare.sh`, `tools/e2e/COMPARISON-pulsar-only.md`): the
+/// attacker on the operator's own host, an address the profile already
+/// allows and the configured Unitree legacy command sender. Every scenario,
+/// alone in its own capture, raises at least one id the comparison credits
+/// it with. `robot.unitree.legacy_unknown_sender` cannot fire from the
+/// configured sender, so lowcmd-torque is detected here by its channel.
+#[test]
+fn every_scenario_is_detected_from_the_operators_host() {
+    let mut failures = Vec::new();
+    for s in Scenario::ALL {
+        let seen = run_alone("insider", LEGACY_PC.parse().unwrap(), s);
+        let hit: Vec<&str> = comparison_evidence(s)
+            .iter()
+            .copied()
+            .filter(|r| seen.iter().any(|x| x.rule_id == *r))
+            .collect();
+        eprintln!("insider {s}: {hit:?}");
+        if hit.is_empty() {
+            failures.push(format!(
+                "insider {s}: none of {:?} in {:?}",
+                comparison_evidence(s),
+                seen.iter().map(|x| &x.rule_id).collect::<Vec<_>>()
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

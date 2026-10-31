@@ -152,3 +152,48 @@ fn pcap_writes_every_scenario_and_score_reports_missing_rules() {
     let o = bin(&["pcap", "--scenario", "nope"]);
     assert_eq!(o.status.code(), Some(2));
 }
+
+/// demo/scripts/check-score.sh, which makes demo/run.sh fail on a scenario
+/// regression, reads the report `score` actually writes.
+#[test]
+fn demo_check_score_fails_the_run_on_a_missed_scenario() {
+    let nd = tmp("check-score.ndjson");
+    std::fs::write(
+        &nd,
+        "{\"entity_context\":{\"rule_id\":\"robot.ros2.unknown_participant\"}}\n",
+    )
+    .unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../demo/scripts/check-score.sh");
+    for (scenarios, want) in [
+        ("rogue-participant", Some(0)),
+        ("rogue-participant,guid-spray", Some(1)),
+    ] {
+        let o = bin(&[
+            "score",
+            "--scenario",
+            scenarios,
+            "--findings",
+            nd.to_str().unwrap(),
+        ]);
+        let report = tmp(&format!("score-{scenarios}.json"));
+        std::fs::write(&report, &o.stdout).unwrap();
+        let c = Command::new("sh")
+            .arg(&script)
+            .arg(&report)
+            .output()
+            .unwrap();
+        let e = String::from_utf8_lossy(&c.stderr);
+        assert_eq!(c.status.code(), want, "{scenarios}: {e}");
+        if want == Some(1) {
+            assert!(e.contains("FAILED (guid-spray)"), "{e}");
+        }
+    }
+    let empty = tmp("score-empty.json");
+    std::fs::write(&empty, "").unwrap();
+    let c = Command::new("sh")
+        .arg(&script)
+        .arg(&empty)
+        .output()
+        .unwrap();
+    assert_eq!(c.status.code(), Some(1));
+}

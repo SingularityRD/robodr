@@ -19,6 +19,7 @@ relevantTechniques: []
 query: |
   RoboDRFindings
   | where RuleId in ("robot.agent.input_silent", "robot.agent.input_ended", "robot.agent.queue_overflow", "robot.agent.evidence_truncated", "robot.rtps.discovery_not_inspected")
+  | where isempty(VerificationStatus) or VerificationStatus == "verified"
   | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
       RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
       by RobotId, Site

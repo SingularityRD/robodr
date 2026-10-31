@@ -15,7 +15,15 @@
 5. The Sentinel DCR outputs exactly the table's columns and reads only
    declared input columns, which are contract fields.
 6. With --findings: the Elastic ingest pipeline, evaluated on each finding
-   by the evaluator below, yields the expected ECS fields and no failure.
+   by the evaluator below, yields the expected ECS fields and no failure
+   (also for a source address display that is not an IP: no source.ip, the
+   document is kept); every adversary_controlled_fields location of each
+   finding is stored but not indexed by the index template.
+7. Verification status: every one of the shared detections, in all three
+   SIEMs, drops findings whose robodr_verification.status is present and not
+   "verified" (findings from a path with no verifier carry no status and
+   still alert), and each SIEM has an "Unverified findings" detection for
+   everything that is not verified.
    The evaluator implements only the processors and options the pipeline
    uses and fails on anything else, so a new processor needs a new
    evaluator branch (it is not Elasticsearch).
@@ -26,7 +34,9 @@ Exit 0 when everything holds, 1 with a list of problems otherwise.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -46,6 +56,8 @@ TOP = (
 ).split()
 # Fields a verifying forwarder adds (integrations/verify/robodr_verify.py).
 ADDED = {"robodr_verification", "robodr_verification.status", "robodr_verification.key_id"}
+# The filter each shared detection carries (gen_detections.py; Splunk by hand).
+SPLUNK_VERIFIED = '(NOT robodr_verification.status=* OR robodr_verification.status="verified")'
 
 problems: list[str] = []
 
@@ -171,6 +183,16 @@ def splunk(schema, ids):
         got = set(RULE_RE.findall(body))
         if got != set(d["rules"]):
             problem(f"splunk/savedsearches.conf [{d['name']}]: rule ids {sorted(got)} != {sorted(d['rules'])}")
+        search = re.search(r"^search = (.*)$", body, re.M)
+        if not search or SPLUNK_VERIFIED not in search.group(1).split("|")[0]:
+            problem(f"splunk/savedsearches.conf [{d['name']}]: base search lacks {SPLUNK_VERIFIED}")
+    unv = by_name.get(gen.UNVERIFIED["name"], "")
+    if not re.search(r"^search = eventtype=robodr_unverified\b", unv, re.M):
+        problem(f"splunk/savedsearches.conf: no [{gen.UNVERIFIED['name']}] on eventtype=robodr_unverified")
+    with open(os.path.join(base, "eventtypes.conf"), encoding="utf-8") as fh:
+        et = fh.read()
+    if not re.search(r'^\[robodr_unverified\]\nsearch = sourcetype="robodr:finding" NOT robodr_verification.status="verified"$', et, re.M):
+        problem("splunk/eventtypes.conf: robodr_unverified must be every finding that is not verified")
 
 
 def load_gen():
@@ -257,10 +279,36 @@ def run_processor(p, doc, ingest):
         "set": {"field", "value", "copy_from", "ignore_empty_value"},
         "append": {"field", "value", "allow_duplicates"},
         "foreach": {"field", "processor", "ignore_missing"},
+        "convert": {"field", "type", "ignore_missing", "on_failure"},
+        "remove": {"field"},
     }
     if kind not in allowed or set(o) - allowed[kind]:
         raise SystemExit(f"evaluator: unsupported processor/options {kind} {sorted(o)}")
-    if kind == "rename":
+    if "on_failure" in o:
+        # Processor-level on_failure: handles this processor's failure only.
+        try:
+            run_processor({kind: {k: v for k, v in o.items() if k != "on_failure"}}, doc, ingest)
+        except PipelineError as e:
+            for h in o["on_failure"]:
+                run_processor(h, doc, {"on_failure_message": str(e)})
+        return
+    if kind == "convert":
+        if o["type"] != "ip":
+            raise SystemExit(f"evaluator: convert type {o['type']} not implemented")
+        v = get_path(doc, o["field"])
+        if v is None:
+            if o.get("ignore_missing"):
+                return
+            raise PipelineError(f"field [{o['field']}] doesn't exist")
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise PipelineError(f"'{v}' is not an IP string literal") from None
+    elif kind == "remove":
+        if get_path(doc, o["field"]) is None:
+            raise PipelineError(f"field [{o['field']}] not present")
+        del_path(doc, o["field"])
+    elif kind == "rename":
         v = get_path(doc, o["field"])
         if v is None:
             if o.get("ignore_missing"):
@@ -340,8 +388,18 @@ def elastic(schema, ids, findings):
             rule = json.load(fh)
         check_rule_ids(f"elastic/detection-rules/{f}", rule["query"], ids)
         for field in re.findall(r"([a-z_.]+)\s*:", rule["query"]):
-            if field not in ("event.module", "rule.id"):
+            if field not in ("event.module", "rule.id", "robodr.verification.status"):
                 problem(f"elastic/detection-rules/{f}: query uses {field}, which the pipeline does not set")
+        q = rule["query"]
+        if f == gen_file(load_gen().UNVERIFIED):
+            if q != 'event.module : "robodr" and not robodr.verification.status : "verified"':
+                problem(f"elastic/detection-rules/{f}: must match every finding that is not verified")
+        elif not q.endswith(ELASTIC_VERIFIED):
+            problem(f"elastic/detection-rules/{f}: query does not end with {ELASTIC_VERIFIED}")
+    if gen_file(load_gen().UNVERIFIED) not in os.listdir(os.path.join(HERE, "elastic/detection-rules")):
+        problem("elastic/detection-rules: no Unverified findings rule")
+    with open(os.path.join(HERE, "elastic/index-template-robodr-findings.json"), encoding="utf-8") as fh:
+        template = json.load(fh)["template"]["mappings"]
     for n, f in enumerate(findings, 1):
         doc = run_pipeline(pipeline, copy.deepcopy(f))
         where = f"elastic pipeline on finding {n} ({f['entity_context']['rule_id']})"
@@ -369,6 +427,78 @@ def elastic(schema, ids, findings):
         src = get_path(f, "entity_context.ros.src_ip.display")
         if get_path(doc, "source.ip") != src:
             problem(f"{where}: source.ip {get_path(doc, 'source.ip')!r} != {src!r}")
+        for ptr in f.get("adversary_controlled_fields", []):
+            if indexed(template, f, ptr):
+                problem(f"{where}: tainted {ptr} would be indexed by the index template")
+    # A source address display that is not an IP (source.ip is mapped `ip`):
+    # dropped in the pipeline, not left to fail the whole document at index time.
+    with_src = [f for f in findings if get_path(f, "entity_context.ros.src_ip.display")]
+    if findings and not with_src:
+        problem("elastic: no finding with a source address to check source.ip handling")
+    for f in with_src[:1]:
+        bad = copy.deepcopy(f)
+        bad["entity_context"]["ros"]["src_ip"]["display"] = "not-an-ip"
+        doc = run_pipeline(pipeline, bad)
+        if doc.get("event", {}).get("kind") != "alert" or get_path(doc, "source.ip") is not None:
+            problem(f"elastic pipeline: a non-IP source display gives event.kind={doc.get('event', {}).get('kind')!r}, "
+                    f"source.ip={get_path(doc, 'source.ip')!r}; want alert and no source.ip")
+
+
+def gen_file(d):
+    return f"{d['key']}.json"
+
+
+ELASTIC_VERIFIED = '(not robodr.verification.status : * or robodr.verification.status : "verified")'
+
+
+def indexed(mappings, finding, ptr):
+    """Whether the value at JSON Pointer `ptr` of `finding`, moved under
+    robodr.* by the pipeline, would be indexed (searchable) by the template:
+    a disabled object on its path, or the first dynamic template that
+    matches each string leaf having index false, means not indexed."""
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in ptr.lstrip("/").split("/")]
+    path = ["robodr"] + parts
+    node = {"properties": mappings["properties"]}
+    for p in path:
+        if p.isdigit():
+            continue  # array index: same mapping as the element
+        props = node.get("properties", {})
+        if p not in props:
+            break
+        node = props[p]
+        if node.get("enabled") is False:
+            return False
+    cur = finding
+    for p in parts:
+        cur = cur[int(p)] if isinstance(cur, list) else cur[p]
+
+    def leaves(v, prefix):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                yield from leaves(x, f"{prefix}.{k}")
+        elif isinstance(v, list):
+            for x in v:
+                yield from leaves(x, prefix)
+        elif isinstance(v, str):
+            yield prefix
+
+    dotted = ".".join(p for p in path if not p.isdigit())
+    tainted_leaves = [lp for lp in leaves(cur, dotted)]
+    if isinstance(cur, dict) and "value" in cur:
+        # A Tainted object: only its raw value is attacker-chosen; display is escaped.
+        tainted_leaves = [f"{dotted}.value"]
+    for leaf in tainted_leaves:
+        for dt in mappings.get("dynamic_templates", []):
+            (_, spec), = dt.items()
+            if spec.get("match_mapping_type", "string") != "string":
+                continue
+            if fnmatch.fnmatchcase(leaf, spec["path_match"]):
+                if spec["mapping"].get("index", True) is not False:
+                    return True
+                break
+        else:
+            return True  # default dynamic mapping: text + keyword, indexed
+    return False
 
 
 # ------------------------------------------------------------------ sentinel
@@ -405,6 +535,12 @@ def sentinel(schema, ids):
         with open(os.path.join(base, "analytics", f), encoding="utf-8") as fh:
             text = fh.read()
         check_rule_ids(f"sentinel/analytics/{f}", text, ids)
+        query = text.split("query: |", 1)[1].split("entityMappings")[0]
+        if f == f"{load_gen().UNVERIFIED['key']}.yaml":
+            if '| where VerificationStatus != "verified"' not in query:
+                problem(f"sentinel/analytics/{f}: must match every finding that is not verified")
+        elif '| where isempty(VerificationStatus) or VerificationStatus == "verified"' not in query:
+            problem(f"sentinel/analytics/{f}: does not drop findings that failed verification")
         for col in re.findall(r"\b([A-Z][A-Za-z]+)\b", text.split("query: |", 1)[1].split("entityMappings")[0]):
             if col not in table and col not in ("RoboDRFindings", "Count", "FirstSeen", "LastSeen", "RuleIds", "SourceIps", "Verification"):
                 problem(f"sentinel/analytics/{f}: query uses unknown column {col}")

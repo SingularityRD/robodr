@@ -7,7 +7,7 @@
   "index": [
     "logs-robodr.findings-*"
   ],
-  "query": "event.module : \"robodr\" and (rule.id : robot.correlate.*)",
+  "query": "event.module : \"robodr\" and (rule.id : robot.correlate.*) and (not robodr.verification.status : * or robodr.verification.status : \"verified\")",
   "severity": "critical",
   "risk_score": 99,
   "interval": "5m",

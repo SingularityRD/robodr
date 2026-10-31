@@ -93,10 +93,24 @@ pub fn is_local_scope(a: Ipv4Addr) -> bool {
     a.is_private() || a.is_loopback() || a.is_link_local() || a.octets().first() == Some(&239)
 }
 
-/// A target that passed every check.
+/// A target that passed every check. [`check`] is the only way to build
+/// one: the field is private, so a library caller cannot hand [`send`] an
+/// address that skipped the guard.
+///
+/// ```compile_fail
+/// use robodr_attack_sim::guard::LiveTarget;
+/// let t = LiveTarget { addr: std::net::Ipv4Addr::new(8, 8, 8, 8) };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveTarget {
-    pub addr: Ipv4Addr,
+    addr: Ipv4Addr,
+}
+
+impl LiveTarget {
+    /// The checked target address.
+    pub fn addr(self) -> Ipv4Addr {
+        self.addr
+    }
 }
 
 pub fn check(

@@ -24,6 +24,10 @@
 mod catalog_ids;
 mod common;
 
+#[path = "support/python.rs"]
+mod py_support;
+
+use py_support::missing_module;
 use robodr_events::{Deviation, Severity};
 use robodr_ocsf::{parse_and_validate, to_json, FindingBuilder};
 use serde_json::Value;
@@ -73,7 +77,9 @@ fn run(lines: &[String], name: &str) -> Option<Report> {
     let _ = std::fs::remove_dir_all(&dir);
     let required = std::env::var_os("ROBODR_REQUIRE_EXTERNAL_VALIDATOR").is_some();
     let out = match out {
-        Ok(o) if o.status.code() != Some(2) => o,
+        // Exit 2 is also a usage or tooling error of the script: only the
+        // missing-module message means "not installed".
+        Ok(o) if !missing_module(&o) => o,
         Ok(o) => {
             let msg = String::from_utf8_lossy(&o.stderr).to_string();
             assert!(!required, "external validator unavailable: {msg}");

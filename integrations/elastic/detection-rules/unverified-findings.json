@@ -1,0 +1,26 @@
+{
+  "rule_id": "baf059db-7f18-5c5c-823f-6552203a13f9",
+  "name": "RoboDR - Unverified findings",
+  "description": "Findings without a verified signature: no verifying forwarder on the path, unsigned (optional policy), or a status other than verified. Never automate a response on these. Observe-only: alerts, never responds.",
+  "type": "query",
+  "language": "kuery",
+  "index": [
+    "logs-robodr.findings-*"
+  ],
+  "query": "event.module : \"robodr\" and not robodr.verification.status : \"verified\"",
+  "severity": "low",
+  "risk_score": 21,
+  "interval": "60m",
+  "from": "now-61m",
+  "enabled": false,
+  "author": [
+    "Singularity RD"
+  ],
+  "tags": [
+    "RoboDR",
+    "Robotics",
+    "OT"
+  ],
+  "max_signals": 100,
+  "version": 1
+}
