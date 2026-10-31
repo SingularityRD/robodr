@@ -169,6 +169,28 @@ package must still be installed at its recorded version, and its
 output and file list must be those it had right after its own install,
 otherwise it is reinstalled and the switch fails.
 .PP
+.B deb
+is for Debian and Ubuntu units only: on a unit without a dpkg database
+.RI ( <dpkg_root>/var/lib/dpkg/status ,
+an RPM-based host) a
+.B deb
+RPK is refused before anything is unpacked, and there is no
+.B rpm
+kind: RoboDR delivers no RPM packages (the other kinds work on any
+unit). Every
+.B dpkg \-\-install
+runs with
+.B ROBODR_DELIVERD_INSTALL=1
+in its environment, which dpkg hands to the maintainer scripts. RoboDR's
+own postinst then does not restart
+.B robodr\-deliverd.service
+(that would stop the agent waiting for dpkg, and with it dpkg and the
+postinst): when RoboDR's own package is delivered, the agent finishes the
+pass (health gate, commit or rollback) on its old binary, sees its
+executable replaced on disk and exits 3; the unit
+.RB ( RestartForceExitStatus=3 )
+starts it again on the new one.
+.PP
 Every step is recorded in the agent's black box
 .RI ( /var/lib/robodr/blackbox/deliverd ,
 signed with the unit's black-box key) and reported as a
@@ -484,6 +506,11 @@ Refused or error (stderr says why).
 .TP
 .B 2
 Usage or configuration error.
+.TP
+.B 3
+.RB ( run
+only) The agent's own executable was replaced on disk (a self-upgrade);
+the pass in progress was finished. Start it again (the unit does).
 .SH FILES
 .TP
 .I /var/lib/robodr/deliverd/

@@ -566,7 +566,7 @@ fields that 13b will act on are in §10 ("13b requirements").
 
 | `kind` | Installer on the unit | Atomicity |
 |---|---|---|
-| `deb` | `dpkg` (maintainer scripts only if allowed, §3.2); the RPK `name` and `arch` declare the dpkg `Package` and `Architecture` (13b review H2); release signers are root-equivalent here (§6.7) | previous `.deb` kept in the store for rollback |
+| `deb` | `dpkg` (maintainer scripts only if allowed, §3.2); the RPK `name` and `arch` declare the dpkg `Package` and `Architecture` (13b review H2); release signers are root-equivalent here (§6.7). Debian / Ubuntu units only: refused on a unit without a dpkg database (T53, below) | previous `.deb` kept in the store for rollback |
 | `oci-image` | import into the unit's local containerd / podman store; or the depot's local registry when units pull | image digest switch; old image retained |
 | `files` | write into a versioned directory under `/opt/robodr-delivered/<name>/<serial>-<digest>/` (named by RPK digest too, 13b review M4), atomic `current` symlink swap | symlink swap is atomic |
 | `model` | as `files`, into the sealed runtime volume (§7.4) only | symlink swap |
@@ -574,6 +574,32 @@ fields that 13b will act on are in §10 ("13b requirements").
 | `robodr-profile` | handed to the existing profile path; `robodr-commission verify-profile` rules still apply (its own signatures, floors and operator attestation) | existing |
 | `robodr-rules` | Pulsar rules TOML, validated as `scripts/validate_rules.py` does | file swap + reload |
 | `os-image` | **delegated** to an A/B updater (RAUC, SWUpdate or Mender; §11). RoboDR verifies, decrypts, gates and orchestrates; it never writes a bootloader itself | A/B slot switch with boot-count fallback |
+
+**deb only, no RPM delivery (T53).** The kind set has no `rpm`: neither
+`robodr-deliverd` nor the depot delivers RPM packages, and a manifest
+with `"kind": "rpm"` does not parse. On a unit without a dpkg database
+(`<dpkg_root>/var/lib/dpkg/status`, i.e. an RPM-based host) a `deb` RPK
+is refused before anything is unpacked, with a reason that says so; the
+data kinds work there unchanged. RoboDR itself reaches RPM hosts through
+the signed offline bundle and `install-bundle.sh` (OPERATIONS section 7).
+An `rpm` kind would need the same guarantees as `deb` (declared package
+identity, path-ownership check against the rpm database, `rpm --verify`
+of every recorded package, scriptlets only when the release allows them,
+rollback by reinstalling the kept package) and is not planned yet.
+
+**Self-upgrade (T52).** When the delivered `.deb` is RoboDR's own
+package (designated programme, maintainer scripts allowed), its
+`postinst` would `systemctl try-restart robodr-deliverd.service` from
+inside the agent's own dpkg run: the stop job would signal the agent's
+cgroup, killing dpkg and the `postinst` half-way. Every `dpkg --install`
+therefore carries `ROBODR_DELIVERD_INSTALL=1` (dpkg passes it to the
+maintainer scripts) and the `postinst` skips that one restart; the agent
+finishes the pass on the old binary, notices that its executable was
+replaced (path now naming another inode) and exits 3, on which the unit
+restarts it (`RestartForceExitStatus=3`). The unit's `KillMode=mixed`
+keeps an operator's stop from signalling a dpkg run in progress. The
+marker only removes a restart: set by anyone else, the agent still
+restarts itself on a replaced binary.
 
 ### 4.3 Fleet model on the depot
 
