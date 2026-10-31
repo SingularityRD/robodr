@@ -22,7 +22,7 @@ Images: `ubuntu:24.04` and `apache/kafka:3.9.1`, both pinned by digest.
 |---|---|---|
 | 1 | `robot` | `robodr-commission` learns the model profile of a **real** ROS 2 Jazzy robot from its capture (`fixtures/captures/ros2-jazzy/fastrtps_baseline.pcap`: Fast DDS, a base controller, a teleop at 0.3 m/s), two operators sign it off, an OEM key locks and signs it: the commissioning flow of `docs/OPERATIONS.md`, with fresh demo keys |
 | 2 | `robot` | `robodr-attack-sim` merges every scenario into the same traffic: rogue DDS participant, GUID spray, malformed RTPS, the operator's commands rewritten to 3 m/s, Unitree `LowCmd` torque from an unlisted host |
-| 3 | `robot` | `robodr-agentd` replays it: profile trust check, detection, signed black box, signed findings in the spool; `robodr-attack-sim score` checks each scenario raised what it must (`demo/state/score.json`) |
+| 3 | `robot` | `robodr-agentd` replays it: profile trust check, detection, signed black box, signed findings in the spool; `robodr-attack-sim score` checks each scenario raised what it must (`demo/state/score.json`); `demo/run.sh` exits non-zero when one did not (`demo/scripts/check-score.sh`) |
 | 4 | `soc`, `uplink` | `robodr-uplink` sends the spool to `robodr-demo-soc` over the `robodr.ingest` API; the SOC verifies every batch and every finding signature and shows them at http://127.0.0.1:8080/ |
 | 5 | `kafka`, `publisher` | `robodr-kafka-publish` sends a copy to topic `robodr.findings` with the `robodr-finding-sig` header (the SIEM path; `integrations/`) |
 | live | `robot-live`, `attacker`, `uplink-live` | a second robot captures live on its interface; the attacker sends the rogue-participant and GUID-spray scenarios with `robodr-attack-sim send` (guarded: `--i-understand`, demo subnet only); time to detect and to SOC are measured on the wall clock |
@@ -61,11 +61,16 @@ black-box record is written before it).
 ## RoboDR vs Pulsar-only
 
 `demo/run.sh --compare` replays every scenario from two attacker placements
-(a new host; the operator's own, compromised host) and prints the table in
+(a new host; the operator's own, compromised host), each scenario alone in
+its own capture and its own `robodr-agentd` run, and prints the table in
 `tools/e2e/COMPARISON-pulsar-only.md`: RoboDR detected 10/10; a Pulsar-only
 deployment could at best flag 4/10, and then only as "a datagram from an
-unknown address" or "a short datagram". Method and limits are in
-`tools/e2e/compare_pulsar_only.py`.
+unknown address" or "a short datagram". From the operator's own host,
+lowcmd-torque is detected by its unprofiled channel, not by
+`robot.unitree.legacy_unknown_sender` (that host is the configured legacy
+sender); the table marks it. The Pulsar-only column is modelled from
+Pulsar's event model, not measured: Pulsar did not run. Method and limits
+are in `tools/e2e/compare_pulsar_only.py`.
 
 ## Not in the demo
 

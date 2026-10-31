@@ -62,6 +62,14 @@ for _ in $(seq 1 600); do
   if [[ -n "${n:-}" && "$n" -gt 0 ]]; then
     echo "first findings at the SOC after $(( $(date +%s) - start )) s: $n so far"
     echo "viewer: http://127.0.0.1:$port/   robot score: demo/state/score.json"
+    # The robot has completed (the SOC starts only after it): fail the run
+    # when a scenario did not raise its expected rule ids. Checked in a
+    # container: demo/state is written as root with umask 077.
+    if ! docker compose run --rm -T --no-deps robot /demo/scripts/check-score.sh /demo/state/score.json; then
+      echo "demo run FAILED: a scenario regression (demo/state/score.json); the stack is left up" >&2
+      exit 1
+    fi
+    echo "scenario score: every scenario raised its expected rule ids"
     echo "Kafka:  docker compose -f demo/docker-compose.yml exec kafka /opt/kafka/bin/kafka-console-consumer.sh \\"
     echo "          --bootstrap-server kafka:9092 --topic robodr.findings --from-beginning --property print.headers=true"
     exit 0
