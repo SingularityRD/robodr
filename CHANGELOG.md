@@ -10,6 +10,27 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Security (release process, 2026-10-31)
+
+- **Release approval is bound to bytes:** a new unprivileged `finalize` job
+  runs every check on the finished set and shows its set digest
+  (`scripts/release-assets.py`); `publish` signs only a set with exactly
+  that digest and publishes only when the draft holds exactly the signed
+  set (an asset added to the draft fails the release).
+- **Release gates:** the newest completed CI run counts (an older green run
+  no longer outweighs a newer red one); `ci-extended.yml` (privileged TPM,
+  seal, netns, eBPF-load tests) is gated like `ci.yml` and runs on
+  `release/**`; the release line's branch must be protected and
+  `release/*` creation restricted; `cargo deny check advisories` runs in
+  `prepare`, `finalize` and `publish`; a version without an RPK serial is
+  refused in `prepare`.
+- **Independent rebuild coverage:** the eBPF objects embedded in
+  `robodr-pulsard` must match the rebuild's; the secure-delivery RPK
+  archive is built with the hash-pinned toolchain and rebuilt on another
+  runner (`rebuild-delivery`); the `.rpm` build's eBPF clang must be the
+  exact pinned one. Not yet pinned: the `.deb` build's eBPF clang
+  (`docs/customer/known-limitations.md`).
+
 ### Security (closing documented gaps, 2026-10-30)
 
 - **Black-box key rotation without a hand-edited log:** `robodr-blackbox

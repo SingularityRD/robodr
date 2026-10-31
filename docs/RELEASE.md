@@ -17,23 +17,34 @@ Pushing a tag `v<VERSION>` on `main` or on a `release/X.Y` branch runs
 **dry run** (section 4): the same jobs, then `publish-dry-run` instead of
 `publish`.
 
+The release approval is bound to bytes. `finalize` runs every check on the
+finished, unsigned set without a secret or write access, and shows its
+**set digest** (the SHA-256 of the manifest of every file to be signed,
+`scripts/release-assets.py`) in its job summary. Only then does `publish`
+ask the `release` environment's reviewers for approval; it signs only a set
+with exactly that digest, and publishes the draft only if the draft holds
+exactly the signed set.
+
 | Job | Runner | Does |
 |---|---|---|
-| `prepare` | ubuntu-24.04 | tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed. **Release line** (`scripts/release-gate.py line`): the commit is on `main` (the release will be "Latest", unless the version is a pre-release: GitHub never makes a pre-release "Latest", so it is published with `--latest=false`) or on `release/X.Y` for version `X.Y.*` (an LTS line, never "Latest", section 6); anything else is refused. **CI gate** (`release-gate.py ci`): `ci.yml` has a completed, successful `push` / `workflow_dispatch` / `schedule` run for exactly this commit (a running one is waited for, up to 2 h; a `pull_request` run tested a merge commit and does not count). Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
+| `prepare` | ubuntu-24.04 | tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed; the version has a secure-delivery serial (`scripts/release-rpk.py --serial`: `X.Y.Z` or `X.Y.Z-(alpha\|beta\|rc).N`, no `+build`). **Release line** (`scripts/release-gate.py line`): the commit is on `main` (the release will be "Latest", unless the version is a pre-release: GitHub never makes a pre-release "Latest", so it is published with `--latest=false`) or on `release/X.Y` for version `X.Y.*` (an LTS line, never "Latest", section 6); anything else is refused. **Protection gate** (`release-gate.py protection`): that branch is protected (classic protection, or a ruleset `pull_request` rule), and a `release/X.Y` branch is also covered by a ruleset that restricts its creation (section 3). **CI gate** (`release-gate.py ci`, for `ci.yml` and for `ci-extended.yml`): for exactly this commit, among its `push` / `workflow_dispatch` / `schedule` runs (a `pull_request` run tested a merge commit and does not count), none is still running (waited for, up to 2 h each) and the **newest** completed one succeeded (cancelled and skipped runs are passed over; an older green run does not outweigh a newer red one, so a scheduled `ci.yml` run that turned red on a new advisory blocks the tag). **Advisories**: `cargo deny --locked check advisories` against today's RustSec database. Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
 | `build` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm (native), in an **Ubuntu 22.04 container** (digest-pinned) | pinned clang-14 for ring, clang-20 (apt.llvm.org, key fingerprint pinned) for Pulsar's eBPF; toolchain inputs recorded (section 11); `scripts/ci-repro.sh` (two builds, two paths, must be bit-identical), release build (`scripts/ci-release-build.sh`), released == reproduced, `--version` names this commit, `SOURCE_DATE_EPOCH` and target, `Cargo.lock` unchanged, CycloneDX 1.5 SBOMs completed by `scripts/release-sbom-augment.sh` (Rust std/core/alloc, robodr-pulsard's eBPF objects with hashes, toolchain formulation; section 9), `robodr_<debver>_<arch>.deb` (`Depends:` from `dpkg-shlibdeps`, libc6 floor <= 2.35 checked), offline bundle, SBOM archive, `SHA256SUMS-<arch>` |
 | `build-rpm` (amd64, arm64) | the same runners, in a **Rocky Linux 9 container** (digest-pinned) | as `build` with the AppStream clang: `robodr-<rpmver>-1.<x86_64\|aarch64>.rpm` (generated GLIBC requirement <= 2.34 checked), RPM offline bundle, its own SBOM archive `robodr-<ver>-rpm-<arch>-sbom.tar.gz`, `SHA256SUMS-rpm-<arch>` |
 | `build-static` (amd64, arm64) | ubuntu-24.04 (both cross-linked with rust-lld; arm64 through `scripts/static-pie-ld`, whose test runs first) | musl repro + `scripts/build-static.sh` (every binary static-pie: ET_DYN, no interpreter, no `NEEDED`, no text relocations), built == reproduced, smoke run naming the build (qemu for arm64), SBOMs (+ musl and libunwind with archive hashes), `robodr-focal_<debver>_<arch>.deb` (its programs re-checked), bundle, SBOM archive, `SHA256SUMS-focal-<arch>` |
 | `smoke` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm | `scripts/check-packages.py` on the three packages of the architecture, then `scripts/pkg-smoke-matrix.sh`: each package installed with apt / dnf in Debian 12, Ubuntu 20.04 / 22.04 / 24.04, Rocky Linux 9 and Fedora 42 containers |
 | `rebuild-deb`, `rebuild-rpm` (amd64, arm64) | ubuntu-22.04, ubuntu-22.04-arm, in the same digest-pinned containers | independent rebuild: Rust from hash-pinned artifacts (`scripts/ci-install-pinned-toolchain.sh`, no rustup), fresh `CARGO_HOME`, every program incl. `robodr-pulsard`, package and bundle (`scripts/ci-rebuild.sh`); its toolchain inputs recorded |
 | `rebuild-static` (amd64, arm64) | a fresh ubuntu-24.04 VM | the same for `robodr-focal` (same static-pie linker) |
-| `delivery` | ubuntu-24.04 | this commit's `robodr-release` builds **unsigned** secure-delivery RPKs of the `robodr` and `robodr-focal` `.deb` (both arches) and of `rules/robodr` (`scripts/release-rpk.py`, each built twice, digests must agree) plus `DELIVERY-MANIFEST.json`: the asset `robodr-<ver>-rpk.tar.gz` for the offline 2-of-N ceremony (section 7) |
-| `publish` (tag push only) | ubuntu-24.04, environment `release` | release line and CI gate again; `scripts/release-finalize.sh`: rebuild comparison (`scripts/compare-rebuild.py`: packages and programs identical, bundles except their SBOM; `robodr-pulsard` recorded) into the signed `REPRODUCIBILITY-<version>.txt` with every job's toolchain inputs appended, **SBOM gate** (all six SBOM archives; the `robodr` and `.rpm` ones must contain a `robodr-pulsard` SBOM, the `robodr-focal` ones must not; every file complete per `metadata_to_cyclonedx.py --check --require-complete`, which requires the eBPF objects in a `robodr-pulsard` SBOM, and valid per the official `cyclonedx validate` 1.5, pinned by SHA-256), `robodr-<ver>.openvex.json` (section 10), `robodr-<ver>.intoto.jsonl` (SLSA v1 provenance of every asset, section 9), per-arch sums re-checked, `SHA256SUMS`; `scripts/release-sign.sh` (minisign, self-verified with the public key variable); provenance verified against the signed set; `actions/attest-build-provenance` (pinned by SHA) attests every asset in `SHA256SUMS`; uploads; publishes with `--latest` from the release line |
-| `publish-dry-run` (`workflow_dispatch` only) | ubuntu-24.04, no environment | the same `release-finalize.sh`, signed with a **throwaway** key generated in the job, verified; the set and `TEST-ONLY-dry-run-minisign.pub` uploaded as the workflow artifact `release-dry-run-<sha>`; nothing published, no secret, no attestation |
+| `delivery` | ubuntu-24.04 | this commit's `robodr-release`, built with the Rust toolchain from hash-pinned artifacts (`scripts/ci-install-pinned-toolchain.sh`, no rustup), builds **unsigned** secure-delivery RPKs of the `robodr` and `robodr-focal` `.deb` (both arches; exactly those build artifacts are its input) and of `rules/robodr` (`scripts/release-rpk.py`, each built twice, digests must agree) plus `DELIVERY-MANIFEST.json`: the asset `robodr-<ver>-rpk.tar.gz` for the offline 2-of-N ceremony (section 7) |
+| `rebuild-delivery` | ubuntu-22.04 | the same archive again on another runner with its own pinned toolchain installation; `finalize` requires it byte-identical |
+| `finalize` | ubuntu-24.04, **no** environment, `contents: read` | `scripts/release-finalize.sh`: rebuild comparison (`scripts/compare-rebuild.py`: packages, programs and the RPK archive identical, bundles except their SBOM; the eBPF objects embedded in `robodr-pulsard` identical; the program `robodr-pulsard` itself recorded) into the signed `REPRODUCIBILITY-<version>.txt` with every job's toolchain inputs appended, **SBOM gate** (all six SBOM archives; the `robodr` and `.rpm` ones must contain a `robodr-pulsard` SBOM, the `robodr-focal` ones must not; every file complete per `metadata_to_cyclonedx.py --check --require-complete`, which requires the eBPF objects in a `robodr-pulsard` SBOM, and valid per the official `cyclonedx validate` 1.5, pinned by SHA-256), `robodr-<ver>.openvex.json` (section 10), `robodr-<ver>.intoto.jsonl` (SLSA v1 provenance of every asset, section 9), per-arch sums re-checked, `SHA256SUMS`; advisories again; the **set digest** (`scripts/release-assets.py digest`) as a job output and, with the manifest of every file and the rebuild record, in the job summary; the finished, unsigned set as the artifact `final-<sha>` |
+| `publish` (tag push only) | ubuntu-24.04, environment `release` (waits for the reviewers) | release line, protection and CI gates again; downloads `final-<sha>` and refuses it unless its set digest is exactly `finalize`'s (`release-assets.py verify-set`); advisories again (finalize's `cargo-deny` binary; approval can come days later); `scripts/release-sign.sh` (minisign, self-verified with the public key variable); provenance verified against the signed set; `actions/attest-build-provenance` (pinned by SHA) attests every asset in `SHA256SUMS`; uploads; refuses unless the draft holds exactly the signed set and a `.minisig` for each (`release-assets.py check-release`: an asset someone else added to the draft fails the release); publishes with `--latest` from the release line |
+| `publish-dry-run` (`workflow_dispatch` only) | ubuntu-24.04, no environment | `finalize`'s set, checked against its set digest, signed with a **throwaway** key generated in the job, verified; the set and `TEST-ONLY-dry-run-minisign.pub` uploaded as the workflow artifact `release-dry-run-<sha>`; nothing published, no secret, no attestation |
 
-The build jobs have `contents: read` only and hand their assets over as
-workflow artifacts; only `prepare` (creates the draft) and `publish`
-(behind the `release` environment) can write the release. Nothing is
-signed before `smoke`, the rebuilds and the SBOM gate passed.
+The build jobs and `finalize` have `contents: read` only and hand their
+assets over as workflow artifacts; only `prepare` (creates the draft) and
+`publish` (behind the `release` environment) can write the release.
+Nothing is signed before `smoke`, the rebuilds, the SBOM gate and the
+reviewers' approval of `finalize`'s set digest.
 
 29 assets + 29 `.minisig` per release. Per architecture (amd64, arm64):
 `.deb`, offline bundle, SBOM archive, `SHA256SUMS-<arch>`; `.rpm`, RPM
@@ -104,8 +115,13 @@ minisign has no certificate chains, so the hierarchy is procedural:
   maintainers, "prevent self-review" on; deployment restricted to tags
   matching `v*`; no admin bypass. Protect `v*` tags with a ruleset (only
   maintainers create them, no deletion or update). The publish job waits
-  for approval, so a reviewer checks the draft (asset list, per-arch hashes,
-  the reproducibility lines in the build logs) before anything is signed.
+  for approval after `finalize` has finished, so the reviewers approve a
+  concrete set: `finalize`'s job summary shows its set digest, the manifest
+  (every file with its SHA-256) and the independent-rebuild record, and
+  `publish` signs nothing else (section 3, step 6). None of these settings
+  can be made from the repository; the release gate reads what the
+  workflow token can (branch protection, section 3), the rest is checked
+  by an administrator.
 - **Rotation / compromise.** Yearly, or immediately on suspicion: new
   release key in a ceremony, root-signed statement, replace the two secrets
   and the variable, announce. On compromise also publish a root-signed
@@ -122,15 +138,38 @@ the repository.
 ## 3. Procedure (maintainer)
 
 1. CI must be green on the commit: `prepare` refuses to start otherwise
-   (`release-gate.py ci`; it waits up to 2 h for a running CI). Required
-   repository settings: branch protection of `main` and `release/*` with
-   `ci.yml`'s jobs as required status checks and required reviews; a tag
-   ruleset for `v*` (only maintainers create, no update or deletion).
-   These settings are not applied by anything in the repository; an
-   administrator sets them. `ci.yml` runs on pushes to `main` and to
-   `release/**`, so an LTS release commit on `release/X.Y` gets its own CI
-   run when it is pushed (a run started by hand, `workflow_dispatch`, also
-   counts; either uses the commit's own `ci.yml`).
+   (`release-gate.py ci`, for `ci.yml` and `ci-extended.yml`: the newest
+   finished run of each for exactly this commit must have succeeded; it
+   waits up to 2 h for a running one). Both workflows run on pushes to
+   `main` and to `release/**`, so a release commit gets its own runs when it
+   is pushed (a run started by hand, `workflow_dispatch`, also counts;
+   either uses the commit's own workflow files). A newer push to the same
+   branch cancels a running CI; the gate passes over a cancelled run, so
+   re-run it from the Actions page if it was the only one.
+
+   **Required repository settings** (Settings; an administrator sets them,
+   nothing in the repository can):
+   - `main` and `release/*`: branch protection or a branch ruleset with
+     required pull-request reviews (at least one approval by a maintainer
+     other than the author), the jobs of `ci.yml` **and** `ci-extended.yml`
+     (all but `bench`) as required status checks, no force push, no
+     deletion. `release-gate.py protection` refuses a line whose branch is
+     neither `protected` nor under a ruleset `pull_request` rule; it cannot
+     read which checks or how many reviews are required (that needs admin
+     access), so those stay an administrator's check.
+   - A branch ruleset on `release/**` with **Restrict creations** (bypass
+     list: the maintainers only). Without it anyone with write access could
+     create `release/X.Y` for an old line, push an unreviewed commit before
+     protection applies, and tag it. `release-gate.py protection` refuses a
+     `release/X.Y` line that no `creation` rule covers.
+   - A tag ruleset on `v*`: only maintainers create, no update, no deletion.
+   - The `release` environment (section 2): two required reviewers,
+     prevent self-review, deployment tags `v*`, no admin bypass.
+
+   The protection gate runs from the tagged commit, like every gate: it
+   catches a missing or removed setting, not a maintainer who edits the
+   gate in the tagged commit. Against that, the control is the `release`
+   environment's two reviewers (step 6).
 2. Release commit on main (or on `release/X.Y`, section 6) via a reviewed PR:
    - `VERSION` = the new version (`0.1.0-alpha.2`, `0.1.0-rc.1`, `0.1.0`);
    - `Cargo.toml` `[workspace.package] version` = the same, then
@@ -149,15 +188,24 @@ the repository.
 4. Tag and push: `git tag -s v<version> -m "RoboDR <version>"` then
    `git push origin v<version>`.
 5. Watch `prepare`, `build` x2, `build-rpm` x2, `build-static` x2,
-   `smoke` x2, `rebuild-*` x6, `delivery`. Check in the logs: `repro: N
-   binary(ies) reproducible` for each target, the `sha256sum -c` of released
-   vs reproduced, the `--version` lines, the `check-glibc-floor` lines, the
-   `pkg-smoke-matrix` summary (every row `ok`), the toolchain-input records,
-   and `DELIVERY-MANIFEST.json`.
-6. Approve the `release` environment for `publish` (second maintainer).
-   It refuses to sign when a rebuild differs, an SBOM is incomplete or
-   invalid, or the provenance does not match; read
-   `REPRODUCIBILITY-<version>.txt` in its log.
+   `smoke` x2, `rebuild-*` x7, `delivery`, `finalize`. Check in the logs:
+   `repro: N binary(ies) reproducible` for each target, the `sha256sum -c`
+   of released vs reproduced, the `--version` lines, the
+   `check-glibc-floor` lines, the `pkg-smoke-matrix` summary (every row
+   `ok`), the toolchain-input records, and `DELIVERY-MANIFEST.json`.
+   `finalize` refuses the set when a rebuild differs (packages, programs,
+   the eBPF objects of `robodr-pulsard`, the RPK archive), an SBOM is
+   incomplete or invalid, or an advisory is open.
+6. Approve the `release` environment for `publish` (two maintainers, not
+   the one who tagged). Before approving, read `finalize`'s job summary on
+   the run page: the set digest, the manifest (the 29 assets with their
+   SHA-256: names and count as in section 1) and the independent-rebuild
+   record. To check the digest independently, download the artifact
+   `final-<sha>` and run, in its directory,
+   `find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort | xargs -r -d '\n' sha256sum | sha256sum`.
+   `publish` signs only a set with exactly that digest, re-runs the gates
+   and the advisory check, and publishes only if the draft holds exactly
+   the signed set.
 7. After publish: download the release on a clean machine, verify with the
    pinned release key as in `OPERATIONS.md` section 2, check the
    provenance (section 9), and run `scripts/deb-install-smoke.sh` on the
@@ -169,7 +217,8 @@ the repository.
 
 ### Checklist
 
-- [ ] CI green on the release commit (enforced by `prepare`)
+- [ ] repository settings of section 3, step 1 in place (branch protection or rulesets of `main` and `release/*` with `ci.yml` and `ci-extended.yml` required, `release/**` creation restricted, `v*` tag ruleset, `release` environment)
+- [ ] CI (`ci.yml` and `ci-extended.yml`) green on the release commit (enforced by `prepare`)
 - [ ] `VERSION`, `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` agree
 - [ ] security floor / formats / VEX statements reviewed
 - [ ] `docs/compliance/threat-model.md`, `third-party-due-diligence.md` (Pulsar) and the other compliance documents reviewed against the release commit, findings recorded in their review logs, and restamped ("Verified at commit")
@@ -180,7 +229,8 @@ the repository.
 - [ ] reproducibility lines present in all six build jobs
 - [ ] `smoke` green on both architectures
 - [ ] 29 assets + `.minisig` each in the published release (section 1), per-arch `SHA256SUMS-*`
-- [ ] `release` environment approved by a second maintainer
+- [ ] `finalize`'s set digest and manifest read (and optionally recomputed from `final-<sha>`) before approving
+- [ ] `release` environment approved by two maintainers
 - [ ] published release verified offline with the pinned key; provenance verified
 - [ ] `deb-install-smoke.sh` on the published `.deb`s
 - [ ] RPKs signed by the release quorum, bundle built and signed (section 7)
@@ -203,17 +253,20 @@ the reproducibility comparison stay valid.
 
 Actions > Release > Run workflow, on any branch. Every job of the release
 runs on the real runners and containers; `prepare` runs the tag-independent
-checks (the release line and CI gate only warn: a feature branch can be
-dry-run), creates no draft; `publish-dry-run` runs `release-finalize.sh`
-(rebuild comparison, SBOM gate with `cyclonedx validate`, VEX, provenance),
-signs with a throwaway key generated in the job and verifies. Download the
+checks (the release line, protection and CI gates only warn: a feature
+branch can be dry-run; the version's RPK serial and the advisory check
+fail as in a release), creates no draft; `finalize` runs
+`release-finalize.sh` (rebuild comparison, SBOM gate with `cyclonedx
+validate`, VEX, provenance) and shows the set digest; `publish-dry-run`
+checks the set against it, signs with a throwaway key generated in the job
+and verifies. Download the
 artifact `release-dry-run-<sha>` and check it like a release, with
 `TEST-ONLY-dry-run-minisign.pub` as the key. No secret, environment, release
 or attestation is touched.
 
 ### Locally
 
-`scripts/release-dry-run.sh [--tag v0.1.0-rc.0-dryrun] [--out DIR]
+`scripts/release-dry-run.sh [--tag v0.1.0-rc.99] [--out DIR]
 [--jobs "..."]` replays `release.yml` without GitHub:
 
 - `scripts/gha-local-run.py` runs each job's `run:` scripts **as written**
@@ -222,13 +275,14 @@ or attestation is touched.
   `container:` jobs inside their digest-pinned image (docker), with a local
   artifact store for `upload-artifact` / `download-artifact`; `gh` is
   `scripts/gh-release-shim.sh` (a local draft-release directory, and the
-  CI gate's `gh api` call).
+  gates' `gh api` calls: CI runs, branch protection).
 - The tree is a snapshot of HEAD (+ submodules); a release commit for the
   simulated tag is made in a private repository under the work directory.
   **No git tag is created.** Uncommitted changes are not part of it.
 - Guard tests: `prepare` must refuse a wrong tag, a commit whose
-  `Cargo.toml` version is not `VERSION`, a commit on neither `main` nor
-  `release/X.Y`, and a commit whose CI run failed; each refusal must be
+  `Cargo.toml` version is not `VERSION`, a version without an RPK serial,
+  a commit on neither `main` nor `release/X.Y`, a line whose branch is not
+  protected, and a commit whose newest CI run failed; each refusal must be
   for that reason (its log is checked).
 - Signing uses a **throwaway, test-only** minisign key generated in the
   work directory and shredded at the end.
@@ -241,7 +295,8 @@ or attestation is touched.
   `scripts/deb-install-smoke.sh` on every `.deb`.
 - On a non-arm64 host the jobs GitHub runs on native arm64 runners (`build`,
   `build-rpm`, `smoke`, `rebuild-deb`, `rebuild-rpm` arm64), and therefore
-  `delivery` and `publish`, are reported as skipped: the complete run is
+  `delivery`, `rebuild-delivery`, `finalize` and `publish`, are reported as
+  skipped: the complete run is
   the workflow_dispatch one above, or the script on an aarch64 host.
 
 ### What the dry runs prove
@@ -261,6 +316,9 @@ or attestation is touched.
   `GITHUB_TOKEN`, `--verify-tag` on a pushed tag, `--latest`), the
   `release` environment's reviewers and secret scoping, and that the real
   secrets are formatted as expected.
+- The protection gate against the real `branches/` and `rules/branches/`
+  answers of the repository (the dry run's shim answers "protected"), and
+  the ci-extended gate against real `ci-extended.yml` runs.
 - `actions/attest-build-provenance` (OIDC, the attestation store) and
   `gh attestation verify` of the published assets.
 - Reproducibility of `robodr-pulsard` (not claimed; recorded) and running
@@ -293,20 +351,28 @@ report, logs and the test-only public key land in `--out`
 A patch for an older line (e.g. `0.1.4` while `main` is at `0.2.x`) is
 released from a protected branch `release/0.1`:
 
-1. Create `release/0.1` from the last `v0.1.*` tag; protect it like `main`
-   (required reviews, `ci.yml` jobs as required checks, no force push).
-   The release commit needs a successful `ci.yml` run of its own: `ci.yml`
-   runs on pushes to `release/**` (a `workflow_dispatch` run on the branch
-   also counts; section 3, step 1). GitHub reads the trigger from the
-   branch's own `ci.yml`: a line cut from a tag older than the
-   `release/**` trigger needs the `workflow_dispatch` run.
+1. A maintainer on the `release/**` ruleset's bypass list creates
+   `release/0.1` from the last `v0.1.*` tag; it is protected like `main`
+   (required reviews, `ci.yml` and `ci-extended.yml` jobs as required
+   checks, no force push; section 3, step 1). The release commit needs
+   successful `ci.yml` and `ci-extended.yml` runs of its own: both run on
+   pushes to `release/**` (a `workflow_dispatch` run on the branch also
+   counts). GitHub reads the trigger from the branch's own workflow files:
+   a line cut from a tag older than the `release/**` triggers needs the
+   `workflow_dispatch` runs.
 2. Cherry-pick or backport the fix with a reviewed PR into `release/0.1`;
    release commit as in section 3 (version `0.1.4`).
 3. Tag `v0.1.4` on that branch. `prepare` accepts it only because the commit
    is on `origin/release/0.1` and the version is `0.1.*`
-   (`scripts/release-gate.py line`); a `v0.2.*` tag there, or any tag on an
-   unprotected branch, is refused, before anything is built and again
-   before signing.
+   (`scripts/release-gate.py line`), and the branch `release/0.1` is
+   protected and covered by the ruleset restricting the creation of
+   `release/**` (`release-gate.py protection`, section 3); a `v0.2.*` tag
+   there, or a tag on a commit that is on no `main` or `release/X.Y`
+   branch, is refused, before anything is built and again before signing.
+   What the gates cannot stop: they run from the tagged commit, so a
+   maintainer who edits them in that commit passes them. The `release`
+   environment's two reviewers, and the protection settings that keep
+   unreviewed commits off `release/X.Y`, are the control against that.
 4. The release is published with `--latest=false`: the repository's
    "Latest" stays the newest `main` release.
 
@@ -471,12 +537,24 @@ independent rebuild, or between two releases, is visible and signed.
 
 `scripts/release-toolchain-inputs.lock` turns records into enforced pins:
 for a job label with lines there, any other version or fingerprint fails
-the build. It is empty, so today nothing is pinned and the toolchain
-inputs are only recorded (and signed with the record). It is empty on
-purpose: apt.llvm.org (the eBPF clang of the
+the build. It is empty, so today nothing is pinned through it and the
+toolchain inputs are only recorded (and signed with the record). It is
+empty on purpose: apt.llvm.org (the eBPF clang of the
 `.deb` build) and Rocky's AppStream do not keep superseded builds, so a pin
 only holds once those packages come from a **hash-pinned mirror** under our
 control (an apt/dnf snapshot repository; hosting is an infrastructure
-decision). Then point `scripts/ci-install-ebpf-toolchain.sh` /
-`ci-install-clang.sh` at the mirror and copy the recorded lines into the
-lock in a reviewed commit.
+decision, open). Then point `scripts/ci-install-ebpf-toolchain.sh` /
+`ci-install-clang.sh` at the mirror, copy the recorded lines into the
+lock in a reviewed commit, and make the release builds refuse an empty
+lock.
+
+What holds meanwhile, for the eBPF compiler of `robodr-pulsard` (root,
+`CAP_BPF`): the `.rpm` build uses exactly the C-toolchain clang
+(21.1.8-2.el9, `scripts/c-toolchain.sh`; any other version fails), one
+major ahead of Pulsar's pin of 20; the `.deb` build uses apt.llvm.org's
+current clang-20 (archive key pinned, major version enforced, exact build
+not); and `finalize` requires the eBPF objects embedded in the released
+`robodr-pulsard` to equal those of the independent rebuild. Both builds
+fetch the compiler from the same source within minutes, so this detects a
+tampered build job, not a tampered compiler package
+(`docs/customer/known-limitations.md`).

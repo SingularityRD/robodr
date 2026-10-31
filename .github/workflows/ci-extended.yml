@@ -9,7 +9,10 @@ name: CI (extended)
 
 on:
   push:
-    branches: [main]
+    # release/X.Y: an LTS release commit needs a run of its own; release.yml
+    # gates on this workflow as on ci.yml (scripts/release-gate.py ci
+    # --workflow ci-extended.yml; docs/RELEASE.md section 6).
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
 

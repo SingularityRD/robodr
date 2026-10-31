@@ -285,6 +285,27 @@
   (`findings.finding_key`) has no HMAC check yet.
 - **No time-source authentication.** Signatures and replay windows depend
   on NTP.
+- **The eBPF compiler of `robodr-pulsard` is not hash-pinned.**
+  `robodr-pulsard` runs as root with `CAP_BPF` and loads clang-built eBPF
+  objects into the kernel. The program as a whole is not claimed to be
+  reproducible; its eBPF objects are compared with an independent rebuild
+  before a release is signed. On the `.deb` build the compiler is
+  apt.llvm.org's current clang 20 (archive key pinned, exact build not);
+  on the `.rpm` build it is exactly clang 21.1.8-2.el9 from Rocky
+  AppStream, one major version ahead of the 20 that Pulsar pins (its
+  objects compiled and the program starts; they have not been loaded into
+  a kernel). Both builds fetch the compiler from the same source, so the
+  comparison detects a tampered build job, not a tampered compiler package.
+  Planned fix: a hash-pinned package mirror and an enforced toolchain lock
+  ([`docs/RELEASE.md`](../RELEASE.md) section 11).
+- **The release gates run from the tagged commit.** They refuse a tag that
+  is not on a protected `main` or `release/X.Y` branch, whose newest CI
+  runs are not green, or with an open advisory, and the signing approval
+  is bound to the exact set of files. A maintainer who edits the gates in
+  the tagged commit passes them; against that, the controls are the two
+  required reviewers of the `release` environment and the repository's
+  protection settings, which GitHub administrators set and the workflow
+  can only partly read ([`docs/RELEASE.md`](../RELEASE.md) section 3).
 
 ## Operations
 

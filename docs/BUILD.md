@@ -386,15 +386,19 @@ is noble's), the Rust toolchain installed without rustup from hash-pinned
 artifacts (`scripts/ci-install-pinned-toolchain.sh`: the channel manifest
 pinned by SHA-256, each component checked against it), a fresh
 `CARGO_HOME`, every program rebuilt (`robodr-pulsard` included) and every
-package and offline bundle rebuilt (`scripts/ci-rebuild.sh`). `publish`
-compares them with the release (`scripts/compare-rebuild.py`) before it
-signs anything: packages and programs must be identical, bundles too
-except their SBOM (cargo-cyclonedx output). `robodr-pulsard` is not
-claimed to be reproducible: the rebuilt packages carry the release's
-`robodr-pulsard`, so every other byte is compared, and whether the rebuilt
-one matched is recorded in the signed asset `REPRODUCIBILITY-<version>.txt`,
-which is also appended to the release notes. `publish` (and `prepare`)
-also refuse a tag whose commit is not on `main`.
+package and offline bundle rebuilt (`scripts/ci-rebuild.sh`), and the
+secure-delivery RPK archive rebuilt by `rebuild-delivery`. `finalize`
+compares them with the release (`scripts/compare-rebuild.py`) before
+anything is signed: packages, programs and the RPK archive must be
+identical, bundles too except their SBOM (cargo-cyclonedx output).
+`robodr-pulsard` is not claimed to be reproducible: the rebuilt packages
+carry the release's `robodr-pulsard`, so every other byte is compared, the
+eBPF objects it embeds (cut out of both programs by their ELF headers) must
+be identical in the release and the rebuild, and whether the rebuilt
+program as a whole matched is recorded in the signed asset
+`REPRODUCIBILITY-<version>.txt`, which is also appended to the release
+notes. `prepare` and `publish` also refuse a tag whose commit is not on
+`main` or `release/X.Y` (docs/RELEASE.md section 1 lists every gate).
 
 To verify a published release independently: follow
 [C toolchain](#c-toolchain), "Independent verification of a release"
@@ -411,8 +415,16 @@ ceremony are in [docs/RELEASE.md](RELEASE.md).
 cosign / SLSA provenance is a TODO in the workflow.
 
 The Pulsar-bound binary (`pulsard` with RoboDR modules, embedding eBPF objects
-built by clang) is **not** covered yet: clang/LLVM output must be pinned and
-checked separately.
+built by clang) is covered only partly: its eBPF objects must agree between
+the release build and the independent rebuild (above), but the eBPF clang
+is pinned by major version only on the `.deb` build (apt.llvm.org keeps no
+superseded builds; `scripts/release-toolchain-inputs.lock` is empty until a
+hash-pinned package mirror exists, docs/RELEASE.md section 11), and both
+builds fetch it from the same source at the same time, so the comparison
+catches a compromised build job, not a compromised clang package. On the
+`.rpm` build the eBPF clang is the exact C-toolchain pin (21.1.8-2.el9; any
+other version fails `scripts/ci-install-ebpf-toolchain.sh`), one major
+ahead of Pulsar's 20.
 
 ## Static (musl) build
 
@@ -635,10 +647,23 @@ comment; container images by multi-arch index digest (resolved with
 
 ## Extended CI
 
-`.github/workflows/ci-extended.yml` has the same triggers as `ci.yml`. It
-holds the jobs that need a privileged runner, the arm64 runner, a real
-broker or a real kernel. All of them are required except `bench`, which is
-informational (`continue-on-error`).
+`.github/workflows/ci-extended.yml` runs on pushes to `main` and
+`release/**`, on pull requests and by hand (`workflow_dispatch`); unlike
+`ci.yml` it has no weekly schedule. It holds the jobs that need a
+privileged runner, the arm64 runner, a real broker or a real kernel. All of
+them are required except `bench`, which is informational
+(`continue-on-error`, so its failure does not fail the run).
+"Required" is enforced in two places: as required status checks of `main`
+and `release/*` (a repository setting, docs/RELEASE.md section 3), and by
+the release gate: `release.yml` refuses a tag unless the newest completed
+`ci-extended.yml` run for exactly that commit succeeded
+(`scripts/release-gate.py ci --workflow ci-extended.yml`).
+`scripts/check-packages.py` keeps that run conclusion meaningful: no job
+but `bench` may be `continue-on-error` or carry a job-level `if:` (a
+skipped job would not fail the run). A newer push to the same branch
+cancels a running `ci-extended.yml` (and `ci.yml`) run; the gate passes
+over a cancelled run, so a release commit needs one finished run: re-run
+the cancelled one from the Actions page.
 
 | Job | What |
 |---|---|
@@ -1175,5 +1200,7 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   on GitHub: no signing key is provisioned and no release was cut. The whole
   workflow passed a local dry run with a throwaway key on 2026-10-26
   ([Release dry run](#release-dry-run-2026-10-26)).
-  Reproducibility of the Pulsar-bound binary (eBPF objects from clang) is not
-  checked.
+  Reproducibility of the Pulsar-bound binary as a whole is not claimed; its
+  eBPF objects are compared with an independent rebuild (see
+  [Reproducible builds](#reproducible-builds) above), with an eBPF clang
+  that is pinned exactly only on the `.rpm` build.

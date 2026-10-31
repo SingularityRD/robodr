@@ -14,14 +14,19 @@
 #   the package and its offline bundle, named as the release job names them;
 #   BINARIES-<kind>-<arch>.sha256  every robodr-* program this rebuild built,
 #                                  robodr-pulsard included (deb, rpm);
-#   PACKAGES-<kind>-<arch>.sha256  the package and the bundle.
+#   PACKAGES-<kind>-<arch>.sha256  the package and the bundle;
+#   EBPF-<kind>-<arch>.sha256      the SHA-256 of every eBPF object the
+#                                  rebuilt robodr-pulsard embeds (deb, rpm;
+#                                  scripts/compare-rebuild.py --ebpf-objects).
 #
 # robodr-pulsard (Pulsar-bound, clang-built eBPF objects) is not proven to
 # be reproducible: the .deb / .rpm are therefore packaged with the RELEASE
 # job's robodr-pulsard, taken from its package in RELEASE_DIR, so every other
 # byte of the packages is compared, while the rebuilt robodr-pulsard's own
-# hash is in BINARIES-* and publish records in the signed
-# REPRODUCIBILITY-<version>.txt whether it matched.
+# hash is in BINARIES-* and finalize records in the signed
+# REPRODUCIBILITY-<version>.txt whether it matched. The eBPF objects it
+# embeds (the code loaded into the kernel) must match the release's
+# exactly: compare-rebuild.py fails on any difference.
 #
 # Exit: 0 built, 1 build failed, 2 usage.
 set -euo pipefail
@@ -62,6 +67,10 @@ esac
 (cd "$bins" && find . -maxdepth 1 -type f -name 'robodr-*' -perm -u+x ! -name '*.d' -printf '%P\n' |
     LC_ALL=C sort | xargs -r -d '\n' sha256sum) >"$out/BINARIES-$kind-$arch.sha256"
 test -s "$out/BINARIES-$kind-$arch.sha256"
+if [[ "$kind" != focal ]]; then
+    # Fails when the rebuilt robodr-pulsard embeds no eBPF object.
+    python3 scripts/compare-rebuild.py --ebpf-objects "$bins/robodr-pulsard" >"$out/EBPF-$kind-$arch.sha256"
+fi
 
 # The programs to package: the rebuilt ones, robodr-pulsard from the release.
 stage="$tmp/bin"
@@ -107,3 +116,4 @@ focal)
     ;;
 esac
 cat "$out/BINARIES-$kind-$arch.sha256" "$out/PACKAGES-$kind-$arch.sha256"
+[[ "$kind" == focal ]] || cat "$out/EBPF-$kind-$arch.sha256"
