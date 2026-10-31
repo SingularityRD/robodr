@@ -15,7 +15,11 @@ cargo bench -p robodr-benches                   # same workloads, in-process
 exits 1 when a workload's rate falls below `(1 - tolerance)` of the
 baseline's, its peak RSS rises above `(1 + tolerance)` of it, or it dropped
 datagrams (`--tolerance`, default 0.3). A baseline is only comparable on the
-same host class: record one per CI runner type (`--out`).
+same host class: record one per CI runner type (`--out`). On shared runners
+the quick suite varies by up to ±50 % between runs (83 000 and 124 000
+datagrams/s for the same workload on the host below), so gate there with
+`--tolerance 0.5` and treat it as a guard against order-of-magnitude
+regressions; a dedicated runner can use the default.
 
 ## Workloads
 
