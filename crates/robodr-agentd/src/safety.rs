@@ -133,6 +133,27 @@
 //! fails to decode sets that writer's claim to `unknown`
 //! ([`rules::UNDECODABLE`]).
 //!
+//! # Latched sources
+//!
+//! A `lifecycle` source is published on change only, so it has no
+//! `stale_after_ms`: a writer's last trusted event counts while the
+//! writer's **participant is alive**, i.e. until one SPDP lease after the
+//! participant's latest SPDP announcement from an IP bound to it, or after
+//! the event itself if no such announcement followed it (the announced `lease_duration`, clamped to
+//! [`MIN_LATCH_LEASE_MS`]..=[`MAX_LATCH_LEASE_MS`];
+//! [`DEFAULT_LATCH_LEASE_MS`] when none was announced or remembered). An
+//! SPDP dispose of the participant, or an SEDP dispose of the writer, drops
+//! the reading at once, unless it came from an IP outside the
+//! participant's binding (a spoofer's dispose is ignored; one that gets
+//! through only makes the source read `on_stale`). Without a live reading
+//! the source's fields read `on_stale`. So a crashed node holds its last
+//! state for at most one lease (at most [`MAX_LATCH_LEASE_MS`] after its
+//! last trusted SPDP or event), and indefinitely only while its
+//! participant keeps announcing itself: a node that hangs while its
+//! process (and DDS participant) stays up, or a node that dies while other
+//! nodes sharing its participant (one ROS 2 context, e.g. a composed Nav2
+//! container) keep running, is not detected.
+//!
 //! # Recording
 //!
 //! Every change of the combined state is appended to the black box as a
@@ -145,8 +166,9 @@
 //! * Only RTPS over UDP that the capture sees; shared memory, TCP and
 //!   DDS-Security-protected payloads are invisible (sources go stale ->
 //!   `unknown`). Publishers must publish **periodically** (faster than
-//!   `stale_after_ms`); a latched, publish-on-change topic reads as
-//!   `unknown` between changes.
+//!   `stale_after_ms`); a latched, publish-on-change safety topic reads
+//!   as `unknown` between changes (only `lifecycle` context sources are
+//!   latched, above).
 //! * A writer announced before the daemon started is unknown until it
 //!   re-announces (SEDP is not periodic), so its source reads `unknown`.
 //! * The discovery of safety writers is parsed here a second time (own
@@ -198,7 +220,8 @@ pub mod rules {
     /// becomes `unknown`. Medium.
     pub const UNDECODABLE: &str = "robot.safety_state.undecodable_sample";
     /// A trusted writer sent a value the mapping does not list: its claim
-    /// becomes `unknown`. Low.
+    /// becomes `unknown` (on a context-only source: the context fields it
+    /// reports read `on_stale`, the safety state is not affected). Low.
     pub const UNMAPPED_VALUE: &str = "robot.safety_state.unmapped_value";
     /// More fresh writers (or socket connections) than a source keeps: the
     /// source claims at least `unknown` for `stale_after_ms`. High.
@@ -226,6 +249,16 @@ pub const MAX_WRITERS_PER_SOURCE: usize = 8;
 pub const DEFAULT_ANGULAR_MOVING_ABOVE: f64 = 0.1;
 /// SEDP writers on safety topics remembered (least recent evicted).
 pub const MAX_KNOWN_WRITERS: usize = 256;
+/// Participant leases remembered for latched sources (profiled
+/// participants only; a new one is not remembered when full and gets
+/// [`DEFAULT_LATCH_LEASE_MS`]).
+pub const MAX_KNOWN_LEASES: usize = 256;
+/// Lease assumed for a latched reading's participant whose SPDP lease is
+/// not known (the RTPS default `leaseDuration`, as the binding table).
+pub const DEFAULT_LATCH_LEASE_MS: u64 = 100_000;
+/// Bounds of an announced lease (as the binding table clamps it).
+pub const MIN_LATCH_LEASE_MS: u64 = 10_000;
+pub const MAX_LATCH_LEASE_MS: u64 = 600_000;
 /// Distinct (topic, type) readings kept per writer.
 const MAX_READINGS_PER_WRITER: usize = 4;
 /// Dedup keys of reported findings (cleared when full).
@@ -485,7 +518,8 @@ impl Decoder {
     }
 
     /// Published on change only: the last trusted reading counts until the
-    /// next one (no staleness).
+    /// next one, while its writer's participant is alive (no
+    /// `stale_after_ms`; module docs, "Latched sources").
     pub fn latched(&self) -> bool {
         matches!(self, Decoder::Lifecycle(_))
     }
@@ -1045,6 +1079,9 @@ struct Reading {
     ctx: CtxReading,
     /// Last remote activity (`wireless_controller` sources).
     active_at: Option<u64>,
+    /// Latched sources: the reading counts until this time (its writer's
+    /// participant lease, refreshed by its trusted SPDP).
+    alive_until: Option<u64>,
 }
 
 /// Eviction rank of a claim: `none` lowest, then [`conservativeness`].
@@ -1072,7 +1109,8 @@ struct Source {
     safety: bool,
     /// Operational-context fields reported, with their `on_stale` values.
     ctx: CtxRole,
-    /// A reading counts until the next one ([`Decoder::latched`]).
+    /// A reading counts until the next one, while its participant is alive
+    /// ([`Decoder::latched`]).
     latched: bool,
     readings: BTreeMap<String, Reading>,
     evicted: u64,
@@ -1097,7 +1135,20 @@ impl Source {
     }
 
     fn fresh(&self, r: &Reading, now_ms: u64) -> bool {
-        self.latched || now_ms.saturating_sub(r.at_ms) <= self.stale_after_ms
+        if self.latched {
+            return r.alive_until.is_some_and(|u| now_ms <= u);
+        }
+        now_ms.saturating_sub(r.at_ms) <= self.stale_after_ms
+    }
+
+    /// Readings of writers of participant `prefix_hex` (latched sources).
+    fn readings_of<'a>(
+        &'a mut self,
+        prefix_hex: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a mut Reading)> + 'a {
+        self.readings
+            .iter_mut()
+            .filter(move |(w, _)| w.starts_with(prefix_hex))
     }
 
     /// Overflowed within the last `stale_after_ms`.
@@ -1144,6 +1195,7 @@ impl Source {
                 level,
                 ctx: CtxReading::default(),
                 active_at: None,
+                alive_until: None,
             },
         )
     }
@@ -1347,6 +1399,9 @@ pub struct SafetyFeed {
     /// The live context as of the last [`SafetyFeed::evaluate_context`].
     live: Option<LiveContext>,
     context_views: Vec<ContextSourceView>,
+    /// Profiled participant -> its announced lease (ms), for latched
+    /// sources (bounded, [`MAX_KNOWN_LEASES`]).
+    leases: BTreeMap<[u8; 12], u64>,
 }
 
 impl std::fmt::Debug for SafetyFeed {
@@ -1398,6 +1453,7 @@ impl SafetyFeed {
             uplink: uplink_spec.map(UplinkSource::new),
             live: None,
             context_views: Vec::new(),
+            leases: BTreeMap::new(),
         }
     }
 
@@ -1615,6 +1671,7 @@ impl SafetyFeed {
                 level: Level::Idle,
                 ctx: CtxReading::default(),
                 active_at: None,
+                alive_until: None,
             },
         );
         self.stats.applied += 1;
@@ -1738,9 +1795,85 @@ impl SafetyFeed {
         }
     }
 
-    /// Learn this datagram's SEDP and apply its samples on safety topics.
-    /// Call after the pipeline has processed the same datagram (its binding
-    /// table then includes this datagram's SPDP). Returns findings.
+    /// The lease of `writer`'s participant for a latched reading.
+    fn lease_ms(&self, writer: &Guid) -> u64 {
+        let prefix: [u8; 12] = writer[..12].try_into().unwrap_or_default();
+        self.leases
+            .get(&prefix)
+            .copied()
+            .unwrap_or(DEFAULT_LATCH_LEASE_MS)
+    }
+
+    /// Latched sources (module docs, "Latched sources"): a trusted SPDP of
+    /// a writer's participant extends its readings by one lease; a dispose
+    /// of the participant or of the writer drops them. A refresh counts only
+    /// from an IP bound to the participant (as the pipeline judged this
+    /// datagram); a dispose is ignored only from an IP outside the binding
+    /// (after a legit self-dispose the pipeline has already removed it).
+    fn track_liveness(
+        &mut self,
+        report: &robodr_rtps::DatagramReport,
+        profile: &Profile,
+        binding: &BindingTable,
+        datagram: &Datagram,
+        now_ms: u64,
+    ) {
+        let Some(ip) = parse_src_ip(&datagram.src_ip) else {
+            return;
+        };
+        for p in &report.participants {
+            let prefix = p.guid_prefix;
+            if p.source != prefix
+                || binding.is_contested(&prefix)
+                || binding.allows_from(&prefix, ip, datagram.ingress) != Some(true)
+            {
+                continue;
+            }
+            let lease = p
+                .lease_duration
+                .and_then(|d| d.to_std())
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
+                .unwrap_or(DEFAULT_LATCH_LEASE_MS)
+                .clamp(MIN_LATCH_LEASE_MS, MAX_LATCH_LEASE_MS);
+            let prefix_hex = hex12(&prefix);
+            if profile.participants.contains(&prefix_hex)
+                && (self.leases.len() < MAX_KNOWN_LEASES || self.leases.contains_key(&prefix))
+            {
+                self.leases.insert(prefix, lease);
+            }
+            let until = now_ms.saturating_add(lease);
+            for s in self.sources.iter_mut().filter(|s| s.latched) {
+                for (_, r) in s.readings_of(&prefix_hex) {
+                    r.alive_until = Some(until);
+                }
+            }
+        }
+        let refused =
+            |prefix: &[u8; 12]| binding.allows_from(prefix, ip, datagram.ingress) == Some(false);
+        for r in &report.removed_participants {
+            if refused(&r.guid_prefix) {
+                continue;
+            }
+            let prefix_hex = hex12(&r.guid_prefix);
+            self.leases.remove(&r.guid_prefix);
+            for s in self.sources.iter_mut().filter(|s| s.latched) {
+                s.readings.retain(|w, _| !w.starts_with(&prefix_hex));
+            }
+        }
+        for r in &report.removed_endpoints {
+            let Some(g) = r.guid.filter(|_| r.kind == EndpointKind::Writer) else {
+                continue;
+            };
+            if refused(&r.participant) {
+                continue;
+            }
+            let writer = hex_guid(&g);
+            for s in self.sources.iter_mut().filter(|s| s.latched) {
+                s.readings.remove(&writer);
+            }
+        }
+    }
+
     /// The participant identities currently held (prefix -> identity
     /// name), as resolved by the sensor pipeline; replaces the previous
     /// map. A writer listed as `identity:<name>` is trusted while its
@@ -1749,6 +1882,9 @@ impl SafetyFeed {
         self.identities = held;
     }
 
+    /// Learn this datagram's SEDP and apply its samples on safety topics.
+    /// Call after the pipeline has processed the same datagram (its binding
+    /// table then includes this datagram's SPDP). Returns findings.
     pub fn observe_datagram(
         &mut self,
         datagram: &Datagram,
@@ -1764,6 +1900,9 @@ impl SafetyFeed {
         let Some(report) = self.tap.reassembler.parse_datagram_detailed(payload) else {
             return out;
         };
+        if self.sources.iter().any(|s| s.latched) {
+            self.track_liveness(&report, profile, binding, datagram, now_ms);
+        }
         for ep in &report.endpoints {
             if ep.kind != EndpointKind::Writer {
                 continue;
@@ -1850,15 +1989,23 @@ impl SafetyFeed {
                             Some(c) => c,
                             None => {
                                 self.stats.unmapped += 1;
-                                let dev = Deviation::new(
-                                    rules::UNMAPPED_VALUE,
-                                    Severity::Low,
+                                let detail = if spec.decoder.is_safety() {
                                     format!(
                                         "safety-state topic {} carried a value the safety_feed \
                                          mapping does not list (writer {writer}); read as unknown",
                                         spec.topic
-                                    ),
-                                );
+                                    )
+                                } else {
+                                    format!(
+                                        "operational-context topic {} carried a value the \
+                                         safety_feed mapping does not list (writer {writer}); the \
+                                         context fields it reports read their on_stale values \
+                                         (the safety state is not affected)",
+                                        spec.topic
+                                    )
+                                };
+                                let dev =
+                                    Deviation::new(rules::UNMAPPED_VALUE, Severity::Low, detail);
                                 let key = format!("m|{}|{writer}", spec.topic);
                                 self.finding(
                                     &mut out,
@@ -1877,6 +2024,7 @@ impl SafetyFeed {
                             level: d.level,
                             ctx: d.ctx,
                             active_at: d.active_at,
+                            alive_until: None,
                         }
                     }
                     Err(why) => {
@@ -1898,12 +2046,19 @@ impl SafetyFeed {
                             level: prev_level,
                             ctx: CtxReading::unknown(&spec.ctx),
                             active_at: prev_active,
+                            alive_until: None,
                         }
                     }
                 };
+                let lease = self.lease_ms(&s.address.writer);
                 let Some(source) = self.sources.get_mut(idx) else {
                     continue;
                 };
+                let mut reading = reading;
+                if source.latched {
+                    // A trusted sample: its participant is alive now.
+                    reading.alive_until = Some(now_ms.saturating_add(lease));
+                }
                 let outcome = source.set_reading(&writer, reading);
                 self.stats.applied += 1;
                 if outcome == SetOutcome::Overflow {
