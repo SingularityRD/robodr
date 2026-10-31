@@ -627,7 +627,11 @@ partitioner all agreed with the real brokers.
   4096..=100000, the server nonce must extend ours, mandatory extensions
   refused, the server signature is checked in constant time (a TLS-valid
   broker that does not know the credential cannot complete it), failures
-  are fatal (not retried). A broker session lifetime
+  are fatal (not retried). HMAC, PBKDF2 (`Hi`) and SHA-2 are RustCrypto's
+  `hmac` / `pbkdf2` / `sha2` with `zeroize` (keyed hash states wiped on
+  drop), base64 is `base64ct` (constant time, canonical padding only); the
+  previous in-crate code stays in the unit tests as a differential
+  reference. A broker session lifetime
   (`connections.max.reauth.ms`) is honoured by closing the connection at
   80 % of it and authenticating a new one (KIP-368 in-band
   re-authentication is not implemented). Not implemented: `PLAIN`,
@@ -636,7 +640,7 @@ partitioner all agreed with the real brokers.
   SCRAM; bad CA, wrong host, expired, no `serverAuth`, pin mismatch,
   missing / foreign client certificate, downgrades both ways, wrong
   credentials, impostor broker, downgraded iteration count, session
-  renewal, CLI rules), RFC 7677 / RFC 4231 vectors, and
+  renewal, CLI rules), RFC 7677 / RFC 4231 / RFC 7914 vectors, and
   `scripts/kafka-tls-it.sh` against a real Apache Kafka 3.9.1 (SSL, SSL with
   `ssl.client.auth=required`, SASL_SSL SCRAM-SHA-256/512 with
   `connections.max.reauth.ms`). Behind a local TLS proxy instead

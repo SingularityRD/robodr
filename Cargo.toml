@@ -134,6 +134,19 @@ hkdf = "0.12"
 # - HMAC-SHA256 (keyed file digests, synthetic nonces); already in the graph
 #   through p256's RFC 6979 signing;
 hmac = "0.12"
+# SASL/SCRAM of the Kafka producer (robodr-export kafka/sasl.rs, T60):
+# HMAC and PBKDF2 (RFC 5802 `Hi`) from RustCrypto instead of in-crate code.
+# hmac 0.13 / sha2 0.11 are already in the graph (p256 0.14 -> rfc6979 0.6,
+# hkdf 0.13); their `zeroize` feature wipes the keyed hash states (ipad /
+# opad) on drop, which hmac 0.12 above does not. pbkdf2 0.13 is the only new
+# crate (RustCrypto, MIT OR Apache-2.0, no further new dependencies).
+hmac13 = { package = "hmac", version = "0.13", default-features = false, features = ["zeroize"] }
+sha2-11 = { package = "sha2", version = "0.11", default-features = false, features = ["zeroize"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+# Constant-time, strict (canonical padding) RFC 4648 base64 for SCRAM nonces,
+# salts, proofs and signatures (RustCrypto; already in the graph through
+# spki).
+base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
 # - X25519 for depot wrapping keys and units without a TPM (§7.7); its
 #   curve arithmetic is curve25519-dalek, already in the graph;
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }

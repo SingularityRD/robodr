@@ -17,9 +17,14 @@
 //! * Re-authentication (KIP-368) is not implemented: a connection whose
 //!   broker-announced session lifetime is about to end is closed and
 //!   re-opened (a fresh authentication) before its next request.
+//! * Primitives (ADR-0007): HMAC, PBKDF2 (`Hi`) and SHA-2 are RustCrypto's
+//!   `hmac`, `pbkdf2` and `sha2` with their `zeroize` feature (the keyed
+//!   hash states are wiped on drop; the derived keys held here are wiped
+//!   after use); base64 is `base64ct` (constant time, canonical padding
+//!   only). Pinned to RFC 4231 / RFC 7914 / RFC 7677 vectors and to an
+//!   independent in-test reference implementation.
 
 use super::wire::{derr, DecodeError, Reader, Writer};
-use robodr_blackbox::crypto::{Sha256, Sha512};
 use std::fmt;
 use zeroize::Zeroize;
 
@@ -60,67 +65,61 @@ impl Mechanism {
         }
     }
 
-    /// `H(parts...)` through the wiping hashers of `robodr_blackbox::crypto`
-    /// (no keyed hash state is left behind).
-    fn hash(self, parts: &[&[u8]]) -> Vec<u8> {
+    /// `H(data)` (RustCrypto `sha2`; its state is wiped on drop).
+    fn hash(self, data: &[u8]) -> Vec<u8> {
+        use sha2_11::Digest;
         match self {
-            Self::ScramSha256 => {
-                let mut h = Sha256::new();
-                parts.iter().for_each(|p| h.update(p));
-                h.finalize().to_vec()
-            }
-            Self::ScramSha512 => {
-                let mut h = Sha512::new();
-                parts.iter().for_each(|p| h.update(p));
-                h.finalize().to_vec()
-            }
+            Self::ScramSha256 => sha2_11::Sha256::digest(data).to_vec(),
+            Self::ScramSha512 => sha2_11::Sha512::digest(data).to_vec(),
         }
     }
 
-    fn block_len(self) -> usize {
-        match self {
-            Self::ScramSha256 => 64,
-            Self::ScramSha512 => 128,
-        }
-    }
-
-    /// HMAC (RFC 2104) with this mechanism's hash.
+    /// HMAC (RFC 2104) with this mechanism's hash: RustCrypto `hmac`, whose
+    /// keyed inner / outer hash states are wiped on drop (`zeroize`).
     pub fn hmac(self, key: &[u8], msg: &[u8]) -> Vec<u8> {
-        let b = self.block_len();
-        let mut k0 = vec![0u8; b];
-        if key.len() > b {
-            let mut h = self.hash(&[key]);
-            // A digest is shorter than the block.
-            k0.iter_mut().zip(&h).for_each(|(d, s)| *d = *s);
-            h.zeroize();
-        } else {
-            k0.iter_mut().zip(key).for_each(|(d, s)| *d = *s);
-        }
-        let mut pad: Vec<u8> = k0.iter().map(|k| k ^ 0x36).collect();
-        let mut ih = self.hash(&[&pad, msg]);
-        pad.iter_mut().zip(&k0).for_each(|(p, k)| *p = k ^ 0x5c);
-        k0.zeroize();
-        let out = self.hash(&[&pad, &ih]);
-        pad.zeroize();
-        ih.zeroize();
-        out
-    }
-
-    /// `Hi(password, salt, i)`: PBKDF2 with this HMAC, one block.
-    pub fn hi(self, password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
-        let mut s = salt.to_vec();
-        s.extend_from_slice(&1u32.to_be_bytes());
-        let mut u = self.hmac(password, &s);
-        let mut out = u.clone();
-        for _ in 1..iterations {
-            let next = self.hmac(password, &u);
-            u.zeroize();
-            u = next;
-            for (o, x) in out.iter_mut().zip(&u) {
-                *o ^= x;
+        use hmac13::{KeyInit, Mac};
+        fn run<M: Mac + KeyInit>(key: &[u8], msg: &[u8]) -> Vec<u8> {
+            // HMAC takes keys of any length (longer ones are hashed).
+            match <M as KeyInit>::new_from_slice(key) {
+                Ok(mut m) => {
+                    m.update(msg);
+                    m.finalize().into_bytes().to_vec()
+                }
+                Err(_) => Vec::new(),
             }
         }
-        u.zeroize();
+        match self {
+            Self::ScramSha256 => run::<hmac13::Hmac<sha2_11::Sha256>>(key, msg),
+            Self::ScramSha512 => run::<hmac13::Hmac<sha2_11::Sha512>>(key, msg),
+        }
+    }
+
+    fn digest_len(self) -> usize {
+        match self {
+            Self::ScramSha256 => 32,
+            Self::ScramSha512 => 64,
+        }
+    }
+
+    /// `Hi(password, salt, i)` of RFC 5802: PBKDF2 (RustCrypto `pbkdf2`)
+    /// with this HMAC, one block of the digest's length.
+    pub fn hi(self, password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+        let mut out = vec![0u8; self.digest_len()];
+        // HMAC accepts any key length, so this cannot fail; were it to,
+        // the empty result fails the exchange (the server signature does
+        // not verify) instead of panicking.
+        let ok = match self {
+            Self::ScramSha256 => pbkdf2::pbkdf2::<hmac13::Hmac<sha2_11::Sha256>>(
+                password, salt, iterations, &mut out,
+            ),
+            Self::ScramSha512 => pbkdf2::pbkdf2::<hmac13::Hmac<sha2_11::Sha512>>(
+                password, salt, iterations, &mut out,
+            ),
+        };
+        if ok.is_err() {
+            out.zeroize();
+            out.clear();
+        }
         out
     }
 }
@@ -176,52 +175,18 @@ impl SaslConfig {
 
 // --- base64 (RFC 4648, standard alphabet, padded) ---------------------------
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
+/// Standard padded base64 (RustCrypto `base64ct`: constant time, so the
+/// encoding of a proof or signature does not leak through timing).
 pub fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (u32::from(c.first().copied().unwrap_or(0)) << 16)
-            | (u32::from(c.get(1).copied().unwrap_or(0)) << 8)
-            | u32::from(c.get(2).copied().unwrap_or(0));
-        for (i, shift) in [18u32, 12, 6, 0].iter().enumerate() {
-            if i <= c.len() {
-                // Masked to 0..64: always a B64 entry.
-                let d = B64
-                    .get(((n >> shift) & 63) as usize)
-                    .copied()
-                    .unwrap_or(b'=');
-                out.push(char::from(d));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    use base64ct::Encoding;
+    base64ct::Base64::encode_string(data)
 }
 
+/// Strict decoding: canonical padding only, no whitespace, no other
+/// alphabet (`None` on anything else).
 pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if !b.len().is_multiple_of(4) {
-        return None;
-    }
-    let val = |c: u8| B64.iter().position(|&x| x == c).map(|p| p as u32);
-    let mut out = Vec::with_capacity(b.len() / 4 * 3);
-    let chunks = b.len() / 4;
-    for (ci, c) in b.chunks(4).enumerate() {
-        let pad = c.iter().rev().take_while(|&&x| x == b'=').count();
-        if pad > 2 || (pad > 0 && ci + 1 != chunks) {
-            return None;
-        }
-        let mut n = 0u32;
-        for (i, &x) in c.iter().enumerate() {
-            let v = if i >= 4 - pad { 0 } else { val(x)? };
-            n = (n << 6) | v;
-        }
-        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(bytes.get(..3 - pad).unwrap_or_default());
-    }
-    Some(out)
+    use base64ct::Encoding;
+    base64ct::Base64::decode_vec(s).ok()
 }
 
 // --- SCRAM client ------------------------------------------------------------
@@ -318,7 +283,7 @@ impl ScramClient {
         let auth_message = format!("{},{server_first},{without_proof}", self.first_bare);
         let mut salted = m.hi(password.as_bytes(), &salt, iters);
         let mut client_key = m.hmac(&salted, b"Client Key");
-        let mut stored_key = m.hash(&[&client_key]);
+        let mut stored_key = m.hash(&client_key);
         let mut client_sig = m.hmac(&stored_key, auth_message.as_bytes());
         let mut proof: Vec<u8> = client_key
             .iter()
@@ -503,6 +468,155 @@ mod tests {
             "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a\
              6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
         );
+    }
+
+    /// RFC 4231 test case 6: a key longer than the block (hashed first).
+    #[test]
+    fn hmac_long_key_vectors() {
+        let key = [0xaau8; 131];
+        let m = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        assert_eq!(
+            robodr_blackbox::crypto::to_hex(&Mechanism::ScramSha256.hmac(&key, m)),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        assert_eq!(
+            robodr_blackbox::crypto::to_hex(&Mechanism::ScramSha512.hmac(&key, m)),
+            "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352\
+             6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598"
+        );
+    }
+
+    /// PBKDF2-HMAC-SHA-256 of RFC 7914 §11 (its first block: `Hi` is
+    /// exactly one block of the digest's length).
+    #[test]
+    fn hi_is_one_pbkdf2_block() {
+        assert_eq!(
+            robodr_blackbox::crypto::to_hex(&Mechanism::ScramSha256.hi(b"passwd", b"salt", 1)),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+        );
+        assert_eq!(
+            robodr_blackbox::crypto::to_hex(&Mechanism::ScramSha256.hi(
+                b"Password",
+                b"NaCl",
+                80_000
+            )),
+            "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56"
+        );
+        assert_eq!(Mechanism::ScramSha512.hi(b"pw", b"salt", 4096).len(), 64);
+    }
+
+    /// The previous in-crate HMAC / PBKDF2 / base64, kept as an
+    /// independent reference (over `robodr_blackbox::crypto`'s SHA-2).
+    mod reference {
+        use super::Mechanism;
+        use robodr_blackbox::crypto::{Sha256, Sha512};
+
+        fn hash(m: Mechanism, parts: &[&[u8]]) -> Vec<u8> {
+            match m {
+                Mechanism::ScramSha256 => {
+                    let mut h = Sha256::new();
+                    parts.iter().for_each(|p| h.update(p));
+                    h.finalize().to_vec()
+                }
+                Mechanism::ScramSha512 => {
+                    let mut h = Sha512::new();
+                    parts.iter().for_each(|p| h.update(p));
+                    h.finalize().to_vec()
+                }
+            }
+        }
+
+        pub fn hmac(m: Mechanism, key: &[u8], msg: &[u8]) -> Vec<u8> {
+            let b = match m {
+                Mechanism::ScramSha256 => 64,
+                Mechanism::ScramSha512 => 128,
+            };
+            let kh;
+            let key = if key.len() > b {
+                kh = hash(m, &[key]);
+                &kh[..]
+            } else {
+                key
+            };
+            let mut k0 = vec![0u8; b];
+            k0[..key.len()].copy_from_slice(key);
+            let ipad: Vec<u8> = k0.iter().map(|k| k ^ 0x36).collect();
+            let opad: Vec<u8> = k0.iter().map(|k| k ^ 0x5c).collect();
+            let ih = hash(m, &[&ipad, msg]);
+            hash(m, &[&opad, &ih])
+        }
+
+        pub fn hi(m: Mechanism, pw: &[u8], salt: &[u8], iters: u32) -> Vec<u8> {
+            let mut s = salt.to_vec();
+            s.extend_from_slice(&1u32.to_be_bytes());
+            let mut u = hmac(m, pw, &s);
+            let mut out = u.clone();
+            for _ in 1..iters {
+                u = hmac(m, pw, &u);
+                out.iter_mut().zip(&u).for_each(|(o, x)| *o ^= x);
+            }
+            out
+        }
+
+        pub fn b64(data: &[u8]) -> String {
+            const A: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for c in data.chunks(3) {
+                let n = (u32::from(c[0]) << 16)
+                    | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*c.get(2).unwrap_or(&0));
+                for (i, sh) in [18u32, 12, 6, 0].iter().enumerate() {
+                    out.push(if i <= c.len() {
+                        char::from(A[((n >> sh) & 63) as usize])
+                    } else {
+                        '='
+                    });
+                }
+            }
+            out
+        }
+    }
+
+    /// The crates against the reference: key lengths around both block
+    /// sizes, salts and iteration counts, every base64 tail length.
+    #[test]
+    fn crates_agree_with_the_reference() {
+        for m in [Mechanism::ScramSha256, Mechanism::ScramSha512] {
+            for klen in [0usize, 1, 31, 32, 63, 64, 65, 127, 128, 129, 300] {
+                let key: Vec<u8> = (0..klen).map(|i| (i * 7 + 3) as u8).collect();
+                for msg in [&b""[..], b"Client Key", &[0xffu8; 200][..]] {
+                    assert_eq!(
+                        m.hmac(&key, msg),
+                        reference::hmac(m, &key, msg),
+                        "{m:?} {klen}"
+                    );
+                }
+            }
+            for (pw, salt, n) in [
+                (&b"pencil"[..], &b"\x5b\x6d\x99\x68"[..], 1u32),
+                (b"pencil", b"salt-salt-salt", 2),
+                (b"p", b"s", 4096),
+            ] {
+                assert_eq!(m.hi(pw, salt, n), reference::hi(m, pw, salt, n));
+            }
+        }
+        for len in 0..40usize {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let enc = b64_encode(&data);
+            assert_eq!(enc, reference::b64(&data), "{len}");
+            assert_eq!(b64_decode(&enc), Some(data));
+        }
+    }
+
+    /// Non-canonical base64 (padding bits set) is refused: a salt or a
+    /// server signature has exactly one encoding.
+    #[test]
+    fn base64_is_canonical() {
+        assert_eq!(b64_decode("Zg=="), Some(b"f".to_vec()));
+        for bad in ["Zh==", "Zm9=", "Zg==\n", " Zg==", "Zg", "Zm9v\r\n"] {
+            assert_eq!(b64_decode(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
