@@ -13,8 +13,8 @@
 #    digest. Cargo tools pinned by version + --locked; downloaded tools
 #    (cyclonedx-cli) by version + SHA-256.
 #  * Build jobs only read the repository (contents: read) and hand their
-#    assets to `publish` as workflow artifacts; only `prepare` (draft) and
-#    `publish` (upload, sign, publish) can write the release.
+#    assets on as workflow artifacts; only `prepare` (draft) and `publish`
+#    (sign, upload, publish) can write the release.
 #  * Every build is --locked against the COMMITTED Cargo.lock
 #    (scripts/ci-setup.sh fails without one), SOURCE_DATE_EPOCH = the tagged
 #    commit's time, --remap-path-prefix for checkout and CARGO_HOME. Every
@@ -29,11 +29,33 @@
 #    unless the version is a pre-release, which GitHub never makes
 #    "Latest") or
 #    on release/X.Y for version X.Y.* (a long-term-support line; never
-#    "Latest"). Protect release/* like main (required reviews and checks).
-#  * ci: ci.yml has a completed, successful push / workflow_dispatch /
-#    schedule run for exactly the tagged commit (waited for up to 2 h;
-#    pull_request runs test a merge commit and do not count). Make ci.yml's
-#    jobs required checks of main and release/* in branch protection.
+#    "Latest").
+#  * protection: that branch is protected (classic protection or a ruleset
+#    pull_request rule), and a release/X.Y branch is covered by a ruleset
+#    restricting its creation (docs/RELEASE.md sections 3 and 6). What the
+#    workflow token cannot read (required reviewers and checks of classic
+#    protection, bypass lists) stays a documented repository setting.
+#  * ci: ci.yml AND ci-extended.yml (privileged TPM / seal / netns /
+#    nftables tests, arm64, real Kafka, eBPF load) each have no run still
+#    going and a successful NEWEST completed push / workflow_dispatch /
+#    schedule run for exactly the tagged commit (waited for; an older green
+#    run does not outweigh a newer red one; pull_request runs test a merge
+#    commit and do not count). Make both workflows' jobs required checks of
+#    main and release/*.
+#  * advisories: `cargo deny --locked check advisories` against today's
+#    RustSec database (prepare; finalize and publish again).
+# The version must also have an RPK serial (scripts/release-rpk.py
+# --serial), so `delivery` cannot refuse it after the builds.
+#
+# Approval is bound to bytes: `finalize` (no secret, contents: read) runs
+# every check on the finished set (rebuild comparison, SBOM gate, VEX,
+# provenance, SHA256SUMS) and publishes its SET DIGEST
+# (scripts/release-assets.py) as an output and, with the full manifest, in
+# its job summary. Only then does `publish` wait for the `release`
+# environment's reviewers, who approve that digest; `publish` signs only a
+# set with exactly that digest, and publishes the draft only when its
+# assets are exactly the signed set (an asset someone added to the draft
+# fails the release instead of going out unsigned).
 #
 # Outputs, per architecture (amd64, arm64; docs/BUILD.md "Package matrix"):
 #   robodr_<debver>_<arch>.deb                  Debian package, built in Ubuntu
@@ -60,7 +82,8 @@
 #   robodr-<ver>-rpk.tar.gz                     UNSIGNED secure-delivery RPKs (robodr,
 #                                               robodr-focal, rules) and
 #                                               DELIVERY-MANIFEST.json for the
-#                                               offline 2-of-N ceremony (job delivery)
+#                                               offline 2-of-N ceremony (job delivery;
+#                                               rebuilt by rebuild-delivery)
 #   REPRODUCIBILITY-<ver>.txt                   independent-rebuild result and the
 #                                               toolchain inputs of every build
 #   robodr-<ver>.openvex.json                   OpenVEX (security/vex/statements.json)
@@ -84,9 +107,10 @@
 #            example.*, localhost) fails them (packaging/release-maintainer.sh)
 #   environment "release" holding the secrets, with required reviewers.
 # A dry run (workflow_dispatch) never enters the "release" environment: its
-# publish-dry-run job generates a throwaway minisign key, signs, verifies,
-# and uploads everything with the TEST-ONLY public key as a workflow
-# artifact. The delivery keys (RPK release quorum) never reach CI at all.
+# publish-dry-run job checks finalize's set like publish, generates a
+# throwaway minisign key, signs, verifies, and uploads everything with the
+# TEST-ONLY public key as a workflow artifact. The delivery keys (RPK
+# release quorum) never reach CI at all.
 #
 # Reproducibility, two layers:
 #  1. In each build job the pure binaries are built twice from different
@@ -101,13 +125,15 @@
 #     (scripts/ci-install-pinned-toolchain.sh: the channel manifest is pinned
 #     by SHA-256, every component checked against it), a fresh CARGO_HOME,
 #     rebuilds every program, robodr-pulsard included, and every package and
-#     offline bundle (scripts/ci-rebuild.sh). `publish` compares binaries
-#     and packages with the release (scripts/compare-rebuild.py) and signs
-#     nothing unless they are identical (bundles: except their SBOM, the
+#     offline bundle (scripts/ci-rebuild.sh); rebuild-delivery rebuilds the
+#     RPK archive. `finalize` compares binaries, packages and the RPK
+#     archive with the release (scripts/compare-rebuild.py) and nothing is
+#     signed unless they are identical (bundles: except their SBOM, the
 #     cargo-cyclonedx output). robodr-pulsard (Pulsar-bound: clang-built
 #     eBPF objects) is not claimed to be bit-for-bit reproducible: the
 #     rebuilt packages carry the release's robodr-pulsard so every other
-#     byte is compared, and whether the rebuilt robodr-pulsard matched is
+#     byte is compared, the eBPF objects it embeds must be identical in
+#     both builds, and whether the rebuilt robodr-pulsard matched is
 #     recorded in REPRODUCIBILITY-<version>.txt, a signed release asset that
 #     is also appended to the release notes.
 #
@@ -115,8 +141,9 @@
 # outside the repository (container digest, rustc, the target's rust-std,
 # every C / eBPF toolchain package with version and fingerprint;
 # scripts/release-toolchain-inputs.sh), checked against
-# scripts/release-toolchain-inputs.lock where that has lines for the job;
-# `publish` appends all records to REPRODUCIBILITY-<version>.txt.
+# scripts/release-toolchain-inputs.lock where that has lines for the job
+# (none yet: docs/RELEASE.md section 11); `finalize` appends all records to
+# REPRODUCIBILITY-<version>.txt.
 name: Release
 
 on:
@@ -153,6 +180,8 @@ env:
   # not been validated with it yet (first GitHub dry run).
   CYCLONEDX_CLI_VERSION: 0.27.2
   CYCLONEDX_CLI_SHA256: 5e1595542a6367378a3944bbd3008caab3de65d572345361d3b9597b1dbbaaa0
+  # Same pin as ci.yml (the release-time advisory check).
+  CARGO_DENY_VERSION: 0.20.2
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -161,11 +190,14 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-      # gh api .../actions/workflows/ci.yml/runs (the CI gate).
+      # gh api .../actions/workflows/{ci,ci-extended}.yml/runs (the CI
+      # gates). The protection gate reads branches/ and rules/branches/,
+      # which need only the metadata access every token has.
       actions: read
     outputs:
       version: ${{ steps.meta.outputs.version }}
       latest: ${{ steps.line.outputs.latest }}
+      line: ${{ steps.line.outputs.line }}
       dry_run: ${{ steps.mode.outputs.dry_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,9 +205,11 @@ jobs:
           persist-credentials: false
           # Every branch: the tagged commit must be on main or release/X.Y.
           fetch-depth: 0
-      - name: Release tooling self-tests (gates, SBOM, RPK, VEX, provenance, toolchain record)
+      - name: Release tooling self-tests (gates, asset set, rebuild comparison, SBOM, RPK, VEX, provenance, toolchain record)
         run: |
           python3 scripts/release-gate.py --self-test
+          python3 scripts/release-assets.py --self-test
+          python3 scripts/compare-rebuild.py --self-test
           python3 scripts/vuln-scan-tags.py --self-test
           python3 scripts/metadata_to_cyclonedx.py --self-test
           python3 scripts/sbom-select.py --self-test
@@ -235,6 +269,14 @@ jobs:
             echo "::error file=Cargo.lock::Cargo.lock is not committed; a release cannot be --locked (docs/BUILD.md)"
             exit 1
           fi
+          # The delivery job needs an RPK serial: X.Y.Z or
+          # X.Y.Z-(alpha|beta|rc).N, no build metadata. Refused here, before
+          # anything is built (release-gate.py accepts any semantic version).
+          if ! serial="$(python3 scripts/release-rpk.py --serial "$version")"; then
+            echo "::error file=VERSION::$version has no secure-delivery serial (scripts/release-rpk.py): use X.Y.Z or X.Y.Z-(alpha|beta|rc).N"
+            exit 1
+          fi
+          echo "RPK serial of $version: $serial"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Release line (main, or release/X.Y long-term support)
         id: line
@@ -251,17 +293,35 @@ jobs:
           else
             exit 1
           fi
-      - name: CI passed for this commit (ci.yml)
+      - name: The release line's branch is protected (and release/* creation restricted)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINE: ${{ steps.line.outputs.line }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            if [ "$LINE" = none ]; then
+              echo "::warning::dry run: no release line, branch protection not checked"
+            else
+              python3 scripts/release-gate.py protection --repo "$GITHUB_REPOSITORY" --branch "$LINE" ||
+                echo "::warning::dry run of a line whose branch is not protected as a release requires"
+            fi
+          else
+            python3 scripts/release-gate.py protection --repo "$GITHUB_REPOSITORY" --branch "$LINE"
+          fi
+      - name: CI passed for this commit (ci.yml and ci-extended.yml, newest run)
         env:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ steps.mode.outputs.dry_run }}
         run: |
-          if [ "$DRY_RUN" = true ]; then
-            python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" ||
-              echo "::warning::dry run of a commit without a green CI run"
-          else
-            python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --wait-minutes 120
-          fi
+          for wf in ci.yml ci-extended.yml; do
+            if [ "$DRY_RUN" = true ]; then
+              python3 scripts/release-gate.py ci --workflow "$wf" --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" ||
+                echo "::warning::dry run of a commit without a green $wf run"
+            else
+              python3 scripts/release-gate.py ci --workflow "$wf" --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --wait-minutes 120
+            fi
+          done
       - name: Release notes from CHANGELOG
         env:
           VERSION: ${{ steps.meta.outputs.version }}
@@ -289,6 +349,18 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --draft --verify-tag $pre \
             --title "RoboDR $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+      # Last in this job: `cargo install` runs third-party build scripts,
+      # which could add to $GITHUB_PATH / $GITHUB_ENV of the steps after
+      # them; no step that holds the token comes after. The build jobs
+      # need this job, so nothing is built on an open advisory.
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Setup (mirror, --locked)
+        run: scripts/ci-setup.sh
+      - name: No known advisory (cargo deny, today's RustSec database)
+        run: |
+          cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+          cargo deny --locked check advisories
 
   # ---------------------------------------------------------------------------
   build:
@@ -893,8 +965,13 @@ jobs:
     # this commit as UNSIGNED RPKs, built with this commit's robodr-release
     # (each twice; digests must agree), plus DELIVERY-MANIFEST.json. The
     # release quorum signs them offline (2-of-N); no delivery key is in CI.
+    # The Rust toolchain from hash-pinned artifacts (no rustup), and exactly
+    # the robodr and robodr-focal build artifacts as input (named, so the
+    # input set never depends on which other jobs happen to have finished);
+    # rebuild-delivery builds the same archive again on another runner and
+    # finalize compares the two.
     name: Unsigned delivery RPKs
-    needs: [prepare, build, build-static]
+    needs: [prepare, build, build-rpm, build-static]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -905,16 +982,25 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Rust toolchain from hash-pinned artifacts (no rustup), fresh CARGO_HOME
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >> "$GITHUB_PATH"
+          scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
       - name: robodr-release of this commit
         run: cargo build --release --locked -p robodr-release
-      - name: The .deb packages and SBOM archives of the build jobs
+      - name: The robodr .deb packages and SBOM archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: release-*-${{ github.sha }}
+          pattern: release-a*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/assets
+      - name: The robodr-focal .deb packages and SBOM archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-focal-*-${{ github.sha }}
           merge-multiple: true
           path: ${{ runner.temp }}/assets
       - name: Build the RPKs and the delivery manifest
@@ -928,7 +1014,7 @@ jobs:
               --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
               -C dist/delivery -cf - rpk | gzip -9 -n > "dist/delivery-asset/robodr-$VERSION-rpk.tar.gz"
           cat dist/delivery/rpk/DELIVERY-MANIFEST.json
-      - name: Hand the RPK archive to publish
+      - name: Hand the RPK archive to finalize
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-rpk-${{ github.sha }}
@@ -936,45 +1022,89 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  # ---------------------------------------------------------------------------
-  publish:
-    name: Checksums, provenance, sign, publish
-    if: github.event_name == 'push'
-    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static, delivery]
-    runs-on: ubuntu-24.04
-    # Secrets live in this environment only; give it required reviewers.
-    environment: release
+  rebuild-delivery:
+    # Independent rebuild of `delivery` (another runner, its own pinned
+    # toolchain installation and CARGO_HOME): the RPK archive must be
+    # byte-identical (scripts/compare-rebuild.py, in finalize).
+    name: Independent rebuild, delivery RPKs
+    needs: [prepare, build, build-rpm, build-static]
+    runs-on: ubuntu-22.04
     permissions:
-      contents: write
-      actions: read
-      # actions/attest-build-provenance (Sigstore certificate via OIDC, and
-      # the attestation store).
-      id-token: write
-      attestations: write
+      contents: read
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Rust toolchain from hash-pinned artifacts (no rustup), fresh CARGO_HOME
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >> "$GITHUB_PATH"
+          scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: robodr-release of this commit
+        run: cargo build --release --locked -p robodr-release
+      - name: The robodr .deb packages and SBOM archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-a*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/assets
+      - name: The robodr-focal .deb packages and SBOM archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-focal-*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/assets
+      - name: Rebuild the RPKs and the delivery manifest
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python3 scripts/release-rpk.py --version "$VERSION" --assets "$RUNNER_TEMP/assets" \
+            --rules rules/robodr --robodr-release target/release/robodr-release --out dist/delivery/rpk
+          mkdir -p dist/rebuild
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mode=go-w \
+              --mtime="@$SOURCE_DATE_EPOCH" \
+              --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              -C dist/delivery -cf - rpk | gzip -9 -n > "dist/rebuild/robodr-$VERSION-rpk.tar.gz"
+          sha256sum "dist/rebuild/robodr-$VERSION-rpk.tar.gz"
+      - name: Hand the rebuild to finalize
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebuild-delivery-${{ github.sha }}
+          path: dist/rebuild
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  finalize:
+    # Every check on the finished set, WITHOUT a secret or write access, so
+    # its result exists before anyone is asked to approve: rebuild
+    # comparison, toolchain record, SBOM gate, VEX, provenance, SHA256SUMS
+    # (scripts/release-finalize.sh), today's advisories, and the set digest
+    # (scripts/release-assets.py) as an output and in the job summary. The
+    # finished, unsigned set goes to publish / publish-dry-run as the
+    # artifact final-<sha>.
+    name: Rebuild comparison, SBOM gate, provenance, SHA256SUMS (the set to approve)
+    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static, delivery, rebuild-delivery]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      set_sha256: ${{ steps.digest.outputs.set_sha256 }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Release line and CI (again, right before signing)
-        id: line
-        # No pipe: the default `bash -e` shell has no pipefail, so
-        # `gate | tee` would hide a refusal. The output reaches
-        # $GITHUB_OUTPUT only when the gate accepted.
-        run: |
-          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" > "$RUNNER_TEMP/line"
-          cat "$RUNNER_TEMP/line"
-          grep -qxE 'latest=(true|false)' "$RUNNER_TEMP/line" || { echo "::error::release line output missing"; exit 1; }
-          cat "$RUNNER_TEMP/line" >> "$GITHUB_OUTPUT"
-          python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
-      - name: Install minisign, rpm2archive (rebuild comparison) and cyclonedx-cli (SBOM schema)
+      - name: Install rpm2archive (rebuild comparison) and cyclonedx-cli (SBOM schema)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign rpm
-          minisign -v
+          sudo apt-get install -y --no-install-recommends rpm
           curl -fsSL -o "$RUNNER_TEMP/cyclonedx" \
             "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v$CYCLONEDX_CLI_VERSION/cyclonedx-linux-x64"
           echo "$CYCLONEDX_CLI_SHA256  $RUNNER_TEMP/cyclonedx" | sha256sum --strict -c
@@ -997,9 +1127,132 @@ jobs:
         run: ls -l "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild"
       - name: Rebuild comparison, toolchain record, SBOM gate, VEX, provenance, SHA256SUMS
         # Fails (nothing is signed) on any rebuild difference except
-        # robodr-pulsard's own reproducibility (recorded either way), on an
-        # incomplete or schema-invalid SBOM, or on a per-arch hash mismatch.
+        # robodr-pulsard's own reproducibility (recorded either way; its
+        # eBPF objects must match), on an incomplete or schema-invalid SBOM,
+        # or on a per-arch hash mismatch.
         run: scripts/release-finalize.sh "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild" "$VERSION"
+      # The digest is taken, and the set handed on, before anything else
+      # runs in this job (cargo install below runs third-party build
+      # scripts): a later change to these files cannot match the digest.
+      - name: Set digest and summary (what the release reviewers approve)
+        id: digest
+        run: |
+          h="$(python3 scripts/release-assets.py digest --dir "$RUNNER_TEMP/rel" --manifest "$RUNNER_TEMP/manifest.txt")"
+          echo "set_sha256=$h" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Release $VERSION: the set to approve"
+            echo
+            echo "Set digest (scripts/release-assets.py; \`publish\` signs only a set with exactly this digest):"
+            echo
+            echo '```'
+            echo "$h"
+            echo '```'
+            echo
+            echo "Manifest (every asset to be signed and published, SHA-256):"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/manifest.txt"
+            echo '```'
+            echo
+            echo "Independent rebuild:"
+            echo
+            echo '```'
+            sed -n '1,/^Toolchain inputs/p' "$RUNNER_TEMP/rel/REPRODUCIBILITY-$VERSION.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "set digest: $h"
+      - name: Hand the finished set to publish
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: final-${{ github.sha }}
+          path: ${{ runner.temp }}/rel
+          if-no-files-found: error
+          retention-days: 90
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Setup (mirror, --locked)
+        run: scripts/ci-setup.sh
+      - name: No known advisory (cargo deny); the binary goes to publish
+        run: |
+          cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION" --root "$RUNNER_TEMP/tools"
+          "$RUNNER_TEMP/tools/bin/cargo-deny" --locked check advisories
+      - name: Hand cargo-deny to publish (its advisory re-check)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tool-cargo-deny-${{ github.sha }}
+          path: ${{ runner.temp }}/tools/bin/cargo-deny
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  publish:
+    # Waits for the `release` environment's reviewers (two maintainers),
+    # who approve finalize's set digest (its job summary). Signs only that
+    # exact set, and publishes only when the draft holds exactly it.
+    name: Sign the approved set, attest, publish
+    if: github.event_name == 'push'
+    needs: [prepare, finalize]
+    runs-on: ubuntu-24.04
+    # Secrets live in this environment only; give it required reviewers.
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      # actions/attest-build-provenance (Sigstore certificate via OIDC, and
+      # the attestation store).
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Release line, protection and CI (again, right before signing)
+        id: line
+        # No pipe: the default `bash -e` shell has no pipefail, so
+        # `gate | tee` would hide a refusal. The output reaches
+        # $GITHUB_OUTPUT only when the gate accepted.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" > "$RUNNER_TEMP/line"
+          cat "$RUNNER_TEMP/line"
+          grep -qxE 'latest=(true|false)' "$RUNNER_TEMP/line" || { echo "::error::release line output missing"; exit 1; }
+          line="$(sed -n 's/^line=//p' "$RUNNER_TEMP/line")"
+          python3 scripts/release-gate.py protection --repo "$GITHUB_REPOSITORY" --branch "$line"
+          for wf in ci.yml ci-extended.yml; do
+            python3 scripts/release-gate.py ci --workflow "$wf" --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --wait-minutes 60
+          done
+          cat "$RUNNER_TEMP/line" >> "$GITHUB_OUTPUT"
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          minisign -v
+      - name: Download the set finalize checked
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: final-${{ github.sha }}
+          path: ${{ runner.temp }}/rel
+      - name: The set is the approved one (finalize's set digest)
+        env:
+          SET_SHA256: ${{ needs.finalize.outputs.set_sha256 }}
+        run: python3 scripts/release-assets.py verify-set --dir "$RUNNER_TEMP/rel" --set-sha256 "$SET_SHA256"
+      - name: cargo-deny of finalize
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tool-cargo-deny-${{ github.sha }}
+          path: ${{ runner.temp }}/tools
+      - name: No known advisory, right before signing (cargo deny, today's RustSec database)
+        # Approval can come days after finalize: a RustSec advisory
+        # published meanwhile stops the release here.
+        run: |
+          rustup toolchain install
+          scripts/ci-setup.sh
+          chmod +x "$RUNNER_TEMP/tools/cargo-deny"
+          "$RUNNER_TEMP/tools/cargo-deny" --locked check advisories
       - name: Sign (minisign) and self-verify with the published public key
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -1016,9 +1269,10 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/rel/SHA256SUMS
-      - name: Upload assets, checksums and signatures, publish
+      - name: Upload assets, checksums and signatures; the draft holds exactly the signed set; publish
         working-directory: ${{ runner.temp }}/rel
         env:
+          GH_TOKEN: ${{ github.token }}
           LATEST: ${{ steps.line.outputs.latest }}
         run: |
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber ./*
@@ -1035,6 +1289,11 @@ jobs:
             echo '```'
           } >> "$RUNNER_TEMP/notes.md"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
+          # Anything else on the draft (an asset added by anyone with
+          # contents: write since prepare created it) fails the release
+          # instead of being published unsigned next to the signed set.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/assets.txt"
+          python3 "$GITHUB_WORKSPACE/scripts/release-assets.py" check-release --dir . --names "$RUNNER_TEMP/assets.txt"
           # An older release line (release/X.Y) or a pre-release never
           # becomes "Latest" (release-gate.py line).
           case "$LATEST" in true|false) ;; *) echo "::error::release line output missing"; exit 1 ;; esac
@@ -1042,14 +1301,14 @@ jobs:
 
   # ---------------------------------------------------------------------------
   publish-dry-run:
-    # workflow_dispatch only: the publish job's checks and signing with a
+    # workflow_dispatch only: publish's set check and signing with a
     # THROWAWAY minisign key generated here (no environment, no secret, no
     # release, no attestation); the signed set and the TEST-ONLY public key
     # are a workflow artifact. Verify it like a release:
     #   minisign -V -p TEST-ONLY-dry-run-minisign.pub -m <asset>
-    name: Dry run - checksums, provenance, sign with a throwaway key
+    name: Dry run - sign finalize's set with a throwaway key
     if: github.event_name == 'workflow_dispatch'
-    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static, delivery]
+    needs: [prepare, finalize]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1060,30 +1319,19 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install minisign, rpm2archive and cyclonedx-cli
+      - name: Install minisign
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign rpm
-          curl -fsSL -o "$RUNNER_TEMP/cyclonedx" \
-            "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v$CYCLONEDX_CLI_VERSION/cyclonedx-linux-x64"
-          echo "$CYCLONEDX_CLI_SHA256  $RUNNER_TEMP/cyclonedx" | sha256sum --strict -c
-          chmod +x "$RUNNER_TEMP/cyclonedx"
-          echo "ROBODR_CYCLONEDX_CLI=$RUNNER_TEMP/cyclonedx" >> "$GITHUB_ENV"
-          echo "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1" >> "$GITHUB_ENV"
-      - name: Download the build jobs' assets
+          sudo apt-get install -y --no-install-recommends minisign
+      - name: Download the set finalize checked
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: release-*-${{ github.sha }}
-          merge-multiple: true
+          name: final-${{ github.sha }}
           path: ${{ runner.temp }}/rel
-      - name: Download the independent rebuilds
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: rebuild-*-${{ github.sha }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/rebuild
-      - name: Rebuild comparison, toolchain record, SBOM gate, VEX, provenance, SHA256SUMS
-        run: scripts/release-finalize.sh "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild" "$VERSION"
+      - name: The set is finalize's (set digest)
+        env:
+          SET_SHA256: ${{ needs.finalize.outputs.set_sha256 }}
+        run: python3 scripts/release-assets.py verify-set --dir "$RUNNER_TEMP/rel" --set-sha256 "$SET_SHA256"
       - name: Sign with a throwaway key (TEST ONLY) and verify
         run: |
           umask 077
@@ -1094,6 +1342,8 @@ jobs:
           MINISIGN_SECRET_KEY="$(cat "$k/TEST-ONLY.key")" MINISIGN_PASSWORD="$pw" \
             scripts/release-sign.sh "$RUNNER_TEMP/rel" "$VERSION" "$(sed -n 2p "$k/TEST-ONLY.pub")"
           shred -u "$k/TEST-ONLY.key"
+          (cd "$RUNNER_TEMP/rel" && ls) > "$RUNNER_TEMP/assets.txt"
+          python3 scripts/release-assets.py check-release --dir "$RUNNER_TEMP/rel" --names "$RUNNER_TEMP/assets.txt"
           mkdir -p dist/dry-run
           cp "$RUNNER_TEMP"/rel/* dist/dry-run/
           cp "$k/TEST-ONLY.pub" dist/dry-run/TEST-ONLY-dry-run-minisign.pub

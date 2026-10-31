@@ -4,6 +4,7 @@ delivery: RPKs and the 2-of-N signing ceremony"; docs/SECURE-DELIVERY.md).
 
     release-rpk.py --version V --assets DIR --rules DIR --robodr-release BIN --out DIR
                    [--platform LABEL] [--sha256sums FILE]
+    release-rpk.py --serial V
     release-rpk.py --self-test
 
 From the release's own assets (the build jobs' output, before signing) it
@@ -29,7 +30,11 @@ Serial: robodr-pkg orders releases by an integer serial. From the semantic
 version X.Y.Z[-pre]: serial = ((X*1000 + Y)*1000 + Z)*1000 + p, with
 p = 100+N for alpha.N, 400+N for beta.N, 700+N for rc.N (N <= 99) and 999
 for a final release, so 0.1.0-alpha.1 < 0.1.0-rc.2 < 0.1.0 < 0.1.1. Any
-other pre-release label is refused.
+other pre-release label (and build metadata, `+...`) is refused.
+`--serial V` prints V's serial, or refuses V (exit 1): release.yml
+`prepare` runs it, so a version this script cannot deliver is refused
+before anything is built, not after the build jobs (scripts/release-gate.py
+accepts the wider semantic-version grammar).
 
 Exit: 0 built, 1 refused / failed, 2 usage.
 """
@@ -285,6 +290,14 @@ def self_test() -> int:
                 with self.assertRaises(ValueError, msg=v):
                     serial(v)
 
+        def test_serial_cli(self):
+            # release.yml prepare: the semantic versions release-gate.py
+            # accepts but no RPK serial exists for are refused up front.
+            self.assertEqual(main(["--serial", "0.1.0-rc.2"]), 0)
+            for v in ("0.1.0-dev.1", "0.2.0+build.1", "0.1.0-rc.1.2"):
+                self.assertEqual(main(["--serial", v]), 1, v)
+            self.assertEqual(main(["--serial"]), 2)
+
         def test_spec(self):
             s = spec("robodr", "0.1.0-alpha.1", "deb", "arm64", "linux", True)
             self.assertEqual(s["version"], {"serial": 1000101, "display": "0.1.0-alpha.1"})
@@ -321,6 +334,16 @@ def self_test() -> int:
 def main(argv: list[str]) -> int:
     if argv[:1] == ["--self-test"]:
         return self_test()
+    if argv[:1] == ["--serial"]:
+        if len(argv) != 2:
+            print("usage: release-rpk.py --serial VERSION", file=sys.stderr)
+            return 2
+        try:
+            print(serial(argv[1]))
+        except ValueError as e:
+            print(f"release-rpk: {e}", file=sys.stderr)
+            return 1
+        return 0
     ap = argparse.ArgumentParser(description="Unsigned secure-delivery RPKs of a release")
     ap.add_argument("--version", required=True)
     ap.add_argument("--assets", required=True)

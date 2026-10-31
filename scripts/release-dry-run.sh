@@ -3,7 +3,7 @@
 # machine, without GitHub and without the real release secrets
 # (docs/RELEASE.md "Dry run").
 #
-#   scripts/release-dry-run.sh [--tag v0.1.0-rc.0-dryrun] [--out DIR]
+#   scripts/release-dry-run.sh [--tag v0.1.0-rc.99] [--out DIR]
 #       [--work DIR] [--jobs "prepare build:amd64 ..."] [--keep-work]
 #
 # What it does, in order:
@@ -20,20 +20,23 @@
 #     as GITHUB_REF_NAME.
 #  3. Guard tests: the prepare job must REFUSE a tag that does not match
 #     VERSION, a commit whose Cargo.toml version disagrees with VERSION, a
-#     commit that is on neither main nor release/X.Y, and a commit whose CI
-#     run (the shim's `gh api`) did not pass.
+#     version without a secure-delivery serial, a commit that is on neither
+#     main nor release/X.Y, a line whose branch is not protected, and a
+#     commit whose newest CI run (the shim's `gh api`) did not pass.
 #  4. The jobs of release.yml, through scripts/gha-local-run.py, which runs
 #     each step's `run:` script as written, `container:` jobs inside their
 #     pinned image (docker), with a local artifact store between jobs:
 #     prepare, build, build-rpm, build-static, smoke, rebuild-deb,
-#     rebuild-rpm, rebuild-static, delivery, publish. Each job starts from a
+#     rebuild-rpm, rebuild-static, delivery, rebuild-delivery, finalize,
+#     publish (with finalize's set digest). Each job starts from a
 #     fresh clone (a fresh runner: no target/, no dist/) that is deleted
 #     after the job. `gh release ...` / the CI `gh api` call are
 #     scripts/gh-release-shim.sh (a local draft release directory).
 #     Adaptations, all printed in the log:
 #       * the arm64 jobs that GitHub runs on native arm64 runners (build,
 #         build-rpm, smoke, rebuild-deb, rebuild-rpm) run only on an
-#         aarch64 host; elsewhere they, delivery and publish are SKIPPED
+#         aarch64 host; elsewhere they, delivery, rebuild-delivery,
+#         finalize and publish are SKIPPED
 #         (reported, RESULT stays PASS for what ran). build-static and
 #         rebuild-static arm64 run anywhere (cross-linked, as on GitHub).
 #         The complete dry run on real runners is the workflow itself:
@@ -77,15 +80,18 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-tag="v0.1.0-rc.0-dryrun"
+# The default simulated tag: a pre-release with a secure-delivery serial
+# (prepare refuses any other, scripts/release-rpk.py --serial). No git tag
+# is created.
+tag="v0.1.0-rc.99"
 out="$root/dist/release-dry-run"
 work=""
 keep=0
 jobs_all="prepare build:amd64 build:arm64 build-rpm:amd64 build-rpm:arm64 build-static:amd64 build-static:arm64
 smoke:amd64 smoke:arm64 rebuild-deb:amd64 rebuild-deb:arm64 rebuild-rpm:amd64 rebuild-rpm:arm64
-rebuild-static:amd64 rebuild-static:arm64 delivery publish"
-# Jobs GitHub runs on native arm64 runners; without them delivery and
-# publish have nothing to work on.
+rebuild-static:amd64 rebuild-static:arm64 delivery rebuild-delivery finalize publish"
+# Jobs GitHub runs on native arm64 runners; without them delivery,
+# rebuild-delivery, finalize and publish have nothing to work on.
 native_arm64=" build:arm64 build-rpm:arm64 smoke:arm64 rebuild-deb:arm64 rebuild-rpm:arm64 "
 jobs="$(tr '\n' ' ' <<<"$jobs_all")"
 while [[ $# -gt 0 ]]; do
@@ -285,19 +291,30 @@ git -C "$repo" checkout -q -b guard-feature "$sha"
 git -C "$repo" commit -q --allow-empty -m "guard: an unreviewed commit on a feature branch"
 feature_sha="$(git -C "$repo" rev-parse HEAD)"
 git -C "$repo" checkout -q main
+git -C "$repo" checkout -q -b guard-serial "$sha"
+set_version "$repo" "${version%%-*}-dev.1"
+git -C "$repo" commit -q -am "guard: a version without an RPK serial"
+serial_sha="$(git -C "$repo" rev-parse HEAD)"
+git -C "$repo" checkout -q main
 guard cargo-version "Cargo.toml" "a commit whose Cargo.toml version is not VERSION" \
     --sha "$guard_sha" --ref-name "v$version-guard"
+guard rpk-serial "has no secure-delivery serial" "a version without a secure-delivery serial" \
+    --sha "$serial_sha" --ref-name "v${version%%-*}-dev.1"
 guard release-line "neither on main nor on release/" "a commit on neither main nor release/X.Y" \
     --sha "$feature_sha" --ref-name "$tag"
-GH_SHIM_CI_CONCLUSION=failure guard ci-red "CI did not pass" "a commit whose CI run failed" \
+GH_SHIM_UNPROTECTED=1 guard unprotected "is not protected" "a release line whose branch is not protected" \
     --sha "$sha" --ref-name "$tag"
-git -C "$repo" branch -q -D guard-cargo-version guard-feature
+GH_SHIM_CI_CONCLUSION=failure guard ci-red "did not pass" "a commit whose newest CI run failed" \
+    --sha "$sha" --ref-name "$tag"
+git -C "$repo" branch -q -D guard-cargo-version guard-feature guard-serial
 
 # ------------------------------------------------------- 4. the jobs
 shim="$work/gh-releases"
 mkdir -p "$shim" "$work/artifacts"
 outputs="$work/prepare-outputs.json"
+foutputs="$work/finalize-outputs.json"
 vout=""
+set_sha=""
 skipped=()
 publish_ran=0
 for j in $jobs; do
@@ -311,7 +328,7 @@ for j in $jobs; do
         result INFO "job $name: SKIPPED (a native arm64 runner on GitHub; this host is $(uname -m))"
         continue
     fi
-    if [[ ("$job" == delivery || "$job" == publish) && ${#skipped[@]} -gt 0 ]]; then
+    if [[ ("$job" == delivery || "$job" == rebuild-delivery || "$job" == finalize || "$job" == publish) && ${#skipped[@]} -gt 0 ]]; then
         result INFO "job $name: SKIPPED (needs ${skipped[*]}); run release.yml with workflow_dispatch for the complete dry run"
         continue
     fi
@@ -319,6 +336,8 @@ for j in $jobs; do
     [[ -n "$arch" ]] && args+=(--matrix "arch=$arch")
     [[ -n "$vout" ]] && args+=(--needs "prepare.version=$vout" --needs "prepare.latest=$want_latest" --needs "prepare.dry_run=false")
     [[ "$job" == prepare ]] && args+=(--outputs-file "$outputs")
+    [[ "$job" == finalize ]] && args+=(--outputs-file "$foutputs")
+    [[ "$job" == publish ]] && args+=(--needs "finalize.set_sha256=$set_sha")
     # The build jobs run with ROBODR_RELEASE=1, which refuses a placeholder
     # maintainer; the dry run's own (reserved .test domain) stands in for
     # the repository variable ROBODR_MAINTAINER.
@@ -351,6 +370,11 @@ for j in $jobs; do
     else
         result FAIL "job $name (exit $rc after $((secs / 60)) min; see logs/$name.log)"
         break
+    fi
+    if [[ "$job" == finalize ]]; then
+        set_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["set_sha256"])' "$foutputs")"
+        [[ "$set_sha" =~ ^[0-9a-f]{64}$ ]] || { result FAIL "finalize: no set digest output"; break; }
+        result INFO "finalize: set digest $set_sha (what the release reviewers approve)"
     fi
     if [[ "$job" == prepare ]]; then
         vout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$outputs")"

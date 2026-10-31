@@ -39,11 +39,26 @@ Static checks (no package needed; CI job `scripts`):
      ProtectHome=, PrivateTmp=, NoNewPrivileges=, a SystemCallFilter=.
 
   10. release.yml: `prepare` and `publish` refuse a tag whose commit is
-     not on main (git merge-base --is-ancestor); every build job has an
-     independent rebuild job (the toolchain from
-     scripts/ci-install-pinned-toolchain.sh, never rustup) that `publish`
-     needs, and `publish` runs scripts/compare-rebuild.py before it writes
-     SHA256SUMS and signs.
+     not on main or release/X.Y (git merge-base --is-ancestor), whose
+     line's branch is not protected (release-gate.py protection), or whose
+     newest ci.yml or ci-extended.yml run is not green (release-gate.py
+     ci, both workflows); `prepare`, `finalize` and `publish` check
+     today's advisories (cargo deny check advisories); `prepare` refuses a
+     version without an RPK serial (release-rpk.py --serial). Every build
+     job, and `delivery`, has an independent rebuild job (the toolchain
+     from scripts/ci-install-pinned-toolchain.sh, never rustup; `delivery`
+     too) that `finalize` needs; `finalize` (no environment, no secret,
+     contents: read) runs scripts/release-finalize.sh (which runs
+     scripts/compare-rebuild.py before it writes SHA256SUMS) and publishes
+     the set digest; `publish` (environment `release`) needs `finalize`,
+     checks the set against that digest (release-assets.py verify-set)
+     before scripts/release-sign.sh, and the draft's assets
+     (release-assets.py check-release) before `--draft=false`;
+     `publish-dry-run` checks the digest before signing too.
+     ci-extended.yml runs on pushes to release/** like ci.yml, and no job
+     of it but `bench` is informational (continue-on-error) or conditional
+     (a job-level `if:`): its run conclusion, which the release gate reads,
+     then covers every required job.
 
   11. Resource caps (sales-readiness T76): every long-running service
      (regular and focal; Type= other than oneshot) sets MemoryMax=, so a
@@ -740,20 +755,36 @@ def job_blocks(text: str) -> dict[str, str]:
     return out
 
 
-REBUILDS = {"build": "rebuild-deb", "build-rpm": "rebuild-rpm", "build-static": "rebuild-static"}
+REBUILDS = {"build": "rebuild-deb", "build-rpm": "rebuild-rpm", "build-static": "rebuild-static",
+            "delivery": "rebuild-delivery"}
+
+
+def job_needs(job: str) -> set[str]:
+    m = re.search(r"needs:\s*\[([^\]]*)\]", job)
+    return {x.strip() for x in m.group(1).split(",")} if m else set()
 
 
 def check_release_workflow_text(text: str) -> list[str]:
     errs = []
     jobs = job_blocks(text)
+    pub, fin, dry = jobs.get("publish", ""), jobs.get("finalize", ""), jobs.get("publish-dry-run", "")
     for j in ("prepare", "publish"):
+        body = jobs.get(j, "")
         # scripts/release-gate.py line: on origin/main, or on the version's
         # release/X.Y line (merge-base --is-ancestor; refused otherwise).
-        if "scripts/release-gate.py line" not in jobs.get(j, ""):
+        if "scripts/release-gate.py line" not in body:
             errs.append(f"release.yml: job {j} does not check that the tagged commit is on main")
-    pub = jobs.get("publish", "")
-    m = re.search(r"needs:\s*\[([^\]]*)\]", pub)
-    needs = {x.strip() for x in m.group(1).split(",")} if m else set()
+        if "scripts/release-gate.py protection" not in body:
+            errs.append(f"release.yml: job {j} does not check that the release line's branch is protected")
+        # Both CI workflows, newest run (release-gate.py ci --workflow).
+        if not re.search(r"for wf in ci\.yml ci-extended\.yml; do\n(?:[^\n]*\bthen\n)?\s+python3 scripts/release-gate\.py ci "
+                         r"--workflow \"\$wf\"", body):
+            errs.append(f"release.yml: job {j} does not gate on both ci.yml and ci-extended.yml")
+    for j in ("prepare", "finalize", "publish"):
+        if "check advisories" not in jobs.get(j, ""):
+            errs.append(f"release.yml: job {j} does not check today's advisories (cargo deny check advisories)")
+    if "scripts/release-rpk.py --serial" not in jobs.get("prepare", ""):
+        errs.append("release.yml: prepare does not refuse a version without an RPK serial")
     for build, rebuild in REBUILDS.items():
         rb = jobs.get(rebuild, "")
         if not rb:
@@ -761,13 +792,50 @@ def check_release_workflow_text(text: str) -> list[str]:
             continue
         if "ci-install-pinned-toolchain.sh" not in rb or "ci-install-rustup.sh" in rb or "rustup " in rb:
             errs.append(f"release.yml: {rebuild} must install the toolchain from pinned artifacts, not rustup")
-        if "ci-rebuild.sh" not in rb:
+        if build != "delivery" and "ci-rebuild.sh" not in rb:
             errs.append(f"release.yml: {rebuild} does not run scripts/ci-rebuild.sh")
-        if rebuild not in needs:
-            errs.append(f"release.yml: publish does not need {rebuild}")
-    fin_at, sign_at = pub.find("scripts/release-finalize.sh"), pub.find("scripts/release-sign.sh")
-    if not (0 <= fin_at < sign_at):
-        errs.append("release.yml: publish must run scripts/release-finalize.sh before scripts/release-sign.sh")
+        if rebuild not in job_needs(fin):
+            errs.append(f"release.yml: finalize does not need {rebuild}")
+    dl = jobs.get("delivery", "")
+    if "ci-install-pinned-toolchain.sh" not in dl or "rustup " in dl:
+        errs.append("release.yml: delivery must install the toolchain from pinned artifacts, not rustup")
+    # finalize: every check before approval, nothing privileged.
+    if "scripts/release-finalize.sh" not in fin or "release-assets.py digest" not in fin:
+        errs.append("release.yml: finalize must run scripts/release-finalize.sh and publish the set digest")
+    if re.search(r"^    environment:", fin, re.M) or "secrets." in fin or "contents: write" in fin:
+        errs.append("release.yml: finalize must run without an environment, a secret or write access")
+    if "release-finalize.sh" in pub or "release-finalize.sh" in dry:
+        errs.append("release.yml: only finalize builds the set (publish signs what finalize checked)")
+    if not re.search(r"^    environment: release$", pub, re.M):
+        errs.append("release.yml: publish must run in the environment release")
+    for name, job in (("publish", pub), ("publish-dry-run", dry)):
+        if "finalize" not in job_needs(job):
+            errs.append(f"release.yml: {name} does not need finalize")
+        ver_at, sign_at = job.find("release-assets.py verify-set"), job.find("scripts/release-sign.sh")
+        if not (0 <= ver_at < sign_at) or "needs.finalize.outputs.set_sha256" not in job:
+            errs.append(f"release.yml: {name} must check finalize's set digest (release-assets.py verify-set) before scripts/release-sign.sh")
+    chk_at, pub_at = pub.find("release-assets.py\" check-release"), pub.find("--draft=false")
+    if chk_at < 0:
+        chk_at = pub.find("release-assets.py check-release")
+    if not (0 <= chk_at < pub_at):
+        errs.append("release.yml: publish must check the draft's assets (release-assets.py check-release) before --draft=false")
+    return errs
+
+
+def check_ci_extended_text(text: str) -> list[str]:
+    """release-gate.py reads ci-extended.yml's run conclusion: every job
+    but the informational `bench` must count towards it, and a release/X.Y
+    commit must get a run."""
+    errs = []
+    m = re.search(r"^  push:\s*\n(?:\s*#[^\n]*\n)*    branches: \[([^\]]*)\]", text, re.M)
+    branches = {b.strip().strip('"') for b in m.group(1).split(",")} if m else set()
+    if not {"main", "release/**"} <= branches:
+        errs.append("ci-extended.yml: push must run on main and release/** (the release gate needs a run per release commit)")
+    for name, body in job_blocks(text).items():
+        if name != "bench" and re.search(r"^    continue-on-error:", body, re.M):
+            errs.append(f"ci-extended.yml: job {name} is continue-on-error; only bench is informational")
+        if re.search(r"^    if:", body, re.M):
+            errs.append(f"ci-extended.yml: job {name} has a job-level if: (a skipped job would pass the release gate)")
     return errs
 
 
@@ -783,7 +851,8 @@ def check_release_finalize_text(text: str) -> list[str]:
 
 def check_release_workflow(root: Path) -> list[str]:
     return check_release_workflow_text((root / ".github" / "workflows" / "release.yml").read_text()) + \
-        check_release_finalize_text((root / "scripts" / "release-finalize.sh").read_text())
+        check_release_finalize_text((root / "scripts" / "release-finalize.sh").read_text()) + \
+        check_ci_extended_text((root / ".github" / "workflows" / "ci-extended.yml").read_text())
 
 
 def static_checks(root: Path) -> list[str]:
@@ -1279,16 +1348,58 @@ def self_test() -> int:
     rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
     expect("release workflow ok", check_release_workflow_text(rel), True)
     expect("no main check", check_release_workflow_text(rel.replace("scripts/release-gate.py line", "true")), False)
-    expect("publish without rebuild", check_release_workflow_text(
-        rel.replace(", rebuild-deb, rebuild-rpm, rebuild-static, delivery]", ", delivery]")), False)
+    expect("finalize without rebuild", check_release_workflow_text(
+        rel.replace(", rebuild-deb, rebuild-rpm, rebuild-static, delivery, rebuild-delivery]", ", delivery]")), False)
+    expect("finalize without the delivery rebuild", check_release_workflow_text(
+        rel.replace(", delivery, rebuild-delivery]", ", delivery]")), False)
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
-    expect("sign before finalize", check_release_workflow_text(
+    expect("delivery with rustup", check_release_workflow_text(
+        rel.replace("""      - name: Rust toolchain from hash-pinned artifacts (no rustup), fresh CARGO_HOME
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo-home/bin" >> "$GITHUB_PATH"
+          scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: robodr-release of this commit""", """      - name: Install toolchain
+        run: rustup toolchain install
+      - name: robodr-release of this commit""", 1)), False)
+    expect("no finalize", check_release_workflow_text(
         rel.replace("scripts/release-finalize.sh", "true")), False)
+    expect("finalize privileged", check_release_workflow_text(
+        rel.replace("""    outputs:
+      set_sha256:""", """    environment: release
+    outputs:
+      set_sha256:""")), False)
+    expect("publish without approval", check_release_workflow_text(
+        rel.replace("    environment: release\n", "")), False)
+    expect("sign without the approved digest", check_release_workflow_text(
+        rel.replace("release-assets.py verify-set", "true")), False)
+    expect("publish draft unchecked", check_release_workflow_text(
+        rel.replace("check-release --dir . --names", "true")), False)
+    expect("publish not after finalize", check_release_workflow_text(
+        rel.replace("needs: [prepare, finalize]", "needs: [prepare]")), False)
+    expect("no protection gate", check_release_workflow_text(
+        rel.replace("scripts/release-gate.py protection", "true")), False)
+    expect("ci.yml only", check_release_workflow_text(
+        rel.replace("for wf in ci.yml ci-extended.yml; do", "for wf in ci.yml; do")), False)
+    expect("no advisory check", check_release_workflow_text(
+        rel.replace("check advisories", "check bans")), False)
+    expect("no RPK serial check", check_release_workflow_text(
+        rel.replace("scripts/release-rpk.py --serial", "true")), False)
+    ext = (ROOT / ".github" / "workflows" / "ci-extended.yml").read_text()
+    expect("ci-extended ok", check_ci_extended_text(ext), True)
+    expect("ci-extended main only", check_ci_extended_text(
+        ext.replace('branches: [main, "release/**"]', "branches: [main]")), False)
+    expect("ci-extended second informational job", check_ci_extended_text(
+        ext.replace("    runs-on: ubuntu-24.04-arm\n", "    runs-on: ubuntu-24.04-arm\n    continue-on-error: true\n", 1)), False)
+    expect("ci-extended conditional job", check_ci_extended_text(
+        ext.replace("    runs-on: ubuntu-24.04-arm\n", "    runs-on: ubuntu-24.04-arm\n    if: github.event_name == 'push'\n", 1)), False)
     fin = (ROOT / "scripts" / "release-finalize.sh").read_text()
     expect("finalize ok", check_release_finalize_text(fin), True)
     expect("no comparison", check_release_finalize_text(fin.replace("compare-rebuild.py", "true")), False)
-    total = 79
+    total = 79 + 17
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

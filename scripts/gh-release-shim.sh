@@ -9,11 +9,15 @@
 #   gh release upload TAG --repo R [--clobber] FILE...
 #   gh release download TAG --repo R -D DIR
 #   gh release view TAG --repo R --json body --jq .body
+#   gh release view TAG --repo R --json assets --jq '.assets[].name'
 #   gh release edit TAG --repo R [--notes-file F] [--draft=false] [--latest=true|false]
-#   gh api -X GET repos/R/actions/workflows/ci.yml/runs -f head_sha=SHA -f per_page=N
-#       (the CI gate, scripts/release-gate.py): one completed run of event
+#   gh api -X GET repos/R/actions/workflows/{ci,ci-extended}.yml/runs -f head_sha=SHA -f per_page=N
+#       (the CI gates, scripts/release-gate.py): one completed run of event
 #       push for SHA, with conclusion $GH_SHIM_CI_CONCLUSION (default
 #       success; the dry run's guard test sets failure).
+#   gh api -X GET repos/R/branches/B and repos/R/rules/branches/B
+#       (the protection gate): B protected, with a pull_request and a
+#       creation rule, unless GH_SHIM_UNPROTECTED=1 (unprotected, no rule).
 #
 # --verify-tag: the dry run does not create a git tag (by design); the shim
 # checks instead that GITHUB_SHA is a commit of the dry-run repository.
@@ -34,7 +38,21 @@ if [[ "${1:-}" == api ]]; then
         *) path="$1"; shift ;;
         esac
     done
-    [[ "$path" =~ ^repos/[^/]+/[^/]+/actions/workflows/ci\.yml/runs$ ]] || die 2 "api: only the ci.yml runs endpoint is emulated, got $path"
+    if [[ "$path" =~ ^repos/[^/]+/[^/]+/branches/([A-Za-z0-9._%-]+)$ ]]; then
+        if [[ "${GH_SHIM_UNPROTECTED:-0}" == 1 ]]; then p=false; else p=true; fi
+        printf '{"name":"%s","protected":%s}\n' "${BASH_REMATCH[1]//%2F//}" "$p"
+        exit 0
+    fi
+    if [[ "$path" =~ ^repos/[^/]+/[^/]+/rules/branches/[A-Za-z0-9._%-]+$ ]]; then
+        if [[ "${GH_SHIM_UNPROTECTED:-0}" == 1 ]]; then
+            echo '[]'
+        else
+            echo '[{"type":"pull_request"},{"type":"creation"}]'
+        fi
+        exit 0
+    fi
+    [[ "$path" =~ ^repos/[^/]+/[^/]+/actions/workflows/(ci|ci-extended)\.yml/runs$ ]] ||
+        die 2 "api: only the ci.yml / ci-extended.yml runs and the branch protection endpoints are emulated, got $path"
     [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die 2 "api: head_sha missing"
     printf '{"total_count":1,"workflow_runs":[{"head_sha":"%s","event":"push","status":"completed","conclusion":"%s","run_number":1,"html_url":"local://dry-run"}]}\n' \
         "$sha" "${GH_SHIM_CI_CONCLUSION:-success}"
@@ -111,8 +129,12 @@ download)
     ;;
 view)
     [[ -f "$rel/meta" ]] || die 1 "release $tag not found"
-    [[ "$json" == body && "$jq" == .body ]] || die 2 "view: only --json body --jq .body is emulated"
-    cat "$rel/notes.md"
+    if [[ "$json" == assets && "$jq" == '.assets[].name' ]]; then
+        find "$rel/assets" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
+    else
+        [[ "$json" == body && "$jq" == .body ]] || die 2 "view: only --json body --jq .body and --json assets --jq '.assets[].name' are emulated"
+        cat "$rel/notes.md"
+    fi
     ;;
 edit)
     [[ -f "$rel/meta" ]] || die 1 "release $tag not found"

@@ -5,7 +5,8 @@ Used by scripts/release-dry-run.sh to replay .github/workflows/release.yml
 without GitHub: the `run:` scripts of the workflow are executed AS WRITTEN
 (same shell as GitHub: `bash --noprofile --norc -eo pipefail`), with the
 workflow, job and step `env:` blocks, `working-directory:`, $GITHUB_ENV,
-$GITHUB_PATH and $GITHUB_OUTPUT handling, and the `${{ ... }}` expressions
+$GITHUB_PATH, $GITHUB_OUTPUT and $GITHUB_STEP_SUMMARY (one file per job,
+printed when the job ends) handling, and the `${{ ... }}` expressions
 the release workflow uses. Nothing is re-implemented from a copy of the
 workflow, so a defect in a step script shows up here.
 
@@ -417,6 +418,7 @@ def run_job(a) -> int:
             step_env["GITHUB_ENV"] = str(genv)
             step_env["GITHUB_OUTPUT"] = str(gout)
             step_env["GITHUB_PATH"] = str(gpath)
+            step_env["GITHUB_STEP_SUMMARY"] = str(temp / "_step_summary.md")
             sfile = temp / f"_step_{n}.sh"
             sfile.write_text(script)
             cwd = ws
@@ -444,6 +446,9 @@ def run_job(a) -> int:
     finally:
         if container:
             container.stop()
+    summary = temp / "_step_summary.md"
+    if summary.is_file() and summary.stat().st_size:
+        log(f"--- job summary ($GITHUB_STEP_SUMMARY):\n{summary.read_text(errors='replace')}")
     outputs = {k: substitute(v, ctx) for k, v in (job.get("outputs") or {}).items()}
     if a.outputs_file:
         Path(a.outputs_file).write_text(json.dumps(outputs, indent=1) + "\n")

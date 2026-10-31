@@ -18,11 +18,18 @@
 # eBPF objects built with Pulsar's pinned major version.
 #
 # Rocky Linux 9 (the RPM build container): clang, lld, llvm from AppStream,
-# whatever major version it carries (21 in 2026-10, one ahead of Pulsar's
-# pin; a warning says so), plus sqlite-devel, openssl-devel, pkgconf.
+# plus sqlite-devel, openssl-devel, pkgconf. AppStream carries one LLVM at a
+# time, so the eBPF clang there is the C toolchain's exact pin
+# (scripts/c-toolchain.sh, rocky9: clang 21.1.8-2.el9, installed first by
+# scripts/ci-install-clang.sh); any other clang FAILS (no warning-only
+# drift), unless ROBODR_ALLOW_UNPINNED_CC=1 (local experiments only). That
+# pin is one major ahead of Pulsar's 20: a known limitation
+# (docs/customer/known-limitations.md), not something this script hides.
 #
-# The eBPF objects' reproducibility is not claimed (docs/BUILD.md); the
-# version used is printed for the build log.
+# The robodr-pulsard program is not claimed bit-for-bit reproducible, but
+# its eBPF objects are: release.yml's independent rebuild must embed the
+# same ones (scripts/compare-rebuild.py). The version used is printed for
+# the build log.
 # Runs apt through sudo, or directly as root (container jobs).
 # Exit: 0 installed, 1 failed.
 set -euo pipefail
@@ -81,6 +88,20 @@ Pin-Priority: 500
 PREF
 }
 
+# rpm_ebpf_clang_check CLANG: on Rocky Linux 9 (scripts/c-toolchain.sh
+# userland rocky9) CLANG must be the exact pinned clang; other dnf hosts
+# (a developer's Fedora) are not release build userlands and pass.
+rpm_ebpf_clang_check() {
+    (
+        # shellcheck source=scripts/c-toolchain.sh disable=SC1091
+        . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/c-toolchain.sh"
+        [[ "$(robodr_build_userland)" == rocky9 ]] || exit 0
+        robodr_clang_ok "$1" && exit 0
+        echo "::error::eBPF clang is \"$("$1" --version 2>/dev/null | head -n1)\"; the RPM build compiles Pulsar's eBPF objects with exactly clang $ROBODR_CLANG_VERSION ($ROBODR_CLANG_APT_PACKAGE-$ROBODR_CLANG_APT_VERSION, scripts/c-toolchain.sh; run scripts/ci-install-clang.sh first)" >&2
+        exit 1
+    )
+}
+
 self_test() {
     local t g ok=0
     t="$(mktemp -d)"
@@ -113,9 +134,17 @@ self_test() {
         ok=$((ok + 1))
     fi
     LLVM_MAJOR=20 llvm_apt_preferences | grep -q '^Pin-Priority: -1$' && ok=$((ok + 1))
+    # Rocky 9: only the pinned clang builds the RPM's eBPF objects.
+    printf '#!/bin/sh\necho "clang version %s"\n' 21.1.8 >"$t/clang-pinned"
+    printf '#!/bin/sh\necho "clang version %s"\n' 20.1.8 >"$t/clang-other"
+    chmod +x "$t/clang-pinned" "$t/clang-other"
+    ROBODR_BUILD_USERLAND=rocky9 rpm_ebpf_clang_check "$t/clang-pinned" && ok=$((ok + 1))
+    ROBODR_BUILD_USERLAND=rocky9 rpm_ebpf_clang_check "$t/clang-other" 2>/dev/null ||
+        ok=$((ok + 1))
+    ROBODR_BUILD_USERLAND=fedora42 rpm_ebpf_clang_check "$t/clang-other" && ok=$((ok + 1))
     rm -rf "$t"
-    echo "self-test: $ok/7 passed"
-    [[ $ok -eq 7 ]]
+    echo "self-test: $ok/10 passed"
+    [[ $ok -eq 10 ]]
 }
 if [[ "${1:-}" == --self-test ]]; then
     self_test
@@ -128,9 +157,16 @@ codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
 if ! command -v apt-get >/dev/null 2>&1; then
     "${as_root[@]}" dnf install -y --setopt=install_weak_deps=False clang lld llvm \
         sqlite-devel openssl-devel pkgconf-pkg-config
+    if ! rpm_ebpf_clang_check clang; then
+        if [[ "${ROBODR_ALLOW_UNPINNED_CC:-0}" == 1 ]]; then
+            echo "::warning::eBPF clang is not the pinned one (ROBODR_ALLOW_UNPINNED_CC=1): NOT a release build"
+        else
+            exit 1
+        fi
+    fi
     major="$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -n1)"
     if [[ "$major" != "$LLVM_MAJOR" ]]; then
-        echo "::warning::eBPF objects built with clang $major from the distribution; Pulsar pins $LLVM_MAJOR"
+        echo "::warning::eBPF objects built with the pinned clang $major (Rocky 9 AppStream has no clang $LLVM_MAJOR); Pulsar pins $LLVM_MAJOR (docs/customer/known-limitations.md)"
     fi
     clang --version | head -n1
     llvm-strip --version | head -n2 | tail -n1
