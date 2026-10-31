@@ -84,23 +84,10 @@ pub fn check_config_file(path: &Path) -> CheckReport {
     match read_bounded(path) {
         Ok(text) => {
             let mut r = check_config_text(&text, crate::config::system_default_route_interface);
-            // The host running the check, which is the robot only when the
-            // check runs there: a warning only when segments are found.
-            match robodr_capture::shm::scan_dir(Path::new(robodr_capture::shm::DEV_SHM)) {
-                Ok(scan) => match shm_warning(&scan) {
-                    Some(w) => r.warnings.push(w),
-                    None => r.summary.push(format!(
-                        "no DDS shared-memory segment in {} of the host running this check",
-                        robodr_capture::shm::DEV_SHM
-                    )),
-                },
-                Err(e) => r.summary.push(format!(
-                    "note: cannot list {}: {} (DDS shared-memory use on the host running this \
-                     check not checked)",
-                    robodr_capture::shm::DEV_SHM,
-                    sanitize(&e.to_string())
-                )),
-            }
+            shm_scan_lines(
+                robodr_capture::shm::scan_dir(Path::new(robodr_capture::shm::DEV_SHM)),
+                &mut r,
+            );
             r
         }
         Err(e) => CheckReport {
@@ -111,6 +98,29 @@ pub fn check_config_file(path: &Path) -> CheckReport {
             )],
             ..CheckReport::default()
         },
+    }
+}
+
+/// Report a `/dev/shm` scan of the host running the check, which is the
+/// robot only when the check runs there: a warning only when segments are
+/// found, a `note:` summary line otherwise (both outcomes say nothing about
+/// the robot when the check runs elsewhere).
+fn shm_scan_lines(scan: std::io::Result<robodr_capture::shm::ShmScan>, r: &mut CheckReport) {
+    match scan {
+        Ok(scan) => match shm_warning(&scan) {
+            Some(w) => r.warnings.push(w),
+            None => r.summary.push(format!(
+                "note: no DDS shared-memory segment in {} of the host running this check \
+                 (meaningful only on the robot)",
+                robodr_capture::shm::DEV_SHM
+            )),
+        },
+        Err(e) => r.summary.push(format!(
+            "note: cannot list {}: {} (DDS shared-memory use on the host running this check \
+             not checked)",
+            robodr_capture::shm::DEV_SHM,
+            sanitize(&e.to_string())
+        )),
     }
 }
 
@@ -564,6 +574,34 @@ mod tests {
         let w = shm_warning(&s).unwrap();
         assert!(w.contains("Fast DDS shared-memory transport (1)"), "{w}");
         assert!(shm_warning(&robodr_capture::shm::scan_names(["x"])).is_none());
+    }
+
+    /// Review (phase 3): the "no segment" line of the `/dev/shm` scan was
+    /// the only static summary line without the `note:` prefix.
+    #[test]
+    fn shm_scan_outcomes_are_a_warning_or_a_note() {
+        let mut r = CheckReport::default();
+        shm_scan_lines(Ok(robodr_capture::shm::scan_names(["x"])), &mut r);
+        assert!(r.warnings.is_empty(), "{r:?}");
+        assert_eq!(r.summary.len(), 1);
+        assert!(
+            r.summary[0].starts_with("note: no DDS shared-memory"),
+            "{r:?}"
+        );
+
+        let mut r = CheckReport::default();
+        shm_scan_lines(Err(std::io::Error::other("denied")), &mut r);
+        assert!(r.warnings.is_empty(), "{r:?}");
+        assert!(r.summary[0].starts_with("note: cannot list"), "{r:?}");
+
+        let mut r = CheckReport::default();
+        shm_scan_lines(
+            Ok(robodr_capture::shm::scan_names(["fastrtps_port7411"])),
+            &mut r,
+        );
+        assert_eq!(r.warnings.len(), 1, "{r:?}");
+        assert!(r.summary.is_empty(), "{r:?}");
+        assert!(!r.ok(true));
     }
 
     #[test]
