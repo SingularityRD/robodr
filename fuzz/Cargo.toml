@@ -338,3 +338,10 @@ path = "fuzz_targets/executor_soc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rtps_secured_prefix"
+path = "fuzz_targets/rtps_secured_prefix.rs"
+test = false
+doc = false
+bench = false
