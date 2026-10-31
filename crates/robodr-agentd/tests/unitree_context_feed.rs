@@ -523,6 +523,27 @@ fn unitree_and_context_configuration_errors() {
         "on_stale": {"phase": "unknown"}})))
     .unwrap_err();
     assert!(e.contains("on_stale"), "{e}");
+    // A silent source never claims the least conservative value.
+    let mut v = topic(serde_json::json!({"type": SPORT, "unitree_sport": sport_sec}));
+    v["topics"].as_array_mut().unwrap().push(serde_json::json!({
+        "topic": "/wirelesscontroller", "type": REMOTE,
+        "writers": [LEGIT_HEX], "wireless_controller": {},
+        "on_stale": {"control": "autonomous"}}));
+    let e = resolve(v.clone()).unwrap_err();
+    assert!(e.contains("least conservative"), "{e}");
+    v["topics"][1]["on_stale"] = serde_json::json!({"control": "teleop"});
+    assert!(resolve(v.clone()).is_ok());
+    let mut ps = sport_sec.clone();
+    ps["phase"] = serde_json::json!({"1": "parked"});
+    let e = resolve(topic(
+        serde_json::json!({"type": SPORT, "unitree_sport": ps,
+                                              "on_stale": {"phase": "parked"}}),
+    ))
+    .unwrap_err();
+    assert!(e.contains("least conservative"), "{e}");
+    v["uplink_status"] = serde_json::json!({"path": "/x/uplink-status.json",
+                                            "on_stale": "connected"});
+    assert!(resolve(v).unwrap_err().contains("cannot read connected"));
     // A remote never means autonomy; a remote alone is no safety source.
     let e = resolve(topic(serde_json::json!({"type": REMOTE,
         "wireless_controller": {"control": "autonomous"}})))

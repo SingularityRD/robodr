@@ -44,10 +44,11 @@
 //!   one, and it reads `on_stale` only until the first event after the
 //!   daemon starts. A node that crashes publishes nothing; pair it with
 //!   `on_stale` values you can live with.
-//! * The uplink status file must be readable by the daemon's user
-//!   (`robodr-uplink` writes it mode 0600; grant read access with an ACL or
-//!   a group, see `crates/robodr-agentd/README.md`). An unreadable,
-//!   malformed, foreign-format or stale file reads `on_stale`.
+//! * The uplink status file must be readable by the daemon's user.
+//!   `robodr-uplink` writes it mode 0600 under its own user, so with the
+//!   shipped units it is not (a packaging change, see
+//!   `crates/robodr-agentd/README.md`). An unreadable, symlinked,
+//!   oversized, malformed, foreign-format or stale file reads `on_stale`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -212,8 +213,25 @@ impl OnStaleSection {
         }
     }
 
-    /// `on_stale` must not name a field the source does not speak to.
+    /// `on_stale` must not name a field the source does not speak to, nor
+    /// the least conservative value of a field (`autonomous`, `parked`,
+    /// `connected`): a source that says nothing must never make the context
+    /// more permissive (a fixed value belongs in `context.*`).
     pub fn check(&self, what: &str, role: &CtxRole) -> Result<(), String> {
+        let permissive = [
+            ("control", self.control == Some(ControlMode::Autonomous)),
+            ("phase", self.phase == Some(MissionPhase::Parked)),
+            (
+                "connectivity",
+                self.connectivity == Some(Connectivity::Connected),
+            ),
+        ];
+        if let Some((f, _)) = permissive.iter().find(|(_, bad)| *bad) {
+            return Err(format!(
+                "{what}.on_stale.{f}: a stale source cannot claim the least conservative \
+                 value; set the static value in context.{f} instead"
+            ));
+        }
         let extra = [
             ("control", self.control.is_some() && role.control.is_none()),
             ("phase", self.phase.is_some() && role.phase.is_none()),
@@ -622,6 +640,13 @@ impl UplinkSection {
         }
         if !(100..=60_000).contains(&self.poll_ms) {
             return Err("safety_feed.uplink_status.poll_ms must be 100..=60000".into());
+        }
+        if self.on_stale == Some(Connectivity::Connected) {
+            return Err(
+                "safety_feed.uplink_status.on_stale: an unreadable or stale status cannot read \
+                 connected"
+                    .into(),
+            );
         }
         Ok(UplinkSpec {
             path: self.path.clone(),
