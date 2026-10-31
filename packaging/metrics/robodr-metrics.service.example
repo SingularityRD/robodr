@@ -15,7 +15,7 @@
 # file holds counters and states only (no finding content, no free text).
 #
 # Privileges: it reads robodr-agentd's status.json (group robodr) and
-# robodr-uplink's uplink-status.json (0600 robodr-uplink), so it runs as
+# robodr-uplink's uplink-status.json (0640 robodr-uplink:robodr), so it runs as
 # root with CAP_DAC_READ_SEARCH only (read any file, write nothing it does
 # not own), no network, a read-only OS, and the key and evidence trees
 # hidden. It writes only its RuntimeDirectory. It also asks systemd for

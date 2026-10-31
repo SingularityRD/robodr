@@ -1117,6 +1117,17 @@ fn a_refused_batch_is_visible_in_the_status_file_and_sd_notify() {
     }
     let (code, rec) = run_service(&r, &svc(), 3, 1000);
     assert_eq!(code, 0);
+    // Group-readable (agentd reads its connectivity through group robodr),
+    // not world-readable.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(r.state.join(service::STATUS_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777 & !0o040, 0o600, "{mode:o}");
+        assert_eq!(mode & 0o040, 0o040, "group-readable: {mode:o}");
+    }
     let st = status_of(&r);
     assert_eq!(st.format, service::STATUS_FORMAT);
     assert_eq!(st.state, "blocked");
