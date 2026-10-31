@@ -16,17 +16,22 @@ too), in place:
     python3 scripts/metadata_to_cyclonedx.py --augment dist/sbom/*.cdx.json \
         --rustc-vv rustc-vV.txt --target aarch64-unknown-linux-musl \
         --self-contained-dir "$(rustc --print sysroot)/lib/rustlib/<triple>/lib/self-contained" \
-        [--ebpf-dir target/release/build --ebpf-version 0.11.0] --tool clang=18.1.3 ...
+        [--ebpf-dir target/release/build --ebpf-embedded-in target/release/robodr-pulsard \
+         --ebpf-version 0.11.0] --tool clang=18.1.3 ...
     python3 scripts/metadata_to_cyclonedx.py --check X.cdx.json --require-complete
 
   * Rust's std, core and alloc (the pinned toolchain's release and commit),
     statically linked into every binary;
   * musl targets: musl (version read from rust-std's libc.a) and LLVM's
     libunwind, with the SHA-256 of the archives that were linked;
-  * eBPF objects embedded in robodr-pulsard (*.bpf.o under --ebpf-dir), with
-    SHA-256 and GPL-2.0-only;
+  * eBPF objects embedded in robodr-pulsard: the *.bpf.o under --ebpf-dir
+    whose bytes occur in --ebpf-embedded-in (the built robodr-pulsard;
+    stale or duplicate build output is dropped, and an eBPF object in the
+    program that no *.bpf.o accounts for is refused), with SHA-256 and
+    GPL-2.0-only;
   * `formulation`: rustc (release, commit, host, LLVM) and every --tool.
---require-complete makes --check refuse a BOM without them (the publish gate).
+--require-complete makes --check refuse a BOM without them (the publish gate);
+a BOM whose root component is robodr-pulsard must list eBPF objects.
 
 What it records, per resolved package: name, version, purl, SPDX license
 expression (or the raw string as a named license when the string is not a
@@ -633,6 +638,85 @@ def augment(
     return out
 
 
+# Programs whose release SBOM must list embedded eBPF objects.
+EBPF_HOST_ROOTS = ("robodr-pulsard",)
+EM_BPF = 247
+
+
+def bom_root_name(bom) -> str | None:
+    """metadata.component.name: the program a per-crate SBOM describes."""
+    if not isinstance(bom, dict):
+        return None
+    name = ((bom.get("metadata") or {}).get("component") or {}).get("name")
+    return name if isinstance(name, str) else None
+
+
+def sbom_roots(directory: str) -> list[str]:
+    """Sorted root component names of every *.cdx.json under `directory`."""
+    names = []
+    for dirpath, _dirs, files in os.walk(directory):
+        for f in files:
+            if f.endswith(".cdx.json"):
+                with open(os.path.join(dirpath, f), encoding="utf-8") as fh:
+                    names.append(bom_root_name(json.load(fh)) or "")
+    return sorted(names)
+
+
+def _bpf_elf_offsets(data: bytes) -> list[int]:
+    """Offsets of 64-bit ELF headers with e_machine EM_BPF (either byte order)."""
+    out, pos = [], 0
+    while True:
+        off = data.find(b"\x7fELF\x02", pos)
+        if off < 0:
+            return out
+        pos = off + 1
+        ident = data[off + 5 : off + 6]
+        mach = data[off + 18 : off + 20]
+        if (ident == b"\x01" and mach == EM_BPF.to_bytes(2, "little")) or (
+            ident == b"\x02" and mach == EM_BPF.to_bytes(2, "big")
+        ):
+            out.append(off)
+
+
+def select_embedded(candidates: list[tuple[str, bytes]], binary: bytes) -> list[tuple[str, bytes]]:
+    """The candidate eBPF objects (relative path, bytes) that `binary` embeds.
+
+    Pulsar embeds its objects verbatim (aya's include_bytes_aligned!), so an
+    object is embedded exactly when its bytes occur in the program. Objects
+    that do not occur (stale build-script output) are dropped; of objects
+    with the same file name and the same bytes (duplicate build
+    directories) the first path is kept. Refuses (ValueError) when no
+    candidate is embedded, or when the program holds an eBPF ELF object
+    that no kept candidate accounts for (the SBOM would be incomplete).
+    """
+    kept: list[tuple[str, bytes]] = []
+    seen: set[tuple[str, str]] = set()
+    covered: set[int] = set()
+    for rel, data in sorted(candidates):
+        if not data:
+            continue
+        key = (rel.rsplit("/", 1)[-1], hashlib.sha256(data).hexdigest())
+        if key in seen:
+            continue
+        off = binary.find(data)
+        if off < 0:
+            continue
+        seen.add(key)
+        kept.append((rel, data))
+        while off >= 0:
+            covered.add(off)
+            off = binary.find(data, off + 1)
+    if not kept:
+        raise ValueError("none of the *.bpf.o objects found is embedded in the program")
+    missing = [o for o in _bpf_elf_offsets(binary) if o not in covered]
+    if missing:
+        raise ValueError(
+            f"the program embeds {len(missing)} eBPF object(s) not among the *.bpf.o found "
+            f"(first at offset {missing[0]})"
+        )
+    return kept
+
+
 def check_complete(bom) -> list[str]:
     """What a release SBOM must contain beyond cargo's view (see augment)."""
     errs: list[str] = []
@@ -662,6 +746,9 @@ def check_complete(bom) -> list[str]:
         str(c.get("name")) for c in roles.get("rust-std-self-contained", [])
     ) != ["libunwind", "musl"]:
         errs.append("musl target without musl and libunwind components")
+    root = bom_root_name(bom)
+    if root in EBPF_HOST_ROOTS and not roles.get("ebpf-object"):
+        errs.append(f"{root}: embedded eBPF objects missing (augment with --ebpf-dir)")
     for c in roles.get("rust-std-self-contained", []) + roles.get("ebpf-object", []):
         if not any(h.get("alg") == "SHA-256" for h in c.get("hashes", []) or []):
             errs.append(f"{c.get('name')}: no SHA-256")
@@ -699,6 +786,17 @@ def augment_main(a) -> int:
                             ebpf.append((os.path.relpath(p, d).replace(os.sep, "/"), fh.read()))
         if a.ebpf_dir and not ebpf:
             raise ValueError(f"no *.bpf.o under {a.ebpf_dir}")
+        if a.ebpf_dir:
+            if not a.ebpf_embedded_in:
+                raise ValueError("--ebpf-dir needs --ebpf-embedded-in (the program that embeds the objects)")
+            with open(a.ebpf_embedded_in, "rb") as fh:
+                program = fh.read()
+            found = len(ebpf)
+            ebpf = select_embedded(ebpf, program)
+            print(
+                f"{a.ebpf_embedded_in}: {len(ebpf)} embedded eBPF object(s) of {found} *.bpf.o found",
+                file=sys.stderr,
+            )
         tools = []
         for t in a.tool or []:
             name, sep, version = t.partition("=")
@@ -751,12 +849,30 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--self-contained-dir", help="--augment, musl: rust-std's lib/rustlib/<triple>/lib/self-contained")
     ap.add_argument("--ebpf-dir", action="append", help="--augment: directory searched for *.bpf.o (repeatable)")
     ap.add_argument("--ebpf-version", help="--augment: version of the eBPF objects (Pulsar's)")
+    ap.add_argument(
+        "--ebpf-embedded-in",
+        metavar="PROGRAM",
+        help="--augment with --ebpf-dir: keep only the objects this program embeds (required with --ebpf-dir)",
+    )
+    ap.add_argument(
+        "--list-roots",
+        metavar="DIR",
+        help="print the root component name of every *.cdx.json under DIR (one per line) and exit",
+    )
     ap.add_argument("--tool", action="append", help="--augment: NAME=VERSION of a build tool (repeatable)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
 
     if a.self_test:
         return _self_test()
+    if a.list_roots:
+        try:
+            for n in sbom_roots(a.list_roots):
+                print(n)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        return 0
     if a.augment:
         if not (a.rustc_vv and a.target):
             ap.error("--augment needs --rustc-vv and --target")
@@ -1157,6 +1273,52 @@ def _self_test() -> int:
             with self.assertRaises(ValueError):
                 self.aug(ebpf_version=None)
 
+        def test_pulsard_needs_ebpf(self):
+            # robodr-pulsard embeds Pulsar's eBPF objects: its release SBOM
+            # is incomplete without them (the publish gate).
+            pb = convert(_fixture(), lock=lock, root_name="robodr-pulsard")
+            rv = parse_rustc_vv(RUSTC_VV)
+            no = augment(pb, rv, "x86_64-unknown-linux-gnu")
+            self.assertEqual(bom_root_name(no), "robodr-pulsard")
+            self.assertTrue(any("eBPF" in e for e in check_complete(no)), check_complete(no))
+            yes = augment(pb, rv, "x86_64-unknown-linux-gnu", ebpf=[("p/out/a.none.bpf.o", b"BPF")], ebpf_version="0.11.0")
+            self.assertEqual(check_complete(yes), [])
+            # Another program's SBOM does not need them.
+            self.assertEqual(check_complete(augment(self.bom(), rv, "x86_64-unknown-linux-gnu")), [])
+
+        def test_embedded_selection(self):
+            obj = lambda tag: b"\x7fELF\x02\x01\x01" + b"\x00" * 11 + b"\xf7\x00" + tag * 8
+            a, b2, stale = obj(b"A"), obj(b"B"), obj(b"S")
+            binary = b"head" + a + b"mid" + b2 + b"tail"
+            cands = [
+                ("m-1111/out/a.bpf.o", a),
+                ("m-2222/out/a.bpf.o", a),  # duplicate build directory, same bytes
+                ("m-1111/out/b.bpf.o", b2),
+                ("m-3333/out/old.bpf.o", stale),  # stale: not in the binary
+            ]
+            self.assertEqual(
+                select_embedded(cands, binary), [("m-1111/out/a.bpf.o", a), ("m-1111/out/b.bpf.o", b2)]
+            )
+            # A BPF ELF in the binary that no candidate accounts for.
+            with self.assertRaises(ValueError):
+                select_embedded([("m/out/a.bpf.o", a)], binary)
+            # Big-endian BPF objects are recognised too.
+            be = b"\x7fELF\x02\x02\x01" + b"\x00" * 11 + b"\x00\xf7" + b"E" * 8
+            with self.assertRaises(ValueError):
+                select_embedded([("m/out/a.bpf.o", a)], a + be)
+            with self.assertRaises(ValueError):
+                select_embedded([("m/out/old.bpf.o", stale)], b"no objects here")
+
+        def test_list_roots(self):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as d:
+                os.makedirs(os.path.join(d, "sbom"))
+                for n in ("robodr-pulsard", "robodr-agentd"):
+                    with open(os.path.join(d, "sbom", f"crates_{n}.cdx.json"), "w") as f:
+                        json.dump(convert(_fixture(), lock=lock, root_name=n), f)
+                self.assertEqual(sbom_roots(d), ["robodr-agentd", "robodr-pulsard"])
+
         def test_gnu_target_needs_no_musl(self):
             b = self.aug(target="x86_64-unknown-linux-gnu", self_contained=None, ebpf=None)
             self.assertEqual(check_complete(b), [])
@@ -1215,14 +1377,25 @@ def _self_test() -> int:
                     f.write(LIBC)
                 with open(os.path.join(sc, "libunwind.a"), "wb") as f:
                     f.write(UNWIND)
+                bpf = b"\x7fELF\x02\x01\x01" + b"\x00" * 11 + b"\xf7\x00BPF"
                 with open(os.path.join(d, "bpf", "out", "a.none.bpf.o"), "wb") as f:
-                    f.write(b"BPF")
+                    f.write(bpf)
+                with open(os.path.join(d, "bpf", "out", "stale.none.bpf.o"), "wb") as f:
+                    f.write(b"STALE")
+                exe = os.path.join(d, "robodr-pulsard")
+                with open(exe, "wb") as f:
+                    f.write(b"\x7fELF..." + bpf + b"...")
                 self.assertEqual(main(["--check", bp, "--require-complete"]), 1)
                 base = ["--augment", bp, "--rustc-vv", rv, "--target", "aarch64-unknown-linux-musl"]
                 self.assertEqual(main(base), 1)  # musl without --self-contained-dir
                 ok = base + ["--self-contained-dir", sc, "--ebpf-dir", os.path.join(d, "bpf"),
                              "--ebpf-version", "0.11.0", "--tool", "clang=18.1.3"]
+                self.assertEqual(main(ok), 1)  # --ebpf-dir without --ebpf-embedded-in
+                ok += ["--ebpf-embedded-in", exe]
                 self.assertEqual(main(ok), 0)
+                with open(bp) as f:
+                    files = [c["name"] for c in json.load(f)["components"] if c["type"] == "file"]
+                self.assertEqual(files, ["a.none.bpf.o"])  # the stale object is not listed
                 self.assertEqual(main(["--check", bp, "--require-complete"]), 0)
                 self.assertEqual(main(ok), 1)  # already augmented
 

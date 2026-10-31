@@ -27,7 +27,7 @@ Pushing a tag `v<VERSION>` on `main` or on a `release/X.Y` branch runs
 | `rebuild-deb`, `rebuild-rpm` (amd64, arm64) | ubuntu-22.04, ubuntu-22.04-arm, in the same digest-pinned containers | independent rebuild: Rust from hash-pinned artifacts (`scripts/ci-install-pinned-toolchain.sh`, no rustup), fresh `CARGO_HOME`, every program incl. `robodr-pulsard`, package and bundle (`scripts/ci-rebuild.sh`); its toolchain inputs recorded |
 | `rebuild-static` (amd64, arm64) | a fresh ubuntu-24.04 VM | the same for `robodr-focal` (same static-pie linker) |
 | `delivery` | ubuntu-24.04 | this commit's `robodr-release` builds **unsigned** secure-delivery RPKs of the `robodr` and `robodr-focal` `.deb` (both arches) and of `rules/robodr` (`scripts/release-rpk.py`, each built twice, digests must agree) plus `DELIVERY-MANIFEST.json`: the asset `robodr-<ver>-rpk.tar.gz` for the offline 2-of-N ceremony (section 7) |
-| `publish` (tag push only) | ubuntu-24.04, environment `release` | release line and CI gate again; `scripts/release-finalize.sh`: rebuild comparison (`scripts/compare-rebuild.py`: packages and programs identical, bundles except their SBOM; `robodr-pulsard` recorded) into the signed `REPRODUCIBILITY-<version>.txt` with every job's toolchain inputs appended, **SBOM gate** (all six SBOM archives, every file complete per `metadata_to_cyclonedx.py --check --require-complete` and valid per the official `cyclonedx validate` 1.5, pinned by SHA-256), `robodr-<ver>.openvex.json` (section 10), `robodr-<ver>.intoto.jsonl` (SLSA v1 provenance of every asset, section 9), per-arch sums re-checked, `SHA256SUMS`; `scripts/release-sign.sh` (minisign, self-verified with the public key variable); provenance verified against the signed set; `actions/attest-build-provenance` (pinned by SHA) attests every asset in `SHA256SUMS`; uploads; publishes with `--latest` from the release line |
+| `publish` (tag push only) | ubuntu-24.04, environment `release` | release line and CI gate again; `scripts/release-finalize.sh`: rebuild comparison (`scripts/compare-rebuild.py`: packages and programs identical, bundles except their SBOM; `robodr-pulsard` recorded) into the signed `REPRODUCIBILITY-<version>.txt` with every job's toolchain inputs appended, **SBOM gate** (all six SBOM archives; the `robodr` and `.rpm` ones must contain a `robodr-pulsard` SBOM, the `robodr-focal` ones must not; every file complete per `metadata_to_cyclonedx.py --check --require-complete`, which requires the eBPF objects in a `robodr-pulsard` SBOM, and valid per the official `cyclonedx validate` 1.5, pinned by SHA-256), `robodr-<ver>.openvex.json` (section 10), `robodr-<ver>.intoto.jsonl` (SLSA v1 provenance of every asset, section 9), per-arch sums re-checked, `SHA256SUMS`; `scripts/release-sign.sh` (minisign, self-verified with the public key variable); provenance verified against the signed set; `actions/attest-build-provenance` (pinned by SHA) attests every asset in `SHA256SUMS`; uploads; publishes with `--latest` from the release line |
 | `publish-dry-run` (`workflow_dispatch` only) | ubuntu-24.04, no environment | the same `release-finalize.sh`, signed with a **throwaway** key generated in the job, verified; the set and `TEST-ONLY-dry-run-minisign.pub` uploaded as the workflow artifact `release-dry-run-<sha>`; nothing published, no secret, no attestation |
 
 The build jobs have `contents: read` only and hand their assets over as
@@ -384,9 +384,16 @@ completed by `scripts/release-sbom-augment.sh`
 see: Rust `std`/`core`/`alloc` of the pinned toolchain; for the musl builds
 `musl` (version read from rust-std's `libc.a`) and `libunwind` with the
 SHA-256 of the archives linked; for `robodr-pulsard` every embedded eBPF
-object (`*.bpf.o`, SHA-256, `GPL-2.0-only`); and a `formulation` naming
+object (`*.bpf.o`, SHA-256, `GPL-2.0-only`): only the build-script outputs
+whose bytes occur in the built `robodr-pulsard` are listed (stale or
+duplicate build directories, and objects built only for Pulsar's tests,
+are left out), and an eBPF ELF object in the program that no `*.bpf.o`
+accounts for fails the build; and a `formulation` naming
 rustc (release, commit, LLVM), cargo, cargo-cyclonedx and the C compilers.
-`publish` refuses to sign unless all six archives are present and every
+`robodr-focal` does not ship `robodr-pulsard`, so its archives leave out
+that crate's SBOM. `publish` refuses to sign unless all six archives are
+present, the `robodr` and `.rpm` archives contain a `robodr-pulsard` SBOM
+(with its eBPF objects) and the `robodr-focal` ones do not, and every
 file passes `metadata_to_cyclonedx.py --check --require-complete` and
 `cyclonedx validate --input-version v1_5 --fail-on-errors`. The delivery
 RPKs carry one merged SBOM per package. (Installing the SBOM into

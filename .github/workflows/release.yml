@@ -596,6 +596,10 @@ jobs:
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          # robodr-focal does not ship robodr-pulsard (not built here), so
+          # its SBOM (cargo-cyclonedx writes one per workspace crate) is not
+          # part of this package's SBOM set.
+          rm -f dist/sbom/*robodr-pulsard*.cdx.json
           scripts/release-sbom-augment.sh dist/sbom
       - name: robodr-focal package, offline bundle and SBOM archive
         env:
