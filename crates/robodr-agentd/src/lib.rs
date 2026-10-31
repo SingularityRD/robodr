@@ -136,8 +136,10 @@ pub mod selfcheck;
 pub mod selftest;
 pub mod signal;
 pub mod spool;
+/// `--check-config` before the first start: the unit's credential sources.
+pub mod unit_credentials;
 
-pub use config::{load, DaemonConfig, Resolved};
+pub use config::{load, load_for_check, DaemonConfig, Resolved};
 pub use daemon::{
     agent_profile, effective_state, run, run_with, DaemonError, DaemonStats, StopReason, Summary,
 };

@@ -7,7 +7,7 @@
 //! | certificate / CRL expiry close | [`rules::CREDENTIAL_EXPIRING`] | Medium (≤ `credential_warn_days`), High (≤ `credential_critical_days` or expired) | per credential on each escalation, then at most once a day |
 //! | kernel clock unsynchronised | [`rules::CLOCK_UNSYNCED`] | Medium | once per episode, after `clock_unsynced_grace_ms` |
 //! | wall clock jumped against monotonic | [`rules::CLOCK_JUMP`] | High | on a new jump, at most every `health_report_ms` |
-//! | filesystem nearly full | [`rules::DISK_LOW`] | Medium (< `disk_warn_percent` free), High (< `disk_critical_percent`) | per filesystem on each escalation |
+//! | filesystem nearly full | [`rules::DISK_LOW`] | Medium (< `disk_warn_percent` free), High (< `disk_critical_percent`) | per filesystem on each escalation; re-armed only once free space is [`DISK_CLEAR_MARGIN_PERCENT`] above the threshold |
 //! | executor does not answer | [`rules::EXECUTOR_UNREACHABLE`] | High | once per outage, after `executor_unreachable_ms` |
 //! | gateway / executor still on the binaries from before an upgrade | [`rules::RESTART_PENDING`] | Medium | once the pending-restart file is `restart_pending_grace_ms` old, again when its units change, then at most once a day |
 //!
@@ -524,14 +524,29 @@ fn percent(free: u64, total: u64) -> u64 {
 
 /// Level of a filesystem with `free` of `total` bytes.
 pub fn disk_level(free: u64, total: u64, cfg: &SelfHealthSection) -> Level {
+    disk_level_at(
+        free,
+        total,
+        cfg.disk_critical_percent,
+        cfg.disk_warn_percent,
+    )
+}
+
+/// Hysteresis of [`rules::DISK_LOW`] (percentage points): a filesystem
+/// whose free space hovers at a threshold must not raise a finding every
+/// time it dips under it again (review 2, L4). A level is left only once
+/// free space is this far above its threshold.
+pub const DISK_CLEAR_MARGIN_PERCENT: u8 = 1;
+
+fn disk_level_at(free: u64, total: u64, critical_pct: u8, warn_pct: u8) -> Level {
     if total == 0 {
         return Level::Ok; // not a real filesystem (or unreadable): nothing to say
     }
     // free/total < pct/100  <=>  free*100 < pct*total (exact, no rounding).
     let below = |pct: u8| u128::from(free) * 100 < u128::from(pct) * u128::from(total);
-    if below(cfg.disk_critical_percent) {
+    if below(critical_pct) {
         Level::Critical
-    } else if below(cfg.disk_warn_percent) {
+    } else if below(warn_pct) {
         Level::Warn
     } else {
         Level::Ok
@@ -658,21 +673,36 @@ impl Warnings {
         out
     }
 
-    /// Filesystems: a finding when one gets worse; getting better re-arms.
+    /// Filesystems: a finding when one gets worse; getting better re-arms,
+    /// but only once free space is [`DISK_CLEAR_MARGIN_PERCENT`] above the
+    /// threshold it fell under (hysteresis: free space hovering at a
+    /// threshold raises one finding, not one per dip).
     pub fn disks(&mut self, disks: &[DiskHealth]) -> Vec<Warning> {
         let mut out = Vec::new();
         for d in disks {
             let level = disk_level(d.free_bytes, d.total_bytes, &self.cfg);
             let prev = self.disks.get(&d.name).copied().unwrap_or(Level::Ok);
-            if level > prev {
+            let kept = if level > prev {
                 out.push(Warning::DiskLow {
                     name: d.name.clone(),
                     free_bytes: d.free_bytes,
                     total_bytes: d.total_bytes,
                     level,
                 });
-            }
-            self.disks.insert(d.name.clone(), level);
+                level
+            } else {
+                // The level with the thresholds raised by the margin: the
+                // reported level stays until free space clears it.
+                let m = DISK_CLEAR_MARGIN_PERCENT;
+                let cleared = disk_level_at(
+                    d.free_bytes,
+                    d.total_bytes,
+                    self.cfg.disk_critical_percent.saturating_add(m),
+                    self.cfg.disk_warn_percent.saturating_add(m),
+                );
+                prev.min(cleared).max(level)
+            };
+            self.disks.insert(d.name.clone(), kept);
         }
         out
     }
@@ -1095,6 +1125,7 @@ mod tests {
         assert!(w.disks(&d(10)).is_empty());
         assert!(w.disks(&d(500)).is_empty());
         assert_eq!(w.disks(&d(20)).len(), 1, "re-armed");
+        assert!(w.disks(&d(500)).is_empty());
         // An unreadable / zero-size filesystem says nothing.
         assert!(w
             .disks(&[DiskHealth {
@@ -1108,6 +1139,40 @@ mod tests {
             disk_level(u64::MAX / 20, u64::MAX, &SelfHealthSection::default()),
             Level::Warn
         );
+    }
+
+    /// Review 2, L4: free space hovering at a threshold raised a new
+    /// finding on every dip under it. A level is left only once free space
+    /// is a percentage point above its threshold.
+    #[test]
+    fn disk_low_has_hysteresis() {
+        let mut w = w();
+        let d = |free: u64| {
+            vec![DiskHealth {
+                name: "spool".into(),
+                free_bytes: free,
+                total_bytes: 1000,
+            }]
+        };
+        assert_eq!(w.disks(&d(99)).len(), 1, "Medium below 10 %");
+        // Hovering around 10 %: one finding, not one per dip.
+        for free in [101, 99, 105, 98, 109, 99] {
+            assert!(w.disks(&d(free)).is_empty(), "{free}");
+        }
+        // 11 % clears the warning (10 % + the margin); the next dip is a
+        // new episode.
+        assert!(w.disks(&d(110)).is_empty());
+        assert_eq!(w.disks(&d(99)).len(), 1, "re-armed above the margin");
+        // The same at the critical threshold: High once; back above 3 %
+        // (but below 4 %) the High level is kept, and a dip is not new.
+        let r = w.disks(&d(29));
+        assert_eq!(r[0].deviation().severity, Severity::High);
+        assert!(w.disks(&d(31)).is_empty());
+        assert!(w.disks(&d(29)).is_empty());
+        // 4 % leaves High (still under 10 %: Warn is kept, no finding);
+        // the next dip under 3 % is High again.
+        assert!(w.disks(&d(40)).is_empty());
+        assert_eq!(w.disks(&d(29)).len(), 1);
     }
 
     /// T41: once per outage after the threshold; recovery re-arms.

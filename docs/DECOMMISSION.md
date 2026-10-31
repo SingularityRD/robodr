@@ -20,8 +20,10 @@ Contract of the SOC step: [`contracts/robodr.fleet-api.md`](contracts/robodr.fle
   step 3 changes the command path.
 * Lost, stolen or suspected-compromised unit: do **not** run this on the
   unit. Retire its keys at the SOC from the SOC side (operator action, no
-  request from the unit), revoke it at the depot (step 5) and at the anchor
-  receiver (step 6), and treat its last evidence as an incident.
+  request from the unit), revoke it at the depot (step 5), at the anchor
+  receiver (step 6) and everywhere else the SOC trusts it (step 6a: diode
+  keyring, control-plane certificate, Kafka principal), and treat its last
+  evidence as an incident.
 
 ## 1. Export and verify the evidence
 
@@ -139,6 +141,19 @@ the enrollment. The black-box key stays until step 8.
   A request that may have reached the SOC is never dropped on the unit.
 * Refused while a key rotation is unfinished: finish it (`robodr-enroll
   rotate --role R --finish`) or cancel it (`--cancel`) first.
+* **Black-box key rotated in place** (OPERATIONS 4.3, `robodr-blackbox
+  rotate`): the fleet API does not rotate the black-box key, so the SOC
+  still has the enrollment black-box key registered, and the request must
+  be signed by it. `robodr-enroll` finds it by its fingerprint among the
+  retired keys in `/etc/robodr/keys/retired/` (where 4.3 step 4 moves it
+  and, on an enrolled unit, keeps it) and signs with it. The fleet journal
+  must have been rotated with the black-box key (4.3 step 3) and the
+  retired `.pub` listed in agentd's `blackbox.previous_keys`; otherwise
+  every `robodr-enroll` command is refused with the command that fixes it.
+  If the retired secret was destroyed, the command refuses before sending
+  anything ("put the retired secret key file back"): the unit can no
+  longer prove the registered key, and the SOC operator has to retire its
+  keys from the SOC side, as for a lost unit (step 0).
 
 Proof: the receipt (`robodr-fleet-decommission-receipt/v1`: the request
 signed by the unit's three keys and the answer signed by the SOC fleet
@@ -176,6 +191,44 @@ On the base station / fleet host running `robodr-anchor-receiver`:
 
 Proof: `robodr-anchor-receiver status --config FILE` no longer lists the
 unit; the CRL serial.
+
+## 6a. Revoke the unit's other credentials
+
+Step 4 retires the keys the fleet API knows (uplink, finding, black-box).
+Depending on how the unit delivered findings and took requests, the SOC
+and the site's CAs trust more of its credentials; each stays valid until
+it is revoked here. This matters most for a lost, stolen or compromised
+unit (step 0), whose secrets may be in other hands. Skip the items the
+unit never had.
+
+1. **Diode signing key** (air-gapped sites, OPERATIONS 4.4 and 8.3): on the
+   high side, remove the unit's lines from the keyring file
+   `robodr-diode-unpack --keyring` reads, and delete its `diode-<unit>.key.pub`
+   next to it (and its `robots` line, if any). From then on a batch signed
+   with that key is quarantined as signed by an unknown key.
+   Proof: the keyring file without the unit (diff in the site log).
+2. **Control-plane server certificate** (OPERATIONS 6.4, control plane
+   step 3: `robot.pem`, issued by the CA the SOC uses for robots): revoke
+   it at that CA and publish the new CRL to the SOC client that connects to
+   robots, and remove the robot's address and its SPKI pin from the SOC's
+   list of robots. Without the revocation, whoever holds the unit's
+   `agentd-cp-tls.key` can answer as that robot until the certificate
+   expires.
+   Proof: the CRL serial and the certificate's serial in it; the SOC's
+   robot list without the unit.
+3. **Kafka principal** (connected sites publishing with
+   `robodr-kafka-publish` from the unit, OPERATIONS 8.3): revoke the
+   unit's client certificate at the CA the brokers trust (and publish the
+   CRL to the brokers), or delete its SCRAM user
+   (`kafka-configs.sh --alter --delete-config 'SCRAM-SHA-512' --entity-type
+   users --entity-name <user>`), and remove its ACLs
+   (`kafka-acls.sh --remove --allow-principal User:<principal>`).
+   Proof: `kafka-acls.sh --list --principal User:<principal>` prints
+   nothing; the CRL serial or the SCRAM user's absence in
+   `kafka-configs.sh --describe --entity-type users`.
+
+The anchor-receiver client certificate is revoked in step 6, the depot
+enrolment in step 5.
 
 ## 7. Release the unit's TPM resources
 

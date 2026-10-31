@@ -438,9 +438,14 @@ pub struct ReplayGuard {
     /// Compact (dropping dead pairs) when the journal reaches this many
     /// lines: twice the live set after the last compaction, plus 1024.
     compact_at: usize,
-    /// The latest wall-clock second at which dead pairs were dropped
-    /// (persisted as the `clock` entry of every compaction). A clock below
-    /// it could bring their timestamps back into the window.
+    /// The newest `dead_after` of the pairs dropped so far (persisted as
+    /// the `clock` entry of every compaction): a clock below it could
+    /// bring a dropped pair's timestamp back into the window. It is the
+    /// pairs' own bound, never the clock that dropped them: a clock stepped
+    /// forward (a bad NTP source, a wrong RTC at boot) drops every pair but
+    /// must not carry its wrong time into the mark, or the corrected clock
+    /// would stay fenced until real time reached the wrong one (review 2,
+    /// M4).
     high_water: u64,
 }
 
@@ -479,7 +484,7 @@ impl ReplayGuard {
     ///   Without any head in the black box (a new black box) the sealed
     ///   store is taken as it is;
     /// * the wall clock reads below the persisted high-water mark, the
-    ///   latest second at which dead pairs were dropped (they would live
+    ///   newest `dead_after` of the dead pairs dropped (they would live
     ///   again).
     ///
     /// The fence refuses every timestamp up to `max(now, high-water) +
@@ -518,6 +523,7 @@ impl ReplayGuard {
                 AnchorCheck::RolledBack(_) | AnchorCheck::Unanchored(_)
             );
         let mut hwm: Option<u64> = None;
+        let mut expired_max = 0u64;
         for e in loaded.entries {
             if e.t == "clock" && e.key_id.is_empty() && e.nonce.is_empty() {
                 hwm = Some(hwm.map_or(e.dead_after, |h| h.max(e.dead_after)));
@@ -529,6 +535,7 @@ impl ReplayGuard {
             }
             if e.dead_after < now_s {
                 load.expired += 1;
+                expired_max = expired_max.max(e.dead_after);
                 continue;
             }
             g.seen.insert((e.key_id, e.nonce), e.dead_after);
@@ -541,10 +548,7 @@ impl ReplayGuard {
             g.fence_from(now_s.max(high));
             load.fence = g.fence;
         }
-        g.high_water = high;
-        if load.expired > 0 {
-            g.high_water = g.high_water.max(now_s);
-        }
+        g.high_water = high.max(expired_max);
         g.journal = Some(journal);
         // Start from a compact file.
         g.compact(now_s);
@@ -573,11 +577,15 @@ impl ReplayGuard {
     }
 
     fn compact(&mut self, now_s: u64) {
-        let before = self.seen.len();
-        self.seen.retain(|_, dead_after| *dead_after >= now_s);
-        if self.seen.len() < before {
-            self.high_water = self.high_water.max(now_s);
-        }
+        let mut dropped_max = self.high_water;
+        self.seen.retain(|_, dead_after| {
+            let live = *dead_after >= now_s;
+            if !live {
+                dropped_max = dropped_max.max(*dead_after);
+            }
+            live
+        });
+        self.high_water = dropped_max;
         let Some(j) = self.journal.as_mut() else {
             return;
         };
@@ -1022,6 +1030,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.fence, Some(1040));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A clock stepped far forward during a restart drops every pair, but
+    /// the high-water mark stays the dropped pairs' own `dead_after`: once
+    /// the clock is corrected, correctly signed requests are accepted again
+    /// (it used to be the wrong clock, fencing until real time caught up;
+    /// review 2, M4). A clock that goes back below a dropped pair's
+    /// `dead_after` still fences.
+    #[test]
+    fn a_forward_clock_step_does_not_fence_the_corrected_clock() {
+        let s = crate::control::journal::tests::sealing();
+        let d = seasoned("forward-step", 1000);
+        let (mut g, _) = ReplayGuard::persistent(&d, 30, 100, 1000, &s).unwrap();
+        g.check("k", "nonce-aaaaaaaaaaaaaaaa", 1000, 1000).unwrap();
+        drop(g);
+        // Restart with the clock a year ahead: the pair is dropped.
+        let (g, l) = ReplayGuard::persistent(&d, 30, 100, 1000 + 365 * 86_400, &s).unwrap();
+        assert_eq!((l.expired, l.fence), (1, None));
+        drop(g);
+        // The clock is corrected: no fence, a fresh request is accepted.
+        let (mut g, l) = ReplayGuard::persistent(&d, 30, 100, 1100, &s).unwrap();
+        assert_eq!(l.high_water, Some(1031), "the dropped pair's dead_after");
+        assert!(!l.clock_went_back && l.fence.is_none(), "{l:?}");
+        assert_eq!(g.check("k", "nonce-bbbbbbbbbbbbbbbb", 1100, 1100), Ok(()));
+        drop(g);
+        // A clock below a dropped pair's dead_after fences (the pair
+        // could be replayed): up to that bound plus the skew.
+        let (_, l) = ReplayGuard::persistent(&d, 30, 100, 1020, &s).unwrap();
+        assert!(l.clock_went_back);
+        assert_eq!(l.fence, Some(1031 + 30));
         let _ = std::fs::remove_dir_all(&d);
     }
 

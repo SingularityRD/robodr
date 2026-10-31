@@ -190,12 +190,14 @@
 //! every outcome the link reports is journalled at once
 //! ([`crate::control::api::Engine::sync`]).
 //! Failed authentications, authenticated invalid requests, signed requests
-//! refused by the replay fence and connections refused or cut before they
-//! authenticated become the observe-only self-health findings
+//! refused by the replay fence, connections refused or cut before they
+//! authenticated and signed requests the robot could not check for replay
+//! become the observe-only self-health findings
 //! `robot.agent.control_plane_unauthenticated` (High),
 //! `robot.agent.control_plane_invalid` (Medium),
-//! `robot.agent.control_plane_request_fenced` (Low) and
-//! `robot.agent.control_plane_saturated` (Medium), each rate-limited by
+//! `robot.agent.control_plane_request_fenced` (Low),
+//! `robot.agent.control_plane_saturated` (Medium) and
+//! `robot.agent.control_plane_replay_unavailable` (Medium), each rate-limited by
 //! `health_report_ms`. The control plane is not an input: a quiet SOC never
 //! makes the state `unknown`.
 
@@ -574,9 +576,10 @@ struct Daemon<'a> {
     /// The control-plane API (`None` = off).
     control: Option<ControlPlane>,
     /// Control-plane counters at their last finding, and when it was raised
-    /// (unauthenticated, invalid, fenced, refused or cut connections).
-    control_reported: [u64; 4],
-    control_reported_at_ms: [Option<u64>; 4],
+    /// (unauthenticated, invalid, fenced, refused or cut connections,
+    /// replay check unavailable).
+    control_reported: [u64; 5],
+    control_reported_at_ms: [Option<u64>; 5],
     /// The control-plane journals' heads last recorded in the black box
     /// (gap 1: [`crate::control::anchor`]).
     state_heads_recorded: Option<crate::control::anchor::StateHeads>,
@@ -588,7 +591,7 @@ struct Daemon<'a> {
     last_note_segment: Option<u64>,
     /// The executor journal head last recorded, and its segment (findings
     /// 1 and 2).
-    executor_head_recorded: Option<(robodr_executor::journal::JournalHead, u64)>,
+    executor_head_recorded: Option<(robodr_executor::journal::JournalHead, Option<u64>, u64)>,
     /// executor v1: requests whose failed revert was reported (one finding
     /// per request until a revert of it succeeds).
     revert_failed_reported: std::collections::BTreeSet<String>,
@@ -945,7 +948,7 @@ impl<'a> Daemon<'a> {
                 let bb_signer =
                     crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
                         .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
-                let (anchor, unverified) = crate::control::anchor::latest_executor_head(
+                let found = crate::control::anchor::latest_executor_head(
                     &crate::control::evidence::DirSource(agent.blackbox_dir().to_path_buf()),
                     &cfg.robot.id,
                     bb_signer.as_ref(),
@@ -955,17 +958,22 @@ impl<'a> Daemon<'a> {
                         "executor: reading the black box for the executor's journal head: {e}"
                     ))
                 })?;
-                if unverified > 0 {
+                if found.unverified > 0 {
                     let _ = writeln!(
                         log,
-                        "robodr-agentd: executor: {unverified} executor journal head note(s) in \
-                         the black box do not verify under the current key: ignored"
+                        "robodr-agentd: executor: {} executor journal head note(s) in the \
+                         black box do not verify under the current key: ignored",
+                        found.unverified
                     );
                 }
+                // Resume the event poll after the last event recorded
+                // (review 2, M6: a restart re-recorded and re-reported the
+                // executor's retained events).
                 let link = crate::executor_link::ExecutorLink::start_anchored(
                     spec,
                     crate::executor_link::SafetyCell::default(),
-                    anchor,
+                    found.head,
+                    found.processed_seq,
                 )
                 .map_err(DaemonError::Io)?;
                 if link.planner_orders {
@@ -1389,8 +1397,8 @@ impl<'a> Daemon<'a> {
             retention_watch: crate::retention::RetentionWatch::default(),
             host_upstream_seen: Vec::new(),
             control,
-            control_reported: [0; 4],
-            control_reported_at_ms: [None; 4],
+            control_reported: [0; 5],
+            control_reported_at_ms: [None; 5],
             state_heads_recorded: None,
             state_heads_segment: None,
             last_note_segment: None,
@@ -2520,13 +2528,23 @@ impl<'a> Daemon<'a> {
     /// changed or it went backwards (`force`). At the next start agentd
     /// sends the newest one back as the anchor.
     fn record_executor_head(&mut self, reason: &str, force: bool) {
-        let Some(head) = self.executor.as_ref().and_then(|l| l.journal_head()) else {
+        let Some(link) = self.executor.as_ref() else {
             return;
         };
+        let Some(head) = link.journal_head() else {
+            return;
+        };
+        // The last event recorded, when read together with this head
+        // (review 2, M6).
+        let processed = link
+            .resume_point()
+            .filter(|(h, _)| *h == head)
+            .map(|(_, s)| s);
         if !force {
-            if let Some((h, seg)) = &self.executor_head_recorded {
+            if let Some((h, p, seg)) = &self.executor_head_recorded {
+                let changed = *h != head || (processed.is_some() && *p != processed);
                 if !crate::control::anchor::head_note_due(
-                    *h != head,
+                    changed,
                     Some(*seg),
                     self.last_note_segment,
                 ) {
@@ -2534,15 +2552,19 @@ impl<'a> Daemon<'a> {
                 }
             }
         }
-        let note =
-            crate::control::anchor::executor_head_note(&self.r.config.robot.id, reason, &head);
+        let note = crate::control::anchor::executor_head_note(
+            &self.r.config.robot.id,
+            reason,
+            &head,
+            processed,
+        );
         let now = self.clock.now();
         match self
             .agent
             .record_note(now, "executor journal head", &note, true)
         {
             Ok(r) => {
-                self.executor_head_recorded = Some((head, r.segment));
+                self.executor_head_recorded = Some((head, processed, r.segment));
                 self.last_note_segment = Some(r.segment);
             }
             Err(e) => {
@@ -3238,8 +3260,10 @@ impl<'a> Daemon<'a> {
             cp.engine.stats.invalid,
             c.fenced.load(Ordering::Relaxed),
             rejected.saturating_add(evicted),
+            c.replay_unavailable.load(Ordering::Relaxed),
         ];
         let last = cp.counters().last_auth_failure();
+        let last_unavailable = cp.counters().last_replay_unavailable();
         let now_ms = self.now_ms();
         let every = self.r.config.daemon.health_report_ms;
         for (i, &count) in counts.iter().enumerate() {
@@ -3288,6 +3312,20 @@ impl<'a> Daemon<'a> {
                          ({count} in total) signed at or before the replay fence it set after \
                          a restart or a state repair; nothing was judged or executed; the SOC \
                          should re-sign and resend them"
+                    ),
+                ),
+                4 => robodr_events::Deviation::new(
+                    health_rules::CONTROL_PLANE_REPLAY_UNAVAILABLE,
+                    robodr_events::Severity::Medium,
+                    format!(
+                        "the control-plane API refused {delta} correctly signed request(s) \
+                         ({count} in total) it could not check for replay: its replay store \
+                         could not be made durable (disk full, I/O error), its replay cache \
+                         was full of live entries, or its clock could not be read; a fault on \
+                         the robot, not an authentication failure; nothing was judged or \
+                         executed; check the control plane's state directory and the clock; \
+                         last: {}",
+                        last_unavailable.as_deref().unwrap_or("-")
                     ),
                 ),
                 _ => robodr_events::Deviation::new(
@@ -3730,7 +3768,9 @@ impl Daemon<'_> {
                 cp.engine.sync(&id);
             }
         }
-        for ev in link.take_events() {
+        let events = link.take_events();
+        let recorded_events = !events.is_empty();
+        for ev in events {
             let note = serde_json::json!({
                 "kind": "robodr.executor_event",
                 "event": ev,
@@ -3776,6 +3816,9 @@ impl Daemon<'_> {
         if self.executor_head_recorded.is_none() {
             // The first head agentd learns is anchored at once.
             self.record_executor_head("first", false);
+        } else if recorded_events {
+            // Where a restart resumes: after the events just recorded.
+            self.record_executor_head("events", false);
         }
     }
 

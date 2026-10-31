@@ -195,6 +195,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // authenticated.
     "robot.agent.control_plane_request_fenced",
     "robot.agent.control_plane_saturated",
+    "robot.agent.control_plane_replay_unavailable",
     // Contract 2.5 ids reserved for their producers (field self-test,
     // in-path gateway overload).
     "robot.agent.selftest",

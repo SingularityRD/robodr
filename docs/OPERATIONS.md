@@ -376,6 +376,23 @@ rotation.
    authenticates. `--previous-keys` gets the same checks as agentd's
    `blackbox.previous_keys` (below). Re-running it after success prints
    "already rotated" (and re-signs a `--tpm-sidecar` it did not get to).
+
+   **Enrolled units** (`robodr-enroll`, 8.6): the fleet journal is signed
+   by the same key and is a log of its own; rotate it too, with the same
+   keys, while no `robodr-enroll` command runs:
+
+   ```sh
+   sudo robodr-blackbox rotate /var/lib/robodr/fleet/journal \
+       --device <robot.id> \
+       --old-key /etc/robodr/keys/agentd-blackbox.key \
+       --new-key /etc/robodr/keys/agentd-blackbox-$new.key \
+       --reason "scheduled rotation"
+   ```
+
+   `robodr-enroll` opens it with the retired `.pub` files agentd lists in
+   `blackbox.previous_keys` (step 4). Without the rotation every
+   `robodr-enroll` command (rotate, revocations, profiles, ring,
+   decommission) is refused with this command in the message.
 4. Retire the old key and install the new one:
 
    ```sh
@@ -459,7 +476,16 @@ rotation.
    with the verifiers as long as the evidence must remain verifiable. Once
    those segments have rotated out (cyclic retention or export pruning),
    the entry can be removed from `previous_keys`. An Ed25519 secret that is
-   retired (after step 7) can be destroyed (`shred -u`).
+   retired (after step 7) can be destroyed (`shred -u`), **except on an
+   enrolled unit**: the fleet API does not rotate the black-box key, so the
+   SOC keeps the enrollment black-box key registered, and the decommission
+   request (DECOMMISSION step 4) must be signed by it. Keep that one
+   retired secret in `/etc/robodr/keys/retired/` (`0600 root`, directory
+   `0700`) until the unit is decommissioned; `robodr-enroll decommission`
+   finds it there by its fingerprint. Destroyed anyway, the unit cannot
+   ask for its own decommission and the SOC operator retires its keys
+   from the SOC side. (Rotating the black-box registration through the
+   fleet API needs a contract change with the SOC; not available yet.)
 
 *Alternative, new chain:* instead of `rotate`, archive the closed chain
 (stop agentd, `mv /var/lib/robodr/blackbox/agentd
@@ -677,9 +703,47 @@ sudo robodr-agentd --config /etc/robodr/agentd.json --check-config   # "key blac
 Keep the plaintext key file only until the service has started from the
 sealed credential and its public key is safely with the verifiers; then
 destroy it (on flash storage overwriting is unreliable: rely on the
-volume's encryption, see 9). Seal the other keys (`finding.key`,
-`cp-tls.key`, `anchor-tls.key`, `executor.key`) the same way, replacing
-their drop-in's `LoadCredential=` by `LoadCredentialEncrypted=`.
+volume's encryption, see 9), **unless a tool below still needs it**. Seal
+the other keys (`finding.key`, `cp-tls.key`, `anchor-tls.key`,
+`executor.key`) the same way, replacing their drop-in's `LoadCredential=`
+by `LoadCredentialEncrypted=`.
+
+**Tools that read the plaintext key files.** Only the services take
+sealed credentials. The operator tools read and write the key files in
+`/etc/robodr/keys` and have no `systemd-creds` path: `robodr-enroll`
+(8.6: every command signs its fleet journal with the black-box key;
+enrollment, rotation and decommission sign with the uplink, finding and
+black-box keys, and a rotation writes the new key file),
+`robodr-blackbox rotate` and `robodr-deliverd rekey` (4.3). On a unit
+managed with `robodr-enroll`, choose one:
+
+* keep the three plaintext role keys (sealing then protects only the
+  services' copies, not a copied disk: say so in the site's risk record);
+  or
+* destroy them, and for each `robodr-enroll` session decrypt them into a
+  private directory on `/run` (tmpfs, gone at reboot) and point a copy of
+  the fleet configuration at it:
+
+  ```sh
+  sudo install -d -m 0700 /run/robodr-enroll-keys
+  for k in uplink finding blackbox; do       # the credential names you sealed them under
+    sudo systemd-creds decrypt --name=$k.key \
+        /etc/robodr/credstore.encrypted/$k.key /run/robodr-enroll-keys/$k.key
+  done
+  # fleet.json copy with "keys": {"uplink": "/run/robodr-enroll-keys/uplink.key", ...}
+  sudo robodr-enroll --config /run/robodr-enroll-keys/fleet.json <command>
+  sudo rm -rf /run/robodr-enroll-keys        # after the session
+  ```
+
+  A `robodr-enroll rotate` writes the new key there: seal it
+  (`systemd-creds encrypt`, as above) into the credential store before
+  the directory is removed, or the new key is lost with it. A rotated
+  black-box key's retired secret, which decommissioning needs (4.3 step
+  8), is restored the same way into `/run/robodr-enroll-keys/retired/`.
+  The same applies to `robodr-blackbox rotate` and `robodr-deliverd rekey`
+  (give them the decrypted paths).
+
+Native support for sealed keys in these tools is not available yet.
 `host+tpm2` needs both the TPM and the root-only
 `/var/lib/systemd/credential.secret`; `--tpm2-pcrs=7` binds the credential
 to the Secure Boot state, so a firmware or Secure Boot change needs
@@ -1568,10 +1632,23 @@ sudo systemctl restart robodr-agentd
   Expect that once after commissioning.
 - **Restart.** Request states and used nonces survive a restart: the SOC
   can query a request after it and a replay stays refused. If the replay
-  store was damaged or removed, or the robot's clock went back below the
-  store's high-water mark, agentd fences: requests signed up to
+  store was damaged or removed, agentd fences: requests signed up to
   `max_clock_skew_s` after the start are refused `stale_timestamp` (the
-  SOC signs again; `status.json` `control_plane.replay_fence`). A damaged
+  SOC signs again; `status.json` `control_plane.replay_fence`). If the
+  robot's clock reads below the store's high-water mark (the newest expiry,
+  `dead_after`, of the nonces it dropped: a nonce accepted at a timestamp
+  could otherwise be replayed), the fence is that mark plus
+  `max_clock_skew_s`: it ends about `2 × max_clock_skew_s` after the
+  newest timestamp the robot ever accepted. A clock that was stepped
+  forward and then corrected does not move the mark (only accepted
+  requests do), so the corrected clock is not locked out.
+  *Stores written by releases before this one* recorded the clock itself
+  as the mark: after a forward step they can fence every request until
+  real time reaches the wrong time (`status.json`
+  `control_plane.state.replay.high_water` far ahead of the clock). Reset
+  it: stop agentd, remove `<state_dir>/nonces.journal`, start agentd; the
+  store is created and fenced for `max_clock_skew_s` only (as at a first
+  start; the start note says so). A damaged
   journal is copied to `state_dir/quarantine/` and the start note says so.
   Only one torn last line counts as a crash; anything more is damage. A
   damaged request journal is rebuilt from the black box's request and
@@ -1655,7 +1732,7 @@ sudo systemctl restart robodr-agentd
   unlisted peers before agentd sees them.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
   `last_auth_failure`, `connections_rejected`, `connections_evicted`,
-  `fenced`, `recorded_not_executed`,
+  `fenced`, `replay_unavailable`, `recorded_not_executed`,
   `refused`, `busy`, `rate_limited`, `journal_errors`, `replay_fence`,
   `state.refusing_new_request_ids`, `evidence`) and the
   findings `robot.agent.control_plane_unauthenticated` (High: someone
@@ -3665,6 +3742,7 @@ from `/etc/robodr`; never keys, credentials, evidence or findings; mode
 | every control-plane request `refused` `observe_mode` | profile not enforced or policy not OEM-validated | section 5; the API never acts beyond what the policy allows |
 | High `robot.agent.control_plane_unauthenticated` | requests without a valid SOC signature | check `status.json` `control_plane.last_auth_failure`; treat repeated ones as an attempt to reach the robot |
 | Medium `robot.agent.control_plane_saturated` | the control plane's TCP slots were full: connections refused (`connections_rejected`) or handshakes cut (`connections_evicted`) | sustained: a handshake flood or slowloris (check the source addresses at the firewall; `soc_sources` keeps the SOC's slot); otherwise more SOC clients than `max_connections` |
+| Medium `robot.agent.control_plane_replay_unavailable` | correctly signed requests refused 503 `replay_store_unavailable` (the replay store could not be written or fsynced: disk full, I/O error), `replay_cache_full` (more live nonces than the cache holds) or `clock_unavailable` | a fault on the robot, not an attack: check free space and errors on `control_plane.state_dir` (`status.json` `control_plane.replay_store_errors`), the clock; the SOC re-signs and resends once fixed |
 | Low `robot.agent.control_plane_request_fenced` | requests signed before the replay fence set at start (the replay store was created, damaged or the clock went back) | expected right after such a start; the SOC signs again |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |
 | executor: request `failed` "executor unreachable" | `robodr-executor` not running, wrong `executor.socket`, or the two keys differ | section 6.5: `systemctl status robodr-executor`; the same `/etc/robodr/keys/executor.key` must reach both units |

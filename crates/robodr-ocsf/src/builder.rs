@@ -1249,6 +1249,11 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.",
             AGENT,
         ),
+        "robot.agent.control_plane_replay_unavailable" => e(
+            "Control-plane request refused: replay check unavailable",
+            "A correctly signed control-plane request was refused because the robot could not check it for replay: its replay store could not be made durable (disk full, I/O error), its replay cache was full of live entries, or its clock could not be read. This is a fault on the robot, not an authentication failure; nothing was judged or executed. Check the robot's control-plane storage and clock; the SOC re-signs and resends once it is fixed.",
+            AGENT,
+        ),
         "robot.agent.control_plane_saturated" => e(
             "Control-plane connections refused or cut before authentication",
             "The robot's control-plane listener refused or cut connections before they authenticated because every slot they could use was busy: a TLS handshake flood or slowloris against the API, or more legitimate clients than its connection limit. SOC requests may fail until it ends; nothing was judged or executed.",

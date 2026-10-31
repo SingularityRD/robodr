@@ -186,3 +186,59 @@ fn policy_overrides_name_cataloged_rules() {
     }
     assert!(checked >= 4, "{checked}");
 }
+
+/// Review 2, M18: the example names its key where systemd puts it while
+/// the unit runs (`/run/credentials/robodr-agentd.service/`), so the
+/// documented pre-start `--check-config` failed on every fresh install (the
+/// directory exists only while the service runs). Outside the unit the
+/// check now reads the key where the shipped unit loads it from.
+#[test]
+fn check_config_before_the_first_start_reads_the_units_credential_sources() {
+    let s = setup_root("example-prestart");
+    let root = s.dir.to_str().unwrap().to_string();
+    // The credentials directory of a service that has not run: missing.
+    let creds = format!("{root}/run-credentials/robodr-agentd.service");
+    let mut v: serde_json::Value = serde_json::from_str(
+        &relocate(&example("agentd.example.json"), &s)
+            .replace(&format!("{root}/credentials/"), &format!("{creds}/")),
+    )
+    .unwrap();
+    v["key_protection"] = serde_json::json!({ "credentials_dir": creds });
+    let path = s.dir.join("agentd.json");
+    std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    // The key where the shipped unit loads it from.
+    std::fs::create_dir_all(s.dir.join("etc/keys")).unwrap();
+    std::fs::rename(
+        s.dir.join("credentials/blackbox.key"),
+        s.dir.join("etc/keys/agentd-blackbox.key"),
+    )
+    .unwrap();
+    let units = s.dir.join("units");
+    std::fs::create_dir_all(&units).unwrap();
+    let unit = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/systemd/robodr-agentd.service"),
+    )
+    .unwrap()
+    .replace("/etc/robodr/keys/", &format!("{root}/etc/keys/"));
+    std::fs::write(units.join("robodr-agentd.service"), unit).unwrap();
+
+    // Before: the plain load (and the old check) fails on the missing
+    // credential.
+    let e = robodr_agentd::load(&path).expect_err("no credentials directory");
+    assert!(e.contains("blackbox.key"), "{e}");
+    // The check outside the unit reads the unit's source and passes.
+    let (r, notes) = robodr_agentd::load_for_check(&path, &[units.as_path()], false)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(r.config.robot.id, v["robot"]["id"].as_str().unwrap());
+    assert!(
+        notes.iter().any(|n| n.contains("credential blackbox.key")
+            && n.contains(&format!("{root}/etc/keys/agentd-blackbox.key"))),
+        "{notes:?}"
+    );
+    // Inside the unit nothing is rewritten (systemd handed the files over).
+    assert!(robodr_agentd::load_for_check(&path, &[units.as_path()], true).is_err());
+    // A unit without that credential: refused, naming the drop-in to add.
+    std::fs::write(units.join("robodr-agentd.service"), "[Service]\n").unwrap();
+    let e = robodr_agentd::load_for_check(&path, &[units.as_path()], false).unwrap_err();
+    assert!(e.contains("LoadCredential=blackbox.key:"), "{e}");
+}

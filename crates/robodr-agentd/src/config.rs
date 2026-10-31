@@ -984,6 +984,33 @@ pub fn load(path: &Path) -> Result<Resolved, String> {
     resolve(parse(&text)?)
 }
 
+/// [`load`] for `--check-config` (review 2, M18). Outside the unit
+/// (`in_unit` false: no `$CREDENTIALS_DIRECTORY`) and while the configured
+/// credentials directory does not exist (the service has not run, or is
+/// stopped), the keys the configuration names there are checked at the
+/// sources the unit loads them from ([`crate::unit_credentials`], unit
+/// files under `unit_dirs`). Returns the notes to print with the report.
+pub fn load_for_check(
+    path: &Path,
+    unit_dirs: &[&Path],
+    in_unit: bool,
+) -> Result<(Resolved, Vec<String>), String> {
+    let text = read_capped(path, MAX_CONFIG_BYTES)?;
+    let c = parse(&text)?;
+    let cred_dir = c
+        .key_protection
+        .as_ref()
+        .and_then(|k| k.credentials_dir.clone())
+        .unwrap_or_else(|| PathBuf::from(crate::key_protection::DEFAULT_CREDENTIALS_DIR));
+    if in_unit || cred_dir.exists() {
+        return Ok((resolve(c)?, Vec::new()));
+    }
+    use crate::unit_credentials as uc;
+    let sources = uc::parse_sources(&uc::read_unit_texts(unit_dirs, uc::UNIT));
+    let (rewritten, notes) = uc::rewrite(&text, &cred_dir, &sources)?;
+    Ok((resolve(parse(&rewritten)?)?, notes))
+}
+
 fn require_abs(what: &str, p: &Path) -> Result<(), String> {
     if p.as_os_str().is_empty() || !p.is_absolute() {
         return Err(format!(

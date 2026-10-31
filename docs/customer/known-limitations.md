@@ -231,6 +231,10 @@
   when a sealed file of that name exists; check the unit after sealing.
   `robodr-executor`, the uplink, the exporters and the anchor receiver do
   not report key protection. Tested on swtpm only, not on a hardware TPM.
+  The operator tools (`robodr-enroll`, `robodr-blackbox rotate`,
+  `robodr-deliverd rekey`) read only plaintext key files: on a unit with
+  sealed keys the plaintext must be kept or decrypted into `/run` for each
+  session ([`docs/OPERATIONS.md`](../OPERATIONS.md) 4.7).
 - **Offline signing keys in a token (PKCS#11)** are tested with SoftHSM 2
   only, not yet on YubiKey, Nitrokey or a network HSM. The signing station
   needs OpenSC 0.25 or later (Ubuntu 22.04 and Debian 12 ship older
@@ -243,7 +247,10 @@
   on an unreleased AutoSecOps branch. The black-box key is rotated with
   `robodr-blackbox rotate` while agentd is stopped (retired keys in
   `blackbox.previous_keys`); rotation with a remote head anchor has no
-  end-to-end test. Anti-rollback state is a plain file (S9, S10).
+  end-to-end test. The fleet API does not rotate the black-box key: the
+  SOC keeps the enrollment black-box key registered, so an enrolled unit
+  keeps that retired secret until it is decommissioned (its decommission
+  request is signed by it). Anti-rollback state is a plain file (S9, S10).
 - **The TPM head anchor is tested on swtpm only.** Head anchors make
   rollback and truncation *detectable*, not impossible
   ([`SECURITY.md`](../../SECURITY.md)).
@@ -284,7 +291,10 @@
   verifiers holding an HMAC key can forge. The deliverd finding key
   (`findings.finding_key`) has no HMAC check yet.
 - **No time-source authentication.** Signatures and replay windows depend
-  on NTP.
+  on NTP. A control-plane replay store written by an earlier release
+  after a forward clock step can refuse every request until real time
+  reaches the wrong time; it is reset by removing it while agentd is
+  stopped ([`docs/OPERATIONS.md`](../OPERATIONS.md) 6.4, "Restart").
 
 ## Operations
 

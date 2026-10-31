@@ -143,7 +143,19 @@ fn main() -> ExitCode {
             robodr_agentd::selftest::Outcome::Failed(_) => ExitCode::from(1),
         };
     }
-    let resolved = match robodr_agentd::load(&path) {
+    // --check-config before the first start: the keys are checked where the
+    // unit loads them from (review 2, M18).
+    let loaded = if check {
+        let dirs: Vec<&std::path::Path> = robodr_agentd::unit_credentials::UNIT_DIRS
+            .iter()
+            .map(std::path::Path::new)
+            .collect();
+        let in_unit = std::env::var_os("CREDENTIALS_DIRECTORY").is_some();
+        robodr_agentd::load_for_check(&path, &dirs, in_unit)
+    } else {
+        robodr_agentd::load(&path).map(|r| (r, Vec::new()))
+    };
+    let (resolved, check_notes) = match loaded {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
@@ -154,6 +166,9 @@ fn main() -> ExitCode {
         }
     };
     if check {
+        for n in &check_notes {
+            eprintln!("robodr-agentd: {}", robodr_ros2_pipeline::sanitize(n));
+        }
         for w in &resolved.warnings {
             eprintln!(
                 "robodr-agentd: warning: {}",
