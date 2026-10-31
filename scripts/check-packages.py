@@ -62,7 +62,9 @@ Package checks (`--deb FILE ... --rpm FILE ...`; CI jobs `package-*`):
      /etc/robodr, no private key material (PEM private keys, minisign
      secret keys) anywhere in the payload; exactly the variant's programs,
      each unit together with its program, and a man page for every
-     shipped program that has one in man/.
+     shipped program that has one in man/; the customer documentation
+     (no drafts), the demo captures and the operator examples
+     (SHIPPED_DOCS).
   6. robodr .deb vs robodr .rpm of the same architecture: the same paths
      with the same modes, and byte-identical content except the programs
      (built in different userlands).
@@ -116,6 +118,11 @@ PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
     "robodr-seal": ("usr/sbin", BOTH),
     "robodr-depot": ("usr/sbin", BOTH),
     "robodr-enroll": ("usr/sbin", BOTH),
+    # Operator tools (crates/robodr-ops): first-boot setup, support bundle,
+    # metrics textfile exporter.
+    "robodr-setup": ("usr/sbin", BOTH),
+    "robodr-support-bundle": ("usr/sbin", BOTH),
+    "robodr-metrics": ("usr/bin", BOTH),
     # Pulsar-bound (glibc, eBPF, needs BTF): not static, not on systemd 245.
     "robodr-pulsard": ("usr/sbin", frozenset({STD})),
     # Base station only: use the robodr package there.
@@ -126,7 +133,8 @@ NEVER_PACKAGED = {
     "robodr-release": "SOC / build-side delivery artifact tool",
 }
 # build-deb.sh requires these whatever ROBODR_DEB_REQUIRE says.
-ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch"}
+ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch",
+                   "robodr-setup", "robodr-support-bundle", "robodr-metrics"}
 
 # program -> units installed with it.
 UNITS = {
@@ -180,6 +188,21 @@ ALLOWED_ROOTS = ("/usr/", "/etc/robodr")
 NOTICE_FILES = (
     "/usr/share/doc/robodr/THIRD_PARTY_NOTICES",
     "/usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER",
+)
+# Every variant ships the customer documentation, the demo data and the
+# operator examples (sales-readiness T49, T70, T87).
+SHIPPED_DOCS = (
+    "/usr/share/doc/robodr/customer/quick-start.md",
+    "/usr/share/doc/robodr/customer/known-limitations.md",
+    "/usr/share/doc/robodr/customer/support-matrix.md",
+    "/usr/share/doc/robodr/demo/README.md",
+    "/usr/share/doc/robodr/demo/SHA256SUMS",
+    "/usr/share/doc/robodr/demo/fastrtps_baseline.pcap",
+    "/usr/share/doc/robodr/demo/fastrtps_rogue_cmd_vel.pcap",
+    "/usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
+    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.service.example",
+    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.timer.example",
+    "/usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
 )
 SECRET_MARKERS = (
     re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -783,6 +806,12 @@ def check_package(label: str, variant: str, entries: dict[str, Entry], contents:
     for p in NOTICE_FILES:
         if p not in entries:
             errs.append(f"{label}: lacks {p} (scripts/third_party_notices.py)")
+    for p in SHIPPED_DOCS:
+        if p not in entries:
+            errs.append(f"{label}: lacks {p} (packaging/build-deb.sh)")
+    for p in entries:
+        if p.startswith("/usr/share/doc/robodr/customer/") and p.endswith("-draft.md"):
+            errs.append(f"{label}: ships the draft {p}")
     for prog in sorted(progs):
         for page in sorted((root / "man").glob(f"{prog}.[1-8]")):
             sec = page.suffix[1:]
@@ -926,11 +955,15 @@ def self_test() -> int:
     for page in (ROOT / "man").glob("robodr-*.[1-8]"):
         if page.stem in base or any(k.endswith("/" + page.stem) for k in base):
             base[f"/usr/share/man/man{page.suffix[1:]}/{page.name}.gz"] = ent()
-    for n in NOTICE_FILES:
+    for n in NOTICE_FILES + SHIPPED_DOCS:
         base[n] = ent()
     expect("clean package", check_package("t", STD, base, {}, ROOT), True)
     no_notices = {k: v for k, v in base.items() if not k.endswith("/THIRD_PARTY_NOTICES")}
     expect("notices missing", check_package("t", STD, no_notices, {}, ROOT), False)
+    no_demo = {k: v for k, v in base.items() if not k.endswith("/fastrtps_rogue_cmd_vel.pcap")}
+    expect("demo capture missing", check_package("t", STD, no_demo, {}, ROOT), False)
+    expect("draft shipped", check_package(
+        "t", STD, {**base, "/usr/share/doc/robodr/customer/eula-draft.md": ent()}, {}, ROOT), False)
     expect("setuid", check_package("t", STD, {**base, "/usr/bin/robodr-replay": ent(mode=0o4755)}, {}, ROOT), False)
     expect("not root", check_package("t", STD, {**base, "/usr/share/x": ent(owner="robodr")}, {}, ROOT), False)
     expect("state in payload", check_package("t", STD, {**base, "/var/lib/robodr/x": ent()}, {}, ROOT), False)
@@ -1016,7 +1049,7 @@ def self_test() -> int:
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
     expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 57
+    total = 59
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
