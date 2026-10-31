@@ -68,6 +68,10 @@ pub struct AgentConfig {
     /// Findings `data_source` label; default
     /// [`robodr_ocsf::DEFAULT_DATA_SOURCE`].
     pub data_source: String,
+    /// Producer cap: build findings for contract `2.<minor>.0`
+    /// (`robodr_ocsf::RobotContext::max_contract_minor`), at most
+    /// [`robodr_ocsf::CONTRACT_MINOR`]. `None`: the current contract.
+    pub max_contract_minor: Option<u64>,
     /// Record every event in the black box, not only events that produced a
     /// deviation or a non-pass firewall verdict. Off by default: motion
     /// topics run at 50-1000 Hz and would flood the recorder.
@@ -99,6 +103,7 @@ impl AgentConfig {
             kafka_partitions: None,
             findings_topic: robodr_ocsf::DEFAULT_TOPIC.into(),
             data_source: robodr_ocsf::DEFAULT_DATA_SOURCE.into(),
+            max_contract_minor: None,
             record_all_events: false,
             clock_jump_tolerance_ns: DEFAULT_CLOCK_JUMP_TOLERANCE_NS,
         }
@@ -142,6 +147,15 @@ impl AgentConfig {
             return Err(AgentError::Config(format!(
                 "data_source {:?} must match [a-z0-9][a-z0-9._-]{{0,63}}",
                 self.data_source
+            )));
+        }
+        if let Some(m) = self
+            .max_contract_minor
+            .filter(|m| *m > robodr_ocsf::CONTRACT_MINOR)
+        {
+            return Err(AgentError::Config(format!(
+                "max_contract_minor {m} is above this build's contract {}",
+                robodr_ocsf::CONTRACT_VERSION
             )));
         }
         if let Some(m) = &self.monitor {

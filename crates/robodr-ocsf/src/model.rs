@@ -34,6 +34,9 @@ pub const CONTRACT_NAME: &str = "robodr.findings";
 /// Contract (envelope) schema version emitted, semver. See
 /// `docs/contracts/robodr.findings.md`.
 pub const CONTRACT_VERSION: &str = "2.5.0";
+/// Minor of [`CONTRACT_VERSION`]: the highest a producer can be capped to
+/// (`RobotContext::max_contract_minor`).
+pub const CONTRACT_MINOR: u64 = 5;
 /// Contract major emitted and validated in full.
 pub const CONTRACT_MAJOR: u64 = 2;
 /// Older contract major still accepted on parse (replay, migration), never

@@ -801,6 +801,7 @@ impl<'a> Daemon<'a> {
         acfg.kafka_partitions = cfg.robot.kafka_partitions;
         acfg.findings_topic = cfg.findings.topic.clone();
         acfg.data_source = cfg.findings.data_source.clone();
+        acfg.max_contract_minor = cfg.findings.max_contract_minor;
         match (&cfg.firewall, validated) {
             (Some(fw), true) => {
                 // Low-level joint channels (Unitree LowCmd) come with the

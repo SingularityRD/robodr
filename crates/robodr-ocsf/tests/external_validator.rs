@@ -124,11 +124,14 @@ fn all_findings() -> Vec<String> {
     for id in catalog_ids::catalog_rule_ids() {
         for sev in [Severity::Low, Severity::Critical] {
             let dev = Deviation::new(id.clone(), sev, "detail for the external validator");
-            let f = FindingBuilder::from_deviation(&dev, &ctx)
+            let mut b = FindingBuilder::from_deviation(&dev, &ctx)
                 .seen(common::T0, common::T0 + 5)
-                .occurrences(2)
-                .build()
-                .unwrap_or_else(|e| panic!("{id}: {e:?}"));
+                .occurrences(2);
+            // The health record rule requires its record (contract 2.5).
+            if id == robodr_ocsf::AGENT_HEALTH_RULE {
+                b = b.agent_health(common::health::sample());
+            }
+            let f = b.build().unwrap_or_else(|e| panic!("{id}: {e:?}"));
             out.push(to_json(&f).unwrap());
         }
     }

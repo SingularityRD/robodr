@@ -359,11 +359,13 @@ fn default_data_source() -> String {
 }
 
 /// `findings` (optional): the deployment labels of the findings this robot
-/// emits (`robodr.findings` contract 2.x). Both default to the contract
-/// defaults, so a config without the section is unchanged.
+/// emits (`robodr.findings` contract 2.x) and the contract minor they are
+/// built for. All default to the contract defaults, so a config without
+/// the section is unchanged.
 ///
 /// ```json
-/// "findings": { "topic": "robodr.findings", "data_source": "robodr" }
+/// "findings": { "topic": "robodr.findings", "data_source": "robodr",
+///               "max_contract_minor": 4 }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -376,6 +378,13 @@ pub struct FindingsSection {
     /// `[a-z0-9][a-z0-9._-]{0,63}`.
     #[serde(default = "default_data_source")]
     pub data_source: String,
+    /// Producer cap (T38): build every finding for contract
+    /// `2.<max_contract_minor>.0` so a SOC whose validators are older than
+    /// this build accepts them (0 ..= [`robodr_ocsf::CONTRACT_MINOR`];
+    /// absent: the current contract). What a lower minor changes:
+    /// `robodr_ocsf::RobotContext::contract_minor`.
+    #[serde(default)]
+    pub max_contract_minor: Option<u64>,
 }
 
 impl Default for FindingsSection {
@@ -383,6 +392,7 @@ impl Default for FindingsSection {
         Self {
             topic: default_findings_topic(),
             data_source: default_data_source(),
+            max_contract_minor: None,
         }
     }
 }
@@ -1165,6 +1175,16 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         return Err(format!(
             "findings.data_source {:?} must match [a-z0-9][a-z0-9._-]{{0,63}}",
             robodr_ros2_pipeline::sanitize(&config.findings.data_source)
+        ));
+    }
+    if let Some(m) = config
+        .findings
+        .max_contract_minor
+        .filter(|m| *m > robodr_ocsf::CONTRACT_MINOR)
+    {
+        return Err(format!(
+            "findings.max_contract_minor {m} is above this build's contract {}",
+            robodr_ocsf::CONTRACT_VERSION
         ));
     }
     require_abs("policy_path", &config.policy_path)?;

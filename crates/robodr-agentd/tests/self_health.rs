@@ -222,6 +222,48 @@ fn t7_refused_clock_probe_is_reported() {
         .any(|r| r == "robot.agent.clock_unsynced"));
 }
 
+/// T38: `findings.max_contract_minor: 4` makes agentd emit contract 2.4.0
+/// findings a 2.4 SOC accepts: the health finding goes out with the
+/// generic entry and without its 2.5 record; a cap above this build's
+/// contract is refused at load.
+#[test]
+fn t38_producer_cap_emits_the_older_contract() {
+    let s = setup("contract-cap", &robot_profile(true));
+    let mut cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        json!({"self_health": {"health_record_ms": 1000,
+            "disk_warn_percent": 1, "disk_critical_percent": 0,
+            "clock_unsynced_grace_ms": 86_400_000}}),
+    );
+    cfg["findings"] = json!({"max_contract_minor": robodr_ocsf::CONTRACT_MINOR + 1});
+    let err = robodr_agentd::load(&s.write_config(&cfg))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("max_contract_minor"), "{err}");
+    cfg["findings"] = json!({"max_contract_minor": 4});
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(15, "a health record", || {
+        rules(&spooled(&s.spool))
+            .iter()
+            .any(|r| r == "robot.agent.health")
+            .then_some(())
+    });
+    let log = finish(stop, h);
+    let found = spooled(&s.spool);
+    assert!(!found.is_empty(), "{log}");
+    for (_, e) in &found {
+        assert_eq!(e.contract_version, "2.4.0", "{}", e.entity_context.rule_id);
+        assert!(e.entity_context.agent_health.is_none());
+    }
+    let rec = found
+        .iter()
+        .find(|(_, e)| e.entity_context.rule_id == "robot.agent.health")
+        .map(|(_, e)| e)
+        .unwrap();
+    assert_eq!(rec.title, "RoboDR model-profile deviation");
+}
+
 /// The record can be switched off (replay, tests); the early warnings stay.
 #[test]
 fn t5_health_record_off_emits_none() {
