@@ -721,7 +721,11 @@ fn default_connections() -> usize {
 
 /// Platform context. Without a `safety_feed`, the configured
 /// `safety_state` is used for every plan (default `unknown`); with one, the
-/// feed decides and this must stay `unknown`.
+/// feed decides and this must stay `unknown`. `control`, `phase` and
+/// `connectivity` are replaced, field by field, by the live context when a
+/// `safety_feed` source reports that field
+/// ([`crate::safety_feed::context`]); they remain the value used while no
+/// live source contributes.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSection {

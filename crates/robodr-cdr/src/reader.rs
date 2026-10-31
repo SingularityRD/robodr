@@ -211,6 +211,15 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// `uint64` (8-aligned under XCDR1, 4-aligned under XCDR2).
+    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
+        let b = self.array::<8>()?;
+        Ok(match self.endian {
+            Endian::Big => u64::from_be_bytes(b),
+            Endian::Little => u64::from_le_bytes(b),
+        })
+    }
+
     /// `float` / `float32` (4-aligned).
     pub(crate) fn f32(&mut self) -> Result<f32, DecodeError> {
         let b = self.array::<4>()?;

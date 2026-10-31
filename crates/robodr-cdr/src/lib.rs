@@ -126,6 +126,7 @@
 pub mod encap;
 pub mod error;
 pub mod event;
+pub mod lifecycle;
 pub mod msgs;
 mod reader;
 pub mod registry;
