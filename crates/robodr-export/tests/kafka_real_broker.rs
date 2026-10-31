@@ -1204,3 +1204,172 @@ fn real_scram_over_tls() {
         assert_eq!(after.io_errors, before.io_errors, "no failed request");
     }
 }
+
+// ------------------------------------------------- KIP-360 epoch bumps
+
+/// One raw idempotent Produce v8 of `n` records to `TOPIC`/`p`: the
+/// partition's error code.
+fn raw_produce(c: &mut Consumer, p: i32, pid: i64, epoch: i16, seq: i32, n: usize) -> i16 {
+    use robodr_export::kafka::batch::ProducerFields;
+    let recs: Vec<ProduceRecord> = (0..n).map(|i| plain(i, 10)).collect();
+    let b = robodr_export::kafka::encode_batch_idempotent(
+        &recs,
+        ProducerFields {
+            producer_id: pid,
+            producer_epoch: epoch,
+            base_sequence: seq,
+        },
+    )
+    .unwrap();
+    let body = proto::encode_produce_request(8, -1, 30_000, TOPIC, &[(p, b)]).unwrap();
+    let r = proto::decode_produce_response(8, &c.exchange(proto::API_PRODUCE, 8, &body)).unwrap();
+    r.topics[0].1[0].error_code
+}
+
+fn raw_init_pid(c: &mut Consumer) -> (i64, i16) {
+    let body = proto::encode_init_producer_id_request(1).unwrap();
+    // Right after the broker starts, the producer id manager may not be
+    // ready yet (COORDINATOR_NOT_AVAILABLE and the like): retried.
+    for _ in 0..60 {
+        let r = proto::decode_init_producer_id_response(&c.exchange(
+            proto::API_INIT_PRODUCER_ID,
+            1,
+            &body,
+        ))
+        .unwrap();
+        if r.error_code == 0 {
+            return (r.producer_id, r.producer_epoch);
+        }
+        eprintln!("InitProducerId: error {}, retrying", r.error_code);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("InitProducerId kept failing");
+}
+
+/// What the producer's epoch bump (KIP-360, `kafka/client.rs`) relies on,
+/// checked against the real broker with raw requests:
+/// * an idempotent producer may raise its epoch on its own: the first
+///   batch of the new epoch must have sequence 0 and is accepted on a
+///   partition that holds the producer at the older epoch;
+/// * the older epoch is then fenced on that partition
+///   (INVALID_PRODUCER_EPOCH), but not on a partition that has not seen
+///   the new epoch, so a batch in doubt there can still be re-sent and
+///   deduplicated under the older epoch;
+/// * the broker offers InitProducerId v3+ (Kafka 2.5+, KIP-360), and
+///   InitProducerId with no transactional id never bumps an epoch: given
+///   the current id and epoch (v3) it hands out a new producer id.
+#[test]
+#[ignore = "needs a Kafka broker: ROBODR_KAFKA_BROKER (scripts/kafka-it.sh)"]
+fn real_kip360_epoch_bump_semantics() {
+    let Some(b) = broker() else { return };
+    let mut c = Consumer::connect(&b);
+    let av = proto::decode_api_versions(&c.exchange(proto::API_VERSIONS, 0, &[])).unwrap();
+    let ipid = av
+        .apis
+        .iter()
+        .find(|a| a.api_key == proto::API_INIT_PRODUCER_ID)
+        .unwrap();
+    assert!(ipid.max >= 3, "InitProducerId v{}", ipid.max);
+    let (pid, e0) = raw_init_pid(&mut c);
+    assert_eq!(e0, 0);
+    // Partition 0 and 1 at epoch 0.
+    assert_eq!(raw_produce(&mut c, 0, pid, 0, 0, 3), 0);
+    assert_eq!(raw_produce(&mut c, 1, pid, 0, 0, 2), 0);
+    // A gap: OUT_OF_ORDER_SEQUENCE_NUMBER.
+    assert_eq!(raw_produce(&mut c, 0, pid, 0, 7, 1), 45);
+    // A bumped epoch must start at 0 ...
+    assert_eq!(raw_produce(&mut c, 0, pid, 1, 5, 1), 45);
+    // ... and is then accepted.
+    assert_eq!(raw_produce(&mut c, 0, pid, 1, 0, 2), 0);
+    assert_eq!(raw_produce(&mut c, 0, pid, 1, 2, 1), 0);
+    // The old epoch is fenced on partition 0 ...
+    assert_eq!(raw_produce(&mut c, 0, pid, 0, 3, 1), 47);
+    // ... but partition 1 still deduplicates it and continues it.
+    assert_eq!(raw_produce(&mut c, 1, pid, 0, 0, 2), 0, "duplicate");
+    assert_eq!(raw_produce(&mut c, 1, pid, 0, 2, 1), 0);
+    assert_eq!(raw_produce(&mut c, 1, pid, 1, 0, 1), 0);
+    // InitProducerId v3 (flexible: request header v2, compact null
+    // transactional id) with the current id and epoch: a new id.
+    let mut body = vec![0u8]; // compact nullable string: null
+    body.extend_from_slice(&60_000i32.to_be_bytes());
+    body.extend_from_slice(&pid.to_be_bytes());
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body.push(0); // tagged fields
+    let mut req = Writer::new();
+    req.i16(proto::API_INIT_PRODUCER_ID).i16(3).i32(9999);
+    req.try_nullable_string(Some("robodr-it")).unwrap();
+    req.buf.push(0); // request header v2 tagged fields
+    req.buf.extend_from_slice(&body);
+    let mut s = TcpStream::connect(&b).unwrap();
+    s.write_all(&(req.buf.len() as i32).to_be_bytes()).unwrap();
+    s.write_all(&req.buf).unwrap();
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).unwrap();
+    let mut resp = vec![0u8; i32::from_be_bytes(len) as usize];
+    s.read_exact(&mut resp).unwrap();
+    // correlation id, header tags, throttle, error, id, epoch.
+    let mut r = Reader::new(&resp);
+    assert_eq!(r.i32().unwrap(), 9999);
+    assert_eq!(r.i8().unwrap(), 0);
+    r.i32().unwrap();
+    assert_eq!(r.i16().unwrap(), 0);
+    let new_pid = r.i64().unwrap();
+    let new_epoch = r.i16().unwrap();
+    eprintln!("InitProducerId v3 ({pid}, 1) -> ({new_pid}, {new_epoch})");
+    assert_ne!(new_pid, pid, "no epoch bump without a transactional id");
+    assert_eq!(new_epoch, 0);
+}
+
+/// The producer against the real broker: a restored state whose sequence
+/// runs ahead of the broker's (OUT_OF_ORDER_SEQUENCE_NUMBER) is renumbered
+/// by an epoch bump (same producer id, no InitProducerId), every record is
+/// written exactly once, and the producer continues under the new epoch.
+#[test]
+#[ignore = "needs a Kafka broker: ROBODR_KAFKA_BROKER (scripts/kafka-it.sh)"]
+fn real_sequence_error_bumps_the_epoch() {
+    let Some(b) = broker() else { return };
+    let mut c = Consumer::connect(&b);
+    let marks = c.marks(TOPIC, PARTITIONS);
+    let tag = format!("kip360-{}", run_base());
+    let batch = |from: usize, n: usize| -> Vec<(i32, ProduceRecord)> {
+        (from..from + n)
+            .map(|i| {
+                let mut r = plain(i, 10);
+                r.key = Some(format!("{tag}-{i}").into_bytes());
+                (2, r)
+            })
+            .collect()
+    };
+    let mut p = Producer::new(producer_cfg(&b)).unwrap();
+    assert_eq!(p.send(TOPIC, &batch(0, 3)).unwrap().len(), 3);
+    let mut st = p.idempotent_state().unwrap().clone();
+    assert_eq!(st.next(TOPIC, 2), 3);
+    drop(p);
+    // A state from the future (a restored copy that does not match the
+    // broker): sequence 10 where the broker expects 3.
+    st.sequences.get_mut(TOPIC).unwrap().insert(2, 10);
+    let (pid, epoch) = (st.producer_id, st.producer_epoch);
+    let mut p = Producer::new(producer_cfg(&b)).unwrap();
+    p.restore_idempotent_state(st);
+    let out = p.send(TOPIC, &batch(3, 4)).unwrap();
+    assert!(out.iter().all(|o| matches!(o, Outcome::Delivered { .. })));
+    let s = p.stats();
+    eprintln!("kip360: {s:?}");
+    assert_eq!(
+        (s.epoch_bumps, s.producer_id_resets, s.producer_ids),
+        (1, 0, 0)
+    );
+    let now = p.idempotent_state().unwrap();
+    assert_eq!((now.producer_id, now.producer_epoch), (pid, epoch + 1));
+    assert_eq!(now.next(TOPIC, 2), 4);
+    assert_eq!(p.send(TOPIC, &batch(7, 2)).unwrap().len(), 2);
+    let got: Vec<Fetched> = c
+        .since(TOPIC, &marks)
+        .into_iter()
+        .filter(|f| f.key().starts_with(&format!("{tag}-")))
+        .collect();
+    let keys: Vec<String> = got.iter().map(Fetched::key).collect();
+    let want: Vec<String> = (0..9).map(|i| format!("{tag}-{i}")).collect();
+    assert_eq!(keys, want, "each record once, in order");
+    assert!(got.iter().all(|f| f.producer_id == pid));
+}

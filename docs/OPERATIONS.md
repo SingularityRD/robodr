@@ -2899,7 +2899,21 @@ consumers drop duplicates on `event-uid`). Without `--once` it loops every
 `--done-max-age-s` (default 2592000 = 30 days; 0 = keep) or beyond
 `--done-max-count` are deleted, but never while their batch is still in
 the importer's `out/` (the marker is what stops it being published again):
-prune `out/` and the markers follow.
+prune `out/` and the markers follow. Where the tool is the **only
+consumer** of `out/`, it can prune `out/` itself: `--out-max-age-s N` /
+`--out-max-count N` / `--out-max-bytes N` delete the records and bundles of
+the batches it has finished (never one without its `done/` marker); each
+directory stays with its `MANIFEST.json` as a small tombstone, so a batch
+re-emitted after an importer state reset cannot land under a finished
+name. With a spool source,
+`--rejected-max-age-s` / `--rejected-max-count` / `--rejected-max-bytes`
+bound `<spool>/rejected/` (default: kept); `robodr-uplink
+--reinject-max-age-s` / `--reinject-max-count` / `--reinject-max-bytes`
+delete the `records.jsonl` of finished re-injection generations (the
+ledger stays). All of these are off by default. Sizes: `state_usage` in
+`uplink-status.json` and in the publisher's JSON report (entries and bytes
+of `done/`, dead letters, `out/` or `rejected/`, re-injection), measured at
+most once a minute.
 
 Dead letters: **`robodr-kafka-publish` keeps `dead-letter.jsonl` as one
 growing file and never deletes it by default**: its entries are the

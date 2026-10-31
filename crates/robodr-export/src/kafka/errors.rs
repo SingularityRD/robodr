@@ -15,8 +15,9 @@ pub enum ErrorClass {
     /// The broker's idempotent-producer state disagrees with ours
     /// (`OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID`,
     /// `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED`): the batch was **not**
-    /// appended; get a new producer id, restart the sequences at 0 and
-    /// re-send (see [`super::client`], "Idempotence").
+    /// appended; renumber (an epoch bump, or a new producer id), restart
+    /// the sequences at 0 and re-send (see [`super::client`],
+    /// "Idempotence").
     Sequence,
     /// `DUPLICATE_SEQUENCE_NUMBER`: the broker already holds this batch
     /// (a re-send after a lost acknowledgement): success.

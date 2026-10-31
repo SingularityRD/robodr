@@ -863,7 +863,10 @@ impl Exporter {
 /// docs): each `<seq>.json` with its `<seq>.json.reason.json` is one item
 /// (age: the reason file's time, i.e. when it was rejected; a record found
 /// without one gets one now and is dated now), deleted together. A name
-/// still in `ready/` is never touched.
+/// still in `ready/` is never touched. Also used by `robodr-kafka-publish`
+/// and `robodr-uplink` for a spool source: they move records here without
+/// a reason file (the reason is in their dead-letter file), so each is
+/// dated by the first pruning pass that sees it (the run after the move).
 pub fn prune_rejected(
     dir: &Path,
     ready: &Path,
@@ -902,8 +905,10 @@ pub fn prune_rejected(
             // is dated now, by writing the missing reason file.
             let note = serde_json::json!({
                 "file": name,
-                "reason": "unknown: the reason file was missing (rejected by a run that was \
-                           interrupted before writing it); dated when this was noticed",
+                "reason": "unknown here: the reason file was missing (robodr-kafka-publish and \
+                           robodr-uplink record the reason in their dead-letter file, by \
+                           sequence number; robodr-spool-export writes it before the move, \
+                           so a run interrupted in between); dated when this was noticed",
             });
             fsutil::atomic_write(&why, note.to_string().as_bytes())?;
             m_why = file_meta(&why)?;

@@ -6,7 +6,7 @@
 //! | ApiVersions | 18 | 0 | always answered with a v0 header; discovers the others |
 //! | Metadata | 3 | 1–8 | v9+ are flexible (compact encodings), not implemented |
 //! | Produce | 0 | 3–8 | v3 is the first with RecordBatch v2; v9+ are flexible |
-//! | InitProducerId | 22 | 0–1 | idempotent producer only; v2+ are flexible (v3+ add epoch bumps, KIP-360, not used) |
+//! | InitProducerId | 22 | 0–1 | idempotent producer only; v2+ are flexible. A broker offering v3+ (Kafka 2.5+) implements KIP-360: the producer then bumps its epoch itself instead of asking for a new id (`client.rs`) |
 //!
 //! InitProducerId v1 is v0 with quota throttling; both are served by Kafka
 //! 0.11 to 4.1 (KIP-896 keeps every version a Kafka 2.1 client uses).
@@ -26,6 +26,14 @@ pub const API_INIT_PRODUCER_ID: i16 = 22;
 pub const PRODUCE_VERSIONS: (i16, i16) = (3, 8);
 pub const METADATA_VERSIONS: (i16, i16) = (1, 8);
 pub const INIT_PRODUCER_ID_VERSIONS: (i16, i16) = (0, 1);
+/// First InitProducerId version of KIP-360 (Kafka 2.5): a broker that
+/// offers it accepts an idempotent producer's own epoch bump (the first
+/// batch of the new epoch at sequence 0) and fences the older epoch per
+/// partition. InitProducerId itself is not used for the bump: without a
+/// transactional id the broker answers it with a new producer id, whatever
+/// id and epoch are sent (checked against Kafka 3.9.1,
+/// `tests/kafka_real_broker.rs`).
+pub const INIT_PRODUCER_ID_KIP360_VERSION: i16 = 3;
 
 /// Build a size-prefixed request frame.
 pub fn frame_request(
