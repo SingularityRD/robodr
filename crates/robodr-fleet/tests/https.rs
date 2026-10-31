@@ -509,3 +509,96 @@ fn crl_files_refuse_a_revoked_soc_server() {
     )
     .is_err());
 }
+
+/// `robodr-enroll check` (site acceptance): read-only, exit 0 when TLS,
+/// the fleet API and request authentication work; exit 3 for a SOC that
+/// TLS refuses; exit 1 for a SOC key that does not verify. Then
+/// `decommission` over HTTPS: the keys are retired at the SOC, the
+/// receipt is written, and `check` finds the unit no longer enrolled.
+#[test]
+fn cli_check_and_decommission() {
+    let srv = serve(live_soc());
+    let u = unit_with_ca("cli-check");
+    let cfgf = u.config_file(Some(&srv.url()));
+    let c = cfgf.to_str().unwrap();
+    // Not enrolled: TLS and the fleet API are checked, authentication skipped.
+    let o = run(&["check", "--config", c]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("skip request authentication"));
+    // The SOC's certificate from another CA: not reached (exit 3).
+    std::fs::copy(tls_data("other-ca.pem"), &u.cfg.ca_bundle).unwrap();
+    let o = run(&["check", "--config", c]);
+    assert_eq!(code(&o), 3, "{}", txt(&o));
+    std::fs::copy(tls_data("ca.pem"), &u.cfg.ca_bundle).unwrap();
+    // Enrolled: the uplink key authenticates; no ring published yet.
+    let tok = srv
+        .soc
+        .lock()
+        .unwrap()
+        .issue_token("tok-1", ROBOT, Some(SITE), 600_000, [9; 32]);
+    let tokf = token_file(&u, &tok);
+    let o = run(&["--config", c, "--token-file", tokf.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    let o = run(&["check", "--config", c]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("the SOC accepts the uplink key"));
+    // A published ring document is verified, not recorded; nothing is
+    // written to the journal either.
+    srv.soc.lock().unwrap().ring(ROBOT, 1, 0, None);
+    let journal_len = |u: &Unit| {
+        std::fs::read_dir(u.cfg.state_dir.join("journal"))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum::<u64>()
+    };
+    let before = journal_len(&u);
+    let o = run(&["check", "--config", c]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("verifies under SOC fleet key"));
+    assert!(!u.cfg.state_dir.join("ring.json").exists());
+    assert_eq!(journal_len(&u), before);
+    // A configured SOC fleet key that is not the SOC's: the ring signature
+    // does not verify (exit 1).
+    let wrong = u.etc("wrong-soc.pub");
+    write_public_key(&wrong, &profile_key());
+    let o = run(&["check", "--config", c, "--soc-key", wrong.to_str().unwrap()]);
+    assert_eq!(code(&o), 1, "{}", txt(&o));
+
+    // Decommission: --reason is required; then online.
+    let o = run(&["decommission", "--config", c]);
+    assert_eq!(code(&o), 2, "{}", txt(&o));
+    let receipt = u.root.join("receipt.json");
+    let o = run(&[
+        "decommission",
+        "--config",
+        c,
+        "--reason",
+        "end_of_life",
+        "--receipt-out",
+        receipt.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("decommissioned: robot ugv-001"));
+    let r: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(r["format"], "robodr-fleet-decommission-receipt/v1");
+    assert!(srv
+        .soc
+        .lock()
+        .unwrap()
+        .keys
+        .values()
+        .all(|k| k.retired_at.is_some()));
+    let o = run(&["status", "--config", c]);
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("Done"),
+        "{}",
+        txt(&o)
+    );
+    // Re-running shows the receipt again (exit 0); check now finds no
+    // enrollment and passes the unauthenticated part only.
+    let o = run(&["decommission", "--config", c]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    let o = run(&["check", "--config", c]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("not enrolled"));
+}

@@ -336,7 +336,7 @@ done
 
 doc="$pkg/usr/share/doc/robodr"
 install -d "$doc/examples"
-for f in docs/OPERATIONS.md docs/UNITREE.md SECURITY.md CHANGELOG.md README.md packaging/README.md; do
+for f in docs/OPERATIONS.md docs/UNITREE.md docs/DECOMMISSION.md SECURITY.md CHANGELOG.md README.md packaging/README.md; do
     [[ -f "$root/$f" ]] || continue
     case "$f" in
     packaging/README.md) install -m 0644 "$root/$f" "$doc/PACKAGING.md" ;;

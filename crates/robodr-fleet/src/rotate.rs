@@ -81,7 +81,7 @@ fn check_role(role: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "--role must be one of {:?} (the black-box key is not rotated by robodr-enroll: \
-             agentd's chain would need the old key to verify; see OPERATIONS 8.6)",
+             agentd's chain would need the old key to verify; see docs/OPERATIONS.md 8.6)",
             wire::ROTATABLE
         ))
     }

@@ -163,6 +163,42 @@ fn cancel_body(rotation: u8, old: &str, new: &str, rotate: &[u8], signer: &str) 
     .unwrap()
 }
 
+/// A decommission request (§5.6) of `robot` listing the keys `keys`
+/// (uplink, finding, blackbox stems), signed by `signers`.
+fn decommission_body(id: u8, robot: &str, keys: [&str; 3], signers: &[&str]) -> Vec<u8> {
+    let refs = keys
+        .iter()
+        .zip(wire::ROLES)
+        .map(|(stem, role)| {
+            let k = key(stem);
+            wire::KeyRef {
+                role: role.into(),
+                key_id: k.key_id().into(),
+                fingerprint: wire::fingerprint(&k.public_key()),
+            }
+        })
+        .collect();
+    let req = wire::DecommissionRequest {
+        format: wire::DECOMMISSION_REQUEST_FORMAT.into(),
+        decommission_id: format!("rfd1-{}", format!("{id:02x}").repeat(16)),
+        workspace: WORKSPACE.into(),
+        robot_id: robot.into(),
+        reason: "end_of_life".into(),
+        keys: refs,
+        journal_head: "ab".repeat(32),
+        created_at_ms: T0 + 300_000,
+    };
+    let ks: Vec<Ed25519SigningKey> = signers.iter().map(|s| key(s)).collect();
+    let refs: Vec<&Ed25519SigningKey> = ks.iter().collect();
+    Envelope::sign(
+        wire::T_DECOMMISSION_REQUEST,
+        &wire::payload_bytes(&req).unwrap(),
+        &refs,
+    )
+    .to_bytes()
+    .unwrap()
+}
+
 fn retire_body(rotation: u8, old: &str, new: &str) -> Vec<u8> {
     let req = RetireRequest {
         format: wire::RETIRE_REQUEST_FORMAT.into(),
@@ -597,6 +633,29 @@ pub fn cases() -> Vec<Case> {
             authed("POST", wire::PATH_RETIRE, retire_body(1, up, next), next, t + 44_000, t + 44_000),
         ],
     });
+    let bb = "ugv-001-blackbox";
+    let d1 = || decommission_body(1, "ugv-001", [up, fnd, bb], &[up, fnd, bb]);
+    let d2 = || decommission_body(2, "ugv-001", [next, fnd, bb], &[next, fnd, bb]);
+    v.push(Case {
+        name: "18-decommission",
+        description: "§5.6 decommission: enroll; rotate the uplink key (overlap); a decommission naming the old uplink key authenticated by the new one -> 401 wrong_key; authenticated by the old one -> 409 rotation_in_progress; retire the rotation; the old request again -> 401 unknown_key (its uplink key is retired); a request signed by the uplink key only -> 401 bad_signature; one naming another robot's blackbox key -> 409 stale_key; one for another robot -> 403 robot_mismatch; the valid request (signed by uplink, finding, blackbox, in order) -> decommissioned, every key retired; the same request again, authenticated by the uplink key it retired -> the stored answer; another decommission request -> 409 already_decommissioned; the retired uplink key no longer authenticates anything else (401 unknown_key)",
+        setup: Setup { tokens: vec!["tok-1"], rings: publications().rings, ..Default::default() },
+        steps: vec![
+            json_post(wire::PATH_ENROLL, enroll1(), t),
+            authed("POST", wire::PATH_ROTATE, r1(), up, t + 40_000, t + 40_000),
+            authed("POST", wire::PATH_DECOMMISSION, d1(), next, t + 41_000, t + 41_000),
+            authed("POST", wire::PATH_DECOMMISSION, d1(), up, t + 42_000, t + 42_000),
+            authed("POST", wire::PATH_RETIRE, retire_body(1, up, next), next, t + 43_000, t + 43_000),
+            authed("POST", wire::PATH_DECOMMISSION, d1(), up, t + 44_000, t + 44_000),
+            authed("POST", wire::PATH_DECOMMISSION, decommission_body(2, "ugv-001", [next, fnd, bb], &[next]), next, t + 45_000, t + 45_000),
+            authed("POST", wire::PATH_DECOMMISSION, decommission_body(3, "ugv-001", [next, fnd, "ugv-002-blackbox"], &[next, fnd, "ugv-002-blackbox"]), next, t + 46_000, t + 46_000),
+            authed("POST", wire::PATH_DECOMMISSION, decommission_body(4, "ugv-002", [next, fnd, bb], &[next, fnd, bb]), next, t + 47_000, t + 47_000),
+            authed("POST", wire::PATH_DECOMMISSION, d2(), next, t + 48_000, t + 48_000),
+            authed("POST", wire::PATH_DECOMMISSION, d2(), next, t + 49_000, t + 49_000),
+            authed("POST", wire::PATH_DECOMMISSION, decommission_body(5, "ugv-001", [next, fnd, bb], &[next, fnd, bb]), next, t + 50_000, t + 50_000),
+            authed("GET", wire::PATH_RING, Vec::new(), next, t + 51_000, t + 51_000),
+        ],
+    });
     v
 }
 
@@ -643,6 +702,7 @@ pub fn response_json(status: u16, body: &[u8], body_file: &str) -> Value {
         wire::T_ROTATE_ANSWER,
         wire::T_RETIRE_ANSWER,
         wire::T_CANCEL_ANSWER,
+        wire::T_DECOMMISSION_ANSWER,
         wire::T_APPROVAL,
         wire::T_RING,
     ] {

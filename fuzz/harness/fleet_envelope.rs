@@ -1,7 +1,8 @@
 //! Harness: fleet envelopes and SOC answers (`robodr_fleet::wire`): what
 //! `robodr-enroll` reads from the SOC or from vetted media — enrollment,
-//! rotate, retire and cancel answers, profile approvals, ring information, profile
-//! offers, error bodies — and what the SOC reads (requests).
+//! rotate, retire, cancel and decommission answers, profile approvals, ring
+//! information, profile offers, error bodies — and what the SOC reads
+//! (requests).
 //!
 //! Input: arbitrary bytes, offered to `Envelope::parse` for every type, to
 //! the payload parser of that type, to `Offer::parse` and `error_code`.
@@ -18,7 +19,7 @@
 use robodr_blackbox::Ed25519SigningKey;
 use robodr_fleet::wire::{self, Envelope};
 
-const TYPES: [&str; 11] = [
+const TYPES: [&str; 13] = [
     wire::T_TOKEN,
     wire::T_ENROLL_REQUEST,
     wire::T_ENROLL_ANSWER,
@@ -30,6 +31,8 @@ const TYPES: [&str; 11] = [
     wire::T_CANCEL_ANSWER,
     wire::T_APPROVAL,
     wire::T_RING,
+    wire::T_DECOMMISSION_REQUEST,
+    wire::T_DECOMMISSION_ANSWER,
 ];
 
 pub fn run(data: &[u8]) {
@@ -66,6 +69,8 @@ pub fn run(data: &[u8]) {
             }
             wire::T_APPROVAL => wire::Approval::parse(p).map(|_| ()),
             wire::T_RING => wire::RingInfo::parse(p).map(|_| ()),
+            wire::T_DECOMMISSION_REQUEST => wire::DecommissionRequest::parse(p).map(|_| ()),
+            wire::T_DECOMMISSION_ANSWER => wire::DecommissionAnswer::parse(p).map(|_| ()),
             _ => Ok(()),
         };
         if kind == wire::T_ENROLL_REQUEST {

@@ -275,6 +275,33 @@
           "tokens/tok-1.txt"
         ]
       }
+    },
+    {
+      "description": "§5.6 decommission: enroll; rotate the uplink key (overlap); a decommission naming the old uplink key authenticated by the new one -> 401 wrong_key; authenticated by the old one -> 409 rotation_in_progress; retire the rotation; the old request again -> 401 unknown_key (its uplink key is retired); a request signed by the uplink key only -> 401 bad_signature; one naming another robot's blackbox key -> 409 stale_key; one for another robot -> 403 robot_mismatch; the valid request (signed by uplink, finding, blackbox, in order) -> decommissioned, every key retired; the same request again, authenticated by the uplink key it retired -> the stored answer; another decommission request -> 409 already_decommissioned; the retired uplink key no longer authenticates anything else (401 unknown_key)",
+      "name": "18-decommission",
+      "requests": [
+        "cases/18-decommission/1",
+        "cases/18-decommission/2",
+        "cases/18-decommission/3",
+        "cases/18-decommission/4",
+        "cases/18-decommission/5",
+        "cases/18-decommission/6",
+        "cases/18-decommission/7",
+        "cases/18-decommission/8",
+        "cases/18-decommission/9",
+        "cases/18-decommission/10",
+        "cases/18-decommission/11",
+        "cases/18-decommission/12",
+        "cases/18-decommission/13"
+      ],
+      "setup": {
+        "rings": {
+          "ugv-001": "cases/18-decommission/setup/rings-ugv-001.body"
+        },
+        "tokens": [
+          "tokens/tok-1.txt"
+        ]
+      }
     }
   ],
   "compare": "status; error bodies by code; 200 envelopes by type, signer list and decoded payload (JSON value equality; the committed body bytes are the reference's, Ed25519 is deterministic so an implementation serialising payloads as compact JSON in the contract's key order reproduces them exactly); other 200 bodies byte-exact (body_sha256)",

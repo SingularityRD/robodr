@@ -79,6 +79,26 @@ robodr\-enroll \- enroll a RoboDR unit with the SOC, rotate its keys, take revoc
 .IR FILE ]
 .br
 .B robodr\-enroll status
+.br
+.B robodr\-enroll check
+.br
+.B robodr\-enroll decommission \-\-reason
+.BR end_of_life | transfer | repair
+.RB [ \-\-request\-out
+.I FILE
+|
+.B \-\-answer
+.IR FILE ]
+.RB [ \-\-receipt\-out
+.IR FILE ]
+.br
+.B robodr\-enroll decommission
+.RB [ \-\-answer
+.IR FILE ]
+.RB [ \-\-receipt\-out
+.IR FILE ]
+.br
+.B robodr\-enroll decommission \-\-abort
 .SH DESCRIPTION
 The robot side of the fleet lifecycle (contract
 .IR /usr/share/doc/robodr/contracts/robodr.fleet\-api.md ).
@@ -214,6 +234,39 @@ for
 .BR install\-bundle.sh ,
 which raises the unit's security floor to the minimum release. Otherwise
 information only: nothing is downloaded or installed.
+.SS Site acceptance check
+.B check
+proves the fleet path without changing anything: the SOC fleet and approval
+key files load, the SOC answers over TLS with the configured CA bundle,
+pins and CRLs, the URL is the fleet API, and, once the unit is enrolled,
+the active uplink key file is the registered one and the SOC accepts a
+request it authenticates (a read-only
+.BR "GET .../ring" ;
+a published ring document is verified against the SOC fleet keys but not
+recorded). Exit 0 when every step passes, 1 when one fails, 3 when the SOC
+is not reached.
+.SS Decommissioning
+.B decommission \-\-reason
+.I R
+asks the SOC to retire every key of the unit: the request names the
+registered uplink, finding and black-box keys and the fleet journal head,
+and is signed by all three keys; it is refused while an enrollment or a
+rotation is unfinished. On the SOC's signed answer the unit writes a
+.B robodr.fleet.decommission
+note into the fleet journal, shreds the uplink and finding secret keys and
+removes its enrollment;
+.I /var/lib/robodr/fleet/decommission.json
+holds request and answer (the receipt;
+.B \-\-receipt\-out
+writes a copy for the site's records). The black-box key is kept until the
+unit's data is sanitised. A request that may have reached the SOC is never
+abandoned: run the command again (the SOC answers a resend with its stored
+answer);
+.B \-\-abort
+only drops a request that never left the unit. The whole procedure
+(export, services, gateway, depot, anchor receiver, TPM, sanitisation) is
+in
+.IR /usr/share/doc/robodr/DECOMMISSION.md .
 .SH OPTIONS
 .TP
 .BI \-\-config " FILE"
@@ -254,6 +307,17 @@ profile approval is accepted from; never one of the fleet keys.
 .TP
 .BI \-\-agentd\-config " FILE"
 agentd's configuration (robot id, site, profile path and trust inputs).
+.TP
+.BI \-\-reason " R"
+why the unit is decommissioned:
+.BR end_of_life ,
+.B transfer
+or
+.BR repair .
+.TP
+.BI \-\-receipt\-out " FILE"
+write the decommission receipt (request and answer envelopes, JSON) to
+.IR FILE .
 .SH FILES
 .TP
 .I /etc/robodr/fleet.json
