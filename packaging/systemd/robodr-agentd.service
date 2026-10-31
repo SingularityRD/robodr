@@ -128,8 +128,15 @@ UMask=0027
 
 # --- Key material ------------------------------------------------------------
 # systemd (PID 1, root) reads the root-only key file and exposes a copy to
-# this service alone, on a non-swappable ramfs, readable only by User=:
+# this service alone, on a private non-swappable credential mount, readable
+# only by User= (and root):
 #   /run/credentials/robodr-agentd.service/blackbox.key
+# systemd < 254 (or kernel < 6.4): ramfs, the copy is 0400 owned by User=.
+# systemd >= 254 on kernel >= 6.4 (Ubuntu 24.04, Debian 13): a read-only
+# tmpfs, the copy is 0440 root:root with a POSIX ACL user:<User=>:r-- (ls
+# shows -r--r-----+: the group bits are the ACL mask). agentd accepts that
+# form only when the ACL lets nobody but root and User= read the file
+# (robodr_blackbox::secret_file; packaging/README.md, "Key material").
 # The robodr-agentd user itself has no access to /etc/robodr/keys.
 LoadCredential=blackbox.key:/etc/robodr/keys/agentd-blackbox.key
 InaccessiblePaths=-/etc/robodr/keys

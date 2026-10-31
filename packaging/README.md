@@ -241,7 +241,8 @@ choice here is **root-only files, handed to each service by systemd**
 1. **Least access.** At start, systemd (PID 1) reads
    `/etc/robodr/keys/agentd-blackbox.key` and places a copy at
    `/run/credentials/robodr-agentd.service/blackbox.key`. The copy is on a
-   private, non-swappable ramfs, readable only by that unit's `User=`.
+   private, non-swappable credential mount, readable only by that unit's
+   `User=` (and root; see "How the daemons check a key file" below).
    No other process running as `robodr` gets access, and neither does a
    future second `robodr` service, a debugging shell under `sudo -u robodr`,
    or a compromised tool in group `robodr`. With a group-readable `0640
@@ -261,9 +262,39 @@ places the same copy at the same `/run/credentials/<unit>/<name>` path
 (`0400`, owned by the service user, in a root-owned `0711` directory the
 service cannot write) and `ExecStopPost=+` removes it. Points 2 to 4 above
 hold; point 1 holds except that the copy is on `/run` (tmpfs, swappable)
-rather than a private ramfs. A group-readable `0640 root:robodr` key is
-**not** an option: agentd and the blackbox key loader refuse any key file
-with a group or other permission bit.
+rather than a private credential mount. A group-readable `0640 root:robodr`
+key is **not** an option: every daemon refuses a key file with a group or
+other permission bit (the systemd credential form below is the one
+exception).
+
+### How the daemons check a key file
+
+Every binary that loads secret material (agentd's black-box, finding,
+executor-link and control-plane TLS keys, robodr-executor, robodr-uplink,
+robodr-spool-export, robodr-diode-pack, robodr-kafka-publish's TLS key and
+SASL password, robodr-deliverd, robodr-anchor-receiver, the fleet tools,
+robodr-seal) applies one rule, `robodr_blackbox::secret_file`:
+
+- a regular file, never a symlink, owned by root or the daemon's user;
+- **ordinary paths**: no group or other permission bits (`chmod 600`/`400`);
+- **systemd credentials**: systemd >= 254 on kernel >= 6.4 (Ubuntu 24.04,
+  Debian 13) puts `LoadCredential=` copies on a **read-only tmpfs**, owned
+  by root, mode `0440`, with a POSIX ACL `user:<User=>:r--` (`ls -l` shows
+  `-r--r-----+ root root`: the "group" bits are the ACL mask). Such a file
+  is accepted when its real directory is `$CREDENTIALS_DIRECTORY` or
+  `/run/credentials/<unit>/`, that directory is root-owned on the same
+  read-only mount, the file has no write bit and no other bit, and its ACL
+  (`getfacl`) gives read to nobody but root and the daemon's user: the
+  owning group, every named group and every other named user have no
+  effective permission. Anything else is refused with the reason (for
+  example `the ACL grants read to group gid 44 (group:44:r--)`). Where the
+  ACL cannot be read the strict rule applies. Older systemd (ramfs, `0400`
+  owned by `User=`) and the focal helper pass the strict rule.
+
+A key, configuration or credential error at start is fatal: the daemons
+exit 2, which every unit's `RestartPreventExitStatus=2` leaves `failed`
+(no restart loop; `RoboDRUnitFailed` fires) instead of retrying while the
+unit reads `active (running)`.
 
 **Ed25519 is the default** (`robodr-blackbox keygen` writes the secret
 `FILE`, `0600`, and the public `FILE.pub`). Only the secret goes into

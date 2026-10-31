@@ -87,7 +87,12 @@ from the command line (argv is readable by every process via `/proc`).
   files over 256 KiB. A file that holds *secret* material (an Ed25519 seed,
   any HMAC key, a keyring containing either) is also refused if group or
   others have any access (`mode & 0o077 != 0`) or if it is owned by neither
-  the effective user nor root. Public key files load whatever their mode.
+  the effective user nor root. The one exception is a systemd
+  `LoadCredential=` file (systemd >= 254 on kernel >= 6.4: `0440 root` on a
+  read-only tmpfs, read granted by a POSIX ACL) that only root and this user
+  can read: `secret_file` (the rule every RoboDR daemon shares) parses its
+  `system.posix_acl_access` and explains any refusal. Public key files load
+  whatever their mode.
   `KeyFile::load_public` / `Keyring::load_public_file` refuse secrets
   outright, for verifiers that must never hold signing keys.
 - **Keyring** (`Keyring`, file format `robodr-blackbox-keyring/v1`:

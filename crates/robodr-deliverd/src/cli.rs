@@ -55,8 +55,8 @@ reanchor      after a lost state file the agent locks itself (no import,
               configured blackbox.key is usually a systemd credential
               that exists only while the service runs: pass the key file
               itself with --key (/etc/robodr/keys/agentd-blackbox.key;
-              a regular file of the invoking user, no group or other
-              permissions).
+              a regular file of the invoking user or root, no group or
+              other permissions).
 rekey         after the unit's black-box key was rotated (OPERATIONS
               §4.3): verify the delivery journal and the high-water
               record with the old key, archive the journal next to it
@@ -434,23 +434,17 @@ fn rekey(cfg: &Config, a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// `--key`: an absolute path to a regular file (not a symlink) owned by
-/// the invoking user with no group or other permission bits.
+/// `--key`: an absolute path to a regular file (not a symlink) that passes
+/// the shared secret-file rule (`robodr_blackbox::secret_file`): owned by
+/// the invoking user or root with no group or other permission bits, or a
+/// systemd credential only root and the invoking user can read.
 fn check_key_file(p: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
     if !p.is_absolute() {
         return Err(format!("--key {}: not an absolute path", p.display()));
     }
-    let md = std::fs::symlink_metadata(p).map_err(|e| format!("--key {}: {e}", p.display()))?;
-    let me = crate::users::effective_uid().ok_or("cannot read the effective uid")?;
-    if !md.file_type().is_file() || md.uid() != me || md.mode() & 0o077 != 0 {
-        return Err(format!(
-            "--key {}: must be a regular file owned by uid {me} with no group or other \
-             permissions",
-            p.display()
-        ));
-    }
-    Ok(())
+    robodr_blackbox::secret_file::check_secret_path(p)
+        .map(|_| ())
+        .map_err(|e| format!("--key {}: {e}", p.display()))
 }
 
 fn status(cfg: &Config) -> Result<(), String> {

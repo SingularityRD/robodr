@@ -318,7 +318,8 @@ unit.
    the unit stops. The `0640 root:robodr` group-readable fallback is **not**
    used: agentd refuses a key file with any group or other permission bit.
    Differences to `LoadCredential=`: the copy is on `/run` (tmpfs, can be
-   swapped: encrypt swap or run without it) instead of a private ramfs.
+   swapped: encrypt swap or run without it) instead of a private
+   non-swappable credential mount.
 4. **agentd configuration.** Start from `$E/agentd.unitree-edu.example.json`:
    capture on the development computer's interface on 192.168.123.0/24 (TUNE
    the name). Install and check it as in step 6 of section 3.1. Do **not**

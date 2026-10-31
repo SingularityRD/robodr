@@ -68,8 +68,9 @@
 //!   (then they load with a start-up warning: symmetric, every verifier
 //!   can forge); migrate with `robodr-blackbox rotate`. The file
 //!   must be a regular file (not a symlink), owned by the daemon's effective
-//!   user or root, and not accessible by group or others (`chmod 600`); see
-//!   [`read_key_file`]. A `blackbox.key_id` that contradicts the key file's
+//!   user or root, and not accessible by group or others (`chmod 600`), or
+//!   a systemd `LoadCredential=` file that only root and this user can read
+//!   (`robodr_blackbox::secret_file`); see [`read_key_file`]. A `blackbox.key_id` that contradicts the key file's
 //!   own id is a configuration error.
 //! * `blackbox.previous_keys` (optional, at most [`MAX_PREVIOUS_KEY_FILES`]
 //!   absolute paths): the black box's **retired** keys after an in-place
@@ -136,7 +137,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use robodr_commission::trust::{AcceptedState, RollbackDecision, StateAlarm};
@@ -2333,7 +2334,9 @@ pub fn read_key_material(path: &Path) -> Result<(KeyBytes, Option<String>), Stri
 /// secret key file (Ed25519 v2 or HMAC-SHA256 v1/v2; returns its key id
 /// too) or bare hex HMAC (returns no key id). Refuses a file that is a
 /// symlink or not a regular file, is readable or writable by group or
-/// others, is not owned by the effective user (or root), or is larger than
+/// others (except a systemd credential only root and this user can read:
+/// `robodr_blackbox::secret_file`), is not owned by the effective user (or
+/// root), or is larger than
 /// [`MAX_KEY_FILE_BYTES`]; and refuses a public key file (it cannot sign).
 /// The file is opened once and the checks run on the opened file (`fstat`),
 /// compared against the path's `lstat`, so it cannot be swapped between
@@ -2351,19 +2354,12 @@ pub fn read_key(path: &Path) -> Result<KeyMaterial, String> {
     if meta.ino() != lmeta.ino() || meta.dev() != lmeta.dev() {
         return Err(format!("key file {shown}: changed while being opened"));
     }
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "key file {shown}: mode {mode:03o} lets group/others access it; chmod 600"
-        ));
-    }
-    let euid = effective_uid();
-    if meta.uid() != euid && meta.uid() != 0 {
-        return Err(format!(
-            "key file {shown}: owned by uid {}, not by the daemon's uid {euid} or root",
-            meta.uid()
-        ));
-    }
+    // The one secret-file rule of every RoboDR binary
+    // (robodr_blackbox::secret_file): owner root or this user, and no
+    // group/other bits, or a systemd credential only root and this user
+    // can read (systemd >= 254 hands it over 0440 root with an ACL).
+    robodr_blackbox::secret_file::check_secret_file(&f, &meta)
+        .map_err(|e| format!("key file {shown}: {e}"))?;
     if meta.len() > MAX_KEY_FILE_BYTES {
         return Err(format!(
             "key file {shown}: larger than {MAX_KEY_FILE_BYTES} bytes"
@@ -2449,6 +2445,7 @@ fn wipe_text(s: &mut String) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
 
     fn tmp(tag: &str) -> PathBuf {
         let d =

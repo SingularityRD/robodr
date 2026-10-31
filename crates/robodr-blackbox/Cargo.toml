@@ -23,6 +23,9 @@ subtle = { workspace = true }
 # rustls-webpki as robodr-uplink and agentd's control plane.
 rustls = { workspace = true }
 webpki = { workspace = true }
+# fgetxattr / fstatvfs of the shared secret-file rule (src/secret_file.rs):
+# systemd credentials readable through a POSIX ACL. Already in the graph.
+libc = { workspace = true }
 
 [[bin]]
 name = "robodr-blackbox"

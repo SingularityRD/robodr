@@ -155,8 +155,10 @@ pub fn spki_sha256(cert: &CertificateDer<'_>) -> Result<[u8; 32], String> {
 }
 
 /// Read a PEM file: absolute, regular (no symlink), owned by `euid` or
-/// root, at most [`MAX_PEM_BYTES`]; `secret`: no group/other bits at all,
-/// else not group/other-writable. The file is opened first
+/// root, at most [`MAX_PEM_BYTES`]; `secret`: the shared secret-file rule
+/// (`robodr_blackbox::secret_file`: no group/other bits, or a systemd
+/// credential only root and this user can read), else not
+/// group/other-writable. The file is opened first
 /// (`O_NOFOLLOW | O_NONBLOCK`: a symlink fails, a FIFO never blocks) and
 /// every check is made on the opened descriptor, then read from it: no
 /// file swapped in between a check and the read is ever used.
@@ -180,11 +182,11 @@ fn read_pem(what: &str, path: &Path, euid: u32, secret: bool) -> Result<Vec<u8>,
         .metadata()
         .map_err(|e| format!("control_plane.tls.{what} {shown}: {e}"))?;
     let mode = lmeta.permissions().mode() & 0o777;
-    if secret && mode & 0o077 != 0 {
-        return Err(format!(
-            "control_plane.tls.{what} {shown}: mode {mode:03o} lets group/others access the \
-             private key; chmod 600"
-        ));
+    if secret {
+        // robodr_blackbox::secret_file: no group/other bits, or a systemd
+        // credential only root and this user can read.
+        robodr_blackbox::secret_file::check_secret_file(&f, &lmeta)
+            .map_err(|e| format!("control_plane.tls.{what} {shown}: {e} (private key)"))?;
     }
     if !secret && mode & 0o022 != 0 {
         return Err(format!(

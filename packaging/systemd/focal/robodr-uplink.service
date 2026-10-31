@@ -8,7 +8,8 @@
 #     prefix (outside the sandbox) in ExecStartPre=/ExecStopPost=; it puts
 #     the same file at the same /run/credentials/<unit>/ path, so the
 #     configuration is identical. The copy lives on /run (tmpfs, swappable),
-#     not on a private ramfs.
+#     not on a private non-swappable credential mount (ramfs or, on newer
+#     systemd, a read-only tmpfs).
 #   * ProtectProc= and ProcSubset= (systemd 247) are dropped: every process
 #     of the host stays visible in this unit's /proc. Nothing replaces them
 #     on 245 (hidepid= is not per unit).

@@ -426,8 +426,12 @@ fn main() -> ExitCode {
     let loaded = match load(&o) {
         Ok(l) => l,
         Err(e) => {
+            // The key file or the CA bundle cannot be loaded: a
+            // configuration error that a restart cannot fix. The service
+            // exits 2 (RestartPreventExitStatus=2 leaves the unit failed,
+            // RoboDRUnitFailed fires); --check keeps its "check failed" 1.
             eprintln!("robodr-uplink: {e}");
-            return ExitCode::from(1);
+            return ExitCode::from(if check { 1 } else { 2 });
         }
     };
     if check {

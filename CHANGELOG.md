@@ -10,6 +10,26 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
 
 ## [Unreleased]
 
+### Fixed (customer E2E, 2026-10-31)
+
+- **The daemons start on Ubuntu 24.04 / Debian 13 (systemd >= 254, kernel
+  >= 6.4).** systemd hands `LoadCredential=` keys over there as `0440
+  root:root` on a read-only tmpfs with a POSIX ACL for the service user;
+  agentd, robodr-executor, robodr-uplink and robodr-spool-export refused
+  them as "group-readable". Every binary that loads secret material now
+  shares one rule (`robodr_blackbox::secret_file`): `chmod 600`, or a
+  systemd credential whose ACL lets nobody but root and the daemon's user
+  read it (refusals name the principal, e.g. `group:44:r--`).
+  **Behaviour change:** robodr-kafka-publish's TLS key / SASL password file
+  and the anchor TLS keys no longer accept `0640`; robodr-executor (and
+  agentd's executor link) now also requires the key to be owned by root or
+  its user, and never follows a symlink to it.
+- **A key file a daemon cannot load is fatal:** robodr-spool-export exits 2
+  (it retried every interval while the unit stayed "active (running)"),
+  robodr-uplink exits 2 instead of 1 (`--check` keeps 1); with the units'
+  `RestartPreventExitStatus=2` the unit is left failed and
+  `RoboDRUnitFailed` fires.
+
 ### Security (closing documented gaps, 2026-10-30)
 
 - **Black-box key rotation without a hand-edited log:** `robodr-blackbox

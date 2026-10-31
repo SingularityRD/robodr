@@ -58,7 +58,11 @@
 //! either) is additionally refused, with [`KeyFileError::Permissions`], when
 //! group or others have any access (`mode & 0o077 != 0`), and with
 //! [`KeyFileError::Owner`] when it is owned by neither the effective user
-//! nor root. A file with only public keys passes whatever its mode.
+//! nor root. The one exception is a systemd `LoadCredential=` file that
+//! only root and this user can read through its POSIX ACL (the shared rule
+//! in [`crate::secret_file`]); a credential that fails that rule is
+//! [`KeyFileError::Credential`]. A file with only public keys passes
+//! whatever its mode.
 //!
 //! # Keyring (`robodr-blackbox-keyring/v1`)
 //!
@@ -149,10 +153,14 @@ pub enum KeyFileError {
     Exists,
     /// A symlink, directory or other non-regular file.
     NotRegular,
-    /// Group or others have access (`mode & 0o077 != 0`) to secret material.
+    /// Group or others have access (`mode & 0o077 != 0`) to secret material
+    /// (and it is not an acceptable systemd credential).
     Permissions {
         mode: u32,
     },
+    /// A file in a systemd credential directory that fails the credential
+    /// rule ([`crate::secret_file`]); the error says why.
+    Credential(crate::secret_file::SecretFileError),
     TooLarge {
         len: u64,
     },
@@ -208,8 +216,10 @@ impl fmt::Display for KeyFileError {
             }
             KeyFileError::Permissions { mode } => write!(
                 f,
-                "key file mode {mode:04o} gives group/others access to secret key material; chmod 600 it"
+                "key file mode {mode:04o} gives group/others access to secret key material; chmod 600 it \
+                 (a systemd LoadCredential= file is accepted when only root and this user can read it)"
             ),
+            KeyFileError::Credential(e) => write!(f, "secret key file: {e}"),
             KeyFileError::TooLarge { len } => {
                 write!(f, "{len} bytes exceeds {MAX_KEY_FILE_BYTES}")
             }
@@ -807,12 +817,12 @@ impl KeyFile {
     /// described in the module docs: the permission/owner rule applies only
     /// if the file holds secret material.
     pub fn load(path: &Path) -> Result<Self, KeyFileError> {
-        let (mut text, md) = read_key_text(path)?;
+        let (mut text, md, f) = read_key_text(path)?;
         let r = Self::from_json(&text);
         wipe_string(&mut text);
         let k = r?;
         if !k.is_public() {
-            check_secret_access(&md)?;
+            check_secret_access(&f, &md)?;
         }
         Ok(k)
     }
@@ -820,7 +830,7 @@ impl KeyFile {
     /// Load a key file that must be a **public** key file; a file with
     /// secret material is [`KeyFileError::NotPublic`] (whatever its mode).
     pub fn load_public(path: &Path) -> Result<Self, KeyFileError> {
-        let (mut text, _) = read_key_text(path)?;
+        let (mut text, _, _) = read_key_text(path)?;
         let r = Self::from_json(&text);
         wipe_string(&mut text);
         let k = r?;
@@ -868,24 +878,18 @@ pub fn effective_uid() -> u32 {
     unsafe { geteuid() }
 }
 
-/// The rule for files holding secret material: no group/other access, owned
-/// by the effective user or root.
-fn check_secret_access(md: &Metadata) -> Result<(), KeyFileError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let mode = md.permissions().mode() & 0o7777;
-        if mode & 0o077 != 0 {
-            return Err(KeyFileError::Permissions { mode });
-        }
-        let uid = md.uid();
-        if uid != 0 && uid != effective_uid() {
-            return Err(KeyFileError::Owner { uid });
-        }
+/// The rule for files holding secret material ([`crate::secret_file`]):
+/// owned by the effective user or root, and either no group/other access
+/// or a systemd credential only root and this user can read.
+fn check_secret_access(f: &File, md: &Metadata) -> Result<(), KeyFileError> {
+    use crate::secret_file::{check_secret_file, SecretFileError};
+    match check_secret_file(f, md) {
+        Ok(_) => Ok(()),
+        Err(SecretFileError::Mode { mode }) => Err(KeyFileError::Permissions { mode }),
+        Err(SecretFileError::Owner { uid, .. }) => Err(KeyFileError::Owner { uid }),
+        Err(SecretFileError::NotRegular) => Err(KeyFileError::NotRegular),
+        Err(e) => Err(KeyFileError::Credential(e)),
     }
-    #[cfg(not(unix))]
-    let _ = md;
-    Ok(())
 }
 
 /// The rule for files used as trust anchors (keyrings, previous keys, even
@@ -911,7 +915,7 @@ fn check_trust_access(md: &Metadata) -> Result<(), KeyFileError> {
 /// size, read it. Returns the text and the opened file's metadata (the
 /// permission rule is applied by the caller once it knows whether the file
 /// holds secrets).
-fn read_key_text(path: &Path) -> Result<(String, Metadata), KeyFileError> {
+fn read_key_text(path: &Path) -> Result<(String, Metadata, File), KeyFileError> {
     let mut o = OpenOptions::new();
     o.read(true);
     #[cfg(unix)]
@@ -937,7 +941,7 @@ fn read_key_text(path: &Path) -> Result<(String, Metadata), KeyFileError> {
     // Sized up front: a String that grows while reading would leave copies
     // of the key text in the buffers it outgrew.
     let mut s = String::with_capacity(md.len() as usize + 64);
-    f.take(MAX_KEY_FILE_BYTES + 1)
+    (&f).take(MAX_KEY_FILE_BYTES + 1)
         .read_to_string(&mut s)
         .map_err(|e| KeyFileError::Parse(e.to_string()))?;
     if s.len() as u64 > MAX_KEY_FILE_BYTES {
@@ -945,7 +949,7 @@ fn read_key_text(path: &Path) -> Result<(String, Metadata), KeyFileError> {
         wipe_string(&mut s);
         return Err(KeyFileError::TooLarge { len });
     }
-    Ok((s, md))
+    Ok((s, md, f))
 }
 
 /// Parse key file or keyring file text into key files. The text is parsed
@@ -1134,7 +1138,7 @@ impl Keyring {
     /// The file must pass the trust-anchor rule (owned by root or this
     /// user, not group/world-writable: [`KeyFileError::UntrustedFile`]).
     pub fn load_public_file(&mut self, path: &Path) -> Result<(), KeyFileError> {
-        let (mut text, md) = read_key_text(path)?;
+        let (mut text, md, _) = read_key_text(path)?;
         let r = parse_key_files(&text);
         wipe_string(&mut text);
         let keys = r?;
@@ -1238,12 +1242,12 @@ impl Verifier for Keyring {
 /// permission/owner rule, a public-only file the trust-anchor rule: owned
 /// by root or this user, not group/world-writable).
 pub fn load_key_files(path: &Path) -> Result<Vec<KeyFile>, KeyFileError> {
-    let (mut text, md) = read_key_text(path)?;
+    let (mut text, md, f) = read_key_text(path)?;
     let r = parse_key_files(&text);
     wipe_string(&mut text);
     let keys = r?;
     if keys.iter().any(|k| !k.is_public()) {
-        check_secret_access(&md)?;
+        check_secret_access(&f, &md)?;
     } else {
         check_trust_access(&md)?;
     }
@@ -1893,7 +1897,8 @@ mod tests {
             .write_new(&p)
             .unwrap();
         let md = std::fs::metadata(&p).unwrap();
-        assert!(check_secret_access(&md).is_ok());
+        let f = File::open(&p).unwrap();
+        assert!(check_secret_access(&f, &md).is_ok());
         assert!(md.uid() == effective_uid() || md.uid() == 0);
         // Changing ownership needs root; when we have it, check a foreign
         // owner is refused (and root ownership is accepted).

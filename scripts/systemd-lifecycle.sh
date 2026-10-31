@@ -24,6 +24,12 @@
 #      scripts/lifecycle-state.sh); the daemon is (still
 #      or again) active and heartbeating; the black box verifies INTACT
 #      across the upgrade (one chain, no gap);
+#   3b. key credentials on N: prints the form LoadCredential= hands over
+#      (ls -ln as the service user) and requires the ACL form (0440 root,
+#      "+") where systemd >= 254 and the kernel >= 6.4 (E2E finding F1:
+#      the daemons refused it); starts robodr-spool-export under its shipped
+#      unit with its own credential (diode.key) and requires it active, not
+#      restarted and without a key error;
 #   4. rollback to N-1 (apt-get --allow-downgrades / dnf downgrade): the
 #      same checks;
 #   5. purge (deb) / remove (rpm): units gone, nothing robodr running, the
@@ -189,6 +195,41 @@ systemctl stop robodr-agentd
 verify_bb "N"
 snapshot >/var/tmp/lifecycle.after-upgrade
 systemctl start robodr-agentd
+
+step "3b. key credentials on N: the form systemd hands over, spool-export under its unit"
+# E2E finding F1: systemd >= 254 on kernel >= 6.4 hands a LoadCredential=
+# file over as 0440 root:root with a POSIX ACL for User= (ls: -r--r-----+).
+# Every daemon must accept exactly that. Say which form this host produces,
+# and require the ACL form where systemd and the kernel are new enough, so
+# the Ubuntu 24.04 row cannot silently test only the old 0400 form.
+sd_ver="$(systemctl --version | head -n1 | awk '{print $2}')"
+k_ver="$(uname -r | awk -F. '{printf "%d%03d", $1, $2}')"
+probe_unit="robodr-lifecycle-probe-$$.service"
+form="$(systemd-run --quiet --wait --pipe --collect --unit="$probe_unit" -p User=robodr-agentd \
+    -p LoadCredential=probe:"$key" /bin/ls -ln "/run/credentials/$probe_unit/probe" 2>&1 || true)"
+echo "systemd-lifecycle: credential form (systemd $sd_ver, kernel $(uname -r)): $form" >&2
+if [[ "${sd_ver%%[!0-9]*}" -ge 254 && "$k_ver" -ge 6004 && "$form" != *+* ]]; then
+    bad "systemd $sd_ver on kernel $(uname -r) should hand credentials over with an ACL (got: $form)"
+fi
+# agentd's heartbeat above already proves its black-box credential loads;
+# spool-export loads its own (diode.key) under its shipped unit and must
+# stay active without a restart (a key it refuses is exit 2: failed).
+if [[ -f /usr/lib/systemd/system/robodr-spool-export.service ]]; then
+    robodr-blackbox keygen --out /etc/robodr/keys/diode.key --key-id lifecycle-diode >/dev/null
+    chmod 600 /etc/robodr/keys/diode.key
+    [[ -f /etc/robodr/spool-export.env ]] || printf 'ROBODR_UNIT_ID=lifecycle-1\nROBODR_SPOOL_EXPORT_ARGS=\n' >/etc/robodr/spool-export.env
+    systemctl start robodr-spool-export.service || bad "robodr-spool-export does not start on N"
+    sleep 3
+    if ! systemctl is-active --quiet robodr-spool-export ||
+        [[ "$(systemctl show -p NRestarts --value robodr-spool-export)" != 0 ]]; then
+        bad "robodr-spool-export is not running with its credential: $(journalctl -u robodr-spool-export --no-pager -n 5 | tr '\n' ' ')"
+    elif journalctl -u robodr-spool-export --no-pager | grep -q 'key file\|secret file\|credential directory'; then
+        bad "robodr-spool-export logged a key error: $(journalctl -u robodr-spool-export --no-pager -n 5 | tr '\n' ' ')"
+    else
+        echo "systemd-lifecycle: N: robodr-spool-export active with its credential" >&2
+    fi
+    systemctl stop robodr-spool-export.service || true
+fi
 
 step "4. rollback to N-1 ($v_old)"
 install_pkg "$old" downgrade || die "rollback to N-1 failed"

@@ -212,7 +212,7 @@ fn remote_anchor_config_is_checked() {
         serde_json::json!([p.join("crl-ca.crl.pem")]);
     assert!(robodr_agentd::load(&s.write_config(&with_crl)).is_ok());
     std::fs::set_permissions(p.join("client.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
-    tls_refused(&|_| {}, "mode 644");
+    tls_refused(&|_| {}, "mode 0644");
     std::fs::set_permissions(p.join("client.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
 
     // The receiver verifies with the public key: HMAC is refused.

@@ -222,7 +222,7 @@
 - **Robot keys are files by default.** agentd's private keys can instead
   be sealed to the robot's TPM as systemd encrypted credentials (systemd
   250 or newer, not the focal package): that protects them **at rest**
-  only; while the service runs the key is in its credential ramfs and
+  only; while the service runs the key is in its credential mount and
   memory, and the TPM does not make the signatures. agentd reports each
   key's protection in `status.json` and, with `key_protection.require:
   "tpm2"`, refuses to start on a weaker one (or when systemd did not start

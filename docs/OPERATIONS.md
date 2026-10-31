@@ -302,7 +302,31 @@ id comes from the file, so `blackbox.key_id` in `/etc/robodr/agentd.json`
 can be left out, and if it is set it must match). `robodr-replay --key-file`
 reads it too. Every tool refuses a secret key file that is a symlink, that
 group or others can access, or that is owned by another user (root
-excepted), and refuses a `.pub` where a signing key is needed. Verifiers
+excepted), and refuses a `.pub` where a signing key is needed.
+
+*systemd credentials.* The one exception to "no group or other bits" is a
+`LoadCredential=` copy under `/run/credentials/<unit>/`. systemd 254 or
+newer on kernel 6.4 or newer (Ubuntu 24.04, Debian 13) puts it on a
+read-only tmpfs as `-r--r-----+ root root`: mode `0440` whose group bits are
+the mask of a POSIX ACL `user:<service user>:r--`, and `chmod` is impossible
+there. Every RoboDR daemon accepts such a file only when its real directory
+is `$CREDENTIALS_DIRECTORY` or `/run/credentials/<unit>/`, that directory is
+root-owned on a read-only mount, the file has no write or other bit, and the
+ACL (`getfacl /run/credentials/<unit>/<name>` as root) gives read to nobody
+except root and the daemon's user. Otherwise the error names what is wrong,
+for example `refused because the ACL grants read to group gid 44
+(group:44:r--)`. Check what a unit will see before starting it:
+
+```sh
+sudo systemd-run --wait --pipe -p User=robodr-agentd \
+  -p LoadCredential=probe:/etc/robodr/keys/agentd-blackbox.key \
+  sh -c 'ls -l "$CREDENTIALS_DIRECTORY"; getfacl -n "$CREDENTIALS_DIRECTORY/probe" 2>/dev/null'
+```
+
+A key file a daemon cannot load is fatal at start: agentd, the executor,
+robodr-uplink and robodr-spool-export exit 2, and the units'
+`RestartPreventExitStatus=2` leaves them `failed` (no restart loop; the
+`RoboDRUnitFailed` alert fires). Verifiers
 (`robodr-blackbox verify --keyring`, `robodr-replay verify --key-file`)
 take the **`.pub`** file, whatever its mode.
 
@@ -729,7 +753,7 @@ with credentials, it cannot hold a TPM-sealed credential, whatever the
 configured directory contains.
 
 Limits: sealing protects keys **at rest**. While the service runs, the key
-is in its private credential ramfs and memory and the TPM does not make the
+is in its private credential mount and memory and the TPM does not make the
 signatures; root on a running unit can still read it. The report matches a
 credential to `<encrypted_dir>/<name>` by name and reads only the header;
 it does not read the unit file. systemd places a `LoadCredential=` copy of

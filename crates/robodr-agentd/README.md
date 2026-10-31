@@ -1015,7 +1015,9 @@ request.
   not against a production cluster; TLS, mutual TLS and SASL/SCRAM against
   a real 3.9.1 broker (`scripts/kafka-tls-it.sh`).
 - **The key is a file, not a TPM.** The Ed25519 seed sits in a 0600 file
-  (handed over by systemd `LoadCredential=`); root on the unit can read it
+  (handed over by systemd `LoadCredential=`; on systemd >= 254 the copy is
+  `0440 root` with a POSIX ACL for the service user, which agentd accepts
+  only when nobody but root and its user can read it); root on the unit can read it
   and sign as the unit. The Ed25519 implementation is the audited
   `ed25519-dalek` crate (RFC 8032 vectors pinned). HMAC keys load only with
   `blackbox.allow_hmac` (warned: the verifier can forge). Wall time is recorded with `TimeSource::Unknown`.

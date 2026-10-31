@@ -78,17 +78,32 @@ fn opts(a: &Args) -> Result<Opts, String> {
     })
 }
 
-fn run_one(o: &Opts) -> Result<(), String> {
-    let (signer, warning) = load_signer(&o.key_file, o.key_id.as_deref(), o.allow_hmac)?;
-    if let Some(w) = warning {
-        eprintln!("{w}");
+/// Why [`run_one`] stopped.
+enum Stop {
+    /// The key file cannot be loaded (permissions, owner, format, id):
+    /// retrying cannot help, exit 2 (the unit's `RestartPreventExitStatus=2`
+    /// leaves it failed, so `RoboDRUnitFailed` fires).
+    Key(String),
+    /// Opening the packer or the exporter failed.
+    Open(String),
+    /// An export round failed after a successful start.
+    Run(String),
+}
+
+fn run_one(o: &Opts, first: bool) -> Result<(), Stop> {
+    let (signer, warning) =
+        load_signer(&o.key_file, o.key_id.as_deref(), o.allow_hmac).map_err(Stop::Key)?;
+    if first {
+        if let Some(w) = warning {
+            eprintln!("{w}");
+        }
     }
     let packer = Packer::open(&o.outbox, &o.pack_state, o.pack.clone(), signer)
-        .map_err(|e| format!("packer: {e}"))?;
-    let mut x =
-        Exporter::open_checked(o.cfg.clone(), &o.pack, packer).map_err(|e| e.to_string())?;
+        .map_err(|e| Stop::Open(format!("packer: {e}")))?;
+    let mut x = Exporter::open_checked(o.cfg.clone(), &o.pack, packer)
+        .map_err(|e| Stop::Open(e.to_string()))?;
     loop {
-        let r = x.run_once(now_ms()).map_err(|e| e.to_string())?;
+        let r = x.run_once(now_ms()).map_err(|e| Stop::Run(e.to_string()))?;
         if r.exported > 0
             || !r.rejected.is_empty()
             || r.recovered.is_some()
@@ -153,10 +168,25 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let mut first = true;
     loop {
-        match run_one(&o) {
+        match run_one(&o, first) {
             Ok(()) => return ExitCode::SUCCESS,
-            Err(e) => {
+            // A key that cannot be loaded is fatal (F2): exiting 2 stops the
+            // unit (RestartPreventExitStatus=2) instead of looping while it
+            // reports "active (running)" and exports nothing.
+            Err(Stop::Key(e)) => {
+                eprintln!("robodr-spool-export: fatal: {e}");
+                return ExitCode::from(2);
+            }
+            // Not even the first open succeeded: exit 1 so systemd restarts
+            // the unit (NRestarts counts, the start limit applies) rather
+            // than retrying out of sight.
+            Err(Stop::Open(e)) if first || o.once => {
+                eprintln!("robodr-spool-export: {e}");
+                return ExitCode::from(1);
+            }
+            Err(Stop::Open(e)) | Err(Stop::Run(e)) => {
                 eprintln!("robodr-spool-export: {e}");
                 if o.once {
                     return ExitCode::from(1);
@@ -166,5 +196,6 @@ fn main() -> ExitCode {
                 std::thread::sleep(o.interval);
             }
         }
+        first = false;
     }
 }

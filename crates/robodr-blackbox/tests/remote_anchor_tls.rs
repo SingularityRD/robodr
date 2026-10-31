@@ -418,10 +418,14 @@ fn file_checks() {
     };
     std::fs::set_permissions(pki.p("server.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
     let e = tls::load_server(&files("server.key")).unwrap_err();
-    assert!(e.contains("mode 644"), "{e}");
+    assert!(e.contains("mode 0644"), "{e}");
     std::fs::set_permissions(pki.p("server.key"), std::fs::Permissions::from_mode(0o660)).unwrap();
     assert!(tls::load_server(&files("server.key")).is_err());
+    // One secret-file rule for every binary: group-readable is refused too.
     std::fs::set_permissions(pki.p("server.key"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    let e = tls::load_server(&files("server.key")).unwrap_err();
+    assert!(e.contains("chmod 600"), "{e}");
+    std::fs::set_permissions(pki.p("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(tls::load_server(&files("server.key")).is_ok());
     // T6: the server certificate's notAfter (2125-01-01) is kept.
     let t = tls::load_server_tls_with_crl_state(&files("server.key"), None).unwrap();

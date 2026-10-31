@@ -451,7 +451,7 @@ fn cli_never_takes_the_token_from_argv() {
     std::fs::set_permissions(&tokf, std::fs::Permissions::from_mode(0o644)).unwrap();
     let o = run(&["--config", c, "--token-file", tokf.to_str().unwrap()]);
     assert_eq!(code(&o), 1, "{}", txt(&o));
-    assert!(txt(&o).contains("group or others"), "{}", txt(&o));
+    assert!(txt(&o).contains("group/others"), "{}", txt(&o));
     assert!(!u.cfg.uplink_key.exists());
     // On stdin (`--token -`): accepted.
     let mut child = Command::new(BIN)

@@ -62,6 +62,48 @@ fn usage_errors_exit_2() {
     }
 }
 
+/// E2E finding F2: a key file the exporter cannot load is fatal at start
+/// (exit 2, which the unit's RestartPreventExitStatus=2 leaves failed),
+/// also without `--once`; it used to retry every interval forever while
+/// the unit read "active (running)".
+#[test]
+fn spool_export_key_error_is_fatal_exit_2() {
+    let t = TempDir::new("cli-fatal-key");
+    let spool = t.path().join("spool");
+    drop(Spool::open(&spool, 1 << 30, 1000).unwrap());
+    let key = t.path().join("diode.key");
+    let kf = KeyFile::ed25519_from_seed(&[9; 32], Some("diode-ugv-007")).unwrap();
+    fs::write(&key, kf.to_json()).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+    let outbox = t.path().join("outbox");
+    fs::create_dir_all(&outbox).unwrap();
+    let mut child = Command::new(EXPORT)
+        .args(["--spool".as_ref(), spool.as_os_str()])
+        .args(["--outbox".as_ref(), outbox.as_os_str()])
+        .args(["--state".as_ref(), t.path().join("x.json").as_os_str()])
+        .args(["--pack-state".as_ref(), t.path().join("p.json").as_os_str()])
+        .args(["--unit", UNIT, "--interval-ms", "50"])
+        .args(["--key-file".as_ref(), key.as_os_str()])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("robodr-spool-export kept running with an unloadable key");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("fatal") && err.contains("chmod 600"), "{err}");
+}
+
 #[test]
 fn export_then_publish_spool_once() {
     let t = TempDir::new("cli");

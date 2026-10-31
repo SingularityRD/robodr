@@ -36,10 +36,15 @@ robodr-spool-export --spool /var/lib/robodr/spool --outbox /var/lib/robodr/outbo
 ```
 
 Key handling is `robodr-diode-pack`'s (`robodr_diode::cli::load_signer`):
-an Ed25519 secret key file, mode 0600, owned by the caller; HMAC only with
-`--allow-hmac`. Each run prints a JSON report line when it did something.
-Exit codes: 0 (`--once` done), 1 (runtime error with `--once`), 2 (usage).
-Without `--once` it polls every `--interval-ms` and, after an error,
+an Ed25519 secret key file, mode 0600, owned by the caller or root (or a
+systemd `LoadCredential=` file only root and the caller can read:
+`robodr_blackbox::secret_file`, packaging/README.md "How the daemons check
+a key file"); HMAC only with `--allow-hmac`. Each run prints a JSON report
+line when it did something. Exit codes: 0 (`--once` done), 1 (runtime
+error with `--once`, or the first open of the packer / exporter failed),
+2 (usage, or a key file that cannot be loaded: fatal, with or without
+`--once`, so the unit is left failed instead of retrying while "active").
+Without `--once` it polls every `--interval-ms` and, after a runtime error,
 re-opens the packer and the exporter (which is what recovers a
 half-finished batch).
 
@@ -677,7 +682,10 @@ partitioner all agreed with the real brokers.
   `--tls-ca`; every broker certificate, bootstrap **and advertised**, is
   verified with the host it is dialled at (SNI = the verified name;
   `--tls-server-name` overrides it for every broker); optional SPKI pins
-  add to the chain check; `--tls-cert` / `--tls-key` give mutual TLS. No
+  add to the chain check; `--tls-cert` / `--tls-key` give mutual TLS (the
+  key and `--sasl-password-file` follow the one secret-file rule of every
+  daemon: `chmod 600`, or a systemd credential only root and this user can
+  read; the former `0640` allowance is gone). No
   fallback: a TLS producer never retries in plain TCP. The handshake and
   every TLS request are bounded as a whole (`robodr_blackbox::tls::DeadlineTcp`
   re-arms the socket timeout before every read and write), so a broker or

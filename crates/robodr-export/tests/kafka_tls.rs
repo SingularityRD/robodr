@@ -424,7 +424,7 @@ fn cli_requires_tls_or_an_explicit_plaintext_flag() {
         ),
         (
             [&["--tls-ca", ca][..], &sasl[..]].concat(),
-            "lets others read",
+            "lets group/others access",
         ),
         (
             vec![

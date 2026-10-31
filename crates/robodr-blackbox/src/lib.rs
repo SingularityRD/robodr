@@ -92,6 +92,7 @@ pub mod keys;
 pub mod outbox;
 pub mod record;
 pub mod remote_anchor;
+pub mod secret_file;
 pub mod sign;
 pub mod sign_ed25519;
 pub mod state_seal;

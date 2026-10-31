@@ -5,7 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Read a regular file (no symlink, no FIFO / device) of at most `max`
@@ -236,24 +236,19 @@ pub fn shred(path: &Path) -> io::Result<()> {
     sync_parent(path)
 }
 
-/// Whether `path` is owned by the effective user (or root) and not
-/// accessible by group or others: the rule for a secret file.
+/// Whether `path` passes the shared secret-file rule
+/// (`robodr_blackbox::secret_file`): a regular file (no symlink) owned by
+/// the effective user (or root) and not accessible by group or others, or
+/// a systemd `LoadCredential=` file only root and this user can read.
 pub fn check_secret_mode(path: &Path) -> io::Result<()> {
-    let md = fs::symlink_metadata(path)?;
-    if md.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is accessible by group or others", path.display()),
-        ));
-    }
-    let euid = robodr_blackbox::keys::effective_uid();
-    if md.uid() != euid && md.uid() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} is not owned by root or this user", path.display()),
-        ));
-    }
-    Ok(())
+    robodr_blackbox::secret_file::check_secret_path(path)
+        .map(|_| ())
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{}: {e}", path.display()),
+            )
+        })
 }
 
 // --------------------------------------------------------------- lock --

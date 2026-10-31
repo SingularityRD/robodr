@@ -176,23 +176,28 @@ impl Key {
             .map_err(|e| format!("executor state key: {e}"))
     }
 
-    /// Load from a file that must be a regular file without group / other
-    /// permission bits.
+    /// Load from a file that must pass the shared secret-file rule
+    /// (`robodr_blackbox::secret_file`): a regular file (never a symlink)
+    /// owned by root or this user, without group / other permission bits,
+    /// or a systemd `LoadCredential=` file only root and this user can
+    /// read. Checked and read on one descriptor.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        use std::os::unix::fs::PermissionsExt;
-        let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if !md.is_file() {
-            return Err(format!("{}: not a regular file", path.display()));
-        }
-        if md.permissions().mode() & 0o077 != 0 {
-            return Err(format!(
-                "{}: readable or writable by group/other (mode {:o}); use 0400 or 0600",
-                path.display(),
-                md.permissions().mode() & 0o777
-            ));
-        }
-        let mut text = crate::config::read_small(path)?;
-        let k = Key::parse(&text);
+        use robodr_blackbox::secret_file::{check_secret_file, open_secret_file};
+        use std::io::Read;
+        let shown = path.display();
+        let (f, md) = open_secret_file(path).map_err(|e| format!("{shown}: {e}"))?;
+        check_secret_file(&f, &md).map_err(|e| format!("{shown}: {e}"))?;
+        let max = crate::config::MAX_FILE_BYTES;
+        let mut text = String::with_capacity(usize::try_from(md.len().min(max)).unwrap_or(0) + 1);
+        let read = f
+            .take(max + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("{shown}: {e}"));
+        let k = match read {
+            Ok(_) if text.len() as u64 > max => Err(format!("{shown}: larger than {max} bytes")),
+            Ok(_) => Key::parse(&text),
+            Err(e) => Err(e),
+        };
         // Wipe the text copy of the key.
         let mut b = std::mem::take(&mut text).into_bytes();
         robodr_blackbox::crypto::wipe(&mut b);

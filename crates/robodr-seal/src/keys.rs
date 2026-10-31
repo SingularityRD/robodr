@@ -16,7 +16,7 @@ use crate::{from_hex, invalid, io_err, to_hex, SealError};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use zeroize::Zeroizing;
 
@@ -90,12 +90,17 @@ pub(crate) fn read_bounded(path: &Path, secret: bool) -> Result<Zeroizing<Vec<u8
     if !md.is_file() {
         return Err(invalid(format!("{}: not a regular file", path.display())));
     }
-    if secret && md.mode() & 0o077 != 0 {
-        return Err(invalid(format!(
-            "{}: a secret key file must not be accessible by group or others (mode {:o})",
-            path.display(),
-            md.mode() & 0o777
-        )));
+    if secret {
+        // The one secret-file rule of every RoboDR binary
+        // (robodr_blackbox::secret_file): owner root or this user, no
+        // group/other bits, or a systemd credential only root and this
+        // user can read.
+        robodr_blackbox::secret_file::check_secret_file(&f, &md).map_err(|e| {
+            invalid(format!(
+                "{}: a secret key file must not be accessible by group or others: {e}",
+                path.display()
+            ))
+        })?;
     }
     let mut buf = Zeroizing::new(Vec::new());
     Read::by_ref(&mut f)

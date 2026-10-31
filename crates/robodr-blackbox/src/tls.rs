@@ -36,8 +36,10 @@
 //!
 //! Every file is a regular file (symlinks are followed; a FIFO or device
 //! is refused without blocking), at most [`MAX_PEM_BYTES`], owned by root
-//! or the process's effective user. A private key file must not be
-//! group-writable or accessible to others at all (`chmod 600` or `640`); a
+//! or the process's effective user. A private key file (or SASL password
+//! file) follows the shared secret-file rule of [`crate::secret_file`]: no
+//! group or other permission bits (`chmod 600`), or a systemd
+//! `LoadCredential=` file that only root and this user can read; a
 //! certificate or CA file must not be writable by group or others. Secret
 //! file contents are read into a buffer that is wiped when dropped.
 //!
@@ -228,11 +230,12 @@ pub fn read_pem(
         ));
     }
     let mode = meta.permissions().mode() & 0o777;
-    if secret && mode & 0o027 != 0 {
-        return Err(format!(
-            "{what} {shown}: mode {mode:03o} lets others read or the group write the private \
-             key; chmod 600 (or 640)"
-        ));
+    if secret {
+        // The one secret-file rule of every RoboDR binary
+        // (crate::secret_file): no group/other bits, or a systemd
+        // credential only root and this user can read.
+        crate::secret_file::check_secret_file(&f, &meta)
+            .map_err(|e| format!("{what} {shown}: {e}"))?;
     }
     if !secret && mode & 0o022 != 0 {
         return Err(format!(
