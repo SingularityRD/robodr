@@ -39,12 +39,15 @@
 //!   exported as `state="other"`.
 //! * `robodr_units_readable` and, for every RoboDR service in
 //!   [`ROBODR_UNITS`] that systemd has loaded (`systemctl show`),
-//!   `robodr_unit_active{unit}`, `robodr_unit_failed{unit}` (0 or 1) and
+//!   `robodr_unit_active{unit}`, `robodr_unit_failed{unit}`,
+//!   `robodr_unit_enabled{unit}` (0 or 1; enabled = `UnitFileState`
+//!   `enabled` or `enabled-runtime`, i.e. the site expects it to run) and
 //!   `robodr_unit_restarts{unit}` (systemd's `NRestarts`: automatic
 //!   restarts since the unit was last started by hand). A unit that systemd
-//!   gave up on, or one an event storm keeps getting killed (for example
-//!   `robodr-pulsard` at its `MemoryMax=`), is visible here even when the
-//!   daemon itself writes no status file.
+//!   gave up on, one an event storm keeps getting killed (for example
+//!   `robodr-pulsard` at its `MemoryMax=`), or an enabled one that is simply
+//!   not running (a failed `Assert...=` leaves it `inactive`, not `failed`)
+//!   is visible here even when the daemon itself writes no status file.
 //!
 //! Free text (health reasons, error messages, batch ids) is never exported:
 //! label values are limited to the robot id, the profile and safety states,
@@ -80,7 +83,10 @@ pub const ROBODR_UNITS: &[&str] = &[
 
 /// The `systemctl show` arguments whose output [`Inputs::units`] holds.
 pub fn units_show_args() -> Vec<&'static str> {
-    let mut a = vec!["show", "--property=Id,LoadState,ActiveState,NRestarts"];
+    let mut a = vec![
+        "show",
+        "--property=Id,LoadState,ActiveState,UnitFileState,NRestarts",
+    ];
     a.extend_from_slice(ROBODR_UNITS);
     a
 }
@@ -355,6 +361,14 @@ fn units(e: &mut Exposition, st: &Result<String, String>) {
             "gauge",
             &[("unit", unit)],
             u8::from(active == "failed").to_string(),
+        );
+        let enabled = matches!(get("UnitFileState"), Some("enabled" | "enabled-runtime"));
+        e.add(
+            "robodr_unit_enabled",
+            "1 if the RoboDR unit is enabled (systemctl enable): the site expects it to run.",
+            "gauge",
+            &[("unit", unit)],
+            u8::from(enabled).to_string(),
         );
         if let Some(n) = get("NRestarts").and_then(|n| n.trim().parse::<u64>().ok()) {
             e.add(

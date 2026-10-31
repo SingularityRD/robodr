@@ -127,8 +127,8 @@ stalled loop (slow fsync, hang) is killed and restarted. `robodr-pulsard` stays
 with `WatchdogSec=` set, systemd would kill a healthy daemon. For it,
 `Restart=on-failure` (every 10 s, `OOMPolicy=stop`, no start limit so that
 repeated kills at its memory cap cannot switch host detection off for good)
-covers crashes; `robodr-metrics` exports each unit's restarts and failed
-state for alerting.
+covers crashes; `robodr-metrics` exports each unit's restarts, failed,
+active and enabled state for alerting.
 Neither watchdog has been exercised under a real systemd yet.
 
 Every long-running unit caps its own cgroup with `MemoryMax=` (and most with

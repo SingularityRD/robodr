@@ -60,6 +60,22 @@ Description=RoboDR agent (decision chain, black box, OCSF spool)
 Documentation=file:/usr/share/doc/robodr/OPERATIONS.md
 AssertPathExists=/etc/robodr/agentd.json
 After=local-fs.target network.target
+# Start limit KEPT (unlike robodr-pulsard, which never gives up): after 5
+# starts in 300 s the unit is left failed (example alert RoboDRUnitFailed).
+# Decision recorded for sales-readiness B6, revisit with its measurements:
+#  * agentd bounds its input by design: the input queue drops and counts
+#    what does not fit (daemon.queue_bytes, below the MemoryMax= budget),
+#    so an event storm is meant to cost dropped input, not a kill at
+#    MemoryMax= (not yet measured on the target). robodr-pulsard got its
+#    never-give-up policy because a storm can push it to its own cap.
+#  * Every agentd process increments the TPM NV counter at its first
+#    black-box head mark (head_anchor kind tpm_nv_counter; the 60 s limit in
+#    crates/robodr-blackbox/src/tpm_anchor.rs lives in memory). Restarting
+#    every RestartSec=5s without end would write TPM NV about 12 times as
+#    often as that limit allows, against the part's write endurance.
+# If B6 shows agentd can reach MemoryMax= under a storm, switch to
+# StartLimitIntervalSec=0 together with a restart delay of at least the
+# anchor's increment interval, or persist that interval across restarts.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

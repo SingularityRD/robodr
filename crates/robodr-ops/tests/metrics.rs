@@ -307,16 +307,19 @@ fn an_unknown_uplink_state_is_other() {
 fn show_output() -> String {
     let mut s = String::new();
     for u in ROBODR_UNITS {
-        let (load, active, restarts) = match *u {
-            "robodr-agentd.service" => ("loaded", "active", 0),
+        let (load, active, file, restarts) = match *u {
+            "robodr-agentd.service" => ("loaded", "active", "enabled", 0),
             // Killed at MemoryMax= by an event storm, restarted 4 times.
-            "robodr-pulsard.service" => ("loaded", "activating", 4),
-            "robodr-uplink.service" => ("loaded", "failed", 1),
-            "robodr-executor.service" => ("loaded", "inactive", 0),
-            _ => ("not-found", "inactive", 0),
+            "robodr-pulsard.service" => ("loaded", "activating", "enabled", 4),
+            "robodr-uplink.service" => ("loaded", "failed", "enabled-runtime", 1),
+            "robodr-executor.service" => ("loaded", "inactive", "disabled", 0),
+            // Enabled, but its start job failed an Assert...= (no BTF):
+            // systemd leaves it inactive, not failed.
+            "robodr-deliverd.service" => ("loaded", "inactive", "enabled", 0),
+            _ => ("not-found", "inactive", "", 0),
         };
         s.push_str(&format!(
-            "Id={u}\nLoadState={load}\nActiveState={active}\nNRestarts={restarts}\n\n"
+            "Id={u}\nLoadState={load}\nActiveState={active}\nUnitFileState={file}\nNRestarts={restarts}\n\n"
         ));
     }
     // A unit the exporter never asked for is ignored.
@@ -353,6 +356,23 @@ fn unit_states_and_restarts() {
         s("robodr_unit_failed", "robodr-executor.service").as_deref(),
         Some("0")
     );
+    // Enabled: the site expects it to run (RoboDRUnitDown).
+    for (u, want) in [
+        ("robodr-agentd.service", "1"),
+        ("robodr-uplink.service", "1"),
+        ("robodr-executor.service", "0"),
+        ("robodr-deliverd.service", "1"),
+    ] {
+        assert_eq!(s("robodr_unit_enabled", u).as_deref(), Some(want), "{u}");
+    }
+    assert_eq!(
+        s("robodr_unit_failed", "robodr-deliverd.service").as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        s("robodr_unit_active", "robodr-deliverd.service").as_deref(),
+        Some("0")
+    );
     // Not installed: not exported. Unknown units: never exported.
     assert!(s("robodr_unit_active", "robodr-depot.service").is_none());
     assert!(!t.contains("evil"), "{t}");
@@ -380,6 +400,7 @@ fn unit_list_matches_the_packaged_services() {
     let args = units_show_args();
     assert_eq!(args[0], "show");
     assert!(args[1].contains("NRestarts") && args[1].contains("ActiveState"));
+    assert!(args[1].contains("UnitFileState"));
     assert_eq!(args.len(), 2 + ROBODR_UNITS.len());
 }
 

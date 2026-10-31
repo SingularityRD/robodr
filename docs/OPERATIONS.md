@@ -1156,14 +1156,19 @@ systemd-analyze security robodr-pulsard robodr-agentd   # exposure report
 ```
 
 Both units restart on failure. `robodr-agentd` restarts up to 5 times in
-300 s, then stays failed. `robodr-pulsard` has no start limit: it is
+300 s, then stays failed (kept on purpose; the reasons are in its unit
+file). `robodr-pulsard` has no start limit: a daemon that exits non-zero is
 restarted every 10 s for as long as it fails (an event storm can kill it at
 its `MemoryMax=` again and again; giving up would leave host detection
-off), and each restart is counted in its `NRestarts`. A failed or
+off), and each restart is counted in its `NRestarts`. A failed
+`AssertPathExists=` (no BTF, no bpffs) is different: systemd runs nothing,
+does not restart, and leaves the unit inactive, not failed. A failed or
 restarting unit does not affect the robot's operation; it does mean the
-robot is not (fully) being watched. Alert on both: `robodr-metrics`
-exports `robodr_unit_failed` and `robodr_unit_restarts` per unit
-(example alerts `RoboDRUnitFailed`, `RoboDRUnitRestartLoop`).
+robot is not (fully) being watched. Alert on all of these: `robodr-metrics`
+exports `robodr_unit_failed`, `robodr_unit_restarts`, `robodr_unit_active`
+and `robodr_unit_enabled` per unit (example alerts `RoboDRUnitFailed`,
+`RoboDRUnitRestartLoop`, and `RoboDRUnitDown` for an enabled unit that is
+not running).
 
 `robodr-agentd` runs as `Type=notify` with `WatchdogSec=60s`; a hung main
 loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and

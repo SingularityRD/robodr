@@ -101,6 +101,18 @@ times are not exported as counters).
 masked). A unit systemd gave up restarting is
 .BR failed .
 .TP
+.B robodr_unit_enabled{unit}
+1 if the unit's
+.B UnitFileState
+is
+.B enabled
+or
+.BR enabled-runtime :
+the site expects it to run. Enabled, not active and not failed is a unit
+that is down without systemd calling it failed (for example a start job
+that failed an
+.BR Assert ...= ).
+.TP
 .B robodr_unit_restarts{unit}
 systemd's
 .B NRestarts
