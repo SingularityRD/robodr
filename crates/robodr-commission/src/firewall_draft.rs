@@ -11,7 +11,9 @@
 //!   DDS type name, else by its envelope shape: a linear bound and no joint
 //!   bound);
 //! * `max_linear_speed`: the profile envelope, lowered to the OEM ceiling
-//!   (`ceiling_linear`) when that is lower: the firewall can only tighten;
+//!   (`ceiling_linear`) when that is lower: the firewall can only tighten.
+//!   An envelope without a linear bound takes the ceiling; without either
+//!   the channel is reported missing (never drafted unlimited);
 //! * `max_angular_speed`: the OEM's yaw-rate ceiling (`max_angular`,
 //!   required: the profile has no angular dimension);
 //! * `allowed_sources`: the writers the run observed commanding the channel
@@ -21,7 +23,8 @@
 //!
 //! What cannot be learned is reported, not invented: low-level joint
 //! channels (per-motor tables from the OEM data sheet), joint-velocity
-//! channels (joint count) and channels without an observed source. The
+//! channels (joint count), channels without an observed source and Twist
+//! channels with no linear limit at all (no envelope bound, no ceiling). The
 //! draft is then **incomplete**, does not compile against the profile, and
 //! `bind` refuses it until the OEM completes it.
 //!
@@ -161,16 +164,29 @@ pub fn draft_firewall(
                 out.notes.push(format!(
                     "{ch}: linear bound lowered from the envelope {e} to the OEM ceiling {c} m/s"
                 ));
-                Some(c)
+                c
             }
-            (Some(e), _) => Some(e),
-            (None, c) => c,
+            (Some(e), _) => e,
+            (None, Some(c)) => {
+                out.notes.push(format!(
+                    "{ch}: the envelope has no linear bound: the OEM ceiling {c} m/s is the limit"
+                ));
+                c
+            }
+            (None, None) => {
+                // Review WP6: never draft an unlimited linear speed.
+                out.missing.push(format!(
+                    "{ch}: the profile envelope has no linear bound and no --ceiling-linear was \
+                     given: set max_linear_speed by hand or pass the OEM's linear ceiling"
+                ));
+                continue;
+            }
         };
         out.config.channels.insert(
             ch.clone(),
             ChannelSpec {
                 allowed_sources: sources,
-                max_linear_speed: linear,
+                max_linear_speed: Some(linear),
                 max_angular_speed: Some(opts.max_angular),
                 ..ChannelSpec::default()
             },
@@ -267,6 +283,36 @@ mod tests {
             "{:?}",
             d.notes
         );
+    }
+
+    /// Review (WP6): a Twist channel whose envelope has no linear bound
+    /// was drafted with `max_linear_speed: None` (unlimited) when no
+    /// ceiling was given, and not reported.
+    #[test]
+    fn a_twist_channel_without_any_linear_limit_is_incomplete() {
+        let (mut p, r) = learned();
+        assert!(p.motion_types["/cmd_vel"].contains("Twist"));
+        p.motion_envelopes
+            .get_mut("/cmd_vel")
+            .unwrap()
+            .max_linear_speed = None;
+        let d = draft_firewall(&p, &r, &opts()).unwrap();
+        assert!(d.config.channels.is_empty(), "{:?}", d.config.channels);
+        assert_eq!(d.missing.len(), 1);
+        assert!(d.missing[0].contains("--ceiling-linear"), "{:?}", d.missing);
+        assert!(d.config.compile(&p).is_err());
+        // With the OEM ceiling it is the limit.
+        let d = draft_firewall(
+            &p,
+            &r,
+            &DraftOptions {
+                ceiling_linear: Some(0.7),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert!(d.missing.is_empty(), "{:?}", d.missing);
+        assert_eq!(d.config.channels["/cmd_vel"].max_linear_speed, Some(0.7));
     }
 
     #[test]

@@ -491,9 +491,12 @@ gateway's channel file from what commissioning learned: one Twist spec per
 Twist motion channel, `max_linear_speed` = the envelope lowered to the OEM
 ceiling, `max_angular_speed` = the OEM yaw ceiling (the profile learns no
 yaw rate), `allowed_sources` = the writers observed commanding the channel
-(excluded and unprofiled sources dropped, each noted). What cannot be
-learned (low-level joint channels, joint-velocity channel counts, channels
-without an observed writer) is listed as INCOMPLETE (exit 1): the file then
+(excluded and unprofiled sources dropped, each noted). `--ceiling-linear`
+is optional: an envelope without a linear bound takes it, and a Twist
+channel with neither is not drafted unlimited but listed as INCOMPLETE.
+What cannot be learned (low-level joint channels, joint-velocity channel
+counts, channels without an observed writer, a Twist channel with no linear
+limit) is listed as INCOMPLETE (exit 1): the file then
 does not compile against the profile and `bind` refuses it until the OEM
 completes it.
 
