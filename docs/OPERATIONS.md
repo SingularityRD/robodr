@@ -3469,6 +3469,31 @@ or other permissions, as for `--key`.
   package is back at its recorded version or a release of it is
   delivered. Hold them in apt (`apt-mark hold`) or leave them out of
   unattended-upgrades.
+* **deb only (T53).** `deb` is for Debian / Ubuntu units. On a unit
+  without a dpkg database (`<dpkg_root>/var/lib/dpkg/status`: an
+  RPM-based host such as Rocky / RHEL 9) a `deb` RPK is refused before
+  anything is unpacked (`robot.deliver.refused`, "kind deb needs a
+  Debian / Ubuntu unit ... RoboDR delivers no RPM packages"). There is no
+  `rpm` kind: neither the agent nor the depot delivers RPM packages. The
+  other kinds (`files`, `config`, `robodr-rules`) work on RPM hosts; RoboDR
+  itself is updated there with `install-bundle.sh` (section 7).
+* **Delivering RoboDR's own package (self-upgrade, T52).** Every
+  `dpkg --install` of the agent runs with `ROBODR_DELIVERD_INSTALL=1`,
+  which dpkg hands to the maintainer scripts. RoboDR's `postinst` then
+  try-restarts every running RoboDR unit except `robodr-deliverd.service`:
+  restarting the agent from inside the dpkg run it waits for would stop
+  the unit and kill dpkg and the `postinst` with it (a half-configured
+  package). The agent finishes the pass on its old binary (health gate,
+  commit or automatic rollback), then sees its own executable replaced
+  and exits 3; the unit (`RestartForceExitStatus=3`) starts it again on
+  the new binary within `RestartSec=`. Expect one
+  `robodr-deliverd.service: Main process exited, status=3` line per
+  self-upgrade; it is not a failure. The unit also sets `KillMode=mixed`,
+  so `systemctl stop` signals the agent only and a dpkg run in progress
+  finishes with its pass. Tested with the real dpkg and a chrooted
+  `postinst` (`tests/kinds.rs`), the postinst's restart loop and the
+  exit-3 path of `run` (`tests/binary.rs`); the full upgrade on a
+  systemd-booted VM is the VM job of T10 (not yet in CI).
 * Release-allowed maintainer scripts stay root-equivalent: a `preinst`
   can divert a floored package's file (the file-list check then fails the
   switch, but the script has run).

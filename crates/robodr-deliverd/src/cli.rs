@@ -101,7 +101,14 @@ verify-minisign
               the verifier's known-answer test. Used by
               install-bundle.sh instead of the minisign program.
 
-Exit codes: 0 ok, 1 refused or error, 2 usage.";
+Exit codes: 0 ok, 1 refused or error, 2 usage, 3 (run only) the agent's
+own executable was replaced (a self-upgrade): the pass in progress was
+finished, start it again (the unit does: RestartForceExitStatus=3).";
+
+/// `run` stopped after its pass because its own executable was replaced on
+/// disk (T52: RoboDR's package upgraded by this agent; the postinst leaves
+/// the restart to it). The unit restarts it on that code.
+pub const EXIT_RESTART: i32 = 3;
 
 pub const REPLAY_USAGE: &str = "\
 usage:
@@ -236,7 +243,17 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "pull" => crate::lan::pull(&cfg).map(|p| print(serde_json::json!({"pack": p}))),
         "report" => report_cmd(cfg, &a),
         "lease" => lease_cmd(cfg, &a),
-        _ => run_loop(cfg),
+        _ => match run_loop(cfg) {
+            Ok(Stop::Replaced) => {
+                eprintln!(
+                    "robodr-deliverd: this program was replaced on disk (an upgrade); \
+                     exiting {EXIT_RESTART} to be started again on the new one"
+                );
+                return EXIT_RESTART;
+            }
+            Ok(Stop::Signal) => Ok(()),
+            Err(e) => Err(e),
+        },
     };
     match r {
         Ok(()) => 0,
@@ -483,7 +500,66 @@ fn once(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-fn run_loop(cfg: Config) -> Result<(), String> {
+/// Why `run` stopped (without an error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// SIGTERM / SIGINT.
+    Signal,
+    /// The agent's own executable was replaced ([`OwnBinary`]).
+    Replaced,
+}
+
+/// The executable this process was started from, as path, device and
+/// inode taken at start (T52). dpkg replaces a file by renaming a new one
+/// over it, so after an upgrade the path names another inode (or nothing)
+/// while this process still runs the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnBinary {
+    path: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl OwnBinary {
+    /// Of this process (`/proc/self/exe`). `None`: not knowable (already
+    /// replaced before the start, or no `/proc`): never reports a change.
+    pub fn of_self() -> Option<Self> {
+        Self::of(Path::new("/proc/self/exe"))
+    }
+
+    /// Of the executable `link` resolves to (`/proc/<pid>/exe`, or any
+    /// path in tests).
+    pub fn of(link: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::fs::canonicalize(link).ok()?;
+        // The kernel marks an unlinked executable " (deleted)".
+        if path.to_string_lossy().ends_with(" (deleted)") {
+            return None;
+        }
+        let m = std::fs::metadata(link).ok()?;
+        let p = std::fs::metadata(&path).ok()?;
+        if (m.dev(), m.ino()) != (p.dev(), p.ino()) {
+            return None;
+        }
+        Some(Self {
+            path,
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+
+    /// The path now names another file, or none.
+    pub fn replaced(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(&self.path) {
+            Ok(m) => (m.dev(), m.ino()) != (self.dev, self.ino),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+}
+
+fn run_loop(cfg: Config) -> Result<Stop, String> {
+    let own = OwnBinary::of_self();
     robodr_agentd::signal::install().map_err(|e| format!("signal handler: {e}"))?;
     let interval = Duration::from_millis(cfg.interval_ms);
     let triggers = match &cfg.erase {
@@ -496,7 +572,7 @@ fn run_loop(cfg: Config) -> Result<(), String> {
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
     let notifier = robodr_agentd::notify::Notifier::from_env();
     notifier.notify("READY=1");
-    let mut res = Ok(());
+    let mut res = Ok(Stop::Signal);
     while !robodr_agentd::signal::requested() {
         // Sprint 14b: erase triggers first (planned by the responder,
         // executed when the safety state allows).
@@ -557,6 +633,13 @@ fn run_loop(cfg: Config) -> Result<(), String> {
                 break;
             }
         }
+        // T52: checked between passes only, so a pass that installed
+        // RoboDR's own package has finished (health gate, commit or
+        // rollback) on the old binary first.
+        if own.as_ref().is_some_and(OwnBinary::replaced) {
+            res = Ok(Stop::Replaced);
+            break;
+        }
         let until = Instant::now() + interval;
         while Instant::now() < until && !robodr_agentd::signal::requested() {
             std::thread::sleep(Duration::from_millis(50));
@@ -564,8 +647,9 @@ fn run_loop(cfg: Config) -> Result<(), String> {
     }
     notifier.notify("STOPPING=1");
     let closed = e.close().map_err(|e| e.0);
-    res?;
-    closed
+    let stop = res?;
+    closed?;
+    Ok(stop)
 }
 
 /// Entry point of `robodr-safety-replay`.

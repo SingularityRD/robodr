@@ -219,3 +219,79 @@ fn replay_check_parses_without_sending() {
     ]);
     assert_eq!(o.status.code(), Some(1));
 }
+
+/// Start a copy of the agent binary at `exe` (retrying ETXTBSY: another
+/// test may fork while the copy's descriptor is still open).
+fn spawn_copy(exe: &std::path::Path, args: &[&str]) -> std::process::Child {
+    for _ in 0..50 {
+        match Command::new(exe)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => return c,
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(100))
+            }
+            Err(e) => panic!("{}: {e}", exe.display()),
+        }
+    }
+    panic!("{}: text file busy", exe.display());
+}
+
+fn wait_exit(c: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < until {
+        if let Some(st) = c.try_wait().unwrap() {
+            return Some(st);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+/// T52: RoboDR's own package upgraded by this agent replaces its binary
+/// while it runs (the postinst leaves the restart to it: restarting the
+/// unit from inside its own dpkg run would kill dpkg). `run` notices
+/// between passes and exits 3, which the unit restarts on
+/// (RestartForceExitStatus=3); without a replacement it runs until
+/// SIGTERM and exits 0.
+#[test]
+fn run_exits_3_after_its_own_binary_is_replaced() {
+    let u = Unit::new("bin-replaced");
+    let cfgp = u.dir().join("deliverd.json");
+    std::fs::write(&cfgp, serde_json::to_vec_pretty(&u.cfg).unwrap()).unwrap();
+    let c = cfgp.to_str().unwrap();
+    let exe = u.dir().join("robodr-deliverd");
+    std::fs::copy(env!("CARGO_BIN_EXE_robodr-deliverd"), &exe).unwrap();
+
+    // Not replaced: runs until SIGTERM, then exits 0.
+    let mut child = spawn_copy(&exe, &["run", "--config", c]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "run stopped by itself");
+    let pid = child.id().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let st = wait_exit(&mut child, 30).expect("run ignored SIGTERM");
+    assert_eq!(st.code(), Some(0), "{st:?}");
+
+    // Replaced as dpkg does it (a new file renamed over the path).
+    let mut child = spawn_copy(&exe, &["run", "--config", c]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "run stopped by itself");
+    let new = u.dir().join("robodr-deliverd.dpkg-new");
+    std::fs::copy(env!("CARGO_BIN_EXE_robodr-deliverd"), &new).unwrap();
+    std::fs::rename(&new, &exe).unwrap();
+    let Some(st) = wait_exit(&mut child, 30) else {
+        let _ = child.kill();
+        panic!("run kept running on a replaced binary");
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
+    assert_eq!(st.code(), Some(3), "{st:?} {err}");
+    assert!(err.contains("replaced on disk"), "{err}");
+}
