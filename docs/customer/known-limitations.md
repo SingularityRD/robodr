@@ -163,6 +163,14 @@
   format, downgrade and security-floor checks as the `.deb` bundle) has
   been tested against `rpm` in a separate root only, not on a real RHEL /
   Rocky / Fedora host.
+- **Secure delivery of packages is deb only.** `robodr-deliverd` installs
+  package RPKs with dpkg; on an RPM-based unit (Rocky / RHEL / Fedora) a
+  `deb` RPK is refused before anything is unpacked, and there is no `rpm`
+  kind, so neither the unit agent nor the site depot delivers RPM
+  packages. The `files`, `model`, `config` and `robodr-rules` kinds work
+  there, and
+  RoboDR itself is updated with the offline bundle
+  ([`docs/OPERATIONS.md`](../OPERATIONS.md) sections 7 and 11.4).
 - **Host-side (Pulsar) signals reach correlation** by their Pulsar rule
   name. Since contract 2.5 each Pulsar rule RoboDR ships has its own
   finding id (`robot.host.<name>`), which the response planner sees; a

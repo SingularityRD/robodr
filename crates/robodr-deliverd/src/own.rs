@@ -6,16 +6,28 @@
 //! [`crate::cli::EXIT_RESTART`]); the unit starts the new binary.
 //!
 //! Before that pass commits, the health gate also runs the **new** binary
-//! once: `<path> self-check --config <file>` ([`SelfCheck`]), as root,
-//! inside the same unit sandbox, bounded by [`SELF_CHECK_TIMEOUT`]. It
-//! loads the configuration, the state file the old binary wrote and the
-//! black-box and finding keys, the inputs `run` needs before it reports
-//! READY. A binary that cannot start (wrong architecture, missing
-//! library, a state or configuration it cannot read) fails the gate, and
-//! the old binary, still running, rolls the package back. A new binary
-//! that passes `self-check` but fails later in `run` is **not** rolled
-//! back automatically: systemd restarts it (`Restart=on-failure`) until its
-//! start limit, and then an operator acts (`docs/OPERATIONS.md` 11.4).
+//! once: `<path> self-check --config <file>` ([`SelfCheck`],
+//! [`crate::engine::Engine::self_check`]), as root, inside the same unit
+//! sandbox, bounded by [`SELF_CHECK_TIMEOUT`]. Read only, it checks what
+//! the start needs: the keys, the journal's segments, the state file the
+//! old binary wrote (and that it is this unit's), a start the high-water
+//! record would not lock, the NV counter's TPM settings and the trust
+//! anchor. A binary that cannot start (wrong architecture, missing
+//! library, a state, record or configuration it cannot read) fails the
+//! gate, and the old binary, still running, rolls the package back. The
+//! gate runs only when the switch being judged replaced the binary (a
+//! [`Mark`] taken right before it). If the rollback cannot restore the
+//! binary (the security floor blocks it), `run` does not exit into it
+//! ([`SelfCheck::replacement_failed`]).
+//!
+//! Not covered: a new binary that passes `self-check` but fails later in
+//! `run` is **not** rolled back automatically: systemd restarts it
+//! (`Restart=on-failure`) until its start limit, and then an operator acts
+//! (`docs/OPERATIONS.md` 11.4). Nor is an agent killed between the switch
+//! and the end of the gate: the next start runs the new binary, which
+//! judges the resumed gate without a self-check of itself. When
+//! `/proc/self/exe` does not resolve, the check is skipped and the journal
+//! says so (`robodr.deliver.self_check_unavailable`).
 
 use crate::runner::{self, Limits};
 use std::path::{Path, PathBuf};

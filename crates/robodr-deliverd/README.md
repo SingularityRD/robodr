@@ -13,7 +13,7 @@ code, reused).
 robodr-deliverd run          --config FILE      # the daemon (robodr-deliverd.service)
 robodr-deliverd once         --config FILE      # one pass, JSON report
 robodr-deliverd check-config --config FILE
-robodr-deliverd self-check   --config FILE      # config, state and keys load (read only)
+robodr-deliverd self-check   --config FILE      # what the start needs: keys, journal, state, high-water, anchor (read only)
 robodr-deliverd init-anchor  --config FILE --trust TRUST.json   # once, at enrolment
 robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]   # lift the lock after a lost state
 robodr-deliverd status       --config FILE

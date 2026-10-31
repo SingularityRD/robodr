@@ -3746,17 +3746,38 @@ or other permissions, as for `--key`.
   `robodr-deliverd.service: Main process exited, status=3` line per
   self-upgrade; it is not a failure.
   The health gate of such an install also runs the **new** binary once,
-  `robodr-deliverd self-check --config <file>` (it loads the
-  configuration, the state file and the black-box and finding keys; 60 s
-  at most), and records it as the check `robodr-deliverd self-check`. If
-  it fails, the old agent rolls the package back like any failed gate
+  `robodr-deliverd self-check --config <file>` (60 s at most), and records
+  it as the check `robodr-deliverd self-check`. Read only, it checks what
+  the start needs: the configuration, the black-box and finding keys,
+  that the journal's segments can be read, the state file and that it is
+  this unit's and site's, that the high-water record would not lock the
+  start (not usable, of another unit, missing next to a journal with
+  records, or older than the journal's or the state's generation), the
+  TPM settings of `seal.anti_rollback_nv` (not the counter itself) and
+  that an existing trust anchor loads under the pinned roots. If it
+  fails, the old agent rolls the package back like any failed gate
   (`robot.deliver.health_failed`). A RoboDR version without the
   `self-check` command therefore cannot be installed by the agent onto
-  itself. Not covered: a new binary that passes `self-check` but fails
+  itself. The check runs only when the switch being judged replaced the
+  agent's binary (device and inode before and after the switch), so
+  another deb is never rolled back for it.
+  If the rollback cannot restore the binary (the security floor blocks it:
+  `robot.deliver.rollback_blocked_floor`, Critical), the old agent does
+  not exit 3 into the failing binary: it logs that it stays and keeps
+  running until it is stopped. A restart, or a reboot, then starts the
+  failing binary; deliver a release that passes before that.
+  Not covered: a new binary that passes `self-check` but fails
   later in `run` is not rolled back automatically; systemd restarts it
   (`Restart=on-failure`) until its start limit (5 in 300 s) and the unit
   is then failed; an operator restores the previous release (section 7)
-  and reports the version.
+  and reports the version. The same holds when the agent is killed
+  between the switch and the end of the gate (power loss, or the
+  `TimeoutStopSec=` kill below): the next start runs the new binary,
+  which resumes the gate without a self-check of itself (it has started)
+  and, if it cannot start, is not rolled back. When the agent cannot know
+  its own executable (`/proc/self/exe` does not resolve), deb installs
+  commit without the self-check and the journal says so at the start
+  (`robodr.deliver.self_check_unavailable`, also on stderr).
   The unit also sets `KillMode=mixed`, so `systemctl stop` signals the
   agent only and a dpkg run in progress finishes with its pass, as long
   as that takes less than `TimeoutStopSec=5min`. A longer one
@@ -3764,8 +3785,9 @@ or other permissions, as for `--key`.
   agent at the timeout and recovered from the intent at the next start
   (a half-done dpkg run is rolled back); raise `TimeoutStopSec=` in a drop-in where dpkg runs take
   longer. Tested with the real dpkg and a chrooted `postinst`
-  (`tests/kinds.rs`, also the self-check rollback with a stand-in
-  package), the postinst's restart loop and the exit-3 path of `run`
+  (`tests/kinds.rs`, also the self-check rollback and the floor-blocked
+  case with a stand-in package), what `self-check` refuses
+  (`tests/binary.rs`), the postinst's restart loop and the exit-3 path of `run`
   (`tests/binary.rs`); the full upgrade on a systemd-booted VM is the VM
   job of T10 (not yet in CI).
 * Release-allowed maintainer scripts stay root-equivalent: a `preinst`
