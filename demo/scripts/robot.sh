@@ -82,8 +82,11 @@ cp -p "$S/spool/ready/"* "$S/spool-siem/ready/" 2>/dev/null || true
 n=$(ls "$S/spool/ready" | wc -l)
 say "done: $n findings spooled; the SOC viewer is on http://127.0.0.1:${DEMO_SOC_PORT:-8080}/"
 # score exits 1 when a scenario missed its expected ids. The robot still
-# completes (the SOC should show what was found), and demo/run.sh fails the
-# run on it with demo/scripts/check-score.sh.
-"$B/robodr-attack-sim" score --scenario all --findings "$S/spool" > "$S/score.json" || true
+# completes (the SOC should show what was found); its exit status goes to
+# score.rc, and demo/run.sh fails the run on it with
+# demo/scripts/check-score.sh.
+rc=0
+"$B/robodr-attack-sim" score --scenario all --findings "$S/spool" > "$S/score.json" || rc=$?
+echo "$rc" > "$S/score.rc"
 /demo/scripts/check-score.sh "$S/score.json" && say "every scenario raised its expected rule ids" || true
 touch "$S/robot.done"
