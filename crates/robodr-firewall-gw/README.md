@@ -1163,6 +1163,12 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   `rt/arm_sdk` (`hg`, weight slot 27) are enforceable.
 - **Go1 compressed low-level frames** cannot be decided (dropped if the
   channel is configured).
+- **No configuration reload** (sales-readiness T43, open): there is no
+  reload signal; a changed configuration, profile or firewall file takes
+  effect at the next start, and the restart is time without decisions
+  (`on_gateway_down`). The per-writer sequence state and the firewall's
+  hold references start empty after it (the enforced-writer table survives
+  in `rtps.state_file`).
 - **IPv4 only**: the ruleset drops IPv6, PPPoE, stacked VLAN tags and
   every other ethertype from the controller port (the gateway decides
   IPv4 only, so nothing else could carry a command past it unchecked).
