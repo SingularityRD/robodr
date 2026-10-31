@@ -186,15 +186,17 @@ pub fn gateway_config(fx: Fixture) -> GatewayConfig {
             "codec": "unitree_sport_request",
             "allowed_api_ids": [1003, 1008, 1001, 1004],
         }));
-        // Go2's other motion services (gateway review, finding 3): no
+        // Go2's other motion services (gateway review, finding 3): an empty
         // allowlist, so only their velocity `Move` and queries pass.
         channels.push(serde_json::json!({
             "firewall_channel": "/api/obstacles_avoid/request",
             "codec": "unitree_obstacles_avoid_request",
+            "allowed_api_ids": [],
         }));
         channels.push(serde_json::json!({
             "firewall_channel": "/api/uwbswitch/request",
             "codec": "unitree_uwbswitch_request",
+            "allowed_api_ids": [],
         }));
         channels.push(serde_json::json!({
             "firewall_channel": "/legacy/high_cmd",

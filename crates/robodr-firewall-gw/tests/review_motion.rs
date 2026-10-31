@@ -305,7 +305,7 @@ fn f5_feed_hand_off_never_blocks() {
 #[test]
 fn f8_speed_level_is_refused_while_restricted() {
     let mut cfg = gateway_config(Fixture::Go2);
-    cfg.channels[1].allowed_api_ids = None;
+    cfg.channels[1].allowed_api_ids = Some(vec![1015]);
     let mut g = Gateway::new(&cfg, &profile(Fixture::Go2), &firewall(Fixture::Go2)).unwrap();
     announce(
         &mut g,

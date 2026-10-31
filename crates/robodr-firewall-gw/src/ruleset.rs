@@ -225,7 +225,7 @@ mod tests {
                 "queue":{"num":7,"controller_port":"enp2s0","robot_port":"enp3s0"},
                 "rtps":{"domain_ids":[0,1]},
                 "channels":[{"firewall_channel":"/lowcmd","codec":"unitree_go_lowcmd"},
-                            {"firewall_channel":"/high","codec":"go1_high_cmd"}]}"#,
+                            {"firewall_channel":"/high","codec":"go1_high_cmd","allowed_high_modes":[0]}]}"#,
         )
         .unwrap();
         let s = render(&c, "test.json");

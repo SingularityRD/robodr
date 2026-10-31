@@ -493,10 +493,13 @@ pub struct ChannelConfig {
     /// foreign.
     #[serde(default)]
     pub legacy_sources: BTreeMap<String, String>,
-    /// Sport requests / Go1 `HighCmd`: if set, a request whose api id (a
-    /// `HighCmd` whose mode) is not listed is suppressed. Velocity calls
-    /// (`Move`, mode 2) are always decided by the firewall and need not be
-    /// listed.
+    /// Api requests / Go1 `HighCmd`: a request whose api id (a `HighCmd`
+    /// whose mode) is not listed is suppressed. Velocity calls (`Move`,
+    /// mode 2), stops and queries are decided without it. **Required** on
+    /// `unitree_sport_request`, `unitree_obstacles_avoid_request`,
+    /// `unitree_uwbswitch_request` (`allowed_api_ids`) and `go1_high_cmd`
+    /// (`allowed_high_modes`): a missing list used to mean "everything"
+    /// (gateway review, finding 6).
     #[serde(default)]
     pub allowed_api_ids: Option<Vec<i64>>,
     #[serde(default)]
@@ -1135,6 +1138,28 @@ impl GatewayConfig {
                         format!("{at}: legacy_sources key {ip:?} is not an IPv4 address")
                     })?;
                 }
+            }
+            // Gateway review, finding 6: a missing allowlist used to mean
+            // "every call / mode" (tricks, flips, attitude, trajectory
+            // following, unknown ids, Go1 mode 1 poses).
+            if matches!(
+                c.codec,
+                Codec::UnitreeSportRequest
+                    | Codec::UnitreeObstaclesAvoidRequest
+                    | Codec::UnitreeUwbSwitchRequest
+            ) && c.allowed_api_ids.is_none()
+            {
+                return Err(format!(
+                    "{at}: codec {} needs allowed_api_ids (the non-velocity calls forwarded; [] \
+                     for none: velocity, stop and queries only)",
+                    c.codec.as_str()
+                ));
+            }
+            if c.codec == Codec::Go1HighCmd && c.allowed_high_modes.is_none() {
+                return Err(format!(
+                    "{at}: codec go1_high_cmd needs allowed_high_modes (the modes forwarded \
+                     besides 2, velocity; [0] for idle only)"
+                ));
             }
             if c.allowed_api_ids.is_some() && !c.codec.is_api_request() {
                 return Err(format!(

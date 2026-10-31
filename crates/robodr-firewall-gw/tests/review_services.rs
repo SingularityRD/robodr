@@ -5,6 +5,12 @@
 //! target passed. And a Go2 configuration without a channel for every
 //! motion service now refuses to start in enforce mode.
 //!
+//! Finding 6: a sport channel without `allowed_api_ids` and a Go1
+//! `HighCmd` channel without `allowed_high_modes` forwarded every call /
+//! mode (tricks, flips, attitude, trajectory following, unknown ids, mode 1
+//! poses) after a source / rate check; and a restriction did not refuse an
+//! allowlisted motion call.
+//!
 //! Finding 4: a `TwistStamped` with a far-future `header.stamp` was
 //! forwarded untouched, so `diff_drive_controller` kept executing it past
 //! its `cmd_vel_timeout`; the stamp is now zeroed ("now").
@@ -16,7 +22,7 @@ use robodr_cdr::{ApiCall, Representation};
 use robodr_firewall_gw::ip::parse_ipv4_udp;
 use robodr_firewall_gw::rtps::{self, build::Datagram, Content, WalkOptions};
 use robodr_firewall_gw::testkit::*;
-use robodr_firewall_gw::{ros2, sport, Gateway, GatewayConfig, PacketMeta, Verdict};
+use robodr_firewall_gw::{legacy, ros2, sport, Gateway, GatewayConfig, PacketMeta, Verdict};
 
 const MS: u64 = 1_000_000;
 const T0: u64 = 1_000_000_000;
@@ -209,4 +215,115 @@ fn f4_twist_stamped_stamp_is_zeroed() {
         run(&mut gw, &packet(CONTROLLER_IP, DDS_PORT, &d), now).0,
         Verdict::Accept
     );
+}
+
+fn sport_gw(edit: impl FnOnce(&mut GatewayConfig)) -> Gateway {
+    let mut cfg = gateway_config(Fixture::Go2);
+    edit(&mut cfg);
+    let mut gw = Gateway::new(&cfg, &profile(Fixture::Go2), &firewall(Fixture::Go2)).unwrap();
+    let sedp = sedp_datagram(
+        PREFIX,
+        SPORT_WRITER,
+        "rt/api/sport/request",
+        "unitree_api::msg::dds_::Request_",
+    );
+    run(&mut gw, &packet(CONTROLLER_IP, 7410, &sedp), T0);
+    gw
+}
+
+fn restricted() -> robodr_firewall_gw::restrict::Restriction {
+    robodr_firewall_gw::restrict::parse(
+        r#"{"format":"robodr-gw-restriction/v1","id":"r","factor":0.5,"expires_unix_ms":18446744073709551615}"#,
+    )
+    .unwrap()
+}
+
+/// A sport channel without `allowed_api_ids` is refused (it used to
+/// forward every call); with the empty list only velocity, stop and query
+/// calls pass: a flip (Go2 `FrontFlip` 1030), `Euler` (1007),
+/// `TrajectoryFollow` (1018) and an unknown id are refused.
+#[test]
+fn f6_sport_without_allowlist_is_default_deny() {
+    let mut cfg = gateway_config(Fixture::Go2);
+    cfg.channels[1].allowed_api_ids = None;
+    let e = Gateway::new(&cfg, &profile(Fixture::Go2), &firewall(Fixture::Go2)).unwrap_err();
+    assert!(e.contains("allowed_api_ids"), "{e}");
+    let mut gw = sport_gw(|c| c.channels[1].allowed_api_ids = Some(Vec::new()));
+    let mut now = T0;
+    let mut sn = 0;
+    for (api, param, pass) in [
+        (1030, "", false),
+        (1007, r#"{"x":0.5,"y":0.5,"z":0.0}"#, false),
+        (1018, "[]", false),
+        (1199, "", false),
+        (1003, "", true),
+        (1008, r#"{"x":0.2,"y":0.0,"z":0.0}"#, true),
+    ] {
+        sn += 1;
+        now += 100 * MS;
+        let out = send(&mut gw, PREFIX, SPORT_WRITER, sn, &req(api, param), now);
+        assert_eq!(out_payload(&out).is_some(), pass, "api {api}");
+    }
+    // A configuration file without the list is refused.
+    let text =
+        std::fs::read_to_string(config_dir().join("firewall-gw.unitree-go2.example.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["channels"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("allowed_api_ids");
+    let e = GatewayConfig::from_json(&v.to_string()).unwrap_err();
+    assert!(e.contains("allowed_api_ids"), "{e}");
+}
+
+/// Under a restriction an allowlisted motion call (`StandUp` 1004) is
+/// refused; `StopMove` and a capped `Move` still pass.
+#[test]
+fn f6_restriction_refuses_allowlisted_motion_calls() {
+    let mut gw = sport_gw(|_| {});
+    gw.set_restriction(Some(restricted()));
+    let mut now = T0;
+    for (sn, (api, param, pass)) in [
+        (1004, "", false),
+        (1001, "", false),
+        (1003, "", true),
+        (1008, r#"{"x":0.2,"y":0.0,"z":0.0}"#, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        now += 100 * MS;
+        let out = send(
+            &mut gw,
+            PREFIX,
+            SPORT_WRITER,
+            sn as i64 + 1,
+            &req(api, param),
+            now,
+        );
+        assert_eq!(out_payload(&out).is_some(), pass, "api {api}");
+    }
+    assert_eq!(gw.stats.restriction_refused, 2);
+}
+
+/// Go1 `HighCmd`: without `allowed_high_modes` only idle (0) and velocity
+/// (2); a listed pose (mode 1) is refused under a restriction.
+#[test]
+fn f6_go1_high_modes_default_deny_and_restriction() {
+    let high = |m: u8| packet(CONTROLLER_IP, 8082, &legacy::build_high(m, 0.0, 0.0, 0.0));
+    let hi = |c: &mut GatewayConfig| {
+        c.channels
+            .iter_mut()
+            .find(|x| x.codec == robodr_firewall_gw::config::Codec::Go1HighCmd)
+            .unwrap()
+            .allowed_high_modes = None;
+    };
+    let mut cfg = gateway_config(Fixture::Go2);
+    hi(&mut cfg);
+    assert!(Gateway::new(&cfg, &profile(Fixture::Go2), &firewall(Fixture::Go2)).is_err());
+    let mut gw = sport_gw(|_| {});
+    assert_eq!(run(&mut gw, &high(1), T0 + 100 * MS).0, Verdict::Accept);
+    gw.set_restriction(Some(restricted()));
+    assert_eq!(run(&mut gw, &high(1), T0 + 200 * MS).0, Verdict::Drop);
+    assert_eq!(run(&mut gw, &high(0), T0 + 300 * MS).0, Verdict::Accept);
 }

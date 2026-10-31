@@ -231,8 +231,8 @@ segment, `allowed_src_macs`) on every channel.
 |---|---|---|---|
 | `unitree_hg_lowcmd` | RTPS DATA `unitree_hg::msg::dds_::LowCmd_` on `rt/lowcmd` (G1, H1-2) | joint, 35 slots | `mode_pr` / `mode_machine` passed through (pinnable) |
 | `unitree_go_lowcmd` | RTPS DATA `unitree_go::msg::dds_::LowCmd_` (Go2, B2, H1) | joint, 20 slots | |
-| `unitree_sport_request` | RTPS DATA `unitree_api::msg::dds_::Request_` on `rt/api/sport/request` | twist | `Move` (1008) decided as `(vx, vy, 0)/(0, 0, vyaw)`; a malformed `Move` as non-finite; `StopMove` always allowed; other calls: `allowed_api_ids`, then a zero-velocity check (source, rate); an api id outside `i32` (aliasing) is suppressed |
-| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes: `allowed_high_modes`, then a zero-velocity check; `bms.off` non-zero refused |
+| `unitree_sport_request` | RTPS DATA `unitree_api::msg::dds_::Request_` on `rt/api/sport/request` | twist | `Move` (1008) decided as `(vx, vy, 0)/(0, 0, vyaw)`; a malformed `Move` as non-finite; `StopMove` always allowed, queries pass; other calls only if listed in `allowed_api_ids` (**required**; `[]` = velocity, stop and queries only), then a zero-velocity check (source, rate); an api id outside `i32` (aliasing) is suppressed |
+| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes only if listed in `allowed_high_modes` (**required**; `[0]` = idle only), then a zero-velocity check; `bms.off` non-zero refused |
 | `go1_low_cmd` | UDP uncompressed `LowCmd` (734 octets), default port 8007 | joint, 20 slots | `bms.off` non-zero refused (integrity failure); any other length is undecidable (dropped) |
 | `go1_low_cmd_compressed` | UDP compressed `LowCmd` (614 octets, `LOW_CMD_LENGTH` of `unitree_legged_sdk` v3.8.6: what a real Go1 client sends), default port 8007 | joint, 20 slots | layout from the library's `refineCmd` (below, "Go1 compressed `LowCmd`"); `tau` / `Kp` / `Kd` are `i16` fixed point (÷256 / ÷32 / ÷16), a limited value is written as the step on the safe side of the bound and one beyond `i16` is refused (suppressed); holds ride on the last accepted 614-octet frame; any other length is dropped. Cannot share its port with `go1_low_cmd` |
 | `unitree_a2_lowcmd` | RTPS DATA on an A2 / AS2 `rt/lowcmd`, **inferred** `unitree_go::msg::dds_::LowCmd_` | joint, 20 slots | decided exactly as `unitree_go_lowcmd`; refused at start unless the firewall channel has `require_crc`, the profile records the channel's type (learned from the robot's SEDP; any other type than the go `LowCmd_` is refused), and `on_gateway_down` is not `bypass`; `allow_battery_off` refused (below, "A2 / AS2") |
@@ -655,7 +655,12 @@ Firewall decides (review F3), so the firewall's ramp state follows the
 capped speed and lifting the restriction ramps up from it at the
 channel's acceleration limit. While a restriction is active, the sport
 API's `SpeedLevel` (1015) is refused (review F8): the firmware's speed
-range must not be raised under a restriction. A restriction applies to
+range must not be raised under a restriction. Gateway review, finding 6:
+so is every other non-velocity motion call whatever the allowlist says
+(sport / `obstacles_avoid` / `uwbswitch` / loco / arm-action requests
+other than stops and queries, Go1 `HighCmd` modes other than 0 and 2;
+`restriction_refused`): a restriction must not be answered with a flip or
+a posture change. Velocity calls are capped, stops pass. A restriction applies to
 commands decided after it; a trajectory the controller already accepted
 keeps executing at its accepted speeds (review F9; `safe_pause` stops
 it). Low-level joint channels (`LowCmd_`, arm SDK, hands) are
@@ -1075,8 +1080,9 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   (contract 2.2) are follow-ups.
 - **Non-motor fields**: only `bms_cmd.off` is refused (see "Non-motor
   `LowCmd_` fields"); `led` / `fan` / `gpio` are forwarded as sent, and so
-  are the sport API's non-velocity calls in `allowed_api_ids` (`Damp`
-  included when listed).
+  are the sport API's non-velocity calls listed in `allowed_api_ids`
+  (`Damp` included when listed; the list is required and only what it
+  names passes, gateway review finding 6).
 - **Spoofed IP and MAC**: see "Sequence numbers and writer binding" — the
   gateway bounds, but cannot prevent, the effect of an attacker that sends
   with the controller's own IP and MAC on the controller-side segment.

@@ -280,7 +280,7 @@ fn sport_codec_is_refused_for_a_humanoid() {
     let cfg = g1_channels_config(|v| {
         v["robot_model"] = serde_json::json!("g1");
         v["channels"][2] = serde_json::json!(
-            {"firewall_channel": "/loco", "codec": "unitree_sport_request"});
+            {"firewall_channel": "/loco", "codec": "unitree_sport_request", "allowed_api_ids": []});
     });
     let e = Gateway::new(&cfg, &g1_channels_profile(), &g1_channels_firewall()).unwrap_err();
     assert!(e.contains("unitree_loco_request"), "{e}");

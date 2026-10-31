@@ -602,6 +602,13 @@ start-up and confirm every port either side receives RTPS on is queued.
   that re-engages a released joint far from its last target within that
   time is held / limited; raise it with care or lower the TTL.
 * **`TwistStamped` stamps are zeroed** in forwarded commands.
+* **Allowlists are required** (gateway review, finding 6): a
+  `unitree_sport_request`, `unitree_obstacles_avoid_request` or
+  `unitree_uwbswitch_request` channel without `allowed_api_ids`, or a
+  `go1_high_cmd` channel without `allowed_high_modes`, is refused (it used
+  to forward every call / mode). `[]` / `[0]` mean velocity, stop and
+  queries only. Under a `restrict_motion` restriction every non-velocity
+  motion call is refused whatever the list says (stops and queries pass).
 
 * **G1 / H1 / H2 / R1 `Start` is refused** (`SetFsmId` 500 / 204 / 601 /
   811) unless the loco channel's `allowed_fsm_ids` lists it. List it only

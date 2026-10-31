@@ -193,6 +193,10 @@ pub struct GatewayStats {
     /// Sport `SpeedLevel` requests refused while a restriction is in
     /// force (F8).
     pub restriction_speed_level_refused: u64,
+    /// Non-velocity motion calls (sport / loco / arm / obstacles_avoid /
+    /// uwbswitch requests, Go1 `HighCmd` modes other than 0 and 2) refused
+    /// while a restriction is in force (gateway review, finding 6).
+    pub restriction_refused: u64,
     /// Robot-side packets observed (NFLOG copies; never verdicted).
     pub observed_packets: u64,
     /// `rt/lowstate` samples taken from them.
@@ -1994,7 +1998,6 @@ impl Gateway {
             Codec::UnitreeSportRequest => (ApiService::Sport, None),
             _ => ch.api(),
         };
-        let strict_default = ch.codec != Codec::UnitreeSportRequest;
         let req = match sport::decode_strict_for(slot, service, model) {
             Ok(r) => r,
             Err(_) => {
@@ -2036,25 +2039,28 @@ impl Gateway {
                 };
             }
             _ => {
+                let class = req.call.class();
+                let query = class == robodr_cdr::unitree::ApiClass::Query;
                 // Review F8: while a restriction is in force nobody may
                 // change the sport speed level (the executor's
-                // unitree_sport adapter set the restricted one).
-                if self.restriction.is_some() && req.api_id == SPORT_SPEED_LEVEL {
-                    self.stats.restriction_speed_level_refused += 1;
+                // unitree_sport adapter set the restricted one); gateway
+                // review finding 6: nor make any other motion call (a
+                // posture, a trick, a trajectory, a hand-over, an unknown
+                // id) whatever the allowlist says. Stops (handled above)
+                // and queries pass; velocities are capped.
+                if self.restriction.is_some() && !query {
+                    if req.api_id == SPORT_SPEED_LEVEL {
+                        self.stats.restriction_speed_level_refused += 1;
+                    }
+                    self.stats.restriction_refused += 1;
                     let _ = self.access_check(id, source, now, twist(0.0, 0.0, 0.0));
                     return Outcome::Suppress;
                 }
                 // Not a velocity call: allowlist, then the source / rate
                 // check only (the twist state is not touched, F10 b).
-                // obstacles_avoid / uwbswitch: without an allowlist only
-                // queries pass (their other calls are a position target, a
-                // UWB follow mode or a control handover).
-                let listed = match &allow {
-                    Some(a) => a.contains(&req.api_id),
-                    None => {
-                        !strict_default || req.call.class() == robodr_cdr::unitree::ApiClass::Query
-                    }
-                };
+                // Queries always pass; without an allowlist (the
+                // configuration requires one: finding 6) nothing else.
+                let listed = query || allow.as_ref().is_some_and(|a| a.contains(&req.api_id));
                 if !listed {
                     self.stats.not_allowlisted += 1;
                     return Outcome::Suppress;
@@ -2183,6 +2189,12 @@ impl Gateway {
             self.stats.loco_refused += 1;
             return Outcome::Suppress;
         }
+        // Finding 6: under a restriction only queries (stops are velocity
+        // calls, decided above).
+        if self.restriction.is_some() && req.call.class() != ApiClass::Query {
+            self.stats.restriction_refused += 1;
+            return Outcome::Suppress;
+        }
         // No motion of its own: source / rate only (F10 b).
         if self.access_check(id, source, now, twist(0.0, 0.0, 0.0)) {
             Outcome::Pass
@@ -2232,6 +2244,13 @@ impl Gateway {
         };
         if !allowed {
             self.stats.arm_request_refused += 1;
+            return Outcome::Suppress;
+        }
+        // Finding 6: under a restriction only stops and queries.
+        if self.restriction.is_some()
+            && !matches!(req.call.class(), ApiClass::Query | ApiClass::Stop)
+        {
+            self.stats.restriction_refused += 1;
             return Outcome::Suppress;
         }
         if self.access_check(id, source, now, twist(0.0, 0.0, 0.0)) {
@@ -2683,8 +2702,17 @@ impl Gateway {
             return self.legacy_high_substitute(ci, frame, v);
         };
         if h.mode != 2 {
-            if allow.as_ref().is_some_and(|a| !a.contains(&h.mode)) {
+            // Finding 6: only listed modes (the configuration requires the
+            // list; without one only idle, mode 0); under a restriction
+            // only idle (mode 1 is a body pose, 3 a position target, the
+            // rest stand / lie / damp / tricks).
+            let listed = allow.as_ref().map_or(h.mode == 0, |a| a.contains(&h.mode));
+            if !listed {
                 self.stats.not_allowlisted += 1;
+                return Outcome::Suppress;
+            }
+            if self.restriction.is_some() && h.mode != 0 {
+                self.stats.restriction_refused += 1;
                 return Outcome::Suppress;
             }
             return match self.twist_check(id, source, now, twist(0.0, 0.0, 0.0), late) {
