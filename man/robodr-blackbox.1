@@ -263,8 +263,16 @@ At most
 .B \-\-max\-records
 (100000) records or
 .B \-\-max\-bytes
-(64 MiB) per run. Records lost before they were exported are reported and
-make the run exit 1 after writing what is there.
+(64 MiB) per run; segments are streamed one frame at a time, so memory
+follows
+.BR \-\-max\-bytes ,
+not the segment size. A
+.B \-\-key
+that did not sign the newest record (a key retired by
+.BR rotate )
+is refused (exit 2) before anything is written. Records lost before they
+were exported are reported and make the run exit 1 after writing what is
+there.
 .TP
 .B backup create
 Archive a unit's configuration, drop\-ins, anchor\-receiver state and a
@@ -278,14 +286,22 @@ under
 encrypt such an archive before it leaves the unit.
 .TP
 .B backup verify
-Check an archive end to end (exit 1 if damaged).
+Check an archive end to end (exit 1 if damaged). The SHA\-256 sums are
+unkeyed: they catch corruption, not tampering; an archive is only as
+trustworthy as the encrypted, offline media it was kept on.
 .TP
 .B backup restore
 Verify the whole archive, then restore configuration under
-.BR \-\-root .
+.BR \-\-root ,
+checking every entry again against the verified pass while it is written
+(an archive that changed in between stops the restore, exit 1). Restored
+files are never set\-id, group\- or world\-writable; key material
+(etc/robodr/keys, etc/robodr\-depot/keys, *.key) is 0600 in 0700
+directories; owners are the restoring user's.
 Evidence goes only to
 .BR \-\-evidence\-to ,
-never into the unit; spool
+never into the unit (a directory that resolves to the root or into its
+live trees is refused, exit 2); spool
 .I ready/
 findings only with
 .B \-\-spool\-ready

@@ -356,7 +356,11 @@ rotation.
    # records of keys retired before; add --allow-hmac when the old key is HMAC
    ```
 
-   It refuses a log that is open (agentd still running), the wrong old key,
+   It refuses a log that is open (agentd still running), a log being
+   exported right now (`export.lock` held by `export-pending`: retry; with
+   the export timer, a run that starts between this step and step 4 holds
+   the retired key and is refused, exit 2, without touching the cursor),
+   the wrong old key,
    an HMAC new key, a reused key id, and a log holding records no given key
    authenticates. `--previous-keys` gets the same checks as agentd's
    `blackbox.previous_keys` (below). Re-running it after success prints
@@ -1697,12 +1701,19 @@ re-reads the export cursor every health tick and raises, observe-only:
 
 | Condition | Finding | Severity |
 |---|---|---|
-| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
+| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode, again at High if it climbs to 95 %; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
 | cyclic retention dropped unexported evidence (the reserve was used up) | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | High |
+| plain cyclic retention (no reserve, the default) dropped segments no export had confirmed | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | Medium, at most once a day with the count since the last report |
 
 (These use the catalogued `evidence_degraded` id until the next
-findings-contract minor gives them their own.) Plain cyclic retention with
-no exporter drops by design and raises neither.
+findings-contract minor gives them their own.) Plain cyclic retention has
+no pressure finding: without an exporter every segment is unexported, so
+it would always read full. Its drops are reported, once a day at most, so
+a unit on the default configuration (8 x 8 MiB, no reserve) that nobody
+exports says that its oldest evidence is going; a site that exports the
+black box sets the reserve and runs the export (8.2). Drops are counted
+per recorder: a recorder reopened after an outage starts from 0 and what
+the previous one dropped but had not reported is carried over.
 
 Sizing (hours of evidence held; a cyclic store holds between `segments - 1`
 and `segments` full segments; the oldest is the one dropped next):
@@ -2752,7 +2763,14 @@ robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd \
 Each record's hash, signature and link are checked before it is
 exported; each bundle is written durably before the cursor moves (a crash
 in between re-exports the same records; the far side reports the replay).
-After a key rotation add the retired public keys with `--previous-keys`.
+It streams the segments one frame at a time, so its memory is about
+`--max-bytes` (64 MiB) plus one frame (at most 16 MiB) whatever the
+segment size. After a key rotation (4.3) `--key` must be the new key and
+the retired public keys go in `--previous-keys`: a run with the retired
+key is refused (exit 2) before it writes anything, because the newest
+record is not signed by it. `robodr-blackbox rotate` holds `export.lock`
+(it fails while an export runs: retry) and re-signs the newest cursor on
+disk under the new key.
 Records lost before they were exported (a gap after the cursor) are named
 on stderr and the run exits 1 after writing what is there; the far side
 reports them too. On the far side, verify each bundle in order with
@@ -4199,6 +4217,13 @@ robodr-blackbox backup create --include-keys --out - | age -r <custodian key> \
 
 `create` archives only the "back up: yes" rows (never symlinks or special
 files), each file with its SHA-256; the "no" rows are not archived. The
+SHA-256 sums and the archive's end record are **not keyed**: `verify`
+catches corruption and truncation, not tampering. Anyone who can write an
+archive can build a consistent one with other contents, and a restore
+writes trust files (profile trust, control-plane and SOC trust, CA
+certificates) from it. The archive's authenticity rests entirely on how it
+was kept: encrypted (`age`) and on offline media under the site's custody.
+Restore only from such a copy. The
 same with `tar` and `age` by hand:
 
 ```sh
@@ -4228,19 +4253,32 @@ state re-created by its own procedure, never copied.
    the security floor the fleet runs; this creates the directories and
    `/var/lib/robodr/releases/security-floor` from the bundle.
 2. Restore `/etc/robodr` (and the drop-ins) from the configuration
-   backup, then the keys; `systemd-tmpfiles --create` resets owners and
-   modes. With an archive of 14.2:
+   backup, then the keys; `systemd-tmpfiles --create` resets the owners
+   and modes of the packaged directories. With an archive of 14.2:
    `robodr-blackbox backup restore FILE [--evidence-to /srv/archive/<unit>]
    [--spool-ready] [--dry-run]` (decrypt the keys archive first:
    `age -d ... > keys.rbkup`). It verifies the whole archive before writing
-   anything, restores configuration (keys 0600 in a 0700 directory, no
-   set-id bits) and the anchor receiver's state, extracts evidence only
-   under `--evidence-to` (never into the unit), restores the spools'
-   `ready/` findings only with `--spool-ready` and only into an empty
-   `ready/`, and **never** restores a "no" row of 14.1, even from an
-   archive that holds one: each refused path is printed with its reason.
-   It refuses paths that escape the root and targets behind a symlink. A replaced unit with a new TPM keeps the old keys only if the
-   site decides so; otherwise rotate (4.3).
+   anything, then reads it again to write it, checking every entry and
+   every file's bytes against the verified pass before the file replaces
+   anything (an archive that changed in between stops the restore with
+   exit 1; what was written before is what was verified). It restores
+   configuration and the anchor receiver's state (never set-id, sticky,
+   group- or world-writable; key material — `/etc/robodr/keys`,
+   `/etc/robodr-depot/keys`, any `*.key` file — 0600 in 0700 directories),
+   extracts evidence only under `--evidence-to` (a directory that, after
+   resolving `..`, relative paths and symlinks, is the root or lies in
+   `/etc`, `/var/lib/robodr`, `/var/lib/robodr-anchor-receiver`,
+   `/var/lib/robodr-seal` or `/opt/robodr-delivered` is refused, exit 2),
+   restores the spools' `ready/` findings only with `--spool-ready` and only
+   into an empty `ready/`, and **never** restores a "no" row of 14.1, even
+   from an archive that holds one: each refused path is printed with its
+   reason. It refuses paths that escape the root and targets behind a
+   symlink. Restored files are owned by the user who runs it (root):
+   `systemd-tmpfiles --create` resets the packaged directories, not the
+   files in them, so give the depot's keys back to its user
+   (`chown -R robodr-depot:robodr-depot /etc/robodr-depot/keys`) and check
+   any file a service reads as its own user. A replaced unit with a new TPM
+   keeps the old keys only if the site decides so; otherwise rotate (4.3).
 3. Do **not** copy any "no" row of 14.1. Re-create instead: seal
    provisioning and enrolment (12.1-12.3) and the anchor sidecar (6.4),
    fleet enrollment (8.6), delivery anchor (11.3), depot enrolment (13.3).

@@ -110,26 +110,36 @@
 //!   `rbbx-<device>-<chain>-<first>-<last>.rbbx`), each written durably
 //!   before the cursor is advanced (signed with `--key`, the recorder's
 //!   current secret key; records signed by keys retired by a rotation need
-//!   `--previous-keys`). Each record's hash, signature and link are checked
+//!   `--previous-keys`; a `--key` that did not sign the newest record, a
+//!   key retired by `rotate`, is refused before anything is written).
+//!   Segments are streamed one frame at a time (memory follows
+//!   `--max-bytes`, not the segment size). Each record's hash, signature
+//!   and link are checked
 //!   first; a bundle stops at a break. With
 //!   `blackbox.retention.unexported_reserve_segments` the recorder keeps
 //!   segments this has not exported. Up to `--max-bundles` (default 64)
 //!   bundles of at most `--max-records` (100000) records / `--max-bytes`
 //!   (64 MiB) per run. It prints one line per bundle; records lost before
 //!   they were exported (a gap after the cursor) are reported and make the
-//!   run exit 1 after writing what is there. Packaged as
-//!   `robodr-blackbox-export.timer` (OPERATIONS 8.2).
+//!   run exit 1 after writing what is there. Example units (not installed
+//!   by the package): `packaging/systemd/blackbox-export/`
+//!   (OPERATIONS 8.2).
 //! - `backup` backs a unit up and restores it as OPERATIONS §14 says
 //!   (`robodr_blackbox::backup`): `create` archives the §14.1 "back up"
 //!   paths under `--root` (default `/`) into an `RBKUP001` archive
 //!   (`--out`, created new, 0600; `-` = stdout, to pipe into the site's
 //!   encryption); the keys (`etc/robodr/keys`) only with `--include-keys`.
-//!   `verify` checks an archive end to end. `restore` verifies the whole
-//!   archive first, then writes configuration (and the anchor receiver's
-//!   state) under `--root`, never anything the §14.1 table says must not
-//!   be restored (anti-rollback floors, replay stores, security floor,
-//!   TPM-bound material, exporter sequence state: each is listed with the
-//!   reason), evidence only under `--evidence-to` (never into the unit),
+//!   `verify` checks an archive end to end (unkeyed SHA-256: corruption,
+//!   not tampering; the archive's authenticity rests on the encrypted,
+//!   offline media it was kept on). `restore` verifies the whole archive
+//!   first, then writes configuration (and the anchor receiver's state)
+//!   under `--root`, checking each entry again against the verified pass
+//!   (an archive that changed in between stops the restore, exit 1),
+//!   never anything the §14.1 table says must not be restored
+//!   (anti-rollback floors, replay stores, security floor, TPM-bound
+//!   material, exporter sequence state: each is listed with the reason),
+//!   evidence only under `--evidence-to` (never into the unit: a directory
+//!   that resolves to the root or into its live trees is refused, exit 2),
 //!   and the spools' `ready/` findings only with `--spool-ready` and only
 //!   into an empty `ready/`. `--dry-run` reports without writing.
 //!
@@ -1053,22 +1063,23 @@ fn backup(raw: &[String]) -> Result<(), Fail> {
                 evidence_to: a.one("evidence-to")?.map(PathBuf::from),
                 dry_run: a.flag("dry-run"),
             };
-            if let Some(d) = &opts.evidence_to {
-                // Evidence never goes back into the unit's live state.
-                if ["var/lib/robodr", "etc"]
-                    .iter()
-                    .any(|live| d.starts_with(root.join(live)))
-                {
-                    return Err(format!(
-                        "--evidence-to {}: inside the unit's live state under --root (evidence \
-                         goes to an archive directory, OPERATIONS 14.1)",
-                        d.display()
-                    )
-                    .into());
-                }
-            }
+            // `--evidence-to` inside the unit's live state (however it is
+            // spelled) is refused by `backup::restore` before anything is
+            // read: a usage error (exit 2).
             let rep = match backup::restore(&p, &root, &opts) {
                 Ok(r) => r,
+                Err(e)
+                    if e.get_ref()
+                        .is_some_and(|x| x.is::<backup::ArchiveChanged>()) =>
+                {
+                    eprintln!(
+                        "robodr-blackbox: {}: {e}; entries before it were written, each \
+                         checked against the verified archive; restore again from a copy \
+                         nobody else can write",
+                        p.display()
+                    );
+                    return Err(Fail::Verify);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     eprintln!(
                         "robodr-blackbox: {}: {e}; nothing was restored",

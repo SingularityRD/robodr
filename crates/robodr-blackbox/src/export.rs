@@ -333,23 +333,30 @@ pub struct Bundle {
 
 impl Bundle {
     pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 4 + 1 + 72 + 8 + self.frames.len() + 512);
+        // Writing to a Vec cannot fail.
+        let _ = self.write_to(&mut out);
+        out
+    }
+
+    /// Write the bundle's bytes ([`Bundle::to_bytes`]) to `w` without
+    /// building them in memory first (the frames can be tens of MiB).
+    pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let id = serde_json::to_vec(&self.identity).unwrap_or_default();
-        let mut out = Vec::with_capacity(8 + 4 + id.len() + 1 + 72 + 8 + self.frames.len());
-        out.extend_from_slice(BUNDLE_MAGIC);
-        out.extend_from_slice(&(id.len() as u32).to_be_bytes());
-        out.extend_from_slice(&id);
+        w.write_all(BUNDLE_MAGIC)?;
+        w.write_all(&(id.len() as u32).to_be_bytes())?;
+        w.write_all(&id)?;
         match &self.anchor {
             Some(a) => {
-                out.push(1);
-                out.extend_from_slice(&a.chain_id);
-                out.extend_from_slice(&a.seq.to_be_bytes());
-                out.extend_from_slice(&a.hash);
+                w.write_all(&[1])?;
+                w.write_all(&a.chain_id)?;
+                w.write_all(&a.seq.to_be_bytes())?;
+                w.write_all(&a.hash)?;
             }
-            None => out.push(0),
+            None => w.write_all(&[0])?,
         }
-        out.extend_from_slice(&(self.frames.len() as u64).to_be_bytes());
-        out.extend_from_slice(&self.frames);
-        out
+        w.write_all(&(self.frames.len() as u64).to_be_bytes())?;
+        w.write_all(&self.frames)
     }
 
     /// Strict parse; never panics on hostile input.

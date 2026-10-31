@@ -982,3 +982,158 @@ fn export_pending_writes_verifiable_bundles_and_advances_the_cursor() {
     let r = Recorder::open(c, key, clock()).unwrap();
     assert!(r.export_cursor().is_some());
 }
+
+fn export_args<'a>(dir: &'a Path, k: &'a Path, out: &'a Path) -> Vec<&'a str> {
+    vec![
+        "export-pending",
+        s(dir),
+        "--key",
+        s(k),
+        "--device",
+        "ugv-01",
+        "--out-dir",
+        s(out),
+    ]
+}
+
+/// Review (WP4): `export-pending` streams the segments, so its memory is
+/// bounded by `--max-bytes` and one frame, not by the segment size
+/// (`blackbox.retention.segment_bytes` accepts 256 MiB; the service has
+/// `MemoryMax=320M`). A 60 MiB segment exported under a 96 MiB
+/// address-space limit.
+#[cfg(target_os = "linux")]
+#[test]
+fn export_pending_memory_does_not_grow_with_the_segment() {
+    let d = TestDir::new("cli-export-mem");
+    let k = d.sub("unit.key");
+    assert!(run(&["keygen", "--out", s(&k)]).status.success());
+    let key = KeyFile::load(&k).unwrap().signer().unwrap();
+    let dir = d.sub("log");
+    let mut c = cfg(&dir, big());
+    c.device_id = "ugv-01".into();
+    c.max_segment_bytes = 256 * 1024 * 1024;
+    let mut r = Recorder::open(c, key, clock()).unwrap();
+    let pad = "x".repeat(60 * 1024);
+    for i in 0..1000u64 {
+        recorded(
+            r.append_note(&serde_json::json!({ "i": i, "pad": pad }), false)
+                .unwrap(),
+        );
+    }
+    r.close().unwrap();
+    let biggest = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .max()
+        .unwrap();
+    assert!(biggest > 55 * 1024 * 1024, "{biggest}");
+    let out = d.sub("outbox");
+    std::fs::create_dir(&out).unwrap();
+    let mut args = export_args(&dir, &k, &out);
+    args.extend(["--max-bytes", "4194304"]);
+    let o = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v 98304 && exec \"$@\"")
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_robodr-blackbox"))
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{:?}: {}", o.status, text(&o));
+    assert!(text(&o).contains("exported seq"), "{}", text(&o));
+    let o = run(&args);
+    assert!(text(&o).contains("nothing pending"), "{}", text(&o));
+}
+
+/// Review (WP4): the timer's failure signal. Records dropped before they
+/// were exported: the CLI still writes the bundle of what is there, says
+/// so, and exits 1.
+#[test]
+fn export_pending_gap_writes_the_bundle_and_exits_1() {
+    let d = TestDir::new("cli-export-gap");
+    let k = d.sub("unit.key");
+    assert!(run(&["keygen", "--out", s(&k)]).status.success());
+    let key = KeyFile::load(&k).unwrap().signer().unwrap();
+    let dir = d.sub("log");
+    let mut c = cfg(&dir, RetentionMode::Cyclic { max_segments: 2 });
+    c.device_id = "ugv-01".into();
+    let mut r = Recorder::open(c, key, clock()).unwrap();
+    for i in 0..400 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    assert!(r.unexported_drops() > 0);
+    r.close().unwrap();
+    let out = d.sub("outbox");
+    std::fs::create_dir(&out).unwrap();
+    let o = run(&export_args(&dir, &k, &out));
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(
+        text(&o).contains("EVIDENCE LOST BEFORE EXPORT: records 0..="),
+        "{}",
+        text(&o)
+    );
+    let bundles: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(bundles.len(), 1, "{}", text(&o));
+    let v = run(&[
+        "verify",
+        s(&bundles[0]),
+        "--keyring",
+        s(&k),
+        "--device",
+        "ugv-01",
+    ]);
+    assert!(v.status.code().is_some(), "{}", text(&v));
+    assert!(dir.join(robodr_blackbox::store::CURSOR_FILE).exists());
+}
+
+/// Review (WP4): after `robodr-blackbox rotate`, an exporter still holding
+/// the old key (the timer's credential not yet replaced) is refused before
+/// it writes anything: it would re-export everything and overwrite the
+/// cursor the rotation re-signed with one the recorder ignores. The
+/// cursor-ignored warning names the likely cause.
+#[test]
+fn export_pending_with_a_superseded_key_is_refused() {
+    let d = TestDir::new("cli-export-stale-key");
+    let (k_old, dir) = log_with_key_file(&d);
+    let out = d.sub("outbox");
+    std::fs::create_dir(&out).unwrap();
+    // Export once, then rotate.
+    let o = run(&export_args(&dir, &k_old, &out));
+    assert!(o.status.success(), "{}", text(&o));
+    let k_new = d.sub("unit-2.key");
+    assert!(run(&[
+        "keygen",
+        "--out",
+        s(&k_new),
+        "--key-id",
+        "ugv-01-bb-2",
+        "--device",
+        "ugv-01"
+    ])
+    .status
+    .success());
+    let o = run(&rotate_args(&dir, &k_old, &k_new));
+    assert!(o.status.success(), "{}", text(&o));
+    let cursor = std::fs::read(dir.join(robodr_blackbox::store::CURSOR_FILE)).unwrap();
+    let before = std::fs::read_dir(&out).unwrap().count();
+    let o = run(&export_args(&dir, &k_old, &out));
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("rotat"), "{}", text(&o));
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), before);
+    assert_eq!(
+        std::fs::read(dir.join(robodr_blackbox::store::CURSOR_FILE)).unwrap(),
+        cursor,
+        "the re-signed cursor is untouched"
+    );
+    // With the new key (and the old public key for the records before the
+    // rotation) the export continues from the cursor.
+    let mut a = export_args(&dir, &k_new, &out);
+    let pub_old = format!("{}.pub", s(&k_old));
+    a.extend(["--previous-keys", &pub_old]);
+    let o = run(&a);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!text(&o).contains("cursor ignored"), "{}", text(&o));
+}

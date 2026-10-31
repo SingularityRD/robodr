@@ -5,8 +5,11 @@
 # pending (at most 64 bundles of 100000 records / 64 MiB) and exits.
 #
 # Checked against crates/robodr-blackbox (robodr-blackbox export-pending):
-#   * It reads the black box while agentd records (read only, one segment
-#     in memory at a time; its own export.lock, never agentd's lock), checks
+#   * It reads the black box while agentd records (read only, streaming one
+#     frame at a time: memory is about --max-bytes (64 MiB) plus one frame
+#     of at most 16 MiB whatever blackbox.retention.segment_bytes is; only a
+#     damaged segment is read whole from the damage on; its own
+#     export.lock, never agentd's lock), checks
 #     every record's hash, signature and link, writes each bundle durably,
 #     then advances the signed export cursor (export-cursor.json). agentd
 #     re-reads the cursor before cyclic retention would drop a segment
@@ -19,8 +22,14 @@
 #     robodr: the bundles are 0640 root:robodr for the transfer to the
 #     diode.
 #   * The cursor is signed with agentd's black-box key (LoadCredential
-#     below; the same file agentd loads). After a key rotation, add the
-#     retired public keys: ROBODR_BLACKBOX_EXPORT_ARGS="--previous-keys
+#     below; the same file agentd loads). `robodr-blackbox rotate` takes
+#     export.lock (it fails while a run is in progress: retry) and
+#     re-signs the cursor under the new key. Until the new key is installed
+#     as /etc/robodr/keys/agentd-blackbox.key (OPERATIONS 4.3 step 4) a run
+#     holding the old key is refused (exit 2: "the newest record ... is not
+#     signed by --key"), writing nothing and leaving the cursor alone. After
+#     a key rotation, add the retired public keys:
+#     ROBODR_BLACKBOX_EXPORT_ARGS="--previous-keys
 #     /etc/robodr/keys/agentd-blackbox-2025.key.pub".
 #   * Exit 1: records after the cursor were lost before they were exported
 #     (the bundles written still hold what is there; the receiver reports
@@ -31,7 +40,8 @@
 #   ROBODR_UNIT_ID=<robot id, agentd's robot.id>             (required)
 #   ROBODR_BLACKBOX_EXPORT_ARGS="--max-bundles 64"           (optional extra flags)
 #
-# Installed disabled. Enable on diode / media sites after commissioning:
+# Not installed by the package yet: copy both units to /etc/systemd/system/
+# (OPERATIONS 8.2) and enable on diode / media sites after commissioning:
 #   systemctl enable --now robodr-blackbox-export.timer
 # Verify after editing: systemd-analyze verify robodr-blackbox-export.service
 #                       systemd-analyze security robodr-blackbox-export.service

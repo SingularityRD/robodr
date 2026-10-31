@@ -2577,9 +2577,13 @@ impl<'a> Daemon<'a> {
             return;
         };
         let saturation = ret.mode == crate::retention::RetentionKind::Saturation;
-        for dev in self
-            .retention_watch
-            .observe(&st, ret.warn_percent, saturation)
+        // The recorder generation: a reopened recorder counts its drops
+        // from 0 again.
+        let generation = self.agent.stats().blackbox_reopens;
+        let now_ms = self.now_ms();
+        for dev in
+            self.retention_watch
+                .observe(&st, ret.warn_percent, saturation, generation, now_ms)
         {
             self.self_health("agentd:blackbox", dev);
         }

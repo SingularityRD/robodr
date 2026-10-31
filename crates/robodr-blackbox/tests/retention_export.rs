@@ -294,3 +294,80 @@ fn the_cursor_is_owned_like_the_directory() {
     assert_eq!((m.uid(), m.gid()), (4242, 4243));
     assert_eq!(m.mode() & 0o777, 0o600);
 }
+
+/// The exporter streams segments one frame at a time; bytes that are not
+/// a frame in the middle of a segment (damage) are resynchronised past as
+/// before: the bundle stops at the break and the next one names the lost
+/// record as a gap.
+#[test]
+fn a_damaged_frame_mid_segment_is_a_break_then_a_gap() {
+    let d = TestDir::new("t15-damaged");
+    let out = TestDir::new("t15-damaged-out");
+    let mut r = open(cfg(d.path(), big()));
+    let mut i = 0;
+    rotations(&mut r, 3, &mut i);
+    let head = r.head().unwrap().0;
+    drop(r);
+    let segs = robodr_blackbox::store::list_segments(d.path()).unwrap();
+    let victim = &segs[1].1;
+    let mut b = std::fs::read(victim).unwrap();
+    let at = b
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"RBF1")
+        .map(|(i, _)| i)
+        .nth(3)
+        .unwrap();
+    b[at] = b'X';
+    std::fs::write(victim, b).unwrap();
+    let opts = PendingOptions::default();
+    let (p1, _) = export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+        .unwrap()
+        .unwrap();
+    assert!(p1.gap.is_none());
+    assert!(p1.last_seq < head);
+    let (p2, _) = export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p2.gap, Some([p1.last_seq + 1, p1.last_seq + 1]));
+    assert_eq!(p2.first_seq, p1.last_seq + 2);
+    assert!(p2.last_seq <= head);
+}
+
+/// Review (WP4): a key rotation re-signs the newest export cursor on disk
+/// (one an exporter beside the recorder advanced since the recorder last
+/// read it), never an older copy held in memory: moving the cursor back
+/// would re-export records the far side already has.
+#[test]
+fn rotation_never_moves_the_export_cursor_backwards() {
+    let d = TestDir::new("t15-rotate-cursor");
+    let out = TestDir::new("t15-rotate-cursor-out");
+    let mut r = open(cfg(d.path(), big()));
+    for i in 0..10 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    let opts = PendingOptions::default();
+    export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+        .unwrap()
+        .unwrap();
+    assert!(r.refresh_export_state());
+    let held = r.retention_status().confirmed_export_seq.unwrap();
+    for i in 10..20 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    let (p, _) = export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+        .unwrap()
+        .unwrap();
+    assert!(p.last_seq > held);
+    let k2 = Ed25519SigningKey::from_seed("bb-2", &[2; 32]).unwrap();
+    let k2b = Ed25519SigningKey::from_seed("bb-2", &[2; 32]).unwrap();
+    r.rotate_key(Box::new(k2b), None, "test").unwrap();
+    let c = SignedCursor::from_json(&std::fs::read_to_string(d.path().join(CURSOR_FILE)).unwrap())
+        .unwrap();
+    assert_eq!(c.anchor.seq, p.last_seq, "cursor moved back to {held}");
+    assert_eq!(
+        k2.verify_own(&cursor_signing_message(&c.anchor), &c.sig),
+        Some(true)
+    );
+    assert_eq!(r.retention_status().confirmed_export_seq, Some(p.last_seq));
+}

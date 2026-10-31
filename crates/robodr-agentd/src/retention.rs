@@ -27,7 +27,9 @@
 //!   to this many segments beyond `segments`; only when that reserve is
 //!   used up is unexported evidence dropped.
 //! * Without a `retention` section the recorder's defaults apply (cyclic,
-//!   8 x 8 MiB, no reserve): what agentd did before.
+//!   8 x 8 MiB, no reserve; 12-14 h at the sizing table's soak rate):
+//!   segments are dropped whether exported or not, and drops of unexported
+//!   ones are reported (below).
 //!
 //! At start the configuration is checked against the black box's
 //! filesystem: the retention it describes (`(segments + reserve) x
@@ -39,18 +41,26 @@
 //!
 //! | condition | rule (detail prefix) | severity |
 //! |---|---|---|
-//! | unexported segments reach `warn_percent` of the capacity (protection on, or saturation mode) | `robot.agent.evidence_degraded` (`retention pressure:`) | Medium (High from 95 %) |
-//! | cyclic retention dropped unexported evidence (protection on) | `robot.agent.evidence_degraded` (`unexported evidence dropped:`) | High |
+//! | unexported segments reach `warn_percent` of the capacity (protection on, or saturation mode) | `robot.agent.evidence_degraded` (`retention pressure:`) | Medium; High from 95 % (raised again if the episode climbs there) |
+//! | cyclic retention dropped unexported evidence (protection on) | `robot.agent.evidence_degraded` (`unexported evidence dropped:`) | High, every new drop |
+//! | cyclic retention dropped unexported evidence (no reserve: plain cyclic, the default) | `robot.agent.evidence_degraded` (`unexported evidence dropped:`) | Medium, at most once a day with the count since the last report |
 //!
 //! Both use the catalogued `evidence_degraded` id for now: a dedicated id
 //! is a findings-contract minor bump, left to the next one.
 //!
 //! The pressure finding is raised once per episode (it clears below
-//! `warn_percent - 10`). With protection on and `warn_percent` 80, it comes
-//! at least `0.2 x (segments + reserve)` segment rotations before the first
-//! unexported drop; at the sizing table's write rates that is hours
-//! (docs/OPERATIONS.md 6.4, "Black-box sizing"). Plain cyclic retention
-//! without an exporter drops by design and raises neither finding.
+//! `warn_percent - 10`), and once more at High if an episode that started
+//! below 95 % reaches 95 %. With protection on and `warn_percent` 80, it
+//! comes at least `0.2 x (segments + reserve)` segment rotations before the
+//! first unexported drop; at the sizing table's write rates that is hours
+//! (docs/OPERATIONS.md 6.4, "Black-box sizing"). Plain cyclic retention has
+//! no pressure finding (without an exporter every segment is unexported, so
+//! it would always be full), but its drops of records no export confirmed
+//! are reported (Medium, at most once a day): on the default configuration
+//! a unit that nobody exports says so instead of losing evidence quietly.
+//! Drops are counted per recorder generation (`AgentStats::blackbox_reopens`):
+//! a reopened recorder counts from 0, and what the previous one dropped but
+//! was not yet reported is carried over.
 
 use robodr_blackbox::{RecorderConfig, RetentionMode, RetentionStatus};
 use robodr_events::{Deviation, Severity};
@@ -66,6 +76,10 @@ pub const EVIDENCE_RETENTION_PRESSURE: &str = crate::health::rules::EVIDENCE_DEG
 /// Cyclic retention dropped black-box evidence that had not been exported
 /// (same id, see [`EVIDENCE_RETENTION_PRESSURE`]).
 pub const EVIDENCE_UNEXPORTED_DROPPED: &str = crate::health::rules::EVIDENCE_DEGRADED;
+
+/// Plain cyclic retention (no pending-export reserve): unexported drops
+/// are reported at most this often (with the count since the last report).
+pub const PLAIN_DROP_REPORT_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Smallest segment size accepted.
 pub const MIN_SEGMENT_BYTES: u64 = 64 * 1024;
@@ -244,73 +258,158 @@ pub fn segments_bytes(dir: &std::path::Path) -> u64 {
 /// Turns successive [`RetentionStatus`] readings into findings (pure).
 #[derive(Debug, Clone, Default)]
 pub struct RetentionWatch {
-    warned: bool,
+    /// Severity raised in the current pressure episode.
+    warned: Option<Severity>,
+    /// Recorder generation the counters below belong to.
+    generation: Option<u64>,
+    /// Unexported drops of this generation already reported.
     drops_seen: u64,
+    /// Unexported drops of this generation at the last reading.
+    drops_last: u64,
+    /// Drops of earlier generations not reported yet.
+    drops_carried: u64,
+    /// When plain cyclic retention last reported drops.
+    plain_reported_ms: Option<u64>,
 }
 
 impl RetentionWatch {
     /// Findings for this reading. `saturation`: the store refuses instead
-    /// of dropping (pressure is reported there too).
+    /// of dropping (pressure is reported there too). `generation`
+    /// identifies the recorder (`AgentStats::blackbox_reopens`: a reopened
+    /// recorder counts its drops from 0 again); `now_ms` is a monotonic
+    /// clock for the plain-cyclic rate limit.
     pub fn observe(
         &mut self,
         st: &RetentionStatus,
         warn_percent: u8,
         saturation: bool,
+        generation: u64,
+        now_ms: u64,
     ) -> Vec<Deviation> {
         let mut out = Vec::new();
-        if !(st.protecting || saturation) {
-            return out;
+        if st.protecting || saturation {
+            self.pressure(st, warn_percent, saturation, &mut out);
         }
+        self.drops(st, saturation, generation, now_ms, &mut out);
+        out
+    }
+
+    fn pressure(
+        &mut self,
+        st: &RetentionStatus,
+        warn_percent: u8,
+        saturation: bool,
+        out: &mut Vec<Deviation>,
+    ) {
         let fill = st.unexported_fill_percent();
         let warn = u64::from(warn_percent);
-        if fill >= warn && !self.warned {
-            self.warned = true;
-            let sev = if fill >= 95 {
-                Severity::High
-            } else {
-                Severity::Medium
-            };
-            let then = if saturation {
-                "when it is full, non-critical records are refused"
-            } else {
-                "when it is full, the oldest unexported segment is dropped"
-            };
-            out.push(Deviation::new(
-                EVIDENCE_RETENTION_PRESSURE,
-                sev,
-                format!(
-                    "retention pressure: black-box evidence not yet exported fills {fill} % of the retention ({} of \
-                     {} segments, {} records after the export position {}); {then}: run the \
-                     export (robodr-blackbox export-pending) or check the diode / media path",
-                    st.unexported_segments,
-                    st.capacity_segments,
-                    st.unexported_records,
-                    st.confirmed_export_seq
-                        .map_or_else(|| "none".to_string(), |s| s.to_string()),
-                ),
-            ));
-        } else if self.warned && fill + 10 < warn {
-            self.warned = false;
+        if self.warned.is_some() && fill + 10 < warn {
+            self.warned = None;
+            return;
         }
-        // A reopened recorder counts from 0 again.
-        if st.unexported_drops < self.drops_seen {
+        if fill < warn {
+            return;
+        }
+        let sev = if fill >= 95 {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        // Once per episode, and once more if it climbs to High.
+        if self.warned == Some(Severity::High) || self.warned == Some(sev) {
+            return;
+        }
+        self.warned = Some(sev);
+        let then = if saturation {
+            "when it is full, non-critical records are refused"
+        } else {
+            "when it is full, the oldest unexported segment is dropped"
+        };
+        out.push(Deviation::new(
+            EVIDENCE_RETENTION_PRESSURE,
+            sev,
+            format!(
+                "retention pressure: black-box evidence not yet exported fills {fill} % of the \
+                 retention ({} of {} segments, {} records after the export position {}); \
+                 {then}: run the export (robodr-blackbox export-pending) or check the diode / \
+                 media path",
+                st.unexported_segments,
+                st.capacity_segments,
+                st.unexported_records,
+                st.confirmed_export_seq
+                    .map_or_else(|| "none".to_string(), |s| s.to_string()),
+            ),
+        ));
+    }
+
+    fn drops(
+        &mut self,
+        st: &RetentionStatus,
+        saturation: bool,
+        generation: u64,
+        now_ms: u64,
+        out: &mut Vec<Deviation>,
+    ) {
+        // A new recorder counts from 0: keep what the old one dropped and
+        // was not reported yet.
+        let reopened = self.generation.is_some_and(|g| g != generation)
+            || st.unexported_drops < self.drops_last;
+        if reopened {
+            self.drops_carried = self
+                .drops_carried
+                .saturating_add(self.drops_last.saturating_sub(self.drops_seen));
             self.drops_seen = 0;
         }
-        if st.protecting && st.unexported_drops > self.drops_seen {
-            let delta = st.unexported_drops - self.drops_seen;
-            self.drops_seen = st.unexported_drops;
-            out.push(Deviation::new(
+        self.generation = Some(generation);
+        self.drops_last = st.unexported_drops;
+        let new = st
+            .unexported_drops
+            .saturating_sub(self.drops_seen)
+            .saturating_add(self.drops_carried);
+        if new == 0 || saturation {
+            return;
+        }
+        let dev = if st.protecting {
+            Deviation::new(
                 EVIDENCE_UNEXPORTED_DROPPED,
                 Severity::High,
                 format!(
-                    "unexported evidence dropped: cyclic retention dropped {delta} black-box segment(s) holding evidence that \
-                     had not been exported (the pending-export reserve was used up; each drop \
-                     is a signed SegmentDropped record with exported: false): the evidence is \
-                     gone from the unit; check the export path and the sizing"
+                    "unexported evidence dropped: cyclic retention dropped {new} black-box \
+                     segment(s) holding evidence that had not been exported (the \
+                     pending-export reserve was used up; each drop is a signed SegmentDropped \
+                     record with exported: false): the evidence is gone from the unit; check \
+                     the export path and the sizing"
                 ),
-            ));
-        }
-        out
+            )
+        } else {
+            // Plain cyclic retention drops by design; say so, at most once
+            // a day, so a site that meant to export learns that it does not.
+            if self
+                .plain_reported_ms
+                .is_some_and(|t| now_ms.saturating_sub(t) < PLAIN_DROP_REPORT_MS)
+            {
+                return;
+            }
+            self.plain_reported_ms = Some(now_ms);
+            Deviation::new(
+                EVIDENCE_UNEXPORTED_DROPPED,
+                Severity::Medium,
+                format!(
+                    "unexported evidence dropped: cyclic retention dropped {new} black-box \
+                     segment(s) whose records no export had confirmed (each drop is a signed \
+                     SegmentDropped record with exported: false). No pending-export reserve \
+                     is configured (blackbox.retention.unexported_reserve_segments = 0), so \
+                     the black box keeps only its last {} segments; if this site exports the \
+                     black box (diode / media), set the reserve and run the export \
+                     (robodr-blackbox export-pending, OPERATIONS 8.2). Reported at most once \
+                     a day",
+                    st.capacity_segments
+                ),
+            )
+        };
+        self.drops_seen = st.unexported_drops;
+        self.drops_carried = 0;
+        out.push(dev);
     }
 }
 
@@ -375,14 +474,75 @@ mod tests {
         c.check_space(0, None).unwrap();
     }
 
+    /// Review (WP4): an episode that starts below 95 % is escalated to High
+    /// when it crosses 95 %, once.
+    #[test]
+    fn pressure_escalates_to_high_at_95_percent() {
+        let mut w = RetentionWatch::default();
+        let f = w.observe(&st(81, 100, 0, true), 80, false, 0, 0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert!(w.observe(&st(90, 100, 0, true), 80, false, 0, 0).is_empty());
+        let f = w.observe(&st(96, 100, 0, true), 80, false, 0, 0);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::High);
+        assert!(f[0].detail.starts_with("retention pressure:"));
+        assert!(w.observe(&st(99, 100, 0, true), 80, false, 0, 0).is_empty());
+        // Down and up again: a new episode.
+        assert!(w.observe(&st(10, 100, 0, true), 80, false, 0, 0).is_empty());
+        let f = w.observe(&st(85, 100, 0, true), 80, false, 0, 0);
+        assert_eq!(f[0].severity, Severity::Medium);
+    }
+
+    /// Review (WP4): a reopened recorder (new generation) counts drops from
+    /// 0; drops it made before the next reading are all reported, even when
+    /// its counter has already passed the old one.
+    #[test]
+    fn drops_are_counted_per_recorder_generation() {
+        let mut w = RetentionWatch::default();
+        let f = w.observe(&st(16, 16, 3, true), 80, false, 0, 0);
+        assert!(f.iter().any(|d| d.detail.contains("dropped 3 ")), "{f:?}");
+        // Reopened (generation 1) and already 4 drops since: 4 new ones.
+        let f = w.observe(&st(16, 16, 4, true), 80, false, 1, 0);
+        assert!(f.iter().any(|d| d.detail.contains("dropped 4 ")), "{f:?}");
+        assert!(w.observe(&st(16, 16, 4, true), 80, false, 1, 0).is_empty());
+    }
+
+    /// Review (WP4): plain cyclic retention (no reserve, the default) also
+    /// reports evidence dropped before any export confirmed it: Medium,
+    /// at most once a day with the count since the last report.
+    #[test]
+    fn plain_cyclic_reports_unexported_drops_once_a_day() {
+        let day = PLAIN_DROP_REPORT_MS;
+        let mut w = RetentionWatch::default();
+        assert!(w.observe(&st(8, 8, 0, false), 80, false, 0, 0).is_empty());
+        let f = w.observe(&st(8, 8, 1, false), 80, false, 0, 1_000);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_str(), EVIDENCE_UNEXPORTED_DROPPED);
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert!(f[0].detail.starts_with("unexported evidence dropped:"));
+        assert!(f[0].detail.contains("unexported_reserve_segments"));
+        // More drops within the day: held back, then reported together.
+        assert!(w
+            .observe(&st(8, 8, 5, false), 80, false, 0, 1_000 + day / 2)
+            .is_empty());
+        // A reopen in between carries what was not reported yet.
+        assert!(w
+            .observe(&st(8, 8, 2, false), 80, false, 1, 1_000 + day / 2 + 1)
+            .is_empty());
+        let f = w.observe(&st(8, 8, 2, false), 80, false, 1, 1_000 + day);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].detail.contains("dropped 6 "), "{}", f[0].detail);
+        assert!(w
+            .observe(&st(8, 8, 2, false), 80, false, 1, 1_000 + 3 * day)
+            .is_empty());
+    }
+
     #[test]
     fn pressure_once_per_episode_then_drops_reported_by_delta() {
         let mut w = RetentionWatch::default();
-        // Plain cyclic (no exporter): drops are by design, nothing raised.
-        assert!(w.observe(&st(8, 8, 5, false), 80, false).is_empty());
-        let mut w = RetentionWatch::default();
-        assert!(w.observe(&st(12, 16, 0, true), 80, false).is_empty());
-        let f = w.observe(&st(13, 16, 0, true), 80, false);
+        assert!(w.observe(&st(12, 16, 0, true), 80, false, 0, 0).is_empty());
+        let f = w.observe(&st(13, 16, 0, true), 80, false, 0, 0);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule_str(), EVIDENCE_RETENTION_PRESSURE);
         assert!(
@@ -391,27 +551,30 @@ mod tests {
             f[0].detail
         );
         assert_eq!(f[0].severity, Severity::Medium);
-        assert!(w.observe(&st(14, 16, 0, true), 80, false).is_empty());
-        let f = w.observe(&st(16, 16, 2, true), 80, false);
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].rule_str(), EVIDENCE_UNEXPORTED_DROPPED);
-        assert!(f[0].detail.starts_with("unexported evidence dropped:"));
+        assert!(w.observe(&st(14, 16, 0, true), 80, false, 0, 0).is_empty());
+        // Full: the episode escalates to High, and the drop is reported.
+        let f = w.observe(&st(16, 16, 2, true), 80, false, 0, 0);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].detail.starts_with("retention pressure:"));
         assert_eq!(f[0].severity, Severity::High);
-        assert!(f[0].detail.contains("dropped 2 "), "{}", f[0].detail);
-        assert!(w.observe(&st(16, 16, 2, true), 80, false).is_empty());
+        assert_eq!(f[1].rule_str(), EVIDENCE_UNEXPORTED_DROPPED);
+        assert!(f[1].detail.starts_with("unexported evidence dropped:"));
+        assert_eq!(f[1].severity, Severity::High);
+        assert!(f[1].detail.contains("dropped 2 "), "{}", f[1].detail);
+        assert!(w.observe(&st(16, 16, 2, true), 80, false, 0, 0).is_empty());
         // An export brings it down; the next episode warns again, High at 95 %.
-        assert!(w.observe(&st(2, 16, 2, true), 80, false).is_empty());
-        let f = w.observe(&st(16, 16, 2, true), 80, false);
+        assert!(w.observe(&st(2, 16, 2, true), 80, false, 0, 0).is_empty());
+        let f = w.observe(&st(16, 16, 2, true), 80, false, 0, 0);
         assert_eq!(f[0].severity, Severity::High);
-        // A reopened recorder counts drops from 0.
-        assert!(w.observe(&st(16, 16, 0, true), 80, false).is_empty());
-        let f = w.observe(&st(16, 16, 1, true), 80, false);
+        // A reopened recorder (generation 1) counts drops from 0.
+        assert!(w.observe(&st(16, 16, 0, true), 80, false, 1, 0).is_empty());
+        let f = w.observe(&st(16, 16, 1, true), 80, false, 1, 0);
         assert!(f
             .iter()
             .any(|d| d.detail.starts_with("unexported evidence dropped:")));
         // Saturation mode: pressure is reported without protection.
         let mut w = RetentionWatch::default();
-        let f = w.observe(&st(9, 10, 0, false), 80, true);
+        let f = w.observe(&st(9, 10, 0, false), 80, true, 0, 0);
         assert_eq!(f.len(), 1);
         assert!(f[0].detail.contains("refused"));
     }
