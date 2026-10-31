@@ -119,6 +119,7 @@ jobs:
           python3 scripts/check-detection-catalog.py --self-test
           python3 scripts/check-doc-facts.py --self-test
           scripts/ci-install-ebpf-toolchain.sh --self-test
+          scripts/ebpf-load-smoke.sh --self-test
       - name: Customer detection catalog in step with the rule catalog
         # docs/customer/detection-catalog.md's generated tables against
         # crates/robodr-ocsf/src/builder.rs (regenerate with --write).
@@ -195,7 +196,27 @@ jobs:
         # PURE_EXCLUDES only names members that exist (older cargo errors on
         # `--exclude` of an unknown package), see scripts/ci-pure-excludes.py.
         run: cargo clippy --workspace $PURE_EXCLUDES $CARGO_LOCKED --all-targets -- -D warnings
+      - name: External tools the tests require (minisign, rpm, Python validators)
+        # minisign: the signed-install tests below and robodr-ops'
+        # sensor_box_image (signed bundle before mkosi). rpm (rpm, rpmbuild,
+        # rpm2archive): the RPM bundle tests. The Python venv (first on PATH,
+        # so the tests' `python3 -I` uses it): jsonschema >= 4.18 for
+        # robodr-ocsf's external_validator, PyYAML and cryptography for its
+        # integrations_content (Ubuntu 24.04's python3-jsonschema is 4.10).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign rpm
+          minisign -v
+          python3 -m venv "$RUNNER_TEMP/pyval"
+          "$RUNNER_TEMP/pyval/bin/pip" install --disable-pip-version-check \
+            jsonschema==4.23.0 PyYAML==6.0.2 cryptography==44.0.0
+          echo "$RUNNER_TEMP/pyval/bin" >> "$GITHUB_PATH"
       - name: test
+        # The REQUIRE variables turn "tool missing, skipped" into a failure,
+        # so these tests cannot pass in CI without running.
+        env:
+          ROBODR_REQUIRE_MINISIGN_TEST: "1"
+          ROBODR_REQUIRE_EXTERNAL_VALIDATOR: "1"
         run: cargo test --workspace $PURE_EXCLUDES $CARGO_LOCKED
       - name: install-bundle.sh against a real dpkg and rpm (root; update/rollback tests)
         # The test binary is built as the runner user and run as root, so no
@@ -204,8 +225,6 @@ jobs:
         # a tampered extracted directory refused). rpm (rpm, rpmbuild,
         # rpm2archive): the RPM bundle tests, in a separate rpm root.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign rpm
           bin=$(cargo test -p robodr-fleet --test packaging $CARGO_LOCKED --no-run 2>&1 |
             sed -n 's/.*Executable tests\/packaging.rs (\(.*\))$/\1/p')
           test -x "$bin"

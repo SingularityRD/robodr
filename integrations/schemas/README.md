@@ -34,7 +34,8 @@ tampered findings and requires both this validator and the in-crate validator
 to reject them (undeclared keys are rejected by the schemas only: the crate
 tolerates unknown keys for forward compatibility). With
 `ROBODR_REQUIRE_EXTERNAL_VALIDATOR=1` a missing `python3`/`jsonschema` fails
-the test instead of skipping it; CI should set it.
+the test instead of skipping it; CI sets it (`.github/workflows/ci.yml`, pure
+job, with jsonschema, PyYAML and cryptography in a venv).
 
 ## Result against OCSF 1.1.0
 
