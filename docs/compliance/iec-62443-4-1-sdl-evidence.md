@@ -83,7 +83,7 @@ SL-C targets by the product owner.
 |---|---|
 | Protective-only scope: the control plane has no motion fields; nothing in the motion stack depends on RoboDR except in the opt-in inline gateway mode, whose failure behaviour is configured and documented | [`SECURITY.md`](../../SECURITY.md) "Scope"; [`docs/contracts/robodr.control-plane.md`](../contracts/robodr.control-plane.md) §4; [`safety-positioning.md`](safety-positioning.md) |
 | Defence in depth: policy validation, plan-time invariants, agentd's judgment, then the executor's own precheck and a safety re-check right before apply | [`crates/robodr-responder/README.md`](../../crates/robodr-responder/README.md), [`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md) |
-| Privilege separation: the only `CAP_NET_ADMIN` in the agent path is a separate executor process with no IP sockets; agentd keeps `CAP_NET_RAW` only | [`packaging/systemd/robodr-executor.service`](../../packaging/systemd/robodr-executor.service), [`packaging/systemd/robodr-agentd.service`](../../packaging/systemd/robodr-agentd.service) |
+| Privilege separation: the only `CAP_NET_ADMIN` in the agent path is a separate executor process with no IP sockets by default (the motion-adapter drop-in allows UDP to the adapters' peers only); agentd keeps `CAP_NET_RAW` only | [`packaging/systemd/robodr-executor.service`](../../packaging/systemd/robodr-executor.service), [`packaging/systemd/robodr-agentd.service`](../../packaging/systemd/robodr-agentd.service) |
 | Least privilege per service (capabilities, `IPAddressDeny`, syscall filters, credentials) with the reasons documented | [`packaging/README.md`](../../packaging/README.md), [`packaging/systemd/`](../../packaging/systemd/) |
 | Decision records | [`docs/adr/`](../adr/README.md) |
 
@@ -110,6 +110,14 @@ now an item of the release checklist ([`docs/RELEASE.md`](../RELEASE.md)
   `overflow-checks`), and `indexing_slicing` is not denied in the crates
   outside the list above (for example `robodr-blackbox`, `-diode`,
   `-seal`, `-depot`, `-fleet`);
+- the deny set is a crate-level attribute of each root, so it does not
+  reach the binary entry files that do not repeat it (`src/bin/*.rs`,
+  `src/main.rs`): it is in those of agentd, the executor, the gateway and
+  `robodr-enroll`, not in those of `robodr-uplink`, `robodr-kafka-publish`,
+  `robodr-spool-export`, `robodr-anchor-receiver`, `robodr-pulsard` and
+  the operator tools;
+- no fuzz target yet for `robodr-rtps` `secured_prefix` and
+  `robodr-blackbox` `remote_anchor` (`fuzz/README.md`);
 - the hand-written HTTP/1.1 server (agentd control plane, now fuzzed) and
   Kafka client remain (ADR-0007).
 

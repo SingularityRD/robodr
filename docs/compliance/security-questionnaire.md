@@ -67,7 +67,7 @@
 |---|---|---|---|---|
 | AIS-01 | Is a secure development lifecycle followed? | Partial | Evidence per 62443-4-1 practice; gaps listed (plan, training, human review). | [SDL evidence](iec-62443-4-1-sdl-evidence.md) |
 | AIS-02 | Memory-safe language? | Yes | Rust; `forbid(unsafe_code)` where possible, reviewed FFI elsewhere; eBPF probes (Pulsar) in C, kernel-verified. | [SDL evidence](iec-62443-4-1-sdl-evidence.md) "SI" |
-| AIS-03 | Static analysis and lint gates? | Yes | `clippy -D warnings`, panic-family calls and `clippy::indexing_slicing` denied in the daemons and parsers, `cargo fmt --check`. | [`docs/BUILD.md`](../BUILD.md) "CI jobs" |
+| AIS-03 | Static analysis and lint gates? | Yes | `clippy -D warnings`, panic-family calls and `clippy::indexing_slicing` denied in the daemons' library code and the parsers (not yet in several binary entry files: [known limitations](../customer/known-limitations.md)), `cargo fmt --check`. | [`docs/BUILD.md`](../BUILD.md) "CI jobs" |
 | AIS-04 | Dependency vulnerability scanning (SCA)? | Partial | `cargo deny` (advisories, licences, bans, sources) in CI; currently **failing** on RUSTSEC-2026-0387 (fix in progress). No scan of released tags yet. | [`deny.toml`](../../deny.toml); [third-party due diligence](third-party-due-diligence.md) §3 |
 | AIS-05 | Fuzzing? | Partial | 42 cargo-fuzz targets with smoke runs in the tests; 10 ran 630 s under libFuzzer without findings; no long campaigns; CI fuzz smoke job red on its first run. | [`fuzz/README.md`](../../fuzz/README.md); [4-2 gap analysis](iec-62443-4-2-gap-analysis.md) CR 3.5 |
 | AIS-06 | Independent penetration test? | No | None yet (SALES-READINESS C8). An end-to-end red team by an AI agent (2026-10-30) is recorded. | [`tools/e2e/RESULTS.md`](../../tools/e2e/RESULTS.md) "Wave-2 soak and red team" |
@@ -96,7 +96,7 @@
 | CEK-03 | Encryption at rest? | Partial | Only secure-delivery content is encrypted (sealed, TPM-bound). Evidence, findings and state are signed but rely on host full-disk encryption. | [data-handling.md](../customer/data-handling.md) §5 |
 | CEK-04 | Key storage and hardware protection? | Partial | Root-only key files delivered as systemd credentials; TPM used for the head anchor, sealing and the depot client key (swtpm-tested). Operational signing keys are files, not TPM-held (GAP-04). | [4-2 gap analysis](iec-62443-4-2-gap-analysis.md) CR 1.5 |
 | CEK-05 | Key rotation and revocation? | Partial | Uplink and finding key rotation with the SOC (`robodr-enroll`), black-box key rotation, revocation lists, CRLs on TLS paths. SOC side unreleased. | `docs/OPERATIONS.md` §4, §8.6 |
-| CEK-06 | Release signing key custody? | Owner | Key ceremony designed (offline root, two people) but **not held**; no release signed yet (SALES-READINESS C1). | [`docs/RELEASE.md`](../RELEASE.md) §2 |
+| CEK-06 | Release signing key custody? | Owner | Key ceremony designed (offline root, two people) but **not held**; no release signed yet (SALES-READINESS C1). Designed custody: the root key offline; the release key as an encrypted secret of the GitHub environment `release`, used online on a GitHub-hosted runner after two required reviewers approve, with an offline copy next to the root. | [`docs/RELEASE.md`](../RELEASE.md) §2 |
 
 ## 7. Logging, monitoring and evidence
 
@@ -126,7 +126,7 @@
 |---|---|---|---|---|
 | STA-01 | SBOM per release? | Partial | CycloneDX SBOM generated per build (CI job green); no release has shipped one; eBPF objects, Rust std and musl not yet in it. | [cra-readiness.md](cra-readiness.md) §3 |
 | STA-02 | Signed releases and integrity verification? | Partial | Minisign over every asset, verified before extraction; quorum-signed RPKs for air-gapped delivery. **No release has been signed yet.** | [`docs/RELEASE.md`](../RELEASE.md); `docs/OPERATIONS.md` §2 |
-| STA-03 | Build provenance (SLSA) and reproducible builds? | Partial | Pure binaries reproducible bit for bit (CI job green); no SLSA/in-toto provenance. | [`docs/BUILD.md`](../BUILD.md) "Reproducible builds" |
+| STA-03 | Build provenance (SLSA) and reproducible builds? | Partial | Pure binaries reproducible bit for bit (CI job green). The release workflow generates SLSA v1 provenance as an in-toto statement over every asset (`scripts/slsa-provenance.py`, minisign-signed) and a GitHub (Sigstore) build-provenance attestation, but from the same workflow that builds and signs; no SLSA build level is claimed and no release has produced either yet. | [`docs/BUILD.md`](../BUILD.md) "Reproducible builds" |
 | STA-04 | Third-party component due diligence? | Partial | Pulsar record with risk table and per-release review; lockfile policy and `cargo deny` for crates.io dependencies. | [third-party due diligence](third-party-due-diligence.md) |
 | STA-05 | Open-source licence compliance? | Yes | Licence policy in `deny.toml`; `THIRD_PARTY_NOTICES` and GPL-2.0 source offer ship in packages (offer wording awaits legal approval). | [`deny.toml`](../../deny.toml); `scripts/third_party_notices.py` |
 | CCC-01 | Change control for releases (review, approval)? | Partial | Release environment needs a second maintainer's approval; tag must be on `main`; never exercised. | [`docs/RELEASE.md`](../RELEASE.md) §3 |
@@ -140,7 +140,7 @@
 | DSP-01 | Data inventory and classification? | Yes | 17 flows with storage place, protection and retention; categories that identify people marked. | [data-handling.md](../customer/data-handling.md) |
 | DSP-02 | Does the vendor process customer personal data? | No | Only what a customer sends for support. | [data-handling.md](../customer/data-handling.md) §2 |
 | DSP-03 | Data minimisation and redaction? | Partial | Findings carry detections and evidence references, not raw telemetry; no option to redact user ids, process paths, addresses or operator names yet. | [data-handling.md](../customer/data-handling.md) §8 |
-| DSP-04 | Retention and secure deletion? | Partial | Size-bounded black box and export limits; decommissioning procedure; crypto-erase for sealed content only. | [data-handling.md](../customer/data-handling.md) §4, §6 |
+| DSP-04 | Retention and secure deletion? | Partial | Size-bounded black box and export limits; delivered findings stay in the spool's `acked/` until the size bound forces them out (no age-based retention; manual purge documented); decommissioning procedure; crypto-erase for sealed content only. | [data-handling.md](../customer/data-handling.md) §4, §6 |
 | DSP-05 | DPA available? | Owner | Not issued (C3). | — |
 
 ## 11. Resilience and availability

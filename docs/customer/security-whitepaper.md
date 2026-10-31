@@ -1,6 +1,6 @@
 # RoboDR security whitepaper
 
-> **Pre-release draft (refreshed 2026-10-26).** This describes the architecture as
+> **Pre-release draft (refreshed 2026-10-31).** This describes the architecture as
 > implemented in the repository at this date, and marks what is planned.
 > Claims are limited to what the code and its tests show. Nothing here has
 > been validated on a customer robot, and no external audit or penetration
@@ -24,11 +24,25 @@ It is **protective only**:
 It is **not a safety-rated component**
 ([`docs/compliance/safety-positioning.md`](../compliance/safety-positioning.md)).
 By default it **executes no response**: plans and SOC requests are
-recorded, not carried out. Two opt-in components can act, within narrow,
-reversible limits: executor v1 (network containment and, where the site
-configures OEM-validated platform adapters, motion actions) and the inline
-Motion Firewall gateway (motion-command filtering on a bridged sensor
-box). Section 7 lists exactly what each does.
+recorded, not carried out. Three opt-in components can act:
+
+- executor v1: network containment (reversible, TTL-bounded nftables
+  rules) and, where the site configures OEM-validated platform adapters,
+  motion actions; a `rollback_config` adapter runs the site's own rollback
+  program, whose effect RoboDR cannot undo;
+- the inline Motion Firewall gateway: motion-command filtering on a
+  bridged sensor box;
+- secure delivery (`robodr-deliverd`, root): it installs signed packages
+  with `dpkg` (their maintainer scripts run as root; a failed health check
+  rolls back to the previous version), and, with sealed delivery
+  configured, **crypto-erases** the unit's sealed keys on an operator
+  command or a platform tamper / attestation / authentication trigger.
+  The erase is **irreversible** (recovery is re-enrolment and
+  re-delivery); it also stops the services listed in `seal.stop_units`
+  and closes the runtime volume once the robot is idle or in a safe
+  state.
+
+Section 7 lists what each does.
 
 ## 2. Architecture
 
@@ -54,7 +68,7 @@ box). Section 7 lists exactly what each does.
 
 | Process | Privilege | Network |
 |---|---|---|
-| `robodr-agentd` | User `robodr`, `CAP_NET_RAW` only, syscall filter, `ProtectSystem=strict`, `MemoryMax=512M` | Passive capture only. `IPAddressDeny=any`: agentd opens no IP connection. |
+| `robodr-agentd` | User `robodr-agentd`, `CAP_NET_RAW` only, syscall filter, `ProtectSystem=strict`, `MemoryMax=512M` | Passive capture. `IPAddressDeny=any`: by default agentd opens no IP connection. Opt-in, each only to the addresses of an `IPAddressAllow=` drop-in: the control plane's inbound mutual-TLS listener (`30-control-plane.conf.example`), and an outbound TLS connection to a remote head-anchor receiver (`blackbox.head_anchor` kind `remote`). |
 | `robodr-pulsard` | root. Pulsar's eBPF probes load into the kernel. Bounded capabilities. | Local only |
 | `robodr-uplink` | User `robodr` | Only the SOC address in its drop-in. TLS. |
 | `robodr-spool-export` | User `robodr` | None (`PrivateNetwork=yes`) |
@@ -62,7 +76,7 @@ box). Section 7 lists exactly what each does.
 | `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only; changes only the nftables table `inet robodr`; writes only its journal directory (`/var/lib/robodr/executor`; the motion drop-in adds the gateway's restriction directory); runs `nft` and motion adapters with an argument vector and an empty environment | None by default: `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any`. Motion adapters need a drop-in (`robodr-executor.service.d/40-motion.conf.example`) that adds `AF_INET` and allows exactly their peers |
 | `robodr-firewall-gw` (inline sensor box, opt-in) | User `robodr-gw`, `CAP_NET_ADMIN` only (NFQUEUE), FIFO priority 40, watchdog 2 s | `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any`; it never originates a datagram, and the bridge needs no IP address |
 | `robodr-anchor-receiver` (off-robot) | `DynamicUser=yes`, no capabilities | Its listen address; TLS (mutual TLS optional) |
-| `robodr-deliverd` (secure delivery, opt-in) | root, no ambient capabilities (it installs packages and drives the TPM) | None (`PrivateNetwork=yes`, `IPAddressDeny=any`); releases arrive from the site depot or on media |
+| `robodr-deliverd` (secure delivery, opt-in) | root, no ambient capabilities (it installs packages, drives the TPM and crypto-erases) | None by default (`PrivateNetwork=yes`, `IPAddressDeny=any`; releases on media). LAN delivery (`robodr-deliverd.service.d/50-depot-lan.conf.example`) opens mutual TLS to the site depot's address only |
 | `robodr-depot` (site depot, off-robot) | User `robodr-depot`, no capabilities | Its LAN listen address |
 | `robodr-enroll` (run by the operator) | root (`sudo`), no daemon; it reads the enrollment token only from a file closed to group and others (owned by root) or from standard input, never from the command line | Only the SOC's fleet API, TLS; air-gapped units exchange a request and an answer file on media instead |
 
@@ -90,8 +104,14 @@ Unit files and the reasons behind them:
 
 All keys are Ed25519 (the audited `ed25519-dalek` crate, strict
 verification) in the `robodr-blackbox-key/v2` file format. Secret files
-are `0600 root`, and services receive them only as systemd credentials. No
-tool accepts a key on its command line.
+are `0600 root`, and services receive them as systemd credentials. No
+tool accepts a key on its command line. Two exceptions: the site depot
+(off the robot) reads its keys by path from `/etc/robodr-depot/keys`
+(0700, owned by its user `robodr-depot`), because the operator's depot
+commands load the same keys; and on `robodr-focal` (systemd 245, no
+`LoadCredential=`) a root helper copies each credential to
+`/run/credentials/<unit>/` on a tmpfs, which can be swapped out, unlike
+systemd's credential store (encrypt swap or run without it).
 
 | Key | Lives | Signs |
 |---|---|---|
@@ -106,7 +126,8 @@ tool accepts a key on its command line.
 | Profile-signing key | commissioning station, never the robot | locked profiles |
 | Trust roots | offline station or token | profile trust files, revocation lists |
 | Operator keys | each operator | commissioning sign-off |
-| Release key | SingularityRD, offline | releases (minisign) |
+| Release key | GitHub environment `release` of the RoboDR repository (encrypted minisign secret key and its password as environment secrets), used online by the release workflow's publish job on a GitHub-hosted runner after two required reviewers approve; an offline copy stays with the root key. Not generated yet: no release has been signed | releases (minisign) |
+| Release root key | SingularityRD, offline | the statement that names the current release key |
 
 Limits:
 
@@ -206,9 +227,10 @@ action tools in every agent; this is not released yet.
 | SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor`, after its own precheck and a safety-state re-check right before apply; states `verified` / `refused` / `failed` / `reverted` are signed and journalled. `restrict_motion`, `safe_pause`, `request_safe_state` and `rollback_config` are recorded or refused unless the site configures a platform adapter for them **and** sets its `oem_validated: true` (`gateway`, `unitree_sport`, `nav2`, `ros2_control`, `px4`, `rollback`); pause, safe state and rollback then need two distinct human approvers and are never executed on a humanoid ([support matrix](support-matrix.md#response-actions)). |
 | Motion Firewall, passive modes | Decides per command and per joint frame; **recording only**. |
 | Motion Firewall, inline gateway (opt-in) | Passes, limits in place, holds (humanoid: never damping or limp) or removes motion samples that cross the bridge; never originates a datagram; `fail_closed` by default when it is down. Its limits are configuration, not SOC actions. |
-| Processes RoboDR starts | None on the robot's behalf. |
+| Processes RoboDR starts | No process of the robot's own. Its components run tools with an argument vector: the executor `nft`, the configured motion adapters and (`rollback_config`) the site's rollback program; deliverd `dpkg` / `dpkg-deb` / `dpkg-query` (package maintainer scripts run as root), `systemctl` (health checks, the erase lockdown), `mount` / `umount`, `cryptsetup`, the `tpm2-tools` and the site's configured rules reload and validator commands; agentd the `tpm2-tools` for a TPM head anchor. |
 | Code loaded into the kernel | Pulsar's eBPF probes (GPL-2.0), only by `robodr-pulsard`, only where enabled. |
-| Network transmission from agentd | None (passive capture; IP denied). |
+| Network transmission from agentd | None by default (passive capture; IP denied). Opt-in: answers on the control plane's mutual-TLS listener, and marks to a remote head-anchor receiver, each to the addresses its `IPAddressAllow=` drop-in names. |
+| Secure delivery (`robodr-deliverd`, opt-in) | Installs quorum-signed packages with `dpkg` after a safety-state check, rolls back on a failed health check. Crypto-erase (sealed delivery only): destroys the unit's sealed keys at once, in every safety state, and **cannot be undone**; stopping `seal.stop_units` and closing the runtime volume wait until the robot is idle, in a safe state or e-stopped. Triggers: an operator command, or the platform's tamper / attestation / authentication input on a peer-checked socket ([OPERATIONS](../OPERATIONS.md) §12.6, §12.8). |
 
 **Implemented, not yet validated by an OEM:** `restrict_motion` as a SOC
 action through the gateway (run with the real gateway in a lab soak) and
@@ -243,9 +265,12 @@ the de-energising actions are never executable
 - Exporters are crash-safe and at-least-once. A batch the SOC keeps
   refusing blocks later findings visibly, and is never dropped.
 - `panic = "abort"`: a panic stops the daemon until systemd restarts it.
-  Panic-family calls are denied in the daemon crates' non-test code, and a
-  process-level test checks that the black box verifies across an abort
-  and restart.
+  Panic-family calls are denied in the non-test library code of the
+  daemon crates and in the entry files of agentd, the executor and the
+  gateway (not yet in the entry files of the exporters, the anchor
+  receiver and pulsard; [`known-limitations.md`](known-limitations.md)),
+  and a process-level test checks that the black box verifies across an
+  abort and restart.
 
 ## 9. Supply chain
 
@@ -257,7 +282,12 @@ the de-energising actions are never executable
   delivered out of band.
 - **Not yet:**
   - a real release;
-  - SLSA or cosign provenance;
+  - an independently produced provenance. The release workflow writes
+    SLSA v1 provenance (`robodr-<ver>.intoto.jsonl`, an in-toto statement
+    over every asset, minisign-signed like the assets) and a GitHub
+    (Sigstore) build-provenance attestation of every asset, but both come
+    from the same workflow that builds and signs, and neither has been
+    produced for a real release yet; no SLSA build level is claimed;
   - a reproducibility check of the Pulsar-bound binary;
   - a green CI run on GitHub (the first complete run, 2026-10-30, failed
     several jobs).

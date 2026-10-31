@@ -70,7 +70,7 @@ adds to the "at rest" column.
 |---|---|---|---|---|---|---|---|---|
 | F1 | Capture and parsing (`robodr-agentd`) | Packets of the robot network, in memory only | Not stored | — | — | — | Not kept | — |
 | F2 | Black box | Findings, deviations, decisions, control-plane requests with signatures and operator names, executor events, profile acceptance, safety-state changes | `/var/lib/robodr/blackbox/agentd` on the unit (example configuration) | — | No | Ed25519-signed, hash-chained | Ring of 8 segments × 8 MiB (oldest dropped with a signed record) | `blackbox` section of `agentd.json`; deletion: segment rotation, or the whole store at decommissioning (OPERATIONS §9). Single records cannot be deleted without breaking the chain. |
-| F3 | Findings spool | Findings (OCSF Detection Finding in the `robodr.findings` envelope) | `/var/lib/robodr/spool/agentd` | — | No | Optional per-finding signatures | Until an exporter has delivered them; `done/` markers (ids only) 30 days | `robodr-export` README "Retention"; dead-letter files are never deleted by default (they may be the only copy) |
+| F3 | Findings spool | Findings (OCSF Detection Finding in the `robodr.findings` envelope) | `/var/lib/robodr/spool/agentd` | — | No | Optional per-finding signatures | **Not deleted on delivery.** A delivered finding moves to `acked/` and stays until the spool bound (`ready/` + `acked/`: 64 MiB or 10,000 files) forces the oldest out, which on a quiet unit can take months; undelivered findings are never deleted. No age-based retention yet. Exporters' `done/` markers (ids only) 30 days | `spool.max_bytes` / `spool.max_files` in `agentd.json`; purge `acked/` by age as in OPERATIONS §8.3 ("Delivered findings stay on the unit"); `rejected/` records and dead-letter files are never deleted by default (they may be the only copy; `robodr-export` README "Retention") |
 | F4 | Uplink to your SOC (`robodr-uplink`) | Findings in signed NDJSON batches | Your SOC | TLS (rustls), your CA, optional SPKI pin, CRL | Your SOC's | Ed25519 batch signature | Your SOC's policy | [`robodr.ingest-api`](../contracts/robodr.ingest-api.md) |
 | F5 | Kafka export (`robodr-kafka-publish`) | Findings | Your brokers | TLS by default (plain TCP only if explicitly allowed); optional mutual TLS, SASL/SCRAM | Your brokers' | Optional per-finding signatures | Proposed topic retention 7 days | [`robodr.findings`](../contracts/robodr.findings.md) §7 |
 | F6 | Diode / media (`robodr-spool-export`) | Findings and black-box bundles | Media, then your SOC | No (signed, not encrypted): protect the media physically | No | Ed25519, hash chain, Reed-Solomon parity | Until you delete the media | OPERATIONS; diode README |
@@ -89,13 +89,31 @@ adds to the "at rest" column.
 ## 5. Protection measures
 
 - **Access on the unit:** every service has its own system user and the
-  minimum capabilities; key files are `0600 root` and reach services only
-  as systemd credentials; state directories are not world-readable
-  ([`packaging/README.md`](../../packaging/README.md)).
-- **Network:** `robodr-agentd`, the executor, the gateway, deliverd and
-  spool-export cannot open IP connections (`IPAddressDeny=any` or
-  `PrivateNetwork=yes`); the exporters may reach only the addresses in
-  their drop-ins.
+  minimum capabilities; key files are `0600 root` and reach services as
+  systemd credentials; state directories are not world-readable
+  ([`packaging/README.md`](../../packaging/README.md)). Two exceptions:
+  the site depot's keys (`/etc/robodr-depot/keys`, directory 0700) belong
+  to its own user `robodr-depot` and are read by path, because the
+  operator's depot commands load the same keys; and on `robodr-focal`
+  (systemd 245, no `LoadCredential=`) a helper copies each credential to
+  `/run/credentials/<unit>/`, a tmpfs that can be swapped out, not
+  systemd's non-swappable credential store: encrypt swap or run without
+  it where that matters ([`docs/UNITREE.md`](../UNITREE.md) 3.2).
+- **Network:** by default `robodr-agentd`, the executor, the gateway,
+  deliverd and spool-export open no IP connection (`IPAddressDeny=any` or
+  `PrivateNetwork=yes`), and the exporters reach only the addresses in
+  their drop-ins. Opt-in features open the following flows, each only to
+  the addresses its `IPAddressAllow=` drop-in names:
+  - agentd, control plane (`robodr-agentd.service.d/30-control-plane.conf.example`):
+    an inbound mutual-TLS listener (`control_plane.listen_tcp`) for the
+    SOC's networks;
+  - agentd, remote head anchor (`blackbox.head_anchor` kind `remote`): an
+    outbound TLS connection to your anchor receiver (allow its address in
+    a drop-in);
+  - executor, motion adapters (`robodr-executor.service.d/40-motion.conf.example`):
+    UDP to the configured ROS 2 / PX4 peer of each adapter;
+  - deliverd, LAN delivery (`robodr-deliverd.service.d/50-depot-lan.conf.example`):
+    mutual TLS to your site depot.
 - **Integrity:** evidence, findings, requests, answers and fleet documents
   are signed (Ed25519); attacker-chosen strings are marked and escaped in
   findings (SR-TAINT), so a SOC can show them safely.

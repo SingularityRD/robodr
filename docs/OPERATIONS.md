@@ -2132,7 +2132,11 @@ set: SNI and the verified name are the same); `server_spki_sha256`
 for a receiver with `client_ca`. All paths absolute; the key file needs
 no access for others and no group write; give it to agentd through a
 `LoadCredential=anchor-tls.key:/etc/robodr/anchor/ugv-07.key` drop-in
-(section 6.4 explains drop-ins). A TLS failure is an anchor failure (the
+(section 6.4 explains drop-ins). agentd's unit denies every IP address
+(`IPAddressDeny=any`), so the same drop-in must also allow the receiver
+(`IPAddressAllow=10.20.0.1/32` for the example above); without it every
+delivery fails and is counted as an anchor failure. This outbound
+connection is the only one agentd opens. A TLS failure is an anchor failure (the
 robot keeps recording, `anchor_failures` counts it); there is no fallback
 to plain TCP. Each exchange is bounded as a whole (connect within
 `timeout_ms`, then handshake, request and answer within three times it),
@@ -3342,6 +3346,35 @@ wrong user or password, or the mechanism is not enabled for that user. `UNKNOWN_
 DESCRIBE on the findings topic (default `robodr.findings`) to the
 publisher's principal.
 
+**Delivered findings stay on the unit.** Every exporter (spool-export,
+kafka-publish, uplink) acknowledges a delivered record by moving it from
+`<spool>/ready/` to `<spool>/acked/`; nothing deletes it on delivery.
+agentd deletes `acked/` records, oldest first, only when a new record would
+exceed the spool bound (`spool.max_bytes` / `spool.max_files` in
+`agentd.json`, default 64 MiB / 10,000 files for `ready/` and `acked/`
+together); undelivered records in `ready/` are never deleted. On a unit
+that reports a few findings a day, delivered findings (which can carry
+personal data: operator names, addresses, process names) can therefore stay
+for months. `rejected/` records are kept unless the exporter's
+`--rejected-max-*` bounds are set (above). There is no age-based retention
+for `acked/` yet. To purge by age, delete old `acked/` records, but keep the
+newest one: agentd numbers new records after the highest one in `ready/`
+and `acked/` when it starts, and an emptied spool would reuse numbers the
+exporters have already seen:
+
+```sh
+A=/var/lib/robodr/spool/agentd/acked
+keep=$(sudo ls "$A" | sort | tail -n 1)
+sudo find "$A" -maxdepth 1 -name '*.json' ! -name "$keep" -mtime +30 -delete
+```
+
+(`-mtime +30`: written more than 30 days ago; a move into `acked/` keeps
+the file's time.) Run it from a timer or cron job to keep a fixed
+retention (agentd tolerates records removed under it: it rescans the
+spool before it prunes or refuses a record). Lowering
+`spool.max_files` / `spool.max_bytes` also shortens it, at the cost of
+headroom for an exporter that falls behind.
+
 ### 8.4 Journal
 
 ```sh
@@ -3680,18 +3713,23 @@ The package never deletes evidence or keys, not even on `apt purge`. The
 end-of-life checklist, with the commands and the proof each step leaves,
 is [`DECOMMISSION.md`](DECOMMISSION.md); run its steps in this order:
 
-1. Export the evidence (section 8) and have the far side verify it.
-2. Stop every RoboDR service, not only agentd and pulsard.
+1. Export the evidence (section 8): every black-box chain and the fleet
+   journal, with every black-box public key including retired ones, and
+   have the far side verify it.
+2. Stop every RoboDR unit that is installed (one at a time: the set
+   differs between `robodr` and `robodr-focal`), timers included.
 3. Inline units: take the Motion Firewall gateway out of the path.
    Stopping it or purging the package leaves its rules in place, and with
    `fail_closed` the bridge keeps dropping motion commands (section 6.6).
 4. Retire the unit's keys at the SOC (`robodr-enroll decommission`, signed
-   receipt).
+   receipt), then export and verify the evidence again (the shutdown
+   records and the decommission note); nothing is destroyed before that.
 5. Revoke the unit at the site depot (`robodr-depot unit revoke`).
 6. Remove the unit from the anchor receiver.
 7. Release its TPM resources (`tpm2_nvundefine`, `robodr-seal erase`).
 8. Purge the package, then destroy and sanitise the data per NIST SP
-   800-88 (`shred` is best effort on flash media).
+   800-88 (`shred` is best effort on flash media). On the sensor-box
+   image (read-only root) sanitise its `var` partition instead.
 
 ## 10. Troubleshooting
 

@@ -96,6 +96,19 @@ Checks (``--only`` takes these names):
       2.39" of a 24.04 build); a mention right after a history marker (see
       contract-version) is not checked.
 
+  install-sequence
+      Source: the first-installation code block of docs/OPERATIONS.md
+      section 3 (the first fenced block after "*First installation*"): copy
+      the tarball once into a root-owned 0700 directory, then verify,
+      extract and install that copy. It must copy (``cp``) before it
+      verifies (``minisign -V``), and its ``--tarball`` must name the copy.
+      * in the install documents (INSTALL_DOCS below), every fenced block
+        that extracts a tarball (``tar -x``) or runs an ``install-bundle.sh
+        install`` from anywhere but /usr/lib/robodr/ is that block,
+        verbatim apart from indentation, and each document has one: a
+        quick-start that verifies one read of the media and extracts
+        another (a swap in between runs unverified code as root) fails.
+
   pulsar-pin
       Source: the gitlink of vendor/pulsar in HEAD. The Pulsar
       due-diligence record names that commit in full, and
@@ -156,6 +169,16 @@ STAMPED_DOCS = (
 # Further documents whose evidence links must resolve.
 EVIDENCE_DOCS = ("SECURITY.md",)
 
+# Documents that give the first-installation commands; each must repeat
+# OPERATIONS section 3's block (install-sequence).
+INSTALL_DOCS = (
+    "docs/customer/quick-start.md",
+    "docs/UNITREE.md",
+)
+OPERATIONS_MD = "docs/OPERATIONS.md"
+FIRST_INSTALL_MARK = "*First installation*"
+FENCE_RE = re.compile(r"^([ \t]*)```[a-z]*\n(.*?)^[ \t]*```[ \t]*$", re.MULTILINE | re.DOTALL)
+
 DUE_DILIGENCE_MD = "docs/compliance/third-party-due-diligence.md"
 PULSAR_INTEGRATION_MD = "docs/PULSAR-INTEGRATION.md"
 
@@ -180,6 +203,7 @@ CHECKS = (
     "evidence-links",
     "pulsar-pin",
     "glibc-floor",
+    "install-sequence",
 )
 
 LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
@@ -759,6 +783,62 @@ def check_glibc_floor(root: Path) -> list[str]:
     return errs
 
 
+def fenced_blocks(text: str) -> list[tuple[int, str]]:
+    """(offset, body) of every fenced code block, the fence's indentation removed."""
+    out: list[tuple[int, str]] = []
+    for m in FENCE_RE.finditer(text):
+        indent = len(m.group(1))
+        lines = [ln[indent:] if ln[:indent].strip() == "" else ln for ln in m.group(2).split("\n")]
+        out.append((m.start(), "\n".join(ln.rstrip() for ln in lines).strip("\n")))
+    return out
+
+
+def is_install_block(body: str) -> bool:
+    """A block that extracts a bundle or runs a bundle's own installer."""
+    if re.search(r"\btar\s+-?[a-z]*x", body):
+        return True
+    for m in re.finditer(r"(\S*)install-bundle\.sh\s+install\b", body):
+        if m.group(1) != "/usr/lib/robodr/":
+            return True
+    return False
+
+
+def check_install_sequence(root: Path) -> list[str]:
+    ops = read(root, OPERATIONS_MD)
+    at = ops.find(FIRST_INSTALL_MARK)
+    blocks = [b for off, b in fenced_blocks(ops) if off > at] if at >= 0 else []
+    if not blocks:
+        raise SourceError(f"{OPERATIONS_MD}: no code block after '{FIRST_INSTALL_MARK}'")
+    ref = blocks[0]
+    errs: list[str] = []
+    # The reference itself must be the safe order: one copy, then every
+    # read of the copy only.
+    cp = re.search(r"^sudo cp -- .*?(/root/\S+)/$", ref, re.MULTILINE)
+    verify = ref.find("minisign -V")
+    if not cp or verify < 0 or cp.start() > verify:
+        errs.append(f"{OPERATIONS_MD}: the first-installation block does not copy the tarball "
+                    "into a root-owned directory before it verifies it")
+    elif not re.search(r"--tarball\s+" + re.escape(cp.group(1)) + r"/", ref):
+        errs.append(f"{OPERATIONS_MD}: the first-installation block's --tarball does not name "
+                    f"the copy in {cp.group(1)}")
+    for rel in INSTALL_DOCS:
+        text = read(root, rel)
+        found = False
+        for off, body in fenced_blocks(text):
+            if not is_install_block(body):
+                continue
+            if body == ref:
+                found = True
+                continue
+            errs.append(
+                f"{rel}:{line_of(text, off)}: install block differs from {OPERATIONS_MD} "
+                f"section 3 ('{FIRST_INSTALL_MARK}'); copy that block verbatim"
+            )
+        if not found:
+            errs.append(f"{rel}: no copy of the {OPERATIONS_MD} section 3 first-installation block")
+    return errs
+
+
 def check_pulsar_pin(root: Path) -> list[str]:
     r = git(root, "ls-tree", "HEAD", "vendor/pulsar")
     m = re.match(r"160000 commit ([0-9a-f]{40})\t", r.stdout)
@@ -807,6 +887,8 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
                 errs += check_evidence_links(root)
             elif name == "glibc-floor":
                 errs += check_glibc_floor(root)
+            elif name == "install-sequence":
+                errs += check_install_sequence(root)
             elif name == "pulsar-pin":
                 if skip_git:
                     notes.append("pulsar-pin: SKIPPED (--skip-git); the Pulsar pin was not checked")
@@ -818,6 +900,17 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
 
 
 # --------------------------------------------------------------- self-test
+
+FIRST_INSTALL = (
+    "sudo install -d -m 0700 -o root -g root /root/r\n"
+    "sudo cp -- t.tar.gz t.tar.gz.minisig /root/r/\n"
+    "sudo minisign -V -p k.pub -m /root/r/t.tar.gz\n"
+    "#   the trusted comment must name t.tar.gz\n"
+    "sudo tar -xzf /root/r/t.tar.gz -C /root/r\n"
+    "sudo sh /root/r/t/install-bundle.sh install \\\n"
+    "    --pubkey k.pub \\\n"
+    "    --tarball /root/r/t.tar.gz\n"
+)
 
 GOOD_TREE: dict[str, str] = {
     "Cargo.toml": (
@@ -916,6 +1009,21 @@ GOOD_TREE: dict[str, str] = {
         '            AdapterKind::Gateway => "gateway",\n            AdapterKind::Nav2 => "nav2",\n'
         "        }\n    }\n}\n"
     ),
+    # install-sequence: the reference block, a verbatim copy (and an upgrade
+    # block, which is not checked), an indented copy in a list.
+    OPERATIONS_MD: (
+        "## 3. Install\n\n*First installation*. Copy once:\n\n```sh\n" + FIRST_INSTALL + "```\n\n"
+        "*Upgrades*:\n\n```sh\nsudo sh /usr/lib/robodr/install-bundle.sh install --tarball t.tar.gz\n```\n"
+    ),
+    "docs/customer/quick-start.md": (
+        "## 2. Install\n\n```sh\n" + FIRST_INSTALL + "```\n\nUpgrades:\n\n"
+        "```sh\nsudo sh /usr/lib/robodr/install-bundle.sh install --tarball t.tar.gz\n```\n"
+    ),
+    "docs/UNITREE.md": (
+        "2. **Install**:\n\n   ```sh\n"
+        + "".join("   " + ln + "\n" if ln else "\n" for ln in FIRST_INSTALL.splitlines())
+        + "   ```\n"
+    ),
     EXECUTOR_README: (
         "# x\n\n## Motion adapters (Sprint 8)\n\n| Action | Adapter | Apply | Revert |\n"
         "|---|---|---|---|\n| `move_less` | `gateway` | a | b |\n| `pause` | `nav2` | a | b |\n\n## Next\n"
@@ -985,6 +1093,24 @@ MUTATIONS = (
      "names glibc 2.36"),
     ("glibc-floor", "scripts/check-glibc-floor.sh", "DEB_FLOOR=2.35", "DEB_FLOOR=2.31",
      "names glibc 2.35; the robodr package needs 2.31"),
+    ("install-sequence", "docs/customer/quick-start.md",
+     "sudo install -d -m 0700 -o root -g root /root/r\nsudo cp -- t.tar.gz t.tar.gz.minisig /root/r/\n"
+     "sudo minisign -V -p k.pub -m /root/r/t.tar.gz\n",
+     "minisign -V -p k.pub -m t.tar.gz\nsudo mkdir -m 0700 /root/r\n",
+     "quick-start.md:3: install block differs from docs/OPERATIONS.md"),
+    ("install-sequence", "docs/customer/quick-start.md", "    --tarball /root/r/t.tar.gz\n",
+     "    --tarball t.tar.gz\n", "quick-start.md:3: install block differs"),
+    ("install-sequence", "docs/customer/quick-start.md", "Upgrades:\n\n",
+     "Or:\n\n```sh\nsudo sh ./t/install-bundle.sh install --tarball t.tar.gz\n```\n\n",
+     "quick-start.md:16: install block differs"),
+    ("install-sequence", "docs/UNITREE.md", "   sudo tar -xzf /root/r/t.tar.gz -C /root/r\n", "",
+     "UNITREE.md: no copy of the docs/OPERATIONS.md section 3"),
+    ("install-sequence", OPERATIONS_MD, "sudo cp -- t.tar.gz t.tar.gz.minisig /root/r/\n"
+     "sudo minisign -V -p k.pub -m /root/r/t.tar.gz\n",
+     "sudo minisign -V -p k.pub -m /root/r/t.tar.gz\nsudo cp -- t.tar.gz t.tar.gz.minisig /root/r/\n",
+     "does not copy the tarball into a root-owned directory before it verifies it"),
+    ("install-sequence", OPERATIONS_MD, "    --tarball /root/r/t.tar.gz\n```", "    --tarball t.tar.gz\n```",
+     "--tarball does not name the copy in /root/r"),
     ("pulsar-pin", DUE_DILIGENCE_MD, "`PULSAR`", "`" + "a" * 40 + "`", "review the bump"),
     ("pulsar-pin", PULSAR_INTEGRATION_MD, "PULSHORT", "abcdef1", "verified against abcdef1"),
     ("stamps", "docs/customer/data-handling.md", "> Verified at commit `STAMP`.\n", "> Reviewed.\n",
@@ -1103,6 +1229,16 @@ def self_test() -> int:
         except SourceError:
             expect("unparseable catalog raises", True)
         mr.write_text(orig)
+
+        op = base / OPERATIONS_MD
+        orig = op.read_text()
+        op.write_text(orig.replace(FIRST_INSTALL_MARK, "*First install*"))
+        try:
+            run(base, ["install-sequence"], None, False)
+            expect("missing first-installation block raises", False)
+        except SourceError:
+            expect("missing first-installation block raises", True)
+        op.write_text(orig)
 
         errs, _ = run(base, list(CHECKS), None, False)
         expect("tree restored passes", errs == [], str(errs))
