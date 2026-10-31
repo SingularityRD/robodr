@@ -278,6 +278,9 @@
           "properties": {
             "synchronized": { "type": "boolean" },
             "max_error_ms": { "type": "integer", "minimum": 0 },
+            "source": { "enum": ["adjtimex", "timesyncd"] },
+            "adjtimex_errno": { "type": "integer", "minimum": 0 },
+            "timesync_age_ms": { "type": "integer", "minimum": 0 },
             "wall_jumps": { "type": "integer", "minimum": 0 }
           }
         },

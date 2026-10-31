@@ -905,6 +905,17 @@ struct Recorded {
 /// Run the service loop for `runs` iterations (then `stop`), the wall clock
 /// advancing `step_ms` per reading.
 fn run_service(r: &Rig, cfg: &ServiceConfig, runs: usize, step_ms: u64) -> (u8, Recorded) {
+    run_service_with(r, cfg, runs, step_ms, Box::new(|_| Vec::new()))
+}
+
+/// [`run_service`] with the credentials the binary reads from its CRLs.
+fn run_service_with(
+    r: &Rig,
+    cfg: &ServiceConfig,
+    runs: usize,
+    step_ms: u64,
+    credentials: Box<dyn FnMut(u64) -> Vec<robodr_ocsf::CredentialExpiry>>,
+) -> (u8, Recorded) {
     let rec = Arc::new(Mutex::new(Recorded::default()));
     let clock = Arc::new(AtomicU64::new(NOW));
     let mut left = runs;
@@ -921,6 +932,7 @@ fn run_service(r: &Rig, cfg: &ServiceConfig, runs: usize, step_ms: u64) -> (u8, 
             left -= 1;
             left == 0
         }),
+        credentials,
     };
     let code = service::run(cfg, &r.state, || Ok(r.uplink(r.spool_cfg())), &mut env);
     drop(env);
@@ -981,6 +993,76 @@ fn retry_after_on_the_last_attempt_is_honoured_by_the_service() {
         assert_eq!(st.state, "retrying");
         assert_eq!(st.last_error.unwrap().retry_after_s, Some(want));
     }
+}
+
+/// Sales-readiness T6: the status file carries each CRL's `nextUpdate`
+/// with the days left, and a CRL within 14 days is logged once per day
+/// count, not every run.
+#[test]
+fn status_reports_crl_expiry_and_warns_once_a_day() {
+    use robodr_blackbox::crl::{CrlInUse, CrlStatus};
+    let day_ms = 86_400_000u64;
+    // Valid for 3.5 more days at NOW; one day passes per run.
+    let next_update_s = i64::try_from((NOW + 3 * day_ms + day_ms / 2) / 1000).unwrap();
+    let crls = CrlStatus {
+        in_use: vec![
+            CrlInUse {
+                issuer: "Site CA".into(),
+                next_update: Some(next_update_s),
+                ..CrlInUse::default()
+            },
+            CrlInUse {
+                issuer: "No next update".into(),
+                ..CrlInUse::default()
+            },
+        ],
+        ..CrlStatus::default()
+    };
+    assert_eq!(service::crl_credentials(&crls, NOW).len(), 1);
+    let r = Rig::new("crl-expiry", Role::Uplink);
+    let (code, rec) = run_service_with(
+        &r,
+        &svc(),
+        6,
+        day_ms / 4,
+        Box::new(move |now| service::crl_credentials(&crls, now)),
+    );
+    assert_eq!(code, 0);
+    let st = status_of(&r);
+    let c = st
+        .credentials
+        .first()
+        .expect("credential in the status file");
+    assert_eq!(c.name, "crl:Site CA");
+    assert_eq!(c.expires_ms, u64::try_from(next_update_s).unwrap() * 1000);
+    assert!(c.days_to_expiry <= 3, "{c:?}");
+    let warns: Vec<_> = rec
+        .logs
+        .iter()
+        .filter(|l| l.contains("crl:Site CA"))
+        .collect();
+    // Six runs over a day and a half: day counts 3 and 2 (maybe 1).
+    assert!((2..=3).contains(&warns.len()), "{warns:?}");
+    assert!(warns[0].contains("expires in 3 day(s)"), "{warns:?}");
+    // A credential far from expiry is in the file but never logged.
+    let r = Rig::new("crl-far", Role::Uplink);
+    let far = CrlStatus {
+        in_use: vec![CrlInUse {
+            issuer: "Far CA".into(),
+            next_update: Some(4_891_363_200),
+            ..CrlInUse::default()
+        }],
+        ..CrlStatus::default()
+    };
+    let (_, rec) = run_service_with(
+        &r,
+        &svc(),
+        2,
+        1000,
+        Box::new(move |now| service::crl_credentials(&far, now)),
+    );
+    assert_eq!(status_of(&r).credentials.len(), 1);
+    assert!(!rec.logs.iter().any(|l| l.contains("Far CA")));
 }
 
 /// F2: refusals back off to the long cap; transient failures to the short

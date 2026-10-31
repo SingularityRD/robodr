@@ -31,8 +31,10 @@
 //!   last delivery, last error (kind, HTTP status, server code, message),
 //!   `stuck_since_ms` (start of the current failure streak, kept across
 //!   restarts while the same batch is pending), the pending batch id, its
-//!   line count and failed runs, the backlog, the next attempt time and the
-//!   delivery totals;
+//!   line count and failed runs, the backlog, the next attempt time, the
+//!   delivery totals and `credentials` (each CRL's `nextUpdate` with
+//!   `days_to_expiry`; a log line once a day from
+//!   [`CREDENTIAL_WARN_DAYS`] before it);
 //! * `sd_notify` `STATUS=` (shown by `systemctl status robodr-uplink`; the
 //!   units set `NotifyAccess=main`);
 //! * a log line per failed run;
@@ -153,6 +155,12 @@ pub struct Status {
     /// Spool files quarantined as unreadable (I/O error) by this process.
     #[serde(default)]
     pub quarantined_unreadable: u64,
+    /// Expiry of the credentials the uplink depends on, as of the last
+    /// run: each CRL in use (`--crl-file`) as `crl:<issuer>` with its
+    /// `nextUpdate` (past it every connection is refused). Empty without
+    /// CRLs.
+    #[serde(default)]
+    pub credentials: Vec<robodr_ocsf::CredentialExpiry>,
     #[serde(flatten)]
     pub snapshot: Snapshot,
 }
@@ -173,6 +181,7 @@ impl Status {
             next_attempt_at_ms: None,
             dead_letter_malformed: 0,
             quarantined_unreadable: 0,
+            credentials: Vec::new(),
             snapshot: Snapshot::default(),
         }
     }
@@ -258,6 +267,59 @@ pub struct Env<'a> {
     /// Checked after each sleep: `true` ends the loop with exit code 0
     /// (tests).
     pub stop: Box<dyn FnMut() -> bool + 'a>,
+    /// The credentials' expiry at a wall-clock time ([`Status::credentials`]).
+    pub credentials: Box<dyn FnMut(u64) -> Vec<robodr_ocsf::CredentialExpiry> + 'a>,
+}
+
+/// The expiry of each CRL in use (`crl:<issuer>`, its `nextUpdate`) at
+/// `now_ms`; a CRL without `nextUpdate` has none.
+pub fn crl_credentials(
+    s: &robodr_blackbox::crl::CrlStatus,
+    now_ms: u64,
+) -> Vec<robodr_ocsf::CredentialExpiry> {
+    s.in_use
+        .iter()
+        .filter_map(|u| {
+            u.next_update.map(|nu| {
+                robodr_ocsf::CredentialExpiry::at(&format!("crl:{}", u.issuer), nu, now_ms)
+            })
+        })
+        .collect()
+}
+
+/// A credential this close to expiry (whole days) is logged once a day
+/// (the same default as agentd's `credential_warn_days`).
+pub const CREDENTIAL_WARN_DAYS: i64 = 14;
+
+/// Log each credential within [`CREDENTIAL_WARN_DAYS`] once per day count
+/// (`logged`: the day count last logged per name).
+fn warn_expiring(
+    creds: &[robodr_ocsf::CredentialExpiry],
+    logged: &mut std::collections::BTreeMap<String, i64>,
+    log: &mut dyn FnMut(&str),
+) {
+    for c in creds {
+        if c.days_to_expiry > CREDENTIAL_WARN_DAYS {
+            logged.remove(&c.name);
+            continue;
+        }
+        if logged.get(&c.name) == Some(&c.days_to_expiry) {
+            continue;
+        }
+        logged.insert(c.name.clone(), c.days_to_expiry);
+        log(&if c.days_to_expiry < 0 {
+            format!(
+                "{} expired {} day(s) ago: install a fresh one (every connection is refused)",
+                c.name,
+                c.days_to_expiry.unsigned_abs()
+            )
+        } else {
+            format!(
+                "{} expires in {} day(s): install a fresh one before then",
+                c.name, c.days_to_expiry
+            )
+        });
+    }
 }
 
 /// The wait after `failures` failed runs in a row ending with `e`.
@@ -307,6 +369,7 @@ pub fn run<T: Transport>(
     let mut failures: u32 = 0;
     let mut streak_start: Option<u64> = None;
     let mut warned = false;
+    let mut cred_logged = std::collections::BTreeMap::new();
     loop {
         let (result, snap) = match open() {
             Ok(mut u) => {
@@ -317,6 +380,8 @@ pub fn run<T: Transport>(
         };
         let now = (env.now_ms)();
         status.updated_at_ms = now;
+        status.credentials = (env.credentials)(now);
+        warn_expiring(&status.credentials, &mut cred_logged, &mut *env.log);
         if let Some(s) = snap {
             status.apply_snapshot(s);
         }

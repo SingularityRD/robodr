@@ -90,6 +90,12 @@ pub struct RobotContext {
     /// Topic the finding is published on (`ocsf.metadata.log_name`, the
     /// Kafka record topic); defaults to [`DEFAULT_TOPIC`].
     pub topic: String,
+    /// Producer cap (sales-readiness T38): emit contract
+    /// `2.<max_contract_minor>.0` instead of [`CONTRACT_VERSION`], for a SOC
+    /// whose validators are older than this build. `None` (default) or a
+    /// value at or above [`CONTRACT_MINOR`]: the current contract. See
+    /// [`RobotContext::contract_minor`] for what a lower minor changes.
+    pub max_contract_minor: Option<u64>,
 }
 
 impl RobotContext {
@@ -101,6 +107,49 @@ impl RobotContext {
             product_version: env!("CARGO_PKG_VERSION").to_string(),
             data_source: DEFAULT_DATA_SOURCE.to_string(),
             topic: DEFAULT_TOPIC.to_string(),
+            max_contract_minor: None,
+        }
+    }
+
+    /// The contract minor findings are built for: [`CONTRACT_MINOR`],
+    /// lowered by [`RobotContext::max_contract_minor`]. Below the current
+    /// minor a finding is built exactly as a producer of that minor would
+    /// build it, so that minor's validator accepts it:
+    ///
+    /// * the rule catalog of that minor applies ([`rule_info_for_contract`]):
+    ///   an id catalogued later gets the generic entry (title "RoboDR
+    ///   model-profile deviation", data source `robodr`, no techniques),
+    ///   its rule id unchanged;
+    /// * below 2.5, a per-rule host id (`robot.host.<rule>`,
+    ///   [`crate::host_rules::HOST_RULES`]) is sent as
+    ///   [`crate::host_rules::HOST_THREAT_FALLBACK`] (the detail still names
+    ///   the Pulsar rule), and `entity_context.agent_health` is left out.
+    pub fn contract_minor(&self) -> u64 {
+        self.max_contract_minor
+            .map_or(CONTRACT_MINOR, |m| m.min(CONTRACT_MINOR))
+    }
+
+    /// `contract_version` of the findings built with this context.
+    pub fn contract_version(&self) -> String {
+        let minor = self.contract_minor();
+        if minor == CONTRACT_MINOR {
+            CONTRACT_VERSION.to_string()
+        } else {
+            format!("{CONTRACT_MAJOR}.{minor}.0")
+        }
+    }
+
+    /// The rule id a finding for `rule` carries under this context's
+    /// contract minor ([`RobotContext::contract_minor`]).
+    pub fn wire_rule<'r>(&self, rule: &'r str) -> &'r str {
+        if self.contract_minor() < CATALOG_2_5_MINOR
+            && crate::host_rules::HOST_RULES
+                .iter()
+                .any(|(_, id)| *id == rule)
+        {
+            crate::host_rules::HOST_THREAT_FALLBACK
+        } else {
+            rule
         }
     }
 }
@@ -1624,13 +1673,16 @@ pub struct FindingBuilder<'a> {
 }
 
 /// A trusted label for `entity_context.agent_health`: printable ASCII
-/// without `<`, `>` or `` ` `` (anything else becomes `?`), at most `max`
-/// bytes. Names come from agentd's own configuration (input names carry
-/// configured paths), never from the bus.
+/// without `<`, `>`, `` ` ``, `"` or `\` (anything else becomes `?`), at
+/// most `max` bytes. Names come from agentd's own configuration (input
+/// names carry configured paths), never from the bus. `"` and `\` are
+/// replaced because JSON escapes them to two bytes: without them a label
+/// serialises to at most `max` bytes, which keeps the largest record
+/// within the finding size limit (`tests/agent_health.rs`).
 fn health_label(s: &str, max: usize) -> String {
     s.chars()
         .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() && !matches!(c, '<' | '>' | '`') {
+            if c.is_ascii() && !c.is_ascii_control() && !matches!(c, '<' | '>' | '`' | '"' | '\\') {
                 c
             } else {
                 '?'
@@ -1780,7 +1832,11 @@ impl<'a> FindingBuilder<'a> {
 
     /// The deterministic finding uid this builder will produce.
     pub fn finding_uid(&self) -> String {
-        finding_uid(&self.ctx.robot.id, self.dev.rule_str(), &self.subject)
+        finding_uid(
+            &self.ctx.robot.id,
+            self.ctx.wire_rule(self.dev.rule_str()),
+            &self.subject,
+        )
     }
 
     /// Assemble and validate. Never panics on hostile input; returns every
@@ -1792,8 +1848,17 @@ impl<'a> FindingBuilder<'a> {
         };
         let ctx = self.ctx;
         let dev = self.dev;
-        let info = rule_info(dev.rule_str());
+        // The contract this finding is built for (producer cap, T38) and
+        // the rule id and catalog entry a producer of it would use.
+        let contract_version = ctx.contract_version();
+        let rule = ctx.wire_rule(dev.rule_str());
+        let info = rule_info_for_contract(rule, &contract_version);
         let uid = self.finding_uid();
+        let agent_health = if ctx.contract_minor() >= CATALOG_2_5_MINOR {
+            self.agent_health
+        } else {
+            None
+        };
         let robot_id = ctx.robot.id.clone();
 
         // Observe wins: a deviation the detection core marked observe-only must
@@ -1820,7 +1885,7 @@ impl<'a> FindingBuilder<'a> {
         let entity_context = EntityContext {
             robot: ctx.robot.clone(),
             profile: ctx.profile.clone(),
-            rule_id: dev.rule.to_string(),
+            rule_id: rule.to_string(),
             mode,
             safety_state: self.safety,
             attestation: self.attestation,
@@ -1829,7 +1894,7 @@ impl<'a> FindingBuilder<'a> {
             bus_message_id: self.bus_message_id,
             occurrence_count: self.count,
             detail: Tainted::new(&dev.detail, caps::DETAIL),
-            agent_health: self.agent_health,
+            agent_health,
         };
 
         let mut evidence = self.evidence;
@@ -1947,8 +2012,8 @@ impl<'a> FindingBuilder<'a> {
                 first_seen_time: first,
                 last_seen_time: last,
                 analytic: Analytic {
-                    uid: dev.rule_str().into(),
-                    name: dev.rule_str().into(),
+                    uid: rule.into(),
+                    name: rule.into(),
                     type_id: 1,
                     type_: "Rule".into(),
                 },
@@ -1970,7 +2035,7 @@ impl<'a> FindingBuilder<'a> {
         };
 
         let mut env = FindingEnvelope {
-            contract_version: CONTRACT_VERSION.into(),
+            contract_version,
             finding_id: uid.clone(),
             external_id: format!("{robot_id}:{uid}"),
             data_source: ctx.data_source.clone(),

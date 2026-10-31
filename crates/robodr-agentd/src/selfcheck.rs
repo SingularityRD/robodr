@@ -14,7 +14,12 @@
 //! milliseconds: daemon time for durations, Unix time for expiry), so it is
 //! unit-tested without a clock, a disk or a kernel. The two probes
 //! ([`fs_space`], [`kernel_clock`]) are thin `statvfs(3)` / `adjtimex(2)`
-//! wrappers; `adjtimex` with `modes = 0` only reads and needs no privilege.
+//! wrappers; `adjtimex` with `modes = 0` only reads and needs no
+//! capability, but a seccomp filter can refuse it: the shipped systemd
+//! unit's `ProtectClock=yes` / `@clock` filter does. Then the clock state
+//! falls back to systemd-timesyncd's marker file ([`clock_health`]), the
+//! health record carries `clock.adjtimex_errno`, and `clock_unsynced`
+//! cannot be raised.
 //!
 //! Like every self-health finding these are observe-only: a full disk or
 //! a lost clock never causes a response by itself.
@@ -161,20 +166,13 @@ impl Level {
 /// Whole days from `now_ms` to `expires_ms` (Unix ms), rounded down
 /// (negative once expired).
 pub fn days_to_expiry(expires_ms: u64, now_ms: u64) -> i64 {
-    let diff = i128::from(expires_ms) - i128::from(now_ms);
-    let days = diff.div_euclid(i128::from(DAY_MS));
-    i64::try_from(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
+    CredentialExpiry::days_between(expires_ms, now_ms)
 }
 
 /// A credential's expiry from its Unix-seconds date (`notAfter`,
 /// `nextUpdate`) at `now_ms` (Unix ms). Dates before 1970 read as 0.
 pub fn credential(name: &str, expires_s: i64, now_ms: u64) -> CredentialExpiry {
-    let expires_ms = u64::try_from(expires_s).unwrap_or(0).saturating_mul(1000);
-    CredentialExpiry {
-        name: name.to_string(),
-        expires_ms,
-        days_to_expiry: days_to_expiry(expires_ms, now_ms),
-    }
+    CredentialExpiry::at(name, expires_s, now_ms)
 }
 
 /// The kernel's view of the wall clock (`adjtimex(2)`).
@@ -184,6 +182,105 @@ pub struct KernelClock {
     pub synchronized: bool,
     /// `maxerror` (µs).
     pub max_error_us: u64,
+}
+
+/// Why [`kernel_clock`] has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockProbeError {
+    /// `adjtimex(2)` failed with this `errno` (`EPERM` under the shipped
+    /// unit: its `ProtectClock=yes` / `@clock` system-call filter refuses
+    /// the call even read-only).
+    Errno(u32),
+    /// No `adjtimex(2)` on this platform.
+    Unsupported,
+}
+
+/// systemd-timesyncd touches this file each time it synchronises the clock
+/// (`systemd-timesyncd.service(8)`).
+pub const TIMESYNC_MARKER: &str = "/run/systemd/timesync/synchronized";
+
+/// A marker touched at most this long ago (twice timesyncd's default
+/// longest poll interval, `PollIntervalMaxSec=2048`) reads as synchronised
+/// when `adjtimex(2)` is refused. An older marker proves nothing either
+/// way (timesyncd may have stopped, or polls less often): unknown.
+pub const TIMESYNC_FRESH_MS: u64 = 4_096_000;
+
+/// The clock part of the health record from the `adjtimex(2)` probe, the
+/// age of [`TIMESYNC_MARKER`] (`None`: no such file) and the agent's
+/// wall-clock jump count. `adjtimex` wins; a fresh marker only ever says
+/// "synchronised" (an absent or old one is not evidence of the opposite:
+/// the site may run chrony), so it never raises `clock_unsynced`.
+pub fn clock_health(
+    kernel: Result<KernelClock, ClockProbeError>,
+    timesync_age_ms: Option<u64>,
+    wall_jumps: u64,
+) -> robodr_ocsf::ClockHealth {
+    use robodr_ocsf::{ClockHealth, ClockSource};
+    let mut h = ClockHealth {
+        timesync_age_ms,
+        wall_jumps,
+        ..ClockHealth::default()
+    };
+    match kernel {
+        Ok(k) => {
+            h.synchronized = Some(k.synchronized);
+            h.max_error_ms = Some(k.max_error_us / 1000);
+            h.source = Some(ClockSource::Adjtimex);
+        }
+        Err(e) => {
+            if let ClockProbeError::Errno(n) = e {
+                h.adjtimex_errno = Some(n);
+            }
+            if timesync_age_ms.is_some_and(|a| a <= TIMESYNC_FRESH_MS) {
+                h.synchronized = Some(true);
+                h.source = Some(ClockSource::Timesyncd);
+            }
+        }
+    }
+    h
+}
+
+/// Reachability of a component fed by one or more inputs (`(ended,
+/// last_rx_ms)` each, daemon time): an input is reachable when heard
+/// within `silence_ms`, unknown before `silence_ms` has passed without a
+/// word, unreachable otherwise or once ended. Several inputs report the
+/// worst one, with that input's age, so a dead input is never hidden by a
+/// live one and the state and `last_ok_age_ms` describe the same input.
+pub fn inputs_reachability(
+    inputs: impl IntoIterator<Item = (bool, Option<u64>)>,
+    now_ms: u64,
+    silence_ms: u64,
+) -> (robodr_ocsf::ReachState, Option<u64>) {
+    use robodr_ocsf::ReachState;
+    let rank = |s: ReachState| match s {
+        ReachState::Unreachable => 3,
+        ReachState::Unknown => 2,
+        ReachState::Reachable => 1,
+        ReachState::NotConfigured => 0,
+    };
+    let mut worst = (ReachState::NotConfigured, None);
+    for (ended, last_rx) in inputs {
+        let state = match last_rx {
+            _ if ended => ReachState::Unreachable,
+            None if now_ms < silence_ms => ReachState::Unknown,
+            None => ReachState::Unreachable,
+            Some(t) if now_ms.saturating_sub(t) < silence_ms => ReachState::Reachable,
+            Some(_) => ReachState::Unreachable,
+        };
+        if rank(state) > rank(worst.0) {
+            worst = (state, last_rx.map(|t| now_ms.saturating_sub(t)));
+        }
+    }
+    worst
+}
+
+/// Milliseconds from `path`'s modification time to `wall_ms` (Unix ms);
+/// 0 for a time in the future, `None` if it cannot be read.
+pub fn file_age_ms(path: &Path, wall_ms: u64) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let at = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let at_ms = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
+    Some(wall_ms.saturating_sub(at_ms))
 }
 
 /// A problem worth a finding.
@@ -383,8 +480,9 @@ impl Warnings {
         out
     }
 
-    /// The kernel clock (`None`: not known here) and the agent's count of
-    /// wall-clock jumps at daemon time `now_ms`.
+    /// The kernel clock (`None`: not known here, including when
+    /// `adjtimex(2)` is refused) and the agent's count of wall-clock jumps
+    /// at daemon time `now_ms`.
     pub fn clock(
         &mut self,
         now_ms: u64,
@@ -503,9 +601,11 @@ pub fn fs_space(dir: &Path) -> Option<(u64, u64)> {
 }
 
 /// The kernel clock discipline (`adjtimex(2)` with `modes = 0`: read
-/// only, no privilege). `None` where unavailable.
+/// only, no capability needed). A seccomp filter can still refuse it: the
+/// shipped systemd unit's `ProtectClock=yes` and `@clock` filter do, so
+/// under that unit this returns `Err(Errno(EPERM))`.
 #[allow(unsafe_code)]
-pub fn kernel_clock() -> Option<KernelClock> {
+pub fn kernel_clock() -> Result<KernelClock, ClockProbeError> {
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     {
         extern "C" {
@@ -524,7 +624,11 @@ pub fn kernel_clock() -> Option<KernelClock> {
         // fills it.
         let rc = unsafe { adjtimex(buf.as_mut_ptr()) };
         if rc < 0 {
-            return None;
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .and_then(|e| u32::try_from(e).ok())
+                .unwrap_or(0);
+            return Err(ClockProbeError::Errno(errno));
         }
         let [_, _, _, maxerror, _, status_word, ..] = buf;
         // `status` is the low 32 bits of its 8-byte slot (little endian:
@@ -534,14 +638,14 @@ pub fn kernel_clock() -> Option<KernelClock> {
         } else {
             (status_word >> 32) & 0xffff_ffff
         };
-        Some(KernelClock {
+        Ok(KernelClock {
             synchronized: rc != TIME_ERROR && status & STA_UNSYNC == 0,
             max_error_us: u64::try_from(maxerror).unwrap_or(0),
         })
     }
     #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
     {
-        None
+        Err(ClockProbeError::Unsupported)
     }
 }
 
@@ -770,8 +874,110 @@ mod tests {
         let (free, total) = fs_space(Path::new("/")).expect("statvfs /");
         assert!(total > 0 && free <= total);
         assert!(fs_space(Path::new("/nonexistent/robodr")).is_none());
-        // adjtimex(2) with modes = 0 works unprivileged on Linux.
+        // adjtimex(2) with modes = 0 works unprivileged on Linux (outside a
+        // seccomp filter: the test runner has none).
         let k = kernel_clock().expect("adjtimex");
         assert!(k.max_error_us <= 16_000_000 || !k.synchronized);
+        let dir = std::env::temp_dir().join(format!("robodr-selfcheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let marker = dir.join("synchronized");
+        std::fs::write(&marker, b"").expect("marker");
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis(),
+        )
+        .expect("ms");
+        let age = file_age_ms(&marker, now_ms + 5_000).expect("age");
+        assert!((5_000..60_000).contains(&age), "{age}");
+        assert_eq!(file_age_ms(&marker, 0), Some(0), "future mtime reads 0");
+        assert_eq!(file_age_ms(&dir.join("absent"), now_ms), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several inputs of one component: the worst one is reported, with
+    /// its own age (before: the last input's state and the first one's
+    /// age, so a dead input could hide behind a live one).
+    #[test]
+    fn reachability_reports_the_worst_input_with_its_age() {
+        use robodr_ocsf::ReachState as R;
+        let silence = 1_000;
+        let now = 10_000;
+        assert_eq!(
+            inputs_reachability([], now, silence),
+            (R::NotConfigured, None)
+        );
+        let live = (false, Some(9_900));
+        let dead = (false, Some(2_000));
+        let ended = (true, Some(9_950));
+        for set in [vec![dead, live], vec![live, dead]] {
+            assert_eq!(
+                inputs_reachability(set, now, silence),
+                (R::Unreachable, Some(8_000))
+            );
+        }
+        assert_eq!(
+            inputs_reachability([live, ended], now, silence),
+            (R::Unreachable, Some(50))
+        );
+        assert_eq!(
+            inputs_reachability([live, (false, Some(9_990))], now, silence),
+            (R::Reachable, Some(100))
+        );
+        // Not heard yet: unknown during the first silence window.
+        assert_eq!(
+            inputs_reachability([(false, None), (false, Some(500))], 800, silence),
+            (R::Unknown, None)
+        );
+        assert_eq!(
+            inputs_reachability([(false, None)], now, silence),
+            (R::Unreachable, None)
+        );
+    }
+
+    /// Under the shipped unit `adjtimex(2)` fails with EPERM (seccomp
+    /// `@clock`): the record must say so instead of looking like a platform
+    /// without a clock probe, and a fresh timesyncd marker still reports
+    /// the clock synchronised.
+    #[test]
+    fn clock_probe_refused_is_reported_and_timesyncd_fallback() {
+        use robodr_ocsf::{ClockHealth, ClockSource};
+        let eperm = Err(ClockProbeError::Errno(1));
+        assert_eq!(
+            clock_health(eperm, None, 2),
+            ClockHealth {
+                adjtimex_errno: Some(1),
+                wall_jumps: 2,
+                ..ClockHealth::default()
+            }
+        );
+        let fresh = clock_health(eperm, Some(TIMESYNC_FRESH_MS), 0);
+        assert_eq!(fresh.synchronized, Some(true));
+        assert_eq!(fresh.source, Some(ClockSource::Timesyncd));
+        assert_eq!(fresh.max_error_ms, None);
+        assert_eq!(fresh.adjtimex_errno, Some(1));
+        // A stale marker is not evidence either way.
+        let stale = clock_health(eperm, Some(TIMESYNC_FRESH_MS + 1), 0);
+        assert_eq!((stale.synchronized, stale.source), (None, None));
+        assert_eq!(stale.timesync_age_ms, Some(TIMESYNC_FRESH_MS + 1));
+        // No adjtimex on the platform: no errno.
+        let none = clock_health(Err(ClockProbeError::Unsupported), None, 0);
+        assert_eq!(none, ClockHealth::default());
+        // adjtimex wins over the marker, unsynchronised included.
+        let k = KernelClock {
+            synchronized: false,
+            max_error_us: 16_000_000,
+        };
+        let h = clock_health(Ok(k), Some(10), 0);
+        assert_eq!(h.synchronized, Some(false));
+        assert_eq!(h.max_error_ms, Some(16_000));
+        assert_eq!(h.source, Some(ClockSource::Adjtimex));
+        assert_eq!(h.adjtimex_errno, None);
+        let json = serde_json::to_value(clock_health(eperm, None, 0)).expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({"adjtimex_errno": 1, "wall_jumps": 0})
+        );
     }
 }

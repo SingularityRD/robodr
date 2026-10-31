@@ -34,6 +34,9 @@ pub const CONTRACT_NAME: &str = "robodr.findings";
 /// Contract (envelope) schema version emitted, semver. See
 /// `docs/contracts/robodr.findings.md`.
 pub const CONTRACT_VERSION: &str = "2.5.0";
+/// Minor of [`CONTRACT_VERSION`]: the highest a producer can be capped to
+/// (`RobotContext::max_contract_minor`).
+pub const CONTRACT_MINOR: u64 = 5;
 /// Contract major emitted and validated in full.
 pub const CONTRACT_MAJOR: u64 = 2;
 /// Older contract major still accepted on parse (replay, migration), never
@@ -389,16 +392,65 @@ pub struct CredentialExpiry {
     pub days_to_expiry: i64,
 }
 
-/// The kernel's clock discipline (`adjtimex(2)`).
+impl CredentialExpiry {
+    /// A credential expiring at `expires_s` (Unix seconds: `notAfter`,
+    /// `nextUpdate`; dates before 1970 read as 0), seen at `now_ms` (Unix
+    /// ms).
+    pub fn at(name: &str, expires_s: i64, now_ms: u64) -> Self {
+        let expires_ms = u64::try_from(expires_s).unwrap_or(0).saturating_mul(1000);
+        Self {
+            name: name.to_string(),
+            expires_ms,
+            days_to_expiry: Self::days_between(expires_ms, now_ms),
+        }
+    }
+
+    /// Whole days from `now_ms` to `expires_ms` (Unix ms), rounded down
+    /// (negative once expired).
+    pub fn days_between(expires_ms: u64, now_ms: u64) -> i64 {
+        const DAY_MS: i128 = 86_400_000;
+        let diff = i128::from(expires_ms) - i128::from(now_ms);
+        let days = diff.div_euclid(DAY_MS);
+        i64::try_from(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
+    }
+}
+
+/// Where [`ClockHealth::synchronized`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSource {
+    /// The kernel's clock discipline (`adjtimex(2)`, read only).
+    Adjtimex,
+    /// `adjtimex(2)` failed; systemd-timesyncd's marker file
+    /// (`/run/systemd/timesync/synchronized`) was touched recently. Only
+    /// ever `synchronized: true`, without an error estimate.
+    Timesyncd,
+}
+
+/// The robot's clock: the kernel's clock discipline (`adjtimex(2)`) or,
+/// where that call fails, systemd-timesyncd's marker file; and the agent's
+/// own wall-clock jump count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockHealth {
     /// `false`: the kernel reports the clock unsynchronised (`STA_UNSYNC`
-    /// / `TIME_ERROR`); absent: not known on this platform.
+    /// / `TIME_ERROR`); absent: not known (see `adjtimex_errno`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synchronized: Option<bool>,
     /// The kernel's maximum error estimate (ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_error_ms: Option<u64>,
+    /// Where `synchronized` came from (present exactly with it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ClockSource>,
+    /// `adjtimex(2)` failed with this `errno` (1, `EPERM`: a system-call
+    /// filter refused it, as the shipped systemd unit's `@clock` filter
+    /// does). Absent: it answered, or the platform has no `adjtimex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjtimex_errno: Option<u32>,
+    /// Milliseconds since systemd-timesyncd last touched its marker file
+    /// `/run/systemd/timesync/synchronized` (absent: no such file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timesync_age_ms: Option<u64>,
     /// Wall-clock jumps against the monotonic clock since start.
     pub wall_jumps: u64,
 }

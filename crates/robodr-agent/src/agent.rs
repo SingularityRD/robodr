@@ -599,6 +599,7 @@ impl Agent {
             mode,
         );
         ocsf.data_source = cfg.data_source;
+        ocsf.max_contract_minor = cfg.max_contract_minor;
         ocsf.topic = cfg.findings_topic;
         let start = clock.now();
         // Fail at start, not on every finding, if the trusted labels (model,

@@ -678,7 +678,7 @@ response).
 | --- | --- | --- | --- |
 | `robot.agent.health` | Agent health record | Low | every `daemon.self_health.health_record_ms` (default 60 s), carries `entity_context.agent_health` |
 | `robot.agent.credential_expiring` | Agent credential expires soon | Medium (≤ `credential_warn_days`, default 14); High (≤ `credential_critical_days`, default 3, or expired) | per credential on each escalation, then at most daily |
-| `robot.agent.clock_unsynced` | Robot clock not synchronised | Medium | once per episode, after the kernel has reported the clock unsynchronised for `clock_unsynced_grace_ms` (default 5 min) |
+| `robot.agent.clock_unsynced` | Robot clock not synchronised | Medium | once per episode, after the kernel has reported the clock unsynchronised for `clock_unsynced_grace_ms` (default 5 min); never where `adjtimex(2)` is refused, as under the shipped systemd unit (`clock.adjtimex_errno`, `docs/TIME-SYNC.md`) |
 | `robot.agent.clock_jump` | Robot wall clock jumped | High | per wall-clock jump against the monotonic clock (> 1 s), at most every `health_report_ms` |
 | `robot.agent.disk_low` | Agent storage running out of space | Medium (free < `disk_warn_percent`, default 10 %); High (free < `disk_critical_percent`, default 3 %) | per filesystem on each escalation |
 | `robot.agent.executor_unreachable` | Response executor unreachable | High | once per outage, after `executor_unreachable_ms` (default 30 s) without an answer |
@@ -735,9 +735,9 @@ bytes (`robodr_ocsf::health_limits`):
 | `inputs[]` | `{name, last_rx_age_ms?, received, dropped, malformed, ended}` per input |
 | `counters` | `findings_spooled`, `finding_errors`, `health_findings`, `spool_dropped`, `spool_write_errors`, `note_errors` |
 | `blackbox` | `{degraded, anchored, anchor_failures}` |
-| `reachability[]` | `{component, state, last_ok_age_ms?}` for `executor`, `gateway` (the in-path gateway's feed) and `pulsard` (the host-threat forwarder): `reachable` \| `unreachable` \| `unknown` (configured, not heard yet) \| `not_configured` |
+| `reachability[]` | `{component, state, last_ok_age_ms?}` for `executor`, `gateway` (the in-path gateway's feed) and `pulsard` (the host-threat forwarder): `reachable` \| `unreachable` \| `unknown` (configured, not heard yet) \| `not_configured`; a component fed by several inputs reports its worst input, and `last_ok_age_ms` is that input's |
 | `credentials[]` | `{name, expires_ms, days_to_expiry}`: the control plane's server certificate (`control_plane.server_cert`) and each CRL's `nextUpdate` (`control_plane.crl:<issuer>`) |
-| `clock` | `{synchronized?, max_error_ms?, wall_jumps}` from `adjtimex(2)` and agentd's time guard |
+| `clock` | `{synchronized?, max_error_ms?, source?, adjtimex_errno?, timesync_age_ms?, wall_jumps}`: `synchronized` / `max_error_ms` from `adjtimex(2)` (`source` `adjtimex`); where that call fails, `adjtimex_errno` (1 = `EPERM`, the shipped unit's `@clock` seccomp filter) and, if systemd-timesyncd touched `/run/systemd/timesync/synchronized` within 4 096 s, `synchronized: true` with `source` `timesyncd` (no error estimate; an older or absent marker leaves `synchronized` out); `timesync_age_ms` is that marker's age; `wall_jumps` from agentd's time guard |
 | `disks[]` | `{name, free_bytes, total_bytes}` for `blackbox`, `spool` and `control_plane` |
 
 The profile digest and the safety state are the finding's own
@@ -793,6 +793,23 @@ box, and exported on every path (Kafka, HTTPS uplink, diode) unchanged.
   host ids) 2.5 validators: an older validator rejects those findings (their
   catalog entry differs), so upgrade the SOC side and both sides of a diode
   first.
+* **Producer cap** (`findings.max_contract_minor` in `robodr-agentd`'s
+  configuration, `RobotContext::max_contract_minor` in `robodr-ocsf`): a
+  robot whose SOC still validates an older minor `m` (0 ≤ `m` ≤ the
+  current minor) builds every finding for contract `2.m.0`, exactly as a
+  producer of that minor would: `contract_version` is `2.m.0`; the
+  catalog of minor `m` applies, so an id catalogued later carries the
+  generic entry (title "RoboDR model-profile deviation", data source
+  `robodr`, no techniques) under its own rule id; below 2.5 a per-rule
+  host id is sent as `robot.host.pulsar_threat` (with that id's finding
+  identity; the detail still names the Pulsar rule) and
+  `entity_context.agent_health` is left out (the `robot.agent.health`
+  finding still goes out every period, with the generic entry). A cap
+  above this build's minor is refused at load. Only findings agentd
+  builds are capped: `robodr-deliverd` always labels its `robot.deliver.*`
+  and `robot.seal.*` findings with this build's version (their entries are
+  2.2 / 2.3 ones, which an older 2.x validator from 2.3 on applies
+  unchanged).
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -1096,7 +1113,12 @@ safely. Nothing here is specific to one product.
     `robot.gateway.overload` (reserved for `robodr-firewall-gw`); data
     source `host_runtime`: one `robot.host.<rule>` per shipped Pulsar rule
     (`robodr_ocsf::HOST_RULES`), `robot.host.pulsar_threat` kept as the
-    fallback (§3g).
+    fallback (§3g); `robot.agent.config_unattested` (data source
+    `robodr_agent`, emitted by `robodr-agentd` at start),
+    `robot.ros2.untrusted_security_identity` and
+    `robot.capture.unsupported_transport` (data source `ros2_dds_discovery`):
+    ids their producers already emitted without an entry (so with the
+    generic one), now catalogued (§3g).
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.5.0`.
 
 * **2.4.0** — rule-catalog entries only (minor): agentd's sealed

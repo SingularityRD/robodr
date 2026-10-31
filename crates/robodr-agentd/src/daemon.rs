@@ -122,7 +122,9 @@
 //! With `host_threats` ([`crate::host`]), the `robodr-threat-forward`
 //! Pulsar module delivers every Pulsar threat (except the ROS 2 sensor's
 //! own) over a peer-checked unix socket. Each one is reported as a
-//! `robot.host.pulsar_threat` finding (`Detector::Sensor`, source
+//! finding under the rule's own `robot.host.<rule>` id (contract 2.5,
+//! `robodr_ocsf::HOST_RULES`; `robot.host.pulsar_threat` for a rule RoboDR
+//! does not ship) (`Detector::Sensor`, source
 //! `host:<module>`, the threat's severity) and fed to the correlator as
 //! `Signal::host(<Pulsar rule name>)` with the `process` entity
 //! (the pid), so the host-dependent default rules
@@ -812,6 +814,7 @@ impl<'a> Daemon<'a> {
         acfg.kafka_partitions = cfg.robot.kafka_partitions;
         acfg.findings_topic = cfg.findings.topic.clone();
         acfg.data_source = cfg.findings.data_source.clone();
+        acfg.max_contract_minor = cfg.findings.max_contract_minor;
         match (&cfg.firewall, validated) {
             (Some(fw), true) => {
                 // Low-level joint channels (Unitree LowCmd) come with the
@@ -2672,8 +2675,10 @@ impl<'a> Daemon<'a> {
     /// Probe credentials, clock, disks and reachability, refresh
     /// [`SelfView`] and report what got worse ([`crate::selfcheck`]).
     fn early_warnings(&mut self) {
-        use crate::selfcheck::{credential, fs_space, kernel_clock};
-        use robodr_ocsf::{ClockHealth, DiskHealth, ReachState, Reachability};
+        use crate::selfcheck::{
+            clock_health, credential, file_age_ms, fs_space, kernel_clock, TIMESYNC_MARKER,
+        };
+        use robodr_ocsf::{DiskHealth, ReachState, Reachability};
         let now_ms = self.now_ms();
         let wall_ms = self.clock.now().wall_ns / 1_000_000;
         // Credentials: the control plane's own certificate and its CRLs.
@@ -2694,14 +2699,16 @@ impl<'a> Daemon<'a> {
                 }
             }
         }
-        // Clock.
+        // Clock: adjtimex(2), refused under the shipped unit's seccomp
+        // filter (the record then says so), else timesyncd's marker.
         let kernel = kernel_clock();
         let wall_jumps = self.agent.stats().wall_clock_jumps;
-        let clock = ClockHealth {
-            synchronized: kernel.map(|k| k.synchronized),
-            max_error_ms: kernel.map(|k| k.max_error_us / 1000),
+        let clock = clock_health(
+            kernel,
+            file_age_ms(std::path::Path::new(TIMESYNC_MARKER), wall_ms),
             wall_jumps,
-        };
+        );
+        let kernel = kernel.ok();
         // Disks.
         let mut dirs: Vec<(&str, &std::path::Path)> = vec![
             ("blackbox", self.r.config.blackbox.dir.as_path()),
@@ -2723,25 +2730,20 @@ impl<'a> Daemon<'a> {
         // Reachability: the executor link, the gateway feed and the Pulsar
         // forwarder (their sockets are inputs: heard within silence_ms).
         let silence = self.r.config.daemon.silence_ms;
-        let input_reach = |prefix: &str| -> ReachState {
-            let mut state = ReachState::NotConfigured;
-            for i in self.inputs.iter().filter(|i| i.name.starts_with(prefix)) {
-                state = match i.stats.last_rx_ms() {
-                    _ if i.stats.ended.load(Ordering::SeqCst) => ReachState::Unreachable,
-                    None if now_ms < silence => ReachState::Unknown,
-                    None => ReachState::Unreachable,
-                    Some(t) if now_ms.saturating_sub(t) < silence => ReachState::Reachable,
-                    Some(_) => ReachState::Unreachable,
-                };
+        let input_reach = |component: &str, prefix: &str| -> Reachability {
+            let (state, last_ok_age_ms) = crate::selfcheck::inputs_reachability(
+                self.inputs
+                    .iter()
+                    .filter(|i| i.name.starts_with(prefix))
+                    .map(|i| (i.stats.ended.load(Ordering::SeqCst), i.stats.last_rx_ms())),
+                now_ms,
+                silence,
+            );
+            Reachability {
+                component: component.into(),
+                state,
+                last_ok_age_ms,
             }
-            state
-        };
-        let input_age = |prefix: &str| -> Option<u64> {
-            self.inputs
-                .iter()
-                .find(|i| i.name.starts_with(prefix))
-                .and_then(|i| i.stats.last_rx_ms())
-                .map(|t| now_ms.saturating_sub(t))
         };
         let exec = self.executor.as_ref().map(|l| l.reach());
         let reachability = vec![
@@ -2755,16 +2757,8 @@ impl<'a> Daemon<'a> {
                 },
                 last_ok_age_ms: exec.as_ref().and_then(|r| r.last_ok_age_ms),
             },
-            Reachability {
-                component: "gateway".into(),
-                state: input_reach("gateway:"),
-                last_ok_age_ms: input_age("gateway:"),
-            },
-            Reachability {
-                component: "pulsard".into(),
-                state: input_reach("host:"),
-                last_ok_age_ms: input_age("host:"),
-            },
+            input_reach("gateway", "gateway:"),
+            input_reach("pulsard", "host:"),
         ];
 
         let mut found = self.warnings.credentials(now_ms, &creds);

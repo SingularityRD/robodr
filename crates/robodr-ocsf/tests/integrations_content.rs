@@ -81,6 +81,10 @@ fn findings() -> Vec<String> {
         if i % 2 == 0 {
             b = b.subject(Subject::from_participant(&part));
         }
+        // The health record rule requires its record (contract 2.5).
+        if id == robodr_ocsf::AGENT_HEALTH_RULE {
+            b = b.agent_health(common::health::sample());
+        }
         out.push(to_json(&b.build().unwrap()).unwrap());
     }
     out.push(to_json(&common::example_finding()).unwrap());
