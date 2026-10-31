@@ -393,13 +393,19 @@ runs.
   need care. Adding the *first* reader topics switches enforcement on, which
   is `reader-topic enforcement: off -> on [tightens]`. Removing all of them
   switches it off, which is `[LOOSENS]`. Adding reader topics while
-  enforcement is already on is `[LOOSENS]`.
+  enforcement is already on is `[LOOSENS]`. Bound safety configuration
+  (`bound_config`, see `bind` below) that was added, re-bound or removed is
+  listed as `bound <role>` with both digests (`bound_config_changes` in
+  `--json`) and marked `[REVIEW the file]`: whether a new policy or firewall
+  file permits more depends on its content, which `diff` does not read.
 * **merge** refuses an input with a bound above the hard caps (same flags as
   `lock`), so "larger bound wins" cannot carry a hand-edited `1e300` into the
   result. It also unions services, actions, raw DDS topics and reader topics.
   It refuses to mix profiles that enforce reader topics with profiles that do
   not, because the union would start enforcing readers that the other
-  missions never recorded.
+  missions never recorded. It does not carry over `bound_config`: the
+  merged draft binds nothing until `bind` runs on it again, so a unit using
+  it treats the policy and adapters as not OEM-validated.
 * **check** runs `Profile::evaluate` on every event, plus one rule of this
   crate's own, `commission.motion.anomalous_speed` (see Limits).
 
@@ -425,11 +431,17 @@ robodr-commission bind --in draft.json --out bound.json \
 robodr-commission lock --in bound.json --signoff bound.json.signoff.json ...
 ```
 
-`bind` validates each file as its loader will (the policy parses, a
-firewall file compiles against the draft), writes its digest into the
-draft's `bound_config` (profile *content*), and writes a new sign-off list:
-the learner's items plus one `bound_config:<role> <digest>` item per file,
-all unconfirmed again, and the manifest. A `bound_config` item is a motion
+`bind` validates the policy and firewall files as their loaders will (the
+policy parses, a firewall file compiles against the draft). For
+`--executor-config` it checks only the shape (the `robodr-executor-config/v1`
+schema and a `motion` object): `robodr-executor` depends on this crate, so
+its parser is not available here. Run `robodr-executor --config FILE
+--check-config` on the same file before binding it. `bind` then writes each
+digest into the draft's `bound_config` (profile *content*), and writes a new
+sign-off list: the learner's items plus one `bound_config:<role> <digest>`
+item per file, all unconfirmed again, and the manifest. Binding in steps
+works: given the previous run's list (`--signoff`), `bind` keeps the items
+of the bindings it does not replace. A `bound_config` item is a motion
 item, so `motion_quorum` distinct operators must sign; the floor
 (`required_items`) requires a confirmed item for every binding, so a forged
 list cannot drop it. The profile signature, the attestation and the
@@ -457,6 +469,19 @@ What the unit does (fail closed):
   may change without a re-lock. Without the section the flags are
   unsigned: kept for compatibility, with a loud warning at start and in
   `--check-config` (agentd, which every order passes, still gates them).
+  The section itself lives in `executor.json`, which is not bound. A
+  running executor therefore keeps the section it read: if the file's
+  section is later removed or re-pointed (other profile, other trust
+  anchors), the re-read before each order still verifies against the
+  section the process had, with a warning. The change takes effect only
+  at a restart, which prints the UNSIGNED warning again when the section
+  is gone. Someone who can edit `executor.json` *and* restart the
+  executor can still drop to unsigned flags; making the section mandatory
+  is an open product decision. When a re-read's notes differ from the
+  previous ones (a binding lost or regained, the section changed), the
+  executor logs them and journals a `reconciled` event that agentd
+  receives. A profile accepted under a lab-only trust file (`poc-init`)
+  makes the executor print the LAB-ONLY banner at start too.
 * **gateway** (`motion_firewall`): `trust::bound::verify_bindings` is the
   call; refusing `enforce` on an unbound file belongs to the gateway work
   package (WP11) and is not in this change.
@@ -474,21 +499,29 @@ gateway's channel file from what commissioning learned: one Twist spec per
 Twist motion channel, `max_linear_speed` = the envelope lowered to the OEM
 ceiling, `max_angular_speed` = the OEM yaw ceiling (the profile learns no
 yaw rate), `allowed_sources` = the writers observed commanding the channel
-(excluded and unprofiled sources dropped, each noted). What cannot be
-learned (low-level joint channels, joint-velocity channel counts, channels
-without an observed writer) is listed as INCOMPLETE (exit 1): the file then
+(excluded and unprofiled sources dropped, each noted). `--ceiling-linear`
+is optional: an envelope without a linear bound takes it, and a Twist
+channel with neither is not drafted unlimited but listed as INCOMPLETE.
+What cannot be learned (low-level joint channels, joint-velocity channel
+counts, channels without an observed writer, a Twist channel with no linear
+limit) is listed as INCOMPLETE (exit 1): the file then
 does not compile against the profile and `bind` refuses it until the OEM
 completes it.
 
 ## Review page (`report-html`)
 
-`report-html --report report.json --out report.html [--signoff S] [--note
-TEXT]` renders the learn report (configuration, runs, warnings, sign-off
-items with their confirmation state and signer key ids, motion channels,
-participants, topics, services, overflow, anomalies) as one HTML page to
-review, archive with the commissioning record and print to PDF. It is a
-view: it names the SHA-256 of the files it shows, which stay the signed
-artifacts. Every string is escaped (topic names come off the bus), the
+`report-html --report report.json --out report.html [--signoff S
+[--operators O]] [--note TEXT]` renders the learn report (configuration,
+runs, warnings, sign-off items with their confirmation state and the
+signatures, motion channels, participants, topics, services, overflow,
+anomalies) as one HTML page to review, archive with the commissioning
+record and print to PDF. It is a view: it names the SHA-256 of the files it
+shows, which stay the signed artifacts. The page flags a sign-off whose
+items no longer match its `items_sha256`. The key ids in `S.sig` are shown
+as **UNVERIFIED** unless `--operators` is given; with it, every signature is
+checked over the exact sign-off bytes against that operators file, and the
+page lists the operators with a valid signature and every problem. It does
+not check the quorum or the other `lock` rules. Every string is escaped (topic names come off the bus), the
 page has no script and a `default-src 'none'` CSP, and tables are capped
 at 5000 rows.
 
@@ -502,8 +535,9 @@ with the step-by-step path (learn, report-html, firewall-draft, bind,
 sign-off, lock, verify-profile). The POC therefore runs the production
 path, not observe-only shortcuts. The marking is loud and sticky: key ids
 start with `lab-only-`, the operator is `NAME [LAB-ONLY]` (so `locked_by`
-of every profile says it), `verify-profile` and agentd print the LAB-ONLY
-banner at every start, and removing `lab_only` breaks the root signature.
+of every profile says it), `verify-profile`, agentd and (with
+`commissioning`) the executor print the LAB-ONLY banner at every start,
+and removing `lab_only` breaks the root signature.
 Never deploy it: production needs an offline root and two or more
 operators; nothing of a lab chain is reusable.
 

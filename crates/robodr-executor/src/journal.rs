@@ -239,7 +239,9 @@ pub enum EventKind {
     /// `nft delete table inet robodr`): every action is dropped, nothing is
     /// re-applied.
     RemovedExternally,
-    /// Restart reconciliation finished (detail: what it did).
+    /// Restart reconciliation finished (detail: what it did); also the
+    /// commissioning notes of a configuration re-read changed (detail
+    /// starts with `commissioning`).
     Reconciled,
     /// The journal was unreadable: the table was deleted and the executor
     /// started empty. High severity: whatever was in force is gone and its

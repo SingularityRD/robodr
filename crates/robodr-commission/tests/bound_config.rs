@@ -4,8 +4,8 @@
 //! then what a loader decides for the bound files (`trust::bound`).
 
 use robodr_commission::trust::bound::{
-    bytes_digest, digest_for_role, verify_bindings, BindingRefusal, ROLE_EXECUTOR_MOTION,
-    ROLE_MOTION_FIREWALL, ROLE_RESPONSE_POLICY,
+    bytes_digest, digest_for_role, verify_bindings, verify_bindings_report, BindingRefusal,
+    ROLE_EXECUTOR_MOTION, ROLE_MOTION_FIREWALL, ROLE_RESPONSE_POLICY,
 };
 use robodr_commission::trust::TrustInputs;
 use std::path::{Path, PathBuf};
@@ -213,6 +213,10 @@ fn bound_policy_and_executor_motion_are_honoured_only_as_signed() {
     );
     assert!(r.iter().all(Result::is_ok), "{r:?}");
     assert_eq!(r[0].as_ref().unwrap().locked_by, "alice [LAB-ONLY]");
+    // Review (WP6): a loader without the trust evaluation (the executor)
+    // learns the chain is lab-only, to print the banner.
+    let rep = verify_bindings_report(&locked, &ti, &[(ROLE_RESPONSE_POLICY, &pol_d)]);
+    assert!(rep.lab_only && rep.results[0].is_ok(), "{rep:?}");
 
     // A flipped flag (or any edit) under the same profile: mismatch.
     let edited = bytes_digest(policy_text(false).as_bytes());
@@ -248,6 +252,163 @@ fn bound_policy_and_executor_motion_are_honoured_only_as_signed() {
     let _ = std::fs::remove_dir_all(&c.d);
 }
 
+/// Review (WP6): binding in steps with `--signoff` (the policy first, the
+/// executor's motion section with the first run's list) kept only the
+/// items of the last run, so `lock` refused the list (RequiredItemMissing).
+#[test]
+fn bind_in_steps_keeps_the_earlier_binding_items() {
+    let c = chain();
+    let pol = c.d.join("response-policy.json");
+    std::fs::write(&pol, policy_text(true)).unwrap();
+    let exe = c.d.join("executor.json");
+    std::fs::write(&exe, EXECUTOR).unwrap();
+    let learned = PathBuf::from(format!("{}.signoff.json", c.draft.display()));
+    let b1 = c.d.join("b1.json");
+    let o = run(&[
+        "bind",
+        "--in",
+        s(&c.draft),
+        "--out",
+        s(&b1),
+        "--signoff",
+        s(&learned),
+        "--response-policy",
+        s(&pol),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so1 = c.d.join("b1.json.signoff.json");
+    let b2 = c.d.join("b2.json");
+    let o = run(&[
+        "bind",
+        "--in",
+        s(&b1),
+        "--out",
+        s(&b2),
+        "--signoff",
+        s(&so1),
+        "--executor-config",
+        s(&exe),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so2 = c.d.join("b2.json.signoff.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&so2).unwrap()).unwrap();
+    let subjects: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "bound_config")
+        .map(|i| i["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert!(subjects.iter().any(|s| s.starts_with("response_policy ")));
+    assert!(subjects.iter().any(|s| s.starts_with("executor_motion ")));
+
+    // Re-binding the same role replaces its item (no stale digest kept).
+    std::fs::write(&pol, policy_text(false)).unwrap();
+    let b3 = c.d.join("b3.json");
+    let o = run(&[
+        "bind",
+        "--in",
+        s(&b2),
+        "--out",
+        s(&b3),
+        "--signoff",
+        s(&so2),
+        "--response-policy",
+        s(&pol),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so3 = c.d.join("b3.json.signoff.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&so3).unwrap()).unwrap();
+    let pol_items: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "bound_config")
+        .filter_map(|i| i["subject"].as_str())
+        .filter(|s| s.starts_with("response_policy "))
+        .collect();
+    assert_eq!(
+        pol_items,
+        vec![format!(
+            "response_policy {}",
+            bytes_digest(policy_text(false).as_bytes())
+        )]
+    );
+
+    // And the two-step list locks.
+    confirm(&so3, "alice [LAB-ONLY]");
+    let ops = c.poc.join("operators.json");
+    let o = run(&[
+        "signoff",
+        "--signoff",
+        s(&so3),
+        "--sign-key",
+        s(&c.poc.join("lab-only-operator.key")),
+        "--operators",
+        s(&ops),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    // report-html shows the .sig key ids as unverified unless given the
+    // operators file, then as checked (review WP6).
+    let html = c.d.join("r.html");
+    let o = run(&[
+        "report-html",
+        "--report",
+        s(&c.report),
+        "--out",
+        s(&html),
+        "--signoff",
+        s(&so3),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let h = std::fs::read_to_string(&html).unwrap();
+    assert!(h.contains("UNVERIFIED"), "{h}");
+    let o = run(&[
+        "report-html",
+        "--report",
+        s(&c.report),
+        "--out",
+        s(&html),
+        "--signoff",
+        s(&so3),
+        "--operators",
+        s(&ops),
+        "--force",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let h = std::fs::read_to_string(&html).unwrap();
+    assert!(
+        h.contains("signatures (verified against the operators file)"),
+        "{h}"
+    );
+    assert!(
+        h.contains("<span class=\"ok\">valid</span>: alice [LAB-ONLY]"),
+        "{h}"
+    );
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&b3),
+        "--signoff",
+        s(&so3),
+        "--operators",
+        s(&ops),
+        "--out",
+        s(&c.d.join("locked.json")),
+        "--platform",
+        "ugv",
+        "--profile-version",
+        "1",
+        "--sign-key",
+        s(&c.poc.join("lab-only-profile.key")),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let _ = std::fs::remove_dir_all(&c.d);
+}
+
 #[test]
 fn bind_refuses_invalid_files_and_locked_input() {
     let c = chain();
@@ -272,6 +433,31 @@ fn bind_refuses_invalid_files_and_locked_input() {
     // Nothing to bind.
     let o = run(&["bind", "--in", s(&c.draft), "--out", s(&c.d.join("b.json"))]);
     assert_eq!(code(&o), 2);
+    // Not an executor configuration, or a `motion` that is not an object
+    // (review WP6: only a digest was computed before).
+    for bad_exe in [
+        r#"{"motion": {"nav2": {"oem_validated": true}}}"#,
+        r#"{"schema": "robodr-executor-config/v1", "motion": [1]}"#,
+        r#"{"schema": "robodr-executor-config/v1", "motion": "x"}"#,
+    ] {
+        let exe = c.d.join("bad-executor.json");
+        std::fs::write(&exe, bad_exe).unwrap();
+        let o = run(&[
+            "bind",
+            "--in",
+            s(&c.draft),
+            "--out",
+            s(&c.d.join("b.json")),
+            "--executor-config",
+            s(&exe),
+        ]);
+        assert_eq!(code(&o), 2, "{bad_exe}: {}", err(&o));
+        assert!(
+            err(&o).contains("not a valid executor_motion file"),
+            "{}",
+            err(&o)
+        );
+    }
     // A firewall file that does not compile against the draft.
     let fw = c.d.join("fw.json");
     std::fs::write(&fw, "{\"channels\": {}}").unwrap();

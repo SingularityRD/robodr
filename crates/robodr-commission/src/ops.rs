@@ -853,6 +853,10 @@ impl std::error::Error for MergeError {}
 /// the larger bound wins. `None` is read as "not observed" (the learner's meaning), so a bound
 /// from one profile is kept when the other has none. The result is always
 /// unlocked: a merged profile must be reviewed and locked again.
+/// `bound_config` is **not** carried over (nor are participant identities
+/// and learned motion types): the merged draft binds no safety
+/// configuration until `bind` runs on it, so a unit using it treats the
+/// policy and adapters as not OEM-validated (fail closed).
 ///
 /// Prefer [`crate::Learner::merge`] when the raw runs are available: it
 /// computes percentiles and warnings over all samples, and applies the margin
@@ -975,6 +979,13 @@ pub struct ProfileDiff {
     pub motion_channels_added: BTreeMap<String, Envelope>,
     pub motion_channels_removed: BTreeMap<String, Envelope>,
     pub envelope_changes: Vec<EnvelopeChange>,
+    /// Bound safety configuration (`bound_config`, see
+    /// `trust::bound`) that was added, removed or re-bound: role ->
+    /// `(old digest, new digest)`. Neither tightens nor loosens by itself
+    /// (the file's content decides), so it is shown for review, not in
+    /// [`ProfileDiff::loosens`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bound_config_changes: BTreeMap<String, (Option<String>, Option<String>)>,
 }
 
 impl ProfileDiff {
@@ -1090,6 +1101,18 @@ pub fn diff(old: &Profile, new: &Profile) -> ProfileDiff {
             d.motion_channels_removed.insert(ch.clone(), env.clone());
         }
     }
+    let roles: BTreeSet<&String> = old
+        .bound_config
+        .keys()
+        .chain(new.bound_config.keys())
+        .collect();
+    for role in roles {
+        let (a, b) = (old.bound_config.get(role), new.bound_config.get(role));
+        if a != b {
+            d.bound_config_changes
+                .insert(role.clone(), (a.cloned(), b.cloned()));
+        }
+    }
     d
 }
 
@@ -1196,6 +1219,19 @@ impl fmt::Display for ProfileDiff {
                     Direction::Tightened => "tightens",
                 }
             )?;
+        }
+        for (role, (a, b)) in &self.bound_config_changes {
+            match (a, b) {
+                (None, Some(n)) => writeln!(f, "+ bound {role} {n}   [REVIEW the file]")?,
+                (Some(o), None) => writeln!(
+                    f,
+                    "- bound {role} (was {o}): the unit no longer honours that file's flags"
+                )?,
+                (Some(o), Some(n)) => {
+                    writeln!(f, "~ bound {role}: {o} -> {n}   [REVIEW the file]")?
+                }
+                (None, None) => {}
+            }
         }
         Ok(())
     }
@@ -2248,5 +2284,65 @@ mod tests {
         let (locked, _) =
             lock_signed_draft(&draft, &so, Some(&two), &policy, &HardCaps::default()).unwrap();
         assert_eq!(locked.bound_config.get("response_policy"), Some(&d));
+    }
+
+    /// Review (WP6): `diff` did not show bound_config changes, so a
+    /// re-lock review could not see that the policy, executor motion or
+    /// firewall binding changed; `merge` drops the bindings (fail closed,
+    /// now documented and tested).
+    #[test]
+    fn diff_shows_bound_config_and_merge_drops_it() {
+        let old = base();
+        let mut new = old.clone();
+        let (a, b) = (
+            format!("sha256:{}", "a".repeat(64)),
+            format!("sha256:{}", "b".repeat(64)),
+        );
+        let mut old_b = old.clone();
+        old_b
+            .bound_config
+            .insert("response_policy".into(), a.clone());
+        old_b
+            .bound_config
+            .insert("motion_firewall".into(), a.clone());
+        new.bound_config.insert("response_policy".into(), b.clone());
+        new.bound_config.insert("executor_motion".into(), b.clone());
+        let d = diff(&old_b, &new);
+        assert!(!d.is_empty());
+        assert!(!d.loosens(), "{d}");
+        assert_eq!(
+            d.bound_config_changes.get("response_policy"),
+            Some(&(Some(a.clone()), Some(b.clone())))
+        );
+        assert_eq!(
+            d.bound_config_changes.get("executor_motion"),
+            Some(&(None, Some(b.clone())))
+        );
+        assert_eq!(
+            d.bound_config_changes.get("motion_firewall"),
+            Some(&(Some(a.clone()), None))
+        );
+        let text = d.to_string();
+        assert!(
+            text.contains(&format!("~ bound response_policy: {a} -> {b}")),
+            "{text}"
+        );
+        assert!(text.contains("+ bound executor_motion"), "{text}");
+        assert!(text.contains("- bound motion_firewall"), "{text}");
+        let j = serde_json::to_value(&d).unwrap();
+        assert!(
+            j["bound_config_changes"]["response_policy"].is_array(),
+            "{j}"
+        );
+        // Unchanged bindings: nothing reported (and the JSON omits it).
+        let d = diff(&new, &new);
+        assert!(d.is_empty());
+        assert!(serde_json::to_value(&d)
+            .unwrap()
+            .get("bound_config_changes")
+            .is_none());
+
+        let m = merge_profiles(&[old_b, new]).unwrap();
+        assert!(m.bound_config.is_empty());
     }
 }

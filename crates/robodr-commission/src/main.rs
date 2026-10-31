@@ -137,7 +137,8 @@ USAGE:
                           --max-angular RAD_PER_S [--ceiling-linear M_PER_S]
                           [--morphology wheeled|quadruped|humanoid|arm|other] [--force]
   robodr-commission report-html --report report.json --out report.html
-                          [--signoff signoff.json] [--note TEXT] [--force]
+                          [--signoff signoff.json [--operators operators.json]]
+                          [--note TEXT] [--force]
   robodr-commission poc-init --dir DIR [--operator NAME]
   robodr-commission merge   --out merged.json <a.json> <b.json> [...]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
@@ -240,7 +241,9 @@ USAGE:
   report (envelopes capped by the OEM ceilings, observed writers as
   allowed_sources); exit 1 when channels still need the OEM's specs.
   report-html renders a learn report (and sign-off state) as one inert
-  HTML page for review, archive and print-to-PDF.
+  HTML page for review, archive and print-to-PDF; the sign-off's
+  signatures are shown as UNVERIFIED key ids unless --operators is given
+  (then checked against it).
   poc-init creates a LAB-ONLY single-operator signing chain (keys, roots,
   operators, root-signed trust file marked lab_only) for a proof of
   concept; units accept it but report it loudly. Never for production.

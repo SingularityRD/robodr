@@ -2610,3 +2610,42 @@ fn t18_real_ros2_peer() {
     assert_eq!(st["cancels"], 3, "{st}");
     eprintln!("peer: {st}");
 }
+
+/// Review (WP6): `clear_validation` / `any_validated` once listed the six
+/// adapter fields by hand; an adapter added later would have kept its
+/// `oem_validated` under a mismatched (unsigned) motion section. Both now
+/// go through `AdapterKind::ALL`, which must name every variant serde
+/// knows.
+#[test]
+fn every_adapter_kind_is_cleared_by_clear_validation() {
+    // serde lists every variant in its unknown-variant error.
+    let e = serde_json::from_value::<crate::motion::AdapterKind>(json!("no-such-adapter"))
+        .unwrap_err()
+        .to_string();
+    let listed: Vec<&str> = e.split('`').skip(3).step_by(2).collect();
+    let all: Vec<&str> = crate::motion::AdapterKind::ALL
+        .iter()
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(listed, all, "AdapterKind::ALL out of date ({e})");
+
+    let peer = json!({"peer_ip": "10.0.0.2", "local_ip": "10.0.0.1"});
+    let mut m: crate::motion::MotionSection = serde_json::from_value(json!({
+        "gateway": {"oem_validated": true, "restriction_path": "/r", "status_path": "/s"},
+        "unitree_sport": {"oem_validated": true, "ros2": peer},
+        "nav2": {"oem_validated": true, "ros2": peer},
+        "ros2_control": {"oem_validated": true, "ros2": peer, "deactivate": ["a"]},
+        "px4": {"oem_validated": true, "address": "10.0.0.3:14540", "bind": "0.0.0.0:0"},
+        "rollback": {"oem_validated": true, "program": "/bin/true"}
+    }))
+    .unwrap();
+    for k in crate::motion::AdapterKind::ALL {
+        assert_eq!(m.adapter(k).map(|(v, _)| v), Some(true), "{k:?}");
+    }
+    assert!(m.any_validated());
+    m.clear_validation();
+    for k in crate::motion::AdapterKind::ALL {
+        assert_eq!(m.adapter(k).map(|(v, _)| v), Some(false), "{k:?}");
+    }
+    assert!(!m.any_validated());
+}

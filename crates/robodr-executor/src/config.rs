@@ -47,6 +47,9 @@
 //! With it, `oem_validated` (policy and adapters) counts only for the bound
 //! files, checked by the executor itself at start and before every order
 //! ([`load_commissioned`]). Without it the flags are unsigned (warned).
+//! Once a running executor has read the section it keeps verifying against
+//! it until restarted, even if the file's section is removed or changed
+//! ([`load_commissioned_pinned`]).
 //!
 //! `network.quarantine` (review finding F4): the participant's locators an
 //! order carries come from SPDP (unauthenticated), so a quarantine drops
@@ -170,7 +173,14 @@ pub struct ExecutorConfig {
 /// refused `observe_mode`), a motion section that is not the bound one has
 /// every adapter treated as not validated (`adapter_not_validated`). The
 /// anti-rollback state stays agentd's (it reports `profile_locked`).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// **Sticky for the process's lifetime** ([`load_commissioned_pinned`]):
+/// once a running executor has read a `commissioning` section, a re-read
+/// that finds the section removed or changed (other profile, other trust
+/// anchors) still verifies against the section it already had, and says so
+/// in a note. Changing or removing the section takes a restart of the
+/// executor (which prints the UNSIGNED warning again if it is gone).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Commissioning {
     pub profile_path: PathBuf,
@@ -686,12 +696,46 @@ pub fn load_policy(path: &Path) -> Result<robodr_responder::ResponsePolicy, Stri
 pub fn load_commissioned(
     path: &Path,
 ) -> Result<(Resolved, robodr_responder::ResponsePolicy, Vec<String>), String> {
+    load_commissioned_pinned(path, None)
+}
+
+/// [`load_commissioned`] for a running executor that already holds
+/// `pinned`, the `commissioning` section it read before (review WP6: the
+/// section sits in the same unbound file as the network settings, so
+/// deleting it, or pointing it at other trust anchors, must not restore
+/// the flags at runtime). With `pinned`, the file's own section is replaced
+/// by `pinned` before the decision; a section that differs or is missing
+/// adds a note.
+pub fn load_commissioned_pinned(
+    path: &Path,
+    pinned: Option<&Commissioning>,
+) -> Result<(Resolved, robodr_responder::ResponsePolicy, Vec<String>), String> {
     let text = read_small(path)?;
     let mut cfg = ExecutorConfig::parse(&text)?.validate()?;
+    let mut sticky_note = None;
+    if let Some(pin) = pinned {
+        if cfg.config.commissioning.as_ref() != Some(pin) {
+            sticky_note = Some(format!(
+                "WARNING: the `commissioning` section of {} was {} since this executor read \
+                 it; still verifying against the section it had (restart the executor to \
+                 apply the change)",
+                path.display(),
+                if cfg.config.commissioning.is_none() {
+                    "removed"
+                } else {
+                    "changed"
+                }
+            ));
+            cfg.config.commissioning = Some(pin.clone());
+        }
+    }
     let policy_text = read_small(&cfg.config.policy_path)?;
     let mut policy = robodr_responder::ResponsePolicy::from_json(&policy_text)
         .map_err(|e| format!("{}: {e}", cfg.config.policy_path.display()))?;
-    let notes = apply_commissioning(&mut cfg, &text, &policy_text, &mut policy);
+    let mut notes = apply_commissioning(&mut cfg, &text, &policy_text, &mut policy);
+    if let Some(n) = sticky_note {
+        notes.insert(0, n);
+    }
     Ok((cfg, policy, notes))
 }
 
@@ -706,7 +750,7 @@ pub fn apply_commissioning(
     policy: &mut robodr_responder::ResponsePolicy,
 ) -> Vec<String> {
     use robodr_commission::trust::bound::{
-        bytes_digest, canonical_json_digest, verify_bindings, ROLE_EXECUTOR_MOTION,
+        bytes_digest, canonical_json_digest, verify_bindings_report, ROLE_EXECUTOR_MOTION,
         ROLE_RESPONSE_POLICY,
     };
     let mut notes = Vec::new();
@@ -744,8 +788,17 @@ pub fn apply_commissioning(
         expect_unit_id: Some(&robot_id),
         ..Default::default()
     };
-    let results = verify_bindings(&c.profile_path, &inputs, &wanted);
-    for ((role, _), r) in wanted.iter().zip(results) {
+    let report = verify_bindings_report(&c.profile_path, &inputs, &wanted);
+    if report.lab_only {
+        // The banner agentd and verify-profile print (review WP6: the
+        // executor accepted a lab-only chain without a word).
+        notes.push(format!(
+            "WARNING: {}: {}",
+            c.profile_path.display(),
+            robodr_commission::poc::LAB_ONLY_BANNER
+        ));
+    }
+    for ((role, _), r) in wanted.iter().zip(report.results) {
         let Err(e) = r else { continue };
         if *role == ROLE_RESPONSE_POLICY && policy.oem_validated {
             policy.oem_validated = false;

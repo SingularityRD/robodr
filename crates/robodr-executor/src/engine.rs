@@ -295,6 +295,10 @@ pub struct Engine {
     /// The configuration file, re-read (with the policy it names) before
     /// every order and re-arm ([`Engine::with_reload`]).
     reload: Option<PathBuf>,
+    /// The commissioning notes of the last configuration read (start:
+    /// [`Engine::with_commissioning_notes`]); a re-read whose notes differ
+    /// logs and journals them (review WP6).
+    commissioning_notes: Vec<String>,
     /// Ids whose `journal_error` event was emitted (no event per retry).
     unjournalled: BTreeSet<String>,
     /// The last reason held actions could not be re-armed (one event per
@@ -447,6 +451,7 @@ impl Engine {
             boot_id: boot_id.to_string(),
             last_verify_boot_ms: now.boot_ms.unwrap_or(now.wall_ms),
             reload: None,
+            commissioning_notes: Vec::new(),
             unjournalled: BTreeSet::new(),
             last_hold_reason: None,
             loaded_seq: None,
@@ -686,7 +691,20 @@ impl Engine {
         self
     }
 
-    fn reload_config(&mut self) -> Result<(), Refusal> {
+    /// The commissioning notes of the configuration this engine was opened
+    /// with (already logged by the caller): a re-read logs and journals its
+    /// notes only when they differ.
+    pub fn with_commissioning_notes(mut self, notes: Vec<String>) -> Self {
+        self.commissioning_notes = notes;
+        self
+    }
+
+    /// The commissioning notes of the last configuration read.
+    pub fn commissioning_notes(&self) -> &[String] {
+        &self.commissioning_notes
+    }
+
+    fn reload_config(&mut self, now_ms: u64) -> Result<(), Refusal> {
         let Some(p) = &self.reload else {
             return Ok(());
         };
@@ -697,8 +715,26 @@ impl Engine {
             )
         };
         // The signed commissioning is re-checked with the files (T12): a
-        // policy or motion section edited since start loses its flags.
-        let (mut new, policy, _notes) = crate::config::load_commissioned(p).map_err(fail)?;
+        // policy or motion section edited since start loses its flags. The
+        // `commissioning` section this process holds stays in force (review
+        // WP6): removing it from the file, or re-pointing its trust anchors,
+        // does not restore the flags before a restart.
+        let pinned = self.cfg.config.commissioning.clone();
+        let (mut new, policy, notes) =
+            crate::config::load_commissioned_pinned(p, pinned.as_ref()).map_err(fail)?;
+        if notes != self.commissioning_notes {
+            let detail = if notes.is_empty() {
+                "commissioning: the configuration re-read is honoured as signed again (no notes)"
+                    .to_string()
+            } else {
+                format!("commissioning changed: {}", notes.join("; "))
+            };
+            eprintln!("robodr-executor: {detail}");
+            self.state
+                .event(now_ms, EventKind::Reconciled, None, None, detail);
+            let _ = self.save();
+            self.commissioning_notes = notes;
+        }
         let old = &self.cfg.config;
         new.config.socket = old.socket.clone();
         new.config.key_file = old.key_file.clone();
@@ -1209,7 +1245,7 @@ impl Engine {
                 now_ms,
             );
         }
-        if let Err(r) = self.reload_config() {
+        if let Err(r) = self.reload_config(now_ms) {
             return self.refuse(order, &digest, r, now_ms);
         }
         // Trust boundary (M1): the approval is the SOC's, verified here.
@@ -1458,7 +1494,7 @@ impl Engine {
         if self.removed_by_operator(now_ms) || self.state.operator_disabled {
             return;
         }
-        let reload = self.reload_config().err();
+        let reload = self.reload_config(now_ms).err();
         let held: Vec<Entry> = self
             .state
             .entries

@@ -69,6 +69,18 @@ pub enum AdapterKind {
 }
 
 impl AdapterKind {
+    /// Every adapter kind. A test checks it against the variants serde
+    /// knows, so a new adapter cannot be left out (and keep its
+    /// `oem_validated` through [`MotionSection::clear_validation`]).
+    pub const ALL: [AdapterKind; 6] = [
+        AdapterKind::Gateway,
+        AdapterKind::UnitreeSport,
+        AdapterKind::Nav2,
+        AdapterKind::Ros2Control,
+        AdapterKind::Px4,
+        AdapterKind::Rollback,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             AdapterKind::Gateway => "gateway",
@@ -485,38 +497,33 @@ fn topic_ok(s: &str) -> bool {
 impl MotionSection {
     /// Does any configured adapter claim `oem_validated`?
     pub fn any_validated(&self) -> bool {
-        [
-            AdapterKind::Gateway,
-            AdapterKind::UnitreeSport,
-            AdapterKind::Nav2,
-            AdapterKind::Ros2Control,
-            AdapterKind::Px4,
-            AdapterKind::Rollback,
-        ]
-        .into_iter()
-        .any(|k| self.adapter(k).is_some_and(|(v, _)| v))
+        AdapterKind::ALL
+            .into_iter()
+            .any(|k| self.adapter(k).is_some_and(|(v, _)| v))
     }
 
     /// Treat every adapter as not OEM-validated (the section is not the one
     /// the signed commissioning binds: `crate::config::Commissioning`).
+    /// Goes through [`AdapterKind::ALL`] and the exhaustive
+    /// [`MotionSection::validated_mut`], so an adapter added later cannot
+    /// keep its flag (review: a hand-written field list failed open).
     pub fn clear_validation(&mut self) {
-        if let Some(a) = &mut self.gateway {
-            a.oem_validated = false;
+        for k in AdapterKind::ALL {
+            if let Some(v) = self.validated_mut(k) {
+                *v = false;
+            }
         }
-        if let Some(a) = &mut self.unitree_sport {
-            a.oem_validated = false;
-        }
-        if let Some(a) = &mut self.nav2 {
-            a.oem_validated = false;
-        }
-        if let Some(a) = &mut self.ros2_control {
-            a.oem_validated = false;
-        }
-        if let Some(a) = &mut self.px4 {
-            a.oem_validated = false;
-        }
-        if let Some(a) = &mut self.rollback {
-            a.oem_validated = false;
+    }
+
+    /// The adapter's `oem_validated` flag (`None`: not configured).
+    fn validated_mut(&mut self, k: AdapterKind) -> Option<&mut bool> {
+        match k {
+            AdapterKind::Gateway => self.gateway.as_mut().map(|a| &mut a.oem_validated),
+            AdapterKind::UnitreeSport => self.unitree_sport.as_mut().map(|a| &mut a.oem_validated),
+            AdapterKind::Nav2 => self.nav2.as_mut().map(|a| &mut a.oem_validated),
+            AdapterKind::Ros2Control => self.ros2_control.as_mut().map(|a| &mut a.oem_validated),
+            AdapterKind::Px4 => self.px4.as_mut().map(|a| &mut a.oem_validated),
+            AdapterKind::Rollback => self.rollback.as_mut().map(|a| &mut a.oem_validated),
         }
     }
 
