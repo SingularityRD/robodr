@@ -20,6 +20,25 @@ the ROS 2 pipeline and the RoboDR decision chain, records evidence in a signed
 black box and writes validated OCSF findings to a spool directory. It reports
 its own health and is never "OK" while blind.
 .PP
+Every
+.B daemon.self_health.health_record_ms
+(default 60 s, 0 off) it sends the Low, observe\-only
+.B robot.agent.health
+finding with its state, inputs, counters, reachability, credential expiry,
+clock and free disk space, and it raises observe\-only early warnings:
+.BR robot.agent.credential_expiring ,
+.BR clock_unsynced ,
+.BR clock_jump ,
+.B disk_low
+and
+.B executor_unreachable
+(thresholds in
+.BR daemon.self_health ;
+docs/OPERATIONS.md section 6.1).
+.B findings.max_contract_minor
+builds findings for an older findings contract 2.x minor (for a SOC with
+older validators); below 5 the health record is off.
+.PP
 It is read\-only on networks and protective only: response plans are
 recorded, never executed by agentd itself; only with
 .B executor.enabled
