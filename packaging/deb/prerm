@@ -1,6 +1,7 @@
 #!/bin/sh
 # robodr prerm. Stops the services on removal; on upgrade they keep running
-# until postinst try-restarts them on the new binaries.
+# until postinst try-restarts them on the new binaries (the gateway and the
+# executor only through the safety-state gate: postinst, gated_restart).
 set -e
 
 case "$1" in

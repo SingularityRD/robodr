@@ -70,6 +70,19 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .RB [ \-\-trigger
 .IR tamper | attestation_failed | auth_failures ]
 .br
+.B robodr\-deliverd safety\-state
+.RB [ \-\-config
+.IR FILE ]
+.br
+.B robodr\-deliverd verify\-minisign \-\-pubkey
+.I FILE
+.B \-\-file
+.I FILE
+.RB [ \-\-sig
+.IR FILE ]
+.br
+.B robodr\-deliverd verify\-minisign \-\-self\-test
+.br
 .B robodr\-deliverd \-\-version
 .SH DESCRIPTION
 The on-unit delivery agent of RoboDR's secure delivery (Sprint 13b). It
@@ -341,6 +354,40 @@ before acting; the intent is journaled first. A
 trigger reports
 .B robot.seal.tamper
 (Critical) at once.
+.TP
+.B safety\-state
+Print, as JSON, the live safety state as the install gate sees it (the
+.B safety
+section of
+.BR \-\-config ,
+or its defaults: agentd's status socket, peer\-checked) and whether
+agentd's heartbeat is fresh
+.RB ( agentd_fresh ).
+Exit 0 when the gateway and the executor may be restarted now
+.RB ( idle " or " safe_state_active ),
+1 otherwise.
+.B install\-bundle.sh
+uses it to gate package upgrades and for its post\-install health check
+(OPERATIONS.md section 7).
+.TP
+.B verify\-minisign
+Check the minisign signature
+.RI ( FILE .minisig,
+or
+.BR \-\-sig )
+of
+.I FILE
+against a minisign public key file with RoboDR's built\-in verifier and
+print the trusted comment. Only prehashed signatures (the minisign
+default, as releases are signed) are accepted; Ed25519 is verified
+strictly and the trusted comment's signature is checked.
+.B \-\-self\-test
+runs the verifier's known\-answer test.
+.B install\-bundle.sh
+uses it instead of the
+.B minisign
+program once a release carrying it is installed, and then refuses
+.BR ROBODR_ALLOW_UNSIGNED .
 .SH SEALED PACKAGES
 With the optional
 .B seal

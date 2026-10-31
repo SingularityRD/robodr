@@ -2,7 +2,8 @@
 # robodr postinst. Creates the robodr user and directories, reloads systemd.
 # Services are NOT enabled or started on first install: an uncommissioned
 # robot must not start enforcing (OPERATIONS.md, "Commissioning"). On upgrade,
-# services that were running are restarted on the new binaries.
+# services that were running are restarted on the new binaries, except the
+# gateway and the executor (gated_restart below).
 set -e
 
 # >>> migrate_agentd_tree (tests/review2_13b.rs runs this block)
@@ -76,8 +77,48 @@ migrate_exporter_users() {
 }
 # <<< migrate_exporter_users
 
+# >>> gated_restart (packaging/rpm/post carries the same block)
+# T9: robodr-firewall-gw and robodr-executor are never restarted by a
+# package upgrade: restarting the gateway drops the motion commands
+# queued in it (fail_closed: the bridge refuses motion while it is down),
+# restarting the executor drops its pending actions. They keep running
+# the previous binaries and are recorded in /var/lib/robodr/pending-restart;
+# install-bundle.sh restarts them only while the live safety state is
+# idle or safe_state_active (or with --allow-gateway-restart), at once or
+# later with `install-bundle.sh restart-pending` (OPERATIONS.md 7).
+mark_pending_restart() { # unit
+    systemctl is-active --quiet "$1" || return 0
+    # Already started on the new binaries by the user migration.
+    case " $stopped " in *" $1 "*) return 0 ;; esac
+    mkdir -p /var/lib/robodr
+    grep -qx "$1" /var/lib/robodr/pending-restart 2>/dev/null ||
+        echo "$1" >>/var/lib/robodr/pending-restart
+    echo "robodr: $1 keeps running the previous binaries until a safety-gated restart:"
+    echo "robodr:   /usr/lib/robodr/install-bundle.sh restart-pending (OPERATIONS.md 7)"
+}
+
+# The one-time gateway user migration (migrate_exporter_users) stops the
+# gateway. It runs only when install-bundle.sh found the safety state to
+# allow it (ROBODR_GATED_RESTART=allow); otherwise the configuration is
+# refused before anything is stopped, and the gateway keeps running.
+gateway_migration_gate() {
+    [ ! -e /var/lib/robodr/.exporter-users-migrated ] || return 0
+    [ -d /run/systemd/system ] || return 0
+    [ "${ROBODR_GATED_RESTART:-}" != allow ] || return 0
+    systemctl is-active --quiet robodr-firewall-gw.service || return 0
+    echo "robodr: this upgrade must stop robodr-firewall-gw once to move its state to its own" >&2
+    echo "robodr: user, and nothing said the safety state allows that. Nothing was stopped." >&2
+    echo "robodr: When the robot is idle or in its safe state, run" >&2
+    echo "robodr:   /usr/lib/robodr/install-bundle.sh restart-pending   (.deb), or" >&2
+    echo "robodr:   install the release again with install-bundle.sh install (OPERATIONS.md 7)." >&2
+    exit 1
+}
+# <<< gated_restart
+
+stopped=""
 case "$1" in
 configure)
+    gateway_migration_gate
     if command -v systemd-sysusers >/dev/null 2>&1; then
         systemd-sysusers /usr/lib/sysusers.d/robodr.conf
     elif ! getent passwd robodr >/dev/null; then
@@ -157,12 +198,15 @@ configure)
             systemctl start "$u" || true
         done
         if [ -n "$2" ]; then
-            # Upgrade: restart only what was running.
+            # Upgrade: restart only what was running...
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
                 robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
-                robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service \
-                robodr-depot.service; do
+                robodr-deliverd.service robodr-depot.service; do
                 systemctl try-restart "$u" || true
+            done
+            # ...but never the gateway or the executor (gated_restart).
+            for u in robodr-executor.service robodr-firewall-gw.service; do
+                mark_pending_restart "$u"
             done
         else
             echo "robodr: installed. Services are disabled until commissioning is"

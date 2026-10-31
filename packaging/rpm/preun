@@ -1,7 +1,8 @@
 #!/bin/sh
 # robodr preun scriptlet (RPM). The counterpart of packaging/deb/prerm: stops the
 # services on removal; on upgrade they keep running until the new
-# package's post scriptlet try-restarts them.
+# package's post scriptlet try-restarts them (the gateway and the executor
+# only through the safety-state gate: post, gated_restart).
 #
 # $1: 0 = removal, >= 1 = upgrade (this is the old package's scriptlet).
 set -e
