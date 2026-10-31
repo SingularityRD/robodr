@@ -281,9 +281,17 @@
   clocks) remain in agentd, the black box, capture, deliverd, depot,
   diode, executor, export, firewall-gw, fleet and the ROS 2 pipeline.
 - **`panic = "abort"`:** a panic stops the daemon until systemd restarts
-  it. Panic-family calls and unchecked indexing are denied in daemon code
-  and in the in-process parsers; arithmetic overflow and the remaining
-  library code are left to review and fuzzing.
+  it. Panic-family calls and unchecked indexing are denied in the library
+  code of the daemons and the in-process parsers, and in the entry files of
+  agentd, the executor, the gateway and `robodr-enroll`. The lints are set
+  per crate root, so they do not reach the other binary entry files
+  (`src/bin/*.rs`, `src/main.rs`): among them `robodr-uplink`,
+  `robodr-kafka-publish`, `robodr-spool-export`, `robodr-anchor-receiver`
+  and `robodr-pulsard` (about 2,100 lines of argument handling and set-up)
+  and the operator tools. Arithmetic overflow and the remaining library
+  code are left to review and fuzzing; two parsers of untrusted input
+  have no fuzz target yet (`secured_prefix`, `remote_anchor`;
+  [`fuzz/README.md`](../../fuzz/README.md)).
 - **Legacy HMAC keys** are refused unless explicitly allowed
   (`blackbox.allow_hmac`, `--allow-hmac`). Where they are allowed,
   verifiers holding an HMAC key can forge. The deliverd finding key

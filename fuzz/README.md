@@ -1,8 +1,22 @@
 # Coverage-guided fuzzing for RoboDR (cargo-fuzz / libFuzzer)
 
-Every parser that reads bytes an attacker (or a corrupted disk) can control
-has a libFuzzer target here. Each target fails on a panic **or** on a
-violated output invariant (documented at the top of its harness file).
+The parsers that read bytes an attacker (or a corrupted disk) can control
+have libFuzzer targets here, with these known exceptions (no target yet):
+
+- `robodr-rtps` `secured_prefix`: rebuilds the DER of the certificate
+  subject a secured participant's SPDP identity token claims (`dds.cert.sn`,
+  attacker-chosen text) to check its GUID prefix; it has unit tests only,
+  and the `pipeline_config` target runs the pipeline over fixed fixtures;
+- `robodr-blackbox` `remote_anchor`: the marks a robot sends and the
+  answers `robodr-anchor-receiver` returns (`parse_request`,
+  `read_frame`; over TLS unless plain TCP is allowed, Ed25519-signed, but
+  parsed before any signature is checked);
+- the argument and configuration handling in the binary entry files
+  (`src/bin/*.rs`, `src/main.rs`), for example `robodr-uplink`,
+  `robodr-kafka-publish` and `robodr-anchor-receiver`.
+
+Each target fails on a panic **or** on a violated output invariant
+(documented at the top of its harness file).
 
 | target | crate | what it feeds | smoke test |
 |---|---|---|---|

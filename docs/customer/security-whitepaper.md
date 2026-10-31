@@ -256,9 +256,12 @@ the de-energising actions are never executable
 - Exporters are crash-safe and at-least-once. A batch the SOC keeps
   refusing blocks later findings visibly, and is never dropped.
 - `panic = "abort"`: a panic stops the daemon until systemd restarts it.
-  Panic-family calls are denied in the daemon crates' non-test code, and a
-  process-level test checks that the black box verifies across an abort
-  and restart.
+  Panic-family calls are denied in the non-test library code of the
+  daemon crates and in the entry files of agentd, the executor and the
+  gateway (not yet in the entry files of the exporters, the anchor
+  receiver and pulsard; [`known-limitations.md`](known-limitations.md)),
+  and a process-level test checks that the black box verifies across an
+  abort and restart.
 
 ## 9. Supply chain
 

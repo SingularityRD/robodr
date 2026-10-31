@@ -110,6 +110,14 @@ now an item of the release checklist ([`docs/RELEASE.md`](../RELEASE.md)
   `overflow-checks`), and `indexing_slicing` is not denied in the crates
   outside the list above (for example `robodr-blackbox`, `-diode`,
   `-seal`, `-depot`, `-fleet`);
+- the deny set is a crate-level attribute of each root, so it does not
+  reach the binary entry files that do not repeat it (`src/bin/*.rs`,
+  `src/main.rs`): it is in those of agentd, the executor, the gateway and
+  `robodr-enroll`, not in those of `robodr-uplink`, `robodr-kafka-publish`,
+  `robodr-spool-export`, `robodr-anchor-receiver`, `robodr-pulsard` and
+  the operator tools;
+- no fuzz target yet for `robodr-rtps` `secured_prefix` and
+  `robodr-blackbox` `remote_anchor` (`fuzz/README.md`);
 - the hand-written HTTP/1.1 server (agentd control plane, now fuzzed) and
   Kafka client remain (ADR-0007).
 
