@@ -421,7 +421,8 @@ pub struct MotionSection {
     /// default 2; sales-readiness T42, [`MotionPorts::latch`]): `nav2`
     /// cancels every goal again and `px4` reads the vehicle's mode back
     /// and sets hold again; a goal or a mode change someone made while
-    /// paused is reported (`overridden`, High).
+    /// paused is reported (`overridden`, High; the same kind again at most
+    /// every [`crate::engine::LATCH_REPEAT_REPORT_MS`], with a count).
     #[serde(default = "default_latch_s")]
     pub safe_pause_latch_s: u64,
     /// The robot's motion envelope (the profile's, as the gateway applies
@@ -1223,9 +1224,17 @@ pub enum Latch {
     /// what was checked.
     Held(String),
     /// Someone set the robot moving while paused (a new navigation goal,
-    /// a flight-mode change): the adapter cancelled it / set hold again;
-    /// the note says what it found.
-    Overridden(String),
+    /// a flight-mode change): the adapter cancelled it / set hold again.
+    /// `kind` names what was found without its counts (`nav2:goals`,
+    /// `px4:manual:POSCTL`, `px4:mode:AUTO.MISSION`): the engine reports a
+    /// kind once and then repeats of it at most every
+    /// [`crate::engine::LATCH_REPEAT_REPORT_MS`]; `note` says what it found.
+    Overridden {
+        /// What was found, stable across repeats.
+        kind: String,
+        /// What was found and done, for the event.
+        note: String,
+    },
 }
 
 /// The real adapters.

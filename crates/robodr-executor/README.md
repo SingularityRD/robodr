@@ -244,8 +244,7 @@ after a reboot call the adapter's undo; a failed undo leaves the action
 setting hold once is not enough: a new goal or a mode change by someone
 else would set the robot moving again. While a `safe_pause` is in force
 the executor re-asserts it every `motion.safe_pause_latch_s` (1..=60,
-default 2; counted from the end of the previous run, so a peer that does
-not answer cannot keep the engine busy):
+default 2; counted from the end of the previous run):
 
 * `nav2`: `CancelGoal` (every goal) on each action server again. A goal
   found cancelling was sent while paused: event `overridden` with detail
@@ -259,6 +258,26 @@ not answer cannot keep the engine busy):
   pilot**: the latch never takes the sticks away from a human.
 * `ros2_control`: not observed (the controller manager keeps the switch;
   a later switch by someone else is not detected).
+
+Every run cancels / sets hold again, but the `overridden` events are
+rate-limited per pause: a kind of override (`nav2:goals`,
+`px4:manual:<mode>`, `px4:mode:<mode>`) is reported once, and the same
+kind found again within 5 minutes is counted, not reported; the count
+(and the last one's detail) is reported in the next event for that pause,
+at the latest 5 minutes after the previous one. A different kind is
+reported at once. A pilot holding a manual mode, or a script re-sending a
+goal, is therefore at most one High finding per 5 minutes per pause, and
+cannot push older evidence (approvals, applies, refusals) out of the
+journal's ring of events.
+
+The latch's adapter calls are synchronous: while one run lasts, the
+engine handles nothing else (reverts, new orders and TTL expiries wait).
+One `nav2` run takes at most the adapter's configured worst case (every
+action server's `timeout_ms` plus the zero-twist burst; validated against
+the 4 s motion budget); a `px4` run reads the mode (up to `timeout_ms`)
+and, after a mode change, sets hold again (up to `timeout_ms` more).
+Counting the interval from the end of the previous run limits the share
+of time a peer that does not answer can take; it does not shorten one run.
 
 A platform that cannot be read (no answer, a refused cancel) is one
 `drift` event per change of the error (and `verified` once it answers

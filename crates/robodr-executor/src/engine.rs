@@ -317,6 +317,33 @@ pub struct Engine {
     last_latch_boot_ms: u64,
     /// The last latch error per pause (one event per change).
     latch_errors: BTreeMap<String, String>,
+    /// The last override reported per pause (one event per kind of
+    /// override, repeats summarised at most every
+    /// [`LATCH_REPEAT_REPORT_MS`]).
+    latch_overrides: BTreeMap<String, OverrideSeen>,
+}
+
+/// How often the safe_pause latch reports the **same** kind of override
+/// again while it persists or repeats (a pilot holding a manual mode, a
+/// script re-sending a Nav2 goal): 5 minutes, with the number of repeats
+/// found meanwhile. Every latch run still cancels the goals / sets hold
+/// again; only the `overridden` events (each a High finding in agentd and
+/// a journal write) are rate-limited, so they cannot flood the SOC or push
+/// older evidence out of the journal's ring of events. A different kind
+/// is reported at once.
+pub const LATCH_REPEAT_REPORT_MS: u64 = 300_000;
+
+/// The last override the latch reported for one pause.
+#[derive(Debug, Clone)]
+pub(crate) struct OverrideSeen {
+    /// [`crate::motion::Latch::Overridden`]'s `kind`.
+    pub(crate) kind: String,
+    /// When it was last reported (monotonic ms).
+    pub(crate) reported_ms: u64,
+    /// Overrides of this kind found since, not reported yet.
+    pub(crate) unreported: u64,
+    /// The last unreported one's note.
+    pub(crate) last_note: String,
 }
 
 impl std::fmt::Debug for Engine {
@@ -429,6 +456,7 @@ impl Engine {
             motion: Box::new(crate::motion::SystemPorts),
             last_latch_boot_ms: now.boot_ms.unwrap_or(now.wall_ms),
             latch_errors: BTreeMap::new(),
+            latch_overrides: BTreeMap::new(),
         };
         if let Some(why) = e.soc_replay.fenced_because.clone() {
             e.state.event(

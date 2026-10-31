@@ -2332,6 +2332,10 @@ the pause stays). While paused, the executor re-asserts the pause every
 cancelled and a PX4 mode change is set back to hold (a pilot's manual
 mode is left to the pilot); each is a High finding
 `robot.agent.executor_pause_overridden` (find out who moved the robot).
+The same kind of override found again (a pilot staying in a manual mode,
+a script re-sending a goal) is still cancelled or set back to hold every
+run, but reported at most once per 5 minutes per pause, with the count of
+the repeats.
 Lifting a pause **releases** it and never resumes a
 mission (Nav2 goals are not restored, PX4 stays in hold);
 `request_safe_state` and `rollback_config` answer `applied` and are not

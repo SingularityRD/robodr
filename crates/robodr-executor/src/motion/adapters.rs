@@ -419,6 +419,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
     }
     let mut held = Vec::new();
     let mut overridden = Vec::new();
+    let mut kinds = Vec::new();
     for k in &spec.adapters {
         match k {
             AdapterKind::Nav2 => {
@@ -428,6 +429,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
                     held.push("nav2: no goal".to_string());
                 } else {
                     let tw = nav2_zero_twists(n).map_err(|e| format!("nav2: {e}"))?;
+                    kinds.push("nav2:goals".to_string());
                     overridden.push(format!(
                         "nav2: {total} navigation goal(s) sent while paused were cancelled ({}); \
                          {tw}",
@@ -442,6 +444,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
                 if mode == hold {
                     held.push("px4: in hold".to_string());
                 } else if mav::px4_is_manual(mode) {
+                    kinds.push(format!("px4:manual:{}", mav::px4_mode_name(mode)));
                     overridden.push(format!(
                         "px4: a pilot switched to manual mode {} while paused: left to the pilot \
                          (a manual mode is never taken away)",
@@ -454,6 +457,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
                             mav::px4_mode_name(mode)
                         )
                     })?;
+                    kinds.push(format!("px4:mode:{}", mav::px4_mode_name(mode)));
                     overridden.push(format!(
                         "px4: mode changed to {} while paused; hold set again: {again}",
                         mav::px4_mode_name(mode)
@@ -466,7 +470,10 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
     if overridden.is_empty() {
         Ok(Latch::Held(held.join("; ")))
     } else {
-        Ok(Latch::Overridden(overridden.join("; ")))
+        Ok(Latch::Overridden {
+            kind: kinds.join("+"),
+            note: overridden.join("; "),
+        })
     }
 }
 
