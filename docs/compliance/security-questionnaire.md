@@ -12,6 +12,8 @@
 > validated on a real robot, not reviewed by a human or not yet decided by
 > SingularityRD says so.
 >
+> *Corrected at `a28163b` (2026-10-31) without re-verifying the rest of the document:* the fuzz target count (41) and GRC-05 (now Partial).
+>
 > **Before sending to a customer:** re-run the check script, restamp, have
 > the product owner confirm every "Organisation" answer, and remove
 > anything the customer's NDA does not cover. This file is not legal
@@ -46,7 +48,7 @@
 | GRC-02 | Is the organisation certified (ISO/IEC 27001, SOC 2, IEC 62443-4-1)? | No | No certification. IEC 62443-4-1 / 4-2 self-assessments exist; certification is a post-GA goal. | [4-1 evidence](iec-62443-4-1-sdl-evidence.md), [4-2 gap analysis](iec-62443-4-2-gap-analysis.md) |
 | GRC-03 | Is there a product risk assessment / threat model, reviewed regularly? | Partial | Consolidated threat model with STRIDE per trust boundary, residual risks and SL-C targets; reviewed per release (checklist). Not yet reviewed by an independent human. | [threat-model.md](threat-model.md) |
 | GRC-04 | How do you track regulatory obligations (EU CRA, NIS2 customers)? | Partial | CRA readiness check with open actions; product category and conformity route await legal (CRA-1). | [cra-readiness.md](cra-readiness.md) |
-| GRC-05 | Are security documents kept current? | Yes | Compliance documents carry a "Verified at commit" stamp; a script checks stamps, counts, the action catalog and evidence links against the code. | `scripts/check-doc-facts.py` |
+| GRC-05 | Are security documents kept current? | Partial | Compliance documents carry a "Verified at commit" stamp; a script checks stamps, counts, the action catalog, the unsafe-code lints and evidence links against the code. The script still reports drift in other documents (README, BUILD, fuzz and executor READMEs) and does not run in CI yet, so nothing stops a merge that makes a document stale; a stamp is a manual re-verification, not a guarantee. | `scripts/check-doc-facts.py` |
 | GRC-06 | Is there a functional-safety position? | Yes | RoboDR is a cybersecurity component, not safety-rated; integrator obligations listed. | [safety-positioning.md](safety-positioning.md) |
 
 ## 3. Human resources and awareness (organisation)
@@ -65,7 +67,7 @@
 | AIS-02 | Memory-safe language? | Yes | Rust; `forbid(unsafe_code)` where possible, reviewed FFI elsewhere; eBPF probes (Pulsar) in C, kernel-verified. | [SDL evidence](iec-62443-4-1-sdl-evidence.md) "SI" |
 | AIS-03 | Static analysis and lint gates? | Yes | `clippy -D warnings`, panic-family calls and `clippy::indexing_slicing` denied in the daemons and parsers, `cargo fmt --check`. | [`docs/BUILD.md`](../BUILD.md) "CI jobs" |
 | AIS-04 | Dependency vulnerability scanning (SCA)? | Partial | `cargo deny` (advisories, licences, bans, sources) in CI; currently **failing** on RUSTSEC-2026-0387 (fix in progress). No scan of released tags yet. | [`deny.toml`](../../deny.toml); [third-party due diligence](third-party-due-diligence.md) §3 |
-| AIS-05 | Fuzzing? | Partial | 37 cargo-fuzz targets with smoke runs in the tests; 10 ran 630 s under libFuzzer without findings; no long campaigns; CI fuzz smoke job red on its first run. | [`fuzz/README.md`](../../fuzz/README.md); [4-2 gap analysis](iec-62443-4-2-gap-analysis.md) CR 3.5 |
+| AIS-05 | Fuzzing? | Partial | 41 cargo-fuzz targets with smoke runs in the tests; 10 ran 630 s under libFuzzer without findings; no long campaigns; CI fuzz smoke job red on its first run. | [`fuzz/README.md`](../../fuzz/README.md); [4-2 gap analysis](iec-62443-4-2-gap-analysis.md) CR 3.5 |
 | AIS-06 | Independent penetration test? | No | None yet (SALES-READINESS C8). An end-to-end red team by an AI agent (2026-10-30) is recorded. | [`tools/e2e/RESULTS.md`](../../tools/e2e/RESULTS.md) "Wave-2 soak and red team" |
 | AIS-07 | Is CI enforced on every change? | Partial | CI exists and ran on GitHub for the first time on 2026-10-30: **red** (4 jobs); fixes in progress. | [SDL evidence](iec-62443-4-1-sdl-evidence.md) "Honest limits" |
 | AIS-08 | Input validation and protection against injection? | Yes | Bounded strict parsers; attacker-controlled strings tainted and escaped for LLM-based SOCs (SR-TAINT) with an injection corpus in the tests. | [`docs/contracts/robodr.findings.md`](../contracts/robodr.findings.md) §3; `crates/robodr-ocsf/tests/findings.rs` |

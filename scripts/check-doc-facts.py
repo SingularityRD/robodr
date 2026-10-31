@@ -17,13 +17,18 @@ Checks (``--only`` takes these names):
       * in the current-state documents (CURRENT_DOCS below), every
         "`robodr.findings` X" and "findings contract X" names it (X may
         omit the patch level). A mention right after "since", "before",
-        "until", "from", "up to", "added in" or "introduced in" is history
-        and is not checked.
+        "until", "up to", "added in", "introduced in" or "upgraded /
+        migrated / moved / changed / bumped from" is history and is not
+        checked (a bare "from" is not: "data from findings contract 2.1"
+        states the present).
 
   workspace-members
       Source: ``[workspace] members`` in Cargo.toml.
-      * the README's repository layout lists every member directory, and
-        lists no ``robodr-*`` directory that is not a member;
+      * the code block under the README's "## Repository layout" heading
+        lists every member directory (a ``crates/robodr-x`` member as
+        ``robodr-x/`` indented under ``crates/``, any other member, such as
+        ``benches``, at the top level), and lists no ``crates/robodr-*``
+        directory that is not a member;
       * in the current-state documents, "all N members", "all N crates",
         "N workspace members", "N workspace crates" and (GA-ROADMAP)
         "N workspace üyesi" state the member count.
@@ -33,7 +38,7 @@ Checks (``--only`` takes these names):
       * fuzz/Cargo.toml declares exactly one ``[[bin]]`` per target file;
       * fuzz/README.md has a table row for every target;
       * in the current-state documents, "N fuzz targets" and "N cargo-fuzz
-        targets" state the target count.
+        targets" (N may be bold, ``**N**``) state the target count.
 
   action-catalog
       Source: ``CATALOG`` in crates/robodr-responder/src/actions.rs (name,
@@ -47,6 +52,19 @@ Checks (``--only`` takes these names):
         table has that column;
       * the executor README's "Motion adapters" table names exactly the
         adapters the code has.
+
+  unsafe-lints
+      Source: the crate-level ``#![forbid(unsafe_code)]`` /
+      ``#![deny(unsafe_code)]`` of every library and binary root of the
+      workspace members (``[lib]``, ``[[bin]]``, ``src/main.rs``,
+      ``src/bin/*.rs``).
+      * every library root carries one of the two;
+      * in the current-state documents, "`forbid(unsafe_code)` on N library
+        crates" and "`deny(unsafe_code)` on N library crates (`robodr-a`,
+        ...)" state the count (and, when listed, exactly those crates);
+        "`forbid(unsafe_code)` on N of M binary roots" states both counts;
+        a sentence that claims ``forbid(unsafe_code)`` on "every binary"
+        fails while any binary root does not forbid it.
 
   stamps
       Every document in STAMPED_DOCS carries a line
@@ -132,6 +150,7 @@ CHECKS = (
     "workspace-members",
     "fuzz-targets",
     "action-catalog",
+    "unsafe-lints",
     "stamps",
     "evidence-links",
     "pulsar-pin",
@@ -143,8 +162,13 @@ PATH_RE = re.compile(
     r"|robodr-[a-z0-9-]+/tests/[A-Za-z0-9_]+\.rs)`"
 )
 
+# A mention right after one of these is history. A bare "from" is not: "data
+# from findings contract 2.1" states the present; only "upgraded / migrated /
+# moved / changed / bumped from" does.
 HISTORY_MARKERS = re.compile(
-    r"(?:\bsince|\bbefore|\buntil|\bfrom|\bup to|\badded in|\bintroduced in)\s+(?:the\s+)?$",
+    r"(?:\bsince|\bbefore|\buntil|\bup to|\badded in|\bintroduced in"
+    r"|\b(?:upgraded|upgrading|migrated|migrating|moved|changed|bumped)\s+from)"
+    r"\s+(?:the\s+)?$",
     re.IGNORECASE,
 )
 
@@ -302,6 +326,63 @@ def motion_adapters(root: Path) -> list[str]:
     return sorted(names)
 
 
+def crate_roots(root: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """The library and binary crate roots of every workspace member, each
+    classified by its crate-level unsafe-code lint: ``forbid``, ``deny`` or
+    ``none``. Returns (libraries by package name, binaries by root path).
+
+    A library root is ``[lib] path`` or ``src/lib.rs``; binary roots are the
+    ``[[bin]] path`` entries plus Cargo's auto-discovered ``src/main.rs`` and
+    ``src/bin/*.rs`` (unless ``autobins = false``).
+    """
+    libs: dict[str, str] = {}
+    bins: dict[str, str] = {}
+
+    def lint(rel: str) -> str:
+        text = read(root, rel)
+        if re.search(r"^#!\[forbid\(unsafe_code\)\]", text, re.MULTILINE):
+            return "forbid"
+        if re.search(r"^#!\[deny\(unsafe_code\)\]", text, re.MULTILINE):
+            return "deny"
+        return "none"
+
+    def table_path(manifest: str, header: str) -> list[str]:
+        out = []
+        for sec in re.finditer(r"^" + re.escape(header) + r"\s*$(.*?)(?=^\[|\Z)", manifest,
+                               re.MULTILINE | re.DOTALL):
+            pm = re.search(r'^path\s*=\s*"([^"]+)"', sec.group(1), re.MULTILINE)
+            if pm:
+                out.append(pm.group(1))
+        return out
+
+    for member in workspace_members(root):
+        member = member.rstrip("/")
+        manifest = read(root, f"{member}/Cargo.toml")
+        pkg = re.search(r"^\[package\]\s*$(.*?)(?=^\[|\Z)", manifest, re.MULTILINE | re.DOTALL)
+        name_m = re.search(r'^name\s*=\s*"([^"]+)"', pkg.group(1), re.MULTILINE) if pkg else None
+        if not name_m:
+            raise SourceError(f"{member}/Cargo.toml: [package] name not found")
+        lib_paths = table_path(manifest, "[lib]")
+        lib = lib_paths[0] if lib_paths else "src/lib.rs"
+        if (root / member / lib).is_file():
+            libs[name_m.group(1)] = lint(f"{member}/{lib}")
+        elif lib_paths:
+            raise SourceError(f"{member}/Cargo.toml: [lib] path {lib} does not exist")
+        paths = set(table_path(manifest, "[[bin]]"))
+        if not re.search(r"^autobins\s*=\s*false", manifest, re.MULTILINE):
+            if (root / member / "src/main.rs").is_file():
+                paths.add("src/main.rs")
+            paths.update(str(q.relative_to(root / member)) for q in (root / member / "src/bin").glob("*.rs"))
+        for b in paths:
+            rel = f"{member}/{b}"
+            if not (root / rel).is_file():
+                raise SourceError(f"{member}/Cargo.toml: [[bin]] path {b} does not exist")
+            bins[rel] = lint(rel)
+    if not libs:
+        raise SourceError("no library crate roots found in the workspace members")
+    return libs, bins
+
+
 # ------------------------------------------------------------------ checks
 
 
@@ -334,17 +415,44 @@ def check_contract_version(root: Path) -> list[str]:
     return errs
 
 
+def readme_layout(readme: str) -> list[str] | None:
+    """Lines of the first code block under the README's "## Repository
+    layout" heading (only that block: an indented "robodr-x/" elsewhere in
+    the README does not count as listed)."""
+    sec = re.search(r"^## Repository layout[^\n]*\n(.*?)(?=^## |\Z)", readme, re.MULTILINE | re.DOTALL)
+    if not sec:
+        return None
+    fence = re.search(r"^```[^\n]*\n(.*?)^```", sec.group(1), re.MULTILINE | re.DOTALL)
+    return fence.group(1).splitlines() if fence else None
+
+
 def check_workspace_members(root: Path) -> list[str]:
-    members = workspace_members(root)
-    names = sorted(Path(m).name for m in members)
+    members = [m.rstrip("/") for m in workspace_members(root)]
     errs: list[str] = []
     readme = read(root, "README.md")
-    listed = set(re.findall(r"^ {2,}(robodr-[a-z0-9-]+)/(?:\s|$)", readme, re.MULTILINE))
-    for n in names:
-        if n not in listed:
-            errs.append(f"README.md: repository layout does not list crates/{n}/ (a workspace member)")
-    for n in sorted(listed - set(names)):
-        errs.append(f"README.md: repository layout lists {n}/, which is not a workspace member")
+    block = readme_layout(readme)
+    if block is None:
+        errs.append("README.md: no code block under '## Repository layout'")
+    else:
+        # Directories the block lists: top-level ones ("benches/") and the
+        # ones indented under "crates/" ("  robodr-x/" -> "crates/robodr-x").
+        listed: set[str] = set()
+        under_crates = False
+        for line in block:
+            top = re.match(r"^([A-Za-z0-9_.{},-]+(?:/[A-Za-z0-9_.{},-]+)*)/(?:\s|$)", line)
+            if top:
+                under_crates = top.group(1) == "crates"
+                listed.add(top.group(1))
+                continue
+            sub = re.match(r"^ {2,}(robodr-[a-z0-9-]+)/(?:\s|$)", line)
+            if sub and under_crates:
+                listed.add(f"crates/{sub.group(1)}")
+        for m in sorted(members):
+            if m not in listed:
+                errs.append(f"README.md: repository layout does not list {m}/ (a workspace member)")
+        crate_dirs = {x for x in listed if x.startswith("crates/robodr-")}
+        for d in sorted(crate_dirs - set(members)):
+            errs.append(f"README.md: repository layout lists {d}/, which is not a workspace member")
     pats = (
         re.compile(r"\ball (\d+) (?:workspace )?(?:members|crates)\b"),
         re.compile(r"\b(\d+) workspace (?:members|crates)\b"),
@@ -378,7 +486,7 @@ def check_fuzz_targets(root: Path) -> list[str]:
     for t in targets:
         if t not in rows:
             errs.append(f"fuzz/README.md: no table row for target {t}")
-    pat = re.compile(r"\b(\d+) (?:cargo-fuzz|(?:libFuzzer )?fuzz) targets\b")
+    pat = re.compile(r"(?<![\w*])(?:\*\*)?(\d+)(?:\*\*)? (?:cargo-fuzz|(?:libFuzzer )?fuzz) targets\b")
     for rel in expand(root, CURRENT_DOCS):
         text = read(root, rel)
         for mm in pat.finditer(text):
@@ -396,7 +504,7 @@ def ga_class(cell: str) -> str | None:
         return "plan_only"
     if "platform adapter" in c:
         return "platform_adapter"
-    if c.startswith("executed") or c.startswith("executor"):
+    if c.startswith(("executed", "executor")):
         return "executor"
     return None
 
@@ -497,6 +605,54 @@ def check_action_catalog(root: Path) -> list[str]:
     return errs
 
 
+def check_unsafe_lints(root: Path) -> list[str]:
+    libs, bins = crate_roots(root)
+    forbid_libs = sorted(n for n, v in libs.items() if v == "forbid")
+    deny_libs = sorted(n for n, v in libs.items() if v == "deny")
+    forbid_bins = sorted(b for b, v in bins.items() if v == "forbid")
+    errs: list[str] = []
+    for n, v in sorted(libs.items()):
+        if v == "none":
+            errs.append(f"library crate {n} has neither forbid(unsafe_code) nor deny(unsafe_code) at its root")
+    lint_ = r"`(?:#!\[)?(forbid|deny)\(unsafe_code\)\]?`"
+    lib_pat = re.compile(lint_ + r" on (\d+) library crates(?: \(([^)]*)\))?")
+    bin_pat = re.compile(lint_ + r" on (\d+) of (\d+) binary roots")
+    every_pat = re.compile(r"forbid\(unsafe_code\)[^.|\n]*\bevery binary\b")
+    for rel in expand(root, CURRENT_DOCS):
+        text = read(root, rel)
+        for mm in lib_pat.finditer(text):
+            want = forbid_libs if mm.group(1) == "forbid" else deny_libs
+            where = f"{rel}:{line_of(text, mm.start())}"
+            if int(mm.group(2)) != len(want):
+                errs.append(
+                    f"{where}: says {mm.group(1)}(unsafe_code) on {mm.group(2)} library crates; "
+                    f"the code has {len(want)} ({', '.join(want)})"
+                )
+            if mm.group(3) is not None:
+                named = sorted(re.findall(r"`(robodr-[a-z0-9-]+)`", mm.group(3)))
+                if named != want:
+                    errs.append(
+                        f"{where}: names {', '.join(named) or '(none)'} as the library crates that "
+                        f"{mm.group(1)} unsafe code; the code: {', '.join(want)}"
+                    )
+        for mm in bin_pat.finditer(text):
+            if mm.group(1) != "forbid":
+                continue
+            if (int(mm.group(2)), int(mm.group(3))) != (len(forbid_bins), len(bins)):
+                errs.append(
+                    f"{rel}:{line_of(text, mm.start())}: says forbid(unsafe_code) on {mm.group(2)} of "
+                    f"{mm.group(3)} binary roots; the code: {len(forbid_bins)} of {len(bins)}"
+                )
+        for mm in every_pat.finditer(text):
+            if len(forbid_bins) != len(bins):
+                others = sorted(b for b in bins if b not in forbid_bins)
+                errs.append(
+                    f"{rel}:{line_of(text, mm.start())}: claims forbid(unsafe_code) on every binary; "
+                    f"these binary roots do not forbid it: {', '.join(others)}"
+                )
+    return errs
+
+
 def git(root: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
@@ -592,6 +748,8 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
                 errs += check_fuzz_targets(root)
             elif name == "action-catalog":
                 errs += check_action_catalog(root)
+            elif name == "unsafe-lints":
+                errs += check_unsafe_lints(root)
             elif name == "stamps":
                 if skip_git:
                     notes.append("stamps: SKIPPED (--skip-git); nothing about the stamps was checked")
@@ -614,8 +772,20 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
 GOOD_TREE: dict[str, str] = {
     "Cargo.toml": (
         '[workspace]\nmembers = [\n    "crates/robodr-a",\n    # comment "crates/robodr-x"\n'
-        '    "crates/robodr-b",\n]\n\n[workspace.package]\nversion = "0"\n'
+        '    "crates/robodr-b",\n    "benches",\n]\n\n[workspace.package]\nversion = "0"\n'
     ),
+    # unsafe-lints: robodr-a forbids (lib and declared bin), robodr-b denies
+    # (lib at a [lib] path, auto-discovered main.rs), benches has a bin only.
+    "crates/robodr-a/Cargo.toml": (
+        '[package]\nname = "robodr-a"\n\n[[bin]]\nname = "robodr-a"\npath = "src/bin/a.rs"\n'
+    ),
+    "crates/robodr-a/src/lib.rs": "//! a\n\n#![forbid(unsafe_code)]\n",
+    "crates/robodr-a/src/bin/a.rs": "#![forbid(unsafe_code)]\nfn main() {}\n",
+    "crates/robodr-b/Cargo.toml": '[package]\nname = "robodr-b"\n\n[lib]\npath = "src/root.rs"\n',
+    "crates/robodr-b/src/root.rs": "#![deny(unsafe_code)]\n",
+    "crates/robodr-b/src/main.rs": "#![deny(unsafe_code)]\nfn main() {}\n",
+    "benches/Cargo.toml": '[package]\nname = "robodr-benches"\n',
+    "benches/src/bin/bench.rs": "#![forbid(unsafe_code)]\nfn main() {}\n",
     MODEL_RS: 'pub const CONTRACT_VERSION: &str = "2.4.0";\n',
     CONTRACT_MD: "# Contract\n\n| Contract | `robodr.findings`, version **2.4.0** (x) |\n",
     SCHEMA_JSON: (
@@ -624,13 +794,16 @@ GOOD_TREE: dict[str, str] = {
     ),
     EXAMPLE_JSON: '{\n  "contract_version": "2.4.0"\n}\n',
     "README.md": (
-        "Layout:\n```\ncrates/\n  robodr-a/   first\n  robodr-b/   second\n```\n"
+        "## Repository layout\n\n```\nbenches/     sizing\ncrates/\n  robodr-a/   first\n"
+        "  robodr-b/   second\n```\n\n## Status\n\n"
         "Findings: `robodr.findings` 2.4 over uplink; since `robodr.findings` 2.2 the deliverd.\n"
-        "All 2 members inherit it. 3 fuzz targets.\n"
+        "All 3 members inherit it. 3 fuzz targets.\n\n    robodr-c/   an indented line elsewhere\n"
     ),
     "docs/compliance/a.md": (
         "> Verified at commit `STAMP` (date).\n\nfindings contract 2.4.0\n"
         "See [the readme](../../README.md#layout) and `robodr-a/tests/t.rs`, `scripts/x.py`.\n"
+        "| `#![forbid(unsafe_code)]` on 1 library crates; `deny(unsafe_code)` on 1 library crates "
+        "(`robodr-b`). `#![forbid(unsafe_code)]` on 2 of 3 binary roots | x |\n"
     ),
     "crates/robodr-a/tests/t.rs": "",
     "scripts/x.py": "",
@@ -705,8 +878,27 @@ MUTATIONS = (
     ("workspace-members", "Cargo.toml", '"crates/robodr-b",\n', '"crates/robodr-b",\n    "crates/robodr-c",\n',
      "does not list crates/robodr-c/"),
     ("workspace-members", "README.md", "  robodr-b/   second\n", "  robodr-b/   second\n  robodr-z/   gone\n",
-     "lists robodr-z/, which is not a workspace member"),
-    ("workspace-members", "README.md", "All 2 members", "all 13 members", "says 'all 13 members'"),
+     "lists crates/robodr-z/, which is not a workspace member"),
+    ("workspace-members", "README.md", "All 3 members", "all 13 members", "says 'all 13 members'"),
+    ("workspace-members", "README.md", "benches/     sizing\n", "",
+     "does not list benches/ (a workspace member)"),
+    ("workspace-members", "Cargo.toml", '"benches",\n', '"benches",\n    "crates/robodr-c",\n',
+     "does not list crates/robodr-c/ (a workspace member)"),
+    ("contract-version", "README.md", "Findings: `robodr.findings` 2.4 over",
+     "Data from findings contract 2.1 over", "says 'findings contract 2.1'"),
+    ("fuzz-targets", "README.md", "3 fuzz targets", "**23** fuzz targets", "says '**23** fuzz targets'"),
+    ("unsafe-lints", "crates/robodr-b/src/root.rs", "#![deny(unsafe_code)]", "// nothing",
+     "library crate robodr-b has neither"),
+    ("unsafe-lints", "crates/robodr-b/src/root.rs", "#![deny(unsafe_code)]", "#![forbid(unsafe_code)]",
+     "says forbid(unsafe_code) on 1 library crates; the code has 2"),
+    ("unsafe-lints", "docs/compliance/a.md", "(`robodr-b`)", "(`robodr-z`)",
+     "names robodr-z as the library crates that deny"),
+    ("unsafe-lints", "crates/robodr-b/src/main.rs", "#![deny(unsafe_code)]", "#![forbid(unsafe_code)]",
+     "on 2 of 3 binary roots; the code: 3 of 3"),
+    ("unsafe-lints", "benches/src/bin/bench.rs", "#![forbid(unsafe_code)]", "",
+     "on 2 of 3 binary roots; the code: 1 of 3"),
+    ("unsafe-lints", "docs/compliance/a.md", "on 2 of 3 binary roots", "on every binary root",
+     "claims forbid(unsafe_code) on every binary; these binary roots do not forbid it: crates/robodr-b/src/main.rs"),
     ("fuzz-targets", "fuzz/README.md", "| `t_three` | c |\n", "", "no table row for target t_three"),
     ("fuzz-targets", "README.md", "3 fuzz targets", "23 fuzz targets", "says '23 fuzz targets'"),
     ("fuzz-targets", "fuzz/Cargo.toml", 'name = "t_two"', 'name = "t_2"', "no [[bin]] for fuzz_targets/t_two.rs"),
@@ -802,7 +994,7 @@ def self_test() -> int:
         p.write_text(stamped["docs/compliance/a.md"])
 
         # Stamp age limit: one code commit after the stamp.
-        build_tree(base, {"crates/robodr-a/src/lib.rs": "// change\n"})
+        build_tree(base, {"crates/robodr-a/src/other.rs": "// change\n"})
         git_commit(base, "code", pulsar)
         errs, _ = run(base, ["stamps"], 0, False)
         expect("--max-stamp-age 0 fails an aged stamp", any("code commits old" in e for e in errs), str(errs))
@@ -813,7 +1005,10 @@ def self_test() -> int:
 
         # History markers are not checked.
         rd = base / "README.md"
-        rd.write_text(stamped["README.md"] + "Before findings contract 1.3 it was different.\n")
+        rd.write_text(
+            stamped["README.md"]
+            + "Before findings contract 1.3 it was different.\nUpgraded from findings contract 1.2.\n"
+        )
         errs, _ = run(base, ["contract-version"], None, False)
         expect("history mention ignored", errs == [], str(errs))
         rd.write_text(stamped["README.md"])
