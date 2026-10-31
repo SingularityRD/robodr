@@ -130,6 +130,28 @@ pub enum UnknownWriters {
     Pass,
 }
 
+/// A DATA_FRAG, key-only or non-standard sample (one the content probe
+/// cannot read) from a writer SEDP announced on a topic no channel
+/// enforces (gateway review 2, M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnenforcedUnprobeable {
+    /// **Default.** Suppressed (`unenforced_undecidable`, finding
+    /// `fragmented_command` with reason `unenforced_unprobeable`), as an
+    /// unknown writer's: if the robot matched the writer on a motion topic
+    /// through an announcement the gateway did not see or could not read,
+    /// such a sample (a whole `LowCmd_` in one DATA_FRAG) would otherwise
+    /// reach the motors unchecked. Cost: a controller-side writer of a
+    /// non-motion topic whose samples are fragmented (larger than the DDS
+    /// stack's fragment size) does not reach the robot.
+    #[default]
+    Suppress,
+    /// Forward such samples unchecked (the behaviour before 2.x): only for
+    /// a deployment that needs large non-motion samples to the robot and
+    /// accepts that residual.
+    Pass,
+}
+
 /// Robot-side observation (`crate::observe`): an NFLOG **copy** of every
 /// UDP datagram entering the bridge from the robot port. Never queued,
 /// never dropped (the kernel forwards the original at once): it feeds the
@@ -164,6 +186,8 @@ pub struct RtpsConfig {
     pub domain_ids: Vec<u16>,
     pub malformed_datagram: MalformedPolicy,
     pub unknown_writers: UnknownWriters,
+    /// Unprobeable samples of writers announced on another topic.
+    pub unenforced_unprobeable: UnenforcedUnprobeable,
     /// Most not-enforced writers remembered (SEDP on other topics, probe
     /// results; least recently used evicted first).
     pub max_writers: usize,
@@ -208,6 +232,7 @@ impl Default for RtpsConfig {
             domain_ids: vec![0],
             malformed_datagram: MalformedPolicy::Drop,
             unknown_writers: UnknownWriters::Probe,
+            unenforced_unprobeable: UnenforcedUnprobeable::Suppress,
             max_writers: 4096,
             max_enforced_writers: 1024,
             enforced_idle_evict_s: 3600,

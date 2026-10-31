@@ -19,6 +19,7 @@
     ],
     "malformed_datagram": "drop",
     "unknown_writers": "probe",
+    "unenforced_unprobeable": "suppress",
     "state_file": "/var/lib/robodr/firewall-gw/writers.json"
   },
   "channels": [

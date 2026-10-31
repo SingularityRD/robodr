@@ -17,7 +17,8 @@ use robodr_ros2_pipeline::IdentityResolver;
 use serde::Serialize;
 
 use crate::config::{
-    Codec, GatewayConfig, GatewayMode, LocoModel, MalformedPolicy, OnGatewayDown, UnknownWriters,
+    Codec, GatewayConfig, GatewayMode, LocoModel, MalformedPolicy, OnGatewayDown,
+    UnenforcedUnprobeable, UnknownWriters,
 };
 use crate::discovery::{Discovery, WriterInfo};
 use crate::findings::{rules as gw_rules, Detail, GatewayFindings};
@@ -69,8 +70,9 @@ enum Class {
     Channel(usize),
     /// Not a motion command of an enforced channel.
     Pass,
-    /// An unknown writer's sample the probe cannot read.
-    Undecidable,
+    /// A sample the probe cannot read from an unknown writer (`false`) or
+    /// from a writer known as not enforced (`true`, gateway review 2, M1).
+    Undecidable(bool),
     /// A writer known as not enforced sent this channel's motion command.
     Suspicious(usize),
     /// An unknown writer's api request two services read differently.
@@ -145,6 +147,11 @@ pub struct GatewayStats {
     /// channel's command (suppressed in enforce mode; gateway review,
     /// finding 1).
     pub suspicious_writer: u64,
+    /// DATA_FRAG / key-only / non-standard samples of a writer known as
+    /// not enforced, which the probe cannot read (suppressed in enforce
+    /// mode with `rtps.unenforced_unprobeable: suppress`; gateway review 2,
+    /// M1).
+    pub unenforced_undecidable: u64,
     /// Datagrams dropped because a sample decided "suppress" could not be
     /// removed in place.
     pub suppress_failed: u64,
@@ -376,15 +383,13 @@ impl Channel {
             // Evict a writer that never forwarded anything first (least
             // recently used among those), so a flood of spoofed GUIDs
             // cannot push out the authorised writer's sequence / replay
-            // state.
+            // state. Only forwarding counts: what a GUID claims is
+            // attacker-chosen (gateway review 2, M2: spoofed GUIDs under
+            // the authorised prefix used to rank as authorised).
             if let Some(old) = self
                 .writers
                 .iter()
-                .min_by_key(|(_, w)| {
-                    let authorised =
-                        w.bound.is_some() || w.claimed.is_some_and(|(s, _)| s != SourceId::UNKNOWN);
-                    (authorised, w.used)
-                })
+                .min_by_key(|(_, w)| (w.bound.is_some() || w.last_sn.is_some(), w.used))
                 .map(|(k, _)| *k)
             {
                 self.writers.remove(&old);
@@ -426,6 +431,7 @@ pub struct Gateway {
     rtps_ranges: Vec<(u16, u16)>,
     malformed: MalformedPolicy,
     unknown_writers: UnknownWriters,
+    unenforced_unprobeable: UnenforcedUnprobeable,
     max_sn_jump: i64,
     binding_takeover_ns: u64,
     discovery: Discovery,
@@ -766,6 +772,7 @@ impl Gateway {
             rtps_ranges: cfg.rtps_port_ranges(),
             malformed: cfg.rtps.malformed_datagram,
             unknown_writers: cfg.rtps.unknown_writers,
+            unenforced_unprobeable: cfg.rtps.unenforced_unprobeable,
             max_sn_jump: i64::try_from(cfg.rtps.max_sn_jump).unwrap_or(i64::MAX),
             binding_takeover_ns: cfg.rtps.binding_takeover_ns,
             discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile))
@@ -1186,18 +1193,26 @@ impl Gateway {
     }
 
     /// The enforced channel of a user sample's writer: its SEDP / persisted
-    /// classification, else (`unknown_writers: probe`, or always while the
-    /// enforced table is full) a content probe. A writer known as not
-    /// enforced whose payload probes as a motion channel is
-    /// [`Class::Suspicious`] (gateway review, finding 1: a discovery
-    /// differential that hides a motion writer behind another topic).
+    /// classification, else (`unknown_writers: probe`, always while the
+    /// enforced table is full, and always for a suspect writer: one evicted
+    /// from the enforced table or announced in a contested sample) a
+    /// content probe. A writer known as not enforced whose payload probes
+    /// as a motion channel is [`Class::Suspicious`] (gateway review,
+    /// finding 1: a discovery differential that hides a motion writer
+    /// behind another topic); one whose sample the probe cannot read is
+    /// [`Class::Undecidable`] unless `rtps.unenforced_unprobeable: pass`
+    /// (gateway review 2, M1).
     fn classify(&mut self, d: &[u8], s: &Sample) -> Class {
         let unprobeable =
             s.kind == SampleKind::DataFrag || s.non_standard || s.content == Content::Key;
         if let Some(w) = self.discovery.lookup(&s.writer) {
             return match w.channel {
                 Some(ci) => Class::Channel(ci),
-                None if unprobeable || w.probed => Class::Pass,
+                None if unprobeable => match self.unenforced_unprobeable {
+                    UnenforcedUnprobeable::Suppress => Class::Undecidable(true),
+                    UnenforcedUnprobeable::Pass => Class::Pass,
+                },
+                None if w.probed => Class::Pass,
                 None => match self.probe_match(d, s, |c| {
                     // A CRC-checked `LowCmd_`, a hand frame, a trajectory:
                     // whatever the writer announced. Shapes many messages
@@ -1218,11 +1233,14 @@ impl Gateway {
                 },
             };
         }
-        if self.unknown_writers == UnknownWriters::Pass && !self.discovery.enforced_full() {
+        if self.unknown_writers == UnknownWriters::Pass
+            && !self.discovery.enforced_full()
+            && !self.discovery.is_suspect(&s.writer)
+        {
             return Class::Pass;
         }
         if unprobeable {
-            return Class::Undecidable;
+            return Class::Undecidable(false);
         }
         match self.probe(d, s) {
             Ok(Some(ci)) => Class::Channel(ci),
@@ -1416,8 +1434,15 @@ impl Gateway {
                     .source_id(&format!("{IDENTITY_SOURCE_PREFIX}{name}"))
             })
             .unwrap_or(SourceId::UNKNOWN);
-        if let Some(ch) = self.channels.get_mut(ci) {
-            ch.writer_mut(writer).claimed = Some((s, epoch));
+        // Cached only for a writer that already has state: a sample from
+        // a source the channel does not allow never creates any (gateway
+        // review 2, M2), so a flood of such GUIDs cannot evict anything.
+        if let Some(w) = self
+            .channels
+            .get_mut(ci)
+            .and_then(|ch| ch.writers.get_mut(writer))
+        {
+            w.claimed = Some((s, epoch));
         }
         s
     }
@@ -1456,19 +1481,29 @@ impl Gateway {
                 });
                 return Outcome::Suppress;
             }
-            Class::Undecidable => {
-                // An unknown writer's fragment / key-only / non-standard
-                // sample: the probe cannot read it, so it could be a motion
-                // command nobody checked (see the crate docs).
-                self.stats.unknown_undecidable += 1;
+            Class::Undecidable(known) => {
+                // An unknown (or not-enforced, M1) writer's fragment /
+                // key-only / non-standard sample: the probe cannot read it,
+                // so it could be a motion command nobody checked (see the
+                // crate docs).
+                if known {
+                    self.stats.unenforced_undecidable += 1;
+                } else {
+                    self.stats.unknown_undecidable += 1;
+                }
                 self.stats.suppressed += 1;
                 let kind = s.kind;
+                let writer = s.writer;
                 self.note(gw_rules::FRAGMENTED_COMMAND, None, || Detail {
-                    what: Some("unknown writer".into()),
-                    ..Detail::reason(if kind == SampleKind::DataFrag {
-                        "data_frag"
+                    what: Some(if known {
+                        format!("writer {} announced on another topic", hex(&writer))
                     } else {
-                        "key_only_or_non_standard"
+                        "unknown writer".into()
+                    }),
+                    ..Detail::reason(match (known, kind == SampleKind::DataFrag) {
+                        (true, _) => "unenforced_unprobeable",
+                        (false, true) => "data_frag",
+                        (false, false) => "key_only_or_non_standard",
                     })
                 });
                 return Outcome::Suppress;

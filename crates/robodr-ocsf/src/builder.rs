@@ -1417,7 +1417,7 @@ fn catalog_2_3_gateway(rule: &str) -> Option<RuleInfo> {
         ),
         "robot.gateway.fragmented_command" => e(
             "Fragmented motion command blocked by the in-path gateway",
-            "The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify; such a sample cannot be decided in place.",
+            "The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify or knew only as writing another topic; such a sample cannot be decided in place.",
         ),
         "robot.gateway.writer_binding_conflict" => e(
             "Authorised motion writer seen from another address",

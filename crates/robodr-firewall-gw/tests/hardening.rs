@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use robodr_cdr::Representation;
 use robodr_firewall::ForeignSourceAction;
-use robodr_firewall_gw::config::{GatewayMode, UnknownWriters};
+use robodr_firewall_gw::config::{GatewayMode, UnenforcedUnprobeable, UnknownWriters};
 use robodr_firewall_gw::ip::parse_ipv4_udp;
 use robodr_firewall_gw::lowcmd::{self, LowCmdCodec, WireLowCmd};
 use robodr_firewall_gw::rtps::{self, build::Datagram, Content, SampleKind, WalkOptions};
@@ -499,9 +499,10 @@ fn f2_unknown_writer_key_only_and_non_standard_data_suppressed() {
     }
 }
 
-/// What is unchanged: a fragment of a writer SEDP classified on another
-/// topic passes; `unknown_writers: pass` opts out of the probe for
-/// fragments too; observe mode forwards and counts.
+/// What still passes: a fragment of a writer SEDP classified on another
+/// topic only with `rtps.unenforced_unprobeable: pass` (review 2, M1: it
+/// is suppressed by default); `unknown_writers: pass` opts out of the
+/// probe for fragments too; observe mode forwards and counts.
 #[test]
 fn f2_fragments_that_still_pass() {
     let fx = Fixture::G1;
@@ -521,6 +522,12 @@ fn f2_fragments_that_still_pass() {
     );
     run(&mut gw, &sedp, T0);
     let p = frag_pkt(CONTROLLER_IP, other, 1, 1, 512, n, &payload[..512]);
+    assert_frag_suppressed(&mut gw, &p, T0 + MS, "unenforced writer");
+    assert_eq!(gw.stats.unenforced_undecidable, 1);
+    let mut cfg = gateway_config(fx);
+    cfg.rtps.unenforced_unprobeable = UnenforcedUnprobeable::Pass;
+    let mut gw = Gateway::new(&cfg, &profile(fx), &firewall(fx)).unwrap();
+    run(&mut gw, &sedp, T0);
     assert_eq!(run(&mut gw, &p, T0 + MS).0, Verdict::Accept);
 
     let mut cfg = gateway_config(fx);

@@ -560,6 +560,15 @@ struct Events {
     watcher: Option<crate::restrict::Watcher>,
     /// The last restriction file error (status `restriction_error`).
     restriction_error: Option<String>,
+    /// The kernel's queue-full drop counter (review 2, L3), and whether
+    /// it could be read at the last housekeeping.
+    kernel_drops: nfq::KernelDrops,
+    kernel_dropped_total: u64,
+    kernel_counters: bool,
+    /// Housekeeping ticks that found the kernel queue full (with
+    /// `on_gateway_down: bypass` the kernel then accepts packets
+    /// unchecked and counts nothing).
+    kernel_queue_full_seen: u64,
 }
 
 impl Events {
@@ -597,7 +606,36 @@ impl Events {
                     .ok()
             }),
             restriction_error: None,
+            kernel_drops: nfq::KernelDrops::default(),
+            kernel_dropped_total: 0,
+            kernel_counters: false,
+            kernel_queue_full_seen: 0,
         }
+    }
+}
+
+/// Read the kernel's statistics of queue `cfg.queue.num` (review 2, L3):
+/// packets dropped on a full queue take no packet id, so the id-gap count
+/// misses them; they are counted as shed from the kernel's own counter.
+/// Read through `/proc/<own pid>/net`, which `ProcSubset=pid` keeps
+/// visible (`/proc/net` is not). Unreadable: status `kernel_counters:
+/// false`, nothing counted.
+fn read_kernel_queue(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events) {
+    let path = format!("/proc/{}/net/netfilter/nfnetlink_queue", std::process::id());
+    let stats = read_capped(Path::new(&path), 64 * 1024)
+        .ok()
+        .and_then(|t| nfq::parse_queue_stats(&t, cfg.queue.num));
+    events.kernel_counters = stats.is_some();
+    let Some(s) = stats else {
+        return;
+    };
+    let dropped = events.kernel_drops.observe(s.queue_dropped);
+    if dropped > 0 {
+        events.kernel_dropped_total = events.kernel_dropped_total.saturating_add(dropped);
+        gw.overload.note_shed(dropped);
+    }
+    if s.queue_total >= cfg.queue.max_len {
+        events.kernel_queue_full_seen += 1;
     }
 }
 
@@ -682,6 +720,7 @@ pub fn apply_restriction(
 }
 
 fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist: &LatencyHist) {
+    read_kernel_queue(cfg, gw, events);
     let latest = events.watcher.as_ref().and_then(|w| w.latest());
     let err = apply_restriction(
         gw,
@@ -816,6 +855,9 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
                 "shed_pending": gw.overload.shed_pending(),
                 "shed_total": gw.overload.shed_total,
                 "reports": gw.overload.reports,
+                "kernel_counters": events.kernel_counters,
+                "kernel_queue_dropped": events.kernel_dropped_total,
+                "kernel_queue_full_seen": events.kernel_queue_full_seen,
             },
             "findings_feed": events.feed.as_ref().map(|f| {
                 let s = f.status();

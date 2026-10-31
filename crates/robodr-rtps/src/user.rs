@@ -691,7 +691,7 @@ impl<'a> Walk<'a> {
         for e in &events {
             self.fragment_event(e);
         }
-        if let FragOutcome::Complete(buf, inline, key_only, _) = outcome {
+        if let FragOutcome::Complete(buf, inline, key_only, _, _) = outcome {
             self.report.stats.frag_completed = self.report.stats.frag_completed.saturating_add(1);
             if !self.room() {
                 return;

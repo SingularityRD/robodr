@@ -203,14 +203,22 @@ segment, `allowed_src_macs`) on every channel.
 - **DATA_FRAG, key-only and non-standard samples** of an enforced channel
   are suppressed. The Unitree SDK does not fragment `LowCmd_` (≈ 1 KB) at
   Cyclone DDS's default 1344-octet fragment size; a fragmented one is a
-  misconfiguration or an attack. Fragmented SEDP is reassembled (bounded).
+  misconfiguration or an attack. Fragmented SEDP is reassembled (bounded); an announcement whose fragment copies disagreed is
+  contested (never relaxes anything; see "Discovery differential").
 - **The same samples from an unknown writer** (no SEDP seen, not in the
   state file) are suppressed too in enforce mode with `unknown_writers:
   probe` (review finding F2): the content probe needs a whole payload, so
   such a sample could be a motion command nobody checked (for instance one
   the robot matched to `rt/lowcmd` through an announcement the gateway did
-  not see). Writers classified by SEDP on another topic are not affected;
-  `unknown_writers: pass` opts out (unknown writers unchecked). The gateway
+  not see). **Writers classified by SEDP on another topic** get the same
+  treatment (review 2, M1; `unenforced_undecidable`, finding
+  `fragmented_command` with reason `unenforced_unprobeable`): the
+  suspicious-payload probe below cannot read such a sample either, and a
+  whole `LowCmd_` packed into one DATA_FRAG used to pass it unprobed.
+  `rtps.unenforced_unprobeable: pass` restores forwarding for a deployment
+  that sends large (fragmented) non-motion samples to the robot, at that
+  cost. `unknown_writers: pass` opts out for unknown writers (unchecked),
+  except a suspect one (see "Discovery differential" below). The gateway
   does **not** reassemble user fragments to probe them: the fragments
   before the last one would already have been forwarded, a fragment can
   only be passed or suppressed (not rewritten), and a bounded reassembler
@@ -645,11 +653,18 @@ the run loop watches the kernel's NFQUEUE packet ids, which number a
 queue's packets in order, and a gap means packets the kernel numbered but
 never delivered to the gateway (a full netlink receive buffer: dropped,
 or accepted unchecked with `on_gateway_down: bypass`). A packet the kernel
-drops because the queue already holds `queue.max_len` packets may not
-leave a gap and is then not counted; the gateway does not read the
-kernel's own counters (`/proc/net/netfilter/nfnetlink_queue`, which the
-unit's `ProcSubset=pid` hides). Status: `overload.late_pending`, `overload.shed_pending`,
-`overload.shed_total`, `overload.reports`, `gateway.late`.
+drops because the queue already holds `queue.max_len` packets takes no
+id and leaves no gap: at every housekeeping tick the gateway reads the
+kernel's own `queue_dropped` counter (through
+`/proc/<own pid>/net/netfilter/nfnetlink_queue`, which `ProcSubset=pid`
+leaves visible; review 2, L3) and counts its growth as shed too. With
+`on_gateway_down: bypass` the kernel **accepts** such packets unchecked and
+counts them nowhere: the gateway can only report that it found the queue
+full at a tick (`overload.kernel_queue_full_seen`). Status:
+`overload.late_pending`, `overload.shed_pending`, `overload.shed_total`,
+`overload.reports`, `overload.kernel_counters` (the kernel's counters were
+readable at the last tick), `overload.kernel_queue_dropped`,
+`overload.kernel_queue_full_seen`, `gateway.late`.
 
 Decision summaries (sales-readiness T19, `src/summary.rs`): over the same
 feed the gateway writes a `robodr-gateway-summary/v1` line at start, every
@@ -803,7 +818,9 @@ CRC-valid `LowCmd_`, a hand frame or a joint trajectory from such a writer
 is suppressed (`suspicious_writer`, finding `fragmented_command` with
 reason `unenforced_writer_motion_payload`); so is a twist when the writer
 announced a twist type, and a request when its announcement's INFO_DST
-could not be checked. This is the shape of a discovery differential (the
+could not be checked. Its DATA_FRAG, key-only and non-standard samples,
+which the probe cannot read, are suppressed (`rtps.unenforced_unprobeable`,
+above). This is the shape of a discovery differential (the
 robot matched the writer on the motion topic through an announcement the
 gateway did not see). A same-type topic the robot acts on (`rt/arm_sdk`
 next to `rt/lowcmd`) therefore needs its own channel.
@@ -897,11 +914,12 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `queue.vlan_ids` | none | 802.1Q VLAN ids (`1..=4094`, at most 16) whose single-tagged IPv4 / ARP frames are bridged from the controller port; their IPv4 is queued and decided like untagged traffic (`bridge-nf-filter-vlan-tagged`). Other ids, stacked tags (QinQ), IPv6 and PPPoE stay dropped (T44; `tests/netns_e2e.rs::vlan_pass_through_end_to_end`) |
 | `rtps.domain_ids` | `[0]` | queued DDS port ranges (7400 + 250·d .. +249) |
 | `rtps.malformed_datagram` | `drop` | whole-datagram policy |
-| `rtps.unknown_writers` | `probe` | `probe` or `pass` |
+| `rtps.unknown_writers` | `probe` | `probe` or `pass` (a suspect writer is probed either way) |
+| `rtps.unenforced_unprobeable` | `suppress` | DATA_FRAG / key-only / non-standard samples of a writer SEDP announced on a topic no channel enforces: `suppress` (`gateway.unenforced_undecidable`, finding `fragmented_command`, reason `unenforced_unprobeable`) or `pass` (forwarded unchecked; only for large non-motion samples to the robot, accepting that a motion writer hidden behind another topic can then send fragmented commands) |
 | `rtps.max_writers`, `rtps.max_writers_per_channel` | 4096, 16 | not-enforced writers remembered (least recently used evicted: it is then unknown and probed again); per-channel sequence state |
-| `rtps.max_enforced_writers` | 1024 | writers classified as enforced (`1..=65536`); **never downgraded or removed** by discovery (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer replaces the one seen longest ago (by a sample or an announcement) if that one has been idle for `rtps.enforced_idle_evict_s` (`discovery.enforced_evicted`), else it is refused (finding `fragmented_command`, reason `enforced_writer_table_full`; `discovery.enforced_refused`) and probed. A full table stays full, so unknown writers (an evicted one included) are probed, also with `unknown_writers: pass` |
+| `rtps.max_enforced_writers` | 1024 | writers classified as enforced (`1..=65536`); **never downgraded or removed** by discovery (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer replaces the one seen longest ago (by a sample or an announcement) if that one has been idle for `rtps.enforced_idle_evict_s` (`discovery.enforced_evicted`), else it is refused (finding `fragmented_command`, reason `enforced_writer_table_full`; `discovery.enforced_refused`) and probed. A full table stays full, so unknown writers (an evicted one included) are probed, also with `unknown_writers: pass`. An evicted writer is remembered as a **suspect** (review 2, H2; up to 4 × this size, persisted): a later announcement of its GUID on another topic is ignored (`discovery.suspect_kept`), so it is never downgraded to "not enforced"; while the suspect memory is full no writer is evicted (the newcomer is refused) |
 | `rtps.enforced_idle_evict_s` | 3600 | how long an enforced writer must have sent no sample and had no announcement before a new enforced writer may take its place in a full table; `0` = never (`60..=31536000` otherwise). An active writer is never evicted; a flood of fresh forged announcements on an enforced topic can still hold the table, and a new writer is then refused and probed |
-| `rtps.state_file` | none | persisted writer → channel map (format `robodr-firewall-gw-writers/v2`, v1 still read): the enforced table and the not-enforced writers. Read only if a regular file (symlinks refused), owned by root or the directory's owner and not group / world writable; written through an `O_EXCL` 0600 temporary file |
+| `rtps.state_file` | none | persisted writer → channel map (format `robodr-firewall-gw-writers/v3`, v1 / v2 still read; an older gateway refuses v3, so a downgrade starts with an empty map): the enforced table, the not-enforced writers and the suspects. Read only if a regular file (symlinks refused), owned by root or the directory's owner and not group / world writable; written through an `O_EXCL` 0600 temporary file |
 | `rtps.max_sn_jump` | 64 | largest sequence-number step decided at once (larger: held until confirmed) |
 | `rtps.binding_takeover_ns` | 1 s | silence after which another (IP, MAC) may continue an authorised GUID's stream |
 | `rtps.extra_port_ranges` | none | further `[lo, hi]` UDP port ranges queued and decided as RTPS (non-default DDS ports; at most 16) |
@@ -1115,7 +1133,14 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   ever classified as enforced stays enforced (own table, persisted;
   `discovery.enforced_kept`; evicted only from a full table, idle for
   `rtps.enforced_idle_evict_s`, to make room for a new enforced writer,
-  after which it is probed); the not-enforced table evicts the
+  after which it is a suspect: probed, and never learned as not enforced
+  from an announcement anyone can send, `discovery.suspect_kept`; review
+  2, H2); an announcement or removal reassembled from DATA_FRAG copies
+  that disagreed (one copy addressed elsewhere naming a harmless topic,
+  another to everyone naming `rt/lowcmd`: the robot keeps the second) is
+  **contested** (`discovery.contested`; review 2, H1): its enforced
+  readings are enforced whatever its INFO_DST, its other writers become
+  suspects, a contested removal is ignored; the not-enforced table evicts the
   least recently used; only the standard builtin entity ids are discovery
   (a user writer with builtin kind bits is decided). Until the robot's
   participants are known (observation off, or its SPDP not seen yet) an
@@ -1126,7 +1151,8 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   gateway did not see at all (a discovery path around the bridge, a
   fragmented SEDP the bounded reassembler dropped), only the suspicious-
   payload probe stands between its samples and the robot (strong shapes
-  always, twists / requests as above). Unknown writers are probed (and
+  always, twists / requests as above, and its unprobeable samples are
+  suppressed unless `rtps.unenforced_unprobeable: pass`). Unknown writers are probed (and
   their unprobeable samples suppressed); set `rtps.state_file` so a
   restart does not forget the robot's writers.
   Deployment rule: **all SEDP / SPDP between controller-side participants

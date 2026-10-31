@@ -294,6 +294,11 @@ pub struct EndpointInfo {
     pub alternates: Vec<EndpointAlternate>,
     /// Reassembled from DATA_FRAG.
     pub from_fragments: bool,
+    /// Reassembled from DATA_FRAG copies that disagreed (see
+    /// `robodr_rtps::frag`, "Overlaps"): a receiver may have completed the
+    /// sample from another copy, so this reading is not necessarily the one
+    /// the receiver acts on. Never relax anything because of it.
+    pub contested: bool,
     /// The endpoint's own unicast locators (`PID_UNICAST_LOCATOR`; empty =
     /// the participant's default locators apply).
     pub unicast_locators: Vec<Locator>,
@@ -372,6 +377,8 @@ pub struct EndpointRemoval {
     /// The destination prefix in effect (see [`EndpointInfo::destination`]).
     pub destination: GuidPrefix,
     pub status: StatusInfo,
+    /// See [`EndpointInfo::contested`].
+    pub contested: bool,
 }
 
 /// An SPDP dispose / unregister: the participant is leaving.
@@ -383,6 +390,8 @@ pub struct ParticipantRemoval {
     /// The destination prefix in effect (see [`EndpointInfo::destination`]).
     pub destination: GuidPrefix,
     pub status: StatusInfo,
+    /// See [`EndpointInfo::contested`].
+    pub contested: bool,
 }
 
 /// Everything an SPDP announcement told us about a participant.
@@ -656,6 +665,8 @@ struct Sample<'a> {
     payload: Option<&'a [u8]>,
     key_only: bool,
     from_fragments: bool,
+    /// Reassembled from disagreeing copies (see [`EndpointInfo::contested`]).
+    contested: bool,
 }
 
 /// Distinct values of a repeated parameter, first-appearance order, plus the
@@ -819,6 +830,7 @@ impl Report {
             payload,
             key_only: flags & FLAG_D == 0 && flags & FLAG_K != 0,
             from_fragments: false,
+            contested: false,
         });
     }
 
@@ -952,7 +964,7 @@ impl Report {
         match outcome {
             // Both already reported through the fragment events.
             FragOutcome::Pending | FragOutcome::Rejected | FragOutcome::LateCopy => {}
-            FragOutcome::Complete(buf, inline, key_only, destination) => {
+            FragOutcome::Complete(buf, inline, key_only, destination, contested) => {
                 self.stats.frag_completed += 1;
                 self.handle_sample(Sample {
                     topic,
@@ -962,6 +974,23 @@ impl Report {
                     payload: Some(&buf),
                     key_only,
                     from_fragments: true,
+                    contested,
+                });
+            }
+            // The sample was decoded when it completed; decode it again,
+            // contested, so a consumer that acted on it learns that a
+            // receiver may hold other content (the conflict was reported
+            // through the fragment events).
+            FragOutcome::LateConflict(buf, inline, key_only, destination) => {
+                self.handle_sample(Sample {
+                    topic,
+                    source,
+                    destination,
+                    inline,
+                    payload: Some(&buf),
+                    key_only,
+                    from_fragments: true,
+                    contested: true,
                 });
             }
         }
@@ -1136,6 +1165,7 @@ impl Report {
                         source: s.source,
                         destination: s.destination,
                         status,
+                        contested: s.contested,
                     });
                     return;
                 }
@@ -1210,6 +1240,7 @@ impl Report {
                         source: s.source,
                         destination: s.destination,
                         status,
+                        contested: s.contested,
                     });
                     return;
                 }
@@ -1322,6 +1353,7 @@ impl Report {
             type_names,
             alternates,
             from_fragments: s.from_fragments,
+            contested: s.contested,
             unicast_locators,
             multicast_locators,
         });
@@ -1490,6 +1522,7 @@ mod tests {
             type_names: vec!["T".into()],
             alternates: Vec::new(),
             from_fragments: false,
+            contested: false,
             unicast_locators: Vec::new(),
             multicast_locators: Vec::new(),
         }

@@ -379,6 +379,61 @@ impl IdGaps {
     }
 }
 
+/// One queue's line of the kernel's `nfnetlink_queue` statistics
+/// (`/proc/<pid>/net/netfilter/nfnetlink_queue`; review 2, L3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelQueueStats {
+    /// Packets waiting for a verdict now.
+    pub queue_total: u32,
+    /// Packets the kernel dropped because the queue already held
+    /// `queue.max_len` packets (only without `NFQA_CFG_F_FAIL_OPEN`: with
+    /// it, i.e. `on_gateway_down: bypass`, such packets are accepted
+    /// unchecked and **not counted anywhere**). They take no packet id, so
+    /// [`IdGaps`] cannot see them.
+    pub queue_dropped: u32,
+    /// Packets the kernel could not hand to the socket (a full receive
+    /// buffer); they took an id, so [`IdGaps`] counts them already.
+    pub user_dropped: u32,
+}
+
+/// Parse the statistics line of `queue` from the text of
+/// `/proc/net/netfilter/nfnetlink_queue` (one line per bound queue:
+/// `queue_num peer_portid queue_total copy_mode copy_range queue_dropped
+/// queue_user_dropped id_sequence 1`, decimal). `None`: no such line or
+/// a malformed one.
+pub fn parse_queue_stats(text: &str, queue: u16) -> Option<KernelQueueStats> {
+    text.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let num = |i: usize| f.get(i).and_then(|x| x.parse::<u32>().ok());
+        if num(0)? != u32::from(queue) || f.len() < 8 {
+            return None;
+        }
+        Some(KernelQueueStats {
+            queue_total: num(2)?,
+            queue_dropped: num(5)?,
+            user_dropped: num(6)?,
+        })
+    })
+}
+
+/// Growth of the kernel's (32-bit, wrapping) `queue_dropped` counter
+/// between reads. The queue instance, and so the counter, is created when
+/// the gateway binds the queue, so the first read counts from zero.
+#[derive(Debug, Clone, Default)]
+pub struct KernelDrops {
+    last: Option<u32>,
+}
+
+impl KernelDrops {
+    /// Note the counter's value `now`; returns the packets dropped since
+    /// the previous read.
+    pub fn observe(&mut self, now: u32) -> u64 {
+        let before = self.last.unwrap_or(0);
+        self.last = Some(now);
+        u64::from(now.wrapping_sub(before))
+    }
+}
+
 // FFI: std has no netlink socket API (AF_NETLINK / NETLINK_NETFILTER,
 // `sockaddr_nl`, netlink socket options); this module is the only place the
 // queue touches the kernel.
@@ -628,6 +683,32 @@ mod socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 2, L3: packets the kernel drops on a full queue take no
+    /// packet id, so only its own counter shows them.
+    #[test]
+    fn kernel_queue_stats_are_read_and_counted() {
+        let text = "    0  12345     3 2 65535    17     2      400  1\n\
+                    \x20   7  12346     0 2 65535     0     5       90  1\n";
+        assert_eq!(
+            parse_queue_stats(text, 0),
+            Some(KernelQueueStats {
+                queue_total: 3,
+                queue_dropped: 17,
+                user_dropped: 2,
+            })
+        );
+        assert_eq!(parse_queue_stats(text, 7).map(|s| s.user_dropped), Some(5));
+        assert_eq!(parse_queue_stats(text, 1), None);
+        assert_eq!(parse_queue_stats("0 1 x 2 3 4 5 6 1\n", 0), None);
+        assert_eq!(parse_queue_stats("0 1 2\n", 0), None);
+        assert_eq!(parse_queue_stats("", 0), None);
+        let mut d = KernelDrops::default();
+        assert_eq!(d.observe(17), 17, "the instance starts at zero");
+        assert_eq!(d.observe(17), 0);
+        assert_eq!(d.observe(20), 3);
+        assert_eq!(d.observe(1), u64::from(u32::MAX - 18), "32-bit wrap");
+    }
 
     #[test]
     fn id_gaps_count_skipped_packet_ids() {

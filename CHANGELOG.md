@@ -30,6 +30,41 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   `RestartPreventExitStatus=2` the unit is left failed and
   `RoboDRUnitFailed` fires.
 
+### Security (gateway, review 2)
+
+- **Fragmented SEDP with disagreeing copies (H1):** the RTPS reassembler
+  marks a sample whose fragment copies carried different bytes or inline
+  QoS as contested (`EndpointInfo::contested`, also on removals), and a
+  copy that disagrees with the kept bytes no longer makes them "everyone's".
+  The gateway enforces a contested announcement's enforced readings
+  whatever its INFO_DST, never learns its other writers as not enforced
+  (they become suspects, always probed) and ignores contested removals
+  (`discovery.contested`).
+- **Evicted enforced writers stay suspect (H2):** a writer evicted from a
+  full enforced table is remembered (4 × the table, persisted; state file
+  `robodr-firewall-gw-writers/v3`, v1 / v2 still read) and a later
+  announcement of it on another topic is ignored (`discovery.suspect_kept`);
+  its samples are probed also with `unknown_writers: pass`. While that
+  memory is full no writer is evicted.
+- **Unprobeable samples of not-enforced writers (M1):** DATA_FRAG, key-only
+  and non-standard samples of a writer announced on another topic are
+  suppressed by default (`rtps.unenforced_unprobeable: suppress`,
+  `gateway.unenforced_undecidable`, finding `fragmented_command` reason
+  `unenforced_unprobeable`). **Upgrade note:** a controller-side writer of
+  fragmented non-motion samples to the robot stops reaching it; set
+  `rtps.unenforced_unprobeable: pass` only if that topic must reach the
+  robot and the residual is accepted.
+- **Writer-state eviction (M2):** a sample from a source the channel does
+  not allow no longer creates per-writer state, and eviction ranks only by
+  forwarding, so spoofed GUIDs under the authorised prefix cannot evict the
+  genuine writer's binding, sequence and replay state.
+- **Kernel queue-full drops are counted (L3):** the gateway reads the
+  kernel's `nfnetlink_queue` counters and counts queue-full drops as shed
+  (`overload.kernel_queue_dropped`); with `on_gateway_down: bypass` the
+  kernel forwards such frames uncounted, which is now documented and
+  signalled (`overload.kernel_queue_full_seen`).
+- New fuzz target `rtps_secured_prefix` (L20, partly).
+
 ### Security (closing documented gaps, 2026-10-30)
 
 - **Black-box key rotation without a hand-edited log:** `robodr-blackbox

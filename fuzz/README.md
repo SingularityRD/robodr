@@ -7,6 +7,7 @@ violated output invariant (documented at the top of its harness file).
 | target | crate | what it feeds | smoke test |
 |---|---|---|---|
 | `parse_datagram` | robodr-rtps | one RTPS datagram to `parse_datagram` | `crates/robodr-rtps/tests/mutation_fuzz.rs` |
+| `rtps_secured_prefix` | robodr-rtps | a 12-byte GUID prefix + certificate subject text to `secured_prefix::prefix_matches_subject` (subject parser, DER rebuild); invariants: deterministic, only the 6 hashed prefix bytes count, a match has the secured bit and breaks on any hash-bit flip | `crates/robodr-rtps/tests/fuzz_smoke_secured_prefix.rs` |
 | `pcap_reader` | robodr-capture | a pcap/pcapng file to `CaptureFile` + `rtps_datagrams` + RTPS parser | `crates/robodr-capture/tests/fuzz_smoke.rs` |
 | `cdr_unitree` | robodr-cdr | a selector byte + payload to the Unitree DDS decoders (`decode_unitree` / `decode_payload`), the `unitree_legacy` UDP decoders, and the bounded API-parameter JSON reader | `crates/robodr-cdr/tests/fuzz_smoke.rs` |
 | `capture_reassembly` | robodr-capture | a framed train of link-layer frames to `decode_frame`, `Reassembler` (small limits) and the pipeline | same |
