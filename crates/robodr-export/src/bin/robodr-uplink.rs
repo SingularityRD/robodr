@@ -290,18 +290,21 @@ fn opts(a: &Args) -> Result<Opts, String> {
 struct Loaded {
     key: Ed25519SigningKey,
     tls: Option<rustls::ClientConfig>,
+    /// The CRLs in use (`--crl-file`), for their expiry in the status file.
+    crls: Option<Arc<robodr_blackbox::crl::CrlStats>>,
 }
 
 fn load(o: &Opts) -> Result<Loaded, String> {
     let key = uplink::load_sender_key(std::path::Path::new(&o.key_file))?;
-    let tls = match &o.ca_bundle {
+    let (tls, crls) = match &o.ca_bundle {
         Some(p) => {
             let roots = http::load_ca_bundle(std::path::Path::new(p))?;
-            Some(http::client_config_with_crls(roots, &o.pins, &o.crl_files)?.0)
+            let (c, s) = http::client_config_with_crls(roots, &o.pins, &o.crl_files)?;
+            (Some(c), s)
         }
-        None => None,
+        None => (None, None),
     };
-    Ok(Loaded { key, tls })
+    Ok(Loaded { key, tls, crls })
 }
 
 fn random_u64() -> u64 {
@@ -462,6 +465,10 @@ fn main() -> ExitCode {
         log: Box::new(|m| eprintln!("robodr-uplink: {m}")),
         report: Box::new(|r| println!("{}", serde_json::to_string(r).unwrap_or_default())),
         stop: Box::new(|| false),
+        credentials: Box::new(|now| match &loaded.crls {
+            Some(s) => service::crl_credentials(&s.status(), now),
+            None => Vec::new(),
+        }),
     };
     ExitCode::from(service::run(&o.service, &o.cfg.state_dir, open, &mut env))
 }

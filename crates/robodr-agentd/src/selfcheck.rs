@@ -166,20 +166,13 @@ impl Level {
 /// Whole days from `now_ms` to `expires_ms` (Unix ms), rounded down
 /// (negative once expired).
 pub fn days_to_expiry(expires_ms: u64, now_ms: u64) -> i64 {
-    let diff = i128::from(expires_ms) - i128::from(now_ms);
-    let days = diff.div_euclid(i128::from(DAY_MS));
-    i64::try_from(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
+    CredentialExpiry::days_between(expires_ms, now_ms)
 }
 
 /// A credential's expiry from its Unix-seconds date (`notAfter`,
 /// `nextUpdate`) at `now_ms` (Unix ms). Dates before 1970 read as 0.
 pub fn credential(name: &str, expires_s: i64, now_ms: u64) -> CredentialExpiry {
-    let expires_ms = u64::try_from(expires_s).unwrap_or(0).saturating_mul(1000);
-    CredentialExpiry {
-        name: name.to_string(),
-        expires_ms,
-        days_to_expiry: days_to_expiry(expires_ms, now_ms),
-    }
+    CredentialExpiry::at(name, expires_s, now_ms)
 }
 
 /// The kernel's view of the wall clock (`adjtimex(2)`).

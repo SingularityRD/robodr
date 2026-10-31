@@ -392,6 +392,29 @@ pub struct CredentialExpiry {
     pub days_to_expiry: i64,
 }
 
+impl CredentialExpiry {
+    /// A credential expiring at `expires_s` (Unix seconds: `notAfter`,
+    /// `nextUpdate`; dates before 1970 read as 0), seen at `now_ms` (Unix
+    /// ms).
+    pub fn at(name: &str, expires_s: i64, now_ms: u64) -> Self {
+        let expires_ms = u64::try_from(expires_s).unwrap_or(0).saturating_mul(1000);
+        Self {
+            name: name.to_string(),
+            expires_ms,
+            days_to_expiry: Self::days_between(expires_ms, now_ms),
+        }
+    }
+
+    /// Whole days from `now_ms` to `expires_ms` (Unix ms), rounded down
+    /// (negative once expired).
+    pub fn days_between(expires_ms: u64, now_ms: u64) -> i64 {
+        const DAY_MS: i128 = 86_400_000;
+        let diff = i128::from(expires_ms) - i128::from(now_ms);
+        let days = diff.div_euclid(DAY_MS);
+        i64::try_from(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
+    }
+}
+
 /// Where [`ClockHealth::synchronized`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

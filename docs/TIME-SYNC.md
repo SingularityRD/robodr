@@ -109,4 +109,8 @@ record when the wall clock is behind the black box's newest record time
 6. **Certificates.** Renew control-plane certificates and CRLs before
    `robot.agent.credential_expiring` turns High (3 days by default); on an
    air-gapped site bring the fresh CRL in with the regular update media
-   well before its `nextUpdate`.
+   well before its `nextUpdate`. The HTTPS uplink's CRLs (`--crl-file`)
+   are not seen by agentd: `uplink-status.json` lists them under
+   `credentials` and `robodr-uplink` logs each one from 14 days before its
+   `nextUpdate`. The Kafka publisher, enrolment and head-anchor clients
+   do not report CRL expiry yet.

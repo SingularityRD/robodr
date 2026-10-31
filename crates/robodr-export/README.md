@@ -365,7 +365,10 @@ later record. The loop makes that visible and keeps it cheap:
   `pending_failed_runs`, `backlog` {`spool_ready` | `diode_batches`,
   `reinject_generations`}, `next_attempt_at_ms`, `dead_letter_malformed`,
   `quarantined_unreadable` (spool files this process could not read) and
-  the delivery totals.
+  the delivery totals, and `credentials` [{`name`, `expires_ms`,
+  `days_to_expiry`}]: each CRL in use (`--crl-file`) as `crl:<issuer>`
+  with its `nextUpdate` (empty without CRLs). A CRL within 14 days of its
+  `nextUpdate` (or past it) is also logged, once per day count.
 * **`sd_notify` `STATUS=`** with the same summary (the units set
   `NotifyAccess=main`; `systemctl status robodr-uplink`), and a log line
   per failed run.
