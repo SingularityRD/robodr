@@ -811,6 +811,8 @@ finding):
 | `robot.agent.clock_jump` | High | the agent's time guard saw the wall clock jump against the monotonic clock (> 1 s); at most every `health_report_ms` |
 | `robot.agent.disk_low` | Medium below `disk_warn_percent` (10 %) free, High below `disk_critical_percent` (3 %) | per filesystem (black box, spool, control-plane state) on each escalation, before `spool_full` / `evidence_degraded` |
 | `robot.agent.executor_unreachable` | High | executor v1 has not answered its event poll for `executor_unreachable_ms` (30 s); once per outage |
+| `robot.agent.evidence_retention_pressure` | Medium; High from 95 % | unexported black-box segments reach `blackbox.retention.warn_percent` of the capacity (pending-export reserve or saturation mode); once per episode (`src/retention.rs`) |
+| `robot.agent.evidence_unexported_dropped` | High with a pending-export reserve; Medium on plain cyclic retention | cyclic retention dropped segments no export had confirmed; plain cyclic only when `blackbox.retention.export` is `expected`, or `auto` once an export cursor exists, at most once a day |
 
 Time synchronisation baseline (chrony with NTS, PTP): [`docs/TIME-SYNC.md`](../../docs/TIME-SYNC.md).
 

@@ -475,8 +475,9 @@ fn a_2_2_unitree_message_validates_with_its_own_catalog() {
 }
 
 /// The 2.5 agent entries (sales-readiness WP2: T5 health record, T6
-/// credential expiry, T7 clock, T40 disk, T41 executor reachability; ids
-/// reserved for T81 control-plane fencing and T13 self-test).
+/// credential expiry, T7 clock, T40 disk, T41 executor reachability; WP4
+/// T15 black-box retention pressure and unexported drops; ids reserved for
+/// T81 control-plane fencing and T13 self-test).
 const IDS_2_5_AGENT: &[&str] = &[
     "robot.agent.health",
     "robot.agent.credential_expiring",
@@ -486,6 +487,8 @@ const IDS_2_5_AGENT: &[&str] = &[
     "robot.agent.executor_unreachable",
     "robot.agent.executor_pause_overridden",
     "robot.agent.config_unattested",
+    "robot.agent.evidence_retention_pressure",
+    "robot.agent.evidence_unexported_dropped",
     "robot.agent.control_plane_request_fenced",
     "robot.agent.selftest",
 ];

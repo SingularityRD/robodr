@@ -185,6 +185,9 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.agent.clock_jump",
     "robot.agent.disk_low",
     "robot.agent.executor_unreachable",
+    // robodr-agentd black-box retention (contract 2.5, `retention`)
+    "robot.agent.evidence_retention_pressure",
+    "robot.agent.evidence_unexported_dropped",
     // Contract 2.5 ids reserved for their producers (control-plane replay
     // fence, field self-test, in-path gateway overload).
     "robot.agent.control_plane_request_fenced",

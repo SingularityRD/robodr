@@ -96,9 +96,9 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-251 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+253 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (25)
+### `robot.agent.*` (27)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -114,7 +114,9 @@ correlation entry.
 | `robot.agent.disk_low` | Agent storage running out of space | `robodr_agent` | — | 2.5 |
 | `robot.agent.evidence_degraded` | Black-box recording failing | `robodr_agent` | — | 1.3 |
 | `robot.agent.evidence_quarantined` | Damaged black-box segment quarantined | `robodr_agent` | — | 1.3 |
+| `robot.agent.evidence_retention_pressure` | Unexported black-box evidence filling the retention | `robodr_agent` | — | 2.5 |
 | `robot.agent.evidence_truncated` | Black-box records cut after the newest mark | `robodr_agent` | — | 1.3 |
+| `robot.agent.evidence_unexported_dropped` | Unexported black-box evidence dropped | `robodr_agent` | — | 2.5 |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | `robodr_agent` | — | 2.4 |
 | `robot.agent.executor_pause_overridden` | Robot set moving while paused | `robodr_agent` | — | 2.5 |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | `robodr_agent` | — | 2.4 |

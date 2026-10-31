@@ -14,7 +14,7 @@
 #     then advances the signed export cursor (export-cursor.json). agentd
 #     re-reads the cursor before cyclic retention would drop a segment
 #     (blackbox.retention.unexported_reserve_segments) and reports pressure
-#     before it does (robot.agent.evidence_degraded, "retention pressure:").
+#     before it does (robot.agent.evidence_retention_pressure).
 #   * It runs as root with only CAP_DAC_OVERRIDE (to read agentd's 0700
 #     black box and write its cursor and export.lock there) and CAP_CHOWN
 #     (the cursor is handed to the directory's owner, robodr-agentd, so

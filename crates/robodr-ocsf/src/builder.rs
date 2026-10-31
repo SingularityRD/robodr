@@ -1225,6 +1225,16 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found.",
             AGENT,
         ),
+        "robot.agent.evidence_retention_pressure" => e(
+            "Unexported black-box evidence filling the retention",
+            "Black-box evidence that no export has confirmed yet fills most of the retention the robot's agent was configured with (pending-export reserve or saturation mode): run or repair the export (diode, media) before the oldest unexported evidence is dropped or new records are refused.",
+            AGENT,
+        ),
+        "robot.agent.evidence_unexported_dropped" => e(
+            "Unexported black-box evidence dropped",
+            "Cyclic retention dropped black-box segments holding records that no export had confirmed (each drop is a signed SegmentDropped record): that evidence is no longer on the robot. Recording itself works; check the export path and the retention sizing.",
+            AGENT,
+        ),
         "robot.agent.control_plane_request_fenced" => e(
             "Control-plane request refused by the replay fence",
             "A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.",
