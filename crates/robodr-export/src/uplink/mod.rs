@@ -74,6 +74,7 @@
 //! again on the next run. Deleted dead letters can no longer be
 //! re-injected (`reinject` reads the files present).
 
+pub mod check;
 pub mod http;
 pub mod reinject;
 pub mod service;

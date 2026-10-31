@@ -81,6 +81,11 @@ impl Unit {
     /// A unit with agentd configured for `ROBOT` at `SITE`, profile trust
     /// (profile key, trust roots, revocation list path, state file).
     pub fn new(tag: &str) -> Self {
+        Self::new_robot(tag, ROBOT)
+    }
+
+    /// [`Unit::new`] for robot `robot` (fleet simulations).
+    pub fn new_robot(tag: &str, robot: &str) -> Self {
         let root = tmpdir(tag);
         let etc = root.join("etc");
         let keys = etc.join("keys");
@@ -110,7 +115,7 @@ impl Unit {
         let state = root.join("var/profile-state");
         std::fs::create_dir_all(&state).unwrap();
         let agentd = serde_json::json!({
-            "robot": {"id": ROBOT, "site": SITE},
+            "robot": {"id": robot, "site": SITE},
             "sensor": {
                 "profile_path": etc.join("profile.json"),
                 "profile_trust": {

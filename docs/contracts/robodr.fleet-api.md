@@ -31,6 +31,7 @@ head ≤ 32 KiB, body ≤ 1 MiB.
 | `POST` | `/robot-edr/v2/fleet/keys/rotate` | request auth (§2.5) | `rotate-request` envelope | `rotate-answer` envelope |
 | `POST` | `/robot-edr/v2/fleet/keys/retire` | request auth | `retire-request` envelope | `retire-answer` envelope |
 | `POST` | `/robot-edr/v2/fleet/keys/cancel` | request auth | `cancel-request` envelope | `cancel-answer` envelope |
+| `POST` | `/robot-edr/v2/fleet/decommission` | request auth (§5.6) | `decommission-request` envelope | `decommission-answer` envelope |
 | `GET` | `/robot-edr/v2/fleet/revocations/{platform}` | request auth | — | the `robodr-profile-revocations/v2` file, verbatim |
 | `POST` | `/robot-edr/v2/fleet/profiles/drafts` | request auth | a draft profile file, verbatim | `{"digest":"sha256:…","status":"received"}` |
 | `GET` | `/robot-edr/v2/fleet/profiles/current` | request auth | — | profile offer (§6.2) |
@@ -57,6 +58,7 @@ registered to (§2.5); no path carries a robot or workspace id.
 | workspace, token id, approval id, operator | `[A-Za-z0-9._:-]{1,64}` |
 | request id | `rfe1-` + 32 lower-case hex (random, chosen by the robot) |
 | rotation id | `rfr1-` + 32 lower-case hex (random, chosen by the robot) |
+| decommission id | `rfd1-` + 32 lower-case hex (random, chosen by the robot) |
 | times | Unix milliseconds, JSON integers (`*_ms`) |
 
 ### 2.2 Envelope
@@ -77,7 +79,8 @@ Every signed document (except the compact token, §3.1) is an envelope:
   exactly `alg` (`"hmac-sha256"`), `token_id`, `mac` (64 lower-case hex).
 * `type`: one of `enroll-request`, `enroll-answer`, `rotate-request`,
   `rotate-answer`, `retire-request`, `retire-answer`, `cancel-request`,
-  `cancel-answer`, `profile-approval`, `ring-info` (and `enroll-token`,
+  `cancel-answer`, `profile-approval`, `ring-info`, `decommission-request`,
+  `decommission-answer` (and `enroll-token`,
   used only in signatures of §3.1). A
   reader expects one type per place and refuses any other.
 * Exactly these keys (`format`, `type`, `payload`, `sigs`, plus `mac` on a
@@ -162,7 +165,7 @@ a robot treats an unknown code by its status.
 | `401` | `bad_token`, `bad_signature`, `unknown_key`, `stale_timestamp`, `wrong_key`, `replayed_request` | refused; fix the token, registration or clock |
 | `403` | `workspace_mismatch`, `robot_mismatch` | refused |
 | `404` | `no_list`, `no_profile`, `no_approval`, `no_ring`, `unknown_rotation`, `not_found` | nothing published yet |
-| `409` | `token_used`, `key_conflict`, `rotation_in_progress`, `rotation_id_reuse`, `stale_key`, `already_retired`, `rotation_cancelled`, `already_cancelled` | refused; see the step |
+| `409` | `token_used`, `key_conflict`, `rotation_in_progress`, `rotation_id_reuse`, `stale_key`, `already_retired`, `rotation_cancelled`, `already_cancelled`, `already_decommissioned` | refused; see the step |
 | `410` | `token_expired` | refused; a new token is needed |
 | `413` | `too_large` | refused |
 | `415` | `unsupported_media_type` | refused (a robot bug) |
@@ -487,6 +490,78 @@ unchanged), only while the active key file still holds the old key (after
 the swap the rotation is finished instead); on the verified answer it
 shreds the new key and closes the rotation.
 
+### 5.6 Decommission
+
+At the end of a unit's life (or before it is transferred to another
+operator or returned for repair) the unit asks the SOC to retire **every**
+key it holds and to close its registration. The SOC's signed answer is the
+decommission receipt; the operator keeps request and answer with the
+site's records (procedure: [`../DECOMMISSION.md`](../DECOMMISSION.md)).
+
+Payload `robodr-fleet-decommission-request/v1`, keys in this order:
+
+| Key | Value |
+| --- | --- |
+| `format` | `"robodr-fleet-decommission-request/v1"` |
+| `decommission_id` | `rfd1-…` |
+| `workspace`, `robot_id` | the unit's enrollment |
+| `reason` | `"end_of_life"`, `"transfer"` or `"repair"` |
+| `keys` | exactly three objects `{"role","key_id","fingerprint"}` in the order `uplink`, `finding`, `blackbox`: the unit's registered keys, pairwise distinct |
+| `journal_head` | the fleet journal head the request follows (§5.4: 64 lower-case hex, or `genesis`) |
+| `created_at_ms` | robot clock |
+
+The envelope `decommission-request` is signed by **each of the three
+listed keys**, in that order (the unit, holding every key, asks; as at
+enrollment, §3.2). The HTTP request is authenticated (§2.5) by the listed
+`uplink` key. **Exception to §2.5**: an `uplink` key that a decommission
+of its robot retired still authenticates `POST …/decommission`, and
+nothing else, so a robot whose answer was lost resends its stored request
+and gets the stored answer.
+
+Processing (after §2.5), first failure decides: envelope / payload syntax
+→ `400 bad_request`; `workspace` or `robot_id` not the authenticated
+robot's → `403 robot_mismatch`; the authenticating key is not the listed
+`uplink` key → `401 wrong_key`; replay: the robot's decommission with the
+same payload digest → `200` with the **stored** answer, byte for byte;
+the robot was decommissioned by another request and has no active key →
+`409 already_decommissioned`; a listed key is not the robot's **active**
+key of that role with that fingerprint → `409 stale_key`; signatures (the
+three listed keys, in order, nothing else) → `401 bad_signature`; an open
+rotation of the robot (§5.1, neither retired nor cancelled) → `409
+rotation_in_progress` (finish or cancel it first). Effects, atomically with
+storing the answer: **every** active key of the robot is retired (from now
+on it authenticates nothing: fleet requests, ingest batches and finding
+signatures alike), and the robot is recorded as decommissioned with the
+answer. The robot may be enrolled again later only with a new token and
+new keys (§4: a key id is never registered twice).
+
+Answer `decommission-answer` (payload
+`robodr-fleet-decommission-answer/v1`, signed by a SOC fleet key):
+`format`, `decommission_id`, `request_digest`, `workspace`, `robot_id`,
+`reason`, `keys` (the request's), `status` = `"decommissioned"`, `at_ms`
+(server time).
+
+The SOC shows every decommission to its operators as an audit event. It is
+not an authorisation step: a unit's own keys can ask for it, just as they
+can stop sending findings. A unit that goes silent after a decommission the
+operators did not plan is an incident. Retiring the keys of a unit that is
+lost, stolen or suspected compromised is a SOC-side operator action (no
+request from the unit), outside this API.
+
+**Robot side.** `robodr-enroll decommission --reason R` refuses while an
+enrollment or a rotation is unfinished and when a key file does not hold
+the registered key; it builds the request once (stored byte-exact; resent
+unchanged after a crash), marks it sent before the first submit, and never
+abandons a sent request locally. Air-gapped: `--request-out FILE` writes
+it, `--answer FILE` completes; the SOC's file import applies the same
+processing (its import time is the server time). On the verified answer
+(signed by a configured SOC fleet key, every field equal to the request)
+it stores the answer, writes a `robodr.fleet.decommission` note into the
+fleet journal and seals it (signed by the black-box key), shreds the
+`uplink` and `finding` secret keys and removes the enrollment. The
+black-box key is kept until the unit's data is sanitised: the black box
+may still have to be exported and verified with it.
+
 ## 6. Profiles
 
 ### 6.1 Draft publish
@@ -625,7 +700,11 @@ text requires:
   rotation resent, the new key no longer authenticating, a new rotation
   after it, cancel of a rotation never received, cancel after retire) and
   the authenticating key of an uplink rotation (rotate by the new key,
-  retire by the old key: `401 wrong_key`).
+  retire by the old key: `401 wrong_key`) and decommission (case 18:
+  wrong authenticating key, open rotation, retired key, missing
+  signatures, stale key, another robot, the decommission, the stored
+  answer to a resend by the retired uplink key, a second request, the
+  retired key refused elsewhere).
 
 They are generated deterministically by `cargo run -p robodr-fleet
 --example fleet_vectors`; the RoboDR test suite fails when the committed
@@ -657,3 +736,12 @@ Cases are only ever added.
     optional);
   * profile install: both files staged before the two renames (the
     remaining window stated).
+* **v1 draft, 2026-10-31** (sales-readiness T72; additive, a minor change
+  by §9: a new endpoint and new envelope types, no existing format
+  changed): `POST …/decommission` (§5.6) with `decommission-request` /
+  `decommission-answer`, code `409 already_decommissioned`, the
+  retired-uplink-key exception to §2.5 for that endpoint only; case 18
+  added to the vectors. The SOC-side policy questions (who is shown the
+  audit event, whether an operator must confirm before the keys are
+  retired, releasing the licensed seat: ADR-0008) are AutoSecOps decisions;
+  this text fixes only what the robot sends and accepts.

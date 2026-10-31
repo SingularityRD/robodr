@@ -55,7 +55,7 @@ robodr\-uplink \- send RoboDR findings to the SOC ingest API over TLS
 .IR TOPIC ]
 .RB [ \-\-interval\-ms
 .IR N ]
-.RB [ \-\-once ]
+.RB [ \-\-once " | " \-\-check ]
 .br
 .B robodr\-uplink reinject
 .B \-\-state\-dir
@@ -330,6 +330,27 @@ Loop interval, > 0 (default 2000).
 .TP
 .B \-\-once
 One pass, then exit.
+.TP
+.B \-\-check
+Site acceptance, without sending a finding: TLS with the CA bundle, pins and
+CRLs; the ingest endpoint (a request with valid headers and an empty body,
+which the ingest API refuses with
+.B 400 empty_batch
+before authentication and before anything is stored); and, for a
+.B \-\-spool
+(uplink) key, its registration through a read\-only, authenticated fleet
+request
+.RB ( "GET .../robot\-edr/v2/fleet/ring" :
+.B 200
+or
+.B 404 no_ring
+pass,
+.B 401
+names the reason). A relay key
+.RB ( \-\-diode\-out )
+and a SOC without the fleet API skip the key step, said so on the output.
+Takes no lock and writes nothing, so it runs next to the service. Exit 0
+passed, 1 failed.
 .TP
 .B \-\-version
 Print the version and exit.

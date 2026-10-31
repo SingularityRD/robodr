@@ -27,7 +27,7 @@ const USAGE: &str = "usage: robodr-uplink --url https://HOST[:PORT][/API-ROOT] -
 [--max-attempts N] [--backoff-base-ms N] [--backoff-max-ms N] [--refused-backoff-max-s N] \
 [--exit-when-stuck-s N] [--dead-letter-max-bytes N] [--dead-letter-keep N] \
 [--dead-letter-max-age-s N] [--done-max-age-s N] [--done-max-count N] \
-[--upgrade-data-source LABEL] [--upgrade-topic TOPIC] [--interval-ms N] [--once]\n\
+[--upgrade-data-source LABEL] [--upgrade-topic TOPIC] [--interval-ms N] [--once | --check]\n\
        robodr-uplink reinject --state-dir DIR (--spool DIR | --diode-out DIR) \
 --dead-letter FILE [--dead-letter FILE ...] [--codes CODE,CODE,...] [--dry-run]\n\
        robodr-uplink --version\n\
@@ -38,6 +38,10 @@ of the server's CAs, PEM or DER: a revoked server is refused, an issuer without 
 or unusable CRL refuses every server, the files are reloaded when they change); plain http:// \
 only to a loopback IP literal, without --ca-bundle.\n\
 Status: <state-dir>/uplink-status.json and sd_notify STATUS=. One process per --state-dir (flock).\n\
+--check (site acceptance): TLS (CA bundle, pins, CRLs), the ingest endpoint (an empty batch, \
+refused with 400 empty_batch before authentication: no finding is sent) and, for a --spool \
+(uplink) key, its registration (read-only fleet request); exit 0 passed, 1 failed. Takes no \
+lock and writes nothing: runs next to the service.\n\
 reinject: re-queue dead-lettered records (default codes: unknown_robot, robot_mismatch, \
 site_mismatch, missing_finding_signature, bad_finding_signature) under new batch ids; \
 stop the service first.\n\
@@ -355,8 +359,15 @@ fn main() -> ExitCode {
              24 h (contract section 7)",
         );
     }
-    let o = match parse_args_with_switches(v, SERVICE_FLAGS, &["once"])
-        .and_then(|a| opts(&a))
+    let mut check = false;
+    let o = match parse_args_with_switches(v, SERVICE_FLAGS, &["once", "check"])
+        .and_then(|a| {
+            check = a.flag("check");
+            if check && a.flag("once") {
+                return Err("--check and --once are separate modes".into());
+            }
+            opts(&a)
+        })
         .and_then(|o| o.cfg.validate().map(|()| o).map_err(|e| e.to_string()))
     {
         Ok(o) => o,
@@ -369,6 +380,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if check {
+        return run_check(&o, &loaded);
+    }
     // One process per state directory, for the whole lifetime (also between
     // runs): a second service, a --once or a reinject run fails clearly.
     let lock = match StateLock::acquire(&o.cfg.state_dir) {
@@ -405,6 +419,55 @@ fn main() -> ExitCode {
         stop: Box::new(|| false),
     };
     ExitCode::from(service::run(&o.service, &o.cfg.state_dir, open, &mut env))
+}
+
+/// `--check`: TLS, the ingest endpoint and (uplink keys) the key's
+/// registration, without sending a finding, taking the state lock or
+/// writing anything (`robodr_export::uplink::check`).
+fn run_check(o: &Opts, loaded: &Loaded) -> ExitCode {
+    println!(
+        "robodr-uplink --check: {} ({})",
+        o.url,
+        transport_label(o.url.tls, !o.pins.is_empty(), !o.crl_files.is_empty())
+    );
+    let source = match &o.cfg.source {
+        Source::Spool(p) => ("--spool", p),
+        Source::DiodeOut(p) => ("--diode-out", p),
+    };
+    for (what, p) in [("--state-dir", &o.cfg.state_dir), source] {
+        if !p.is_dir() {
+            println!("FAIL {what} {} is not a directory", p.display());
+            return ExitCode::from(1);
+        }
+        println!("ok   {what} {}", p.display());
+    }
+    let mut t = match HttpsTransport::new(o.url.clone(), loaded.tls.clone(), o.timeouts) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("FAIL {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut nonce = [0u8; 16];
+    if let Err(e) = robodr_blackbox::crypto::fill_random(&mut nonce) {
+        println!("FAIL random: {e}");
+        return ExitCode::from(1);
+    }
+    let relay = matches!(o.cfg.source, Source::DiodeOut(_));
+    let r = uplink::check::run(&mut t, &loaded.key, relay, robodr_export::now_ms(), nonce);
+    for l in &r.lines {
+        println!("{l}");
+    }
+    match r.outcome {
+        uplink::check::Outcome::Ok => {
+            println!("check passed");
+            ExitCode::SUCCESS
+        }
+        uplink::check::Outcome::Failed(e) => {
+            println!("FAIL {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 impl Loaded {

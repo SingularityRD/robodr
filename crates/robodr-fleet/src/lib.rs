@@ -23,6 +23,10 @@
 //!   (distinct from the online fleet key). Nothing is ever
 //!   enforced automatically.
 //! * [`ring`]: update-ring information (0/1/2), information only.
+//! * [`decommission`]: end of life: a request signed by the unit's three
+//!   keys retires them at the SOC; the SOC-signed answer is the receipt;
+//!   the uplink and finding keys are then shredded (procedure:
+//!   `docs/DECOMMISSION.md`).
 //!
 //! Supporting modules: [`wire`] (formats, pure), [`b64`], [`client`] (the
 //! HTTPS client is robodr-uplink's), [`keys`], [`state`], [`journal`] (the
@@ -57,8 +61,10 @@
 )]
 
 pub mod b64;
+pub mod check;
 pub mod client;
 pub mod config;
+pub mod decommission;
 pub mod enroll;
 pub mod fsx;
 pub mod install;

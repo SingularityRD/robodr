@@ -41,6 +41,9 @@ pub const PATH_PROFILE_CURRENT: &str = "/robot-edr/v2/fleet/profiles/current";
 pub const PATH_PROFILE_APPROVALS: &str = "/robot-edr/v2/fleet/profiles/approvals";
 /// `GET`: the ring-information envelope.
 pub const PATH_RING: &str = "/robot-edr/v2/fleet/ring";
+/// `POST`: decommission request envelope -> decommission answer envelope
+/// (§5.6).
+pub const PATH_DECOMMISSION: &str = "/robot-edr/v2/fleet/decommission";
 
 /// Prefix of a compact enrollment token.
 pub const TOKEN_PREFIX: &str = "rdet1.";
@@ -59,6 +62,8 @@ pub const CANCEL_ANSWER_FORMAT: &str = "robodr-fleet-cancel-answer/v1";
 pub const APPROVAL_FORMAT: &str = "robodr-fleet-profile-approval/v1";
 pub const RING_FORMAT: &str = "robodr-fleet-ring/v1";
 pub const OFFER_FORMAT: &str = "robodr-fleet-profile-offer/v1";
+pub const DECOMMISSION_REQUEST_FORMAT: &str = "robodr-fleet-decommission-request/v1";
+pub const DECOMMISSION_ANSWER_FORMAT: &str = "robodr-fleet-decommission-answer/v1";
 
 /// Envelope / token `type` values (also the signature domain's type field).
 pub const T_TOKEN: &str = "enroll-token";
@@ -72,7 +77,9 @@ pub const T_CANCEL_REQUEST: &str = "cancel-request";
 pub const T_CANCEL_ANSWER: &str = "cancel-answer";
 pub const T_APPROVAL: &str = "profile-approval";
 pub const T_RING: &str = "ring-info";
-const TYPES: [&str; 11] = [
+pub const T_DECOMMISSION_REQUEST: &str = "decommission-request";
+pub const T_DECOMMISSION_ANSWER: &str = "decommission-answer";
+const TYPES: [&str; 13] = [
     T_TOKEN,
     T_ENROLL_REQUEST,
     T_ENROLL_ANSWER,
@@ -84,6 +91,8 @@ const TYPES: [&str; 11] = [
     T_CANCEL_ANSWER,
     T_APPROVAL,
     T_RING,
+    T_DECOMMISSION_REQUEST,
+    T_DECOMMISSION_ANSWER,
 ];
 
 /// Signature domain (§2.3).
@@ -120,6 +129,8 @@ pub const MAX_OFFER_BYTES: usize = 2 * 1024 * 1024;
 pub const ROLES: [&str; 3] = ["uplink", "finding", "blackbox"];
 /// Roles `rotate` handles (§5).
 pub const ROTATABLE: [&str; 2] = ["uplink", "finding"];
+/// Why a unit is decommissioned (§5.6).
+pub const DECOMMISSION_REASONS: [&str; 3] = ["end_of_life", "transfer", "repair"];
 
 // ---------------------------------------------------------------- errors --
 
@@ -1069,6 +1080,140 @@ impl CancelRequest {
     }
 }
 
+// --------------------------------------------------------- decommission --
+
+/// Decommission request (§5.6): the unit asks the SOC to retire every key
+/// it holds and to close its registration. Signed by the unit's three
+/// registered keys, in the order `uplink`, `finding`, `blackbox`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecommissionRequest {
+    pub format: String,
+    pub decommission_id: String,
+    pub workspace: String,
+    pub robot_id: String,
+    /// One of [`DECOMMISSION_REASONS`].
+    pub reason: String,
+    /// The unit's registered keys, in role order (`uplink`, `finding`,
+    /// `blackbox`).
+    pub keys: Vec<KeyRef>,
+    /// The fleet journal head the request follows (64 lower-case hex of the
+    /// record hash, or `genesis`): binds the request to the unit's chain.
+    pub journal_head: String,
+    pub created_at_ms: u64,
+}
+
+pub const DECOMMISSION_REQUEST_KEYS: &[&str] = &[
+    "format",
+    "decommission_id",
+    "workspace",
+    "robot_id",
+    "reason",
+    "keys",
+    "journal_head",
+    "created_at_ms",
+];
+
+/// The SOC's answer to a decommission request (§5.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecommissionAnswer {
+    pub format: String,
+    pub decommission_id: String,
+    pub request_digest: String,
+    pub workspace: String,
+    pub robot_id: String,
+    pub reason: String,
+    /// The keys the SOC retired (the request's, in its order).
+    pub keys: Vec<KeyRef>,
+    /// `"decommissioned"`.
+    pub status: String,
+    pub at_ms: u64,
+}
+
+pub const DECOMMISSION_ANSWER_KEYS: &[&str] = &[
+    "format",
+    "decommission_id",
+    "request_digest",
+    "workspace",
+    "robot_id",
+    "reason",
+    "keys",
+    "status",
+    "at_ms",
+];
+
+/// The three key references of a decommission document: roles in order,
+/// well-formed ids and fingerprints, pairwise distinct.
+fn check_key_refs(keys: &[KeyRef]) -> Result<(), WireError> {
+    if keys.len() != ROLES.len() {
+        return err(format!("keys must list exactly the roles {ROLES:?}"));
+    }
+    for (k, role) in keys.iter().zip(ROLES) {
+        if k.role != role {
+            return err(format!("keys must be in the order {ROLES:?}"));
+        }
+        if !is_key_id(&k.key_id) || !is_sha256_digest(&k.fingerprint) {
+            return err("keys[]: key_id must be ed25519:<16 hex>, fingerprint sha256:<64 hex>");
+        }
+    }
+    let mut ids: Vec<&str> = keys.iter().map(|k| k.key_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut fprs: Vec<&str> = keys.iter().map(|k| k.fingerprint.as_str()).collect();
+    fprs.sort_unstable();
+    fprs.dedup();
+    if ids.len() != ROLES.len() || fprs.len() != ROLES.len() {
+        return err("the three role keys must be distinct");
+    }
+    Ok(())
+}
+
+/// `genesis` or 64 lower-case hex (a fleet journal head).
+pub fn is_journal_head(s: &str) -> bool {
+    s == "genesis" || is_lower_hex(s, 64)
+}
+
+impl DecommissionRequest {
+    pub fn parse(payload: &[u8]) -> Result<Self, WireError> {
+        let r: Self = strict_parse(payload, DECOMMISSION_REQUEST_KEYS)?;
+        check_keys_array(&parse_value(payload)?, false)?;
+        if r.format != DECOMMISSION_REQUEST_FORMAT
+            || !is_prefixed_id(&r.decommission_id, "rfd1-")
+            || !is_ident(&r.workspace)
+            || !is_label(&r.robot_id)
+            || !DECOMMISSION_REASONS.contains(&r.reason.as_str())
+            || !is_journal_head(&r.journal_head)
+        {
+            return err("decommission request malformed");
+        }
+        check_key_refs(&r.keys)?;
+        Ok(r)
+    }
+
+    /// The key of `role`.
+    pub fn key(&self, role: &str) -> Option<&KeyRef> {
+        self.keys.iter().find(|k| k.role == role)
+    }
+}
+
+impl DecommissionAnswer {
+    pub fn parse(payload: &[u8]) -> Result<Self, WireError> {
+        let a: Self = strict_parse(payload, DECOMMISSION_ANSWER_KEYS)?;
+        check_keys_array(&parse_value(payload)?, false)?;
+        if a.format != DECOMMISSION_ANSWER_FORMAT
+            || !is_prefixed_id(&a.decommission_id, "rfd1-")
+            || !is_sha256_digest(&a.request_digest)
+            || !is_ident(&a.workspace)
+            || !is_label(&a.robot_id)
+            || !DECOMMISSION_REASONS.contains(&a.reason.as_str())
+            || a.status != "decommissioned"
+        {
+            return err("decommission answer malformed");
+        }
+        check_key_refs(&a.keys)?;
+        Ok(a)
+    }
+}
+
 // -------------------------------------------------------------- profile --
 
 /// Operator approval of the observe -> enforce transition (§6.3).
@@ -1307,6 +1452,104 @@ mod tests {
         assert!(parsed.check_time(1_000_000 - MAX_SKEW_MS - 1).is_err());
         assert!(Token::parse(&t.replacen("rdet1.", "rdet2.", 1)).is_err());
         assert!(Token::parse(&format!("{t}.x")).is_err());
+    }
+
+    #[test]
+    fn decommission_payloads_are_strict() {
+        let kr = |role: &str, b: u8| {
+            let k = key(b);
+            KeyRef {
+                role: role.into(),
+                key_id: robodr_blackbox::Signer::key_id(&k).into(),
+                fingerprint: fingerprint(&k.public_key()),
+            }
+        };
+        let good = DecommissionRequest {
+            format: DECOMMISSION_REQUEST_FORMAT.into(),
+            decommission_id: format!("rfd1-{}", "a".repeat(32)),
+            workspace: "ws-1".into(),
+            robot_id: "ugv-001".into(),
+            reason: "end_of_life".into(),
+            keys: vec![kr("uplink", 1), kr("finding", 2), kr("blackbox", 3)],
+            journal_head: "genesis".into(),
+            created_at_ms: 1,
+        };
+        let p = |r: &DecommissionRequest| payload_bytes(r).unwrap();
+        assert_eq!(DecommissionRequest::parse(&p(&good)).unwrap(), good);
+        let mut r = good.clone();
+        r.keys.swap(0, 1);
+        assert!(DecommissionRequest::parse(&p(&r)).is_err(), "role order");
+        let mut r = good.clone();
+        r.keys[2] = kr("blackbox", 1);
+        assert!(
+            DecommissionRequest::parse(&p(&r)).is_err(),
+            "same key twice"
+        );
+        let mut r = good.clone();
+        r.keys.pop();
+        assert!(DecommissionRequest::parse(&p(&r)).is_err(), "two keys");
+        let mut r = good.clone();
+        r.reason = "scrapped".into();
+        assert!(DecommissionRequest::parse(&p(&r)).is_err(), "reason");
+        let mut r = good.clone();
+        r.journal_head = "AB".repeat(32);
+        assert!(DecommissionRequest::parse(&p(&r)).is_err(), "journal head");
+        let mut r = good.clone();
+        r.decommission_id = format!("rfr1-{}", "a".repeat(32));
+        assert!(DecommissionRequest::parse(&p(&r)).is_err(), "id prefix");
+        // An extra key inside keys[] is refused.
+        let txt = String::from_utf8(p(&good)).unwrap().replacen(
+            "{\"role\":\"uplink\"",
+            "{\"x\":1,\"role\":\"uplink\"",
+            1,
+        );
+        assert!(DecommissionRequest::parse(txt.as_bytes()).is_err());
+        let a = DecommissionAnswer {
+            format: DECOMMISSION_ANSWER_FORMAT.into(),
+            decommission_id: good.decommission_id.clone(),
+            request_digest: digest(b"x"),
+            workspace: "ws-1".into(),
+            robot_id: "ugv-001".into(),
+            reason: "transfer".into(),
+            keys: good.keys.clone(),
+            status: "decommissioned".into(),
+            at_ms: 2,
+        };
+        assert_eq!(
+            DecommissionAnswer::parse(&payload_bytes(&a).unwrap()).unwrap(),
+            a
+        );
+        let mut b = a.clone();
+        b.status = "retired".into();
+        assert!(DecommissionAnswer::parse(&payload_bytes(&b).unwrap()).is_err());
+    }
+
+    /// `robodr-uplink --check` authenticates a fleet request with its own
+    /// copy of the §2.5 message (robodr-export cannot depend on this
+    /// crate): the two must stay byte-identical.
+    #[test]
+    fn uplink_check_signs_the_same_request_message() {
+        for (m, t, k, ts, b) in [
+            (
+                "GET",
+                "/api/robot-edr/v2/fleet/ring",
+                "ed25519:0011223344556677",
+                1u64,
+                &b""[..],
+            ),
+            (
+                "POST",
+                "/x",
+                "ed25519:aaaaaaaaaaaaaaaa",
+                u64::MAX,
+                &b"{\"a\":1}"[..],
+            ),
+        ] {
+            assert_eq!(
+                request_message(m, t, k, ts, b),
+                robodr_export::uplink::check::fleet_request_message(m, t, k, ts, b)
+            );
+        }
     }
 
     #[test]

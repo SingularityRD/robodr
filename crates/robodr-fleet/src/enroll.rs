@@ -54,7 +54,7 @@ pub fn prepare(ctx: &Ctx, token_text: &str, opt: &EnrollOptions) -> Result<Prepa
     if let Some(e) = ctx.load::<Enrollment>(ENROLLMENT)? {
         return Err(format!(
             "this unit is already enrolled as {:?} in workspace {:?} (request {}); a new \
-             enrollment needs the unit decommissioned first (OPERATIONS 8.6)",
+             enrollment needs the unit decommissioned first (robodr-enroll decommission; docs/DECOMMISSION.md)",
             e.robot_id, e.workspace, e.request_id
         ));
     }

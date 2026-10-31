@@ -747,7 +747,7 @@ fn crl_files_refuse_a_revoked_receiver_and_a_revoked_unit() {
 fn current_queries_are_bound_to_the_client_certificate() {
     let pki = Pki::new();
     let d = TestDir::new("tls-recv-bind");
-    let mut recv = AnchorReceiver::open(
+    let recv = AnchorReceiver::open(
         d.path(),
         vec![UnitKey {
             unit: UNIT.into(),
