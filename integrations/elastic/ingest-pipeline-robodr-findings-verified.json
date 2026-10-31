@@ -1,0 +1,13 @@
+{
+  "description": "RoboDR findings verified by integrations/verify/robodr_verify.py (the Logstash robodr-verified-out pipeline): keeps the verifier's robodr_verification as robodr.verification and maps the rest with robodr-findings. Feed it nothing but that verifier's output. integrations/elastic/README.md.",
+  "processors": [
+    {"remove": {"field": "robodr_verified_by_forwarder", "ignore_missing": true}},
+    {"rename": {"field": "robodr_verification", "target_field": "robodr_verified_by_forwarder"}},
+    {"pipeline": {"name": "robodr-findings"}},
+    {"rename": {"field": "robodr_verified_by_forwarder", "target_field": "robodr.verification"}}
+  ],
+  "on_failure": [
+    {"set": {"field": "event.kind", "value": "pipeline_error"}},
+    {"set": {"field": "error.message", "value": "{{{_ingest.on_failure_message}}}"}}
+  ]
+}

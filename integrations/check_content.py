@@ -20,10 +20,20 @@
    document is kept); every adversary_controlled_fields location of each
    finding is stored but not indexed by the index template.
 7. Verification status: every one of the shared detections, in all three
-   SIEMs, drops findings whose robodr_verification.status is present and not
+   SIEMs, drops findings whose verification status is present and not
    "verified" (findings from a path with no verifier carry no status and
    still alert), and each SIEM has an "Unverified findings" detection for
    everything that is not verified.
+8. The status cannot be forged: a finding's producer chooses the whole
+   event, so on a path without a verifier any robodr_verification it carries
+   is discarded. Splunk: only sourcetype robodr:finding:verified takes
+   robodr_verification_status from the event, robodr:finding forces it
+   empty, and no search reads robodr_verification.status itself. Elastic:
+   robodr-findings removes robodr_verification and any robodr object (a
+   forged finding run through it has no robodr.verification);
+   robodr-findings-verified keeps the verifier's status. Sentinel: the DCR's
+   unverified stream does not declare robodr_verification and sets
+   VerificationStatus empty; only the verified stream maps it.
    The evaluator implements only the processors and options the pipeline
    uses and fails on anything else, so a new processor needs a new
    evaluator branch (it is not Elasticsearch).
@@ -57,7 +67,14 @@ TOP = (
 # Fields a verifying forwarder adds (integrations/verify/robodr_verify.py).
 ADDED = {"robodr_verification", "robodr_verification.status", "robodr_verification.key_id"}
 # The filter each shared detection carries (gen_detections.py; Splunk by hand).
-SPLUNK_VERIFIED = '(NOT robodr_verification.status=* OR robodr_verification.status="verified")'
+# robodr_verification_status is computed per sourcetype in props.conf.
+SPLUNK_STATUS = "robodr_verification_status"
+SPLUNK_VERIFIED = f'(NOT {SPLUNK_STATUS}=* OR {SPLUNK_STATUS}="verified")'
+SPLUNK_SOURCETYPES = {
+    # sourcetype -> how props.conf computes SPLUNK_STATUS for it
+    "robodr:finding": "null()",
+    "robodr:finding:verified": "'robodr_verification.status'",
+}
 
 problems: list[str] = []
 
@@ -189,10 +206,44 @@ def splunk(schema, ids):
     unv = by_name.get(gen.UNVERIFIED["name"], "")
     if not re.search(r"^search = eventtype=robodr_unverified\b", unv, re.M):
         problem(f"splunk/savedsearches.conf: no [{gen.UNVERIFIED['name']}] on eventtype=robodr_unverified")
+    # `stats ... by <status>` drops events without it: exactly the unverified ones.
+    m = re.search(r"^search = (.*)$", unv, re.M)
+    if m and re.search(rf"\bby\b[^|]*\b{SPLUNK_STATUS}\b", m.group(1)) and "fillnull value=" not in m.group(1):
+        problem(f"splunk/savedsearches.conf [{gen.UNVERIFIED['name']}]: groups by {SPLUNK_STATUS} without fillnull")
     with open(os.path.join(base, "eventtypes.conf"), encoding="utf-8") as fh:
         et = fh.read()
-    if not re.search(r'^\[robodr_unverified\]\nsearch = sourcetype="robodr:finding" NOT robodr_verification.status="verified"$', et, re.M):
+    st = " OR ".join(f'sourcetype="{t}"' for t in SPLUNK_SOURCETYPES)
+    if not re.search(rf"^\[robodr_finding\]\nsearch = {re.escape(st)}$", et, re.M):
+        problem(f"splunk/eventtypes.conf: robodr_finding must be {st}")
+    if not re.search(rf'^\[robodr_unverified\]\nsearch = eventtype=robodr_finding NOT {SPLUNK_STATUS}="verified"$', et, re.M):
         problem("splunk/eventtypes.conf: robodr_unverified must be every finding that is not verified")
+    splunk_status(base)
+
+
+def splunk_status(base):
+    """The status a detection reads cannot come from an unverified event."""
+    for fn in ("savedsearches.conf", "eventtypes.conf"):
+        with open(os.path.join(base, fn), encoding="utf-8") as fh:
+            if "robodr_verification." in fh.read():
+                problem(f"splunk/{fn}: reads robodr_verification.* (forgeable on robodr:finding); use {SPLUNK_STATUS}")
+    with open(os.path.join(base, "props.conf"), encoding="utf-8") as fh:
+        parts = re.split(r"^\[(.+)\]\s*$", fh.read(), flags=re.M)
+    stanzas = {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
+    if set(stanzas) != set(SPLUNK_SOURCETYPES):
+        problem(f"splunk/props.conf: stanzas {sorted(stanzas)} != {sorted(SPLUNK_SOURCETYPES)}")
+        return
+    bodies = []
+    for t, want in SPLUNK_SOURCETYPES.items():
+        lines = [ln for ln in stanzas[t].splitlines() if ln.strip() and not ln.startswith("#")]
+        evals = [ln for ln in lines if ln.startswith(f"EVAL-{SPLUNK_STATUS} ")]
+        if evals != [f"EVAL-{SPLUNK_STATUS} = {want}"]:
+            problem(f"splunk/props.conf [{t}]: needs exactly EVAL-{SPLUNK_STATUS} = {want}")
+        rest = [ln for ln in lines if ln not in evals]
+        if any("robodr_verification" in ln for ln in rest):
+            problem(f"splunk/props.conf [{t}]: reads robodr_verification outside EVAL-{SPLUNK_STATUS}")
+        bodies.append(rest)
+    if bodies[0] != bodies[1]:
+        problem("splunk/props.conf: the two sourcetypes differ in more than the verification status")
 
 
 def load_gen():
@@ -280,7 +331,8 @@ def run_processor(p, doc, ingest):
         "append": {"field", "value", "allow_duplicates"},
         "foreach": {"field", "processor", "ignore_missing"},
         "convert": {"field", "type", "ignore_missing", "on_failure"},
-        "remove": {"field"},
+        "remove": {"field", "ignore_missing"},
+        "pipeline": {"name"},
     }
     if kind not in allowed or set(o) - allowed[kind]:
         raise SystemExit(f"evaluator: unsupported processor/options {kind} {sorted(o)}")
@@ -306,8 +358,14 @@ def run_processor(p, doc, ingest):
             raise PipelineError(f"'{v}' is not an IP string literal") from None
     elif kind == "remove":
         if get_path(doc, o["field"]) is None:
+            if o.get("ignore_missing"):
+                return
             raise PipelineError(f"field [{o['field']}] not present")
         del_path(doc, o["field"])
+    elif kind == "pipeline":
+        if o["name"] not in PIPELINES:
+            raise SystemExit(f"evaluator: unknown pipeline {o['name']}")
+        run_pipeline(PIPELINES[o["name"]], doc)
     elif kind == "rename":
         v = get_path(doc, o["field"])
         if v is None:
@@ -353,6 +411,12 @@ def run_processor(p, doc, ingest):
             run_processor(o["processor"], doc, {"_value": item})
 
 
+# Ingest pipelines by name, for the `pipeline` processor (filled by elastic()).
+PIPELINES: dict = {}
+VERIFIED_PIPELINE = "robodr-findings-verified"
+STAGING = "robodr_verified_by_forwarder"
+
+
 def run_pipeline(pipeline, doc):
     try:
         for p in pipeline["processors"]:
@@ -366,6 +430,9 @@ def run_pipeline(pipeline, doc):
 def elastic(schema, ids, findings):
     with open(os.path.join(HERE, "elastic/ingest-pipeline-robodr-findings.json"), encoding="utf-8") as fh:
         pipeline = json.load(fh)
+    with open(os.path.join(HERE, f"elastic/ingest-pipeline-{VERIFIED_PIPELINE}.json"), encoding="utf-8") as fh:
+        verified = json.load(fh)
+    PIPELINES.update({"robodr-findings": pipeline, VERIFIED_PIPELINE: verified})
     text = json.dumps(pipeline)
     check_rule_ids("elastic pipeline", text, ids)
     refs = []
@@ -380,9 +447,11 @@ def elastic(schema, ids, findings):
         for m in MUSTACHE.findall(json.dumps(o)):
             if m.startswith("robodr."):
                 refs.append(m[len("robodr."):])
-    # Renamed names map back to the contract (robodr.verification <- robodr_verification).
-    refs = [r.replace("verification", "robodr_verification", 1) if r.startswith("verification") else r for r in refs]
     check_fields("elastic pipeline", refs, schema)
+    # The shared pipeline never keeps a status: a forger chooses every field.
+    keeps = [p for p in pipeline["processors"] if "verification" in json.dumps(p) and "remove" not in p]
+    if keeps:
+        problem(f"elastic pipeline robodr-findings: maps a verification status (forgeable): {keeps}")
     for f in os.listdir(os.path.join(HERE, "elastic/detection-rules")):
         with open(os.path.join(HERE, "elastic/detection-rules", f), encoding="utf-8") as fh:
             rule = json.load(fh)
@@ -400,12 +469,19 @@ def elastic(schema, ids, findings):
         problem("elastic/detection-rules: no Unverified findings rule")
     with open(os.path.join(HERE, "elastic/index-template-robodr-findings.json"), encoding="utf-8") as fh:
         template = json.load(fh)["template"]["mappings"]
-    for n, f in enumerate(findings, 1):
-        doc = run_pipeline(pipeline, copy.deepcopy(f))
-        where = f"elastic pipeline on finding {n} ({f['entity_context']['rule_id']})"
+    status = {"status": "verified", "key_id": "finding:check:1"}
+    for n, f, pipe in [(n, f, p) for n, f in enumerate(findings, 1) for p in ("robodr-findings", VERIFIED_PIPELINE)]:
+        inp = copy.deepcopy(f)
+        if pipe == VERIFIED_PIPELINE:
+            inp["robodr_verification"] = dict(status)  # what robodr_verify.py adds
+        doc = run_pipeline(PIPELINES[pipe], inp)
+        where = f"elastic pipeline {pipe} on finding {n} ({f['entity_context']['rule_id']})"
         if doc.get("event", {}).get("kind") != "alert":
             problem(f"{where}: failed: {doc.get('error')}")
             continue
+        got = get_path(doc, "robodr.verification")
+        if got != (status if pipe == VERIFIED_PIPELINE else None) or STAGING in doc or "robodr_verification" in doc:
+            problem(f"{where}: robodr.verification = {got!r}, root keys {sorted(doc)}")
         want = {
             "@timestamp": f["timestamp"],
             "rule.id": f["entity_context"]["rule_id"],
@@ -430,6 +506,23 @@ def elastic(schema, ids, findings):
         for ptr in f.get("adversary_controlled_fields", []):
             if indexed(template, f, ptr):
                 problem(f"{where}: tainted {ptr} would be indexed by the index template")
+    # A forged status (or a robodr object) on a path without a verifier is
+    # discarded by robodr-findings; on the verified path only the verifier's
+    # own status survives.
+    for f in findings[:1]:
+        forged = copy.deepcopy(f)
+        forged["robodr_verification"] = dict(status)
+        forged["robodr"] = {"verification": dict(status)}
+        forged[STAGING] = dict(status)
+        doc = run_pipeline(pipeline, copy.deepcopy(forged))
+        if doc.get("event", {}).get("kind") != "alert" or get_path(doc, "robodr.verification") is not None:
+            problem(f"elastic pipeline robodr-findings keeps a forged status: robodr.verification = "
+                    f"{get_path(doc, 'robodr.verification')!r}, event.kind {get_path(doc, 'event.kind')!r}")
+        forged["robodr_verification"] = {"status": "unsigned"}
+        doc = run_pipeline(verified, forged)
+        if get_path(doc, "robodr.verification") != {"status": "unsigned"} or STAGING in doc:
+            problem(f"elastic pipeline {VERIFIED_PIPELINE}: robodr.verification = "
+                    f"{get_path(doc, 'robodr.verification')!r}, want the verifier's status only")
     # A source address display that is not an IP (source.ip is mapped `ip`):
     # dropped in the pipeline, not left to fail the whole document at index time.
     with_src = [f for f in findings if get_path(f, "entity_context.ros.src_ip.display")]
@@ -503,6 +596,9 @@ def indexed(mappings, finding, ptr):
 
 # ------------------------------------------------------------------ sentinel
 
+SENTINEL_RAW = "Custom-RoboDRFindingsRaw"
+SENTINEL_VERIFIED = "Custom-RoboDRFindingsVerified"
+
 
 def sentinel(schema, ids):
     base = os.path.join(HERE, "sentinel")
@@ -511,26 +607,49 @@ def sentinel(schema, ids):
     with open(os.path.join(base, "dcr-robodr-findings.json"), encoding="utf-8") as fh:
         dcr = json.load(fh)
     props = dcr["properties"]
-    (stream_name, stream), = props["streamDeclarations"].items()
-    inputs = {c["name"] for c in stream["columns"]}
-    for c in inputs - set(TOP) - {"robodr_verification"}:
-        problem(f"sentinel DCR: input column {c} is not a contract field")
-    (flow,) = props["dataFlows"]
-    if flow["streams"] != [stream_name] or flow["outputStream"] != "Custom-RoboDRFindings_CL":
-        problem("sentinel DCR: data flow does not connect the declared stream to RoboDRFindings_CL")
-    kql = flow["transformKql"]
-    m = re.match(r"^source \| project (.*)$", kql, re.S)
-    if not m:
-        problem("sentinel DCR: transformKql must be `source | project ...`")
+    # Two streams: unverified findings (no status, whatever they carry) and
+    # robodr_verify.py output (its status). Same transformation otherwise.
+    status_of = {
+        SENTINEL_RAW: 'VerificationStatus = ""',
+        SENTINEL_VERIFIED: "VerificationStatus = tostring(robodr_verification.status)",
+    }
+    streams = props["streamDeclarations"]
+    if set(streams) != set(status_of):
+        problem(f"sentinel DCR: streams {sorted(streams)} != {sorted(status_of)}")
         return
-    outs = re.findall(r"(?:^|,\s*)([A-Za-z]+)\s*=", m.group(1))
-    if set(outs) != set(table):
-        problem(f"sentinel DCR: outputs {sorted(set(outs) ^ set(table))} differ from the table columns")
-    refs = FIELD_RE.findall(kql.replace("['count']", ".count"))
-    check_fields("sentinel DCR", refs, schema)
-    for r in refs:
-        if r.split(".")[0] not in inputs:
-            problem(f"sentinel DCR: reads {r} from an undeclared input column")
+    flows = {tuple(f["streams"]): f for f in props["dataFlows"]}
+    if set(flows) != {(s,) for s in status_of} or len(props["dataFlows"]) != len(status_of):
+        problem("sentinel DCR: needs one data flow per stream")
+        return
+    kqls = {}
+    for name, want in status_of.items():
+        inputs = {c["name"] for c in streams[name]["columns"]}
+        extra = {"robodr_verification"} if name == SENTINEL_VERIFIED else set()
+        if inputs != set(TOP) | extra:
+            problem(f"sentinel DCR {name}: input columns {sorted(inputs ^ (set(TOP) | extra))} differ")
+        flow = flows[(name,)]
+        if flow["outputStream"] != "Custom-RoboDRFindings_CL":
+            problem(f"sentinel DCR {name}: data flow does not go to RoboDRFindings_CL")
+        kql = flow["transformKql"]
+        if kql.count("VerificationStatus =") != 1 or want not in kql:
+            problem(f"sentinel DCR {name}: VerificationStatus must be `{want}`")
+        if name == SENTINEL_RAW and "robodr_verification" in kql:
+            problem(f"sentinel DCR {name}: reads robodr_verification (forgeable on this stream)")
+        kqls[name] = kql.replace(want, "VerificationStatus = <status>")
+        m = re.match(r"^source \| project (.*)$", kql, re.S)
+        if not m:
+            problem("sentinel DCR: transformKql must be `source | project ...`")
+            return
+        outs = re.findall(r"(?:^|,\s*)([A-Za-z]+)\s*=", m.group(1))
+        if set(outs) != set(table):
+            problem(f"sentinel DCR: outputs {sorted(set(outs) ^ set(table))} differ from the table columns")
+        refs = FIELD_RE.findall(kql.replace("['count']", ".count"))
+        check_fields("sentinel DCR", refs, schema)
+        for r in refs:
+            if r.split(".")[0] not in inputs:
+                problem(f"sentinel DCR {name}: reads {r} from an undeclared input column")
+    if len(set(kqls.values())) != 1:
+        problem("sentinel DCR: the two transformations differ in more than VerificationStatus")
     for f in os.listdir(os.path.join(base, "analytics")):
         with open(os.path.join(base, "analytics", f), encoding="utf-8") as fh:
             text = fh.read()

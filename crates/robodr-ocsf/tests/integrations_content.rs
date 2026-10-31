@@ -4,8 +4,10 @@
 //! * `integrations/check_content.py`: every field the Splunk, Elastic and
 //!   Sentinel content reads is in the contract schema, every rule id it
 //!   names is in the catalog, the generated detections are current, and the
-//!   Elastic ingest pipeline maps each finding below to the expected ECS
-//!   document.
+//!   Elastic ingest pipelines map each finding below to the expected ECS
+//!   document, and a verification status the finding itself carries is
+//!   discarded on every route a verifier did not write it on (Splunk
+//!   sourcetype, Elastic pipeline, Sentinel stream).
 //! * `integrations/verify/robodr_verify.py`: findings signed by this crate
 //!   verify; tampered values, another robot's key, duplicate or malformed
 //!   headers and (under the strict policy) missing headers are rejected.
