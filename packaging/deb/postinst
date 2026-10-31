@@ -70,7 +70,9 @@ migrate_exporter_users() {
         /var/lib/robodr/export/kafka-publish:robodr-kafka \
         /var/lib/robodr/export/uplink:robodr-uplink \
         /var/lib/robodr/firewall-gw:robodr-gw; do
-        migrate_agentd_tree "${meu_pair%%:*}" robodr "${meu_pair#*:}" robodr
+        # cut, not parameter expansion: rpm scriptlets may not contain a percent sign.
+        meu_dir=$(echo "$meu_pair" | cut -d: -f1)
+        migrate_agentd_tree "$meu_dir" robodr "${meu_pair#*:}" robodr
     done
     mkdir -p /var/lib/robodr
     : >"$meu_marker"

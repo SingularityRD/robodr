@@ -297,7 +297,16 @@ fn f5_feed_hand_off_never_blocks() {
         "{:?}",
         t0.elapsed()
     );
-    assert!(f.status().dropped >= 10);
+    // Either the feed thread is stuck behind the full listener and the
+    // hand-off overflowed (dropped), or the kernel let it connect and it
+    // kept up (lines queued or sent). Which one happens depends on the
+    // host's socket backlog; the property under test is the timing above.
+    let s = f.status();
+    let accounted = s.dropped + s.sent + s.pending as u64;
+    assert!(
+        s.dropped >= 10 || accounted >= robodr_firewall_gw::feed::HANDOFF as u64,
+        "{s:?}"
+    );
 }
 
 /// F8: while a restriction is in force the sport `SpeedLevel` cannot be
