@@ -2698,6 +2698,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-attack-sim"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-agentd",
+ "robodr-blackbox",
+ "robodr-capture",
+ "robodr-cdr",
+ "robodr-commission",
+ "robodr-events",
+ "robodr-ocsf",
+ "serde_json",
+]
+
+[[package]]
+name = "robodr-benches"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-agentd",
+ "robodr-blackbox",
+ "robodr-capture",
+ "robodr-commission",
+ "robodr-correlate",
+ "robodr-events",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-blackbox"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -2778,6 +2805,18 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "robodr-demo-soc"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "robodr-events",
+ "robodr-export",
+ "robodr-ocsf",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

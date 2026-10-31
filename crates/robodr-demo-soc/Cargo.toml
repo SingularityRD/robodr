@@ -1,0 +1,27 @@
+[package]
+name = "robodr-demo-soc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Demo SOC for RoboDR POCs: the reference robodr.ingest v1 consumer (batch and per-finding signature verification) behind a minimal HTTP server, a finding store and a browser viewer with time-to-SOC. Demo only, not a production SOC."
+
+# std HTTP (no framework); the consumer logic is the shared reference
+# consumer of crates/robodr-export/tests/common/ingest.rs, compiled in.
+[dependencies]
+robodr-blackbox = { workspace = true }
+robodr-export = { workspace = true }
+robodr-ocsf = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-demo-soc"
+path = "src/main.rs"
+
+[dev-dependencies]
+robodr-events = { workspace = true }

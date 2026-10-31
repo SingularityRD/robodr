@@ -167,6 +167,15 @@ current matrix.
 
 ## OCSF-UNCERTAIN
 
+> **Checked (T61).** Produced findings are now validated against the official
+> OCSF 1.1.0 schema (compiled from `ocsf/ocsf-schema` v1.1.0 by the OCSF
+> compiler) and the contract schema with the `jsonschema` package
+> (`tests/external_validator.rs`, `integrations/schemas/README.md`). Only
+> `device.model` is not OCSF 1.1.0; every other item below holds. ATT&CK for
+> ICS ids are checked against MITRE's v20 data (`tests/attack_ics.rs`): T0855
+> and T0856 were revoked (now T1692.001 / T1692.002). The list below is kept
+> as written for history.
+
 Written from knowledge of OCSF 1.x without access to the schema server.
 Confident: class 2004 / category 2 and their captions, `activity_id` 1/2/3,
 `type_uid = class_uid*100 + activity_id`, `severity_id` 0–6/99 (Low=2,

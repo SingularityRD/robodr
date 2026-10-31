@@ -3,12 +3,14 @@ resolver = "2"
 members = [
     "crates/robodr-agent",
     "crates/robodr-agentd",
+    "crates/robodr-attack-sim",
     "crates/robodr-blackbox",
     "crates/robodr-buildinfo",
     "crates/robodr-capture",
     "crates/robodr-cdr",
     "crates/robodr-commission",
     "crates/robodr-correlate",
+    "crates/robodr-demo-soc",
     "crates/robodr-deliverd",
     "crates/robodr-depot",
     "crates/robodr-diode",
@@ -27,6 +29,8 @@ members = [
     "crates/robodr-ros2-pipeline",
     "crates/robodr-rtps",
     "crates/robodr-seal",
+    # Throughput benchmarks (sensor-box sizing, regression gate).
+    "benches",
     # Pulsar-dependent (need pulsar + tokio; cannot build without crates.io):
     "crates/robodr-pulsard",
     "crates/robodr-sensor-ros2",

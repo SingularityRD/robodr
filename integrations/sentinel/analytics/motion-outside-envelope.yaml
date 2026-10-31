@@ -1,0 +1,30 @@
+id: c42bfc47-d262-5bbb-a281-0b71ebf638ae
+name: RoboDR - Motion outside the envelope
+description: |
+  Commanded motion beyond the robot's locked profile (linear, angular or joint speed, joint torque). Observe-only: alerts, never responds.
+  RoboDR rule ids (docs/customer/detection-catalog.md):
+    - robot.motion.linear_over_envelope
+    - robot.motion.angular_over_envelope
+    - robot.motion.joint_over_envelope
+    - robot.firewall.joint_torque_out_of_envelope
+severity: High
+requiredDataConnectors: []
+queryFrequency: 5m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics: []
+relevantTechniques: []
+query: |
+  RoboDRFindings
+  | where RuleId in ("robot.motion.linear_over_envelope", "robot.motion.angular_over_envelope", "robot.motion.joint_over_envelope", "robot.firewall.joint_torque_out_of_envelope")
+  | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+      RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
+      by RobotId, Site
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: RobotId
+version: 1.0.0
+kind: Scheduled
