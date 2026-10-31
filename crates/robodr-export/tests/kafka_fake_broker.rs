@@ -501,20 +501,81 @@ fn sequences_are_per_partition_and_survive_leader_moves() {
     assert!(a.iter().all(|x| x.1 == 1000 && x.2 == 0));
 }
 
+/// OUT_OF_ORDER_SEQUENCE_NUMBER / UNKNOWN_PRODUCER_ID on a broker with
+/// KIP-360 (InitProducerId v3+): the same producer id at the next epoch,
+/// from sequence 0, without InitProducerId. INVALID_PRODUCER_EPOCH /
+/// PRODUCER_FENCED (someone else is ahead on this id), and every error on
+/// an older broker: a new producer id.
 #[test]
-fn sequence_errors_reset_the_producer_id() {
-    for code in [45i16, 59, 47, 90] {
-        let c = Cluster::start(1, 1);
+fn sequence_errors_bump_the_epoch_or_reset_the_producer_id() {
+    for max_v in [4i16, 3, 2, 1] {
+        for code in [45i16, 59, 47, 90] {
+            let c = Cluster::start(1, 1);
+            c.state.lock().unwrap().init_pid_max_version = max_v;
+            let mut p = Producer::new(cfg(&c)).unwrap();
+            p.send(TOPIC, &recs(2, 1)).unwrap();
+            c.script([Action::Error(code)]);
+            let out = p.send(TOPIC, &recs(3, 1)).unwrap();
+            let what = format!("code {code}, InitProducerId v{max_v}");
+            assert_eq!(delivered(&out), 3, "{what}");
+            assert_eq!(c.total(), 5, "nothing twice, nothing lost ({what})");
+            let s = p.stats();
+            if max_v >= 3 && (code == 45 || code == 59) {
+                assert_eq!((s.epoch_bumps, s.producer_id_resets), (1, 0), "{what}");
+                assert_eq!(c.init_pid_requests(), 1, "{what}");
+                // The bumped epoch starts at sequence 0.
+                assert_eq!(appended(&c)[1], (0, 1000, 1, 0, 3), "{what}");
+                let st = p.idempotent_state().unwrap();
+                assert_eq!((st.producer_id, st.producer_epoch), (1000, 1));
+                assert_eq!(st.next(TOPIC, 0), 3);
+            } else {
+                assert_eq!((s.epoch_bumps, s.producer_id_resets), (0, 1), "{what}");
+                assert_eq!(c.init_pid_requests(), 2, "{what}");
+                // The new producer id starts at sequence 0.
+                assert_eq!(appended(&c)[1], (0, 1001, 0, 0, 3), "{what}");
+            }
+        }
+    }
+}
+
+/// KIP-360's gain: a batch of another partition whose acknowledgement was
+/// lost when the epoch was bumped keeps its numbering, is re-sent under
+/// the older epoch (that partition has not seen the new one) and is
+/// deduplicated. A new producer id instead (an older broker) re-sends its
+/// records as new ones: written twice.
+#[test]
+fn epoch_bump_keeps_other_partitions_batches_in_doubt_deduplicated() {
+    for max_v in [4i16, 1] {
+        let c = Cluster::start(2, 2);
+        {
+            let mut st = c.state.lock().unwrap();
+            st.leaders = vec![1, 2];
+            st.init_pid_max_version = max_v;
+        }
         let mut p = Producer::new(cfg(&c)).unwrap();
-        p.send(TOPIC, &recs(2, 1)).unwrap();
-        c.script([Action::Error(code)]);
-        let out = p.send(TOPIC, &recs(3, 1)).unwrap();
-        assert_eq!(delivered(&out), 3, "code {code}");
-        assert_eq!(c.total(), 5, "nothing twice, nothing lost (code {code})");
-        assert_eq!(p.stats().producer_id_resets, 1);
-        assert_eq!(c.init_pid_requests(), 2);
-        // The new producer id starts at sequence 0.
-        assert_eq!(appended(&c)[1], (0, 1001, 0, 0, 3));
+        assert_eq!(delivered(&p.send(TOPIC, &recs(4, 2)).unwrap()), 4);
+        // Partition 0 (node 1): appended, reply lost. Partition 1 (node
+        // 2): out of order.
+        c.script([Action::DisconnectAfterAppend, Action::Error(45)]);
+        let out = p.send(TOPIC, &recs(6, 2)).unwrap();
+        assert_eq!(delivered(&out), 6);
+        let s = p.stats();
+        if max_v >= 3 {
+            assert_eq!(c.total(), 10, "nothing written twice");
+            assert_eq!((s.epoch_bumps, s.producer_id_resets), (1, 0));
+            assert_eq!(c.state.lock().unwrap().duplicates, 1);
+            let a = appended(&c);
+            // Partition 0: epoch 0 throughout; partition 1: epoch 1 from 0.
+            assert!(a.contains(&(0, 1000, 0, 2, 3)), "{a:?}");
+            assert!(a.contains(&(1, 1000, 1, 0, 3)), "{a:?}");
+            // Partition 0 continues under the new epoch, from 0.
+            assert_eq!(delivered(&p.send(TOPIC, &recs(2, 2)).unwrap()), 2);
+            assert!(appended(&c).contains(&(0, 1000, 1, 0, 1)));
+            assert_eq!(c.total(), 12);
+        } else {
+            assert_eq!(c.total(), 13, "the in-doubt batch is written twice");
+            assert_eq!((s.epoch_bumps, s.producer_id_resets), (0, 1));
+        }
     }
 }
 
@@ -604,13 +665,14 @@ fn halving_reuses_the_refused_sequences() {
 /// looks for duplicates, e.g. after the topic's `max.message.bytes` was
 /// lowered), the first copy may already be in the log. Its sequences must
 /// not be handed to the next batch, which the broker would answer as a
-/// duplicate: reported delivered, never written. The producer id is reset
-/// instead.
+/// duplicate: reported delivered, never written. The producer renumbers
+/// instead (an epoch bump, or a new producer id on an older broker).
 #[test]
 fn record_error_on_a_resent_batch_never_reuses_its_sequences() {
-    for dup_code in [false, true] {
+    for (dup_code, max_v) in [(false, 4i16), (true, 4), (false, 1), (true, 1)] {
         let c = Cluster::start(1, 1);
         c.state.lock().unwrap().dup_error_code = dup_code;
+        c.state.lock().unwrap().init_pid_max_version = max_v;
         // Appended, reply lost; the re-send is refused as a record.
         c.script([Action::DisconnectAfterAppend, Action::Error(10)]);
         let mut p = Producer::new(cfg(&c)).unwrap();
@@ -626,28 +688,120 @@ fn record_error_on_a_resent_batch_never_reuses_its_sequences() {
             "record 1 reported delivered must be in the log (dup_code {dup_code})"
         );
         assert_eq!(c.state.lock().unwrap().duplicates, 0);
-        assert_eq!(p.stats().producer_id_resets, 1);
-        assert_eq!(c.init_pid_requests(), 2);
-        assert_eq!(appended(&c)[1], (0, 1001, 0, 0, 1));
+        if max_v >= 3 {
+            assert_eq!(p.stats().epoch_bumps, 1);
+            assert_eq!(c.init_pid_requests(), 1);
+            assert_eq!(appended(&c)[1], (0, 1000, 1, 0, 1));
+        } else {
+            assert_eq!(p.stats().producer_id_resets, 1);
+            assert_eq!(c.init_pid_requests(), 2);
+            assert_eq!(appended(&c)[1], (0, 1001, 0, 0, 1));
+        }
     }
 }
 
 /// The same for a re-sent batch that is halved: no later batch may reuse
 /// the in-doubt sequences either.
 #[test]
-fn halving_a_resent_batch_resets_the_producer_id() {
+fn halving_a_resent_batch_renumbers() {
+    for max_v in [4i16, 1] {
+        let c = Cluster::start(1, 1);
+        c.state.lock().unwrap().init_pid_max_version = max_v;
+        c.script([Action::DisconnectAfterAppend, Action::Error(10)]);
+        let mut p = Producer::new(cfg(&c)).unwrap();
+        let out = p.send(TOPIC, &recs(4, 1)).unwrap();
+        // Halved and sent under a new epoch / producer id: a duplicate of
+        // what the first copy appended, never a loss.
+        assert_eq!(delivered(&out), 4);
+        assert_eq!(order(&c, 0), vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        let s = p.stats();
+        assert_eq!(s.epoch_bumps + s.producer_id_resets, 1);
+        assert_eq!(s.epoch_bumps, u64::from(max_v >= 3));
+        let out = p.send(TOPIC, &recs(2, 1)).unwrap();
+        assert_eq!(delivered(&out), 2);
+        assert_eq!(c.total(), 10, "every record reported delivered is written");
+    }
+}
+
+/// At the largest epoch no bump is possible: a new producer id.
+#[test]
+fn largest_epoch_resets_the_producer_id() {
     let c = Cluster::start(1, 1);
-    c.script([Action::DisconnectAfterAppend, Action::Error(10)]);
     let mut p = Producer::new(cfg(&c)).unwrap();
-    let out = p.send(TOPIC, &recs(4, 1)).unwrap();
-    // Halved and sent under a new producer id: a duplicate of what the
-    // first copy appended, never a loss.
-    assert_eq!(delivered(&out), 4);
-    assert_eq!(order(&c, 0), vec![0, 1, 2, 3, 0, 1, 2, 3]);
-    assert_eq!(p.stats().producer_id_resets, 1);
-    let out = p.send(TOPIC, &recs(2, 1)).unwrap();
-    assert_eq!(delivered(&out), 2);
-    assert_eq!(c.total(), 10, "every record reported delivered is written");
+    p.restore_idempotent_state(IdempotentState {
+        producer_id: 77,
+        producer_epoch: i16::MAX,
+        sequences: [(TOPIC.to_string(), [(0, 5)].into_iter().collect())]
+            .into_iter()
+            .collect(),
+    });
+    {
+        // The broker holds producer 77 at the largest epoch, sequence 0.
+        let mut st = c.state.lock().unwrap();
+        st.producers.insert(
+            (77, 0),
+            ProducerEntry {
+                epoch: i16::MAX,
+                last_seq: 0,
+                recent: Default::default(),
+            },
+        );
+    }
+    assert_eq!(delivered(&p.send(TOPIC, &recs(2, 1)).unwrap()), 2);
+    let s = p.stats();
+    assert_eq!((s.epoch_bumps, s.producer_id_resets), (0, 1));
+    assert_eq!(appended(&c), vec![(0, 1000, 0, 0, 2)]);
+}
+
+/// A crash after an epoch bump while another partition's batch was in
+/// doubt under the older epoch: the restarted producer re-sends it as it
+/// was (same id, older epoch) and the broker drops the copy.
+#[test]
+fn restart_after_an_epoch_bump_resends_the_older_epochs_batch() {
+    let c = Cluster::start(2, 2);
+    c.state.lock().unwrap().leaders = vec![1, 2];
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    assert_eq!(delivered(&p.send(TOPIC, &recs(4, 2)).unwrap()), 4);
+    let state0 = p.idempotent_state().unwrap().clone();
+    drop(p);
+    // Partition 0: appended, reply lost; partition 1: out of order; then
+    // the bumped batch of partition 1 is lost too, and the producer gives
+    // up (a crash).
+    c.script([
+        Action::DisconnectAfterAppend,
+        Action::Error(45),
+        Action::DisconnectBeforeAppend,
+        Action::DisconnectBeforeAppend,
+    ]);
+    let mut cf = cfg(&c);
+    cf.retries = 1;
+    let input = recs(6, 2);
+    let saved: Saved = Default::default();
+    let mut p = Producer::new(cf).unwrap();
+    p.restore_idempotent_state(state0);
+    assert!(p
+        .send_journaled(TOPIC, &input, None, &mut saver(&saved))
+        .is_err());
+    assert_eq!(p.stats().epoch_bumps, 1);
+    drop(p);
+    let (state, journal) = saved.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(state.producer_epoch, 1, "the bump is stored");
+    assert!(
+        journal
+            .batches
+            .iter()
+            .any(|b| b.partition == 0 && b.producer_epoch == 0 && b.offset.is_none()),
+        "{journal:?}"
+    );
+    assert_eq!(c.total(), 7, "partition 0's batch is in the log");
+    let mut p = Producer::new(cfg(&c)).unwrap();
+    p.restore_idempotent_state(state);
+    let out = p
+        .send_journaled(TOPIC, &input, Some(&journal), &mut saver(&saved))
+        .unwrap();
+    assert_eq!(delivered(&out), 6);
+    assert_eq!(c.total(), 10, "nothing written twice");
+    assert_eq!(c.init_pid_requests(), 1);
 }
 
 /// Review finding: INVALID_TIMESTAMP means the publishing host's clock is

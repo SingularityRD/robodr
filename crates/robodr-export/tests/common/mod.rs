@@ -155,8 +155,11 @@ pub struct State {
     pub authenticated: u64,
     /// SCRAM attempts refused.
     pub auth_failures: u64,
-    /// Offer InitProducerId (v0-4) in ApiVersions.
+    /// Offer InitProducerId (v0 to `init_pid_max_version`) in ApiVersions.
     pub init_pid_supported: bool,
+    /// Highest InitProducerId version offered: 4 (default) is Kafka 2.5+
+    /// (KIP-360 epoch bumps), 1 or 2 an older broker.
+    pub init_pid_max_version: i16,
     /// Answer InitProducerId with this error (e.g. 31,
     /// CLUSTER_AUTHORIZATION_FAILED).
     pub init_pid_error: Option<i16>,
@@ -277,6 +280,7 @@ impl Cluster {
             max_batch_bytes: usize::MAX,
             produce_max_version: 8,
             init_pid_supported: true,
+            init_pid_max_version: 4,
             next_pid: 1000,
             ..Default::default()
         };
@@ -567,14 +571,18 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                 }
             }
             proto::API_VERSIONS => {
-                let (pmax, init_pid) = {
+                let (pmax, init_pid, init_pid_max) = {
                     let g = st.lock().unwrap();
-                    (g.produce_max_version, g.init_pid_supported)
+                    (
+                        g.produce_max_version,
+                        g.init_pid_supported,
+                        g.init_pid_max_version,
+                    )
                 };
                 let init_pid_api = init_pid.then_some(ApiRange {
                     api_key: proto::API_INIT_PRODUCER_ID,
                     min: 0,
-                    max: 4,
+                    max: init_pid_max,
                 });
                 let mut apis = vec![
                     ApiRange {

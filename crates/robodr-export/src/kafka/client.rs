@@ -81,22 +81,35 @@
 //!
 //! * `DUPLICATE_SEQUENCE_NUMBER`: the broker already holds the batch:
 //!   **success** (offset -1 if the broker does not say).
-//! * `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID`,
-//!   `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED`: the broker's state for
-//!   this producer id disagrees with ours (lost in an unclean leader
-//!   election, or another process uses the same persisted id); the batch
-//!   was not appended. The producer **resets**: a new producer id, every
-//!   sequence back to 0, the undecided records re-sent under it (counted
-//!   in [`ProducerStats::producer_id_resets`]). A batch of another
-//!   partition that was in doubt at that moment (its response lost) may
+//! * `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID`: the broker's
+//!   state for this producer id and partition disagrees with ours (lost in
+//!   an unclean leader election, a restored older state); the batch was
+//!   not appended. Where the partition's leader offers InitProducerId v3+
+//!   (Kafka 2.5+, KIP-360) the producer **bumps its epoch**, as the Java
+//!   client does for an idempotent producer: the same producer id at the
+//!   next epoch, every sequence back to 0, the partition's undecided records
+//!   renumbered under it (counted in [`ProducerStats::epoch_bumps`]). The
+//!   broker fences the older epoch only on a partition that has seen the
+//!   new one, so a batch of another partition that was in doubt at that
+//!   moment (its response lost) keeps its numbering, is re-sent exactly as
+//!   it was, and is still deduplicated: **no duplicate**. Only after it is
+//!   decided does that partition continue under the new epoch. (A new
+//!   epoch is not asked of the broker: InitProducerId without a
+//!   transactional id always hands out a new producer id.)
+//! * `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED` (another process writes
+//!   with the same producer id at a higher epoch), an older broker, or the
+//!   largest epoch: the producer **resets**: a new producer id
+//!   (InitProducerId), every sequence back to 0, all undecided records
+//!   re-sent under it (counted in [`ProducerStats::producer_id_resets`]).
+//!   A batch of another partition that was in doubt at that moment may
 //!   then be written twice: at-least-once, never a loss.
 //! * A record-level error on a batch that is being **re-sent** (an earlier
-//!   copy got no decisive answer) also resets the producer id instead of
-//!   giving the batch's sequences back: the earlier copy may have been
-//!   appended (Kafka validates records before it looks for duplicates), and
-//!   a later batch reusing those sequences would be answered
-//!   `DUPLICATE_SEQUENCE_NUMBER`, i.e. reported delivered but never
-//!   written. A batch sent once and refused frees its sequences.
+//!   copy got no decisive answer) also renumbers (epoch bump, else reset)
+//!   instead of giving the batch's sequences back: the earlier copy may
+//!   have been appended (Kafka validates records before it looks for
+//!   duplicates), and a later batch reusing those sequences would be
+//!   answered `DUPLICATE_SEQUENCE_NUMBER`, i.e. reported delivered but
+//!   never written. A batch sent once and refused frees its sequences.
 //! * InitProducerId `CLUSTER_AUTHORIZATION_FAILED` is fatal and says why:
 //!   brokers before Kafka 3.0 require the `IDEMPOTENT_WRITE` cluster ACL
 //!   (3.0+ imply it from `WRITE` on a topic); grant it, or turn
@@ -112,7 +125,9 @@
 //! ([`Producer::restore_idempotent_state`]) and passes the journal back
 //! with the same records: acknowledged batches are reported delivered
 //! without a request, the batch in doubt is re-sent as it was, and the
-//! broker deduplicates it. That holds while the broker remembers the
+//! broker deduplicates it (also a batch numbered under an earlier epoch of
+//! the same producer id: an epoch bump is stored with the next batch the
+//! new epoch numbers, before it is sent). That holds while the broker remembers the
 //! producer id (`producer.id.expiration.ms`, default one day after its
 //! last write); after that a broker accepts the id again with any
 //! sequence, so the in-doubt batch may be written twice.
@@ -316,8 +331,12 @@ pub struct ProducerStats {
     pub rejected: u64,
     /// Producer ids obtained (InitProducerId).
     pub producer_ids: u64,
-    /// Producer id resets after a sequence / epoch / unknown-id error.
+    /// Producer id resets (a new id) after an epoch / fencing error, or a
+    /// sequence error where no epoch bump is possible.
     pub producer_id_resets: u64,
+    /// Epoch bumps (KIP-360: same producer id, epoch + 1, sequences from
+    /// 0) after a sequence or unknown-producer error.
+    pub epoch_bumps: u64,
     /// Batches the broker reported as already written (re-sends).
     pub duplicates: u64,
     /// Batches reported delivered from a resumed journal, without a request.
@@ -359,6 +378,19 @@ impl IdempotentState {
             .insert(partition, seq);
     }
 
+    /// KIP-360 epoch bump: same producer id, epoch + 1, every sequence
+    /// back to 0. `false` (nothing changed) at the largest epoch.
+    fn bump_epoch(&mut self) -> bool {
+        match self.producer_epoch.checked_add(1) {
+            Some(e) => {
+                self.producer_epoch = e;
+                self.sequences.clear();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Plausible (e.g. as read back from a file): non-negative id, epoch,
     /// partitions and sequences.
     pub fn is_valid(&self) -> bool {
@@ -394,6 +426,14 @@ pub struct JournalBatch {
     /// Base offset once acknowledged (-1 when the broker did not say);
     /// `None`: sent, outcome unknown.
     pub offset: Option<i64>,
+}
+
+impl JournalBatch {
+    /// Numbered with exactly these producer fields.
+    fn numbered_as(&self, f: ProducerFields) -> bool {
+        (self.producer_id, self.producer_epoch, self.base_sequence)
+            == (f.producer_id, f.producer_epoch, f.base_sequence)
+    }
 }
 
 /// The batches of one [`Producer::send_journaled`] call (see the module
@@ -507,6 +547,9 @@ struct Conn {
     metadata_v: i16,
     /// InitProducerId version, if the broker offers one we implement.
     init_pid_v: Option<i16>,
+    /// The broker offers InitProducerId v3+ (KIP-360, Kafka 2.5+): an
+    /// epoch bump is used instead of a new producer id.
+    epoch_bump: bool,
     /// No request after the ApiVersions handshake has completed yet. A
     /// SASL listener answers ApiVersions (allowed before authentication)
     /// and then closes the connection on the first other request.
@@ -797,6 +840,7 @@ impl Conn {
             produce_v: 0,
             metadata_v: 0,
             init_pid_v: None,
+            epoch_bump: false,
             fresh: true,
             last_used: Instant::now(),
             expires: None,
@@ -834,6 +878,10 @@ impl Conn {
             proto::API_INIT_PRODUCER_ID,
             proto::INIT_PRODUCER_ID_VERSIONS,
         );
+        c.epoch_bump = av.apis.iter().any(|a| {
+            a.api_key == proto::API_INIT_PRODUCER_ID
+                && a.max >= proto::INIT_PRODUCER_ID_KIP360_VERSION
+        });
         if let Some(s) = &cfg.sasl {
             let hv = pick(
                 &av.apis,
@@ -1531,8 +1579,13 @@ impl Producer {
                     self.stats.journal_acked += 1;
                     call.acked.push(b.clone());
                 }
-                None if current == Some((b.producer_id, b.producer_epoch))
-                    && !call.fixed.contains_key(&b.partition) =>
+                // In doubt under the current producer id, at its epoch or an
+                // earlier one (bumped since: the batch's partition has not
+                // seen the new epoch, as a batch in doubt is resolved
+                // before its partition gets another one).
+                None if current.is_some_and(|(id, e)| {
+                    id == b.producer_id && (0..=e).contains(&b.producer_epoch)
+                }) && !call.fixed.contains_key(&b.partition) =>
                 {
                     call.fixed.insert(b.partition, b.clone());
                 }
@@ -1770,11 +1823,11 @@ impl Producer {
                     // This request appended nothing; see `release` for the
                     // sequences.
                     call.limits.insert(p, idx.len() / 2);
-                    self.release(call, p, fields, resent);
+                    self.release(call, p, fields, resent, leader);
                     res.progress = true;
                 }
                 ErrorClass::Record => {
-                    self.release(call, p, fields, resent);
+                    self.release(call, p, fields, resent, leader);
                     call.remove_from_queue(p, &idx);
                     call.limits.remove(&p);
                     // A one-record batch (`idx.len() == 1` here), so the
@@ -1812,17 +1865,19 @@ impl Producer {
                     ));
                 }
                 ErrorClass::Sequence if idem_on => {
-                    // Reset (see the module docs): a new producer id is
-                    // obtained before the next request, every undecided
-                    // record is numbered again under it.
-                    if self.idem.take().is_some() {
-                        self.stats.producer_id_resets += 1;
-                    }
-                    call.fixed.clear();
+                    // Nothing appended. Renumber (see the module docs): an
+                    // epoch bump where the broker supports it and the
+                    // error allows it, else a new producer id.
+                    let bump = matches!(
+                        pr.error_code,
+                        errors::OUT_OF_ORDER_SEQUENCE_NUMBER | errors::UNKNOWN_PRODUCER_ID
+                    );
+                    let how = self.renumber(call, p, fields, leader, bump);
                     res.trouble = Some(format!(
-                        "partition {p} on broker {leader}: {} (producer id {} reset)",
+                        "partition {p} on broker {leader}: {} (producer id {} epoch {}: {how})",
                         errors::name(pr.error_code),
-                        fields.producer_id
+                        fields.producer_id,
+                        fields.producer_epoch
                     ));
                 }
                 ErrorClass::Sequence | ErrorClass::Fatal => {
@@ -1845,52 +1900,81 @@ impl Producer {
     /// Rewinding its sequences would hand them to the next batch, which the
     /// broker would then answer `DUPLICATE_SEQUENCE_NUMBER` (reported
     /// delivered, never written). So a re-sent batch never gives its
-    /// sequences back: the producer id is reset instead (as on a sequence
-    /// error; at worst a duplicate, never a loss). A batch sent once only
-    /// frees its sequences ([`Producer::unnumber`]).
-    fn release(&mut self, call: &mut Call<'_, '_>, p: i32, fields: ProducerFields, resent: bool) {
+    /// sequences back: the producer renumbers instead (an epoch bump or a
+    /// new producer id, as on a sequence error; at worst a duplicate, never
+    /// a loss). A batch sent once only frees its sequences
+    /// ([`Producer::unnumber`]).
+    fn release(
+        &mut self,
+        call: &mut Call<'_, '_>,
+        p: i32,
+        fields: ProducerFields,
+        resent: bool,
+        leader: i32,
+    ) {
         if !resent {
             self.unnumber(call, p, fields);
             return;
         }
-        let ours = call.fixed.get(&p).is_some_and(|f| {
-            (f.producer_id, f.producer_epoch, f.base_sequence)
-                == (
-                    fields.producer_id,
-                    fields.producer_epoch,
-                    fields.base_sequence,
-                )
-        });
-        if !ours {
-            return;
+        if call.fixed.get(&p).is_some_and(|f| f.numbered_as(fields)) {
+            self.renumber(call, p, fields, leader, true);
         }
-        if self
+    }
+
+    /// The broker did not append `p`'s batch numbered `fields`, and its
+    /// sequences must not be handed to the next batch (a sequence error, or
+    /// an earlier copy that may be in the log). Leaves the producer able to
+    /// number `p` afresh:
+    ///
+    /// * the batch was numbered under an older id / epoch than the current
+    ///   one (a bump or reset since): only its in-doubt entry is dropped;
+    /// * `bump` allowed and `leader` supports KIP-360: **epoch bump**, the
+    ///   same producer id at epoch + 1 with every sequence back to 0. The
+    ///   broker fences the older epoch only on the partitions that see the
+    ///   new one, so another partition's batch in doubt keeps its numbering
+    ///   and is re-sent as it was (still deduplicated);
+    /// * otherwise (fenced or invalid epoch, a pre-2.5 broker, the largest
+    ///   epoch): **reset**, a new producer id before the next request and
+    ///   every in-doubt batch renumbered under it (a batch in doubt
+    ///   elsewhere may then be written twice).
+    fn renumber(
+        &mut self,
+        call: &mut Call<'_, '_>,
+        p: i32,
+        fields: ProducerFields,
+        leader: i32,
+        bump: bool,
+    ) -> &'static str {
+        let current = self
             .idem
-            .take_if(|s| {
-                (s.producer_id, s.producer_epoch) == (fields.producer_id, fields.producer_epoch)
-            })
-            .is_some()
-        {
+            .as_ref()
+            .map(|s| (s.producer_id, s.producer_epoch));
+        if current != Some((fields.producer_id, fields.producer_epoch)) {
+            if call.fixed.get(&p).is_some_and(|f| f.numbered_as(fields)) {
+                call.fixed.remove(&p);
+            }
+            return "renumbered";
+        }
+        let can_bump = bump && self.conns.get(&leader).is_some_and(|c| c.epoch_bump);
+        if can_bump && self.idem.as_mut().is_some_and(IdempotentState::bump_epoch) {
+            self.stats.epoch_bumps += 1;
+            if call.fixed.get(&p).is_some_and(|f| f.numbered_as(fields)) {
+                call.fixed.remove(&p);
+            }
+            return "epoch bumped";
+        }
+        if self.idem.take().is_some() {
             self.stats.producer_id_resets += 1;
         }
-        // Every batch numbered under the old id is renumbered under the new
-        // one (as after a sequence error).
         call.fixed.clear();
+        "producer id reset"
     }
 
     /// The batch planned for `p` with `fields` was refused as a whole and
     /// was never sent before (nothing appended): free its sequences, unless
     /// a reset or another batch intervened.
     fn unnumber(&mut self, call: &mut Call<'_, '_>, p: i32, fields: ProducerFields) {
-        let ours = call.fixed.get(&p).is_some_and(|f| {
-            (f.producer_id, f.producer_epoch, f.base_sequence)
-                == (
-                    fields.producer_id,
-                    fields.producer_epoch,
-                    fields.base_sequence,
-                )
-        });
-        if !ours {
+        if !call.fixed.get(&p).is_some_and(|f| f.numbered_as(fields)) {
             return;
         }
         call.fixed.remove(&p);

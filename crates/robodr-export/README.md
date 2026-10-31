@@ -155,14 +155,22 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   them and re-sends the batch in doubt with its sequence: **no duplicate**
   (`pipeline.rs`, `publisher_crash_after_send_is_deduplicated_by_the_broker`).
   Errors: `DUPLICATE_SEQUENCE_NUMBER` = success;
-  `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID`,
-  `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED` = the batch was not written:
-  new producer id, sequences from 0, re-send (`producer_id_resets`; a batch
-  of another partition in doubt at that moment may then be written twice);
-  a record-level error on a batch being **re-sent** after a lost reply
-  also resets the producer id instead of freeing its sequences (the first
-  copy may be in the log; a later batch reusing them would be answered as
-  a duplicate, reported delivered and never written);
+  `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID` = the batch was not
+  written: on a broker offering InitProducerId v3+ (Kafka 2.5+) an **epoch
+  bump** (KIP-360, as the Java client: same producer id, epoch + 1,
+  sequences from 0, `epoch_bumps`); a batch of another partition in doubt
+  at that moment keeps its numbering under the older epoch, which that
+  partition has not seen, so its re-send is still deduplicated (no
+  duplicate). `INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED` (another writer
+  ahead on the same id), an older broker or the largest epoch = new
+  producer id, sequences from 0, re-send (`producer_id_resets`; a batch of
+  another partition in doubt at that moment may then be written twice).
+  The epoch is part of the stored `state`; a restart re-sends a batch in
+  doubt under an earlier epoch of the same id as it was. A record-level
+  error on a batch being **re-sent** after a lost reply also renumbers
+  (epoch bump, else new producer id) instead of freeing its sequences (the
+  first copy may be in the log; a later batch reusing them would be
+  answered as a duplicate, reported delivered and never written);
   InitProducerId `CLUSTER_AUTHORIZATION_FAILED` = fatal, naming the
   `IDEMPOTENT_WRITE` ACL (needed before Kafka 3.0; implied by topic `WRITE`
   since) and `--no-idempotence`. Limits: the broker remembers a producer id
@@ -462,12 +470,15 @@ client-side; the broker's channel muting paces the producer (checked with a
 * Idempotence (`tests/kafka_fake_broker.rs`): a lost acknowledgement
   re-sent and dropped by the broker (as success with the original offset
   and as `DUPLICATE_SEQUENCE_NUMBER`), sequences per partition across calls
-  and a leader move, resets on `OUT_OF_ORDER_SEQUENCE_NUMBER` /
-  `UNKNOWN_PRODUCER_ID` / `INVALID_PRODUCER_EPOCH` / `PRODUCER_FENCED`
-  without loss or duplicate, an expired producer, InitProducerId refused
+  and a leader move, epoch bumps on `OUT_OF_ORDER_SEQUENCE_NUMBER` /
+  `UNKNOWN_PRODUCER_ID` (InitProducerId v3+) and resets on
+  `INVALID_PRODUCER_EPOCH` / `PRODUCER_FENCED`, older brokers and the
+  largest epoch, without loss or duplicate; another partition's batch in
+  doubt across a bump deduplicated (also after a restart), where a reset
+  writes it twice; an expired producer, InitProducerId refused
   (`CLUSTER_AUTHORIZATION_FAILED`, not offered, coordinator not ready),
   halving that reuses the refused sequences, a record-level error on a
-  re-sent batch (producer id reset: the next record is really written),
+  re-sent batch (renumbered: the next record is really written),
   `INVALID_TIMESTAMP` retried and reported, never a rejected record (the
   fake broker checks CreateTime against a skewed clock), a restart with the persisted
   state and journal (in-doubt batch deduplicated; more than five batches
@@ -653,9 +664,12 @@ partitioner all agreed with the real brokers.
   against real brokers with it. With `--no-idempotence` (brokers that
   refuse InitProducerId to this principal) delivery is at-least-once: a
   lost response duplicates a request's records. Either way consumers may
-  drop duplicates on `event-uid` (contract §2); an epoch bump (KIP-360,
-  InitProducerId v3+) is not implemented: a sequence error takes a new
-  producer id instead.
+  drop duplicates on `event-uid` (contract §2). Epoch bumps (KIP-360) are
+  verified against Kafka 3.9.1 (`tests/kafka_real_broker.rs`,
+  `real_kip360_epoch_bump_semantics`, `real_sequence_error_bumps_the_epoch`:
+  the broker accepts the bumped epoch at sequence 0, fences the older one
+  per partition only, and answers InitProducerId without a transactional
+  id with a new producer id, which is why the bump is done client side).
 * **DNS.** Host names (bootstrap and advertised listeners) go through the
   system resolver on a helper thread; a lookup that outlives
   `connect_timeout` fails the attempt and its thread is abandoned (at most
