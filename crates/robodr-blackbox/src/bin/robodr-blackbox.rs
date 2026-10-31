@@ -20,6 +20,13 @@
 //! robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
 //!                            [--index-auth-file FILE]
 //! robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE] [--allow-hmac]
+//! robodr-blackbox export-pending DIR --key FILE --device ID --out-dir DIR
+//!                            [--previous-keys FILE]... [--max-records N] [--max-bytes N]
+//!                            [--max-bundles N] [--allow-hmac]
+//! robodr-blackbox backup create  --out FILE|- [--root DIR] [--include-keys]
+//! robodr-blackbox backup verify  FILE
+//! robodr-blackbox backup restore FILE [--root DIR] [--spool-ready]
+//!                            [--evidence-to DIR] [--dry-run]
 //! ```
 //!
 //! **Legacy HMAC keys are refused by default** (symmetric: whoever can
@@ -96,6 +103,35 @@
 //!   signed mark of unit `--unit` (the `advance` request line) to `--out`
 //!   (created new, never overwritten) or stdout, for
 //!   `robodr-anchor-receiver ingest` on the far side of a diode.
+//! - `export-pending` moves the black box's unexported records out of the
+//!   unit **while the recorder runs** (`robodr_blackbox::outbox`): every
+//!   record after the signed export cursor of log `DIR` (unit `--device`)
+//!   becomes `RBBXBND1` bundles in `--out-dir` (the diode / media outbox,
+//!   `rbbx-<device>-<chain>-<first>-<last>.rbbx`), each written durably
+//!   before the cursor is advanced (signed with `--key`, the recorder's
+//!   current secret key; records signed by keys retired by a rotation need
+//!   `--previous-keys`). Each record's hash, signature and link are checked
+//!   first; a bundle stops at a break. With
+//!   `blackbox.retention.unexported_reserve_segments` the recorder keeps
+//!   segments this has not exported. Up to `--max-bundles` (default 64)
+//!   bundles of at most `--max-records` (100000) records / `--max-bytes`
+//!   (64 MiB) per run. It prints one line per bundle; records lost before
+//!   they were exported (a gap after the cursor) are reported and make the
+//!   run exit 1 after writing what is there. Packaged as
+//!   `robodr-blackbox-export.timer` (OPERATIONS 8.2).
+//! - `backup` backs a unit up and restores it as OPERATIONS §14 says
+//!   (`robodr_blackbox::backup`): `create` archives the §14.1 "back up"
+//!   paths under `--root` (default `/`) into an `RBKUP001` archive
+//!   (`--out`, created new, 0600; `-` = stdout, to pipe into the site's
+//!   encryption); the keys (`etc/robodr/keys`) only with `--include-keys`.
+//!   `verify` checks an archive end to end. `restore` verifies the whole
+//!   archive first, then writes configuration (and the anchor receiver's
+//!   state) under `--root`, never anything the §14.1 table says must not
+//!   be restored (anti-rollback floors, replay stores, security floor,
+//!   TPM-bound material, exporter sequence state: each is listed with the
+//!   reason), evidence only under `--evidence-to` (never into the unit),
+//!   and the spools' `ready/` findings only with `--spool-ready` and only
+//!   into an empty `ready/`. `--dry-run` reports without writing.
 //!
 //! Exit codes: 0 = verified intact (warnings allowed unless `--strict`),
 //! 1 = verification failed, 2 = usage, I/O or key error.
@@ -140,6 +176,13 @@ const USAGE: &str = "usage:
   robodr-blackbox tpm-anchor-check --index 0x01XXXXXX [--tcti TCTI] [--tools-dir DIR]
                              [--index-auth-file FILE]
   robodr-blackbox anchor-mark DIR --key FILE --unit ID [--out FILE] [--allow-hmac]
+  robodr-blackbox export-pending DIR --key FILE --device ID --out-dir DIR
+                             [--previous-keys FILE]... [--max-records N] [--max-bytes N]
+                             [--max-bundles N] [--allow-hmac]
+  robodr-blackbox backup create  --out FILE|- [--root DIR] [--include-keys]
+  robodr-blackbox backup verify  FILE
+  robodr-blackbox backup restore FILE [--root DIR] [--spool-ready]
+                             [--evidence-to DIR] [--dry-run]
   robodr-blackbox --version
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
@@ -255,6 +298,8 @@ fn main() -> ExitCode {
         Some("tpm-anchor-init") => tpm_anchor_init(&argv[1..]),
         Some("tpm-anchor-check") => tpm_anchor_check(&argv[1..]),
         Some("anchor-mark") => anchor_mark(&argv[1..]),
+        Some("export-pending") => export_pending(&argv[1..]),
+        Some("backup") => backup(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -812,6 +857,251 @@ fn anchor_mark(raw: &[String]) -> Result<(), Fail> {
         }
     }
     Ok(())
+}
+
+fn positive(a: &Args, name: &str, default: u64) -> Result<u64, String> {
+    match a.one(name)? {
+        None => Ok(default),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!("--{name} must be a positive integer")),
+        },
+    }
+}
+
+fn export_pending(raw: &[String]) -> Result<(), Fail> {
+    use robodr_blackbox::outbox::{export_pending_to, PendingOptions};
+    let a = Args::parse(
+        raw,
+        &[
+            "key",
+            "device",
+            "out-dir",
+            "previous-keys",
+            "max-records",
+            "max-bytes",
+            "max-bundles",
+        ],
+        &["allow-hmac"],
+    )?;
+    let dir = PathBuf::from(a.single_positional("log directory")?);
+    let req = |n: &str| -> Result<String, String> {
+        a.one(n)?
+            .map(str::to_string)
+            .ok_or_else(|| format!("--{n} is required"))
+    };
+    let (key_p, device, out) = (req("key")?, req("device")?, req("out-dir")?);
+    let out = PathBuf::from(out);
+    if !out.is_dir() {
+        return Err(format!("--out-dir {}: not a directory", out.display()).into());
+    }
+    let allow_hmac = a.flag("allow-hmac");
+    let key = KeyFile::load_secret(Path::new(&key_p)).map_err(|e| format!("{key_p}: {e}"))?;
+    hmac_gate(&key, &key_p, allow_hmac)?;
+    let prev_files = a.all("previous-keys");
+    if prev_files.len() > MAX_PREVIOUS_KEY_FILES {
+        return Err(format!("at most {MAX_PREVIOUS_KEY_FILES} --previous-keys files").into());
+    }
+    let prev_paths: Vec<&Path> = prev_files.iter().map(Path::new).collect();
+    let mut warnings = Vec::new();
+    let prev = robodr_blackbox::keys::load_previous_keys(
+        "--previous-keys",
+        &prev_paths,
+        &device,
+        &[(
+            key.key_id.as_str(),
+            "the --key (the key the log is signed with now)",
+        )],
+        allow_hmac,
+        &mut warnings,
+    )?;
+    for w in warnings {
+        eprintln!("robodr-blackbox: warning: {w}");
+    }
+    let signer = key.signer().map_err(|e| format!("{key_p}: {e}"))?;
+    let opts = PendingOptions {
+        max_records: usize::try_from(positive(&a, "max-records", 100_000)?)
+            .map_err(|_| "--max-records is too large".to_string())?,
+        max_bytes: positive(&a, "max-bytes", 64 * 1024 * 1024)?,
+    };
+    let max_bundles = positive(&a, "max-bundles", 64)?;
+    let authentic = |m: &[u8], s: &[u8]| {
+        signer.verify_own(m, s) == Some(true)
+            || (!prev.is_empty() && robodr_blackbox::Verifier::verify_any(&prev, m, s))
+    };
+    let mut lost = false;
+    let mut written = 0u64;
+    for _ in 0..max_bundles {
+        let res = export_pending_to(&dir, &out, &*signer, &authentic, opts, Some(&device))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        let Some((p, path)) = res else {
+            break;
+        };
+        written += 1;
+        if let Some(why) = &p.cursor_rejected {
+            eprintln!(
+                "robodr-blackbox: warning: export cursor ignored ({why}); exported from the \
+                 oldest retained record"
+            );
+        }
+        if let Some([lo, hi]) = p.gap {
+            lost = true;
+            eprintln!(
+                "robodr-blackbox: EVIDENCE LOST BEFORE EXPORT: records {lo}..={hi} after the \
+                 export cursor are no longer in the black box (dropped by retention or \
+                 quarantined); the receiver will report the gap"
+            );
+        }
+        println!(
+            "exported seq {}..={} ({} records) to {}",
+            p.first_seq,
+            p.last_seq,
+            p.records,
+            path.display()
+        );
+        if !p.more {
+            break;
+        }
+    }
+    if written == 0 {
+        println!("nothing pending");
+    }
+    if lost {
+        return Err(Fail::Verify);
+    }
+    Ok(())
+}
+
+fn backup(raw: &[String]) -> Result<(), Fail> {
+    use robodr_blackbox::backup;
+    let (sub, rest) = raw
+        .split_first()
+        .ok_or_else(|| "backup needs create, verify or restore".to_string())?;
+    match sub.as_str() {
+        "create" => {
+            let a = Args::parse(rest, &["out", "root"], &["include-keys"])?;
+            if !a.positional.is_empty() {
+                return Err("backup create takes no positional argument"
+                    .to_string()
+                    .into());
+            }
+            let out = a
+                .one("out")?
+                .ok_or_else(|| "--out FILE (or -) is required".to_string())?;
+            let root = PathBuf::from(a.one("root")?.unwrap_or("/"));
+            let include_keys = a.flag("include-keys");
+            let rep = if out == "-" {
+                let stdout = std::io::stdout();
+                let mut w = std::io::BufWriter::new(stdout.lock());
+                backup::create(&root, &mut w, include_keys).map_err(|e| format!("backup: {e}"))?
+            } else {
+                let mut o = std::fs::OpenOptions::new();
+                o.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    o.mode(0o600);
+                }
+                let f = o.open(out).map_err(|e| format!("{out}: {e}"))?;
+                let mut w = std::io::BufWriter::new(f);
+                let rep = backup::create(&root, &mut w, include_keys)
+                    .map_err(|e| format!("backup: {e}"))?;
+                let f = w.into_inner().map_err(|e| format!("{out}: {e}"))?;
+                f.sync_all().map_err(|e| format!("{out}: {e}"))?;
+                rep
+            };
+            for (p, why) in &rep.skipped {
+                eprintln!("robodr-blackbox: not archived: {p}: {why}");
+            }
+            eprintln!(
+                "robodr-blackbox: backup: {} files, {} directories, {} bytes{}",
+                rep.files,
+                rep.dirs,
+                rep.bytes,
+                if include_keys {
+                    " (holds private keys: encrypt it before it leaves the unit, OPERATIONS 14.2)"
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        "verify" => {
+            let a = Args::parse(rest, &[], &[])?;
+            let p = a.single_positional("archive")?;
+            let f = std::fs::File::open(p).map_err(|e| format!("{p}: {e}"))?;
+            match backup::verify(&mut std::io::BufReader::new(f)) {
+                Ok(entries) => {
+                    println!("{p}: intact, {} entries", entries.len());
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("robodr-blackbox: {p}: {e}");
+                    Err(Fail::Verify)
+                }
+            }
+        }
+        "restore" => {
+            let a = Args::parse(rest, &["root", "evidence-to"], &["spool-ready", "dry-run"])?;
+            let p = PathBuf::from(a.single_positional("archive")?);
+            let root = PathBuf::from(a.one("root")?.unwrap_or("/"));
+            let opts = backup::RestoreOptions {
+                spool_ready: a.flag("spool-ready"),
+                evidence_to: a.one("evidence-to")?.map(PathBuf::from),
+                dry_run: a.flag("dry-run"),
+            };
+            if let Some(d) = &opts.evidence_to {
+                // Evidence never goes back into the unit's live state.
+                if ["var/lib/robodr", "etc"]
+                    .iter()
+                    .any(|live| d.starts_with(root.join(live)))
+                {
+                    return Err(format!(
+                        "--evidence-to {}: inside the unit's live state under --root (evidence \
+                         goes to an archive directory, OPERATIONS 14.1)",
+                        d.display()
+                    )
+                    .into());
+                }
+            }
+            let rep = match backup::restore(&p, &root, &opts) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    eprintln!(
+                        "robodr-blackbox: {}: {e}; nothing was restored",
+                        p.display()
+                    );
+                    return Err(Fail::Verify);
+                }
+                Err(e) => return Err(format!("restore: {e}").into()),
+            };
+            let verb = if opts.dry_run {
+                "would restore"
+            } else {
+                "restored"
+            };
+            for x in &rep.restored {
+                println!("{verb}: {x}");
+            }
+            for x in &rep.evidence {
+                println!("evidence: {x}");
+            }
+            for (x, why) in &rep.refused {
+                println!("not restored: {x}: {why}");
+            }
+            eprintln!(
+                "robodr-blackbox: {verb} {} entries, {} evidence entries, {} not restored. Next \
+                 (OPERATIONS 14.3): systemd-tmpfiles --create; re-create, never copy, the \
+                 monotonic state (seal provisioning, enrolment, delivery anchor, depot); \
+                 re-install the current signed profile; then start the services",
+                rep.restored.len(),
+                rep.evidence.len(),
+                rep.refused.len()
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown backup subcommand {other:?}").into()),
+    }
 }
 
 fn read_bytes_bounded(p: &Path, max: u64) -> Result<Vec<u8>, String> {

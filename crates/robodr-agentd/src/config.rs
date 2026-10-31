@@ -412,6 +412,11 @@ pub struct BlackboxSection {
     /// `tpm_nv_counter` or the `remote` kind.
     #[serde(default)]
     pub head_anchor: Option<HeadAnchorConfig>,
+    /// Retention and pending-export protection; see
+    /// [`crate::retention`]. Absent: the recorder's defaults (cyclic,
+    /// 8 x 8 MiB, no reserve).
+    #[serde(default)]
+    pub retention: Option<crate::retention::RetentionConfig>,
 }
 
 /// `blackbox.head_anchor`.
@@ -1146,6 +1151,9 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     require_abs("policy_path", &config.policy_path)?;
     require_abs("blackbox.dir", &config.blackbox.dir)?;
     require_abs("blackbox.key_file", &config.blackbox.key_file)?;
+    if let Some(r) = &config.blackbox.retention {
+        r.validate()?;
+    }
     require_abs("spool.dir", &config.spool.dir)?;
     if config.spool.max_bytes < 64 * 1024 {
         return Err("spool.max_bytes must be >= 65536".into());

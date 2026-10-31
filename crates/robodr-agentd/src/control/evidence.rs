@@ -19,8 +19,10 @@
 //!
 //! # How an export is built
 //!
-//! 1. Index (pass 1): every retained segment file is scanned
-//!    (`record::scan_frames`, one segment in memory at a time); records of
+//! 1. Index (pass 1): every retained segment file is streamed frame by
+//!    frame (`record::FrameReader`: one frame in memory, review O2; a
+//!    segment with damage or a torn tail falls back to reading it whole
+//!    with `record::scan_frames`, which resynchronises); records of
 //!    the current chain only, with their seq, wall time, hash, frame
 //!    position; the chain identity from the newest `Genesis` /
 //!    `SegmentStart`; the signing key in effect before every record
@@ -49,8 +51,8 @@ use std::sync::Mutex;
 
 use robodr_blackbox::crypto::{from_hex, sha256, to_hex};
 use robodr_blackbox::record::{
-    scan_frames, ChainIdentity, GenesisPayload, Hash, KeyRef, KeyRotationPayload, RecordKind,
-    ScanItem, SegmentStartPayload,
+    scan_frames, ChainIdentity, FrameRead, FrameReader, GenesisPayload, Hash, KeyRef,
+    KeyRotationPayload, Record, RecordKind, ScanItem, SegmentStartPayload,
 };
 use robodr_blackbox::store::parse_segment_file_name;
 use robodr_blackbox::{Anchor, Bundle};
@@ -489,6 +491,26 @@ pub trait SegmentSource {
     fn list(&self) -> io::Result<Vec<u64>>;
     /// The bytes of segment `idx` (`None`: it is gone).
     fn read(&self, idx: u64) -> io::Result<Option<Vec<u8>>>;
+    /// Stream the records of segment `idx` to `visit` (offset, frame
+    /// length, record) without holding the segment in memory. The default
+    /// (and any segment that is not a clean run of frames) answers
+    /// [`Stream::Irregular`]: the caller discards what it was given for
+    /// this segment and reads it whole with [`SegmentSource::read`].
+    fn stream(&self, idx: u64, visit: &mut dyn FnMut(u64, u64, Record)) -> io::Result<Stream> {
+        let _ = (idx, visit);
+        Ok(Stream::Irregular)
+    }
+}
+
+/// Result of [`SegmentSource::stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// Every frame was visited; the segment file holds this many bytes.
+    Done(u64),
+    /// The segment is gone.
+    Missing,
+    /// Not a clean run of frames: read it whole instead.
+    Irregular,
 }
 
 /// The black-box directory (read only; files are never opened through a
@@ -517,6 +539,86 @@ impl SegmentSource for DirSource {
             Err(e) => Err(e),
         }
     }
+
+    fn stream(&self, idx: u64, visit: &mut dyn FnMut(u64, u64, Record)) -> io::Result<Stream> {
+        let p = self.0.join(robodr_blackbox::store::segment_file_name(idx));
+        let f = match fsutil::open_read_nofollow(&p) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Stream::Missing),
+            Err(e) => return Err(e),
+        };
+        let len = f.metadata()?.len();
+        if len > MAX_SEGMENT_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is larger than {MAX_SEGMENT_FILE_BYTES} bytes",
+                    p.display()
+                ),
+            ));
+        }
+        // Never read past the length seen here: the active segment grows
+        // while it is indexed, and a record appended now is not part of
+        // this answer (a torn frame at the cut reads as the end).
+        let mut fr = FrameReader::new(io::BufReader::with_capacity(
+            STREAM_BUFFER_BYTES,
+            f.take(len),
+        ));
+        loop {
+            match fr.next_frame()? {
+                FrameRead::Record(r) => visit(r.offset, r.frame_len, r.record),
+                FrameRead::End => return Ok(Stream::Done(fr.offset())),
+                // The active segment's last frame may be half written right
+                // now: that is its end for this answer, as `scan_frames`
+                // would classify it as an incomplete tail.
+                FrameRead::Irregular { offset } if offset > 0 && is_torn_tail(&p, offset, len) => {
+                    return Ok(Stream::Done(len))
+                }
+                FrameRead::Irregular { .. } => return Ok(Stream::Irregular),
+            }
+        }
+    }
+}
+
+/// Read buffer of a streamed segment.
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Whether the bytes of `path` from `offset` to `len` are an incomplete
+/// frame (a write in progress), read without loading the segment. Any
+/// doubt answers `false` (the caller then reads the segment whole).
+fn is_torn_tail(path: &Path, offset: u64, len: u64) -> bool {
+    let Some(rest) = len.checked_sub(offset) else {
+        return false;
+    };
+    // A torn frame is shorter than one maximal frame; a longer tail is
+    // something else.
+    if rest > robodr_blackbox::record::MAX_FRAME_BODY as u64 {
+        return false;
+    }
+    let Ok(mut f) = fsutil::open_read_nofollow(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8];
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let n = match (&mut f).take(8).read(&mut head) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let Some(h) = head.get(..n) else {
+        return false;
+    };
+    let magic = &robodr_blackbox::record::FRAME_MAGIC;
+    let m = n.min(4);
+    if h.get(..m) != magic.get(..m) {
+        return false;
+    }
+    if n < 8 {
+        return true;
+    }
+    let body = u64::from(u32::from_be_bytes([head[4], head[5], head[6], head[7]]));
+    body <= robodr_blackbox::record::MAX_FRAME_BODY as u64 && 8 + body > rest
 }
 
 /// Segments held in memory.
@@ -565,33 +667,37 @@ fn unavailable(m: impl Into<String>) -> ApiError {
 }
 
 /// Index the black box (see the module docs).
+///
+/// Memory (review O2): segments are streamed, and per record only its
+/// [`RecMeta`] plus a 4-byte chain index is held; identity and rotation
+/// statements (a few per segment) are kept on the side.
 pub fn index(src: &dyn SegmentSource) -> Result<Index, ApiError> {
     let ids = src
         .list()
         .map_err(|e| unavailable(format!("listing the black box: {e}")))?;
-    // Per segment: (idx, len, records with their chain ids).
-    struct Raw {
-        meta: RecMeta,
-        chain_id: Hash,
+    /// A control record pass 2 needs: where it is and what it states.
+    struct Extra {
+        pos: usize,
         kind: RecordKind,
         identity: Option<(ChainIdentity, Option<KeyRef>)>,
         rotation_to: Option<KeyRef>,
     }
-    let mut raw: Vec<Raw> = Vec::new();
-    let mut segment_bytes = BTreeMap::new();
-    for idx in ids {
-        let Some(bytes) = src
-            .read(idx)
-            .map_err(|e| unavailable(format!("reading black-box segment {idx}: {e}")))?
-        else {
-            continue; // removed by retention since the listing
-        };
-        segment_bytes.insert(idx, bytes.len() as u64);
-        for item in scan_frames(&bytes).items {
-            let ScanItem::Record(r) = item else {
-                continue;
+    #[derive(Default)]
+    struct Acc {
+        metas: Vec<RecMeta>,
+        chains: Vec<u32>,
+        chain_ids: Vec<Hash>,
+        extras: Vec<Extra>,
+    }
+    impl Acc {
+        fn push(&mut self, idx: u64, offset: u64, frame_len: u64, rec: Record) {
+            let chain = match self.chain_ids.iter().rposition(|c| *c == rec.chain_id) {
+                Some(i) => i,
+                None => {
+                    self.chain_ids.push(rec.chain_id);
+                    self.chain_ids.len() - 1
+                }
             };
-            let rec = r.record;
             let identity = match rec.kind {
                 RecordKind::Genesis => rec
                     .payload_json::<GenesisPayload>()
@@ -604,74 +710,129 @@ pub fn index(src: &dyn SegmentSource) -> Result<Index, ApiError> {
             let rotation_to = (rec.kind == RecordKind::KeyRotation)
                 .then(|| rec.payload_json::<KeyRotationPayload>().map(|p| p.to))
                 .flatten();
-            raw.push(Raw {
-                meta: RecMeta {
-                    seq: rec.seq,
-                    segment: idx,
-                    offset: r.offset,
-                    frame_len: r.frame_len,
-                    wall_ms: rec.time.wall_ns / 1_000_000,
-                    hash: rec.hash,
-                },
-                chain_id: rec.chain_id,
-                kind: rec.kind,
-                identity,
-                rotation_to,
+            if identity.is_some() || rotation_to.is_some() {
+                self.extras.push(Extra {
+                    pos: self.metas.len(),
+                    kind: rec.kind,
+                    identity,
+                    rotation_to,
+                });
+            }
+            self.metas.push(RecMeta {
+                seq: rec.seq,
+                segment: idx,
+                offset,
+                frame_len,
+                wall_ms: rec.time.wall_ns / 1_000_000,
+                hash: rec.hash,
             });
+            self.chains.push(u32::try_from(chain).unwrap_or(u32::MAX));
+        }
+        /// Forget everything from record position `mark` on.
+        fn truncate(&mut self, mark: usize) {
+            self.metas.truncate(mark);
+            self.chains.truncate(mark);
+            while self.extras.last().is_some_and(|e| e.pos >= mark) {
+                self.extras.pop();
+            }
         }
     }
-    let Some(last) = raw.last() else {
+    let mut acc = Acc::default();
+    let mut segment_bytes = BTreeMap::new();
+    for idx in ids {
+        let reading = |e: io::Error| unavailable(format!("reading black-box segment {idx}: {e}"));
+        let mark = acc.metas.len();
+        let streamed = src
+            .stream(idx, &mut |offset, frame_len, rec| {
+                acc.push(idx, offset, frame_len, rec);
+            })
+            .map_err(reading)?;
+        match streamed {
+            Stream::Done(len) => {
+                segment_bytes.insert(idx, len);
+                continue;
+            }
+            Stream::Missing => continue, // removed by retention since the listing
+            Stream::Irregular => acc.truncate(mark),
+        }
+        let Some(bytes) = src.read(idx).map_err(reading)? else {
+            continue; // removed by retention since the listing
+        };
+        segment_bytes.insert(idx, bytes.len() as u64);
+        for item in scan_frames(&bytes).items {
+            if let ScanItem::Record(r) = item {
+                acc.push(idx, r.offset, r.frame_len, r.record);
+            }
+        }
+    }
+    let Acc {
+        mut metas,
+        chains,
+        chain_ids,
+        extras,
+    } = acc;
+    let Some(&cur) = chains.last() else {
         return Err(ApiError::new(
             404,
             "no_records",
             "the black box holds no records",
         ));
     };
-    let chain_id = last.chain_id;
+    let Some(&chain_id) = usize::try_from(cur).ok().and_then(|c| chain_ids.get(c)) else {
+        return Err(unavailable("chain index out of range"));
+    };
     // The newest identity statement that hashes to the chain id.
-    let identity = raw
+    let identity = extras
         .iter()
         .rev()
-        .filter_map(|r| r.identity.as_ref().map(|(i, _)| i))
+        .filter_map(|e| e.identity.as_ref().map(|(i, _)| i))
         .find(|i| i.chain_id() == chain_id)
         .cloned()
         .ok_or_else(|| {
             unavailable("no retained Genesis or SegmentStart names the current chain")
         })?;
-    let mut records = Vec::new();
-    let mut keys: Vec<(u64, KeyRef)> = Vec::new();
-    let mut foreign = 0u64;
     let chain_key = KeyRef {
         key_id: identity.key_id.clone(),
         algorithm: identity.algorithm.clone(),
     };
-    for r in raw {
-        if r.chain_id != chain_id {
-            foreign += 1;
+    let mut keys: Vec<(u64, KeyRef)> = Vec::new();
+    let mut ex = extras.iter().peekable();
+    for (pos, (m, c)) in metas.iter().zip(&chains).enumerate() {
+        let extra = ex.next_if(|e| e.pos == pos);
+        if *c != cur {
             continue;
         }
         // The key that signs this record: a SegmentStart names its
         // segment's key (it is signed by it).
-        if let (RecordKind::SegmentStart, Some((_, k))) = (r.kind, &r.identity) {
-            let k = k.clone().unwrap_or_else(|| chain_key.clone());
-            if keys.last().is_none_or(|(_, cur)| *cur != k) {
-                keys.push((r.meta.seq, k));
+        match extra {
+            Some(Extra {
+                kind: RecordKind::SegmentStart,
+                identity: Some((_, k)),
+                ..
+            }) => {
+                let k = k.clone().unwrap_or_else(|| chain_key.clone());
+                if keys.last().is_none_or(|(_, cur)| *cur != k) {
+                    keys.push((m.seq, k));
+                }
             }
-        } else if keys.is_empty() {
-            keys.push((r.meta.seq, chain_key.clone()));
+            _ if keys.is_empty() => keys.push((m.seq, chain_key.clone())),
+            _ => {}
         }
-        let seq = r.meta.seq;
-        records.push(r.meta);
         // A rotation record is signed by the old key; the next one onwards
         // by the new key.
-        if let Some(to) = r.rotation_to {
-            keys.push((seq.saturating_add(1), to));
+        if let Some(to) = extra.and_then(|e| e.rotation_to.clone()) {
+            keys.push((m.seq.saturating_add(1), to));
         }
+    }
+    let foreign = chains.iter().filter(|c| **c != cur).count() as u64;
+    if foreign > 0 {
+        let mut it = chains.iter();
+        metas.retain(|_| it.next() == Some(&cur));
     }
     Ok(Index {
         identity,
         chain_id,
-        records,
+        records: metas,
         keys,
         foreign,
         segment_bytes,
@@ -1850,6 +2011,57 @@ mod tests {
         let ix = index(&src)?;
         let (lo, hi, refs) = select(&ix, sel)?;
         build(&src, &ix, lo, hi, refs, max)
+    }
+
+    /// Review O2: a half-written frame at the end of the active segment
+    /// (the writer mid-append) ends the streamed segment like the
+    /// whole-segment scan's incomplete tail; damage in the middle falls
+    /// back to the resynchronising scan. Both index what `scan_frames`
+    /// indexes.
+    #[test]
+    fn streamed_index_handles_torn_tails_and_damage_like_the_scan() {
+        struct Whole(DirSource);
+        impl SegmentSource for Whole {
+            fn list(&self) -> io::Result<Vec<u64>> {
+                self.0.list()
+            }
+            fn read(&self, idx: u64) -> io::Result<Option<Vec<u8>>> {
+                self.0.read(idx)
+            }
+        }
+        let d = tmp("o2-torn");
+        let mut r = recorder(&d, 64);
+        notes(&mut r, 0, 60);
+        drop(r);
+        let src = DirSource(d.clone());
+        let last = *src.list().unwrap().last().unwrap();
+        let p = d.join(robodr_blackbox::store::segment_file_name(last));
+        let clean = std::fs::read(&p).unwrap();
+        // A torn append: the header and part of a body.
+        let mut torn = clean.clone();
+        torn.extend_from_slice(&clean[..40]);
+        std::fs::write(&p, &torn).unwrap();
+        let mut n = 0;
+        let st = src.stream(last, &mut |_, _, _| n += 1).unwrap();
+        assert_eq!(st, Stream::Done(torn.len() as u64));
+        let a = index(&src).unwrap();
+        let b = index(&Whole(src.clone())).unwrap();
+        assert_eq!(a.records, b.records);
+        assert_eq!(a.segment_bytes, b.segment_bytes);
+        // Garbage in the middle: not a clean run, read whole instead.
+        let mut bad = clean.clone();
+        let second = 8 + u32::from_be_bytes([clean[4], clean[5], clean[6], clean[7]]) as usize;
+        bad[second] ^= 0xff; // the second frame's magic
+        std::fs::write(&p, &bad).unwrap();
+        assert_eq!(
+            src.stream(last, &mut |_, _, _| {}).unwrap(),
+            Stream::Irregular
+        );
+        let a = index(&src).unwrap();
+        let b = index(&Whole(src.clone())).unwrap();
+        assert_eq!(a.records, b.records);
+        assert_eq!(a.keys, b.keys);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

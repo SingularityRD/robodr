@@ -1490,6 +1490,67 @@ If authentic state proves the newest records were cut, agentd raises
 Critical `robot.agent.evidence_truncated`. Keep the quarantined files for
 the investigation.
 
+**Black-box retention and sizing** (`blackbox.retention`, optional). Without
+it the black box keeps 8 segments of 8 MiB, cyclic: when a ninth starts the
+oldest is dropped (a signed `SegmentDropped` record names it). At the soak's
+write rate (about 4.7 MB per hour on an idle lab robot) that is 12 to 14
+hours of evidence, and much less during an incident. Size it for the site:
+
+```json
+"blackbox": {
+  "dir": "/var/lib/robodr/blackbox/agentd",
+  "key_file": "/run/credentials/robodr-agentd.service/blackbox.key",
+  "retention": {
+    "mode": "cyclic",
+    "segments": 32,
+    "segment_bytes": 33554432,
+    "unexported_reserve_segments": 16,
+    "warn_percent": 80
+  }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `cyclic` | `cyclic`: drop the oldest segment when a new one starts. `saturation`: never drop; once `segments` are full refuse non-critical records (`Saturation` record), keep `critical_reserve_segments` more for critical ones until an export prunes |
+| `segments` | 8 | segments kept (1..=65536) |
+| `segment_bytes` | 8388608 | size of one segment (64 KiB ..= 256 MiB) |
+| `unexported_reserve_segments` | 0 | cyclic only: **pending-export protection**. A segment whose records are not all covered by the signed export cursor (8.2) is kept, up to this many segments beyond `segments`; only then is unexported evidence dropped |
+| `critical_reserve_segments` | 1 | saturation only |
+| `warn_percent` | 80 | unexported share of the capacity that raises the pressure finding (50..=99) |
+
+At start agentd checks that `(segments + reserve) x segment_bytes`, minus
+what the directory's segments already hold, fits in the free space of the
+black box's filesystem, and refuses to start otherwise (exit 2, the message
+names the numbers). With protection on (or in saturation mode) agentd
+re-reads the export cursor every health tick and raises, observe-only:
+
+| Condition | Finding | Severity |
+|---|---|---|
+| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
+| cyclic retention dropped unexported evidence (the reserve was used up) | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | High |
+
+(These use the catalogued `evidence_degraded` id until the next
+findings-contract minor gives them their own.) Plain cyclic retention with
+no exporter drops by design and raises neither.
+
+Sizing (hours of evidence held; a cyclic store holds between `segments - 1`
+and `segments` full segments; the oldest is the one dropped next):
+
+| Retention | 1 MB/h (quiet) | 4.7 MB/h (soak, idle lab robot) | 20 MB/h (incident, busy bus) |
+|---|---|---|---|
+| 8 x 8 MiB = 64 MiB (default) | 2.8 days | 12-14 h | 3 h |
+| 16 x 16 MiB = 256 MiB | 11 days | 2.4 days | 13 h |
+| 32 x 32 MiB = 1 GiB | 45 days | 9.5 days | 2.2 days |
+| 64 x 64 MiB = 4 GiB | 179 days | 38 days | 9 days |
+
+Measure the rate on the unit (`du -sb` of the black box an hour apart, or
+the segment indices in `status.json` over a day). On a diode or media site
+give the reserve the longest export outage you plan for (diode down, the
+interval between media visits) at the incident rate: `reserve >= hours x
+MB/h / segment MB`, and run the export (8.2) well inside it. The capacity
+needs that much free space on the black box's filesystem.
+
 **Head anchor.** `blackbox.head_anchor` is optional; without it agentd
 warns at start and `status.json` reports `"blackbox": {"anchored":
 false}`: `head.json` alone cannot reveal a cut of the newest records
@@ -2429,17 +2490,48 @@ chunks, and verifies it with the robot's public keys;
 checks a bundle file offline. This does not move the export cursor or prune
 anything: the black box keeps its records (cyclic retention only).
 
-**Diode sites:**
-**planned (CLI); available as a library API.** `robodr-blackbox`'s
-`Recorder::export_pending` produces an `RBBXBND1` bundle of every record after
-the authenticated export cursor. The far side's `Receiver::accept` verifies
-each bundle on its own and its linkage to the previous one, so a gap,
-replay or substitution is detected. There is no command-line exporter in this
-release. Once the agent wires it in, bundles will be written to
-`/var/lib/robodr/export/` and the diode or media picks them up from there.
+**Diode sites: `robodr-blackbox export-pending`.** It exports every
+record after the black box's signed export cursor as `RBBXBND1` bundles
+**while agentd records** (it reads the directory, takes its own
+`export.lock`, never agentd's lock), then advances the cursor, signed with
+the black-box key:
 
-**Interim procedure (available):** export a copy of the chain directory and
-verify it on the far side.
+```sh
+robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd \
+    --key /etc/robodr/keys/agentd-blackbox.key --device <robot-id> \
+    --out-dir /var/lib/robodr/export/blackbox
+# exported seq 0..=40411 (40412 records) to /var/lib/robodr/export/blackbox/rbbx-<robot>-<chain>-...rbbx
+```
+
+Each record's hash, signature and link are checked before it is
+exported; each bundle is written durably before the cursor moves (a crash
+in between re-exports the same records; the far side reports the replay).
+After a key rotation add the retired public keys with `--previous-keys`.
+Records lost before they were exported (a gap after the cursor) are named
+on stderr and the run exits 1 after writing what is there; the far side
+reports them too. On the far side, verify each bundle in order with
+`robodr-blackbox verify BUNDLE --keyring <robot .pub> --device <robot-id>`
+(or `Receiver::accept`, which also checks the link to the previous one, so
+a gap, replay or substitution is detected).
+
+agentd re-reads the cursor before cyclic retention drops a segment: with
+`blackbox.retention.unexported_reserve_segments` (6.4) a segment this has
+not exported is kept, within the reserve, and agentd raises the pressure
+finding before evidence is lost.
+
+Run it periodically with the example units
+`packaging/systemd/blackbox-export/robodr-blackbox-export.{service,timer}`
+(every 15 minutes, as root with only `CAP_DAC_OVERRIDE` and `CAP_CHOWN`,
+the cursor handed to agentd's user, bundles `0640 root:robodr` in
+`/var/lib/robodr/export/blackbox`; site settings in
+`/etc/robodr/blackbox-export.env`, `ROBODR_UNIT_ID=<robot id>`). They are
+not yet installed by the package: copy them to `/etc/systemd/system/` and
+`systemctl enable --now robodr-blackbox-export.timer`. The diode or media
+transfer picks the bundles up from the outbox; remove them there once the
+far side has verified them.
+
+**Copy of the chain directory (still available):** export a copy of the
+chain directory and verify it on the far side.
 
 ```sh
 ts=$(date -u +%Y%m%dT%H%M%SZ)
@@ -3805,6 +3897,22 @@ configurations; if you moved a path in a configuration file, use yours.
 
 ### 14.2 Backup
 
+`robodr-blackbox backup` does this by the table above:
+
+```sh
+# Configuration, drop-ins, receiver state, and a copy of the evidence and
+# spools (keys excluded): verify it, keep it.
+robodr-blackbox backup create --out /root/robodr-$(hostname)-$(date +%F).rbkup
+robodr-blackbox backup verify /root/robodr-$(hostname)-$(date +%F).rbkup
+# The keys, encrypted, to offline media (two-person custody):
+robodr-blackbox backup create --include-keys --out - | age -r <custodian key> \
+    > robodr-keys-$(hostname)-$(date +%F).rbkup.age
+```
+
+`create` archives only the "back up: yes" rows (never symlinks or special
+files), each file with its SHA-256; the "no" rows are not archived. The
+same with `tar` and `age` by hand:
+
 ```sh
 # On the unit, as root. Evidence first: a copy of every chain (8.2,
 # interim procedure), to be verified on the far side.
@@ -3833,7 +3941,17 @@ state re-created by its own procedure, never copied.
    `/var/lib/robodr/releases/security-floor` from the bundle.
 2. Restore `/etc/robodr` (and the drop-ins) from the configuration
    backup, then the keys; `systemd-tmpfiles --create` resets owners and
-   modes. A replaced unit with a new TPM keeps the old keys only if the
+   modes. With an archive of 14.2:
+   `robodr-blackbox backup restore FILE [--evidence-to /srv/archive/<unit>]
+   [--spool-ready] [--dry-run]` (decrypt the keys archive first:
+   `age -d ... > keys.rbkup`). It verifies the whole archive before writing
+   anything, restores configuration (keys 0600 in a 0700 directory, no
+   set-id bits) and the anchor receiver's state, extracts evidence only
+   under `--evidence-to` (never into the unit), restores the spools'
+   `ready/` findings only with `--spool-ready` and only into an empty
+   `ready/`, and **never** restores a "no" row of 14.1, even from an
+   archive that holds one: each refused path is printed with its reason.
+   It refuses paths that escape the root and targets behind a symlink. A replaced unit with a new TPM keeps the old keys only if the
    site decides so; otherwise rotate (4.3).
 3. Do **not** copy any "no" row of 14.1. Re-create instead: seal
    provisioning and enrolment (12.1-12.3) and the anchor sidecar (6.4),
@@ -3848,5 +3966,7 @@ state re-created by its own procedure, never copied.
 
 Status: this procedure follows from the code's checks (anti-rollback,
 replay, security floor, TPM and NV bindings) and the package layout; the
-complete restore has not yet been run on a robot. The package parts
+complete restore has not yet been run on a robot. `robodr-blackbox backup`
+is tested against a tree with every row of 14.1, including archives
+crafted to roll the floors back (`crates/robodr-blackbox/tests/backup_restore.rs`). The package parts
 (steps 1 and the floor) are covered by `crates/robodr-fleet/tests/packaging.rs`.

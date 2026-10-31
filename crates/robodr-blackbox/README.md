@@ -638,6 +638,15 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   If an attacker deletes the oldest segment without that record, the verifier
   reports `HeadMissing`. If a segment vanishes before the recorder deletes it,
   the recorder writes `missing: true` into the drop record.
+- **Pending-export protection** (`RecorderConfig::unexported_reserve_segments`,
+  cyclic only, default 0): a rotation keeps a segment whose records are not
+  all covered by the confirmed export position (signed cursor, or receiver
+  ack in ack mode, re-read from disk first by `refresh_export_state`, so an
+  exporter in another process counts), up to that many segments beyond
+  `max_segments`. Only then is unexported evidence dropped; the drop record
+  says `exported: false` and `unexported_drops()` counts it.
+  `retention_status()` reports unexported segments and records against the
+  capacity, for a host to warn before a drop (agentd: `blackbox.retention`).
 - **Saturation mode:** once `max_segments` are full, a `Saturation` record is
   written. Non-critical appends are then refused (`Refused(Saturated)`) and
   counted. Critical records go into `critical_reserve_segments` extra segments.
@@ -662,6 +671,23 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   intact. A skipped bundle shows up as `Deleted`, a replayed one as
   `StaleBundle`, and loss from cyclic wrap before export as
   `DroppedBeforeExport`.
+- **Exporting beside a live recorder** (`outbox`,
+  `robodr-blackbox export-pending`): the recorder's writer holds the
+  directory lock, so the exporter works on the directory instead: its own
+  `export.lock`, one segment in memory at a time, the records of the current
+  chain after the signed cursor, each checked (hash, signature with the
+  caller's keys, link) and the bundle stopped at the first break; the bundle
+  is written durably to the outbox before the cursor is advanced (signed
+  with the recorder's current key, handed to the directory's owner). A gap
+  after the cursor is reported (`PendingExport::gap`) and the bundle carries
+  no anchor; a record that does not chain onto the cursor's hash is refused
+  (`Error::Untrusted`).
+- **Backup and restore** (`backup`, `robodr-blackbox backup`): OPERATIONS
+  §14 as code. `create` archives the "back up" paths of a unit (RBKUP001:
+  per-file SHA-256, headers digest in the end record); `restore` verifies
+  the whole archive first, restores configuration, sends evidence only to
+  `--evidence-to`, and never restores the monotonic or device-bound state
+  of §14.1 (`backup::NEVER_RESTORE`), even from a crafted archive.
 
 ## Verifier diagnoses
 
@@ -781,7 +807,13 @@ tamper finding.
   (mode 0600, owner = the loading user or root, both checked). Sealing them
   to a TPM is not implemented. Secret buffers are wiped best-effort only.
 - `export_pending` reads the retained segments into memory to build a bundle.
-  Size bundles with `max_records` on constrained units.
+  Size bundles with `max_records` on constrained units. The `outbox`
+  exporter holds one segment plus the bundle (bounded by `max_bytes`,
+  default 64 MiB).
+- The `outbox` exporter checks record signatures with `Verifier::verify_any`
+  over the recorder's own current and previous keys (trusted local keys),
+  not with the key each record's chain names; the far side's
+  `Receiver` does the full per-key verification.
 - A segment always takes at least one caller record after its header. A single
   record larger than `max_segment_bytes` therefore produces an oversized
   segment rather than an error. Payloads are capped by `max_payload_bytes`

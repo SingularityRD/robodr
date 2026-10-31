@@ -657,6 +657,17 @@ pub struct RecorderConfig {
     /// (default: only the first and last record and the control records the
     /// recorder relies on; hashes and links are always checked in full).
     pub verify_closed_signatures: bool,
+    /// Pending-export protection (cyclic mode only; 0 = off, the default).
+    /// When a rotation would drop the oldest segment and not all of its
+    /// records are covered by the confirmed export position (the signed
+    /// export cursor, or the receiver ack in ack mode, re-read from disk
+    /// first so an exporter in another process counts), the segment is
+    /// kept instead, up to this many segments beyond `max_segments`. Only
+    /// when that reserve is used up too is unexported evidence dropped; it
+    /// is then counted ([`Recorder::unexported_drops`]) and the drop record
+    /// says `exported: false`. See [`Recorder::retention_status`] for the
+    /// pressure a host reports before that happens.
+    pub unexported_reserve_segments: u32,
 }
 
 impl RecorderConfig {
@@ -684,6 +695,7 @@ impl RecorderConfig {
             head_mark_interval_ns: 1_000_000_000,
             head_anchor: None,
             verify_closed_signatures: false,
+            unexported_reserve_segments: 0,
         }
     }
 
@@ -715,8 +727,61 @@ impl RecorderConfig {
             } if max_segments == 0 || critical_reserve_segments == 0 => Err(Error::Config(
                 "saturation needs max_segments >= 1 and critical_reserve_segments >= 1".into(),
             )),
+            RetentionMode::Saturation { .. } if self.unexported_reserve_segments > 0 => {
+                Err(Error::Config(
+                    "unexported_reserve_segments applies to cyclic retention only (saturation \
+                     never drops evidence)"
+                        .into(),
+                ))
+            }
+            RetentionMode::Cyclic { max_segments }
+                if u64::from(max_segments) + u64::from(self.unexported_reserve_segments)
+                    > MAX_RETAINED_SEGMENTS =>
+            {
+                Err(Error::Config(format!(
+                    "max_segments + unexported_reserve_segments must be <= {MAX_RETAINED_SEGMENTS}"
+                )))
+            }
             _ => Ok(()),
         }
+    }
+}
+
+/// Most segments a cyclic configuration may retain (with the
+/// pending-export reserve).
+pub const MAX_RETAINED_SEGMENTS: u64 = 1 << 20;
+
+/// Where retention stands ([`Recorder::retention_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionStatus {
+    /// Retained segments (the active one included).
+    pub segments: u64,
+    /// Segments the configuration lets the store hold before it drops
+    /// (cyclic: `max_segments` + `unexported_reserve_segments`) or refuses
+    /// (saturation: `max_segments` + `critical_reserve_segments`).
+    pub capacity_segments: u64,
+    /// Retained segments holding at least one record after the confirmed
+    /// export position (all of them before the first export).
+    pub unexported_segments: u64,
+    /// Records after the confirmed export position (head seq minus the
+    /// position; an upper bound when segments were dropped).
+    pub unexported_records: u64,
+    /// The confirmed export position (cursor, or ack in ack mode).
+    pub confirmed_export_seq: Option<u64>,
+    /// Segments dropped by cyclic retention with records not exported,
+    /// since this recorder was opened.
+    pub unexported_drops: u64,
+    /// Whether pending-export protection is on.
+    pub protecting: bool,
+}
+
+impl RetentionStatus {
+    /// Unexported share of the capacity, in percent (0..=100).
+    pub fn unexported_fill_percent(&self) -> u64 {
+        if self.capacity_segments == 0 {
+            return 0;
+        }
+        (self.unexported_segments.saturating_mul(100) / self.capacity_segments).min(100)
     }
 }
 
@@ -983,9 +1048,33 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// file (mode 0600, `O_NOFOLLOW`), fsync, rename, fsync the directory. A
 /// planted symlink at any predictable path is never followed.
 pub(crate) fn atomic_write(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+    atomic_write_as(dir, name, data, false)
+}
+
+/// [`atomic_write`] for a writer that is not the directory's owner (an
+/// exporter running as root next to a recorder running as its own user):
+/// the file is given the directory's owner and group before it is renamed
+/// into place, so the recorder can read it. Fails rather than leave a file
+/// the recorder cannot read.
+pub(crate) fn atomic_write_owned(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+    atomic_write_as(dir, name, data, true)
+}
+
+fn atomic_write_as(dir: &Path, name: &str, data: &[u8], as_owner: bool) -> io::Result<()> {
     let tmp = dir.join(tmp_name(name));
     let res = (|| {
         let mut f = create_new_private(&tmp, false)?;
+        #[cfg(unix)]
+        if as_owner {
+            use std::os::unix::fs::MetadataExt;
+            let d = fs::metadata(dir)?;
+            let m = f.metadata()?;
+            if (m.uid(), m.gid()) != (d.uid(), d.gid()) {
+                std::os::unix::fs::fchown(&f, Some(d.uid()), Some(d.gid()))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = as_owner;
         f.write_all(data)?;
         f.sync_all()?;
         fault("atomic.after_tmp")?;
@@ -1940,6 +2029,8 @@ pub struct Recorder {
     quarantined_now: Vec<u64>,
     /// Evidence trouble found by this open, for the host to report.
     open_incidents: Vec<OpenIncident>,
+    /// Segments dropped by cyclic retention with unexported records.
+    unexported_drops: u64,
 }
 
 impl fmt::Debug for Recorder {
@@ -2168,6 +2259,7 @@ impl Recorder {
             quarantined_ranges: Vec::new(),
             quarantined_now: Vec::new(),
             open_incidents: Vec::new(),
+            unexported_drops: 0,
         };
         let genesis = to_json(&GenesisPayload {
             identity,
@@ -3025,6 +3117,7 @@ impl Recorder {
             quarantined_ranges: quarantine.iter().filter_map(|q| q.range).collect(),
             quarantined_now: Vec::new(),
             open_incidents: Vec::new(),
+            unexported_drops: 0,
         };
 
         // 10. State: trusted only if authenticated and consistent. An
@@ -3797,11 +3890,123 @@ impl Recorder {
         self.write_segment_start()?;
         fault("rotate.after_segment_start")?;
         if let RetentionMode::Cyclic { max_segments } = self.cfg.mode {
+            let reserve = self.cfg.unexported_reserve_segments as usize;
+            if reserve > 0 && self.segments.len() > max_segments as usize {
+                // An exporter in another process may have moved the cursor.
+                self.refresh_export_state();
+            }
             while self.segments.len() > max_segments as usize {
+                if reserve > 0
+                    && !self.oldest_exported()
+                    && self.segments.len() <= max_segments as usize + reserve
+                {
+                    break; // pending-export protection: keep it
+                }
                 self.drop_oldest(DropReason::Cyclic)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether every record of the oldest retained (closed) segment is
+    /// covered by the confirmed export position.
+    fn oldest_exported(&self) -> bool {
+        match (self.confirmed_export(), self.segment_end(0)) {
+            (Some(c), Some((last, _))) => c.seq >= last,
+            _ => false,
+        }
+    }
+
+    /// Re-read the export cursor (and, in ack mode, the receiver ack) from
+    /// the directory and adopt it if it authenticates, matches the chain
+    /// and is ahead of the position held. An exporter running in another
+    /// process (`robodr-blackbox export-pending`) moves the cursor on disk;
+    /// this is how the recorder learns of it. A file that does not
+    /// authenticate is ignored (re-exporting is safe; dropping unexported
+    /// evidence is not). Returns whether the confirmed position advanced.
+    pub fn refresh_export_state(&mut self) -> bool {
+        let mut advanced = false;
+        // Cheap before costly: only a cursor ahead of the held one is
+        // authenticated (which may re-read a segment).
+        let held = self.export_cursor.as_ref().map(|c| c.seq);
+        let ahead = |seq: u64| held.is_none_or(|h| seq > h);
+        if let Ok(Some(s)) = read_state(&self.cfg.dir, CURSOR_FILE) {
+            let newer = SignedCursor::from_json(&s).is_some_and(|c| ahead(c.anchor.seq));
+            if let Some(a) = newer.then(|| self.check_cursor(&s).ok()).flatten() {
+                self.export_cursor = Some(a);
+                advanced = self.ack_verifier.is_none();
+            }
+        }
+        if self.ack_verifier.is_some() {
+            if let Ok(Some(s)) = read_state(&self.cfg.dir, ACK_FILE) {
+                if let Some(ack) = Ack::from_json(&s) {
+                    if self.acked.as_ref().is_none_or(|a| ack.seq > a.seq)
+                        && self.check_ack(&ack).is_ok()
+                    {
+                        self.acked = Some(ack.anchor());
+                        advanced = true;
+                    }
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Where retention stands: how much of the store holds evidence that
+    /// has not been exported, against what the configuration lets it hold.
+    /// A host reports pressure from it before evidence is dropped (agentd:
+    /// `blackbox.retention`). Uses the export position held in memory;
+    /// call [`Recorder::refresh_export_state`] first to pick up an
+    /// exporter in another process.
+    pub fn retention_status(&self) -> RetentionStatus {
+        let (capacity, protecting) = match self.cfg.mode {
+            RetentionMode::Cyclic { max_segments } => (
+                u64::from(max_segments) + u64::from(self.cfg.unexported_reserve_segments),
+                self.cfg.unexported_reserve_segments > 0,
+            ),
+            RetentionMode::Saturation {
+                max_segments,
+                critical_reserve_segments,
+            } => (
+                u64::from(max_segments) + u64::from(critical_reserve_segments),
+                false,
+            ),
+        };
+        let confirmed = self.confirmed_export().map(|a| a.seq);
+        let n = self.segments.len();
+        let unexported_segments = match confirmed {
+            None => n,
+            Some(c) => (0..n)
+                .filter(|&pos| {
+                    if pos + 1 == n {
+                        // The active segment: anything after the position?
+                        self.head.is_some_and(|(h, _)| h > c)
+                    } else {
+                        self.segment_end(pos).is_none_or(|(last, _)| last > c)
+                    }
+                })
+                .count(),
+        } as u64;
+        let unexported_records = match (self.head, confirmed) {
+            (Some((h, _)), Some(c)) => h.saturating_sub(c),
+            (Some((h, _)), None) => h.saturating_add(1),
+            (None, _) => 0,
+        };
+        RetentionStatus {
+            segments: n as u64,
+            capacity_segments: capacity,
+            unexported_segments,
+            unexported_records,
+            confirmed_export_seq: confirmed,
+            unexported_drops: self.unexported_drops,
+            protecting,
+        }
+    }
+
+    /// Segments dropped by cyclic retention with records not exported
+    /// since this recorder was opened.
+    pub fn unexported_drops(&self) -> u64 {
+        self.unexported_drops
     }
 
     /// `(seq, hash)` of the last record of retained segment `pos`, from the
@@ -3866,6 +4071,9 @@ impl Recorder {
             missing,
         })?;
         self.write_record(RecordKind::SegmentDropped, p, true, true)?;
+        if reason == DropReason::Cyclic && !exported {
+            self.unexported_drops += 1;
+        }
         fault("drop.after_record")?;
         if !missing {
             match fs::remove_file(&path) {

@@ -118,6 +118,7 @@ pub mod host;
 pub mod input;
 pub mod notify;
 pub mod profile_chain;
+pub mod retention;
 pub mod safety;
 /// Health record and early warnings (credential expiry, clock, disk,
 /// executor reachability).
