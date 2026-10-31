@@ -27,12 +27,16 @@ is tested offline. The same code runs in three places:
 | `socket` | Receive-only SPDP multicast socket. It sets `SO_REUSEADDR` before `bind` and binds to the group address, so it coexists with the robot's DDS participants. |
 | `sanitize`, `dedup` | Attacker-controlled text is control-escaped and capped at 512 chars. The dedup set is O(capacity) and stores keyed hashes. |
 | `watch` | Argument parsing and run loop for `robodr-ros2-watch`. |
+| `check` | `robodr-ros2-watch --check-config`: offline validation of `pulsar.toml`'s sensor section (TOML, unknown keys as Pulsar would ignore them, ranges, profile + trust without writing state, `/dev/shm` DDS segments, SROS 2 keystore). |
+| `sros2` | SROS 2 policy input (`sros2_keystore`): `governance.xml` and `permissions.xml` parsed (bounded), SPDP DDS-Security identities judged against the grants, visibility statements. |
 
 ## Findings
 
 | Rule | Severity | When |
 |---|---|---|
 | the profile's own rules (`robot.ros2.unknown_participant`, `robot.ros2.unauthorized_motion_writer`, `unknown_writer_topic`, `unknown_service`, `unknown_action`, `unknown_reader`, ...) | as `robodr-events` decides | every discovery event, through `Profile::evaluate` |
+| `robot.capture.unsupported_transport` | Medium | once per host and transport set: SPDP advertises shared-memory (Fast DDS SHM, Cyclone iceoryx, Connext SHMEM), TCP or unknown locators; same-host traffic over them is not inspected ([`docs/DDS-TRANSPORTS.md`](../../docs/DDS-TRANSPORTS.md)) |
+| `robot.ros2.untrusted_security_identity` | Medium / High | with `sros2_keystore`: no DDS-Security identity on a domain requiring authentication (Medium); a certificate subject no grant names (High) |
 | `robot.ros2.participant_removed` | Medium | a **profiled** participant is announced disposed or unregistered (`relayed by …` when someone else sent it) |
 | `robot.rtps.malformed_discovery` | Low | one per parse-anomaly kind and source IP (`report_anomalies`) |
 | `robot.rtps.fragmented_discovery` | Low | one per source IP sending discovery `DATA_FRAG` (`report_fragmentation`) |
@@ -213,6 +217,8 @@ from community clients, HTTP is read per segment.
 robodr-ros2-watch --profile /etc/robodr/profile.json --pcap lab.pcapng --stats
 # live, read-only (Linux, CAP_NET_RAW)
 sudo robodr-ros2-watch --profile profile.json --interface lo --interface eth0 --duration 60
+# validate the daemon's configuration offline (read-only; exit 1 = invalid)
+sudo robodr-ros2-watch --check-config /etc/robodr/pulsar.toml [--strict]
 ```
 
 - **stdout:** one JSON object per finding, with the fields `rule`,
@@ -293,16 +299,21 @@ There were 73 tests before:
 
 - Most tests use synthetic traffic built from the spec. Real traffic is
   limited to the container-lab captures above (Fast DDS and Cyclone DDS on
-  ROS 2 Jazzy, a Gazebo simulation, no physical robot); RTI Connext has not
-  been captured. On the motion decode path the XCDR1 `Twist` decode is
+  ROS 2 Jazzy, a Gazebo simulation; Fast DDS 2.6 on ROS 2 Humble, incl.
+  default shared-memory transports and SROS 2; no physical robot); RTI
+  Connext has not been captured. On the motion decode path the XCDR1 `Twist` decode is
   confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
   the other message types only on hand-built vectors.
 - Some traffic is invisible or opaque to it:
-  - shared-memory transports;
-  - RTPS over TCP;
-  - DDS-Security-protected discovery.
+  - shared-memory transports (reported per host as
+    `robot.capture.unsupported_transport`);
+  - RTPS over TCP (reported the same way);
+  - DDS-Security-protected discovery (participants and their claimed
+    certificate subjects stay visible; `sros2_keystore` judges them, see
+    `src/sros2.rs`).
 
-  See `robodr-capture` and `robodr-rtps`.
+  See `robodr-capture`, `robodr-rtps` and
+  [`docs/DDS-TRANSPORTS.md`](../../docs/DDS-TRANSPORTS.md).
 - There is no rate limit on *distinct* findings, so a GUID spray yields one
   finding per GUID. Memory stays bounded.
 - Dedup is "until evicted": a participant that leaves and rejoins is not

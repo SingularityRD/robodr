@@ -71,13 +71,14 @@ non-systemd init systems.
 | Item | Level | Notes |
 |---|---|---|
 | ROS 2 Jazzy | V2 | Real captures: robot, teleop and a rogue `/cmd_vel` publisher; Gazebo Harmonic; DATA_FRAG ([`fixtures/captures/ros2-jazzy/`](../../fixtures/captures/ros2-jazzy/README.md)). |
-| ROS 2 Humble | V1 | Protocol-faithful synthetic discovery fixtures. Message definitions are unchanged from Humble to Kilted. GA target. |
+| ROS 2 Humble | V2 (Fast DDS) / V1 (Cyclone DDS) | Real Fast DDS 2.6 captures: robot, teleop and a rogue `/cmd_vel` publisher, three same-host processes, DATA_FRAG, default shared-memory transports, SROS 2 ([`fixtures/captures/ros2-humble/`](../../fixtures/captures/ros2-humble/README.md)). Cyclone DDS on Humble: synthetic fixtures only. GA target. |
 | ROS 2 Foxy (Unitree's pairing on Ubuntu 20.04) | V1 | EOL. Network-passive or agentd-only. Unitree SDK2 vectors only. |
 | Kilted, Rolling | V0 | Same message definitions. Not tested. |
 | Fast DDS 2.14 | V2 | Real captures. GA target "2.14+". |
+| Fast DDS 2.6 (Humble) | V2 | Real captures. Its default shared-memory transport is invisible to the capture and reported (`robot.capture.unsupported_transport`); commission with UDP only ([`docs/DDS-TRANSPORTS.md`](../DDS-TRANSPORTS.md)). |
 | Cyclone DDS 0.10 | V2 | Real captures (and Unitree's DDS). GA target "0.10+". |
 | RTI Connext | V0 | Vendor id recognised. No traffic tested. |
-| DDS-Security / SROS2 | Not supported (payload) | Encrypted payloads cannot be inspected. Discovery visibility depends on the protection settings. Not tested. |
+| DDS-Security / SROS2 | Participants only (V2 on Fast DDS 2.6) | With sros2's default governance only participants and their claimed certificate subjects are visible: no topic, endpoint or motion sample. Unauthenticated participants and subjects outside the keystore are reported (`sros2_keystore`). Real captures; see [`docs/DDS-TRANSPORTS.md`](../DDS-TRANSPORTS.md). |
 | Zenoh (`rmw_zenoh_cpp`) | Detected, **not decoded** | Detected by port on real captures and reported (`robot.capture.unsupported_middleware`). The sensor is blind to its content. |
 | XCDR1 `Twist` decode | V2 | Confirmed on real Fast DDS and Cyclone samples. |
 | XCDR2 and the other motion types | V1 | Hand-built vectors. |

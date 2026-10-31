@@ -14,7 +14,7 @@ docker network inspect $NET >/dev/null 2>&1 || docker network create --subnet 10
 D="$(cd "$(dirname "$0")" && pwd -W 2>/dev/null || pwd)"
 CYC='<CycloneDDS><Domain><General><MaxMessageSize>800B</MaxMessageSize><FragmentSize>256B</FragmentSize></General></Domain></CycloneDDS>'
 E="-e RMW_IMPLEMENTATION=$RMW -e ROS_DOMAIN_ID=0 -e FASTRTPS_DEFAULT_PROFILES_FILE=/cap/${FRAG_XML:-fastdds_frag.xml}"
-run() { n=$1; ip=$2; shift 2; docker run -d --rm --name $n --network $NET --ip $ip $E -e "CYCLONEDDS_URI=$CYC" -v "$D:/cap" $IMG bash -c "source /opt/ros/jazzy/setup.bash && $*" >/dev/null; }
+run() { n=$1; ip=$2; shift 2; docker run -d --rm --name $n --network $NET --ip $ip $E -e "CYCLONEDDS_URI=$CYC" -v "$D:/cap" $IMG bash -c "source /opt/ros/${DISTRO:-jazzy}/setup.bash && $*" >/dev/null; }
 docker rm -f robodr-lab-robot robodr-lab-tcpd robodr-lab-teleop >/dev/null 2>&1 || true
 while docker ps -a --format '{{.Names}}' | grep -q '^robodr-lab-'; do sleep 0.5; done
 run robodr-lab-robot 10.77.10.10 "sleep 1; python3 /cap/arm.py sub arm_driver & python3 /cap/robot.py"

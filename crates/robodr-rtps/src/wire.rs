@@ -254,6 +254,53 @@ pub const LOCATOR_KIND_UDPV4: i32 = 1;
 pub const LOCATOR_KIND_UDPV6: i32 = 2;
 /// `LOCATOR_KIND_INVALID`.
 pub const LOCATOR_KIND_INVALID: i32 = -1;
+/// `LOCATOR_KIND_TCPv4` (Fast DDS and Cyclone DDS TCP transports).
+pub const LOCATOR_KIND_TCPV4: i32 = 4;
+/// `LOCATOR_KIND_TCPv6`.
+pub const LOCATOR_KIND_TCPV6: i32 = 8;
+/// Shared memory: Fast DDS `LOCATOR_KIND_SHM` (its default intra-host
+/// transport since 2.0) and Cyclone DDS `DDSI_LOCATOR_KIND_SHEM` (Iceoryx).
+/// Seen on real Fast DDS 2.6 (ROS 2 Humble) SPDP with default transports
+/// (`fixtures/captures/ros2-humble/fastrtps_shm_default.pcap`).
+pub const LOCATOR_KIND_SHM: i32 = 16;
+/// RTI Connext shared memory (`LOCATOR_KIND_SHMEM`, vendor range).
+pub const LOCATOR_KIND_RTI_SHMEM: i32 = 0x0100_0000;
+
+/// The transport a locator kind names, for reporting what a packet capture
+/// cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LocatorTransport {
+    /// UDPv4 / UDPv6: on the wire, inspected.
+    Udp,
+    /// TCPv4 / TCPv6: on the wire, not decoded.
+    Tcp,
+    /// A shared-memory transport (Fast DDS SHM, Cyclone Iceoryx, Connext
+    /// SHMEM): never on any network interface.
+    SharedMemory,
+    /// `LOCATOR_KIND_INVALID` or the reserved kind 0.
+    Invalid,
+    /// Any other (vendor-specific) kind.
+    Other,
+}
+
+impl LocatorTransport {
+    /// Short, stable name for findings and reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::SharedMemory => "shared memory",
+            Self::Invalid => "invalid",
+            Self::Other => "other",
+        }
+    }
+
+    /// Traffic over it is invisible to (shared memory) or not decoded by
+    /// (TCP, unknown kinds) a packet capture.
+    pub fn uninspected(self) -> bool {
+        matches!(self, Self::Tcp | Self::SharedMemory | Self::Other)
+    }
+}
 
 /// An RTPS `Locator_t`: kind(i32) port(u32) address(16 octets).
 ///
@@ -277,14 +324,31 @@ impl Locator {
         })
     }
 
-    /// A short name for the kind. Kinds other than UDPv4/UDPv6/invalid are
-    /// vendor- or transport-specific and are reported as `"other"`.
+    /// A short name for the kind: `udpv4`, `udpv6`, `tcpv4`, `tcpv6`, `shm`
+    /// (Fast DDS / Cyclone DDS shared memory), `shmem` (Connext shared
+    /// memory), `invalid`; any other vendor- or transport-specific kind is
+    /// `"other"`.
     pub fn kind_name(&self) -> &'static str {
         match self.kind {
             LOCATOR_KIND_UDPV4 => "udpv4",
             LOCATOR_KIND_UDPV6 => "udpv6",
+            LOCATOR_KIND_TCPV4 => "tcpv4",
+            LOCATOR_KIND_TCPV6 => "tcpv6",
+            LOCATOR_KIND_SHM => "shm",
+            LOCATOR_KIND_RTI_SHMEM => "shmem",
             LOCATOR_KIND_INVALID => "invalid",
             _ => "other",
+        }
+    }
+
+    /// The transport this locator's kind names.
+    pub fn transport(&self) -> LocatorTransport {
+        match self.kind {
+            LOCATOR_KIND_UDPV4 | LOCATOR_KIND_UDPV6 => LocatorTransport::Udp,
+            LOCATOR_KIND_TCPV4 | LOCATOR_KIND_TCPV6 => LocatorTransport::Tcp,
+            LOCATOR_KIND_SHM | LOCATOR_KIND_RTI_SHMEM => LocatorTransport::SharedMemory,
+            LOCATOR_KIND_INVALID | 0 => LocatorTransport::Invalid,
+            _ => LocatorTransport::Other,
         }
     }
 
@@ -519,8 +583,38 @@ mod tests {
             address: [0; 16],
         };
         assert_eq!(shm.socket_string(), None);
-        assert_eq!(shm.kind_name(), "other");
+        assert_eq!(shm.kind_name(), "shm");
+        assert_eq!(shm.transport(), LocatorTransport::SharedMemory);
         assert_eq!(shm.to_string(), "kind=16/port=1");
+
+        // T14: every kind a capture cannot inspect is named.
+        for (kind, name, t) in [
+            (LOCATOR_KIND_UDPV4, "udpv4", LocatorTransport::Udp),
+            (LOCATOR_KIND_UDPV6, "udpv6", LocatorTransport::Udp),
+            (LOCATOR_KIND_TCPV4, "tcpv4", LocatorTransport::Tcp),
+            (LOCATOR_KIND_TCPV6, "tcpv6", LocatorTransport::Tcp),
+            (LOCATOR_KIND_SHM, "shm", LocatorTransport::SharedMemory),
+            (
+                LOCATOR_KIND_RTI_SHMEM,
+                "shmem",
+                LocatorTransport::SharedMemory,
+            ),
+            (LOCATOR_KIND_INVALID, "invalid", LocatorTransport::Invalid),
+            (0, "other", LocatorTransport::Invalid),
+            (0x7fff_0001, "other", LocatorTransport::Other),
+        ] {
+            let l = Locator { kind, ..shm };
+            assert_eq!((l.kind_name(), l.transport()), (name, t), "kind {kind}");
+            assert_eq!(
+                t.uninspected(),
+                matches!(
+                    t,
+                    LocatorTransport::Tcp
+                        | LocatorTransport::SharedMemory
+                        | LocatorTransport::Other
+                )
+            );
+        }
 
         for port in [0u32, 65536, u32::MAX] {
             assert_eq!(Locator { port, ..l }.socket_string(), None);

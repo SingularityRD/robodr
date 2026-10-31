@@ -2963,7 +2963,9 @@ dependencies = [
  "robodr-events",
  "robodr-rtps",
  "serde",
+ "serde_ignored",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

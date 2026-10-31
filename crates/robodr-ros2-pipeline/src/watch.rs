@@ -42,11 +42,23 @@ traffic and print each finding as one JSON line on stdout. Read-only.
 USAGE:
     robodr-ros2-watch --profile <profile.json> --pcap <file>
     robodr-ros2-watch --profile <profile.json> --interface <name> [--interface <name>...]
+    robodr-ros2-watch --check-config <pulsar.toml> [--strict]
 
 INPUT (exactly one kind):
     --pcap <file>          replay a pcap or pcapng file
     --interface <name>     live capture on an interface (Linux, CAP_NET_RAW);
                            repeatable; 'any' = every interface
+
+CONFIGURATION CHECK (offline, read-only; no other option applies):
+    --check-config <pulsar.toml>
+                           validate [module.robodr-sensor-ros2] as the daemon
+                           would: TOML syntax, unknown keys (typos the daemon
+                           only logs), ranges, and the profile + its trust
+                           (signature, revocation, rollback; the state file
+                           is not written). Prints warnings and errors on
+                           stderr, a summary on stdout. Exit 0 valid, 1 invalid
+    --strict               with --check-config: warnings (incl. a profile
+                           that would run observe-only) also fail
 
 OPTIONS:
     --profile <file>       model profile (JSON). An invalid profile is reported
@@ -100,6 +112,11 @@ EXIT: 0 done, 1 runtime error, 2 usage error.
 pub enum Command {
     Help,
     Version,
+    /// `--check-config <file> [--strict]`.
+    CheckConfig {
+        path: PathBuf,
+        strict: bool,
+    },
     /// Boxed: [`WatchArgs`] is much larger than the other variants.
     Run(Box<WatchArgs>),
 }
@@ -122,6 +139,13 @@ pub struct WatchArgs {
 
 /// Parse `args` (without the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
+    let args: Vec<String> = args.into_iter().collect();
+    if args
+        .iter()
+        .any(|a| a == "--check-config" || a.starts_with("--check-config="))
+    {
+        return parse_check_args(args);
+    }
     let mut profile = None;
     let mut pcap: Option<PathBuf> = None;
     let mut interfaces: Vec<String> = Vec::new();
@@ -398,6 +422,89 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, St
     })))
 }
 
+/// `--check-config <file> [--strict]` (and `-h` / `-V`); any other
+/// argument is refused, so a check is never mistaken for a run.
+fn parse_check_args(args: Vec<String>) -> Result<Command, String> {
+    let mut path: Option<PathBuf> = None;
+    let mut strict = false;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "--strict" => strict = true,
+            "--check-config" => {
+                let v = it
+                    .next()
+                    .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                    .ok_or("--check-config needs a value")?;
+                if path.replace(PathBuf::from(v)).is_some() {
+                    return Err("--check-config given twice".into());
+                }
+            }
+            a => match a.strip_prefix("--check-config=") {
+                Some(v) if !v.is_empty() => {
+                    if path.replace(PathBuf::from(v)).is_some() {
+                        return Err("--check-config given twice".into());
+                    }
+                }
+                Some(_) => return Err("--check-config needs a value".into()),
+                None => {
+                    return Err(format!(
+                        "{:?} cannot be combined with --check-config",
+                        sanitize(a)
+                    ))
+                }
+            },
+        }
+    }
+    let path = path.ok_or("--check-config needs a value")?;
+    Ok(Command::CheckConfig { path, strict })
+}
+
+/// Run `--check-config`: warnings and errors on `err`, the summary on
+/// `out`. Returns whether the configuration passed.
+pub fn run_check(
+    path: &std::path::Path,
+    strict: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> bool {
+    let r = crate::check::check_config_file(path);
+    for w in &r.warnings {
+        let _ = writeln!(err, "robodr-ros2-watch: warning: {w}");
+    }
+    for e in &r.errors {
+        let _ = writeln!(err, "robodr-ros2-watch: error: {e}");
+    }
+    let ok = r.ok(strict);
+    let shown = sanitize(&path.display().to_string());
+    if ok {
+        for s in &r.summary {
+            let _ = writeln!(out, "{s}");
+        }
+        let _ = writeln!(
+            out,
+            "{shown}: configuration OK ({} warning(s))",
+            r.warnings.len()
+        );
+    } else if r.errors.is_empty() {
+        let _ = writeln!(
+            err,
+            "robodr-ros2-watch: {shown}: {} warning(s) and --strict: configuration REFUSED",
+            r.warnings.len()
+        );
+    } else {
+        let _ = writeln!(
+            err,
+            "robodr-ros2-watch: {shown}: {} error(s): configuration INVALID",
+            r.errors.len()
+        );
+    }
+    let _ = out.flush();
+    ok
+}
+
 /// Result of a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -557,6 +664,30 @@ mod tests {
             Command::Run(a) => *a,
             other => panic!("expected run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_config_args() {
+        assert_eq!(
+            p(&["--check-config", "/etc/robodr/pulsar.toml"]).unwrap(),
+            Command::CheckConfig {
+                path: "/etc/robodr/pulsar.toml".into(),
+                strict: false
+            }
+        );
+        assert_eq!(
+            p(&["--strict", "--check-config=/x.toml"]).unwrap(),
+            Command::CheckConfig {
+                path: "/x.toml".into(),
+                strict: true
+            }
+        );
+        assert!(p(&["--check-config"]).is_err());
+        assert!(p(&["--check-config", "--strict"]).is_err());
+        assert!(p(&["--check-config="]).is_err());
+        assert!(p(&["--check-config", "a", "--check-config", "b"]).is_err());
+        assert!(p(&["--check-config", "a", "--profile", "p.json"]).is_err());
+        assert!(p(&["--check-config", "a", "stray"]).is_err());
     }
 
     #[test]

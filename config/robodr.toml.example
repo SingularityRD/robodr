@@ -46,11 +46,20 @@ rate_limit_burst = 20
 # ... then one more per rule per this many ms (1..=3600000). Profile and
 # binding rules (robot.ros2.*) are never rate limited.
 rate_limit_interval_ms = 6000
+# SROS 2 robots: the keystore's enclaves/ directory (only governance.xml and
+# the permissions.xml files are read, never keys). A participant announcing
+# no DDS-Security identity on a domain that requires one, or a certificate
+# subject no grant names, is reported (robot.ros2.untrusted_security_identity).
+# Check with: robodr-ros2-watch --check-config (it also says what the
+# governance leaves visible). See docs/DDS-TRANSPORTS.md.
+# sros2_keystore = "/etc/robodr/sros2/enclaves"
 
 # Passive capture: sees the unicast SEDP announcements (who writes which
 # topic, e.g. a foreign writer on rt/cmd_vel) and loopback traffic that the
 # SPDP socket cannot. Read-only AF_PACKET; the daemon needs CAP_NET_RAW.
-# Shared-memory DDS transports are invisible to it (see robodr-capture docs).
+# Shared-memory DDS transports are invisible to it: commission the robot with
+# UDP-only transports (docs/DDS-TRANSPORTS.md); participants advertising
+# shared-memory locators are reported (robot.capture.unsupported_transport).
 [module.robodr-sensor-ros2.capture]
 enabled = false
 # Interfaces to capture on. Omit for ["lo", <default-route interface>]
