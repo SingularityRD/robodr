@@ -12,7 +12,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/X.Y: an LTS release commit needs a CI run of its own
+    # (scripts/release-gate.py ci; docs/RELEASE.md section 6).
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
   schedule:

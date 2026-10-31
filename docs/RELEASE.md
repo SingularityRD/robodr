@@ -127,11 +127,10 @@ the repository.
    `ci.yml`'s jobs as required status checks and required reviews; a tag
    ruleset for `v*` (only maintainers create, no update or deletion).
    These settings are not applied by anything in the repository; an
-   administrator sets them. `ci.yml` runs on pushes to `main` only, so an
-   LTS release commit on `release/X.Y` has no CI run of its own: start
-   `ci.yml` by hand on that branch (`workflow_dispatch`, which the gate
-   counts; the run uses the commit's own `ci.yml`), or add a `release/**`
-   push trigger to `ci.yml`.
+   administrator sets them. `ci.yml` runs on pushes to `main` and to
+   `release/**`, so an LTS release commit on `release/X.Y` gets its own CI
+   run when it is pushed (a run started by hand, `workflow_dispatch`, also
+   counts; either uses the commit's own `ci.yml`).
 2. Release commit on main (or on `release/X.Y`, section 6) via a reviewed PR:
    - `VERSION` = the new version (`0.1.0-alpha.2`, `0.1.0-rc.1`, `0.1.0`);
    - `Cargo.toml` `[workspace.package] version` = the same, then
@@ -297,9 +296,10 @@ released from a protected branch `release/0.1`:
 1. Create `release/0.1` from the last `v0.1.*` tag; protect it like `main`
    (required reviews, `ci.yml` jobs as required checks, no force push).
    The release commit needs a successful `ci.yml` run of its own: `ci.yml`
-   runs on pushes to `main` only, so start it by hand on `release/0.1`
-   (`workflow_dispatch`, which the CI gate counts), or add a `release/**`
-   push trigger to `ci.yml` (section 3, step 1).
+   runs on pushes to `release/**` (a `workflow_dispatch` run on the branch
+   also counts; section 3, step 1). GitHub reads the trigger from the
+   branch's own `ci.yml`: a line cut from a tag older than the
+   `release/**` trigger needs the `workflow_dispatch` run.
 2. Cherry-pick or backport the fix with a reviewed PR into `release/0.1`;
    release commit as in section 3 (version `0.1.4`).
 3. Tag `v0.1.4` on that branch. `prepare` accepts it only because the commit
