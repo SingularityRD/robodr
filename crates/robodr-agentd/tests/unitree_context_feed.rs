@@ -298,12 +298,16 @@ struct Bus {
 
 impl Bus {
     fn new(feed: serde_json::Value) -> Self {
+        Self::with_options(feed, PipelineOptions::default())
+    }
+
+    fn with_options(feed: serde_json::Value, opts: PipelineOptions) -> Self {
         let p = profile(false);
         let sec: SafetyFeedSection = serde_json::from_value(feed).unwrap();
         let (spec, w) = sec.resolve(&p).unwrap();
         assert!(w.is_empty(), "{w:?}");
         let mut b = Bus {
-            pipeline: Pipeline::new(p, PipelineOptions::default()),
+            pipeline: Pipeline::new(p, opts),
             feed: SafetyFeed::new(spec),
             sn: 0,
         };
@@ -726,6 +730,76 @@ fn a_latched_lifecycle_reading_ends_with_its_participant() {
         2_000,
     );
     assert!(stale(b.ctx(2_000)), "the writer left");
+}
+
+#[test]
+fn a_wrong_ip_spdp_of_a_pinned_participant_is_no_refresh() {
+    // Pinned, so a second host's SPDP does not contest the prefix: only
+    // the IP check stands between it and a refresh of the latched reading.
+    let active = |c: LiveContext| (c.control, c.phase) == (C::Autonomous, P::Transit);
+    let stale = |c: LiveContext| (c.control, c.phase) == (C::Manual, P::Unknown);
+    let mut opts = PipelineOptions::default();
+    opts.binding
+        .participant_ips
+        .insert(LEGIT, vec![ROBOT_IP.into()]);
+    let mut b = Bus::with_options(lifecycle_only(), opts);
+    b.send(LIFE_W, &transition(3), 1_000);
+    b.raw(ROGUE_IP, spdp_with_lease(LEGIT, ROGUE_IP, 600), 90_000);
+    assert!(!b.pipeline.binding().is_contested(&LEGIT));
+    assert!(active(b.ctx(101_000)));
+    assert!(
+        stale(b.ctx(101_001)),
+        "an SPDP from an IP outside the pin must not extend the latch"
+    );
+    // The pinned IP's SPDP does.
+    b.send(LIFE_W, &transition(3), 200_000);
+    b.raw(ROBOT_IP, spdp_with_lease(LEGIT, ROBOT_IP, 600), 290_000);
+    assert!(active(b.ctx(890_000)));
+    assert!(stale(b.ctx(890_001)));
+}
+
+#[test]
+fn only_a_self_or_relayed_dispose_ends_a_latched_reading() {
+    let active = |c: LiveContext| (c.control, c.phase) == (C::Autonomous, P::Transit);
+    let stale = |c: LiveContext| (c.control, c.phase) == (C::Manual, P::Unknown);
+    let participant = guid(LEGIT, [0, 0, 1, 0xc1]);
+    // Another participant on the same (bound) IP disposes LEGIT, or its
+    // lifecycle writer, under its own prefix: not a self-dispose, ignored.
+    let mut b = Bus::new(lifecycle_only());
+    b.send(LIFE_W, &transition(3), 1_000);
+    b.raw(
+        ROBOT_IP,
+        dispose(ROGUE, ENTITY_SPDP_WRITER, participant),
+        2_000,
+    );
+    assert!(
+        active(b.ctx(2_000)),
+        "a participant dispose by another prefix"
+    );
+    b.raw(
+        ROBOT_IP,
+        dispose(ROGUE, ENTITY_SEDP_PUB_WRITER, guid(LEGIT, LIFE_W)),
+        3_000,
+    );
+    assert!(active(b.ctx(3_000)), "a writer dispose by another prefix");
+    // The latch still ends with its lease.
+    assert!(stale(b.ctx(101_001)));
+
+    // A configured discovery server relays the participant's dispose.
+    let relay = Ipv4Addr::new(10, 0, 0, 77);
+    let mut opts = PipelineOptions::default();
+    opts.binding.discovery_servers.push(relay.into());
+    let mut b = Bus::with_options(lifecycle_only(), opts);
+    b.send(LIFE_W, &transition(3), 1_000);
+    b.raw(
+        relay,
+        dispose(ROGUE, ENTITY_SPDP_WRITER, participant),
+        2_000,
+    );
+    assert!(
+        stale(b.ctx(2_000)),
+        "a relayed dispose from a discovery server"
+    );
 }
 
 #[test]

@@ -1629,6 +1629,13 @@ impl BindingTable {
         }
     }
 
+    /// `ip` (seen on `ingress`) is a configured discovery server, so a
+    /// participant removal it relays for another prefix is trusted (as
+    /// [`BindingTable::observe_participant_removal`] judges it).
+    pub fn is_trusted_relay(&self, ip: IpAddr, ingress: Ingress) -> bool {
+        self.trusted_relay(canonical_ip(ip), ingress)
+    }
+
     fn trusted_relay(&self, ip: IpAddr, ingress: Ingress) -> bool {
         self.opts.discovery_servers.contains(&ip)
             || (self.same_host_loopback(ip, ingress)

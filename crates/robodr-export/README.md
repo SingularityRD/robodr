@@ -371,7 +371,9 @@ later record. The loop makes that visible and keeps it cheap:
   errors) up to `--refused-backoff-max-s` (900 s): under 200 refused
   requests a day instead of ~1440 (each `401` is an audit-log entry on the
   SOC); never less than the last `Retry-After`.
-* **`<state>/uplink-status.json`** (atomic, after every run;
+* **`<state>/uplink-status.json`** (atomic, after every run; mode 0640,
+  so the service's group, `robodr` in the shipped unit, can read it:
+  `robodr-agentd` reads its live connectivity from it;
   `robodr-uplink-status/1`): `state` (`ok`, `retrying`, `blocked`),
   `last_success_at_ms`, `last_delivery_at_ms`, `last_error` {`kind`,
   `status`, `code`, `message`, `retry_after_s`}, `consecutive_failures`,

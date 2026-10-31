@@ -143,9 +143,18 @@
 //! [`MIN_LATCH_LEASE_MS`]..=[`MAX_LATCH_LEASE_MS`];
 //! [`DEFAULT_LATCH_LEASE_MS`] when none was announced or remembered). An
 //! SPDP dispose of the participant, or an SEDP dispose of the writer, drops
-//! the reading at once, unless it came from an IP outside the
-//! participant's binding (a spoofer's dispose is ignored; one that gets
-//! through only makes the source read `on_stale`). Without a live reading
+//! the reading at once when the participant sent it itself (RTPS source
+//! prefix = the disposed participant) from an IP not outside its binding,
+//! or when a configured discovery server relayed it. A dispose sent under
+//! another participant's prefix, or from an IP outside the binding, is
+//! ignored. The source prefix is not authenticated, so a process on a bound
+//! IP, or any host once an unpinned participant has no binding (it lapsed,
+//! or the participant already left), can still end the reading early; that
+//! only makes the source read `on_stale`. A spoofed
+//! SPDP from another host does not refresh the reading, but it marks an
+//! unpinned prefix contested, which stops later legit refreshes until the
+//! prefix is pinned in `participant_ips` (the reading then ends with its
+//! lease, again `on_stale`). Without a live reading
 //! the source's fields read `on_stale`. So a crashed node holds its last
 //! state for at most one lease (at most [`MAX_LATCH_LEASE_MS`] after its
 //! last trusted SPDP or event), and indefinitely only while its
@@ -1755,7 +1764,7 @@ impl SafetyFeed {
                 spec.decoder.type_label()
             ));
         }
-        let prefix: [u8; 12] = guid[..12].try_into().unwrap_or_default();
+        let prefix: [u8; 12] = guid.first_chunk::<12>().copied().unwrap_or_default();
         let prefix_hex = hex12(&prefix);
         if !profile.participants.contains(&prefix_hex) {
             return Some("its participant is not in the profile".into());
@@ -1797,7 +1806,7 @@ impl SafetyFeed {
 
     /// The lease of `writer`'s participant for a latched reading.
     fn lease_ms(&self, writer: &Guid) -> u64 {
-        let prefix: [u8; 12] = writer[..12].try_into().unwrap_or_default();
+        let prefix: [u8; 12] = writer.first_chunk::<12>().copied().unwrap_or_default();
         self.leases
             .get(&prefix)
             .copied()
@@ -1808,8 +1817,11 @@ impl SafetyFeed {
     /// a writer's participant extends its readings by one lease; a dispose
     /// of the participant or of the writer drops them. A refresh counts only
     /// from an IP bound to the participant (as the pipeline judged this
-    /// datagram); a dispose is ignored only from an IP outside the binding
-    /// (after a legit self-dispose the pipeline has already removed it).
+    /// datagram). A dispose counts when the participant sent it itself
+    /// (RTPS source prefix = the disposed prefix) from an IP not outside its
+    /// binding (after a legit self-dispose the pipeline has already removed
+    /// the binding, so an unbound prefix is not refused), or when a
+    /// configured discovery server relayed it.
     fn track_liveness(
         &mut self,
         report: &robodr_rtps::DatagramReport,
@@ -1848,10 +1860,19 @@ impl SafetyFeed {
                 }
             }
         }
-        let refused =
-            |prefix: &[u8; 12]| binding.allows_from(prefix, ip, datagram.ingress) == Some(false);
+        // As the binding judges a participant removal: one relayed for
+        // another prefix counts only from a configured discovery server;
+        // a self-removal only from an IP not outside the binding.
+        let relay = binding.is_trusted_relay(ip, datagram.ingress);
+        let refused = |prefix: &[u8; 12], source: &[u8; 12]| {
+            if source != prefix {
+                !relay
+            } else {
+                binding.allows_from(prefix, ip, datagram.ingress) == Some(false)
+            }
+        };
         for r in &report.removed_participants {
-            if refused(&r.guid_prefix) {
+            if refused(&r.guid_prefix, &r.source) {
                 continue;
             }
             let prefix_hex = hex12(&r.guid_prefix);
@@ -1864,7 +1885,7 @@ impl SafetyFeed {
             let Some(g) = r.guid.filter(|_| r.kind == EndpointKind::Writer) else {
                 continue;
             };
-            if refused(&r.participant) {
+            if refused(&r.participant, &r.source) {
                 continue;
             }
             let writer = hex_guid(&g);

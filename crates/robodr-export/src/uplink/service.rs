@@ -27,7 +27,7 @@
 //! be silent:
 //!
 //! * `<state>/uplink-status.json` ([`STATUS_FILE`], atomically replaced
-//!   after every run): state (`ok`, `retrying`, `blocked`), last success,
+//!   after every run, mode 0640 so the service's group can read it): state (`ok`, `retrying`, `blocked`), last success,
 //!   last delivery, last error (kind, HTTP status, server code, message),
 //!   `stuck_since_ms` (start of the current failure streak, kept across
 //!   restarts while the same batch is pending), the pending batch id, its
@@ -52,6 +52,10 @@ use std::time::Duration;
 
 /// Status file in the state directory.
 pub const STATUS_FILE: &str = "uplink-status.json";
+/// Mode of [`STATUS_FILE`]: group-readable, so `robodr-agentd` (group
+/// `robodr` in the shipped units, like this service's `Group=`) can read the
+/// connectivity it carries.
+pub const STATUS_FILE_MODE: u32 = 0o640;
 pub const STATUS_FORMAT: &str = "robodr-uplink-status/1";
 /// Exit code when failures lasted [`ServiceConfig::exit_when_stuck_after`].
 pub const EXIT_STUCK: u8 = 3;
@@ -354,7 +358,9 @@ pub fn failure_delay(cfg: &ServiceConfig, failures: u32, e: &UplinkError, rand: 
 fn write_status(state_dir: &Path, st: &Status, log: &mut dyn FnMut(&str), warned: &mut bool) {
     let res = serde_json::to_vec_pretty(st)
         .map_err(|e| std::io::Error::other(e.to_string()))
-        .and_then(|b| fsutil::atomic_write(&state_dir.join(STATUS_FILE), &b));
+        .and_then(|b| {
+            fsutil::atomic_write_mode(&state_dir.join(STATUS_FILE), &b, STATUS_FILE_MODE)
+        });
     match res {
         Ok(()) => *warned = false,
         Err(e) if !*warned => {

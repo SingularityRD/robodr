@@ -19,6 +19,12 @@ fn parent(p: &Path) -> &Path {
 /// Replace `path` atomically: write `.<name>.tmp` beside it (mode 0600),
 /// fsync, rename, fsync the directory.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_mode(path, bytes, 0o600)
+}
+
+/// [`atomic_write`] with the file created as `mode` (still masked by the
+/// process umask).
+pub fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let dir = parent(path);
     let name = path
         .file_name()
@@ -29,7 +35,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
