@@ -1,14 +1,16 @@
 # Detection catalog
 
-> **Pre-release draft (2026-10-30).** Every rule id RoboDR can report, as
-> catalogued in the `robodr.findings` contract **2.4**
+> **Pre-release draft (2026-10-31).** Every rule id RoboDR can report, as
+> catalogued in the `robodr.findings` contract **2.5**
 > ([`docs/contracts/robodr.findings.md`](../contracts/robodr.findings.md)).
 > The tables at the end are generated from the rule catalog in the code
 > (`crates/robodr-ocsf/src/builder.rs`) by
 > `scripts/check-detection-catalog.py`, which fails when this page and the
 > code disagree. Verification levels (V0–V3) are those of
 > [`support-matrix.md`](support-matrix.md). Nothing here has been verified
-> on a customer robot.
+> on a customer robot. Three ids are catalogued in 2.5 for features
+> that do not emit them yet: `robot.agent.control_plane_request_fenced`,
+> `robot.agent.selftest` and `robot.gateway.overload`.
 
 ## How to read a finding
 
@@ -46,7 +48,7 @@ makes them `enforce`.
 |---|---|---|---|---|
 | `robot.capture.*`, `robot.rtps.*`, `robot.sensor.*` | `robodr-agentd` (sensor pipeline) | Live capture (AF_PACKET) or pcap replay of the robot bus | **Yes**: packet health, malformed / fragmented / uninspected discovery, Zenoh detected (not decoded) | V2 (real ROS 2 Jazzy captures, red team R3) |
 | `robot.agent.*` | `robodr-agentd` | Nothing beyond a running agent; `executor_*` need the executor, `control_plane_*` the control plane | **Yes**: self-health (silent / ended / malformed input, queue overflow, lag, spool full, black-box degraded / quarantined / truncated) | V2 (soak and red team in a lab VM) |
-| `robot.host.pulsar_threat` | `robodr-pulsard` (Pulsar rules) → `robodr-agentd` | Linux ≥ 5.5 with BTF, `robodr-pulsard` running as root; not in `robodr-focal` | **Yes** | V2 under WSL2 only; rules never loaded on a robot |
+| `robot.host.*` (one id per Pulsar rule RoboDR ships; `robot.host.pulsar_threat` for any other Pulsar rule) | `robodr-pulsard` (Pulsar rules) → `robodr-agentd` | Linux ≥ 5.5 with BTF, `robodr-pulsard` running as root; not in `robodr-focal` | **Yes** | V2 under WSL2 only; rules never loaded on a robot |
 | `robot.ros2.*`, `robot.dds.*` | `robodr-agentd` (sensor pipeline, detection core) | A profile: participants, topics, services, actions, readers, motion writers | No: without a profile every participant is unknown | V2 (Jazzy captures, Fast DDS and Cyclone DDS) |
 | `robot.motion.*_over_envelope`, `unprofiled_channel`, `command_type_mismatch`, `control_handover`, `api_id_out_of_range` | `robodr-agentd` (detection core) | A profile with motion envelopes, learned from clean runs | No | `Twist` V2; other motion types and Unitree V1 |
 | `robot.motion.*` (feedback: `uncommanded_motion`, `frozen_feedback`, `feedback_divergence`, `cross_sensor_disagreement`, …) | `robodr-agentd` (`robodr-motion`) | `sensor.motion.feedback_topics` (odometry, IMU, joint state) | Partly: needs the feedback topics, not the profile's graph | V2 (Gazebo `/odom`), others V1 |
@@ -79,9 +81,10 @@ then report from the first minute; the others report against the draft.
   industrial controllers: not on the GA scope ([`README.md`](../../README.md),
   "Scope").
 - Host detections on JetPack 5 (`robodr-focal` has no `robodr-pulsard`).
-- Each Pulsar host rule is reported under the one id
-  `robot.host.pulsar_threat` (the detail names the Pulsar rule), so a
-  response policy cannot single one host rule out.
+- A Pulsar rule RoboDR does not ship (a site's own rule, or a shipped
+  rule renamed on the unit) has no id of its own: it is reported as
+  `robot.host.pulsar_threat`, and only the detail names the rule, so a
+  response policy cannot single it out.
 
 ## Catalog
 
@@ -93,26 +96,35 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-152 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+248 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (15)
+### `robot.agent.*` (24)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
+| `robot.agent.clock_jump` | Robot wall clock jumped | `robodr_agent` | — | 2.5 |
+| `robot.agent.clock_unsynced` | Robot clock not synchronised | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | `robodr_agent` | — | 1.3 |
+| `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | `robodr_agent` | — | 2.4 |
 | `robot.agent.control_plane_unauthenticated` | Control-plane request failed authentication | `robodr_agent` | — | 1.3 |
 | `robot.agent.correlation_pressure` | Correlation engine state under pressure | `robodr_agent` | — | 1.3 |
+| `robot.agent.credential_expiring` | Agent credential expires soon | `robodr_agent` | — | 2.5 |
+| `robot.agent.disk_low` | Agent storage running out of space | `robodr_agent` | — | 2.5 |
 | `robot.agent.evidence_degraded` | Black-box recording failing | `robodr_agent` | — | 1.3 |
 | `robot.agent.evidence_quarantined` | Damaged black-box segment quarantined | `robodr_agent` | — | 1.3 |
 | `robot.agent.evidence_truncated` | Black-box records cut after the newest mark | `robodr_agent` | — | 1.3 |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | `robodr_agent` | — | 2.4 |
+| `robot.agent.executor_pause_overridden` | Robot set moving while paused | `robodr_agent` | — | 2.5 |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | `robodr_agent` | — | 2.4 |
+| `robot.agent.executor_unreachable` | Response executor unreachable | `robodr_agent` | — | 2.5 |
+| `robot.agent.health` | Agent health record | `robodr_agent` | — | 2.5 |
 | `robot.agent.input_ended` | Agent input ended | `robodr_agent` | — | 1.3 |
 | `robot.agent.input_malformed` | Malformed agent input | `robodr_agent` | — | 1.3 |
 | `robot.agent.input_silent` | Agent input silent | `robodr_agent` | — | 1.3 |
 | `robot.agent.pipeline_lag` | Agent pipeline lagging | `robodr_agent` | — | 1.3 |
 | `robot.agent.queue_overflow` | Agent input queue overflowed | `robodr_agent` | — | 1.3 |
+| `robot.agent.selftest` | Agent field acceptance self-test | `robodr_agent` | — | 2.5 |
 | `robot.agent.spool_full` | Finding spool full or failing | `robodr_agent` | — | 1.3 |
 
 ### `robot.capture.*` (9)
@@ -207,12 +219,13 @@ correlation entry.
 | `robot.firewall.rejected_unknown_channel` | Motion command rejected: unknown channel | `ros2_motion_commands` | T0855 | 1.3 |
 | `robot.firewall.rejected_unknown_source` | Motion command rejected: unknown source | `ros2_motion_commands` | T0855 | 1.3 |
 
-### `robot.gateway.*` (9)
+### `robot.gateway.*` (10)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
 | `robot.gateway.findings_dropped` | In-path gateway findings lost | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.fragmented_command` | Fragmented motion command blocked by the in-path gateway | `ros2_motion_commands` | — | 2.3 |
+| `robot.gateway.overload` | In-path gateway overloaded | `ros2_motion_commands` | — | 2.5 |
 | `robot.gateway.port_bypass_risk` | Motion traffic may bypass the in-path gateway | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.restriction_changed` | Motion restriction changed on the in-path gateway | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.sequence_jump` | Motion command sequence jump held back | `ros2_motion_commands` | — | 2.3 |
@@ -221,11 +234,97 @@ correlation entry.
 | `robot.gateway.undecodable_command` | Undecodable motion command blocked by the in-path gateway | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.writer_binding_conflict` | Authorised motion writer seen from another address | `ros2_motion_commands` | — | 2.3 |
 
-### `robot.host.*` (1)
+### `robot.host.*` (87)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
+| `robot.host.autostart_moved` | Service or autostart entry moved into place outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.autostart_written` | Service or autostart entry written outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.bluetooth_keys_modified` | Bluetooth pairing keys or configuration modified outside bluetoothd | `host_runtime` | — | 2.5 |
+| `robot.host.bluetooth_keys_moved` | Bluetooth pairing keys or configuration moved into place outside bluetoothd | `host_runtime` | — | 2.5 |
+| `robot.host.bluetooth_tooling_executed` | Bluetooth tooling executed on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.boot_hook_linked` | Boot, network or udev hook linked outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.boot_hook_moved` | Boot, network or udev hook moved into place outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.boot_hook_written` | Boot, network or udev hook written outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.deb_database_changed` | Debian package database changed | `host_runtime` | — | 2.5 |
+| `robot.host.deb_installed` | Debian package installed on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.deb_maintainer_script` | Debian package maintainer script executed | `host_runtime` | — | 2.5 |
+| `robot.host.debugger_started` | Debugger or tracer started on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.elf_from_writable_dir` | ELF opened from a world-writable or user cache directory | `host_runtime` | — | 2.5 |
+| `robot.host.exec_from_fd` | Program executed from a file descriptor or /proc path | `host_runtime` | — | 2.5 |
+| `robot.host.exec_from_tmp` | Program executed from a temporary directory | `host_runtime` | — | 2.5 |
+| `robot.host.exec_noncanonical_path` | Program executed through a non-canonical path | `host_runtime` | — | 2.5 |
+| `robot.host.interactive_python` | Interactive or stdin-fed Python interpreter started | `host_runtime` | — | 2.5 |
+| `robot.host.interactive_shell` | Interactive shell started on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.interpreter_one_liner` | Interpreter one-liner executed | `host_runtime` | — | 2.5 |
+| `robot.host.kernel_module_autoload_changed` | Kernel module autoload configuration changed | `host_runtime` | — | 2.5 |
+| `robot.host.kernel_module_linked` | Kernel module file or autoload configuration linked into place outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.kernel_module_moved` | Kernel module file or autoload configuration moved into place outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.kernel_module_written` | Kernel module file written outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.library_from_tmp` | Shared library opened from a temporary directory | `host_runtime` | — | 2.5 |
+| `robot.host.linker_path_changed` | Dynamic linker search path changed | `host_runtime` | — | 2.5 |
+| `robot.host.login_shell` | Login shell started on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.node_package_installed` | Node.js package installed with npm, npx, pnpm or yarn | `host_runtime` | — | 2.5 |
+| `robot.host.overlay_vpn` | Remote-access overlay VPN started on robot | `host_runtime` | — | 2.5 |
+| `robot.host.package_manager_foreign_elf` | Package manager mapped an ELF from outside the system paths | `host_runtime` | — | 2.5 |
+| `robot.host.package_manager_foreign_library` | Package manager loaded a library from outside the system library paths | `host_runtime` | — | 2.5 |
+| `robot.host.pip_installed` | Python package installed on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.proc_memory_written` | Process memory written through /proc | `host_runtime` | — | 2.5 |
+| `robot.host.protected_dir_deleted` | RoboDR or Pulsar protected directory deleted | `host_runtime` | — | 2.5 |
+| `robot.host.protected_file_deleted` | RoboDR or Pulsar protected file deleted | `host_runtime` | — | 2.5 |
+| `robot.host.protected_file_renamed` | RoboDR or Pulsar protected file or directory renamed | `host_runtime` | — | 2.5 |
+| `robot.host.protected_file_written` | RoboDR or Pulsar protected file written | `host_runtime` | — | 2.5 |
+| `robot.host.protected_path_dir_created` | Directory created in a RoboDR or Pulsar protected path | `host_runtime` | — | 2.5 |
+| `robot.host.protected_path_file_created` | File or device node created in a RoboDR or Pulsar protected path | `host_runtime` | — | 2.5 |
+| `robot.host.protected_path_linked` | Link created in or to a RoboDR or Pulsar protected path | `host_runtime` | — | 2.5 |
+| `robot.host.provisioning_ip_connection` | Bluetooth daemon or Wi-Fi provisioning script opened an IP connection | `host_runtime` | — | 2.5 |
+| `robot.host.pty_wrapper` | Pseudo-terminal wrapper executed on robot controller | `host_runtime` | — | 2.5 |
 | `robot.host.pulsar_threat` | Host runtime-security detection (Pulsar rule) | `host_runtime` | — | 1.3 |
+| `robot.host.python_env_file_created` | File created in the system or ROS Python environment outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.python_env_file_moved` | File moved into the system or ROS Python environment outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.python_env_linked` | Link created in the system or ROS Python environment outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.python_tool_installed` | Python package installed with uv, pipx, poetry or conda/mamba | `host_runtime` | — | 2.5 |
+| `robot.host.reverse_tunnel_client` | Reverse tunnel client executed on robot | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_external_connection` | ROS 2 process connects outside the robot's networks | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_foreign_elf_mapped` | ROS 2 process mapped an ELF from outside the allowlisted paths | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_foreign_library` | ROS 2 process loaded a library from outside the allowlisted library paths | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_foreign_python` | ROS 2 process imported Python code from outside the allowlisted paths | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_install_tree_file_placed` | File created or moved into the ROS 2 install tree outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_install_tree_linked` | Link created inside the ROS 2 install tree outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_install_tree_written` | ROS 2 install tree written outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.ros2_ld_preload` | ROS 2 process loaded /etc/ld.so.preload | `host_runtime` | — | 2.5 |
+| `robot.host.service_enabled` | Service enabled, masked or linked outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.service_stop_attempt` | Attempt to stop the Pulsar or RoboDR service | `host_runtime` | — | 2.5 |
+| `robot.host.shell_network_connection` | Shell or netcat-style tool opened a network connection | `host_runtime` | — | 2.5 |
+| `robot.host.shell_startup_linked` | Shell startup or login environment file linked | `host_runtime` | — | 2.5 |
+| `robot.host.shell_startup_modified` | Shell startup or login environment file modified | `host_runtime` | — | 2.5 |
+| `robot.host.shell_startup_moved` | Shell startup or login environment file moved into place | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_ca_key_accessed` | SROS 2 CA private key accessed on robot | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_enclave_linked` | Link created inside an SROS 2 enclave directory | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_foreign_security_files` | SROS 2 security files loaded from outside the commissioned keystore | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_key_linked` | Link created to an SROS 2 private key | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_key_read` | SROS 2 enclave private key read by a process outside the ROS stack | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_keystore_replaced` | SROS 2 keystore file renamed or replaced | `host_runtime` | — | 2.5 |
+| `robot.host.sros2_keystore_written` | SROS 2 keystore file written | `host_runtime` | — | 2.5 |
+| `robot.host.ssh_tunnel` | SSH reverse or dynamic tunnel with bundled options | `host_runtime` | — | 2.5 |
+| `robot.host.system_library_linked` | Link created in a system library path or linker configuration outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.system_library_moved` | File moved into a system library path or linker configuration outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.system_library_opened_for_write` | Existing file in a system library path opened for writing outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.system_library_written` | Shared library written into a system library path outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.unexpected_rmw_library` | Unexpected ROS 2 middleware (RMW) library loaded | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_dds_config_modified` | Unitree DDS configuration modified | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_dds_config_moved` | Unitree DDS configuration moved into place | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_external_connection` | Unitree robot process connects outside the allowlisted destinations | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_sdk_linked` | Unitree SDK or Cyclone DDS library linked outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_sdk_modified` | Unitree SDK or Cyclone DDS library modified outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_sdk_moved` | Unitree SDK or Cyclone DDS library moved into place outside the package manager | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_wifi_script_executed` | Unitree Wi-Fi provisioning script executed | `host_runtime` | — | 2.5 |
+| `robot.host.unitree_wifi_script_opened` | Unitree Wi-Fi provisioning script opened | `host_runtime` | — | 2.5 |
+| `robot.host.wifi_tooling_executed` | Wi-Fi configuration tooling executed on robot controller | `host_runtime` | — | 2.5 |
+| `robot.host.wireless_config_linked` | Link created in a wireless network configuration directory | `host_runtime` | — | 2.5 |
+| `robot.host.wireless_config_modified` | Wireless network configuration modified | `host_runtime` | — | 2.5 |
+| `robot.host.wireless_config_moved` | Wireless network configuration moved into or out of place | `host_runtime` | — | 2.5 |
+| `robot.host.writable_dir_public_connection` | Program in a user-writable directory connects to a public address | `host_runtime` | — | 2.5 |
 
 ### `robot.motion.*` (20)
 
