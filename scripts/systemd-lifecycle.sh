@@ -19,7 +19,9 @@
 #      its heartbeat counter advances, the black box verifies INTACT with
 #      the key's .pub;
 #   3. upgrade to N: the version changed; the key, agentd.json and every
-#      black-box segment written before are unchanged; the daemon is (still
+#      black-box segment written before are unchanged (hashed in full; the
+#      newest one, which may still grow, on its first 4 KiB, see
+#      scripts/lifecycle-state.sh); the daemon is (still
 #      or again) active and heartbeating; the black box verifies INTACT
 #      across the upgrade (one chain, no gap);
 #   4. rollback to N-1 (apt-get --allow-downgrades / dnf downgrade): the
@@ -154,20 +156,17 @@ verify_bb() { # label
         echo "systemd-lifecycle: $1: $(grep -E '^frames' <<<"$out")" >&2
     fi
 }
-snapshot() { # -> stdout: sha256 of key, config and every black-box segment
-    sha256sum "$key" "$key.pub" /etc/robodr/agentd.json
-    # Sealed segments do not change once a newer one exists; the newest one
-    # grows, so only its first bytes are compared.
-    local segs
-    mapfile -t segs < <(find /var/lib/robodr/blackbox/agentd -name 'seg-*.rbb' | LC_ALL=C sort)
-    for s in "${segs[@]}"; do
-        printf '%s  %s\n' "$(head -c 4096 "$s" | sha256sum | cut -d' ' -f1)" "$s (first 4 KiB)"
-    done
+# seg_hash, state_snapshot, state_changed (tested by
+# scripts/test-lifecycle-state.sh).
+# shellcheck source=scripts/lifecycle-state.sh
+. "$(dirname "$0")/lifecycle-state.sh"
+snapshot() { # -> stdout: the key, config and every black-box segment
+    state_snapshot /var/lib/robodr/blackbox/agentd "$key" "$key.pub" /etc/robodr/agentd.json
 }
 same_state() { # label before-file
-    local missing
-    missing="$(snapshot | diff "$2" - | grep '^<' || true)"
-    [[ -z "$missing" ]] || bad "$1: state changed or lost: $missing"
+    local changed
+    changed="$(state_changed "$2")"
+    [[ -z "$changed" ]] || bad "$1: state changed or lost:$changed"
 }
 
 step "2. heartbeat on N-1"

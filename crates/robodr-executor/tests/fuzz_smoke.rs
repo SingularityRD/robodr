@@ -137,8 +137,44 @@ fn soc_seeds_take_the_success_paths() {
     assert_eq!(accepted, executor_soc::seeds().len() - 1);
 }
 
-/// A request signed for this robot but tampered after signing (body,
-/// target, timestamp, robot) never verifies through the harness.
+fn soc_cx(keys: &[SocKey]) -> Context<'_> {
+    Context {
+        keys,
+        robot_id: executor_soc::ROBOT,
+        max_skew_s: executor_soc::SKEW_S,
+        now_ms: executor_soc::NOW_S * 1000,
+    }
+}
+
+fn soc_keys() -> [SocKey; 1] {
+    [SocKey {
+        key_id: executor_soc::KEY_ID.into(),
+        public: robodr_blackbox::sign_ed25519::public_key_from_seed(&executor_soc::SEED),
+    }]
+}
+
+/// `verify` on `text` (an `Order` as JSON) with a fresh replay store.
+fn soc_verifies(text: &str, tag: &str) -> bool {
+    let keys = soc_keys();
+    let tmp = std::env::temp_dir().join(format!(
+        "robodr-executor-soc-tamper-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut replay = ReplayStore::open(&tmp, executor_soc::NOW_S, executor_soc::SKEW_S, false);
+    let order: Order = serde_json::from_str(text).unwrap();
+    let ok = verify(&order, &soc_cx(&keys), &mut replay).is_ok();
+    let _ = std::fs::remove_dir_all(&tmp);
+    ok
+}
+
+/// A signed order changed after signing never verifies: an order field the
+/// SOC signed (id, ttl, requested_by: the first occurrence, in the `Order`)
+/// changed alone is `order_mismatch`; the same field changed inside the
+/// signed body (the last occurrence, in `soc.body`), or the robot in the
+/// signed target, breaks the signature. Each case goes through the harness
+/// too, whose invariants must hold on it.
 #[test]
 fn soc_tampered_requests_are_refused() {
     let seeds = executor_soc::seeds();
@@ -147,16 +183,97 @@ fn soc_tampered_requests_are_refused() {
         .find(|(n, _)| *n == "1-signed-quarantine")
         .unwrap();
     let text = std::str::from_utf8(&signed[1..]).unwrap();
-    for (from, to) in [
-        ("req-quarantine-1", "req-quarantine-2"),
-        ("\"ttl_s\":60", "\"ttl_s\":6000"),
-        ("analyst", "analyse"),
-        ("robot-fuzz", "robot-fuzy"),
-    ] {
-        assert!(text.contains(from), "{from}");
+    assert!(
+        soc_verifies(text, "control"),
+        "the untouched order verifies"
+    );
+    let first = |from: &str, to: &str| text.replacen(from, to, 1);
+    let last = |from: &str, to: &str| {
+        let at = text.rfind(from).unwrap();
+        format!("{}{to}{}", &text[..at], &text[at + from.len()..])
+    };
+    let cases = [
+        ("order id", first("req-quarantine-1", "req-quarantine-2")),
+        ("signed id", last("req-quarantine-1", "req-quarantine-2")),
+        ("order ttl", first("\"ttl_s\":60", "\"ttl_s\":6000")),
+        (
+            "signed ttl",
+            last("\\\"ttl_seconds\\\":60", "\\\"ttl_seconds\\\":6000"),
+        ),
+        ("order requested_by", first("analyst", "analyse")),
+        ("signed requested_by", last("analyst", "analyse")),
+        ("signed robot", first("robot-fuzz", "robot-fuzy")),
+    ];
+    for (i, (what, tampered)) in cases.iter().enumerate() {
+        assert_ne!(tampered, text, "{what}: the replacement changed nothing");
+        assert!(
+            !soc_verifies(tampered, &i.to_string()),
+            "{what}: a tampered order verified"
+        );
         let mut input = vec![1u8];
-        input.extend_from_slice(text.replacen(from, to, 1).as_bytes());
+        input.extend_from_slice(tampered.as_bytes());
         executor_soc::run(&input);
+    }
+}
+
+/// The harness's binding oracle (`signed_body_matches`) catches an accepted
+/// order whose fields differ from the body the SOC signed: with it, a
+/// `verify` that stopped comparing the order with the signed body would
+/// fail the fuzz target instead of passing it.
+#[test]
+fn soc_harness_checks_the_order_against_the_signed_body() {
+    use robodr_executor::order::{Origin, Target};
+    let seeds = executor_soc::seeds();
+    let (_, signed) = seeds
+        .iter()
+        .find(|(n, _)| *n == "1-signed-quarantine")
+        .unwrap();
+    let order: Order = serde_json::from_slice(&signed[1..]).unwrap();
+    assert_eq!(executor_soc::signed_body_matches(&order), Ok(()));
+    let mut swaps: Vec<(&str, Order)> = Vec::new();
+    let mut o = order.clone();
+    o.id = "req-other".into();
+    swaps.push(("request_id", o));
+    let mut o = order.clone();
+    o.action = robodr_responder::ActionId::IsolateNetwork;
+    swaps.push(("action", o));
+    let mut o = order.clone();
+    o.ttl_s = Some(6000);
+    swaps.push(("ttl_seconds", o));
+    let mut o = order.clone();
+    o.ttl_s = None;
+    swaps.push(("ttl_seconds", o));
+    let mut o = order.clone();
+    o.origin = Origin::ControlPlane {
+        key_id: executor_soc::KEY_ID.into(),
+        requested_by: "mallory".into(),
+    };
+    swaps.push(("requested_by", o));
+    let mut o = order.clone();
+    o.origin = Origin::ControlPlane {
+        key_id: "other-key".into(),
+        requested_by: "analyst".into(),
+    };
+    swaps.push(("key_id", o));
+    let mut o = order.clone();
+    if let Target::Participant { guid_prefix, .. } = &mut o.target {
+        guid_prefix.0[0] ^= 1;
+    }
+    swaps.push(("target", o));
+    let mut o = order.clone();
+    o.target = Target::None;
+    swaps.push(("target", o));
+    let mut o = order.clone();
+    o.target = Target::Node {
+        name: "/other".into(),
+    };
+    swaps.push(("target", o));
+    for (field, o) in swaps {
+        assert_eq!(
+            executor_soc::signed_body_matches(&o),
+            Err(field.to_string()),
+            "{field}"
+        );
     }
 }
 

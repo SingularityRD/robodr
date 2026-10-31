@@ -34,6 +34,11 @@ root="$(cd "$here/.." && pwd)"
 cd "$root"
 
 # package | test target | extra arguments to the test binary
+#
+# Deliberately not listed: robodr-depot `soak_binaries` (#[ignore], needs
+# ROBODR_SWTPM=1 and the release robodr-deliverd binary). It is a long soak
+# of N lease-gated rollouts through the real binaries, run by hand as its
+# module docs say, not a per-push check.
 SPECS=(
     "robodr-seal|swtpm_harness|"
     "robodr-seal|adversarial|"

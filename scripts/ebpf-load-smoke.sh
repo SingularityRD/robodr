@@ -50,12 +50,17 @@ TRIGGERS=(
 )
 
 pids=()
+# The /etc/robodr trigger creates /etc/robodr too when it is missing (a
+# runner without robodr installed): remove it again then, and only then.
+etc_robodr_existed=0
+[[ -d /etc/robodr ]] && etc_robodr_existed=1
 # shellcheck disable=SC2317 # called by the EXIT trap
 cleanup() {
     for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
     rm -f /etc/ld.so.conf.d/zz-robodr-ebpf-smoke.conf /etc/modules-load.d/zz-robodr-ebpf-smoke.conf
     rmdir /etc/robodr/zz-ebpf-smoke 2>/dev/null || true
+    [[ $etc_robodr_existed == 1 ]] || rmdir /etc/robodr 2>/dev/null || true
     rm -rf "$work"
 }
 trap cleanup EXIT

@@ -60,3 +60,28 @@ fn swtpm_starts_while_another_process_holds_the_old_ports() {
     sw.provision();
     drop(held);
 }
+
+/// Readiness asks whether the swtpm process itself listens, not whether
+/// anything answers on the port while it runs: another process's listener
+/// on the port, with our child alive, fooled the old check
+/// (`listening(port)` and the child still running 50 ms later).
+#[test]
+fn readiness_tells_our_listener_from_another_processes() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let p = l.local_addr().unwrap().port();
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("sleep");
+    // What the old check saw: the port answers and the child is running.
+    assert!(common::listening(p));
+    assert!(other.try_wait().unwrap().is_none());
+    // Only the process that holds the socket listens on it.
+    assert!(common::listens_on(std::process::id(), p));
+    assert!(!common::listens_on(other.id(), p));
+    drop(l);
+    assert!(!common::listens_on(std::process::id(), p));
+    let _ = other.kill();
+    let _ = other.wait();
+}
