@@ -2975,6 +2975,7 @@ dependencies = [
 name = "robodr-ocsf"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "curve25519-dalek",
  "robodr-blackbox",
  "robodr-events",
  "serde",
