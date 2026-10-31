@@ -126,8 +126,12 @@ the repository.
    repository settings: branch protection of `main` and `release/*` with
    `ci.yml`'s jobs as required status checks and required reviews; a tag
    ruleset for `v*` (only maintainers create, no update or deletion).
-   `ci.yml` runs on pushes to `main`; for an LTS line it must also run on
-   pushes to `release/**` (one trigger line in `ci.yml`).
+   These settings are not applied by anything in the repository; an
+   administrator sets them. `ci.yml` runs on pushes to `main` only, so an
+   LTS release commit on `release/X.Y` has no CI run of its own: start
+   `ci.yml` by hand on that branch (`workflow_dispatch`, which the gate
+   counts; the run uses the commit's own `ci.yml`), or add a `release/**`
+   push trigger to `ci.yml`.
 2. Release commit on main (or on `release/X.Y`, section 6) via a reviewed PR:
    - `VERSION` = the new version (`0.1.0-alpha.2`, `0.1.0-rc.1`, `0.1.0`);
    - `Cargo.toml` `[workspace.package] version` = the same, then
@@ -363,7 +367,10 @@ with the release minisign key and trusted comment first**, and builds with
 and verifies all of it with only the exported public key (`gpgv`,
 `rpm -K`) before handing the tree over as the artifact
 `robodr-pkg-repo-<tag>`. Configuration: environment `package-repo` (required
-reviewers) with secrets `REPO_GPG_PRIVATE_KEY` (ASCII-armoured) and
+reviewers; deployment restricted to tags matching `v*`, like `release`, so
+only a tagged commit's own, reviewed `pkg-repo.yml` reaches the key: a
+`release` event runs on its tag, and a manual run must be started from the
+tag, not from a branch, which may carry a modified workflow) with secrets `REPO_GPG_PRIVATE_KEY` (ASCII-armoured) and
 `REPO_GPG_PASSPHRASE`, variable `ROBODR_REPO_GPG_FINGERPRINT`. The OpenPGP
 repository key is generated in the key ceremony (section 2; RSA 4096 or
 Ed25519 per the customers' RHEL crypto policy) and its fingerprint is given
@@ -443,14 +450,18 @@ Every build and rebuild job records what it took from outside the
 repository (`scripts/release-toolchain-inputs.sh`): the container image
 digest, `rustc -vV`, a hash of the target's rust-std, and every C / eBPF
 toolchain package with its version and a fingerprint (rpm's
-`SHA256HEADER`; for dpkg the SHA-256 of the package's file list with
-contents digests). `publish` appends all records to
+`SHA256HEADER`; for dpkg the SHA-256 of the package's installed
+`md5sums` list: dpkg keeps only MD5 digests of the installed files, so
+this detects a changed package but is not a cryptographic hash of the
+`.deb`). `publish` appends all records to
 `REPRODUCIBILITY-<version>.txt`, so drift between the build and the
 independent rebuild, or between two releases, is visible and signed.
 
 `scripts/release-toolchain-inputs.lock` turns records into enforced pins:
 for a job label with lines there, any other version or fingerprint fails
-the build. It is empty on purpose: apt.llvm.org (the eBPF clang of the
+the build. It is empty, so today nothing is pinned and the toolchain
+inputs are only recorded (and signed with the record). It is empty on
+purpose: apt.llvm.org (the eBPF clang of the
 `.deb` build) and Rocky's AppStream do not keep superseded builds, so a pin
 only holds once those packages come from a **hash-pinned mirror** under our
 control (an apt/dnf snapshot repository; hosting is an infrastructure

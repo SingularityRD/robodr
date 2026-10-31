@@ -146,6 +146,11 @@ env:
   # SHA-256 of the v0.27.2 cyclonedx-linux-x64 release binary, recorded from
   # its download on 2026-10-31 (the project publishes no checksum file for
   # this release): bump both together and re-check the hash on two hosts.
+  # A second download on 2026-10-31 (same network path, so not an
+  # independent host) gave the same hash; that binary ran: it validated an
+  # augmented robodr-pulsard SBOM (metadata_to_cyclonedx.py output) and
+  # rejected one with an invalid component type. A cargo-cyclonedx SBOM has
+  # not been validated with it yet (first GitHub dry run).
   CYCLONEDX_CLI_VERSION: 0.27.2
   CYCLONEDX_CLI_SHA256: 5e1595542a6367378a3944bbd3008caab3de65d572345361d3b9597b1dbbaaa0
 
