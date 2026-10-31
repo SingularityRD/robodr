@@ -156,6 +156,8 @@ jobs:
         run: bash scripts/test-lifecycle-state.sh
       - name: nightly red team assertions (tools/e2e/nightly_redteam_checks.py)
         run: python3 tools/e2e/test_nightly_redteam_checks.py
+      - name: ROS 2 peer's Cyclone DDS wheel pinning (tools/e2e/ros2-peer)
+        run: bash tools/e2e/ros2-peer/test_entrypoint_cyclone.sh
       - name: Validate Pulsar rules (rules/) against vendor/pulsar
         # One rule that fails to load disables Pulsar's whole rules-engine.
         run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict

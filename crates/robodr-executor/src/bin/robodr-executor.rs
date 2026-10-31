@@ -340,7 +340,8 @@ fn main() -> ExitCode {
             eprintln!(
                 "robodr-executor: soc.key_scopes names key id(s) no soc.keys key has ({}): \
                  a SOC key without a key_scopes entry approves and reverts nothing \
-                 (key_scope_denied) until this is fixed",
+                 (key_scope_denied) until this is fixed, and held containment such a key \
+                 approved is not re-armed but released",
                 stale
                     .iter()
                     .map(|s| format!("{s:?}"))

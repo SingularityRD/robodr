@@ -2156,6 +2156,13 @@ table.
      matches no key in `soc.keys` (a typo, or a key you removed) makes
      every key without an entry approve and revert nothing until you fix
      or remove the entry; `robodr-executor --check-config` fails on it.
+     A normal start does not refuse (reverts and TTL expiry must keep
+     working) and only logs it, but containment those keys approved that
+     is in force when the executor starts again (a restart or reboot
+     re-arms it) is then **not re-armed and released**
+     (`key_scope_denied`): isolation and quarantines end. Run
+     `--check-config` after every change to `soc.key_scopes`, before the
+     executor restarts, above all during an incident.
    * `network.quarantine.cidrs`: the networks where a participant may be
      quarantined (its SPDP locators must be there, on the robot's DDS
      ports); empty refuses every quarantine (`locator_out_of_scope`).
@@ -2398,10 +2405,12 @@ the pause stays). While paused, the executor re-asserts the pause every
 cancelled and a PX4 mode change is set back to hold (a pilot's manual
 mode is left to the pilot); each is a High finding
 `robot.agent.executor_pause_overridden` (find out who moved the robot).
-The same kind of override found again (a pilot staying in a manual mode,
-a script re-sending a goal) is still cancelled or set back to hold every
-run, but reported at most once per 5 minutes per pause, with the count of
-the repeats.
+Every override is cancelled or set back to hold on every run, but per
+pause and 5-minute window only the first 3 distinct kinds are reported at
+once; repeats of a kind (a pilot staying in a manual mode, a script
+re-sending a goal) and kinds beyond those 3 (someone alternating modes)
+are counted and reported in one summary with their count, so a pause
+writes at most 4 such findings per 5 minutes.
 Lifting a pause **releases** it and never resumes a
 mission (Nav2 goals are not restored, PX4 stays in hold);
 `request_safe_state` and `rollback_config` answer `applied` and are not

@@ -26,9 +26,12 @@ Humble ros-core image of 2026-10-26, multi-arch); pass another image to
 is pinned by its sha256 in `entrypoint_cyclone.sh` (PyPI's
 `cyclonedds-0.10.5-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl`,
 x86_64 only): put that file, under that name, in the directory named by
-`ROBODR_CYCLONEDDS_WHEELS` (a wheel with another hash is refused). The
+`ROBODR_CYCLONEDDS_WHEELS` (that file with another hash is refused, and so
+is any other `cyclonedds*.whl` there, rather than being ignored). The
 stock image has no pip, so its PyPI fallback (`pip --require-hashes` with
-the same hash) only works on an image that has pip. The apt packages that
+the same hash, used only when the directory holds no cyclonedds wheel)
+only works on an image that has pip. `test_entrypoint_cyclone.sh` checks
+these three cases without Docker or network. The apt packages that
 `Dockerfile.cyclone` installs come from the ROS apt repository, signed by
 its key, and are not pinned to a version.
 
