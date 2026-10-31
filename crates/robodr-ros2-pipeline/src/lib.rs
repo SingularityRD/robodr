@@ -103,6 +103,7 @@ pub mod pipeline;
 pub mod profile_trust;
 pub mod ratelimit;
 pub mod sanitize;
+pub mod secured_prefix;
 pub mod socket;
 pub mod source;
 pub mod sros2;

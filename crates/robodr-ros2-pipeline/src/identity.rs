@@ -22,7 +22,7 @@
 //! |---|---|
 //! | the SPDP was sent by the participant itself (not relayed) and carries one `PID_PARTICIPANT_GUID` | a relayed or ambiguous announcement says nothing about where the participant runs |
 //! | its source IP is one of the identity's `ips`, and the binding check does not reject it (not contested, not outside an existing binding, not a forged loopback source) | the identity is a place on the robot's network |
-//! | `PID_VENDORID` equals `vendor`; for a DDS-Security participant (identity token in SPDP, prefix top bit set) the first two prefix bytes may match instead | a Cyclone process cannot take a Fast DDS node's place; a secured prefix is derived from the certificate subject, and `learn` takes `vendor` from the prefix |
+//! | `PID_VENDORID` equals `vendor`; for an SPDP with a PKI-DH identity token whose claimed certificate subject hashes to the GUID prefix (DDS-Security §9.3.3, [`crate::secured_prefix`]) the first two prefix bytes may match instead | a Cyclone process cannot take a Fast DDS node's place; a secured prefix is derived from the certificate subject, and `learn` takes `vendor` from the prefix. Both are claims in the SPDP (as `PID_VENDORID` is): a crafted SPDP can claim the subject and use its prefix; the address and `max_instances` conditions still apply |
 //! | the SPDP user-data enclave equals `enclave`, when set | the SROS 2 enclave is stable per node set |
 //! | fewer than `max_instances` live prefixes hold the identity | a rogue started next to the live controller stays unknown |
 //!
@@ -336,11 +336,19 @@ impl IdentityResolver {
         };
         let enclave = spdp.enclave();
         // DDS-Security derives a secured participant's GUID prefix from its
-        // certificate subject (top bit set), so a profile learned from the
-        // prefix holds those subject-hash bytes as `vendor` (seen on real
-        // Fast DDS 2.6 SROS 2 captures). They are stable per certificate
-        // subject and can never equal a real vendor id (0x01xx).
-        let secured_hash = (spdp.security.is_secured() && p[0] & 0x80 != 0).then_some([p[0], p[1]]);
+        // certificate subject (top bit set, then 47 bits of SHA-256 of the
+        // subject's DER), so a profile learned from the prefix holds those
+        // subject-hash bytes as `vendor` (seen on real Fast DDS 2.6 SROS 2
+        // captures). They are stable per certificate subject and can never
+        // equal a real vendor id (0x01xx). Accepted only for an SPDP with a
+        // complete PKI-DH identity token whose claimed subject hashes to
+        // this prefix: still attacker-computable claims (the handshake is
+        // not seen), but the sender must claim that one subject.
+        let secured_hash = spdp
+            .security
+            .pki_identity_subject()
+            .is_some_and(|s| crate::secured_prefix::prefix_matches_subject(&p, s))
+            .then_some([p[0], p[1]]);
         let mut full: Option<Resolution> = None;
         for (idx, m) in self.ids.iter().enumerate() {
             if !m.ips.contains(&ip)
@@ -556,6 +564,100 @@ mod tests {
             r.observe_spdp(&spdp(3, FAST, None, "enclave=/robot;"), ip("10.0.0.10"), t),
             Resolution::PoolFull { max: 2, .. }
         ));
+    }
+
+    /// The controller of the Humble SROS 2 capture: its learned `vendor` is
+    /// the subject-hash head of its prefix (`af0c854b646f...`).
+    fn secured(prefix_head: [u8; 6], sec: robodr_rtps::SpdpSecurity) -> SpdpInfo {
+        let mut s = spdp(0, FAST, Some(20), "");
+        s.guid_prefix = [0x11; 12];
+        if let Some(h) = s.guid_prefix.get_mut(..6) {
+            h.copy_from_slice(&prefix_head);
+        }
+        s.source = s.guid_prefix;
+        s.security = sec;
+        s
+    }
+
+    fn secured_profile() -> Profile {
+        let mut p = profile(1, None);
+        if let Some(id) = p.participant_identities.get_mut("base") {
+            id.vendor = "af0c".into();
+        }
+        p
+    }
+
+    const CONTROLLER_HEAD: [u8; 6] = [0xaf, 0x0c, 0x85, 0x4b, 0x64, 0x6f];
+
+    fn pki(subject: &str) -> robodr_rtps::SpdpSecurity {
+        robodr_rtps::SpdpSecurity {
+            identity_class: Some("DDS:Auth:PKI-DH:1.0".into()),
+            cert_subject: Some(subject.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn secured_prefix_matches_its_certificate_subject() {
+        let t = Instant::now();
+        // The real controller (subject as Fast DDS 2.6 announces it).
+        let mut r = IdentityResolver::new(&secured_profile());
+        assert!(matches!(
+            r.observe_spdp(
+                &secured(CONTROLLER_HEAD, pki(r"/CN=\/lab\/base_controller")),
+                ip("10.0.0.10"),
+                t
+            ),
+            Resolution::Resolved { .. }
+        ));
+        // The RFC 4514 form of the same subject.
+        let mut r = IdentityResolver::new(&secured_profile());
+        assert!(matches!(
+            r.observe_spdp(
+                &secured(CONTROLLER_HEAD, pki("CN=/lab/base_controller")),
+                ip("10.0.0.10"),
+                t
+            ),
+            Resolution::Resolved { .. }
+        ));
+    }
+
+    /// Review finding (WP7, low): the subject-hash fallback was gated only
+    /// by attacker-controlled input (any security parameter, prefix top
+    /// bit). A crafted SPDP with PID_PARTICIPANT_SECURITY_INFO and the
+    /// copied prefix head took the identity from a profiled address; so did
+    /// one claiming a subject whose hash is not its prefix.
+    #[test]
+    fn copied_secured_prefix_head_without_its_subject_does_not_resolve() {
+        let t = Instant::now();
+        let info_only = robodr_rtps::SpdpSecurity {
+            security_info: Some((0, 0)),
+            ..Default::default()
+        };
+        for sec in [
+            info_only,
+            pki(r"/CN=\/lab\/teleop_twist"),
+            pki("CN=/lab/base_controller2"),
+        ] {
+            let mut r = IdentityResolver::new(&secured_profile());
+            assert_eq!(
+                r.observe_spdp(&secured(CONTROLLER_HEAD, sec.clone()), ip("10.0.0.10"), t),
+                Resolution::NoMatch,
+                "{sec:?}"
+            );
+        }
+        // The right subject with a prefix whose later bytes differ: no.
+        let mut head = CONTROLLER_HEAD;
+        head[5] ^= 0x01;
+        let mut r = IdentityResolver::new(&secured_profile());
+        assert_eq!(
+            r.observe_spdp(
+                &secured(head, pki("CN=/lab/base_controller")),
+                ip("10.0.0.10"),
+                t
+            ),
+            Resolution::NoMatch
+        );
     }
 
     #[test]

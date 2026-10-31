@@ -107,7 +107,9 @@ SHA-256:
    certificate subject (`af0c854b646f...` for the controller in both runs),
    so `learn`'s prefix-derived `vendor` holds subject-hash bytes, not
    `010f`, and identity resolution never matched. The resolver now accepts
-   those bytes for participants that announce a DDS-Security identity.
+   those bytes when the SPDP's PKI-DH identity token claims the subject
+   whose DER hashes to the prefix (`af0c854b646f` is SHA-256 of the
+   controller certificate's subject DER, §9.3.3).
 6. **What the keystore adds.** With `sros2_keystore` set, the unsecured
    rogue (no identity on a domain that requires authentication) is
    `robot.ros2.untrusted_security_identity` Medium, and a subject the
