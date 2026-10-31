@@ -480,3 +480,108 @@ fn receiver_binary_serves_mutual_tls_and_refuses_plain_tcp_by_default() {
     let p = RemoteHeadAnchor::new(pc, k.receiver_verifier(), k.unit_signer()).unwrap();
     assert!(p.current().is_err());
 }
+
+/// One plain-TCP `current` query; the answer line.
+fn current_query(addr: &str, unit: &str) -> serde_json::Value {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let line = serde_json::json!({"protocol": "robodr-anchor/v1", "op": "current",
+                                  "unit": unit, "nonce": "ab".repeat(32)});
+    s.write_all(format!("{line}\n").as_bytes()).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    serde_json::from_str(out.trim()).unwrap()
+}
+
+/// Poll `current` for `unit` until `want(answer)` (the reload watcher runs
+/// every 100 ms here), at most 10 s.
+fn wait_for(addr: &str, unit: &str, want: impl Fn(&serde_json::Value) -> bool) -> bool {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(10) {
+        if want(&current_query(addr, unit)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// T71: the receiver reloads its unit list while serving (a unit added is
+/// served, a unit removed is refused, a broken configuration keeps the
+/// previous list), and `check` validates what `serve` would load.
+#[test]
+fn receiver_reloads_its_unit_list_while_serving_and_check_validates_the_config() {
+    let k = keys();
+    let d = TestDir::new("ra-reload");
+    let state = d.sub("receiver-state");
+    let second = KeyFile::generate_ed25519(Some("ugv-08-bb")).unwrap();
+    let second_pub = d.sub("ugv-08.key.pub");
+    second.to_public().unwrap().write_new(&second_pub).unwrap();
+    let cfg = |units: serde_json::Value| {
+        serde_json::json!({
+            "listen": "127.0.0.1:0", "state_dir": state, "key_file": k.recv_secret,
+            "units": units, "allow_plaintext": true, "reload_poll_ms": 100
+        })
+        .to_string()
+    };
+    let one = serde_json::json!([{"unit": UNIT, "public_key": k.unit_pub}]);
+    let two = serde_json::json!([{"unit": UNIT, "public_key": k.unit_pub},
+                                 {"unit": "ugv-08", "public_key": second_pub}]);
+    let only_second = serde_json::json!([{"unit": "ugv-08", "public_key": second_pub}]);
+    let path = d.sub("receiver.json");
+    std::fs::write(&path, cfg(one.clone())).unwrap();
+
+    // check: everything loads (exit 0); a missing unit key fails (exit 2).
+    let o = bin("receiver")
+        .args(["check", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("ok   unit ugv-07"));
+    let bad = d.sub("bad.json");
+    std::fs::write(
+        &bad,
+        cfg(serde_json::json!([{"unit": UNIT, "public_key": d.sub("missing.pub")}])),
+    )
+    .unwrap();
+    let o = bin("receiver")
+        .args(["check", "--config"])
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("FAIL"));
+
+    let recv = start(&path);
+    let unknown = |v: &serde_json::Value| {
+        v["ok"] == false && v["error"].as_str().unwrap_or("").contains("unknown unit")
+    };
+    let served = |v: &serde_json::Value| v["ok"] == true;
+    assert!(served(&current_query(&recv.addr, UNIT)));
+    assert!(unknown(&current_query(&recv.addr, "ugv-08")));
+    // Add a unit: served without a restart.
+    std::fs::write(&path, cfg(two)).unwrap();
+    assert!(
+        wait_for(&recv.addr, "ugv-08", served),
+        "ugv-08 never served"
+    );
+    // A configuration that does not load: refused, the previous list stays.
+    std::fs::write(&path, "{ not json").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(served(&current_query(&recv.addr, "ugv-08")));
+    assert!(served(&current_query(&recv.addr, UNIT)));
+    // Remove the first unit (decommissioned): refused from then on, its
+    // state stays on disk.
+    std::fs::write(&path, cfg(only_second)).unwrap();
+    assert!(wait_for(&recv.addr, UNIT, unknown), "{UNIT} still served");
+    assert!(served(&current_query(&recv.addr, "ugv-08")));
+    // check works while serve runs (the listen address is ephemeral here).
+    let o = bin("receiver")
+        .args(["check", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+}

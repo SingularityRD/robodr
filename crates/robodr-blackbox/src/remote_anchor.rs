@@ -168,7 +168,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Wire protocol tag (every request and answer carries it).
@@ -764,6 +764,34 @@ struct UnitSlot {
     state: Mutex<UnitState>,
 }
 
+/// Why a slot left the unit list (set under its state lock, so a request
+/// that held the slot before a reload cannot write to the unit's state file
+/// after the reload replaced or removed it).
+const SLOT_RETIRED: &str = "the unit list was reloaded while this request was in flight; retry";
+
+/// The served units and the client bindings, replaced together by
+/// [`AnchorReceiver::reload_units`].
+struct Roster {
+    units: HashMap<String, Arc<UnitSlot>>,
+    /// Client certificate SPKI SHA-256 -> the units it may query.
+    bindings: HashMap<[u8; 32], Vec<String>>,
+}
+
+/// What [`AnchorReceiver::reload_units`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reloaded {
+    /// Units newly served.
+    pub added: Vec<String>,
+    /// Units no longer served (their state files stay on disk).
+    pub removed: Vec<String>,
+    /// Units whose key changed (state reloaded and re-verified under the
+    /// new key: a held mark the new key does not verify makes the unit
+    /// unusable until an operator acts, as at start).
+    pub rekeyed: Vec<String>,
+    /// Units kept as they were (held mark and alert count in memory).
+    pub kept: usize,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateJson {
@@ -823,14 +851,12 @@ impl Default for ServeOptions {
 /// module docs for the rule.
 pub struct AnchorReceiver {
     dir: PathBuf,
-    units: HashMap<String, UnitSlot>,
+    roster: RwLock<Roster>,
     signer: Mutex<Box<dyn Signer>>,
     alerts_lock: Mutex<u64>,
     log: LogFn,
     /// Failed TLS handshakes (logged: the first 16, then at powers of two).
     tls_failures: std::sync::atomic::AtomicU64,
-    /// Client certificate SPKI SHA-256 -> the units it may query.
-    bindings: HashMap<[u8; 32], Vec<String>>,
     _lock: File,
 }
 
@@ -838,7 +864,7 @@ impl fmt::Debug for AnchorReceiver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnchorReceiver")
             .field("dir", &self.dir)
-            .field("units", &self.units.len())
+            .field("units", &self.roster().units.len())
             .finish_non_exhaustive()
     }
 }
@@ -853,6 +879,24 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A poisoned lock only means another thread panicked mid-update; the
     // state it guards is replaced whole, never left half-written.
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Bindings `b` checked against `units` (each unit must be served).
+fn binding_map(
+    units: &HashMap<String, Arc<UnitSlot>>,
+    b: &[(String, [u8; 32])],
+) -> Result<HashMap<[u8; 32], Vec<String>>, String> {
+    let mut m: HashMap<[u8; 32], Vec<String>> = HashMap::new();
+    for (unit, spki) in b {
+        if !units.contains_key(unit) {
+            return Err(format!("client binding for unknown unit {unit:?}"));
+        }
+        let v = m.entry(*spki).or_default();
+        if !v.contains(unit) {
+            v.push(unit.clone());
+        }
+    }
+    Ok(m)
 }
 
 impl AnchorReceiver {
@@ -910,20 +954,22 @@ impl AnchorReceiver {
             };
             map.insert(
                 u.unit,
-                UnitSlot {
+                Arc::new(UnitSlot {
                     verifier: u.verifier,
                     state: Mutex::new(st),
-                },
+                }),
             );
         }
         let r = Self {
             dir: dir.to_path_buf(),
-            units: map,
+            roster: RwLock::new(Roster {
+                units: map,
+                bindings: HashMap::new(),
+            }),
             signer: Mutex::new(signer),
             alerts_lock: Mutex::new(alerts_len),
             log,
             tls_failures: std::sync::atomic::AtomicU64::new(0),
-            bindings: HashMap::new(),
             _lock: lock_f,
         };
         for (unit, e) in broken {
@@ -937,28 +983,125 @@ impl AnchorReceiver {
     /// with that key query that unit. A unit with bindings answers only
     /// its bound clients; a client bound to any unit queries only its
     /// units. Replaces earlier bindings.
-    pub fn set_client_bindings(&mut self, b: &[(String, [u8; 32])]) -> Result<(), String> {
-        let mut m: HashMap<[u8; 32], Vec<String>> = HashMap::new();
-        for (unit, spki) in b {
-            if !self.units.contains_key(unit) {
-                return Err(format!("client binding for unknown unit {unit:?}"));
-            }
-            let v = m.entry(*spki).or_default();
-            if !v.contains(unit) {
-                v.push(unit.clone());
-            }
-        }
-        self.bindings = m;
+    pub fn set_client_bindings(&self, b: &[(String, [u8; 32])]) -> Result<(), String> {
+        let mut r = self.roster_mut();
+        r.bindings = binding_map(&r.units, b)?;
         Ok(())
     }
 
+    fn roster(&self) -> RwLockReadGuard<'_, Roster> {
+        self.roster.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn roster_mut(&self) -> RwLockWriteGuard<'_, Roster> {
+        self.roster.write().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn slot(&self, unit: &str) -> Option<Arc<UnitSlot>> {
+        self.roster().units.get(unit).cloned()
+    }
+
+    /// Replace the served units and the client bindings while serving
+    /// (the receiver's configuration changed: a unit commissioned or
+    /// decommissioned). All or nothing: on an error nothing changes.
+    ///
+    /// * A unit with the same key id keeps its slot (held mark and alert
+    ///   count in memory).
+    /// * A removed unit is no longer served (`unknown unit`); its state file
+    ///   stays on disk (evidence: archive it).
+    /// * A new unit, or a unit whose key changed, is loaded from its state
+    ///   file and re-verified, as at start.
+    ///
+    /// A request that took a slot before the reload and is still waiting
+    /// for its state lock finds the slot retired and is refused (`retry`),
+    /// so it never writes over the state the new slot loaded.
+    pub fn reload_units(
+        &self,
+        units: Vec<UnitKey>,
+        bindings: &[(String, [u8; 32])],
+    ) -> Result<Reloaded, String> {
+        if units.is_empty() || units.len() > MAX_UNITS {
+            return Err(format!("1..={MAX_UNITS} units must be configured"));
+        }
+        let udir = self.dir.join(UNITS_DIR);
+        let mut roster = self.roster_mut();
+        let mut next: HashMap<String, Arc<UnitSlot>> = HashMap::new();
+        let mut rep = Reloaded::default();
+        // Old slots replaced by a new one or removed: retired once the new
+        // roster is complete (all or nothing).
+        let mut replaced: Vec<Arc<UnitSlot>> = Vec::new();
+        let mut broken = Vec::new();
+        for u in units {
+            if !valid_unit_id(&u.unit) {
+                return Err(format!("unit id {:?} is not valid", u.unit));
+            }
+            if next.contains_key(&u.unit) {
+                return Err(format!("unit {:?} configured twice", u.unit));
+            }
+            let old = roster.units.get(&u.unit);
+            if let Some(o) = old.filter(|o| o.verifier.key_id() == u.verifier.key_id()) {
+                next.insert(u.unit, Arc::clone(o));
+                rep.kept += 1;
+                continue;
+            }
+            // New or re-keyed: load under the old slot's state lock, so no
+            // request on it writes the file meanwhile.
+            let guard = old.map(|o| lock(&o.state));
+            let st = match load_unit(&udir, &u.unit, &*u.verifier) {
+                Ok(st) => st,
+                Err(e) => {
+                    broken.push((u.unit.clone(), e.clone()));
+                    UnitState {
+                        broken: Some(e),
+                        ..Default::default()
+                    }
+                }
+            };
+            drop(guard);
+            if let Some(o) = old {
+                replaced.push(Arc::clone(o));
+                rep.rekeyed.push(u.unit.clone());
+            } else {
+                rep.added.push(u.unit.clone());
+            }
+            next.insert(
+                u.unit,
+                Arc::new(UnitSlot {
+                    verifier: u.verifier,
+                    state: Mutex::new(st),
+                }),
+            );
+        }
+        let bindings = binding_map(&next, bindings)?;
+        for (unit, slot) in &roster.units {
+            if !next.contains_key(unit) {
+                rep.removed.push(unit.clone());
+                replaced.push(Arc::clone(slot));
+            }
+        }
+        for s in &replaced {
+            lock(&s.state).broken = Some(SLOT_RETIRED.into());
+        }
+        roster.units = next;
+        roster.bindings = bindings;
+        drop(roster);
+        for (unit, e) in broken {
+            self.write_alert(&unit, "state_unusable", &e, None, None);
+        }
+        rep.added.sort_unstable();
+        rep.removed.sort_unstable();
+        rep.rekeyed.sort_unstable();
+        Ok(rep)
+    }
+
     /// Units with no client binding (any client may query them).
-    pub fn unbound_units(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self
+    pub fn unbound_units(&self) -> Vec<String> {
+        let r = self.roster();
+        let mut v: Vec<String> = r
             .units
             .keys()
-            .filter(|u| !self.bindings.values().any(|b| b.contains(u)))
-            .map(String::as_str)
+            .filter(|u| !r.bindings.values().any(|b| b.contains(u)))
+            .cloned()
             .collect();
         v.sort_unstable();
         v
@@ -967,10 +1110,11 @@ impl AnchorReceiver {
     /// May the client with certificate key `client` (`None`: plain TCP or
     /// no client certificate) query `unit`?
     fn may_query(&self, client: Option<&[u8; 32]>, unit: &str) -> bool {
-        if let Some(units) = client.and_then(|c| self.bindings.get(c)) {
+        let r = self.roster();
+        if let Some(units) = client.and_then(|c| r.bindings.get(c)) {
             return units.iter().any(|u| u == unit);
         }
-        !self.bindings.values().any(|b| b.iter().any(|u| u == unit))
+        !r.bindings.values().any(|b| b.iter().any(|u| u == unit))
     }
 
     /// TLS handshakes that failed since start (no, unknown or expired
@@ -980,29 +1124,25 @@ impl AnchorReceiver {
     }
 
     /// The configured units.
-    pub fn unit_ids(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.units.keys().map(String::as_str).collect();
+    pub fn unit_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.roster().units.keys().cloned().collect();
         v.sort_unstable();
         v
     }
 
     /// The mark held for `unit`.
     pub fn held(&self, unit: &str) -> Option<RemoteMark> {
-        self.units
-            .get(unit)
-            .and_then(|s| lock(&s.state).held.clone())
+        self.slot(unit).and_then(|s| lock(&s.state).held.clone())
     }
 
     /// Alerts recorded for `unit` (persisted with its state).
     pub fn alerts(&self, unit: &str) -> u64 {
-        self.units.get(unit).map_or(0, |s| lock(&s.state).alerts)
+        self.slot(unit).map_or(0, |s| lock(&s.state).alerts)
     }
 
     /// Why `unit`'s stored state is unusable, if it is.
     pub fn broken(&self, unit: &str) -> Option<String> {
-        self.units
-            .get(unit)
-            .and_then(|s| lock(&s.state).broken.clone())
+        self.slot(unit).and_then(|s| lock(&s.state).broken.clone())
     }
 
     fn write_alert(
@@ -1079,7 +1219,7 @@ impl AnchorReceiver {
 
     /// Apply one mark (see the module docs for the rule).
     pub fn advance(&self, m: &RemoteMark) -> Result<Advanced, Refusal> {
-        let Some(slot) = self.units.get(&m.unit) else {
+        let Some(slot) = self.slot(&m.unit) else {
             (self.log)(&format!(
                 "robodr-anchor-receiver: mark for unknown unit {:?} refused",
                 m.unit
@@ -1148,8 +1288,7 @@ impl AnchorReceiver {
     /// The signed `current` answer for `unit` and `nonce`.
     fn current_reply(&self, unit: &str, nonce: &[u8; NONCE_LEN]) -> Result<ResponseJson, Refusal> {
         let slot = self
-            .units
-            .get(unit)
+            .slot(unit)
             .ok_or_else(|| Refusal::UnknownUnit(unit.to_string()))?;
         let st = lock(&slot.state);
         if let Some(b) = &st.broken {
@@ -1924,6 +2063,95 @@ mod tests {
             .collect()
     }
 
+    fn other_key() -> Ed25519SigningKey {
+        Ed25519SigningKey::from_seed("unit-bb-2", &[8; 32]).unwrap()
+    }
+
+    fn unit(name: &str, k: &Ed25519SigningKey) -> UnitKey {
+        UnitKey {
+            unit: name.into(),
+            verifier: Box::new(k.verifying_key()),
+        }
+    }
+
+    #[test]
+    fn unit_list_reload_adds_removes_and_rekeys_without_losing_state() {
+        let d = TmpDir::new("reload");
+        let r = receiver(&d.0);
+        r.advance(&mark(5, 1)).unwrap();
+        // ugv-08 is not served yet.
+        let m8 = RemoteMark::sign("ugv-08", &cp(3, 2), &unit_key()).unwrap();
+        assert!(matches!(r.advance(&m8), Err(Refusal::UnknownUnit(_))));
+        // Add ugv-08 (same key material is fine for the test), bind it.
+        let rep = r
+            .reload_units(
+                vec![unit("ugv-07", &unit_key()), unit("ugv-08", &unit_key())],
+                &[("ugv-08".into(), [1; 32])],
+            )
+            .unwrap();
+        assert_eq!(rep.added, vec!["ugv-08"]);
+        assert_eq!(rep.kept, 1);
+        assert_eq!(r.held("ugv-07").map(|m| m.seq), Some(5), "kept in memory");
+        r.advance(&m8).unwrap();
+        assert_eq!(r.unbound_units(), vec!["ugv-07"]);
+        // A lower mark for ugv-07 is still refused after the reload.
+        assert!(matches!(
+            r.advance(&mark(4, 1)),
+            Err(Refusal::Lower { held: 5, .. })
+        ));
+        // All or nothing: a binding for an unknown unit refuses the reload.
+        assert!(r
+            .reload_units(
+                vec![unit("ugv-07", &unit_key())],
+                &[("ugv-99".into(), [2; 32])]
+            )
+            .is_err());
+        assert_eq!(r.unit_ids(), vec!["ugv-07", "ugv-08"]);
+        // Remove ugv-08: refused from then on; its state file stays.
+        let rep = r
+            .reload_units(vec![unit("ugv-07", &unit_key())], &[])
+            .unwrap();
+        assert_eq!(rep.removed, vec!["ugv-08"]);
+        assert!(matches!(r.advance(&m8), Err(Refusal::UnknownUnit(_))));
+        assert!(d.0.join(UNITS_DIR).join("ugv-08.json").exists());
+        // Re-adding it reloads the stored mark from disk (re-verified).
+        r.reload_units(
+            vec![unit("ugv-07", &unit_key()), unit("ugv-08", &unit_key())],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.held("ugv-08").map(|m| m.seq), Some(3));
+        // Re-keying ugv-07 to a key its stored mark does not verify under:
+        // the unit becomes unusable (operator action), as at start.
+        let rep = r
+            .reload_units(
+                vec![unit("ugv-07", &other_key()), unit("ugv-08", &unit_key())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rep.rekeyed, vec!["ugv-07"]);
+        assert!(r.broken("ugv-07").is_some());
+        assert!(matches!(r.advance(&mark(6, 1)), Err(Refusal::Broken(_))));
+        assert!(r.reload_units(Vec::new(), &[]).is_err());
+    }
+
+    #[test]
+    fn a_slot_replaced_by_a_reload_refuses_writes() {
+        let d = TmpDir::new("reload-race");
+        let r = receiver(&d.0);
+        r.advance(&mark(5, 1)).unwrap();
+        // A request that took the slot before the reload...
+        let old = r.slot("ugv-07").unwrap();
+        r.reload_units(vec![unit("ugv-07", &other_key())], &[])
+            .unwrap();
+        // ...finds it retired: it can no longer write the unit's state.
+        assert_eq!(
+            lock(&old.state).broken.as_deref(),
+            Some(SLOT_RETIRED),
+            "the replaced slot must refuse further writes"
+        );
+    }
+
     #[test]
     fn unit_ids_and_addresses() {
         assert!(valid_unit_id("ugv-07"));
@@ -2081,7 +2309,7 @@ mod tests {
             unit: u.into(),
             verifier: Box::new(unit_key().verifying_key()),
         };
-        let mut r = AnchorReceiver::open(
+        let r = AnchorReceiver::open(
             &d.0,
             vec![unit("ugv-07"), unit("ugv-08")],
             Box::new(receiver_key()),
