@@ -33,7 +33,7 @@ robodr\-kafka\-publish \- publish RoboDR findings to the robot\-edr.findings Kaf
 .IR N ]
 .RB [ \-\-interval\-ms
 .IR N ]
-.RB [ \-\-once ]
+.RB [ \-\-once " | " \-\-check ]
 .RB [ \-\-upgrade\-data\-source
 .IR LABEL ]
 .RB [ \-\-no\-idempotence ]
@@ -159,6 +159,12 @@ Loop interval, > 0 (default 2000).
 .TP
 .B \-\-once
 One pass, then exit.
+.TP
+.B \-\-check
+Site acceptance: the state and input directories exist, the cluster
+answers with this TLS (CA, client certificate, pins, CRLs) and SASL
+configuration, and the topic's metadata (partitions) is readable. Nothing
+is produced and nothing written; bounded to 30 s. Exit 0 passed, 1 failed.
 .TP
 .B \-\-no\-idempotence
 Producer id \-1, no sequence numbers: for brokers that refuse InitProducerId

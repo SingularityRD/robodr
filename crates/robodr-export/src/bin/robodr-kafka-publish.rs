@@ -15,7 +15,7 @@ use std::time::Duration;
 const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootstrap ...] \
 --state-dir DIR (--diode-out DIR | --spool DIR) [--topic T] [--chunk N] [--client-id S] \
 [--request-timeout-ms N] [--produce-timeout-ms N] [--delivery-timeout-ms N] [--retries N] [--max-request-bytes N] \
-[--interval-ms N] [--once] [--upgrade-data-source LABEL] [--no-idempotence] \
+[--interval-ms N] [--once | --check] [--upgrade-data-source LABEL] [--no-idempotence] \
 [--dead-letter-max-bytes N] [--dead-letter-keep N] [--dead-letter-max-age-s N] \
 [--done-max-age-s N] [--done-max-count N] \
 (--tls-ca FILE [--tls-cert FILE --tls-key FILE] [--tls-server-name NAME] [--tls-spki-sha256 HEX]... [--tls-crl-file FILE]... \
@@ -29,6 +29,9 @@ host name, or --tls-server-name); --tls-cert/--tls-key add a client certificate 
 --tls-crl-file (PEM or DER CRLs of the broker CAs) refuses a revoked broker certificate (an issuer \
 without a CRL, an expired or unusable CRL refuse every broker; reloaded when the files change). \
 Plain TCP only with an explicit --allow-plaintext (isolated network or a local TLS proxy).\n\
+--check (site acceptance): the directories exist, the cluster answers with this TLS and SASL \
+configuration and the topic exists (metadata, partitions); nothing is produced, \
+no state written (at most 30 s); exit 0 passed, 1 failed.\n\
 The producer is idempotent (InitProducerId, sequence numbers; a re-sent batch is dropped by the \
 broker); --no-idempotence for brokers that refuse it (Kafka < 3.0 without the IDEMPOTENT_WRITE \
 cluster ACL): at-least-once.\n\
@@ -213,6 +216,63 @@ fn security(a: &Args, p: &mut ProducerConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// `--check` (site acceptance): the directories exist, and the producer
+/// reaches the cluster with the configured TLS (CA, client certificate,
+/// pins, CRLs) and SASL, negotiates the API versions and reads the topic's
+/// metadata (its partitions). Nothing is produced, no state
+/// is written, no lock is taken. Exit 0 / 1.
+fn check(o: &Opts) -> ExitCode {
+    let source = match &o.publish.source {
+        Source::Spool(p) => ("--spool", p),
+        Source::DiodeOut(p) => ("--diode-out", p),
+    };
+    for (what, p) in [("--state-dir", &o.publish.state_dir), source] {
+        if !p.is_dir() {
+            println!("FAIL {what} {} is not a directory", p.display());
+            return ExitCode::from(1);
+        }
+        println!("ok   {what} {}", p.display());
+    }
+    let security = match (&o.producer.tls, &o.producer.sasl) {
+        (Some(_), Some(_)) => "TLS + SASL",
+        (Some(_), None) => "TLS",
+        (None, Some(_)) => "SASL over plain TCP",
+        (None, None) => "plain TCP (--allow-plaintext)",
+    };
+    // A check answers within 30 s even when the cluster is unreachable.
+    let mut cfg = o.producer.clone();
+    cfg.delivery_timeout = cfg.delivery_timeout.min(Duration::from_secs(30));
+    let mut p = match Producer::new(cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("FAIL {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match p.partition_count(&o.publish.topic) {
+        Ok(0) => {
+            println!("FAIL topic {} has no partition", o.publish.topic);
+            ExitCode::from(1)
+        }
+        Ok(n) => {
+            println!(
+                "ok   {} reached ({security}; handshake, authentication and API versions)",
+                o.producer.bootstrap.join(", ")
+            );
+            println!(
+                "ok   topic {}: {n} partitions (metadata only; nothing produced)",
+                o.publish.topic
+            );
+            println!("check passed");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("FAIL {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn run(o: &Opts) -> Result<(), String> {
     let producer = Producer::new(o.producer.clone()).map_err(|e| e.to_string())?;
     let mut p = Publisher::open(o.publish.clone(), producer).map_err(|e| e.to_string())?;
@@ -278,9 +338,16 @@ fn main() -> ExitCode {
             "sasl-username",
             "sasl-password-file",
         ],
-        &["once", "allow-plaintext", "no-idempotence"],
+        &["once", "allow-plaintext", "no-idempotence", "check"],
     );
-    let o = match parsed.and_then(|a| opts(&a)) {
+    let mut check_mode = false;
+    let o = match parsed.and_then(|a| {
+        check_mode = a.flag("check");
+        if check_mode && a.flag("once") {
+            return Err("--check and --once are separate modes".into());
+        }
+        opts(&a)
+    }) {
         Ok(o) => o,
         Err(e) if e == "help" => {
             println!("{USAGE}");
@@ -292,6 +359,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if check_mode {
+        return check(&o);
+    }
     loop {
         match run(&o) {
             Ok(()) => return ExitCode::SUCCESS,

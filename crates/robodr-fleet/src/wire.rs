@@ -1524,6 +1524,34 @@ mod tests {
         assert!(DecommissionAnswer::parse(&payload_bytes(&b).unwrap()).is_err());
     }
 
+    /// `robodr-uplink --check` authenticates a fleet request with its own
+    /// copy of the §2.5 message (robodr-export cannot depend on this
+    /// crate): the two must stay byte-identical.
+    #[test]
+    fn uplink_check_signs_the_same_request_message() {
+        for (m, t, k, ts, b) in [
+            (
+                "GET",
+                "/api/robot-edr/v2/fleet/ring",
+                "ed25519:0011223344556677",
+                1u64,
+                &b""[..],
+            ),
+            (
+                "POST",
+                "/x",
+                "ed25519:aaaaaaaaaaaaaaaa",
+                u64::MAX,
+                &b"{\"a\":1}"[..],
+            ),
+        ] {
+            assert_eq!(
+                request_message(m, t, k, ts, b),
+                robodr_export::uplink::check::fleet_request_message(m, t, k, ts, b)
+            );
+        }
+    }
+
     #[test]
     fn approval_validity_is_capped() {
         let a = |validity: u64| {
