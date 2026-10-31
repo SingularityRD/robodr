@@ -2734,6 +2734,7 @@ dependencies = [
  "robodr-cdr",
  "robodr-events",
  "robodr-rtps",
+ "robodr-signer",
  "serde",
  "serde_json",
 ]
@@ -2935,6 +2936,7 @@ dependencies = [
  "robodr-diode",
  "robodr-pkg",
  "robodr-seal",
+ "robodr-signer",
  "serde",
  "serde_json",
 ]

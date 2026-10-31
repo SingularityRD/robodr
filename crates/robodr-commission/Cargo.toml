@@ -18,6 +18,9 @@ robodr-rtps = { workspace = true }
 robodr-cdr = { workspace = true }
 # std-only SHA-256 (profile seal, sign-off binding).
 robodr-blackbox = { workspace = true }
+# Key providers for --sign-key / --key (T36): a key file or an external
+# signer (PKCS#11 token, HSM) named by a robodr-signer/v1 signer file.
+robodr-signer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

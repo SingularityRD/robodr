@@ -13,6 +13,9 @@ description = "Connected-side release tool (docs/SECURE-DELIVERY.md §4.1): buil
 [dependencies]
 robodr-pkg = { workspace = true }
 robodr-blackbox = { workspace = true }
+# `sign --key`: a key file or an external signer (PKCS#11 token, HSM)
+# named by a robodr-signer/v1 signer file (T36).
+robodr-signer = { workspace = true }
 # Sealed RPKs (`build rpk --seal-to`, Sprint 13c): chunk encryption and the
 # content key's wraps to the site depots.
 robodr-seal = { workspace = true }
