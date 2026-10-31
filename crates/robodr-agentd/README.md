@@ -615,8 +615,11 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   bounded queue to the main loop (full: 503 `busy`). Failed
   authentications raise `robot.agent.control_plane_unauthenticated` (High),
   authenticated invalid requests `robot.agent.control_plane_invalid`
-  (Medium); both observe-only self-health, rate-limited by
-  `health_report_ms`. The API is not an input: a quiet SOC never makes the
+  (Medium), correctly signed requests refused by the replay fence
+  `robot.agent.control_plane_request_fenced` (Low), connections refused or
+  cut before they authenticated (a handshake flood, a slowloris, overload)
+  `robot.agent.control_plane_saturated` (Medium); all observe-only
+  self-health, rate-limited by `health_report_ms`. The API is not an input: a quiet SOC never makes the
   state `unknown`.
 - **Sockets.** Every unix socket of the daemon (events, safety feed, host
   threats, control plane) is bound inside a fresh 0700 directory, given its

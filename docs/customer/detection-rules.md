@@ -11,14 +11,14 @@ This is the full generated reference. How to read a finding, what each detection
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
 * **Since** is the contract version that added the entry. A consumer validating an older message applies that message's catalog; an id without an entry is reported with a generic title ("RoboDR model-profile deviation").
 
-165 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
+166 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
 
 ## By data source
 
 | Data source | Rule ids |
 |---|---|
 | `host_runtime` | 1 |
-| `robodr_agent` | 27 |
+| `robodr_agent` | 28 |
 | `robodr_correlation` | 10 |
 | `robodr_delivery` | 17 |
 | `robot_safety_state` | 4 |
@@ -27,7 +27,7 @@ This is the full generated reference. How to read a finding, what each detection
 
 ## Families
 
-* [`robot.agent.*`](#robotagent) (25)
+* [`robot.agent.*`](#robotagent) (26)
 * [`robot.capture.*`](#robotcapture) (10)
 * [`robot.correlate.*`](#robotcorrelate) (10)
 * [`robot.dds.*`](#robotdds) (1)
@@ -55,6 +55,7 @@ This is the full generated reference. How to read a finding, what each detection
 | `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | A safety configuration file the robot's agent loaded (response policy, Motion Firewall joint configuration) claims more than the signed commissioning attested: it is not bound to the trusted locked profile, so the agent treats it as not validated and stays observe-only for what it governs. The detail names the file and why the binding failed. | `robodr_agent` | - | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | The robot's control-plane API refused authenticated requests for an action, parameter, time limit or authority it never allows; each was recorded in the black box and nothing was executed. | `robodr_agent` | - | 1.3 |
 | `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it. | `robodr_agent` | - | 2.5 |
+| `robot.agent.control_plane_saturated` | Control-plane connections refused or cut before authentication | The robot's control-plane listener refused or cut connections before they authenticated because every slot they could use was busy: a TLS handshake flood or slowloris against the API, or more legitimate clients than its connection limit. SOC requests may fail until it ends; nothing was judged or executed. | `robodr_agent` | - | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | At start the control plane's sealed request journal or replay store was damaged, edited, sealed under another key, or older than the head the black box recorded for it. The robot failed safe: the damaged copy was quarantined, requests were reconciled with the black box and the replay store was fenced; nothing was reset silently. | `robodr_agent` | - | 2.4 |
 | `robot.agent.control_plane_unauthenticated` | Control-plane request failed authentication | The robot's control-plane API refused requests that did not carry a valid SOC signature (missing or bad signature, unknown key, stale timestamp or replayed nonce); nothing was judged or executed. | `robodr_agent` | - | 1.3 |
 | `robot.agent.correlation_pressure` | Correlation engine state under pressure | The correlation engine evicted or refused pending correlation state, which happens when many fresh entities arrive within a window (possibly a flood aimed at hiding a correlation). | `robodr_agent` | - | 1.3 |

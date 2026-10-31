@@ -64,6 +64,14 @@ pub mod rules {
     /// Authenticated control-plane requests refused as invalid (unknown
     /// action, a parameter the class does not take, an override).
     pub const CONTROL_PLANE_INVALID: &str = "robot.agent.control_plane_invalid";
+    /// Correctly signed control-plane requests refused because they were
+    /// signed at or before the replay fence (T81): not an authentication
+    /// failure. Low. Contract 2.5.
+    pub const CONTROL_PLANE_REQUEST_FENCED: &str = "robot.agent.control_plane_request_fenced";
+    /// Control-plane connections refused or cut before they authenticated
+    /// (every slot they could use was busy: a handshake flood, a slowloris
+    /// or legitimate overload). Medium. Contract 2.5.
+    pub const CONTROL_PLANE_SATURATED: &str = "robot.agent.control_plane_saturated";
     /// The control plane's sealed state (request journal, replay store)
     /// failed its integrity check at start: damaged, edited, sealed under
     /// another key (High) or rolled back against the black box's signed

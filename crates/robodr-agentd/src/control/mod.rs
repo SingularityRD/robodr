@@ -73,7 +73,13 @@
 //!   included) are counted and reported as the observe-only finding
 //!   `robot.agent.control_plane_unauthenticated` (High, rate-limited),
 //!   authenticated invalid requests as `robot.agent.control_plane_invalid`
-//!   (Medium).
+//!   (Medium), correctly signed requests refused by the replay fence as
+//!   `robot.agent.control_plane_request_fenced` (Low; not an
+//!   authentication failure), and connections refused or cut before they
+//!   authenticated (a full listener: a handshake flood, a slowloris or
+//!   legitimate overload) as `robot.agent.control_plane_saturated`
+//!   (Medium). A cut handshake is not an authentication failure, so a
+//!   flood whose handshakes are all cut is reported by the last one.
 
 pub mod anchor;
 pub mod api;
@@ -694,6 +700,9 @@ pub struct Counters {
     /// Pre-authentication connections cut to make room for a newer one
     /// ([`TcpSlots`]).
     pub connections_evicted: AtomicU64,
+    /// Correctly signed requests refused by the replay fence
+    /// ([`AuthFailure::Fenced`]; not in `unauthenticated`).
+    pub fenced: AtomicU64,
     /// Requests that could not be read (malformed, too large, timeout).
     pub malformed: AtomicU64,
     /// Failed authentications, TLS handshakes included.
@@ -798,6 +807,7 @@ pub struct ControlStatus {
     pub connections: u64,
     pub connections_rejected: u64,
     pub connections_evicted: u64,
+    pub fenced: u64,
     pub malformed: u64,
     pub unauthenticated: u64,
     pub tls_failures: u64,
@@ -1253,6 +1263,7 @@ impl ControlPlane {
             connections: g(&c.connections),
             connections_rejected: g(&c.connections_rejected),
             connections_evicted: g(&c.connections_evicted),
+            fenced: g(&c.fenced),
             malformed: g(&c.malformed),
             unauthenticated: g(&c.unauthenticated),
             tls_failures: g(&c.tls_failures),
@@ -2069,8 +2080,21 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared, slot: &mut Slot) 
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .check(&creds.key_id, &creds.nonce, creds.timestamp, now_s);
-    if let Err(f) = checked {
-        return fail(&mut s, f);
+    match checked {
+        Ok(()) => {}
+        // Signed with a valid key before the fence: the SOC re-signs and
+        // resends; not an authentication failure (T81).
+        Err(f @ AuthFailure::Fenced) => {
+            c.fenced.fetch_add(1, Ordering::Relaxed);
+            send(
+                &mut s,
+                f.status(),
+                &api::error_body(f.code(), &f.message()),
+                &[],
+            );
+            return;
+        }
+        Err(f) => return fail(&mut s, f),
     }
     c.authenticated.fetch_add(1, Ordering::Relaxed);
     let has_slot = slot.authenticate();

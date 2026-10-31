@@ -49,7 +49,8 @@ that as "not applied", never as success.
   cuts the **oldest** pre-authentication connection that has spent
   `pre_auth_evict_after_ms` in its handshake or request read
   (`connections_evicted`; the cut peer sees the connection close; the cut
-  is not counted as a TLS or authentication failure); a source at its
+  is not counted as a TLS or authentication failure, it is reported as
+  `robot.agent.control_plane_saturated`, §8); a source at its
   per-source share only cuts one of its own. `pre_auth_evict_after_ms` is
   0 (never cut by age) or 100..=5000; default **100 without
   `soc_sources`, 0 with them**. Cutting by age is a trade: it keeps a
@@ -57,6 +58,12 @@ that as "not applied", never as success.
   overload (more clients than slots, round trips longer than the setting)
   clients cut each other's handshakes and few or none may finish, and
   clients behind one NAT address at its per-source share cut their own.
+  With nothing cut by age (the default with `soc_sources`, or 0) a
+  slowloris peer holds each general slot for the full 5 s deadline of its
+  handshake (or, without TLS, its request read) and reopens: as long as it
+  does, **a legitimate client outside `soc_sources` is refused** (closed
+  at accept); only listed addresses still get through. Cutting by age
+  lets some unlisted clients through instead, at the cost above.
   `soc_sources` (up to 16 networks, `"10.20.0.0/24"` or an address; a /0
   is refused) gets `reserved_connections` (default 1, 1..=4) extra
   pre-authentication slots nobody else may take, and a connection from a
@@ -67,6 +74,8 @@ that as "not applied", never as success.
   certificate and a SOC key. Otherwise over a cap the connection is closed
   at accept (no answer; `connections_rejected`); an authenticated request
   that finds no authenticated slot is answered 503 `busy` (signed).
+  Connections refused or cut before they authenticated are reported as
+  `robot.agent.control_plane_saturated` (§8).
 * Answers are JSON (`Content-Type: application/json`) except evidence chunks
   (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
 * **Listeners** (at least one):
@@ -167,7 +176,10 @@ refused (`stale_timestamp`); sign again. It fences when, at start,
 The fence is `max(now, high-water mark) + max_clock_skew_s`: a request
 accepted before may carry a timestamp up to the skew ahead of the clock
 that accepted it. (`status.json`: `control_plane.replay_fence`;
-`state.replay.high_water`, `state.replay.clock_went_back`.)
+`state.replay.high_water`, `state.replay.clock_went_back`.) A correctly
+signed request the fence refuses is counted in `control_plane.fenced` and
+reported as `robot.agent.control_plane_request_fenced` (Low, §8), not as
+an authentication failure.
 
 Authenticated requests are rate-limited per key (`rate_per_minute`, default
 30, `burst` 10; evidence chunk downloads have their own bucket, §11.7; 429
@@ -394,11 +406,15 @@ snapshot (`key_scope`, §3.1) and the evidence API are not scoped. agentd
 holds one scope per configured key and refuses to start otherwise; a key
 it holds no scope for may request nothing.
 
-Limits: the scope is enforced by agentd. robodr-executor verifies the
-SOC signature on every order itself (§6a) but does not yet apply these
-scopes (planned with the executor's own key configuration), so a
-compromised agentd process could still pass it an out-of-scope request
-that a configured SOC key signed. The robot still cannot verify the SOC's
+Limits: these scopes are enforced by agentd. robodr-executor verifies
+the SOC signature on every order itself (§6a) and applies its **own**
+scopes, configured separately in `executor.json` (`soc.key_scopes`,
+`soc.require_key_scopes`; refusal `key_scope_denied`, §6a). A key without
+an executor scope approves every action there up to the executor's
+`ttl.max_s` unless `soc.require_key_scopes` is set, so only with both
+configured alike does a compromised agentd process fail to pass the
+executor an out-of-scope request a configured SOC key signed. The robot
+still cannot verify the SOC's
 internal approval process (the two-person names are asserted by the SOC,
 §4).
 
@@ -804,11 +820,24 @@ self-health, rate limited by `daemon.health_report_ms`):
   authentication since the last report, TLS handshakes included (count,
   last reason and peer);
 * `robot.agent.control_plane_invalid` (Medium): authenticated requests
-  refused as invalid.
+  refused as invalid;
+* `robot.agent.control_plane_request_fenced` (Low): correctly signed
+  requests refused because they were signed at or before the replay fence
+  (§2, §9; answered 401 `stale_timestamp` as before). They are counted in
+  `fenced`, not in `unauthenticated`: the SOC did nothing wrong and should
+  re-sign and resend;
+* `robot.agent.control_plane_saturated` (Medium): connections refused at
+  accept (`connections_rejected`) or cut before they authenticated
+  (`connections_evicted`) since the last report: every slot they could
+  use was busy. A TLS handshake flood or slowloris whose handshakes are
+  cut is not an authentication failure and is reported only by this; so is
+  legitimate overload (more clients than `max_connections`), and a SOC
+  address cutting an unlisted handshake.
 
 `status.json` and every heartbeat carry `control_plane`: `api`, `listening`
 (`mtls:<addr>`, `tcp:<addr>`, `unix:<path>`), `executor`,
-`executes_actions`, connection, authentication (`tls_failures` included),
+`executes_actions`, connection (`connections`, `connections_rejected`,
+`connections_evicted`), authentication (`tls_failures` included), `fenced`,
 rate-limit and busy counters, `answers_signed`, `answer_sign_failures`,
 `last_auth_failure`, `tls` (`server_spki_sha256`, `client_cas`,
 `client_pins`, `client_crls`), `replay_entries`, `replay_store_errors`,
@@ -1249,11 +1278,20 @@ another robot), 13 (signed in the removed v1 domain); all 401
   pre-authentication slots busy (never the unix socket's); the SOC's own
   addresses, configured as `soc_sources`, keep a reserved slot and cut the
   attacker's handshakes (in process, 4 attacker addresses with 2
-  connections each: 20/20 SOC requests during the attack,
-  `slowloris_cannot_lock_the_listed_soc_out`; the same attack without
-  `soc_sources` and without cutting by age: the SOC is locked out,
-  `without_soc_sources_the_same_slowloris_locks_the_soc_out`). Without
-  `soc_sources` the SOC competes with the attacker for the general slots.
+  connections each: 20/20 sequential SOC requests during the attack, all
+  through the reserved slot, `slowloris_cannot_lock_the_listed_soc_out`;
+  with a second SOC connection holding the reserved slot, 20/20 again,
+  at least 10 of them by cutting an attacker's handshake,
+  `a_soc_beyond_its_reserved_slot_cuts_an_attacker_handshake`; the same
+  attack without `soc_sources` and without cutting by age: the SOC is
+  locked out, `without_soc_sources_the_same_slowloris_locks_the_soc_out`).
+  Without `soc_sources` the SOC competes with the attacker for the general
+  slots, and with nothing cut by age every unlisted client is refused for
+  as long as the attack lasts (§1). Every run raises
+  `robot.agent.control_plane_saturated`
+  (`a_handshake_flood_on_the_default_listener_is_reported` for the default
+  listener, where the attackers' handshakes are cut by their own next
+  connections and nothing counts as an authentication failure).
   Cutting by age (the default without `soc_sources`) has not been measured
   under legitimate load over long round trips (§1: clients may cut each
   other), and the S2 re-run in the network-namespace lab with release
@@ -1465,3 +1503,10 @@ Additive, no version change (`robodr-control-plane/v2`).
   handshake no longer counts in `tls_failures` / `unauthenticated`;
   `soc_sources` refuses a /0; the revert refusal no longer names the
   stored request's action; a key without a scope may request nothing.
+* Second review follow-up (WP3): connections refused or cut before they
+  authenticated raise `robot.agent.control_plane_saturated` (Medium), so a
+  handshake flood whose handshakes are cut is no longer silent; a
+  correctly signed request refused by the replay fence is counted in
+  `fenced` (new `status.json` field) and raises
+  `robot.agent.control_plane_request_fenced` (Low) instead of counting as
+  an authentication failure (T81). The wire answers are unchanged.

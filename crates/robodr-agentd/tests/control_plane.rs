@@ -1546,6 +1546,8 @@ struct Slowloris {
     failures: Vec<String>,
     /// `status.json` `control_plane` at the end of the attack.
     cp: Value,
+    /// Rule ids of the findings spooled by then.
+    rules: Vec<String>,
 }
 
 /// RESULTS.md S2 (W2-4) in process: 4 attacker addresses (127.0.0.10 to
@@ -1553,8 +1555,10 @@ struct Slowloris {
 /// reopening TLS handshakes and trickle a ClientHello's first bytes, one
 /// every 100 ms, against 4 pre-authentication slots; meanwhile the SOC
 /// (from [`SOC_SRC`]) sends 20 signed GETs over mutual TLS. `extra` is
-/// merged into `control_plane`.
-fn slowloris(name: &str, extra: Value) -> Slowloris {
+/// merged into `control_plane`. With `soc_held`, the SOC keeps one more
+/// connection of its own in the handshake (a concurrent request: it holds
+/// the reserved slot) while it sends the 20.
+fn slowloris(name: &str, extra: Value, soc_held: bool) -> Slowloris {
     let s = setup(name, &robot_profile(true));
     let events = s.dir.join("ev.sock");
     let soc_pub = write_soc_pub(&s.dir);
@@ -1619,6 +1623,14 @@ fn slowloris(name: &str, extra: Value) -> Slowloris {
             .then_some(())
     });
     std::thread::sleep(std::time::Duration::from_millis(1500));
+    // A SOC connection still in its handshake: it takes the reserved slot
+    // (well within READ_DEADLINE, which the 20 requests below take less
+    // than), so each of the 20 needs a general slot.
+    let held = soc_held.then(|| connect_from(SOC_SRC, port).unwrap());
+    if held.is_some() {
+        // The listener accepts within its 20 ms poll.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
     let mut ok = 0;
     let mut failures = Vec::new();
     for _ in 0..20 {
@@ -1632,16 +1644,26 @@ fn slowloris(name: &str, extra: Value) -> Slowloris {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    drop(held);
     attack.store(false, Ordering::Relaxed);
     for a in attackers {
         a.join().unwrap();
     }
     let st = status(&s.spool).unwrap();
+    // Connections refused or cut before they authenticated are reported
+    // (WP3 review: a flood whose handshakes are all cut was silent).
+    let rules = wait_for(10, "saturation finding", || {
+        let rs = rules(&spooled(&s.spool));
+        rs.iter()
+            .any(|r| r == "robot.agent.control_plane_saturated")
+            .then_some(rs)
+    });
     finish(stop, h);
     Slowloris {
         ok,
         failures,
         cp: st["control_plane"].clone(),
+        rules,
     }
 }
 
@@ -1656,6 +1678,7 @@ fn slowloris_cannot_lock_the_listed_soc_out() {
     let r = slowloris(
         "cp-slowloris",
         json!({"soc_sources": [SOC_SRC.to_string()]}),
+        false,
     );
     assert_eq!(r.ok, 20, "SOC requests during the attack: {:?}", r.failures);
     assert!(
@@ -1665,13 +1688,64 @@ fn slowloris_cannot_lock_the_listed_soc_out() {
     );
 }
 
+/// WP3 review: the test above gets its 20/20 through the reserved slot
+/// alone (the SOC's requests are sequential), so it never shows a listed
+/// connection cutting an attacker's handshake. Here the SOC holds a second
+/// connection in its handshake (concurrent requests, more than
+/// `reserved_connections`): each of the 20 requests needs a general slot,
+/// and gets it by cutting an attacker's handshake at once.
+#[test]
+fn a_soc_beyond_its_reserved_slot_cuts_an_attacker_handshake() {
+    let r = slowloris(
+        "cp-slowloris-held",
+        json!({"soc_sources": [SOC_SRC.to_string()]}),
+        true,
+    );
+    assert_eq!(r.ok, 20, "SOC requests during the attack: {:?}", r.failures);
+    // Nothing is cut by age with soc_sources: every cut is the SOC's. The
+    // held handshake ends at READ_DEADLINE (5 s), after which the last
+    // requests may take the reserved slot again.
+    assert!(
+        r.cp["connections_evicted"].as_u64().unwrap() >= 10,
+        "each SOC request cut an attacker's handshake: {}",
+        r.cp
+    );
+}
+
+/// WP3 review (medium): with the default listener (no `soc_sources`, cut
+/// by age after 100 ms) the attackers' handshakes are cut by their own
+/// next connections; a cut is not an authentication failure, so the flood
+/// raised no finding at all. It is reported as
+/// `robot.agent.control_plane_saturated` (asserted in [`slowloris`]).
+#[test]
+fn a_handshake_flood_on_the_default_listener_is_reported() {
+    let r = slowloris("cp-slowloris-default", json!({}), false);
+    eprintln!("SOC requests through on the default listener: {}/20", r.ok);
+    assert!(
+        r.cp["connections_evicted"].as_u64().unwrap() > 0,
+        "the attackers cut each other's handshakes: {}",
+        r.cp
+    );
+    assert!(
+        r.rules
+            .iter()
+            .any(|x| x == "robot.agent.control_plane_saturated"),
+        "{:?}",
+        r.rules
+    );
+}
+
 /// The control of the test above, so it is shown to catch the regression:
 /// the same attack against the listener as it was before W2-4 (no
 /// `soc_sources`, nothing cut by age) locks the SOC out, and the assertion
 /// above fails.
 #[test]
 fn without_soc_sources_the_same_slowloris_locks_the_soc_out() {
-    let r = slowloris("cp-slowloris-ctl", json!({"pre_auth_evict_after_ms": 0}));
+    let r = slowloris(
+        "cp-slowloris-ctl",
+        json!({"pre_auth_evict_after_ms": 0}),
+        false,
+    );
     eprintln!("SOC requests through without soc_sources: {}/20", r.ok);
     assert!(r.ok < 20, "the attack did not hold the slots: {}", r.cp);
     assert_eq!(r.cp["connections_evicted"], 0, "{}", r.cp);
@@ -1730,6 +1804,77 @@ fn an_evicted_handshake_is_not_an_authentication_failure() {
     assert_eq!(cp["unauthenticated"], 1, "{cp}");
     let last = cp["last_auth_failure"].as_str().unwrap();
     assert!(last.contains("127.0.0.21"), "{last}");
+}
+
+/// T81: a correctly signed request refused by the replay fence (every
+/// agentd start that has to fence, e.g. after the replay store was lost)
+/// was counted as an authentication failure and raised
+/// `robot.agent.control_plane_unauthenticated` (High) although the SOC did
+/// nothing wrong. It is counted as `fenced` and reported as
+/// `robot.agent.control_plane_request_fenced` (Low) now.
+#[test]
+fn a_fenced_request_is_not_an_authentication_failure() {
+    let s = setup("cp-fenced", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let control = s.dir.join("control.sock");
+    let soc_pub = write_soc_pub(&s.dir);
+    let mut cfg = base_config(&s, &events);
+    let state = state_dir(&s);
+    // No replay store: created at start, fenced up to now + skew.
+    std::fs::remove_file(state.join("nonces.journal")).unwrap();
+    cfg["control_plane"] = json!({
+        "unix_socket": control,
+        "state_dir": state,
+        "soc_keys": [soc_pub],
+        "max_clock_skew_s": 2,
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(5, "control socket", || UnixStream::connect(&control).ok());
+    let base = format!("/api/v2/robots/{ROBOT}");
+    let r = unix(&control, &signed("GET", &base, b""));
+    // The wire answer is unchanged: 401 stale_timestamp.
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_str()),
+        (401, Some("stale_timestamp")),
+        "{}",
+        r.body
+    );
+    wait_for(10, "fenced finding", || {
+        rules(&spooled(&s.spool))
+            .iter()
+            .any(|r| r == "robot.agent.control_plane_request_fenced")
+            .then_some(())
+    });
+    let cp = wait_for(10, "fenced counted", || {
+        let cp = status(&s.spool)?["control_plane"].clone();
+        (cp["fenced"].as_u64()? >= 1).then_some(cp)
+    });
+    assert_eq!(cp["fenced"], 1, "{cp}");
+    assert_eq!(cp["unauthenticated"], 0, "{cp}");
+    // A bad signature is still an authentication failure.
+    let mut bad = signed("GET", &base, b"");
+    bad.sig = "00".repeat(64);
+    let r = unix(&control, &bad);
+    assert_eq!(r.status, 401, "{}", r.body);
+    wait_for(10, "unauthenticated finding", || {
+        rules(&spooled(&s.spool))
+            .iter()
+            .any(|r| r == "robot.agent.control_plane_unauthenticated")
+            .then_some(())
+    });
+    finish(stop, h);
+    let found = rules(&spooled(&s.spool));
+    let n = |id: &str| found.iter().filter(|r| *r == id).count();
+    assert_eq!(
+        n("robot.agent.control_plane_request_fenced"),
+        1,
+        "{found:?}"
+    );
+    assert_eq!(
+        n("robot.agent.control_plane_unauthenticated"),
+        1,
+        "{found:?}"
+    );
 }
 
 // ---------------------------------------------------------------------

@@ -461,7 +461,16 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   fewer than 20). With `soc_sources` agentd no longer cuts by age unless
   `pre_auth_evict_after_ms` is set (review follow-up: cutting by age lets
   legitimate clients cut each other under load). The netns re-run of S2
-  with the release binaries is still to do.
+  with the release binaries is still to do. **Update (WP3 review):** a cut
+  handshake is not an authentication failure, so a flood whose handshakes
+  were all cut raised no finding; connections refused or cut before they
+  authenticated now raise `robot.agent.control_plane_saturated` (Medium),
+  asserted in every slowloris run and in
+  `a_handshake_flood_on_the_default_listener_is_reported` (default
+  listener). `a_soc_beyond_its_reserved_slot_cuts_an_attacker_handshake`
+  covers a SOC with more concurrent connections than its reserved slot
+  (it cuts attackers' handshakes and gets 20/20). With nothing cut by age,
+  clients outside `soc_sources` stay locked out while the attack lasts.
 - **W2-5 (Low, design note).** The gateway feed is trusted by uid: a
   process running as root or as the gateway's user can claim any
   catalogued gateway / firewall finding and its severity (G7) and can
@@ -492,6 +501,11 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   fence, contract §2); the refused SOC request raises
   `robot.agent.control_plane_unauthenticated` (High) worded as if someone
   without a key tried: one false alarm per such start.
+  **Update (T81, WP3):** a correctly signed request the fence refuses is
+  counted in `control_plane.fenced` and raises
+  `robot.agent.control_plane_request_fenced` (Low) instead; regression
+  `tests/control_plane.rs::a_fenced_request_is_not_an_authentication_failure`.
+  Not re-run in the soak.
 
 ### What was not covered (still unverified)
 
