@@ -44,9 +44,26 @@ present and not `verified`; findings indexed through `robodr-findings` have
 no status and still alert. `detection-rules/unverified-findings.json` reports
 every finding that is not verified (`integrations/README.md`).
 
+`robodr-findings` first expands dotted top-level keys (`dot_expander`), so
+a forged `"robodr.verification.status"` key is removed with the `robodr`
+object rather than mapped as that field at index time.
+
 Checked by `integrations/check_content.py` (field references, rule ids, and
 both pipelines evaluated on real findings, and on findings carrying a
-forged status, by an in-repo evaluator); not yet run against a live
-Elasticsearch: `POST _ingest/pipeline/robodr-findings/_simulate`
-with a finding from `docs/contracts/robodr-finding.example.json` is the first
-thing to do on a real cluster.
+forged status, by an in-repo evaluator), and by `live_check.py` against a
+real Elasticsearch:
+
+```sh
+python3 integrations/elastic/live_check.py --es http://127.0.0.1:9200 --findings findings.ndjson
+# or, with one finding per catalog rule id:
+ROBODR_ES_URL=http://127.0.0.1:9200 cargo test -p robodr-ocsf --test integrations_content
+```
+
+It installs both pipelines and the template (overwriting: use a scratch
+cluster), `_simulate`s every finding through both pipelines, checks a forged
+status is dropped, indexes into `logs-robodr.findings-check`, counts the
+verified documents and checks a raw tainted value is not searchable while
+its `display` is. It passed with the 166 findings of the cargo test on
+Elasticsearch 8.15.3 (Docker image `elasticsearch:8.15.3`, single node,
+security off) on 2026-10-31. Not run in CI. The detection rules are
+Kibana objects and have not been loaded into Kibana.

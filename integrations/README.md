@@ -25,11 +25,15 @@ that no verifier checked is discarded (forged-status cases run through the
 Elastic pipelines), and the Sentinel DCR's columns match its table. `crates/robodr-ocsf/tests/integrations_content.rs` runs it.
 
 **What is and is not verified.** The checks above run in RoboDR's tests.
-None of this content has been loaded into a running Splunk, Elastic or
-Sentinel instance yet; doing that with a design partner's SIEM is the
-remaining step (no licence or tenant was available). The Elastic check
-evaluates the pipeline with an in-repo evaluator of the processors it uses,
-not Elasticsearch itself.
+The Elastic check there evaluates the pipelines with an in-repo evaluator of
+the processors they use. `elastic/live_check.py` runs the same findings
+through a real Elasticsearch (both ingest pipelines, the index template,
+indexing and search); the test runs it when `ROBODR_ES_URL` names a scratch
+cluster, and it passed on Elasticsearch 8.15.3 (single node, Docker image
+`elasticsearch:8.15.3`) on 2026-10-31. It does not run in CI. The Elastic
+detection rules (Kibana), the Splunk add-on and the Sentinel content have
+not been loaded into a running instance yet; doing that with a design
+partner's SIEM is the remaining step (no licence or tenant was available).
 
 ## How findings reach a SIEM
 

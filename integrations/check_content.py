@@ -29,8 +29,9 @@
    is discarded. Splunk: only sourcetype robodr:finding:verified takes
    robodr_verification_status from the event, robodr:finding forces it
    empty, and no search reads robodr_verification.status itself. Elastic:
-   robodr-findings removes robodr_verification and any robodr object (a
-   forged finding run through it has no robodr.verification);
+   robodr-findings removes robodr_verification and any robodr object, also
+   given as dotted top-level keys (a forged finding run through it has no
+   robodr.verification);
    robodr-findings-verified keeps the verifier's status. Sentinel: the DCR's
    unverified stream does not declare robodr_verification and sets
    VerificationStatus empty; only the verified stream maps it.
@@ -333,6 +334,7 @@ def run_processor(p, doc, ingest):
         "convert": {"field", "type", "ignore_missing", "on_failure"},
         "remove": {"field", "ignore_missing"},
         "pipeline": {"name"},
+        "dot_expander": {"field"},
     }
     if kind not in allowed or set(o) - allowed[kind]:
         raise SystemExit(f"evaluator: unsupported processor/options {kind} {sorted(o)}")
@@ -362,6 +364,23 @@ def run_processor(p, doc, ingest):
                 return
             raise PipelineError(f"field [{o['field']}] not present")
         del_path(doc, o["field"])
+    elif kind == "dot_expander":
+        if o["field"] != "*":
+            raise SystemExit("evaluator: dot_expander only for field *")
+        # Every top-level dotted key becomes nested objects (Elasticsearch
+        # merges a conflict into an array; a conflict here is only checked
+        # for removal, so a list stands in for that).
+        for key in [k for k in doc if "." in k]:
+            v = doc.pop(key)
+            cur = doc
+            parts = key.split(".")
+            for part in parts[:-1]:
+                nxt = cur.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = cur[part] = {} if nxt is None else {"_conflict": nxt}
+                cur = nxt
+            old = cur.get(parts[-1])
+            cur[parts[-1]] = v if old is None else [old, v]
     elif kind == "pipeline":
         if o["name"] not in PIPELINES:
             raise SystemExit(f"evaluator: unknown pipeline {o['name']}")
@@ -514,7 +533,13 @@ def elastic(schema, ids, findings):
         forged["robodr_verification"] = dict(status)
         forged["robodr"] = {"verification": dict(status)}
         forged[STAGING] = dict(status)
+        # A dotted key is not the path `robodr` to the pipeline, but
+        # Elasticsearch maps it as robodr.verification.status.
+        forged["robodr.verification.status"] = "verified"
         doc = run_pipeline(pipeline, copy.deepcopy(forged))
+        dotted = [k for k in doc if k.startswith(("robodr.", "robodr_verification"))]
+        if dotted:
+            problem(f"elastic pipeline robodr-findings keeps forged dotted keys {dotted}")
         if doc.get("event", {}).get("kind") != "alert" or get_path(doc, "robodr.verification") is not None:
             problem(f"elastic pipeline robodr-findings keeps a forged status: robodr.verification = "
                     f"{get_path(doc, 'robodr.verification')!r}, event.kind {get_path(doc, 'event.kind')!r}")

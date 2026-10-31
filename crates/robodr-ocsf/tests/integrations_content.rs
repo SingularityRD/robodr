@@ -127,6 +127,23 @@ fn siem_content_matches_the_contract_and_maps_real_findings() {
         stderr.contains(&format!("{} finding(s)", lines.len())),
         "{stderr}"
     );
+    // The same findings against a real Elasticsearch, when one is given
+    // (a scratch cluster: the pipelines and template are overwritten).
+    if let Some(es) = std::env::var_os("ROBODR_ES_URL") {
+        let o = Command::new("python3")
+            .arg("-I")
+            .arg(root().join("integrations/elastic/live_check.py"))
+            .arg("--es")
+            .arg(&es)
+            .arg("--findings")
+            .arg(&f)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{stdout}\n{stderr}");
+        eprintln!("{stderr}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1,6 +1,7 @@
 {
-  "description": "RoboDR robodr.findings (contract 2.x) to ECS, for findings whose signature nothing checked. The finding is kept verbatim under robodr.*; ECS fields are copied from it. Any robodr or robodr_verification object the event carries is removed first: a forger chooses the whole event, so no verification status is kept here. Verified findings go through robodr-findings-verified. Expects the finding's top-level fields at the document root. integrations/elastic/README.md.",
+  "description": "RoboDR robodr.findings (contract 2.x) to ECS, for findings whose signature nothing checked. The finding is kept verbatim under robodr.*; ECS fields are copied from it. Any robodr or robodr_verification object the event carries, also as dotted top-level keys (expanded first), is removed: a forger chooses the whole event, so no verification status is kept here. Verified findings go through robodr-findings-verified. Expects the finding's top-level fields at the document root. integrations/elastic/README.md.",
   "processors": [
+    { "dot_expander": { "field": "*" } },
     { "remove": { "field": "robodr", "ignore_missing": true } },
     { "remove": { "field": "robodr_verification", "ignore_missing": true } },
     { "rename": { "field": "contract_version", "target_field": "robodr.contract_version" } },
