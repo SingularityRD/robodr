@@ -1,0 +1,6 @@
+# Lab SROS 2 keystores (private keys; sros2-keystore.sh) and capture
+# scratch. Recorded captures are moved to fixtures/captures/.
+/.sros2/
+/.sros2-foreign/
+/.tcpdump.pid
+/*.pcap
