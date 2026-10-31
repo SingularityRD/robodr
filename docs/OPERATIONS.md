@@ -1801,28 +1801,33 @@ hours of evidence, and much less during an incident. Size it for the site:
 | `unexported_reserve_segments` | 0 | cyclic only: **pending-export protection**. A segment whose records are not all covered by the signed export cursor (8.2) is kept, up to this many segments beyond `segments`; only then is unexported evidence dropped |
 | `critical_reserve_segments` | 1 | saturation only |
 | `warn_percent` | 80 | unexported share of the capacity that raises the pressure finding (50..=99) |
+| `export` | `auto` | whether this site exports the black box (8.2), for the plain-cyclic drop finding below: `auto` reports it only once an export cursor exists (an export ran at least once), `expected` also before the first export, `none` never (the site does not export; refused together with a reserve) |
 
 At start agentd checks that `(segments + reserve) x segment_bytes`, minus
 what the directory's segments already hold, fits in the free space of the
 black box's filesystem, and refuses to start otherwise (exit 2, the message
-names the numbers). With protection on (or in saturation mode) agentd
-re-reads the export cursor every health tick and raises, observe-only:
+names the numbers). agentd re-reads the export cursor every health tick and
+raises, observe-only:
 
 | Condition | Finding | Severity |
 |---|---|---|
-| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode, again at High if it climbs to 95 %; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
-| cyclic retention dropped unexported evidence (the reserve was used up) | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | High |
-| plain cyclic retention (no reserve, the default) dropped segments no export had confirmed | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | Medium, at most once a day with the count since the last report |
+| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode, again at High if it climbs to 95 %; clears 10 points below) | `robot.agent.evidence_retention_pressure` | Medium; High from 95 % |
+| cyclic retention dropped unexported evidence (the reserve was used up) | `robot.agent.evidence_unexported_dropped` | High |
+| plain cyclic retention (no reserve, the default) dropped segments no export had confirmed, and `export` is `expected`, or `auto` with an export cursor | `robot.agent.evidence_unexported_dropped` | Medium, at most once a day with the count since the last report |
 
-(These use the catalogued `evidence_degraded` id until the next
-findings-contract minor gives them their own.) Plain cyclic retention has
-no pressure finding: without an exporter every segment is unexported, so
-it would always read full. Its drops are reported, once a day at most, so
-a unit on the default configuration (8 x 8 MiB, no reserve) that nobody
-exports says that its oldest evidence is going; a site that exports the
-black box sets the reserve and runs the export (8.2). Drops are counted
-per recorder: a recorder reopened after an outage starts from 0 and what
-the previous one dropped but had not reported is carried over.
+(Both ids are findings contract 2.5 entries; `robot.agent.evidence_degraded`
+means only that the recorder failed to store evidence.) Plain cyclic
+retention has no pressure finding: without an exporter every segment is
+unexported, so it would always read full. Its drops are normal operation
+on a unit nobody exports, so with the default `export: auto` they are
+reported (once a day at most) only after an export has run at least once:
+a unit whose exporter stopped or fell behind says that its oldest
+unexported evidence is going, while a unit that was never exported stays
+quiet. Drops made before the first export are not reported later. A site
+that must export sets `export: expected` (reported from the first drop) and
+the reserve; a site that never exports sets `export: none`. Drops are
+counted per recorder: a recorder reopened after an outage starts from 0 and
+what the previous one dropped but had not reported is carried over.
 
 Sizing (hours of evidence held; a cyclic store holds between `segments - 1`
 and `segments` full segments; the oldest is the one dropped next):
@@ -2925,9 +2930,11 @@ robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd \
 Each record's hash, signature and link are checked before it is
 exported; each bundle is written durably before the cursor moves (a crash
 in between re-exports the same records; the far side reports the replay).
-It streams the segments one frame at a time, so its memory is about
-`--max-bytes` (64 MiB) plus one frame (at most 16 MiB) whatever the
-segment size. After a key rotation (4.3) `--key` must be the new key and
+It streams the segments one frame at a time (also past damage, which it
+resynchronises over without reading the segment whole), so its memory is
+the bundle buffer (never more than `--max-bytes`, 64 MiB, but briefly
+about 1.5 times that while it grows) plus a few copies of one frame (at
+most 16 MiB), whatever the segment size. After a key rotation (4.3) `--key` must be the new key and
 the retired public keys go in `--previous-keys`: a run with the retired
 key is refused (exit 2) before it writes anything, because the newest
 record is not signed by it. `robodr-blackbox rotate` holds `export.lock`
@@ -2942,8 +2949,8 @@ a gap, replay or substitution is detected).
 
 agentd re-reads the cursor before cyclic retention drops a segment: with
 `blackbox.retention.unexported_reserve_segments` (6.4) a segment this has
-not exported is kept, within the reserve, and agentd raises the pressure
-finding before evidence is lost.
+not exported is kept, within the reserve, and agentd raises
+`robot.agent.evidence_retention_pressure` before evidence is lost.
 
 Run it periodically with the example units
 `packaging/systemd/blackbox-export/robodr-blackbox-export.{service,timer}`
@@ -4450,7 +4457,11 @@ state re-created by its own procedure, never copied.
    extracts evidence only under `--evidence-to` (a directory that, after
    resolving `..`, relative paths and symlinks, is the root or lies in
    `/etc`, `/var/lib/robodr`, `/var/lib/robodr-anchor-receiver`,
-   `/var/lib/robodr-seal` or `/opt/robodr-delivered` is refused, exit 2),
+   `/var/lib/robodr-seal` or `/opt/robodr-delivered` is refused, exit 2;
+   it is created before the verification pass and must still resolve to
+   itself before each evidence file is written, else the restore stops,
+   exit 2; the check is not atomic with each write, so put it where only
+   the operator can write),
    restores the spools' `ready/` findings only with `--spool-ready` and only
    into an empty `ready/`, and **never** restores a "no" row of 14.1, even
    from an archive that holds one: each refused path is printed with its

@@ -57,7 +57,12 @@
 //!   with `--evidence-to DIR` extracted under `DIR` for the archive host.
 //!   `DIR` is resolved first (relative paths, `..`, symlinks) and refused
 //!   if it is the root or inside one of [`LIVE_TREES`] under the root or
-//!   under `/` ([`evidence_dir`]);
+//!   under `/` ([`evidence_dir`]); it is then created (unless `dry_run`)
+//!   and checked again, and before each evidence entry is written it must
+//!   still resolve to itself: a component replaced in between (a symlink
+//!   planted by someone who can write a parent of `DIR`) stops the restore
+//!   (`InvalidInput`). The check and each write are separate steps, so
+//!   keep `DIR` where only the operator can write;
 //! * **never restored** (§14.1 "no" rows, [`NEVER_RESTORE`]) and anything
 //!   unknown: refused and listed with the reason.
 //!
@@ -822,13 +827,15 @@ fn write_entry(target: &Path, e: &Entry, mode: u32, data: &mut dyn Read) -> io::
         }
         return Ok(());
     }
+    // Local invariants, not archive data: not `InvalidData`.
+    let local = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: {m}", e.path));
     let parent = target
         .parent()
-        .ok_or_else(|| bad("restore target without a parent"))?;
+        .ok_or_else(|| local("restore target without a parent"))?;
     let name = target
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| bad("bad file name"))?;
+        .ok_or_else(|| local("bad file name"))?;
     let tmp = parent.join(format!(
         ".{name}.{}.rbkup-tmp",
         to_hex(
@@ -891,7 +898,20 @@ pub fn restore_from<R: Read + Seek>(
     opts: &RestoreOptions,
 ) -> io::Result<RestoreReport> {
     let evidence_base = match &opts.evidence_to {
-        Some(d) => Some(evidence_dir(root, d)?),
+        Some(d) => {
+            let dest = evidence_dir(root, d)?;
+            if !opts.dry_run {
+                // Made now, before the verification pass, and checked
+                // again: a component planted (a symlink) after the first
+                // check is refused instead of followed by a later
+                // `create_dir_all`.
+                fs::create_dir_all(&dest)?;
+                if evidence_dir(root, &dest)? != dest {
+                    return Err(evidence_moved(d));
+                }
+            }
+            Some(dest)
+        }
         None => None,
     };
     // Pass 1: verify everything before writing anything.
@@ -911,97 +931,102 @@ pub fn restore_from<R: Read + Seek>(
     archive.seek(SeekFrom::Start(0))?;
     let mut r = io::BufReader::new(&mut *archive);
     let mut next = 0usize;
+    // Set when the visitor (not walk's framing or hash checks) failed: a
+    // local error (writing the target) is reported as it is, not as a
+    // change of the archive.
+    let mut local_failed = false;
     walk(&mut r, &mut |e, data| {
-        // Pass 2 must read exactly what pass 1 verified (an archive on
-        // removable media or in a directory someone else can write may be
-        // replaced in between); file bytes are checked again as they are
-        // written ([`write_entry`]).
-        if verified.get(next) != Some(e) {
-            return Err(changed(format!(
-                "{}: the archive changed after it was verified; restore stopped",
-                e.path
-            )));
-        }
-        next += 1;
-        let (base, kind) = match classify(&e.path) {
-            Class::Restore => (root.to_path_buf(), "restore"),
-            Class::SpoolReady if !opts.spool_ready => {
-                rep.refused.push((
-                    e.path.clone(),
-                    "unexported finding: restored only with --spool-ready (§14.1)".into(),
-                ));
-                return Ok(());
+        let res = (|| {
+            // Pass 2 must read exactly what pass 1 verified (an archive on
+            // removable media or in a directory someone else can write may be
+            // replaced in between); file bytes are checked again as they are
+            // written ([`write_entry`]).
+            if verified.get(next) != Some(e) {
+                return Err(changed(format!(
+                    "{}: the archive changed after it was verified; restore stopped",
+                    e.path
+                )));
             }
-            Class::SpoolReady => {
-                if busy_ready.iter().any(|b| under(&e.path, b)) {
+            next += 1;
+            let (base, kind) = match classify(&e.path) {
+                Class::Restore => (root.to_path_buf(), "restore"),
+                Class::SpoolReady if !opts.spool_ready => {
                     rep.refused.push((
                         e.path.clone(),
-                        "the unit's ready/ is not empty: it has findings of its own (§14.1)".into(),
+                        "unexported finding: restored only with --spool-ready (§14.1)".into(),
                     ));
                     return Ok(());
                 }
-                (root.to_path_buf(), "restore")
-            }
-            Class::Evidence => match &evidence_base {
-                Some(d) => (d.clone(), "evidence"),
-                None => {
-                    rep.refused.push((
-                        e.path.clone(),
-                        "evidence: never restored into the unit; use --evidence-to DIR for \
+                Class::SpoolReady => {
+                    if busy_ready.iter().any(|b| under(&e.path, b)) {
+                        rep.refused.push((
+                            e.path.clone(),
+                            "the unit's ready/ is not empty: it has findings of its own (§14.1)"
+                                .into(),
+                        ));
+                        return Ok(());
+                    }
+                    (root.to_path_buf(), "restore")
+                }
+                Class::Evidence => match &evidence_base {
+                    Some(d) => (d.clone(), "evidence"),
+                    None => {
+                        rep.refused.push((
+                            e.path.clone(),
+                            "evidence: never restored into the unit; use --evidence-to DIR for \
                          the archive host (§14.1)"
-                            .into(),
-                    ));
+                                .into(),
+                        ));
+                        return Ok(());
+                    }
+                },
+                Class::Never(why) => {
+                    rep.refused.push((e.path.clone(), why));
                     return Ok(());
                 }
-            },
-            Class::Never(why) => {
-                rep.refused.push((e.path.clone(), why));
-                return Ok(());
-            }
-        };
-        let target = match safe_target(&base, &e.path, e.dir) {
-            Ok(t) => t,
-            Err(why) => {
-                rep.refused.push((e.path.clone(), why));
-                return Ok(());
-            }
-        };
-        if !opts.dry_run {
-            // Evidence goes to a fresh tree: its parents are made as
-            // needed (some are never-restored state directories).
-            if kind == "evidence" {
-                if let Some(p) = target.parent() {
-                    fs::create_dir_all(p)?;
+            };
+            let target = match safe_target(&base, &e.path, e.dir) {
+                Ok(t) => t,
+                Err(why) => {
+                    rep.refused.push((e.path.clone(), why));
+                    return Ok(());
                 }
+            };
+            if !opts.dry_run {
+                // Evidence goes to a fresh tree: its parents are made as
+                // needed (some are never-restored state directories). The
+                // directory is checked again first: it must still resolve to
+                // itself (no component replaced since the start).
+                if kind == "evidence" {
+                    if fs::canonicalize(&base).ok().as_ref() != Some(&base) {
+                        return Err(evidence_moved(opts.evidence_to.as_deref().unwrap_or(&base)));
+                    }
+                    if let Some(p) = target.parent() {
+                        fs::create_dir_all(p)?;
+                    }
+                }
+                // Directories come before their contents in the archive; a
+                // missing parent (a refused directory) refuses the entry.
+                if target.parent().is_some_and(|p| !p.is_dir()) {
+                    rep.refused
+                        .push((e.path.clone(), "parent directory not restored".into()));
+                    return Ok(());
+                }
+                write_entry(&target, e, restored_mode(&e.path, e), data)?;
             }
-            // Directories come before their contents in the archive; a
-            // missing parent (a refused directory) refuses the entry.
-            if target.parent().is_some_and(|p| !p.is_dir()) {
-                rep.refused
-                    .push((e.path.clone(), "parent directory not restored".into()));
-                return Ok(());
+            if kind == "evidence" {
+                rep.evidence.push(e.path.clone());
+            } else {
+                rep.restored.push(e.path.clone());
             }
-            write_entry(&target, e, restored_mode(&e.path, e), data)?;
+            Ok(())
+        })();
+        if res.as_ref().is_err_and(|e| !is_changed(e)) {
+            local_failed = true;
         }
-        if kind == "evidence" {
-            rep.evidence.push(e.path.clone());
-        } else {
-            rep.restored.push(e.path.clone());
-        }
-        Ok(())
+        res
     })
-    .map_err(|e| {
-        // Pass 1 accepted these bytes: any data error now is a change.
-        if e.kind() == io::ErrorKind::InvalidData
-            && e.get_ref().is_none_or(|x| !x.is::<ArchiveChanged>())
-        {
-            changed(format!(
-                "the archive changed after it was verified ({e}); restore stopped"
-            ))
-        } else {
-            e
-        }
-    })?;
+    .map_err(|e| pass2_error(e, local_failed))?;
     if next != verified.len() {
         return Err(changed(
             "the archive changed after it was verified (fewer entries); restore stopped".into(),
@@ -1012,6 +1037,37 @@ pub fn restore_from<R: Read + Seek>(
 
 fn changed(m: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, ArchiveChanged(m))
+}
+
+fn evidence_moved(to: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "--evidence-to {}: the directory no longer resolves to the one checked at the \
+             start (a component was replaced, e.g. by a symlink); restore stopped. Use a \
+             directory only the operator can write",
+            to.display()
+        ),
+    )
+}
+
+fn is_changed(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.is::<ArchiveChanged>())
+}
+
+/// The error of [`restore_from`]'s write pass. Pass 1 accepted the
+/// archive, so a framing or hash error raised by [`walk`] now means the
+/// archive changed; an error of the visitor itself (`local`: writing the
+/// target, e.g. a full disk or a refused path) is returned unchanged, even
+/// when its kind is `InvalidData`.
+fn pass2_error(e: io::Error, local: bool) -> io::Error {
+    if !local && e.kind() == io::ErrorKind::InvalidData && !is_changed(&e) {
+        changed(format!(
+            "the archive changed after it was verified ({e}); restore stopped"
+        ))
+    } else {
+        e
+    }
 }
 
 #[cfg(test)]
@@ -1112,6 +1168,113 @@ mod tests {
                 "{tag}: unverified entry written"
             );
         }
+    }
+
+    /// Review (WP4 phase 3): an error of the write pass's own work (not
+    /// the archive's framing or hashes) is not relabelled as a change of
+    /// the archive, whatever its kind.
+    #[test]
+    fn local_write_errors_are_not_reported_as_archive_changes() {
+        let e = pass2_error(bad("restore target without a parent"), true);
+        assert!(!is_changed(&e), "{e}");
+        assert!(e.to_string().contains("without a parent"), "{e}");
+        let e = pass2_error(bad("truncated header"), false);
+        assert!(is_changed(&e), "{e}");
+        let e = pass2_error(io::Error::other("disk full"), false);
+        assert!(!is_changed(&e), "{e}");
+        // A refused --evidence-to during the write pass is local too.
+        let ev = archive_of(&[("var/lib/robodr/blackbox/agentd/seg", "x")]);
+        let dst = Tmp::new("local-err");
+        let to = dst.0.join("archive-host");
+        let mut a = Plant {
+            inner: Cursor::new(ev),
+            rewinds: 0,
+            plant: Box::new({
+                let to = to.clone();
+                move || {
+                    let _ = fs::rename(&to, to.with_extension("old"));
+                    fs::create_dir_all(to.with_extension("elsewhere")).unwrap();
+                    std::os::unix::fs::symlink(to.with_extension("elsewhere"), &to).unwrap();
+                }
+            }),
+        };
+        let o = RestoreOptions {
+            evidence_to: Some(to),
+            ..RestoreOptions::default()
+        };
+        let e = restore_from(&mut a, &dst.0, &o).unwrap_err();
+        assert!(!is_changed(&e), "{e}");
+        assert!(e.to_string().contains("no longer resolves"), "{e}");
+    }
+
+    /// Runs `plant` when the archive is rewound for the write pass
+    /// (between the verification pass and the writes).
+    struct Plant {
+        inner: Cursor<Vec<u8>>,
+        rewinds: u32,
+        plant: Box<dyn FnMut()>,
+    }
+    impl Read for Plant {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(b)
+        }
+    }
+    impl Seek for Plant {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            if to == SeekFrom::Start(0) {
+                self.rewinds += 1;
+                if self.rewinds == 2 {
+                    (self.plant)();
+                }
+            }
+            self.inner.seek(to)
+        }
+    }
+
+    /// Review (WP4 phase 3): `--evidence-to` is resolved at the start; a
+    /// symlink planted at its not-yet-existing part (or in place of it)
+    /// during the verification pass must not redirect evidence into the
+    /// unit's live tree.
+    #[test]
+    fn evidence_dir_replaced_by_a_symlink_mid_restore_is_refused() {
+        let ev = archive_of(&[("var/lib/robodr/blackbox/agentd/seg", "evidence")]);
+        let root = Tmp::new("plant-root");
+        let live = root.0.join("var/lib/robodr/state");
+        fs::create_dir_all(&live).unwrap();
+        let host = Tmp::new("plant-host");
+        let to = host.0.join("restored/evidence");
+        let mut a = Plant {
+            inner: Cursor::new(ev),
+            rewinds: 0,
+            plant: Box::new({
+                let (to, live) = (to.clone(), live.clone());
+                move || {
+                    let parent = to.parent().unwrap().to_path_buf();
+                    let _ = fs::rename(&parent, parent.with_extension("moved"));
+                    std::os::unix::fs::symlink(&live, &parent).unwrap();
+                }
+            }),
+        };
+        let o = RestoreOptions {
+            evidence_to: Some(to),
+            ..RestoreOptions::default()
+        };
+        assert!(restore_from(&mut a, &root.0, &o).is_err());
+        let mut found = Vec::new();
+        let mut stack = vec![live.clone()];
+        while let Some(d) = stack.pop() {
+            for x in fs::read_dir(&d).unwrap() {
+                let x = x.unwrap().path();
+                if x.is_dir() {
+                    stack.push(x.clone());
+                }
+                found.push(x);
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "evidence written into the live tree: {found:?}"
+        );
     }
 
     #[test]

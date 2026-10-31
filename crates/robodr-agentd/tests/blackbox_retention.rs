@@ -80,7 +80,7 @@ fn unexported_evidence_filling_the_retention_is_reported_before_it_is_dropped() 
     let found = spooled(&s.spool);
     let p: Vec<_> = found
         .iter()
-        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.evidence_degraded")
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.evidence_retention_pressure")
         .filter(|(_, e)| {
             serde_json::to_string(e)
                 .unwrap()

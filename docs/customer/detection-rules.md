@@ -11,14 +11,14 @@ This is the full generated reference. How to read a finding, what each detection
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
 * **Since** is the contract version that added the entry. A consumer validating an older message applies that message's catalog; an id without an entry is reported with a generic title ("RoboDR model-profile deviation").
 
-166 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
+168 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
 
 ## By data source
 
 | Data source | Rule ids |
 |---|---|
 | `host_runtime` | 1 |
-| `robodr_agent` | 28 |
+| `robodr_agent` | 30 |
 | `robodr_correlation` | 10 |
 | `robodr_delivery` | 17 |
 | `robot_safety_state` | 4 |
@@ -27,7 +27,7 @@ This is the full generated reference. How to read a finding, what each detection
 
 ## Families
 
-* [`robot.agent.*`](#robotagent) (26)
+* [`robot.agent.*`](#robotagent) (28)
 * [`robot.capture.*`](#robotcapture) (10)
 * [`robot.correlate.*`](#robotcorrelate) (10)
 * [`robot.dds.*`](#robotdds) (1)
@@ -63,7 +63,9 @@ This is the full generated reference. How to read a finding, what each detection
 | `robot.agent.disk_low` | Agent storage running out of space | A filesystem the robot's agent writes evidence, findings or control-plane state to is nearly full: free space before recording stops. | `robodr_agent` | - | 2.5 |
 | `robot.agent.evidence_degraded` | Black-box recording failing | The black-box recorder failed to store evidence; records from this outage are missing. | `robodr_agent` | - | 1.3 |
 | `robot.agent.evidence_quarantined` | Damaged black-box segment quarantined | Opening the black box found closed segments that failed verification; they were copied to quarantine and recording continued without reusing sequence numbers. | `robodr_agent` | - | 1.3 |
+| `robot.agent.evidence_retention_pressure` | Unexported black-box evidence filling the retention | Black-box evidence that no export has confirmed yet fills most of the retention the robot's agent was configured with (pending-export reserve or saturation mode): run or repair the export (diode, media) before the oldest unexported evidence is dropped or new records are refused. | `robodr_agent` | - | 2.5 |
 | `robot.agent.evidence_truncated` | Black-box records cut after the newest mark | Opening the black box found authentic proof that records after its newest integrity mark were removed; treat the evidence store as tampered with. | `robodr_agent` | - | 1.3 |
+| `robot.agent.evidence_unexported_dropped` | Unexported black-box evidence dropped | Cyclic retention dropped black-box segments holding records that no export had confirmed (each drop is a signed SegmentDropped record): that evidence is no longer on the robot. Recording itself works; check the export path and the retention sizing. | `robodr_agent` | - | 2.5 |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | The robot's executor found its journal unreadable or failing its seal and started empty: every action it held was lifted and its history lost. It refuses new orders until an operator re-arms it. | `robodr_agent` | - | 2.4 |
 | `robot.agent.executor_pause_overridden` | Robot set moving while paused | While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found. | `robodr_agent` | - | 2.5 |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | The robot's executor could not revert a containment action: its transaction or read-back failed, so the action's rules may still be in force after its time limit or revert request. The executor retries every tick; the detail names the action, request, time limit and error. | `robodr_agent` | - | 2.4 |

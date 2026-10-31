@@ -334,6 +334,89 @@ fn a_damaged_frame_mid_segment_is_a_break_then_a_gap() {
     assert!(p2.last_seq <= head);
 }
 
+/// Review (WP4 phase 3): damage early in a large segment is resynchronised
+/// past while streaming, not by reading the rest of the segment whole (up
+/// to 256 MiB, which broke the exporter unit's `MemoryMax`). The segment
+/// here carries 300 MiB of (sparse) zeros after its records: the old
+/// fallback read them all into memory and then refused the segment as
+/// larger than 256 MiB; the export must go on past the damage.
+#[test]
+fn damage_in_a_huge_segment_is_resynchronised_without_reading_it_whole() {
+    let d = TestDir::new("t15-damaged-huge");
+    let out = TestDir::new("t15-damaged-huge-out");
+    let mut r = open(cfg(d.path(), big()));
+    let mut i = 0;
+    rotations(&mut r, 3, &mut i);
+    let head = r.head().unwrap().0;
+    drop(r);
+    let segs = robodr_blackbox::store::list_segments(d.path()).unwrap();
+    let victim = &segs[1].1;
+    let mut b = std::fs::read(victim).unwrap();
+    let at = b
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"RBF1")
+        .map(|(i, _)| i)
+        .nth(1)
+        .unwrap();
+    b[at] = b'X';
+    std::fs::write(victim, &b).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(victim)
+        .unwrap();
+    f.set_len(b.len() as u64 + 300 * 1024 * 1024).unwrap();
+    drop(f);
+    let opts = PendingOptions::default();
+    let (p1, _) = export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+        .unwrap()
+        .unwrap();
+    assert!(p1.gap.is_none());
+    let (p2, _) = export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p2.gap, Some([p1.last_seq + 1, p1.last_seq + 1]));
+    assert_eq!(p2.first_seq, p1.last_seq + 2);
+    // Everything after the damage, the following segments included.
+    let mut last = p2.last_seq;
+    while last < head {
+        let (p, _) = export_pending_to(d.path(), out.path(), &*signer(), &authentic, opts, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.first_seq, last + 1, "{:?}", p.gap);
+        last = p.last_seq;
+    }
+}
+
+/// The bundle buffer never grows past `max_bytes` (a plain `Vec` doubles
+/// to up to twice that).
+#[test]
+fn the_bundle_buffer_stays_within_max_bytes() {
+    let d = TestDir::new("t15-bundle-cap");
+    let mut r = open(cfg(d.path(), big()));
+    for i in 0..400 {
+        recorded(r.append_note(&note(i), false).unwrap());
+    }
+    drop(r);
+    for max in [1000u64, 3000, 5000, 40_000] {
+        let opts = PendingOptions {
+            max_records: 100_000,
+            max_bytes: max,
+        };
+        let cursor_key = |m: &[u8], s: &[u8]| authentic(m, s);
+        let p = collect_pending(d.path(), &cursor_key, &authentic, opts)
+            .unwrap()
+            .unwrap();
+        assert!(p.more);
+        assert!(p.bundle.frames.len() as u64 <= max);
+        assert!(
+            p.bundle.frames.capacity() as u64 <= max,
+            "max {max}: capacity {}",
+            p.bundle.frames.capacity()
+        );
+    }
+}
+
 /// Review (WP4): a key rotation re-signs the newest export cursor on disk
 /// (one an exporter beside the recorder advanced since the recorder last
 /// read it), never an older copy held in memory: moving the cursor back

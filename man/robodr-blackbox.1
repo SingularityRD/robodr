@@ -263,8 +263,8 @@ At most
 .B \-\-max\-records
 (100000) records or
 .B \-\-max\-bytes
-(64 MiB) per run; segments are streamed one frame at a time, so memory
-follows
+(64 MiB) per run; segments are streamed one frame at a time, damaged
+ones included, so memory follows
 .BR \-\-max\-bytes ,
 not the segment size. A
 .B \-\-key
@@ -301,7 +301,9 @@ directories; owners are the restoring user's.
 Evidence goes only to
 .BR \-\-evidence\-to ,
 never into the unit (a directory that resolves to the root or into its
-live trees is refused, exit 2); spool
+live trees is refused, exit 2; it is created first and must still resolve
+to itself before each evidence file is written, else the restore stops,
+exit 2); spool
 .I ready/
 findings only with
 .B \-\-spool\-ready

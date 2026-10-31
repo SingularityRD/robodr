@@ -112,8 +112,8 @@
 //!   current secret key; records signed by keys retired by a rotation need
 //!   `--previous-keys`; a `--key` that did not sign the newest record, a
 //!   key retired by `rotate`, is refused before anything is written).
-//!   Segments are streamed one frame at a time (memory follows
-//!   `--max-bytes`, not the segment size). Each record's hash, signature
+//!   Segments are streamed one frame at a time, damaged ones included
+//!   (memory follows `--max-bytes`, not the segment size). Each record's hash, signature
 //!   and link are checked
 //!   first; a bundle stops at a break. With
 //!   `blackbox.retention.unexported_reserve_segments` the recorder keeps
@@ -139,7 +139,8 @@
 //!   (anti-rollback floors, replay stores, security floor, TPM-bound
 //!   material, exporter sequence state: each is listed with the reason),
 //!   evidence only under `--evidence-to` (never into the unit: a directory
-//!   that resolves to the root or into its live trees is refused, exit 2),
+//!   that resolves to the root or into its live trees is refused, exit 2,
+//!   and so is one that no longer resolves to itself mid-restore),
 //!   and the spools' `ready/` findings only with `--spool-ready` and only
 //!   into an empty `ready/`. `--dry-run` reports without writing.
 //!

@@ -185,6 +185,9 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.agent.clock_jump",
     "robot.agent.disk_low",
     "robot.agent.executor_unreachable",
+    // robodr-agentd black-box retention (contract 2.5, `retention`)
+    "robot.agent.evidence_retention_pressure",
+    "robot.agent.evidence_unexported_dropped",
     // robodr-agentd control-plane API (contract 2.5): signed requests
     // refused by the replay fence, connections refused or cut before they
     // authenticated.

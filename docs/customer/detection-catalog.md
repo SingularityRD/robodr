@@ -8,8 +8,9 @@
 > `scripts/check-detection-catalog.py`, which fails when this page and the
 > code disagree. Verification levels (V0–V3) are those of
 > [`support-matrix.md`](support-matrix.md). Nothing here has been verified
-> on a customer robot. One id is catalogued in 2.5 for a feature that
-> does not emit it yet: `robot.agent.selftest`.
+> on a customer robot. Three ids are catalogued in 2.5 for features
+> that do not emit them yet: `robot.agent.control_plane_request_fenced`,
+> `robot.agent.selftest` and `robot.gateway.overload`.
 
 ## How to read a finding
 
@@ -95,9 +96,9 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-252 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+254 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (26)
+### `robot.agent.*` (28)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -114,7 +115,9 @@ correlation entry.
 | `robot.agent.disk_low` | Agent storage running out of space | `robodr_agent` | — | 2.5 |
 | `robot.agent.evidence_degraded` | Black-box recording failing | `robodr_agent` | — | 1.3 |
 | `robot.agent.evidence_quarantined` | Damaged black-box segment quarantined | `robodr_agent` | — | 1.3 |
+| `robot.agent.evidence_retention_pressure` | Unexported black-box evidence filling the retention | `robodr_agent` | — | 2.5 |
 | `robot.agent.evidence_truncated` | Black-box records cut after the newest mark | `robodr_agent` | — | 1.3 |
+| `robot.agent.evidence_unexported_dropped` | Unexported black-box evidence dropped | `robodr_agent` | — | 2.5 |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | `robodr_agent` | — | 2.4 |
 | `robot.agent.executor_pause_overridden` | Robot set moving while paused | `robodr_agent` | — | 2.5 |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | `robodr_agent` | — | 2.4 |
