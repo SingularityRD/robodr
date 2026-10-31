@@ -3657,18 +3657,23 @@ The package never deletes evidence or keys, not even on `apt purge`. The
 end-of-life checklist, with the commands and the proof each step leaves,
 is [`DECOMMISSION.md`](DECOMMISSION.md); run its steps in this order:
 
-1. Export the evidence (section 8) and have the far side verify it.
-2. Stop every RoboDR service, not only agentd and pulsard.
+1. Export the evidence (section 8): every black-box chain and the fleet
+   journal, with every black-box public key including retired ones, and
+   have the far side verify it.
+2. Stop every RoboDR unit that is installed (one at a time: the set
+   differs between `robodr` and `robodr-focal`), timers included.
 3. Inline units: take the Motion Firewall gateway out of the path.
    Stopping it or purging the package leaves its rules in place, and with
    `fail_closed` the bridge keeps dropping motion commands (section 6.6).
 4. Retire the unit's keys at the SOC (`robodr-enroll decommission`, signed
-   receipt).
+   receipt), then export and verify the evidence again (the shutdown
+   records and the decommission note); nothing is destroyed before that.
 5. Revoke the unit at the site depot (`robodr-depot unit revoke`).
 6. Remove the unit from the anchor receiver.
 7. Release its TPM resources (`tpm2_nvundefine`, `robodr-seal erase`).
 8. Purge the package, then destroy and sanitise the data per NIST SP
-   800-88 (`shred` is best effort on flash media).
+   800-88 (`shred` is best effort on flash media). On the sensor-box
+   image (read-only root) sanitise its `var` partition instead.
 
 ## 10. Troubleshooting
 

@@ -32,22 +32,76 @@ before anything is destroyed (OPERATIONS section 8).
    `state: ok`, no `pending_batch_id` and an empty `backlog`, and no dead
    letters you still need. After step 4 the unit's keys authenticate
    nothing and undelivered findings can no longer be sent.
-2. Export the black box (OPERATIONS 8.2: bundles over the control plane,
-   or a copy of the black-box directory on vetted media) and the fleet
-   journal (`/var/lib/robodr/fleet/journal`), and verify them on the far
-   side with the unit's black-box public key:
-   `robodr-blackbox verify DIR --keyring agentd-blackbox.key.pub`.
-3. Proof: the far side's verification report (intact, last sequence
-   number), signed or countersigned per the site's rules.
+2. Export every black-box chain (OPERATIONS 8.2: bundles over the
+   control plane, or a copy of the directories on vetted media):
+   `/var/lib/robodr/blackbox/agentd`, and where they exist
+   `/var/lib/robodr/blackbox/pulsard` and `/var/lib/robodr/blackbox/deliverd`,
+   and the fleet journal (`/var/lib/robodr/fleet/journal`). Export with
+   them **every black-box public key** that signed part of a chain: the
+   current ones and every key retired by a rotation (OPERATIONS 4.3 keeps
+   them in `/etc/robodr/keys/retired/`). Step 8 destroys
+   `/etc/robodr`, and a chain that spans a rotation verifies only with
+   all of its keys:
+
+   ```sh
+   mkdir -p /media/vetted/ugv-07-pub
+   sudo find /etc/robodr/keys -name '*blackbox*.key.pub' -exec cp -t /media/vetted/ugv-07-pub/ {} +
+   ```
+
+   A retired legacy HMAC key has no `.pub`; such a chain verifies only
+   with the retired secret key: verify it on the unit before step 8, or
+   move that key into the site's key custody with the export.
+3. Verify each copy on the far side with all of those keys (each record is
+   checked under the key its chain names; extra keys do no harm):
+
+   ```sh
+   set --
+   for k in ugv-07-pub/*.pub; do set -- "$@" --keyring "$k"; done
+   for d in blackbox/agentd blackbox/pulsard blackbox/deliverd fleet/journal; do
+     if [ -d "$d" ]; then robodr-blackbox verify "$d" "$@" || echo "FAILED: $d"; fi
+   done
+   ```
+
+4. Proof: the far side's verification report for each chain (intact, last
+   sequence number), signed or countersigned per the site's rules. This is
+   the **first** export: steps 2 and 4 still write to the unit's chains
+   (the services' shutdown records, the decommission note), and step 4a
+   exports them again.
 
 ## 2. Stop every RoboDR service
 
+The set of units differs per package and site (`robodr-focal` has no
+`robodr-pulsard` or `robodr-anchor-receiver`; `robodr-metrics.timer`
+starts `robodr-metrics.service` every 15 s where it is enabled), and
+`systemctl disable --now` with a unit that is not installed fails before
+it stops anything. So stop what is installed, one unit at a time, timers
+first. The inline gateway's two units stay up until step 3 takes it out of
+the motion path, and on the sensor-box image the image's own units
+(`robodr-etc-overlay`, `robodr-image-*`) stay (`/etc/robodr` lives on its
+overlay until step 8):
+
 ```sh
-sudo systemctl disable --now robodr-uplink robodr-kafka-publish robodr-spool-export \
-    robodr-agentd robodr-pulsard robodr-executor robodr-deliverd
-systemctl list-units 'robodr-*' --all     # nothing active except, if inline,
-                                          # the gateway (step 3)
+for u in $(systemctl list-unit-files 'robodr-*.timer' --no-legend | awk '{print $1}') \
+         $(systemctl list-unit-files 'robodr-*.service' --no-legend | awk '{print $1}'); do
+  case "$u" in
+    robodr-firewall-gw.service|robodr-firewall-gw-rules.service) continue ;;  # step 3
+    robodr-etc-overlay.service|robodr-image-*.service) continue ;;            # image, step 8
+  esac
+  # disable fails on a read-only /etc/systemd/system (image): stop then
+  sudo systemctl disable --now "$u" || sudo systemctl stop "$u" || echo "CHECK: $u"
+done
+# check: prints nothing (inline units: only the two gateway units)
+systemctl list-units 'robodr-*' --all --plain --no-legend |
+  awk '$3 != "inactive" && $3 != "failed"' |
+  grep -v -e '^robodr-firewall-gw' -e '^robodr-etc-overlay' -e '^robodr-image-' || true
 ```
+
+A host that also serves other units (a site depot, an anchor receiver for
+the fleet) keeps those running: take them out of the loop. On the
+sensor-box image `disable` fails (`/etc/systemd/system` is on the
+read-only root) and the loop only stops the units; `robodr-image-late`
+starts agentd and the exporter again at the next boot, so do not reboot
+the box before step 8 (or run this step again after a reboot).
 
 The executor removes its own nft table on package removal; stop it here so
 no action is still in force (`nft list table inet robodr` must be empty or
@@ -145,6 +199,21 @@ signed by the unit's three keys and the answer signed by the SOC fleet
 key), archived with the site's records. `robodr-enroll status` shows the
 decommission as `Done`.
 
+## 4a. Export the evidence again
+
+Step 1's export predates the services' shutdown records (step 2) and the
+`robodr.fleet.decommission` note (step 4), and step 8 destroys both on the
+unit. Export the chains and the fleet journal again exactly as in step 1
+(the black-box key is still on the unit; the public keys of step 1 still
+apply) and verify them on the far side. Then, on the far side,
+`robodr-blackbox inspect fleet/journal` must list the note: its payload
+names `robodr.fleet.decommission` (`inspect` checks no signature: run it
+only on the copy that verified).
+
+Proof: the verification report of this second export, with the last
+sequence number of each chain and the decommission note's. **Step 8 does
+not start without it.**
+
 ## 5. Revoke the unit at the site depot (secure delivery)
 
 If the unit is enrolled at a site depot (SECURE-DELIVERY §6), revoke it so
@@ -198,12 +267,15 @@ Proof: `tpm2_getcap handles-nv-index` no longer lists the indices.
 
 ## 8. Remove the package and sanitise the data
 
-1. `sudo apt purge robodr` (or `dpkg -P robodr`; RPM: `dnf remove
-   robodr`). This removes binaries and units, not data or keys.
-2. Following the site's evidence-retention rules, and only after step 1's
-   proof exists: destroy `/var/lib/robodr` (black box, spool, fleet state
-   with the receipt: archive the receipt first) and `/etc/robodr` (keys,
-   including the black-box key; configuration).
+Only once step 4a's proof exists.
+
+1. `sudo apt purge robodr` (`robodr-focal`: `apt purge robodr-focal`; or
+   `dpkg -P`; RPM: `dnf remove robodr`). This removes binaries and units,
+   not data or keys.
+2. Following the site's evidence-retention rules: destroy `/var/lib/robodr`
+   (black box, spool, fleet state with the receipt: archive the receipt
+   first) and `/etc/robodr` (keys, including the black-box key;
+   configuration).
 3. Sanitise the storage per **NIST SP 800-88 Rev. 1**: `shred` and
    `robodr-enroll`'s key shredding are best effort on flash media (wear
    levelling keeps old blocks), so for SSD / eMMC / SD use the device's
@@ -215,6 +287,28 @@ Proof: `tpm2_getcap handles-nv-index` no longer lists the indices.
 
 Proof: the sanitisation certificate / record (method, tool, date, operator)
 as SP 800-88 §4.7 describes.
+
+### 8 on the sensor-box image
+
+On a box built from `packaging/sensor-box/image/` the root is read-only,
+so `apt purge` fails and there is nothing to remove from it: the image
+holds no keys or site data (its build fails if `/etc/robodr/keys` is not
+empty). Everything the box wrote is on the writable `/var` partition
+(label `var`): `/var/lib/robodr` (black box, spool, fleet state) and
+`/var/lib/robodr-image`, which holds the upper layer of the `/etc/robodr`
+overlay (`etc-robodr/upper`: the keys, `agentd.json`, the profile, the
+firewall and provisioning files) and `fingerprints.txt`. So, after step
+4a and with the receipt archived:
+
+1. Power the box off and boot it from external, vetted media (the box's
+   own boot would start agentd again and mount the overlay).
+2. Sanitise the `var` partition, or the whole disk when the box leaves
+   the operator's control, as in item 3 above. Deleting files on the
+   overlay is not enough: on flash the old blocks survive.
+3. Re-flash the image only for a new commissioning; its first boot
+   generates new keys.
+
+Proof: as above.
 
 ## Re-commissioning
 
