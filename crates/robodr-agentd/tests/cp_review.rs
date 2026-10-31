@@ -330,7 +330,10 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
     assert_eq!((load.expired, load.fence), (1, None), "{load:?}");
     drop(g);
     let (mut g, load) = ReplayGuard::persistent(&dir, skew, MAX_NONCES, t, &seal()).unwrap();
-    assert_eq!(load.fence, Some(t + 100 + skew), "{load:?}");
+    // The fence is the newest dropped pair's dead_after (signed t, dead
+    // after t + skew + 1) plus the skew, not the clock at the drop (M4):
+    // a forward step before the drop does not lock the API out.
+    assert_eq!(load.fence, Some(t + skew + 1 + skew), "{load:?}");
     assert_eq!(
         g.check("soc-1", "n-1", t, t),
         Err(AuthFailure::Fenced),
@@ -353,7 +356,7 @@ fn the_replay_fence_covers_the_window_creation_and_clock_steps() {
         Err(AuthFailure::Fenced),
         "replayed after the clock went back while running"
     );
-    assert_eq!(g.fence(), Some(t + 100 + skew));
+    assert_eq!(g.fence(), Some(t + skew + 1 + skew));
     // A step back with nothing dropped since is harmless (no fence).
     let dir2 = tmp("fence-run2");
     let (g, _) = ReplayGuard::persistent(&dir2, skew, MAX_NONCES, t - 3600, &seal()).unwrap();

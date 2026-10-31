@@ -316,8 +316,8 @@
   `robodr-kafka-publish`, `robodr-spool-export`, `robodr-anchor-receiver`
   and `robodr-pulsard` (about 2,100 lines of argument handling and set-up)
   and the operator tools. Arithmetic overflow and the remaining library
-  code are left to review and fuzzing; two parsers of untrusted input
-  have no fuzz target yet (`secured_prefix`, `remote_anchor`;
+  code are left to review and fuzzing; one parser of untrusted input
+  has no fuzz target yet (`remote_anchor`;
   [`fuzz/README.md`](../../fuzz/README.md)).
 - **Legacy HMAC keys** are refused unless explicitly allowed
   (`blackbox.allow_hmac`, `--allow-hmac`). Where they are allowed,
