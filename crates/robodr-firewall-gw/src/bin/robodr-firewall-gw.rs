@@ -54,7 +54,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if matches!(cmd, "-V" | "--version") && rest.is_empty() {
-        println!("robodr-firewall-gw {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-firewall-gw", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     if cmd == "webrtc-block" {

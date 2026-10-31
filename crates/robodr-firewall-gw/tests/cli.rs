@@ -1,6 +1,7 @@
 //! The `robodr-firewall-gw` binary: command-line handling.
 
-/// `--version` prints `<name> <version>` and `--help` the usage, both on
+/// `--version` prints the build line (`<name> <version> (commit C,
+/// source-date-epoch E, target T)`, robodr-buildinfo) and `--help` the usage, both on
 /// stdout with exit 0 (the release .deb smoke test runs both on every
 /// shipped binary); misuse of either stays a usage error (exit 2).
 #[test]
@@ -16,7 +17,10 @@ fn version_and_help_exit_0() {
         assert_eq!(o.status.code(), Some(0), "{name} --version");
         assert_eq!(
             String::from_utf8_lossy(&o.stdout),
-            format!("{name} {}\n", env!("CARGO_PKG_VERSION")),
+            format!(
+                "{}\n",
+                robodr_buildinfo::version_line(name, env!("CARGO_PKG_VERSION"))
+            ),
             "{name} --version"
         );
         let o = std::process::Command::new(exe)

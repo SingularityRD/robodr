@@ -363,7 +363,7 @@ jobs:
         run: |
           epoch="$(git log -1 --format=%ct)"
           triple="$(rustc -vV | sed -n 's/^host: //p')"
-          for b in robodr-agentd robodr-executor robodr-uplink robodr-seal; do
+          for b in robodr-agentd robodr-executor robodr-uplink robodr-seal robodr-firewall-gw; do
             o="$(target/release/$b --version)"
             echo "$o"
             case "$o" in *"$VERSION (commit $GITHUB_SHA, source-date-epoch $epoch, target $triple)"*) ;; *) exit 1 ;; esac
@@ -597,13 +597,11 @@ jobs:
           run=""
           [ "$ARCH" = arm64 ] && run=qemu-aarch64-static
           epoch="$(git log -1 --format=%ct)"
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-deliverd robodr-seal robodr-depot; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot; do
             o="$($run "dist/static/$TARGET/$b" --version)"
             echo "$o"
             case "$o" in *"$VERSION (commit $GITHUB_SHA, source-date-epoch $epoch, target $TARGET)"*) ;; *) exit 1 ;; esac
           done
-          # robodr-firewall-gw prints its version only (until the gateway merge).
-          $run "dist/static/$TARGET/robodr-firewall-gw" --version
       - name: Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
       - name: Install cargo-cyclonedx
