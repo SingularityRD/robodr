@@ -249,7 +249,11 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           test -s target/lcov.info
-          test -s target/nextest/ci/junit.xml
+          # nextest writes under the target directory cargo-llvm-cov uses
+          # (target/llvm-cov-target): copy the report to a fixed place.
+          junit=$(find target -path '*/nextest/ci/junit.xml' | head -n 1)
+          test -s "$junit"
+          cp "$junit" target/junit.xml
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -258,6 +262,6 @@ jobs:
           path: |
             target/lcov.info
             target/coverage-summary.txt
-            target/nextest/ci/junit.xml
+            target/junit.xml
           if-no-files-found: warn
           retention-days: 30
