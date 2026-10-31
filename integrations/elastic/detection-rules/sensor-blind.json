@@ -7,7 +7,7 @@
   "index": [
     "logs-robodr.findings-*"
   ],
-  "query": "event.module : \"robodr\" and (rule.id : \"robot.agent.input_silent\" or rule.id : \"robot.agent.input_ended\" or rule.id : \"robot.agent.queue_overflow\" or rule.id : \"robot.agent.evidence_truncated\" or rule.id : \"robot.rtps.discovery_not_inspected\")",
+  "query": "event.module : \"robodr\" and (rule.id : \"robot.agent.input_silent\" or rule.id : \"robot.agent.input_ended\" or rule.id : \"robot.agent.queue_overflow\" or rule.id : \"robot.agent.evidence_truncated\" or rule.id : \"robot.rtps.discovery_not_inspected\") and (not robodr.verification.status : * or robodr.verification.status : \"verified\")",
   "severity": "high",
   "risk_score": 73,
   "interval": "5m",

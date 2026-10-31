@@ -16,6 +16,7 @@ relevantTechniques: []
 query: |
   RoboDRFindings
   | where RuleId in ("robot.ros2.unknown_participant", "robot.ros2.discovery_flood")
+  | where isempty(VerificationStatus) or VerificationStatus == "verified"
   | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
       RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
       by RobotId, Site

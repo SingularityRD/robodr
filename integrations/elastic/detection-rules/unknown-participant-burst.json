@@ -7,7 +7,7 @@
   "index": [
     "logs-robodr.findings-*"
   ],
-  "query": "event.module : \"robodr\" and (rule.id : \"robot.ros2.unknown_participant\" or rule.id : \"robot.ros2.discovery_flood\")",
+  "query": "event.module : \"robodr\" and (rule.id : \"robot.ros2.unknown_participant\" or rule.id : \"robot.ros2.discovery_flood\") and (not robodr.verification.status : * or robodr.verification.status : \"verified\")",
   "severity": "medium",
   "risk_score": 47,
   "interval": "5m",

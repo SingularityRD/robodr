@@ -1,0 +1,27 @@
+id: aee786e1-4194-59e8-8fd9-ad02e52d59bb
+name: RoboDR - Unverified findings
+description: |
+  Findings without a verified signature: no verifying forwarder on the path, unsigned (optional policy), or a status other than verified. Never automate a response on these. Observe-only: alerts, never responds.
+  RoboDR rule ids (docs/customer/detection-rules.md):
+    - (any)
+severity: Low
+requiredDataConnectors: []
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: []
+relevantTechniques: []
+query: |
+  RoboDRFindings
+  | where VerificationStatus != "verified"
+  | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+      RuleIds = make_set(RuleId), Verification = make_set(VerificationStatus)
+      by RobotId, Site
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: RobotId
+version: 1.0.0
+kind: Scheduled

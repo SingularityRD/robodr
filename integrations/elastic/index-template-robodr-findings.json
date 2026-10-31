@@ -78,6 +78,7 @@
                 "time": { "type": "date", "format": "epoch_millis" },
                 "severity_id": { "type": "long" },
                 "count": { "type": "long" },
+                "resources": { "type": "object", "enabled": false },
                 "unmapped": { "type": "object", "enabled": false }
               }
             }
@@ -87,6 +88,6 @@
     }
   },
   "_meta": {
-    "description": "RoboDR findings data stream. Attacker-controlled DDS names (robodr.entity_context.**.value) are stored but not indexed: search and display the escaped .display forms (SR-TAINT). ocsf.unmapped duplicates entity_context and is stored only."
+    "description": "RoboDR findings data stream. Attacker-controlled values are stored but not indexed: robodr.entity_context.**.value (search and display the escaped .display forms, SR-TAINT), robodr.ocsf.resources (tainted participant and topic names) and robodr.ocsf.unmapped (a copy of entity_context). integrations/check_content.py checks every adversary_controlled_fields location of real findings against this template."
   }
 }

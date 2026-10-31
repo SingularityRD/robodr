@@ -18,6 +18,7 @@ relevantTechniques: []
 query: |
   RoboDRFindings
   | where RuleId in ("robot.ros2.unauthorized_motion_writer", "robot.firewall.rejected_unknown_source", "robot.unitree.legacy_unknown_sender", "robot.unitree.webrtc_unknown_controller")
+  | where isempty(VerificationStatus) or VerificationStatus == "verified"
   | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
       RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
       by RobotId, Site

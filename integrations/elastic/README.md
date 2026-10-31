@@ -20,9 +20,18 @@ Elasticsearch), or index `robodr_verify.py` output directly with the
 fields at the document root and moves them under `robodr.*`, then sets the
 ECS fields (`integrations/README.md`, "Field mapping").
 
-Tainted DDS names (`robodr.entity_context.**.value`) are stored but not
-indexed; search and show the escaped `.display` forms. `robodr.ocsf.unmapped`
-duplicates `entity_context` and is stored only.
+Attacker-controlled values are stored but not indexed: the raw tainted
+names (`robodr.entity_context.**.value`; search and show the escaped
+`.display` forms), `robodr.ocsf.resources` (tainted participant and topic
+names) and `robodr.ocsf.unmapped` (a copy of `entity_context`). Other
+strings under `robodr.*` are indexed as keywords. `source.ip` is set from the
+escaped source address only when that is an IP address; otherwise the
+pipeline drops it and the document is still indexed.
+
+The detection rules drop findings whose `robodr.verification.status` is
+present and not `verified`; findings indexed without `robodr_verify.py` have
+no status and still alert. `detection-rules/unverified-findings.json` reports
+every finding that is not verified (`integrations/README.md`).
 
 Checked by `integrations/check_content.py` (field references, rule ids, and
 the pipeline evaluated on real findings by an in-repo evaluator); not yet run

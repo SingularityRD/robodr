@@ -7,7 +7,7 @@
   "index": [
     "logs-robodr.findings-*"
   ],
-  "query": "event.module : \"robodr\" and (rule.id : \"robot.ros2.unauthorized_motion_writer\" or rule.id : \"robot.firewall.rejected_unknown_source\" or rule.id : \"robot.unitree.legacy_unknown_sender\" or rule.id : \"robot.unitree.webrtc_unknown_controller\")",
+  "query": "event.module : \"robodr\" and (rule.id : \"robot.ros2.unauthorized_motion_writer\" or rule.id : \"robot.firewall.rejected_unknown_source\" or rule.id : \"robot.unitree.legacy_unknown_sender\" or rule.id : \"robot.unitree.webrtc_unknown_controller\") and (not robodr.verification.status : * or robodr.verification.status : \"verified\")",
   "severity": "critical",
   "risk_score": 99,
   "interval": "5m",

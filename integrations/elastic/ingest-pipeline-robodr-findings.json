@@ -37,6 +37,8 @@
     { "set": { "field": "observer.geo.name", "copy_from": "robodr.entity_context.robot.site" } },
     { "set": { "field": "robodr.mode", "copy_from": "robodr.entity_context.mode" } },
     { "set": { "field": "source.ip", "value": "{{{robodr.entity_context.ros.src_ip.display}}}", "ignore_empty_value": true } },
+    { "convert": { "field": "source.ip", "type": "ip", "ignore_missing": true,
+        "on_failure": [ { "remove": { "field": "source.ip" } } ] } },
     { "set": { "field": "robodr.ros.topic", "value": "{{{robodr.entity_context.ros.topic.display}}}", "ignore_empty_value": true } },
     { "set": { "field": "robodr.ros.participant", "value": "{{{robodr.entity_context.ros.participant_guid.display}}}", "ignore_empty_value": true } },
     { "foreach": { "field": "robodr.mitre_predictions", "ignore_missing": true,

@@ -11,6 +11,13 @@ when the checked-in files differ from this output; regenerate with
 
 Splunk's copies are hand-written in splunk/TA-robodr/default/savedsearches.conf
 (check_content.py checks they name the same rule ids).
+
+Verification status (integrations/verify/robodr_verify.py): each of the five
+drops findings whose robodr_verification.status is present and not
+"verified" (under --policy optional: "unsigned"). Findings that reached the
+SIEM on a path with no verifier carry no status and still alert. A sixth,
+low-severity detection, UNVERIFIED, reports every finding that is not
+verified (including those with no status), so an unverified path is visible.
 """
 import json
 import os
@@ -61,11 +68,23 @@ DET = [
 ]
 
 
+UNVERIFIED = {
+    "key": "unverified-findings",
+    "name": "RoboDR - Unverified findings",
+    "desc": "Findings without a verified signature: no verifying forwarder on the path, unsigned (optional policy), or a status other than verified. Never automate a response on these.",
+    "severity": "low", "risk": 21, "sentinel_sev": "Low",
+}
+
+# Present and not "verified" -> dropped; absent (no verifier) -> kept.
+ELASTIC_VERIFIED = '(not robodr.verification.status : * or robodr.verification.status : "verified")'
+SENTINEL_VERIFIED = '| where isempty(VerificationStatus) or VerificationStatus == "verified"'
+
+
 def kql_elastic(rules):
     parts = []
     for r in rules:
         parts.append(f"rule.id : {r}" if r.endswith("*") else f'rule.id : "{r}"')
-    return "event.module : \"robodr\" and (" + " or ".join(parts) + ")"
+    return "event.module : \"robodr\" and (" + " or ".join(parts) + ") and " + ELASTIC_VERIFIED
 
 
 def kql_sentinel(rules):
@@ -79,6 +98,7 @@ def kql_sentinel(rules):
     return (
         "RoboDRFindings\n"
         f"| where {' or '.join(conds)}\n"
+        f"{SENTINEL_VERIFIED}\n"
         "| summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),\n"
         "    RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)\n"
         "    by RobotId, Site\n"
@@ -88,7 +108,20 @@ def kql_sentinel(rules):
 def write(root):
     os.makedirs(os.path.join(root, "elastic/detection-rules"), exist_ok=True)
     os.makedirs(os.path.join(root, "sentinel/analytics"), exist_ok=True)
-    for d in DET:
+    unv = dict(
+        UNVERIFIED,
+        rules=[],
+        elastic_query='event.module : "robodr" and not robodr.verification.status : "verified"',
+        sentinel_query=(
+            "RoboDRFindings\n"
+            '| where VerificationStatus != "verified"\n'
+            "| summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),\n"
+            "    RuleIds = make_set(RuleId), Verification = make_set(VerificationStatus)\n"
+            "    by RobotId, Site\n"
+        ),
+        interval="60m", period="1h",
+    )
+    for d in DET + [unv]:
         rid = str(uuid.uuid5(NS, d["key"]))
         el = {
             "rule_id": rid,
@@ -97,11 +130,11 @@ def write(root):
             "type": "query",
             "language": "kuery",
             "index": ["logs-robodr.findings-*"],
-            "query": kql_elastic(d["rules"]),
+            "query": d.get("elastic_query") or kql_elastic(d["rules"]),
             "severity": d["severity"],
             "risk_score": d["risk"],
-            "interval": "5m",
-            "from": "now-6m",
+            "interval": d.get("interval", "5m"),
+            "from": "now-61m" if "interval" in d else "now-6m",
             "enabled": False,
             "author": ["Singularity RD"],
             "tags": ["RoboDR", "Robotics", "OT"],
@@ -111,8 +144,9 @@ def write(root):
         with open(os.path.join(root, f"elastic/detection-rules/{d['key']}.json"), "w") as fh:
             json.dump(el, fh, indent=2)
             fh.write("\n")
-        rules_yaml = "\n".join(f"  - {r}" for r in d["rules"])
-        query = "\n".join("  " + line for line in kql_sentinel(d["rules"]).splitlines())
+        rules_yaml = "\n".join(f"  - {r}" for r in d["rules"]) or "  - (any)"
+        sq = d.get("sentinel_query") or kql_sentinel(d["rules"])
+        query = "\n".join("  " + line for line in sq.splitlines())
         y = "\n".join(
             [
                 f"id: {uuid.uuid5(NS, 'sentinel-' + d['key'])}",
@@ -123,8 +157,8 @@ def write(root):
                 rules_yaml.replace("  - ", "    - "),
                 f"severity: {d['sentinel_sev']}",
                 "requiredDataConnectors: []",
-                "queryFrequency: 5m",
-                "queryPeriod: 15m",
+                f"queryFrequency: {d.get('period', '5m')}",
+                f"queryPeriod: {d.get('period', '15m')}",
                 "triggerOperator: gt",
                 "triggerThreshold: 0",
                 "tactics: []",
@@ -143,7 +177,7 @@ def write(root):
         )
         with open(os.path.join(root, f"sentinel/analytics/{d['key']}.yaml"), "w") as fh:
             fh.write(y)
-    print(f"wrote {len(DET)} detections under {root}")
+    print(f"wrote {len(DET) + 1} detections under {root}")
 
 
 if __name__ == "__main__":

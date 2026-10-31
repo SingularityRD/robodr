@@ -15,6 +15,7 @@ relevantTechniques: []
 query: |
   RoboDRFindings
   | where RuleId startswith "robot.correlate."
+  | where isempty(VerificationStatus) or VerificationStatus == "verified"
   | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
       RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
       by RobotId, Site
