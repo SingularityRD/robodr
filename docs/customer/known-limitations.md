@@ -164,9 +164,11 @@
   been tested against `rpm` in a separate root only, not on a real RHEL /
   Rocky / Fedora host.
 - **Host-side (Pulsar) signals reach correlation** by their Pulsar rule
-  name, but the response planner sees every host detection as
-  `robot.host.pulsar_threat`, so a response policy cannot single out one
-  host rule.
+  name. Since contract 2.5 each Pulsar rule RoboDR ships has its own
+  finding id (`robot.host.<name>`), which the response planner sees; a
+  Pulsar rule RoboDR does not ship (a site's own rule, or a shipped rule
+  renamed on the unit) is reported as `robot.host.pulsar_threat`, so a
+  response policy cannot single it out.
 - **The sensor box sees only what is mirrored to it** (or, inline, what
   crosses its bridge). It cannot see unicast between the robot's internal
   computers without a mirror, or traffic over Wi-Fi or cellular, or the

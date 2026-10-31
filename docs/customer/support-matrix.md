@@ -168,7 +168,7 @@ newer contract minor catalogues
 
 | RoboDR | `robodr.findings` | Ingest API | Control plane | Fleet API | AutoSecOps |
 |---|---|---|---|---|---|
-| `0.1.0-alpha.1` (current `main`) | **2.4.0** produced; 1.x parse-only | draft v1 (`POST /api/robot-edr/v2/ingest`) | `robodr-control-plane/v2` (v1 removed) | draft v1 | **No released AutoSecOps version yet.** A SOC must accept findings **2.4** for the three `robot.agent.*` ids added in 2.4 (`control_plane_state_untrusted`, `executor_revert_failed`, `executor_journal_reset`); not yet run against AutoSecOps |
+| `0.1.0-alpha.1` (current `main`) | **2.5.0** produced; 1.x parse-only | draft v1 (`POST /api/robot-edr/v2/ingest`) | `robodr-control-plane/v2` (v1 removed) | draft v1 | **No released AutoSecOps version yet.** A SOC must accept findings **2.5** for the ids added in 2.4 (three `robot.agent.*`: `control_plane_state_untrusted`, `executor_revert_failed`, `executor_journal_reset`) and in 2.5 (`robot.agent.health` with its `entity_context.agent_health` record, the agent early warnings, `robot.gateway.overload`, one `robot.host.*` id per shipped Pulsar rule; [`detection-catalog.md`](detection-catalog.md)); not yet run against AutoSecOps |
 | robodr `682461b` (2026-10-26 end-to-end run) | 2.1.0 | draft v1 | v2 | draft v1 | AutoSecOps development branch `claude/robodr-ingest` at `7990c9a1`: ingest, fleet enrollment and evidence export ran end to end in one container (`tools/e2e/RESULTS.md`; evidence export needed an AutoSecOps-side scope fix, D1) |
 
 The producer always writes the current minor; there is no setting yet

@@ -74,7 +74,7 @@ in `tools/e2e/` and the lab captures in `fixtures/captures/ros2-jazzy/`.
 | Malformed or truncated RTPS discovery | `robot.rtps.malformed_discovery`, `robot.rtps.discovery_not_inspected` |
 | Safety-state topic published from a foreign address | `robot.safety_state.untrusted_source`, `robot.ros2.participant_source_mismatch` |
 | New subscriber reading the robot's topics | `robot.ros2.unknown_reader` |
-| Host: a process tripping a Pulsar rule (where `robodr-pulsard` runs) | `robot.host.pulsar_threat` |
+| Host: a process tripping a Pulsar rule (where `robodr-pulsard` runs) | The rule's own `robot.host.*` id (for example `robot.host.exec_from_tmp`); `robot.host.pulsar_threat` for a Pulsar rule RoboDR does not ship |
 
 The full list of rule ids is in the
 [detection catalog](detection-catalog.md).

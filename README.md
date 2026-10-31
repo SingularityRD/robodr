@@ -117,7 +117,7 @@ crates/
                           used for profile signing. Binary: robodr-blackbox
                           (keygen, export-pub, verify, inspect).
   robodr-ocsf/            Deviation -> OCSF Detection Finding in the vendor-neutral
-                          robodr.findings contract (2.4; configurable data source
+                          robodr.findings contract (2.5; configurable data source
                           and topic; 1.x parse-only); Kafka key/partition helpers
                           (no Kafka client); optional detached Ed25519 per-finding
                           signatures (header robodr-finding-sig); rule catalog
@@ -262,7 +262,7 @@ qemu. No release has been cut or signed. GitHub CI has run once in full
   signed and hash-chained black box. Unitree SDK2 topics and Go1 legacy
   UDP decode end to end on synthetic traffic and IDL-derived vectors
   ([`docs/UNITREE.md`](docs/UNITREE.md)).
-- **Findings to a SOC**: `robodr.findings` 2.4 over `robodr-uplink`
+- **Findings to a SOC**: `robodr.findings` 2.5 over `robodr-uplink`
   (signed NDJSON batches, TLS, contract
   [`robodr.ingest-api`](docs/contracts/robodr.ingest-api.md)), the diode,
   or Kafka (TLS, mutual TLS, SASL/SCRAM).

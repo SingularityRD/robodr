@@ -59,15 +59,12 @@ box). Section 7 lists exactly what each does.
 | `robodr-uplink` | User `robodr` | Only the SOC address in its drop-in. TLS. |
 | `robodr-spool-export` | User `robodr` | None (`PrivateNetwork=yes`) |
 | `robodr-kafka-publish` | User `robodr` | Only the brokers in its drop-in. TLS (plain TCP only if explicitly allowed); optional mutual TLS, SASL/SCRAM. |
-| `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only; changes only the nftables table `inet robodr` | AF_UNIX + AF_NETLINK, `IPAddressDeny=any`; motion adapters need a drop-in that allows exactly their peers |
-| `robodr-firewall-gw` (inline sensor box, opt-in) | User `robodr`, `CAP_NET_ADMIN` only (NFQUEUE) | AF_UNIX + AF_NETLINK, `IPAddressDeny=any`; it never originates a datagram |
+| `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only; changes only the nftables table `inet robodr`; writes only its journal directory (`/var/lib/robodr/executor`; the motion drop-in adds the gateway's restriction directory); runs `nft` and motion adapters with an argument vector and an empty environment | None by default: `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any`. Motion adapters need a drop-in (`robodr-executor.service.d/40-motion.conf.example`) that adds `AF_INET` and allows exactly their peers |
+| `robodr-firewall-gw` (inline sensor box, opt-in) | User `robodr-gw`, `CAP_NET_ADMIN` only (NFQUEUE), FIFO priority 40, watchdog 2 s | `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any`; it never originates a datagram, and the bridge needs no IP address |
 | `robodr-anchor-receiver` (off-robot) | `DynamicUser=yes`, no capabilities | Its listen address; TLS (mutual TLS optional) |
 | `robodr-deliverd` (secure delivery, opt-in) | root, no ambient capabilities (it installs packages and drives the TPM) | None (`PrivateNetwork=yes`, `IPAddressDeny=any`); releases arrive from the site depot or on media |
 | `robodr-depot` (site depot, off-robot) | User `robodr-depot`, no capabilities | Its LAN listen address |
-| `robodr-enroll` (run by the operator) | root (`sudo`), no daemon | Only the SOC's fleet API, TLS; air-gapped units exchange a request and an answer file instead |
-| `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only, writes only its journal directory, runs `nft` with an argument vector and an empty environment | None: `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` |
-| `robodr-firewall-gw` (inline mode only) | `CAP_NET_ADMIN` only (NFQUEUE), FIFO priority 40, watchdog 2 s | No IP sockets; the bridge needs no IP address |
-| `robodr-enroll` | root, run by an operator (key files) | Only the SOC, over TLS, or files on media |
+| `robodr-enroll` (run by the operator) | root (`sudo`), no daemon; it reads the enrollment token only from a file closed to group and others (owned by root) or from standard input, never from the command line | Only the SOC's fleet API, TLS; air-gapped units exchange a request and an answer file on media instead |
 
 Unit files and the reasons behind them:
 [`packaging/systemd/`](../../packaging/systemd/),
