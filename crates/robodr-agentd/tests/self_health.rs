@@ -1,5 +1,6 @@
 //! Sales-readiness WP2 end to end: the periodic `robot.agent.health` record
-//! (T5) and the disk early warning (T40, with a real full filesystem).
+//! (T5), the disk early warning and a real ENOSPC on the spool and the
+//! black box (T40, on a small tmpfs), and the producer cap (T38).
 
 mod common;
 
@@ -375,6 +376,92 @@ fn t40_a_nearly_full_spool_filesystem_is_reported_before_it_fills() {
         .unwrap()
         .clone();
     assert!(d["free_bytes"].as_u64().unwrap() * 100 < 3 * d["total_bytes"].as_u64().unwrap());
+}
+
+/// T40 fault injection, real ENOSPC: the spool and the black box share a
+/// small tmpfs that is then filled to the last byte. agentd keeps running
+/// (no panic, no exit), counts the lost spool writes and the black-box
+/// errors, reports the evidence as degraded, and once space is freed it
+/// writes again: the black box recovers and new findings are spooled.
+#[test]
+fn t40_a_full_filesystem_is_survived_and_recovered_from() {
+    let Some(as_root) = privileged() else {
+        eprintln!("skipped: needs root or passwordless sudo to mount a tmpfs");
+        return;
+    };
+    let s = setup("enospc", &robot_profile(true));
+    let mnt = s.dir.join("small-fs");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let (uid, gid) = ids();
+    let ok = as_root("mount")
+        .args(["-t", "tmpfs", "-o"])
+        .arg(format!("size=8m,mode=0700,uid={uid},gid={gid}"))
+        .arg("tmpfs")
+        .arg(&mnt)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipped: mount -t tmpfs failed");
+        return;
+    }
+    struct Umount(std::path::PathBuf, fn(&str) -> std::process::Command);
+    impl Drop for Umount {
+        fn drop(&mut self) {
+            let _ = (self.1)("umount").arg(&self.0).status();
+        }
+    }
+    let _guard = Umount(mnt.clone(), as_root);
+    let (spool, bb) = (mnt.join("spool"), mnt.join("blackbox"));
+    for d in [&spool, &bb] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    }
+    let mut cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        // A health record (a spooled finding, black-box records) every
+        // second, whatever the input does.
+        json!({"self_health": {"health_record_ms": 1000,
+            "disk_warn_percent": 1, "disk_critical_percent": 0,
+            "clock_unsynced_grace_ms": 86_400_000}}),
+    );
+    cfg["spool"]["dir"] = json!(spool);
+    cfg["blackbox"]["dir"] = json!(bb);
+    let (stop, h) = spawn(s.resolve(&cfg));
+    wait_for(15, "a first health record", || {
+        (status(&spool)?["self_health"]["health_records"].as_u64()? >= 1).then_some(())
+    });
+    // Fill the filesystem to the last byte.
+    let ballast = mnt.join("ballast");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&ballast).unwrap();
+        let chunk = vec![0u8; 4096];
+        loop {
+            match f.write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.raw_os_error(), Some(28), "{e}");
+                    break;
+                }
+            }
+        }
+    }
+    // Three health periods on a full filesystem.
+    std::thread::sleep(std::time::Duration::from_millis(3_500));
+    assert!(!h.is_finished(), "agentd stopped on a full filesystem");
+    let before = spooled(&spool).len();
+    std::fs::remove_file(&ballast).unwrap();
+    let st = wait_for(20, "recovery: evidence written, findings spooled", || {
+        let st = status(&spool)?;
+        let recovered = st["evidence_degraded"] == false
+            && st["spool"]["write_errors"].as_u64()? >= 1
+            && st["agent"]["evidence_errors"].as_u64()? >= 1;
+        (recovered && spooled(&spool).len() > before).then_some(st)
+    });
+    let log = finish(stop, h);
+    assert_eq!(st["running"], true, "{st}\n{log}");
 }
 
 /// The test's real uid and gid.
