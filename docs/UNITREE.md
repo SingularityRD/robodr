@@ -981,6 +981,15 @@ the contract's section 5.
   UDP) only, not general IP flows. The host rule sees outbound connections
   only on the EDU computer. Watch the site's Wi-Fi / firewall logs for the
   robot's own external traffic.
+* **Live safety state and context from Unitree topics** (agentd
+  `safety_feed`: sport mode, `LowState_`, the remote, ROS 2 lifecycle; see
+  `crates/robodr-agentd/README.md`) have seen synthetic traffic only. The
+  sport mode codes and joint-speed thresholds in
+  `config/agentd.unitree-go2.example.json` must be checked on the robot. The
+  `LowState_` CRC is unkeyed and detects corruption only, not forgery. A
+  lifecycle (Nav2) state is held for at most one SPDP lease (up to 10 min)
+  after its participant's last announcement; a hung node, or one that dies
+  while its participant lives on, is not detected.
 * **Legacy Go1 "compressed" frames** (`unitree_legged_sdk` v3.8.6): the
   614-byte `LowCmd` is decoded and enforced using the layout read from the
   shipped library's machine code (`refineCmd`), not a header. It has not

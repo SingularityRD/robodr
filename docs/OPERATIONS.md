@@ -1295,6 +1295,25 @@ otherwise). Every change of the combined state is a
 shows `safety_state` and the feed view. Nothing is ever published to the
 robot or its safety system. Verified on synthetic traffic only.
 
+**Live operational context (`safety_feed`).** Control mode, mission
+phase and connectivity can be live too: a Unitree remote
+(`WirelessController_`), Unitree sport mode, ROS 2 lifecycle
+`TransitionEvent`s (e.g. Nav2) and the `robodr-uplink` status file
+(`uplink_status`; the uplink writes it 0640 under group `robodr`, which
+the shipped agentd unit has as a supplementary group). Each field takes the
+most conservative contribution; a stale or missing source contributes its
+`on_stale` value (default `manual` / `unknown` / `disconnected`). A
+lifecycle source is latched: its last trusted event holds while the node's
+DDS participant is alive, at most one SPDP lease (announced
+`lease_duration` clamped to 10..600 s, 100 s if none is known) after the
+participant's last SPDP from a bound IP or after the event, and ends at
+once on the participant's or writer's own dispose. A node that hangs while
+its process stays up, or dies while other nodes in its participant keep
+running, is not detected. A Unitree `LowState_` sample with a wrong CRC
+reads `unknown`; the CRC detects corruption only (anyone can recompute
+it). Details and configuration: `crates/robodr-agentd/README.md`, "Live
+operational context". Verified on synthetic traffic only.
+
 **Correlation (`correlation`, on by default).** Combines findings that were
 each reported on their own into `robot.correlate.*` findings (discovery
 flood, spoofed motion source, motion hijack, ...; the full list is in

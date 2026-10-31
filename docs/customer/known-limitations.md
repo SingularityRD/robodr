@@ -137,10 +137,20 @@
   ([`docs/compliance/safety-positioning.md`](../compliance/safety-positioning.md)).
   In inline mode the gateway is part of the command path and belongs in
   the integrator's risk assessment.
-- **Judgment is only as good as its inputs.** Operational context
-  (control mode, phase, connectivity) is still configuration, not a live
-  input. The safety state comes from a live feed only where one is
-  configured.
+- **Judgment is only as good as its inputs.** The safety state and the
+  operational context (control mode, phase, connectivity) come from a live
+  feed only where one is configured (`safety_feed`); otherwise they are
+  configuration. Live sources have been tested on synthetic traffic only,
+  not on a real robot, Nav2 stack or uplink.
+- **A ROS 2 lifecycle (Nav2) state is held, not re-confirmed.** Lifecycle
+  events come only on change, so agentd keeps the last one while the node's
+  DDS participant is alive: at most one SPDP lease (10 s to 10 min) after
+  the participant's last announcement or the event. A node that hangs while
+  its process keeps running, or that dies while other nodes sharing its
+  participant keep running, is not detected.
+- **The Unitree CRC on `LowState` detects corruption only.** It is an
+  unkeyed CRC32 anyone can recompute; a forged sample with a correct CRC is
+  kept out only by the commissioned writer list and the IP binding.
 
 ## Detection coverage
 
