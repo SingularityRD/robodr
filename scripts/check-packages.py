@@ -237,7 +237,11 @@ SHIPPED_DOCS = (
 # sit back to back in a binary's read-only data.
 SECRET_MARKERS = (
     re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----\r?\n[A-Za-z0-9+/=\r\n]{40,}"),
-    re.compile(rb"untrusted comment: [ -~]{0,120}secret key\r?\n[A-Za-z0-9+/=]{100,}"),
+    # A minisign secret key file: its base64 body starts with the algorithm
+    # bytes "Ed" and the KDF ("Sc" encrypted, two zero bytes with -W) and
+    # checksum "B2". A signature ("signature from minisign secret key",
+    # body "RUS..." / "RWS...") is not key material.
+    re.compile(rb"untrusted comment: [ -~]{0,120}secret key\r?\n(?:RWRTY0Iy|RWQAAEIy)[A-Za-z0-9+/=]{100,}"),
 )
 
 
@@ -1113,6 +1117,11 @@ def self_test() -> int:
     expect("secret", check_package("t", STD, base, {"/usr/share/x": b"-----BEGIN PRIVATE KEY-----\n" + b"MIIEv" * 20 + b"\n"}, ROOT), False)
     expect("minisign secret", check_package("t", STD, base, {
         "/usr/share/x": b"untrusted comment: minisign encrypted secret key\n" + b"RWRTY0Iy" * 20 + b"\n"}, ROOT), False)
+    expect("unencrypted minisign secret", check_package("t", STD, base, {
+        "/usr/share/x": b"untrusted comment: minisign secret key\n" + b"RWQAAEIy" * 20 + b"\n"}, ROOT), False)
+    expect("minisign signature", check_package("t", STD, base, {
+        "/usr/sbin/robodr-x": _elf(3) + b"untrusted comment: signature from minisign secret key\n"
+        + b"RUSXwJ4VahqfRBAZ" * 8 + b"\n"}, ROOT), True)
     expect("detector literals", check_package("t", STD, base, {
         "/usr/sbin/robodr-x": _elf(3) + b"-----BEGINPRIVATE KEY-----minisign encrypted secret keyuntrusted comment: secret key"}, ROOT), True)
     expect("program PIE", check_package("t", STD, base, {"/usr/sbin/robodr-agentd": _elf(3)}, ROOT), True)
