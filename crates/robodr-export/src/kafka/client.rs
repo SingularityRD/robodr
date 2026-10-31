@@ -101,8 +101,11 @@
 //!   largest epoch: the producer **resets**: a new producer id
 //!   (InitProducerId), every sequence back to 0, all undecided records
 //!   re-sent under it (counted in [`ProducerStats::producer_id_resets`]).
-//!   A batch of another partition that was in doubt at that moment may
-//!   then be written twice: at-least-once, never a loss.
+//!   This holds also when the fenced batch was numbered under an older
+//!   epoch of the current producer id (in doubt across an epoch bump):
+//!   someone else is ahead on the id. A batch of another partition that
+//!   was in doubt at that moment may then be written twice: at-least-once,
+//!   never a loss.
 //! * A record-level error on a batch that is being **re-sent** (an earlier
 //!   copy got no decisive answer) also renumbers (epoch bump, else reset)
 //!   instead of giving the batch's sequences back: the earlier copy may
@@ -1926,17 +1929,26 @@ impl Producer {
     /// an earlier copy that may be in the log). Leaves the producer able to
     /// number `p` afresh:
     ///
-    /// * the batch was numbered under an older id / epoch than the current
-    ///   one (a bump or reset since): only its in-doubt entry is dropped;
+    /// `bump` is `false` for `INVALID_PRODUCER_EPOCH` / `PRODUCER_FENCED`
+    /// (another writer is ahead on this producer id) and `true` otherwise.
+    ///
+    /// * the batch was numbered under an older producer id (a reset since),
+    ///   or under an older epoch of the current id with `bump` allowed:
+    ///   only its in-doubt entry is dropped (the current numbering is still
+    ///   ours);
     /// * `bump` allowed and `leader` supports KIP-360: **epoch bump**, the
     ///   same producer id at epoch + 1 with every sequence back to 0. The
     ///   broker fences the older epoch only on the partitions that see the
     ///   new one, so another partition's batch in doubt keeps its numbering
     ///   and is re-sent as it was (still deduplicated);
     /// * otherwise (fenced or invalid epoch, a pre-2.5 broker, the largest
-    ///   epoch): **reset**, a new producer id before the next request and
-    ///   every in-doubt batch renumbered under it (a batch in doubt
-    ///   elsewhere may then be written twice).
+    ///   epoch), also for a batch of an older epoch of the current id:
+    ///   **reset**, a new
+    ///   producer id before the next request and every in-doubt batch
+    ///   renumbered under it (a batch in doubt elsewhere may then be
+    ///   written twice). Going on at the current epoch after a fencing
+    ///   answer would share the id with the other writer, whose batches
+    ///   may then be answered `DUPLICATE_SEQUENCE_NUMBER` for ours.
     fn renumber(
         &mut self,
         call: &mut Call<'_, '_>,
@@ -1949,7 +1961,9 @@ impl Producer {
             .idem
             .as_ref()
             .map(|s| (s.producer_id, s.producer_epoch));
-        if current != Some((fields.producer_id, fields.producer_epoch)) {
+        let stale = current != Some((fields.producer_id, fields.producer_epoch));
+        let same_id = current.is_some_and(|(id, _)| id == fields.producer_id);
+        if stale && (bump || !same_id) {
             if call.fixed.get(&p).is_some_and(|f| f.numbered_as(fields)) {
                 call.fixed.remove(&p);
             }
