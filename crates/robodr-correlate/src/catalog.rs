@@ -188,6 +188,9 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.agent.control_plane_request_fenced",
     "robot.agent.selftest",
     "robot.gateway.overload",
+    // robodr-agentd commissioning: a safety configuration file (response
+    // policy, firewall joint config) not bound to the trusted locked profile
+    "robot.agent.config_unattested",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",

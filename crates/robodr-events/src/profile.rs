@@ -455,7 +455,36 @@ pub struct Profile {
     /// written before this field existed keep their exact bytes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub participant_identities: BTreeMap<String, ParticipantIdentity>,
+    /// Safety-relevant configuration bound into the commissioning chain:
+    /// role (e.g. `response_policy`, `motion_firewall`, `joint_firewall`,
+    /// `executor_motion`; see [`BOUND_CONFIG_ROLES`]) -> `sha256:<hex>` of
+    /// the file's exact bytes (`executor_motion`: of the canonical JSON of
+    /// the executor's `motion` section). Part of the profile *content*: the
+    /// operator sign-off (and its motion quorum), the profile signature and
+    /// its anti-rollback cover it, so a loader honours such a file (an
+    /// `oem_validated` flag, an `enforce` envelope) only when its digest is
+    /// bound here in a trusted locked profile. `robodr-commission bind`
+    /// writes it. Not serialised when empty, so profiles written before
+    /// this field existed keep their exact bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bound_config: BTreeMap<String, String>,
 }
+
+/// Roles a [`Profile::bound_config`] entry may have.
+///
+/// * `response_policy`: the response policy file agentd and the executor
+///   read (`oem_validated`, morphology, safe behaviour).
+/// * `motion_firewall`: the Motion Firewall channel file of
+///   `robodr-firewall-gw` (`firewall.json`: envelopes, `allowed_sources`).
+/// * `joint_firewall`: agentd's `firewall.joint_config` file.
+/// * `executor_motion`: the `motion` section of the executor configuration
+///   (the adapters and their `oem_validated` flags), canonical JSON.
+pub const BOUND_CONFIG_ROLES: [&str; 4] = [
+    "response_policy",
+    "motion_firewall",
+    "joint_firewall",
+    "executor_motion",
+];
 
 /// Most identities in one profile.
 pub const MAX_IDENTITIES: usize = 256;
@@ -675,6 +704,9 @@ pub enum ProfileError {
     /// channel, or its type name is empty, too long or has control
     /// characters.
     InvalidMotionType { channel: String, detail: String },
+    /// A [`Profile::bound_config`] entry has an unknown role or a malformed
+    /// digest.
+    InvalidBoundConfig { role: String, detail: String },
 }
 
 impl fmt::Display for ProfileError {
@@ -683,6 +715,9 @@ impl fmt::Display for ProfileError {
             Self::EmptyModel => write!(f, "profile model name is empty"),
             Self::InvalidMotionType { channel, detail } => {
                 write!(f, "motion_types entry {channel:?}: {detail}")
+            }
+            Self::InvalidBoundConfig { role, detail } => {
+                write!(f, "bound_config entry {role:?}: {detail}")
             }
             Self::InvalidEnvelopeLimit {
                 channel,
@@ -892,6 +927,20 @@ impl Profile {
                 errs.push(ProfileError::InvalidIdentity {
                     name: name.clone(),
                     detail,
+                });
+            }
+        }
+        for (role, digest) in &self.bound_config {
+            if !BOUND_CONFIG_ROLES.contains(&role.as_str()) {
+                errs.push(ProfileError::InvalidBoundConfig {
+                    role: role.clone(),
+                    detail: format!("unknown role (one of: {})", BOUND_CONFIG_ROLES.join(", ")),
+                });
+            }
+            if !is_sha256_digest(digest) {
+                errs.push(ProfileError::InvalidBoundConfig {
+                    role: role.clone(),
+                    detail: "digest must be sha256:<64 lower-case hex>".into(),
                 });
             }
         }
@@ -2782,5 +2831,33 @@ mod joint_terms_and_calls {
         assert!(h.missing_holonomic_limits().is_empty());
         let s = serde_json::to_string(&CommandClass::ControlHandover).unwrap();
         assert_eq!(s, "\"control_handover\"");
+    }
+
+    #[test]
+    fn bound_config_roles_and_digests_are_checked() {
+        let mut p = Profile {
+            model: "m".into(),
+            ..Default::default()
+        };
+        let d = format!("sha256:{}", "0".repeat(64));
+        p.bound_config.insert("response_policy".into(), d.clone());
+        assert!(p.validate().is_ok());
+        p.bound_config.insert("oem_flags".into(), d);
+        p.bound_config
+            .insert("motion_firewall".into(), "sha256:ABC".into());
+        let errs = p.validate().unwrap_err();
+        assert_eq!(
+            errs.iter()
+                .filter(|e| matches!(e, ProfileError::InvalidBoundConfig { .. }))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        // Not serialised when empty: older profiles keep their bytes.
+        let q = Profile {
+            model: "m".into(),
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&q).unwrap().contains("bound_config"));
     }
 }

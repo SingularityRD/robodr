@@ -2733,6 +2733,8 @@ dependencies = [
  "robodr-capture",
  "robodr-cdr",
  "robodr-events",
+ "robodr-firewall",
+ "robodr-responder",
  "robodr-rtps",
  "serde",
  "serde_json",
@@ -2819,6 +2821,8 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
  "robodr-cdr",
+ "robodr-commission",
+ "robodr-events",
  "robodr-executor",
  "robodr-firewall-gw",
  "robodr-responder",

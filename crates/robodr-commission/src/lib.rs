@@ -78,10 +78,13 @@
     )
 )]
 
+pub mod firewall_draft;
 pub mod input;
 pub mod learner;
 pub mod ops;
+pub mod poc;
 pub mod profile_file;
+pub mod report_html;
 pub mod signoff;
 pub mod stats;
 pub mod trust;

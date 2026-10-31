@@ -79,6 +79,14 @@
 //!    otherwise); an unattested profile is then refused
 //!    ([`ProfileTrustError::Unattested`]).
 //!
+//! 9. **Bound configuration** ([`bound`]): the response policy, the
+//!    executor's motion section and the Motion Firewall envelope files are
+//!    bound into the profile content by digest (`bound_config`, written by
+//!    `bind`, confirmed by the motion quorum), so the signature, the
+//!    attestation and the anti-rollback above cover them too. Loaders
+//!    honour `oem_validated` / `enforce` only for a file the trusted
+//!    locked profile binds ([`bound::check_binding`]).
+//!
 //! The whole decision is [`evaluate_profile_trust`]; every loader (sensor
 //! pipeline, agentd, replay, `verify-profile`) calls it.
 //!
@@ -134,6 +142,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub mod attestation;
+pub mod bound;
 pub mod revocation;
 
 use crate::signoff::{OperatorKeyJson, OperatorTrust};
@@ -609,6 +618,11 @@ struct TrustJson {
     motion_quorum: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operators: Option<Vec<OperatorKeyJson>>,
+    /// `true`: a lab / proof-of-concept chain (`poc-init`: one operator,
+    /// every key generated on one workstation). Loaders accept it but say
+    /// so loudly; never `false` on disk (absent instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lab_only: Option<bool>,
     keys: Vec<TrustKeyJson>,
 }
 
@@ -618,11 +632,15 @@ struct KeyList {
     floor: Option<u64>,
     require_attestation: Option<bool>,
     operators: Option<OperatorTrust>,
+    lab_only: bool,
 }
 
 impl KeyList {
     fn has_trust_file_members(&self) -> bool {
-        self.floor.is_some() || self.require_attestation.is_some() || self.operators.is_some()
+        self.floor.is_some()
+            || self.require_attestation.is_some()
+            || self.operators.is_some()
+            || self.lab_only
     }
 }
 
@@ -639,6 +657,9 @@ fn parse_key_list(text: &str, expected: &str) -> Result<KeyList, String> {
     }
     if j.keys.is_empty() {
         return Err("no keys".into());
+    }
+    if j.lab_only == Some(false) {
+        return Err("lab_only: false is not a valid value (omit the member)".into());
     }
     if j.keys.len() > MAX_TRUST_KEYS {
         return Err(format!("more than {MAX_TRUST_KEYS} keys"));
@@ -694,6 +715,7 @@ fn parse_key_list(text: &str, expected: &str) -> Result<KeyList, String> {
         floor: j.min_profile_version,
         require_attestation: j.require_attestation,
         operators,
+        lab_only: j.lab_only == Some(true),
     })
 }
 
@@ -744,6 +766,7 @@ fn key_list_text(format: &str, keys: &[Ed25519VerifyingKey], opt: &TrustFileOpti
         require_attestation: opt.require_attestation,
         motion_quorum: opt.operators.map(OperatorTrust::motion_quorum),
         operators: opt.operators.map(OperatorTrust::entries),
+        lab_only: opt.lab_only.then_some(true),
         keys: keys
             .iter()
             .map(|k| TrustKeyJson {
@@ -780,6 +803,8 @@ pub struct TrustFileOptions<'a> {
     pub require_attestation: Option<bool>,
     /// `operators` and `motion_quorum`: who may attest a profile.
     pub operators: Option<&'a OperatorTrust>,
+    /// Mark the chain lab-only (`poc-init`; see [`TrustFile::lab_only`]).
+    pub lab_only: bool,
 }
 
 /// The text of a trust file listing `keys` with the optional members of
@@ -867,6 +892,11 @@ pub struct TrustFile {
     /// `require_attestation` if the file says, else `true` exactly when
     /// trust roots are configured.
     pub require_attestation: bool,
+    /// The file says `lab_only: true` (`poc-init`): a single-operator
+    /// proof-of-concept chain whose keys were all generated on one host.
+    /// Loaders accept it (it is a complete chain) and report it loudly on
+    /// every start; it must never reach a production unit.
+    pub lab_only: bool,
 }
 
 /// Parse a trust file and check its detached signature `sig_text` (the
@@ -944,6 +974,7 @@ pub fn parse_trust_file(
         signed_by,
         operators: l.operators,
         require_attestation,
+        lab_only: l.lab_only,
     })
 }
 
@@ -1114,6 +1145,9 @@ pub struct TrustPolicy {
     pub require_attestation: bool,
     /// Who may attest (the trust file's `operators` / `motion_quorum`).
     pub operators: Option<OperatorTrust>,
+    /// The trust file is marked lab-only (carried into
+    /// [`VerifiedProfile::lab_only`]).
+    pub lab_only: bool,
 }
 
 /// A profile that passed [`verify_profile_text`].
@@ -1130,6 +1164,9 @@ pub struct VerifiedProfile {
     /// The verified operator attestation (`None` when not required or a
     /// draft).
     pub attestation: Option<AttestationSummary>,
+    /// Accepted under a lab-only trust file ([`TrustFile::lab_only`]):
+    /// the caller must say so loudly.
+    pub lab_only: bool,
 }
 
 impl VerifiedProfile {
@@ -1157,6 +1194,7 @@ pub fn verify_profile_text(
             signed_by: None,
             signer_fingerprint: None,
             attestation: None,
+            lab_only: false,
         });
     }
     let Some(meta) = profile.metadata.as_ref() else {
@@ -1212,6 +1250,7 @@ pub fn verify_profile_text(
         signed_by: Some(sig.key_id),
         signer_fingerprint,
         attestation,
+        lab_only: policy.lab_only,
     })
 }
 
@@ -1707,6 +1746,7 @@ fn evaluate_inner(
                 anchor_keys: tf.public_keys,
                 require_attestation: tf.require_attestation,
                 operators: tf.operators,
+                lab_only: tf.lab_only,
                 ..Default::default()
             },
             tf.min_profile_version,
@@ -2255,6 +2295,7 @@ mod tests {
             signed_by: Some("k1".into()),
             signer_fingerprint: Some(kfp("k1")),
             attestation: None,
+            lab_only: false,
         }
     }
 

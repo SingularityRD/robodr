@@ -69,6 +69,16 @@ pub fn metadata(version: u64) -> robodr_events::profile::ProfileMetadata {
     }
 }
 
+/// The OEM-validated demo policy `setup` installs.
+pub fn demo_policy_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../robodr-agent/examples/policy-oem-validated.json")
+}
+
+/// `sha256:` of [`demo_policy_path`]'s bytes (what `bind` records).
+pub fn demo_policy_digest() -> String {
+    robodr_commission::trust::bound::bytes_digest(&std::fs::read(demo_policy_path()).unwrap())
+}
+
 /// Write `profile` to `path` as `robodr-commission lock --sign-key` would:
 /// a locked profile gets metadata (if it has none), is sealed and signed
 /// (`<path>.sig`); a draft is written as plain JSON.
@@ -76,6 +86,12 @@ pub fn write_profile(path: &Path, profile: &Profile) {
     let text = if profile.locked {
         let mut p = profile.clone();
         p.metadata.get_or_insert_with(|| metadata(1));
+        // As `robodr-commission bind` would: the OEM-validated demo policy
+        // the setup installs is part of the commissioning (T12), unless
+        // the test bound something else.
+        p.bound_config
+            .entry("response_policy".into())
+            .or_insert_with(demo_policy_digest);
         let text = robodr_commission::sealed_text(&p).unwrap();
         let sig =
             robodr_commission::ProfileSignature::create(text.as_bytes(), &profile_key()).unwrap();
@@ -99,12 +115,7 @@ pub fn setup(tag: &str, profile: &Profile) -> Setup {
     )
     .unwrap();
     let policy = dir.join("policy.json");
-    std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../robodr-agent/examples/policy-oem-validated.json"),
-        &policy,
-    )
-    .unwrap();
+    std::fs::copy(demo_policy_path(), &policy).unwrap();
     let key = dir.join("blackbox.key");
     std::fs::write(&key, robodr_blackbox::crypto::to_hex(&KEY)).unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();

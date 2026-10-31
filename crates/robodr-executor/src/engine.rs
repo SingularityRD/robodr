@@ -29,7 +29,7 @@ use std::sync::Arc;
 use robodr_responder::{ActionId, ResponsePolicy};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ExecutorConfig, Resolved};
+use crate::config::Resolved;
 use crate::decision::{self, codes, Current, Effect, Refusal};
 use crate::journal::{Entry, EventKind, Final, Finished, Journal, Loaded, Phase, State};
 use crate::nft::{self, Active, Nft, Rendered};
@@ -668,11 +668,9 @@ impl Engine {
                 format!("the configuration or response policy could not be re-read: {e}"),
             )
         };
-        let text = crate::config::read_small(p).map_err(fail)?;
-        let mut new = ExecutorConfig::parse(&text)
-            .and_then(ExecutorConfig::validate)
-            .map_err(fail)?;
-        let policy = crate::config::load_policy(&new.config.policy_path).map_err(fail)?;
+        // The signed commissioning is re-checked with the files (T12): a
+        // policy or motion section edited since start loses its flags.
+        let (mut new, policy, _notes) = crate::config::load_commissioned(p).map_err(fail)?;
         let old = &self.cfg.config;
         new.config.socket = old.socket.clone();
         new.config.key_file = old.key_file.clone();

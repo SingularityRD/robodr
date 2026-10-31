@@ -423,10 +423,24 @@ fn run(
     if let Some(m) = robot_model {
         cfg["robot"]["robot_model"] = m.into();
     }
+    // As commissioning does (`robodr-commission bind`): the policy and the
+    // joint firewall file the unit runs with are bound into the profile.
+    let mut bound = profile.clone();
+    let digest =
+        |p: &Path| robodr_commission::trust::bound::bytes_digest(&std::fs::read(p).unwrap());
+    bound
+        .bound_config
+        .insert("response_policy".into(), digest(&s.policy));
     if let Some((text, max_angular)) = firewall {
         let p = s.dir.join("firewall.json");
         std::fs::write(&p, text).unwrap();
+        bound
+            .bound_config
+            .insert("joint_firewall".into(), digest(&p));
         cfg["firewall"] = serde_json::json!({"joint_config": p, "max_angular": max_angular});
+    }
+    if bound.locked {
+        write_profile(&s.profile, &bound);
     }
     let r = s.resolve(&cfg);
     let mut log = Vec::new();

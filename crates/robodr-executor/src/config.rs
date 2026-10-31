@@ -34,6 +34,20 @@
 //! }
 //! ```
 //!
+//! `commissioning` (sales-readiness T12, [`Commissioning`]): the signed
+//! locked profile that binds the response policy and this file's `motion`
+//! section, with its trust anchors:
+//!
+//! ```json
+//! "commissioning": {"profile_path": "/etc/robodr/profile.json",
+//!                   "trusted_keys": "/etc/robodr/profile-trust.json",
+//!                   "trust_roots": "/etc/robodr/trust-roots.json"}
+//! ```
+//!
+//! With it, `oem_validated` (policy and adapters) counts only for the bound
+//! files, checked by the executor itself at start and before every order
+//! ([`load_commissioned`]). Without it the flags are unsigned (warned).
+//!
 //! `network.quarantine` (review finding F4): the participant's locators an
 //! order carries come from SPDP (unauthenticated), so a quarantine drops
 //! UDP only to / from locators inside `cidrs` (the networks where DDS
@@ -136,6 +150,39 @@ pub struct ExecutorConfig {
     /// refused `not_executor_action`).
     #[serde(default)]
     pub motion: Option<crate::motion::MotionSection>,
+    /// The signed commissioning the OEM flags must be bound into
+    /// ([`Commissioning`]). Absent: the flags are unsigned (legacy; loud
+    /// warning at start and in `--check-config`).
+    #[serde(default)]
+    pub commissioning: Option<Commissioning>,
+}
+
+/// `commissioning` in executor.json (sales-readiness T12): where the
+/// executor finds the trusted locked profile that binds its response
+/// policy (`response_policy`) and its own `motion` section
+/// (`executor_motion`, canonical JSON), and the trust anchors to verify it
+/// with (the same files as agentd's `sensor.profile_trust`; the profile's
+/// `unit_id` must be this `robot_id` or fleet-wide).
+///
+/// With it the executor **verifies the binding itself** whenever it reads
+/// its configuration (at start and before every order): a policy that is
+/// not the bound one is treated as `oem_validated: false` (every action
+/// refused `observe_mode`), a motion section that is not the bound one has
+/// every adapter treated as not validated (`adapter_not_validated`). The
+/// anti-rollback state stays agentd's (it reports `profile_locked`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Commissioning {
+    pub profile_path: PathBuf,
+    pub trusted_keys: PathBuf,
+    #[serde(default)]
+    pub trust_roots: Option<PathBuf>,
+    #[serde(default)]
+    pub revocation_list: Option<PathBuf>,
+    #[serde(default)]
+    pub revocation_policy: robodr_commission::trust::RevocationPolicy,
+    #[serde(default)]
+    pub expect_platform: Option<String>,
 }
 
 fn default_soc_skew_s() -> u64 {
@@ -569,6 +616,31 @@ impl ExecutorConfig {
         if let Some(m) = &self.motion {
             m.validate(t.max_s)?;
         }
+        if let Some(c) = &self.commissioning {
+            absolute("commissioning.profile_path", &c.profile_path)?;
+            absolute("commissioning.trusted_keys", &c.trusted_keys)?;
+            if let Some(p) = &c.trust_roots {
+                absolute("commissioning.trust_roots", p)?;
+            }
+            match &c.revocation_list {
+                Some(p) => {
+                    absolute("commissioning.revocation_list", p)?;
+                    if c.trust_roots.is_none() {
+                        return Err("commissioning.revocation_list needs \
+                                    commissioning.trust_roots"
+                            .into());
+                    }
+                }
+                None if c.revocation_policy
+                    == robodr_commission::trust::RevocationPolicy::Required =>
+                {
+                    return Err("commissioning.revocation_policy \"required\" needs \
+                                commissioning.revocation_list"
+                        .into());
+                }
+                None => {}
+            }
+        }
         Ok(Resolved {
             config: self,
             socket_mode,
@@ -605,6 +677,99 @@ pub fn load_policy(path: &Path) -> Result<robodr_responder::ResponsePolicy, Stri
     let text = read_small(path)?;
     robodr_responder::ResponsePolicy::from_json(&text)
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Read the configuration at `path` and the policy it names, and apply the
+/// signed commissioning ([`apply_commissioning`]). Returns the notes to
+/// log (why a flag is not honoured, or that the flags are unsigned).
+pub fn load_commissioned(
+    path: &Path,
+) -> Result<(Resolved, robodr_responder::ResponsePolicy, Vec<String>), String> {
+    let text = read_small(path)?;
+    let mut cfg = ExecutorConfig::parse(&text)?.validate()?;
+    let policy_text = read_small(&cfg.config.policy_path)?;
+    let mut policy = robodr_responder::ResponsePolicy::from_json(&policy_text)
+        .map_err(|e| format!("{}: {e}", cfg.config.policy_path.display()))?;
+    let notes = apply_commissioning(&mut cfg, &text, &policy_text, &mut policy);
+    Ok((cfg, policy, notes))
+}
+
+/// The commissioning decision (see [`Commissioning`]) on a configuration
+/// whose file text is `config_text` and a policy whose file text is
+/// `policy_text`. Downgrades `policy` and the motion section in place;
+/// returns the notes.
+pub fn apply_commissioning(
+    cfg: &mut Resolved,
+    config_text: &str,
+    policy_text: &str,
+    policy: &mut robodr_responder::ResponsePolicy,
+) -> Vec<String> {
+    use robodr_commission::trust::bound::{
+        bytes_digest, canonical_json_digest, verify_bindings, ROLE_EXECUTOR_MOTION,
+        ROLE_RESPONSE_POLICY,
+    };
+    let mut notes = Vec::new();
+    let motion_claims = cfg
+        .config
+        .motion
+        .as_ref()
+        .is_some_and(crate::motion::MotionSection::any_validated);
+    let Some(c) = cfg.config.commissioning.clone() else {
+        if policy.oem_validated || motion_claims {
+            notes.push(
+                "WARNING: oem_validated flags are UNSIGNED (no `commissioning` section): they \
+                 are not bound to a signed, quorum-attested commissioning; configure \
+                 `commissioning` (robodr-commission bind) so the executor verifies them itself"
+                    .into(),
+            );
+        }
+        return notes;
+    };
+    let policy_digest = bytes_digest(policy_text.as_bytes());
+    let motion_digest = serde_json::from_str::<serde_json::Value>(config_text)
+        .ok()
+        .and_then(|v| v.get("motion").and_then(canonical_json_digest));
+    let mut wanted: Vec<(&str, &str)> = vec![(ROLE_RESPONSE_POLICY, &policy_digest)];
+    if let Some(d) = &motion_digest {
+        wanted.push((ROLE_EXECUTOR_MOTION, d));
+    }
+    let robot_id = cfg.config.robot_id.clone();
+    let inputs = robodr_commission::trust::TrustInputs {
+        trusted_keys: Some(&c.trusted_keys),
+        trust_roots: c.trust_roots.as_deref(),
+        revocation_list: c.revocation_list.as_deref(),
+        revocation_policy: c.revocation_policy,
+        expect_platform: c.expect_platform.as_deref(),
+        expect_unit_id: Some(&robot_id),
+        ..Default::default()
+    };
+    let results = verify_bindings(&c.profile_path, &inputs, &wanted);
+    for ((role, _), r) in wanted.iter().zip(results) {
+        let Err(e) = r else { continue };
+        if *role == ROLE_RESPONSE_POLICY && policy.oem_validated {
+            policy.oem_validated = false;
+            notes.push(format!(
+                "response policy {}: {e}; treated as NOT OEM-validated (every action refused)",
+                cfg.config.policy_path.display()
+            ));
+        } else if *role == ROLE_EXECUTOR_MOTION && motion_claims {
+            if let Some(m) = &mut cfg.config.motion {
+                m.clear_validation();
+            }
+            notes.push(format!(
+                "motion section: {e}; every adapter treated as NOT OEM-validated"
+            ));
+        }
+    }
+    if motion_claims && motion_digest.is_none() {
+        if let Some(m) = &mut cfg.config.motion {
+            m.clear_validation();
+        }
+        notes.push(
+            "motion section: cannot be digested; every adapter treated as NOT OEM-validated".into(),
+        );
+    }
+    notes
 }
 
 #[cfg(test)]

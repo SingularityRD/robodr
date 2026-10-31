@@ -401,6 +401,110 @@ runs.
 * **check** runs `Profile::evaluate` on every event, plus one rule of this
   crate's own, `commission.motion.anomalous_speed` (see Limits).
 
+## Signed safety configuration (`bind`)
+
+A locked profile is signed, versioned and attested by the operators. The
+files that decide what RoboDR may *do* with it are bound into the same
+chain:
+
+| Role | File | Who checks it |
+|---|---|---|
+| `response_policy` | the response policy (`oem_validated`, morphology, safe behaviour) | agentd, executor |
+| `executor_motion` | the `motion` section of `executor.json` (adapters and their `oem_validated`), canonical JSON | executor |
+| `motion_firewall` | the gateway's Motion Firewall file (`firewall.json`: envelopes, `allowed_sources`) | robodr-firewall-gw (pending, WP11) |
+| `joint_firewall` | agentd's `firewall.joint_config` | agentd |
+
+```sh
+robodr-commission bind --in draft.json --out bound.json \
+  --signoff draft.json.signoff.json \
+  --response-policy response-policy.json \
+  --executor-config executor.json --motion-firewall firewall.json
+# review + confirm bound.json.signoff.json, operators sign it, then:
+robodr-commission lock --in bound.json --signoff bound.json.signoff.json ...
+```
+
+`bind` validates each file as its loader will (the policy parses, a
+firewall file compiles against the draft), writes its digest into the
+draft's `bound_config` (profile *content*), and writes a new sign-off list:
+the learner's items plus one `bound_config:<role> <digest>` item per file,
+all unconfirmed again, and the manifest. A `bound_config` item is a motion
+item, so `motion_quorum` distinct operators must sign; the floor
+(`required_items`) requires a confirmed item for every binding, so a forged
+list cannot drop it. The profile signature, the attestation and the
+profile anti-rollback then cover the files: changing one means `bind` and
+`lock` again with a higher `profile_version`, and an older file under the
+current profile no longer matches its digest.
+
+What the unit does (fail closed):
+
+* **agentd**: a policy that says `oem_validated: true` but is not the
+  bound file of the trusted locked profile is treated as **not**
+  OEM-validated (observe-only plans, control-plane actions refused with
+  `observe_mode`) and, under a trusted locked profile, raises one High,
+  observe-only `robot.agent.config_unattested` finding at start. An
+  unbound `firewall.joint_config` is warned about and reported the same
+  way (agentd's firewall verdicts are recording-only anyway).
+* **executor**, with a `commissioning` section in `executor.json`
+  (`profile_path`, `trusted_keys`, optional `trust_roots`,
+  `revocation_list`, `revocation_policy`, `expect_platform`; `unit_id` must
+  be the executor's `robot_id` or fleet-wide): verifies the profile itself
+  (signature, trust roots, attestation, revocation) whenever it reads its
+  configuration, at start and before every order. A policy that is not the
+  bound one loses `oem_validated`; a `motion` section that is not the bound
+  one has every adapter treated as not validated. The network allow-lists
+  may change without a re-lock. Without the section the flags are
+  unsigned: kept for compatibility, with a loud warning at start and in
+  `--check-config` (agentd, which every order passes, still gates them).
+* **gateway** (`motion_firewall`): `trust::bound::verify_bindings` is the
+  call; refusing `enforce` on an unbound file belongs to the gateway work
+  package (WP11) and is not in this change.
+
+**Upgrade note.** After this change a unit whose profile does not bind its
+policy runs observe-only even if the policy says `oem_validated: true`.
+Re-commission: `bind` the installed policy (and executor / firewall files)
+into a draft, sign off, lock with `--parent` and install.
+
+## Draft Motion Firewall file (`firewall-draft`)
+
+`firewall-draft --in draft.json --report report.json --out firewall.json
+--max-angular R [--ceiling-linear M] [--morphology M]` proposes the
+gateway's channel file from what commissioning learned: one Twist spec per
+Twist motion channel, `max_linear_speed` = the envelope lowered to the OEM
+ceiling, `max_angular_speed` = the OEM yaw ceiling (the profile learns no
+yaw rate), `allowed_sources` = the writers observed commanding the channel
+(excluded and unprofiled sources dropped, each noted). What cannot be
+learned (low-level joint channels, joint-velocity channel counts, channels
+without an observed writer) is listed as INCOMPLETE (exit 1): the file then
+does not compile against the profile and `bind` refuses it until the OEM
+completes it.
+
+## Review page (`report-html`)
+
+`report-html --report report.json --out report.html [--signoff S] [--note
+TEXT]` renders the learn report (configuration, runs, warnings, sign-off
+items with their confirmation state and signer key ids, motion channels,
+participants, topics, services, overflow, anomalies) as one HTML page to
+review, archive with the commissioning record and print to PDF. It is a
+view: it names the SHA-256 of the files it shows, which stay the signed
+artifacts. Every string is escaped (topic names come off the bus), the
+page has no script and a `default-src 'none'` CSP, and tables are capped
+at 5000 rows.
+
+## Proof of concept (`poc-init`)
+
+`poc-init --dir DIR [--operator NAME]` creates a complete **lab-only**
+chain: trust root, profile signing key and one operator key (0600),
+`operators.json` (motion_quorum 1), `trust-roots.json` and a root-signed
+`profile-trust.json` marked `lab_only: true`, plus `LAB-ONLY-README.txt`
+with the step-by-step path (learn, report-html, firewall-draft, bind,
+sign-off, lock, verify-profile). The POC therefore runs the production
+path, not observe-only shortcuts. The marking is loud and sticky: key ids
+start with `lab-only-`, the operator is `NAME [LAB-ONLY]` (so `locked_by`
+of every profile says it), `verify-profile` and agentd print the LAB-ONLY
+banner at every start, and removing `lab_only` breaks the root signature.
+Never deploy it: production needs an offline root and two or more
+operators; nothing of a lab chain is reusable.
+
 ## Learning-time poisoning and other hostile input
 
 Commissioning trusts whatever is on the bus during the clean run, so an

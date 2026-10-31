@@ -236,6 +236,40 @@ pub fn identity_item(name: &str, id: &robodr_events::profile::ParticipantIdentit
 /// dimension ([`required_items`]).
 pub const UNBOUNDED_DIMENSION_KIND: &str = "envelope_dimension_unbounded";
 
+/// Kind of the item that confirms one [`Profile::bound_config`] entry
+/// (a response policy, Motion Firewall envelope or executor motion section
+/// bound into the profile by `bind`). Its subject is `"<role> <digest>"`,
+/// so the operators sign the exact file they reviewed. It counts as a
+/// motion item: the two-person rule (`motion_quorum`) applies, because
+/// these files decide whether motion may be acted on (`oem_validated`) and
+/// how commands are bounded.
+pub const BOUND_CONFIG_KIND: &str = "bound_config";
+
+/// The sign-off subject of the binding `role` -> `digest`.
+pub fn bound_config_subject(role: &str, digest: &str) -> String {
+    format!("{role} {digest}")
+}
+
+/// The sign-off item for the binding `role` -> `digest`; `summary` (what
+/// the file says, e.g. `oem_validated: true, morphology: quadruped`) goes
+/// into the reason, which the item digest binds.
+pub fn bound_config_item(role: &str, digest: &str, summary: &str) -> SignoffItem {
+    SignoffItem::new(
+        BOUND_CONFIG_KIND,
+        &bound_config_subject(role, digest),
+        format!(
+            "{role} file {digest} is bound into this profile: once locked and signed, the unit \
+             honours it (and only it) for {}. Review its content ({summary}) and confirm it is \
+             the OEM-validated file for this robot",
+            match role {
+                "response_policy" => "oem_validated, morphology and the safe behaviour",
+                "executor_motion" => "the executor's motion adapters and their oem_validated flags",
+                _ => "the Motion Firewall envelope and its allowed sources",
+            }
+        ),
+    )
+}
+
 /// One entry of the floor recomputed from a draft ([`required_items`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
@@ -260,8 +294,21 @@ pub struct Requirement {
 ///   the other one: an [`UNBOUNDED_DIMENSION_KIND`] item for
 ///   `"<ch> <dimension>"`. (A channel bounding neither is refused by
 ///   `lock` outright.)
+/// * per [`Profile::bound_config`] entry: a [`BOUND_CONFIG_KIND`] item for
+///   `"<role> <digest>"`.
 pub fn required_items(profile: &Profile) -> Vec<Requirement> {
     let mut out = Vec::new();
+    for (role, digest) in &profile.bound_config {
+        out.push(Requirement {
+            subject: bound_config_subject(role, digest),
+            kinds: &[BOUND_CONFIG_KIND],
+            exact: true,
+            why: format!(
+                "{role} {digest} is bound into the draft, so a confirmed {BOUND_CONFIG_KIND} item \
+                 for exactly that file is required"
+            ),
+        });
+    }
     for name in profile.participant_identities.keys() {
         out.push(Requirement {
             subject: name.clone(),
@@ -385,6 +432,13 @@ impl Signoff {
         }
         for (name, id) in &profile.participant_identities {
             items.push(identity_item(name, id));
+        }
+        for (role, digest) in &profile.bound_config {
+            items.push(bound_config_item(
+                role,
+                digest,
+                "provenance unknown (edited or merged draft): open the file and check it",
+            ));
         }
         for (ch, env) in &profile.motion_envelopes {
             items.push(SignoffItem::new(
@@ -860,12 +914,13 @@ pub fn verify_signoff_signatures(
     v
 }
 
-/// Items that review who may command motion ([`MOTION_REVIEW_KINDS`]):
-/// the ones the two-person rule applies to.
+/// Items that review who may command motion ([`MOTION_REVIEW_KINDS`])
+/// or a bound safety configuration ([`BOUND_CONFIG_KIND`]): the ones the
+/// two-person rule applies to.
 pub fn motion_items(s: &Signoff) -> impl Iterator<Item = &SignoffItem> {
     s.items
         .iter()
-        .filter(|i| MOTION_REVIEW_KINDS.contains(&i.kind.as_str()))
+        .filter(|i| MOTION_REVIEW_KINDS.contains(&i.kind.as_str()) || i.kind == BOUND_CONFIG_KIND)
 }
 
 /// Read a file others must not be able to modify: no symlink at `path`, a

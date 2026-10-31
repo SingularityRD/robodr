@@ -18,6 +18,11 @@ robodr-rtps = { workspace = true }
 robodr-cdr = { workspace = true }
 # std-only SHA-256 (profile seal, sign-off binding).
 robodr-blackbox = { workspace = true }
+# `bind` checks a Motion Firewall file compiles against the draft and
+# `firewall-draft` writes one; `bind` parses the response policy it binds.
+# Both are pure RoboDR crates (events + serde), no new third-party code.
+robodr-firewall = { workspace = true }
+robodr-responder = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
