@@ -14,7 +14,7 @@
 //!
 //! Needs `python3` with PyYAML, and `cryptography` for the verifier. Skipped
 //! with a message when missing, unless `ROBODR_REQUIRE_EXTERNAL_VALIDATOR=1`
-//! (set it in CI).
+//! (the CI pure job sets it).
 
 #[path = "support/catalog_ids.rs"]
 mod catalog_ids;

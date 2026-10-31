@@ -44,7 +44,8 @@ def evaluate(steps, agentd_rc, verify_rc, verify_text, rss_limit):
     safety = steps.get("safety", {})
     check("R4 safety: untrusted_source", found("safety", "robot.safety_state.untrusted_source") > 0,
           safety.get("new_findings"))
-    # status.json's safety_state, 4 s after the last spoofed frame with
+    # status.json's safety_state, read at least 6 s after the last spoofed
+    # frame (redteam_net.py settles 6 s after every step but spray) with
     # stale_after_ms 1000: every source is stale, so the feed must read
     # "unknown". A missing or null value (status.json not read), or any
     # state a claim could have set ("idle" from the spoofed /odom), fails.

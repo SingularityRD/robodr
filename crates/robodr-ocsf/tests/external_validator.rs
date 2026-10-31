@@ -18,7 +18,7 @@
 //!
 //! The test needs `python3` with `jsonschema` >= 4.18. Without them it is
 //! skipped with a message, unless `ROBODR_REQUIRE_EXTERNAL_VALIDATOR=1`, in
-//! which case a missing validator fails the test (set it in CI).
+//! which case a missing validator fails the test (the CI pure job sets it).
 
 #[path = "support/catalog_ids.rs"]
 mod catalog_ids;
