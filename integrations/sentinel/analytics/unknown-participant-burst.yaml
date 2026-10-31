@@ -1,0 +1,28 @@
+id: 34fa6a06-b415-5791-9d06-d8f3eaeb3467
+name: RoboDR - Unknown participant burst
+description: |
+  Unknown DDS participants or a discovery flood on the robot network: reconnaissance or a rogue node. Observe-only: alerts, never responds.
+  RoboDR rule ids (docs/customer/detection-catalog.md):
+    - robot.ros2.unknown_participant
+    - robot.ros2.discovery_flood
+severity: Medium
+requiredDataConnectors: []
+queryFrequency: 5m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics: []
+relevantTechniques: []
+query: |
+  RoboDRFindings
+  | where RuleId in ("robot.ros2.unknown_participant", "robot.ros2.discovery_flood")
+  | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+      RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
+      by RobotId, Site
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: RobotId
+version: 1.0.0
+kind: Scheduled

@@ -1,0 +1,41 @@
+{
+  "location": "<region>",
+  "kind": "Direct",
+  "properties": {
+    "description": "RoboDR findings -> RoboDRFindings_CL. Send each finding (verified by integrations/verify/robodr_verify.py) as one JSON object through the Logs Ingestion API.",
+    "streamDeclarations": {
+      "Custom-RoboDRFindingsRaw": {
+        "columns": [
+          { "name": "contract_version", "type": "string" },
+          { "name": "finding_id", "type": "string" },
+          { "name": "external_id", "type": "string" },
+          { "name": "data_source", "type": "string" },
+          { "name": "title", "type": "string" },
+          { "name": "description", "type": "string" },
+          { "name": "severity", "type": "string" },
+          { "name": "timestamp", "type": "datetime" },
+          { "name": "entity_context", "type": "dynamic" },
+          { "name": "mitre_predictions", "type": "dynamic" },
+          { "name": "evidence_links", "type": "dynamic" },
+          { "name": "anomaly_score", "type": "real" },
+          { "name": "adversary_controlled_fields", "type": "dynamic" },
+          { "name": "ocsf", "type": "dynamic" },
+          { "name": "robodr_verification", "type": "dynamic" }
+        ]
+      }
+    },
+    "destinations": {
+      "logAnalytics": [
+        { "workspaceResourceId": "<workspace resource id>", "name": "sentinelWorkspace" }
+      ]
+    },
+    "dataFlows": [
+      {
+        "streams": ["Custom-RoboDRFindingsRaw"],
+        "destinations": ["sentinelWorkspace"],
+        "outputStream": "Custom-RoboDRFindings_CL",
+        "transformKql": "source | project TimeGenerated = timestamp, FindingId = finding_id, EventUid = tostring(ocsf.metadata.uid), ExternalId = external_id, RuleId = tostring(entity_context.rule_id), Title = title, Description = description, Severity = severity, SeverityId = toint(ocsf.severity_id), RobotId = tostring(entity_context.robot.id), Site = tostring(entity_context.robot.site), Mode = tostring(entity_context.mode), MotionState = tostring(entity_context.safety_state.motion), DataSources = ocsf.finding_info.data_sources, Techniques = mitre_predictions, RosTopic = tostring(entity_context.ros.topic.display), Participant = tostring(entity_context.ros.participant_guid.display), SourceIp = tostring(entity_context.ros.src_ip.display), EvidenceLinks = evidence_links, ActivityId = toint(ocsf.activity_id), OccurrenceCount = tolong(ocsf['count']), VerificationStatus = tostring(robodr_verification.status), ContractVersion = contract_version, RawFinding = pack_all()"
+      }
+    ]
+  }
+}

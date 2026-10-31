@@ -1,0 +1,35 @@
+{
+  "properties": {
+    "schema": {
+      "name": "RoboDRFindings_CL",
+      "description": "RoboDR findings (robodr.findings contract 2.x), one row per emission. RawFinding keeps the whole finding; attacker-controlled DDS names are only in their escaped display form in the typed columns (SR-TAINT).",
+      "columns": [
+        { "name": "TimeGenerated", "type": "datetime" },
+        { "name": "FindingId", "type": "string" },
+        { "name": "EventUid", "type": "string" },
+        { "name": "ExternalId", "type": "string" },
+        { "name": "RuleId", "type": "string" },
+        { "name": "Title", "type": "string" },
+        { "name": "Description", "type": "string" },
+        { "name": "Severity", "type": "string" },
+        { "name": "SeverityId", "type": "int" },
+        { "name": "RobotId", "type": "string" },
+        { "name": "Site", "type": "string" },
+        { "name": "Mode", "type": "string" },
+        { "name": "MotionState", "type": "string" },
+        { "name": "DataSources", "type": "dynamic" },
+        { "name": "Techniques", "type": "dynamic" },
+        { "name": "RosTopic", "type": "string" },
+        { "name": "Participant", "type": "string" },
+        { "name": "SourceIp", "type": "string" },
+        { "name": "EvidenceLinks", "type": "dynamic" },
+        { "name": "ActivityId", "type": "int" },
+        { "name": "OccurrenceCount", "type": "long" },
+        { "name": "VerificationStatus", "type": "string" },
+        { "name": "ContractVersion", "type": "string" },
+        { "name": "RawFinding", "type": "dynamic" }
+      ]
+    },
+    "retentionInDays": 90
+  }
+}

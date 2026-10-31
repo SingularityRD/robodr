@@ -1,0 +1,26 @@
+{
+  "rule_id": "fe89a338-4743-567a-a370-724733c56f76",
+  "name": "RoboDR - Correlated intrusion",
+  "description": "Several independent RoboDR sensors agree on one intrusion (robot.correlate.* findings cite every contributing detection). Observe-only: alerts, never responds.",
+  "type": "query",
+  "language": "kuery",
+  "index": [
+    "logs-robodr.findings-*"
+  ],
+  "query": "event.module : \"robodr\" and (rule.id : robot.correlate.*)",
+  "severity": "critical",
+  "risk_score": 99,
+  "interval": "5m",
+  "from": "now-6m",
+  "enabled": false,
+  "author": [
+    "Singularity RD"
+  ],
+  "tags": [
+    "RoboDR",
+    "Robotics",
+    "OT"
+  ],
+  "max_signals": 100,
+  "version": 1
+}

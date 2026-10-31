@@ -1,0 +1,26 @@
+{
+  "rule_id": "3ed5a922-5999-52c0-8f33-d85e9ad46bed",
+  "name": "RoboDR - Sensor blind or tampered",
+  "description": "The robot's sensor cannot see (input silent or ended, queue overflow, evidence truncated, discovery not inspected). Treat its silence as unknown, not safe. Observe-only: alerts, never responds.",
+  "type": "query",
+  "language": "kuery",
+  "index": [
+    "logs-robodr.findings-*"
+  ],
+  "query": "event.module : \"robodr\" and (rule.id : \"robot.agent.input_silent\" or rule.id : \"robot.agent.input_ended\" or rule.id : \"robot.agent.queue_overflow\" or rule.id : \"robot.agent.evidence_truncated\" or rule.id : \"robot.rtps.discovery_not_inspected\")",
+  "severity": "high",
+  "risk_score": 73,
+  "interval": "5m",
+  "from": "now-6m",
+  "enabled": false,
+  "author": [
+    "Singularity RD"
+  ],
+  "tags": [
+    "RoboDR",
+    "Robotics",
+    "OT"
+  ],
+  "max_signals": 100,
+  "version": 1
+}
