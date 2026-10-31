@@ -20,6 +20,7 @@ mod catalog_ids;
 
 use robodr_ocsf::builder::{
     CATALOG_1_3_MINOR, CATALOG_2_1_MINOR, CATALOG_2_2_MINOR, CATALOG_2_3_MINOR, CATALOG_2_4_MINOR,
+    CATALOG_2_5_MINOR,
 };
 use robodr_ocsf::{rule_info, rule_info_for_contract, RuleInfo, CONTRACT_VERSION};
 use std::collections::BTreeMap;
@@ -44,6 +45,7 @@ fn catalog_versions() -> Vec<String> {
         format!("2.{CATALOG_2_2_MINOR}.0"),
         format!("2.{CATALOG_2_3_MINOR}.0"),
         format!("2.{CATALOG_2_4_MINOR}.0"),
+        format!("2.{CATALOG_2_5_MINOR}.0"),
     ]
 }
 

@@ -30,10 +30,13 @@ const NEW_IDS: &[&str] = &[
 
 fn build(rule: &str) -> String {
     let dev = Deviation::new(rule.to_string(), Severity::High, "detail");
-    let env = FindingBuilder::from_deviation(&dev, &common::ctx())
-        .seen(common::T0, common::T0)
-        .build()
-        .unwrap();
+    let ctx = common::ctx();
+    let mut b = FindingBuilder::from_deviation(&dev, &ctx).seen(common::T0, common::T0);
+    // The health record rule requires its record (contract 2.5).
+    if rule == robodr_ocsf::AGENT_HEALTH_RULE {
+        b = b.agent_health(common::health::sample());
+    }
+    let env = b.build().unwrap();
     robodr_ocsf::to_json(&env).unwrap()
 }
 
@@ -244,6 +247,12 @@ const NOT_EMITTED: &[&str] = &[
     "robot.rtps.x",
     // robodr-responder unit-test rule.
     "robot.motion.envelope_exceeded",
+    // robodr-responder policy-override unit tests.
+    "robot.host.anything_new",
+    "robot.hostile.x",
+    // robodr-demo-soc / robodr-attack-sim unit-test rows.
+    "robot.x.y",
+    "robot.x.z",
 ];
 
 /// Every `"robot.<area>.<name>"` string literal in the workspace's crate

@@ -425,7 +425,7 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
   | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
-  | 2.5 and later | everything of 2.4, unchanged (`robot.host.pulsar_threat` included) + the 2.5 entries of §3g: `robot.agent.health` (Low), `robot.agent.credential_expiring` (Medium / High), `robot.agent.clock_unsynced` (Medium), `robot.agent.clock_jump` (High), `robot.agent.disk_low` (Medium / High), `robot.agent.executor_unreachable` (High), `robot.agent.executor_pause_overridden` (High), `robot.agent.control_plane_request_fenced` (Low), `robot.agent.selftest` (Low), data source `robodr_agent`; `robot.gateway.overload` (Medium / High), data source `ros2_motion_commands`; one `robot.host.<rule>` per shipped Pulsar rule, data source `host_runtime`; no techniques |
+  | 2.5 and later | everything of 2.4, unchanged (`robot.host.pulsar_threat` included) + the 2.5 entries of §3g: `robot.agent.health` (Low), `robot.agent.credential_expiring` (Medium / High), `robot.agent.clock_unsynced` (Medium), `robot.agent.clock_jump` (High), `robot.agent.disk_low` (Medium / High), `robot.agent.executor_unreachable` (High), `robot.agent.executor_pause_overridden` (High), `robot.agent.control_plane_request_fenced` (Low), `robot.agent.selftest` (Low), `robot.agent.config_unattested` (High), data source `robodr_agent`; `robot.ros2.untrusted_security_identity` (Medium / High), `robot.capture.unsupported_transport` (Medium), data source `ros2_dds_discovery`; `robot.gateway.overload` (Medium / High), data source `ros2_motion_commands`; one `robot.host.<rule>` per shipped Pulsar rule, data source `host_runtime`; no techniques |
   | 2.4 | everything of 2.3, unchanged + the 2.4 agentd entries `robot.agent.control_plane_state_untrusted` (High / Critical), `robot.agent.executor_revert_failed` (High), `robot.agent.executor_journal_reset` (High), data source `robodr_agent`, no techniques (§3f) |
   | 2.3 | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c), and the Unitree WebRTC entries `robot.unitree.webrtc_*`, data source `ros2_motion_commands`, no techniques (§3d), and the depot entries `robot.depot.import_refused` (High), `robot.depot.enrolment_refused` (High), `robot.depot.unit_enrolled` (Low), `robot.depot.rollout_halted` (High), `robot.depot.locked` (Critical) and `robot.seal.erase_deferred` (Medium), data source `robodr_delivery`, no techniques (§3e) |
 
@@ -678,7 +678,7 @@ response).
 | --- | --- | --- | --- |
 | `robot.agent.health` | Agent health record | Low | every `daemon.self_health.health_record_ms` (default 60 s), carries `entity_context.agent_health` |
 | `robot.agent.credential_expiring` | Agent credential expires soon | Medium (≤ `credential_warn_days`, default 14); High (≤ `credential_critical_days`, default 3, or expired) | per credential on each escalation, then at most daily |
-| `robot.agent.clock_unsynced` | Robot clock not synchronised | Medium | once per episode, after the kernel has reported the clock unsynchronised for `clock_unsynced_grace_ms` (default 5 min) |
+| `robot.agent.clock_unsynced` | Robot clock not synchronised | Medium | once per episode, after the kernel has reported the clock unsynchronised for `clock_unsynced_grace_ms` (default 5 min); never where `adjtimex(2)` is refused, as under the shipped systemd unit (`clock.adjtimex_errno`, `docs/TIME-SYNC.md`) |
 | `robot.agent.clock_jump` | Robot wall clock jumped | High | per wall-clock jump against the monotonic clock (> 1 s), at most every `health_report_ms` |
 | `robot.agent.disk_low` | Agent storage running out of space | Medium (free < `disk_warn_percent`, default 10 %); High (free < `disk_critical_percent`, default 3 %) | per filesystem on each escalation |
 | `robot.agent.executor_unreachable` | Response executor unreachable | High | once per outage, after `executor_unreachable_ms` (default 30 s) without an answer |
@@ -686,6 +686,9 @@ response).
 | `robot.agent.selftest` | Agent field acceptance self-test | Low | reserved in 2.5 for the field acceptance self-test |
 | `robot.gateway.overload` | In-path gateway overloaded | Medium; High above the gateway's threshold | reserved in 2.5 for `robodr-firewall-gw` (aggregated per interval; `robot.firewall.internal_fault` stays for real faults) |
 | `robot.host.<rule>` | the Pulsar rule's name without its `RoboDR: ` prefix | the Pulsar rule's | per Pulsar threat (data source `host_runtime`) |
+| `robot.agent.config_unattested` | Safety configuration not bound by commissioning | High (observe-only) | at start, per safety configuration file (response policy claiming `oem_validated`, Motion Firewall joint file) that the trusted locked profile does not bind |
+| `robot.ros2.untrusted_security_identity` | DDS participant identity outside the SROS 2 policy | Medium (unauthenticated where the governance requires authentication); High (certificate subject named by no grant) | per participant, from the SROS 2 policy input (data source `ros2_dds_discovery`) |
+| `robot.capture.unsupported_transport` | DDS transport not inspected (shared memory or TCP) | Medium | per (source IP, transports), rate limited like every `robot.capture.*` rule (data source `ros2_dds_discovery`) |
 
 Catalog sentences (`finding_info.desc`):
 
@@ -698,6 +701,9 @@ Catalog sentences (`finding_info.desc`):
 * `robot.agent.control_plane_request_fenced`: A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.
 * `robot.agent.selftest`: A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection.
 * `robot.gateway.overload`: The in-path motion gateway could not process every command in time over the last interval (late or shed packets, aggregated): commands were delayed or dropped by its fail behaviour. Not a gateway fault.
+* `robot.agent.config_unattested`: A safety configuration file the robot's agent loaded (a response policy that claims OEM validation, or the Motion Firewall joint limits) is not the file the trusted, signed commissioning profile binds: the agent does not treat it as commissioned (such a response policy's plans stay observe-only). The detail names the file and why.
+* `robot.ros2.untrusted_security_identity`: A participant's DDS-Security identity does not fit the robot's SROS 2 keystore: it is unauthenticated while the governance requires authentication, or its certificate subject is named by no grant.
+* `robot.capture.unsupported_transport`: Participants on a host advertise discovery locators of a transport the capture cannot inspect (shared memory, TCP or an unknown kind): traffic between participants over it, motion commands included, may be invisible to the sensor.
 * every `robot.host.<rule>`: A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process.
 
 **Per-rule host ids.** The table is `robodr_ocsf::HOST_RULES` (Pulsar
@@ -731,7 +737,7 @@ bytes (`robodr_ocsf::health_limits`):
 | `blackbox` | `{degraded, anchored, anchor_failures}` |
 | `reachability[]` | `{component, state, last_ok_age_ms?}` for `executor`, `gateway` (the in-path gateway's feed) and `pulsard` (the host-threat forwarder): `reachable` \| `unreachable` \| `unknown` (configured, not heard yet) \| `not_configured` |
 | `credentials[]` | `{name, expires_ms, days_to_expiry}`: the control plane's server certificate (`control_plane.server_cert`) and each CRL's `nextUpdate` (`control_plane.crl:<issuer>`) |
-| `clock` | `{synchronized?, max_error_ms?, wall_jumps}` from `adjtimex(2)` and agentd's time guard |
+| `clock` | `{synchronized?, max_error_ms?, source?, adjtimex_errno?, timesync_age_ms?, wall_jumps}`: `synchronized` / `max_error_ms` from `adjtimex(2)` (`source` `adjtimex`); where that call fails, `adjtimex_errno` (1 = `EPERM`, the shipped unit's `@clock` seccomp filter) and, if systemd-timesyncd touched `/run/systemd/timesync/synchronized` within 4 096 s, `synchronized: true` with `source` `timesyncd` (no error estimate; an older or absent marker leaves `synchronized` out); `timesync_age_ms` is that marker's age; `wall_jumps` from agentd's time guard |
 | `disks[]` | `{name, free_bytes, total_bytes}` for `blackbox`, `spool` and `control_plane` |
 
 The profile digest and the safety state are the finding's own
@@ -1090,7 +1096,12 @@ safely. Nothing here is specific to one product.
     `robot.gateway.overload` (reserved for `robodr-firewall-gw`); data
     source `host_runtime`: one `robot.host.<rule>` per shipped Pulsar rule
     (`robodr_ocsf::HOST_RULES`), `robot.host.pulsar_threat` kept as the
-    fallback (§3g).
+    fallback (§3g); `robot.agent.config_unattested` (data source
+    `robodr_agent`, emitted by `robodr-agentd` at start),
+    `robot.ros2.untrusted_security_identity` and
+    `robot.capture.unsupported_transport` (data source `ros2_dds_discovery`):
+    ids their producers already emitted without an entry (so with the
+    generic one), now catalogued (§3g).
   - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.5.0`.
 
 * **2.4.0** — rule-catalog entries only (minor): agentd's sealed

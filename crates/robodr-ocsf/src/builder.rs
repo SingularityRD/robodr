@@ -1124,6 +1124,7 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
     const AGENT: &str = "robodr_agent";
     const MOTION: &str = "ros2_motion_commands";
     const HOST: &str = "host_runtime";
+    const GRAPH: &str = "ros2_dds_discovery";
     const fn e(title: &'static str, desc: &'static str, data_source: &'static str) -> RuleInfo {
         RuleInfo {
             title,
@@ -1189,6 +1190,21 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "In-path gateway overloaded",
             "The in-path motion gateway could not process every command in time over the last interval (late or shed packets, aggregated): commands were delayed or dropped by its fail behaviour. Not a gateway fault.",
             MOTION,
+        ),
+        "robot.agent.config_unattested" => e(
+            "Safety configuration not bound by commissioning",
+            "A safety configuration file the robot's agent loaded (a response policy that claims OEM validation, or the Motion Firewall joint limits) is not the file the trusted, signed commissioning profile binds: the agent does not treat it as commissioned (such a response policy's plans stay observe-only). The detail names the file and why.",
+            AGENT,
+        ),
+        "robot.ros2.untrusted_security_identity" => e(
+            "DDS participant identity outside the SROS 2 policy",
+            "A participant's DDS-Security identity does not fit the robot's SROS 2 keystore: it is unauthenticated while the governance requires authentication, or its certificate subject is named by no grant.",
+            GRAPH,
+        ),
+        "robot.capture.unsupported_transport" => e(
+            "DDS transport not inspected (shared memory or TCP)",
+            "Participants on a host advertise discovery locators of a transport the capture cannot inspect (shared memory, TCP or an unknown kind): traffic between participants over it, motion commands included, may be invisible to the sensor.",
+            GRAPH,
         ),
         _ => return None,
     })
