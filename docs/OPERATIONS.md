@@ -1690,12 +1690,19 @@ re-reads the export cursor every health tick and raises, observe-only:
 
 | Condition | Finding | Severity |
 |---|---|---|
-| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
+| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode, again at High if it climbs to 95 %; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
 | cyclic retention dropped unexported evidence (the reserve was used up) | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | High |
+| plain cyclic retention (no reserve, the default) dropped segments no export had confirmed | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | Medium, at most once a day with the count since the last report |
 
 (These use the catalogued `evidence_degraded` id until the next
-findings-contract minor gives them their own.) Plain cyclic retention with
-no exporter drops by design and raises neither.
+findings-contract minor gives them their own.) Plain cyclic retention has
+no pressure finding: without an exporter every segment is unexported, so
+it would always read full. Its drops are reported, once a day at most, so
+a unit on the default configuration (8 x 8 MiB, no reserve) that nobody
+exports says that its oldest evidence is going; a site that exports the
+black box sets the reserve and runs the export (8.2). Drops are counted
+per recorder: a recorder reopened after an outage starts from 0 and what
+the previous one dropped but had not reported is carried over.
 
 Sizing (hours of evidence held; a cyclic store holds between `segments - 1`
 and `segments` full segments; the oldest is the one dropped next):
