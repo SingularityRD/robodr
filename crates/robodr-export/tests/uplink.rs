@@ -1672,3 +1672,37 @@ fn out_pruning_that_fails_does_not_block_the_uplink() {
     let warned = logs.iter().filter(|l| l.contains("--out-max")).count();
     assert_eq!(warned, 1, "logged once while it lasts: {logs:?}");
 }
+
+/// Review finding (WP16, Phase 3): a status snapshot that cannot be taken
+/// (here `<state>/reinject` is a file, so its listing fails on every run)
+/// is logged once while the same error lasts, not on every loop pass, and
+/// again once it has cleared and comes back.
+#[test]
+fn a_failing_status_snapshot_is_logged_once_while_it_lasts() {
+    let r = Rig::new("snap-err", Role::Uplink);
+    r.spool(UNIT, 0, 1, false);
+    let cfg = r.spool_cfg();
+    // Opened once so the state directory exists, then broken.
+    r.uplink(cfg.clone()).run_once().unwrap();
+    let rj = r.state.join("reinject");
+    let _ = fs::remove_dir_all(&rj);
+    fs::write(&rj, b"not a directory").unwrap();
+    let rj2 = rj.clone();
+    let logs = run_service_between(&r, cfg, 6, move |n| match n {
+        // Repaired after the third run, broken again after the fourth.
+        3 => {
+            fs::remove_file(&rj2).unwrap();
+            fs::create_dir(&rj2).unwrap();
+        }
+        4 => {
+            fs::remove_dir(&rj2).unwrap();
+            fs::write(&rj2, b"not a directory").unwrap();
+        }
+        _ => {}
+    });
+    let n = logs
+        .iter()
+        .filter(|l| l.contains("cannot update the status snapshot"))
+        .count();
+    assert_eq!(n, 2, "once per episode: {logs:#?}");
+}
