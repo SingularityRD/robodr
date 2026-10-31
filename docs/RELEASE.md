@@ -19,7 +19,7 @@ Pushing a tag `v<VERSION>` on `main` or on a `release/X.Y` branch runs
 
 | Job | Runner | Does |
 |---|---|---|
-| `prepare` | ubuntu-24.04 | tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed. **Release line** (`scripts/release-gate.py line`): the commit is on `main` (the release will be "Latest") or on `release/X.Y` for version `X.Y.*` (an LTS line, never "Latest", section 6); anything else is refused. **CI gate** (`release-gate.py ci`): `ci.yml` has a completed, successful `push` / `workflow_dispatch` / `schedule` run for exactly this commit (a running one is waited for, up to 2 h; a `pull_request` run tested a merge commit and does not count). Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
+| `prepare` | ubuntu-24.04 | tag == `v` + `VERSION`; `Cargo.toml` workspace (and every member) version == `VERSION`; `CHANGELOG.md` has `## [<VERSION>]`; `Cargo.lock` committed. **Release line** (`scripts/release-gate.py line`): the commit is on `main` (the release will be "Latest", unless the version is a pre-release: GitHub never makes a pre-release "Latest", so it is published with `--latest=false`) or on `release/X.Y` for version `X.Y.*` (an LTS line, never "Latest", section 6); anything else is refused. **CI gate** (`release-gate.py ci`): `ci.yml` has a completed, successful `push` / `workflow_dispatch` / `schedule` run for exactly this commit (a running one is waited for, up to 2 h; a `pull_request` run tested a merge commit and does not count). Creates a **draft** GitHub release (prerelease when the version has a `-`), notes = that CHANGELOG section |
 | `build` (amd64, arm64) | ubuntu-24.04, ubuntu-24.04-arm (native), in an **Ubuntu 22.04 container** (digest-pinned) | pinned clang-14 for ring, clang-20 (apt.llvm.org, key fingerprint pinned) for Pulsar's eBPF; toolchain inputs recorded (section 11); `scripts/ci-repro.sh` (two builds, two paths, must be bit-identical), release build (`scripts/ci-release-build.sh`), released == reproduced, `--version` names this commit, `SOURCE_DATE_EPOCH` and target, `Cargo.lock` unchanged, CycloneDX 1.5 SBOMs completed by `scripts/release-sbom-augment.sh` (Rust std/core/alloc, robodr-pulsard's eBPF objects with hashes, toolchain formulation; section 9), `robodr_<debver>_<arch>.deb` (`Depends:` from `dpkg-shlibdeps`, libc6 floor <= 2.35 checked), offline bundle, SBOM archive, `SHA256SUMS-<arch>` |
 | `build-rpm` (amd64, arm64) | the same runners, in a **Rocky Linux 9 container** (digest-pinned) | as `build` with the AppStream clang: `robodr-<rpmver>-1.<x86_64\|aarch64>.rpm` (generated GLIBC requirement <= 2.34 checked), RPM offline bundle, its own SBOM archive `robodr-<ver>-rpm-<arch>-sbom.tar.gz`, `SHA256SUMS-rpm-<arch>` |
 | `build-static` (amd64, arm64) | ubuntu-24.04 (both cross-linked with rust-lld; arm64 through `scripts/static-pie-ld`, whose test runs first) | musl repro + `scripts/build-static.sh` (every binary static-pie: ET_DYN, no interpreter, no `NEEDED`, no text relocations), built == reproduced, smoke run naming the build (qemu for arm64), SBOMs (+ musl and libunwind with archive hashes), `robodr-focal_<debver>_<arch>.deb` (its programs re-checked), bundle, SBOM archive, `SHA256SUMS-focal-<arch>` |
@@ -27,7 +27,7 @@ Pushing a tag `v<VERSION>` on `main` or on a `release/X.Y` branch runs
 | `rebuild-deb`, `rebuild-rpm` (amd64, arm64) | ubuntu-22.04, ubuntu-22.04-arm, in the same digest-pinned containers | independent rebuild: Rust from hash-pinned artifacts (`scripts/ci-install-pinned-toolchain.sh`, no rustup), fresh `CARGO_HOME`, every program incl. `robodr-pulsard`, package and bundle (`scripts/ci-rebuild.sh`); its toolchain inputs recorded |
 | `rebuild-static` (amd64, arm64) | a fresh ubuntu-24.04 VM | the same for `robodr-focal` (same static-pie linker) |
 | `delivery` | ubuntu-24.04 | this commit's `robodr-release` builds **unsigned** secure-delivery RPKs of the `robodr` and `robodr-focal` `.deb` (both arches) and of `rules/robodr` (`scripts/release-rpk.py`, each built twice, digests must agree) plus `DELIVERY-MANIFEST.json`: the asset `robodr-<ver>-rpk.tar.gz` for the offline 2-of-N ceremony (section 7) |
-| `publish` (tag push only) | ubuntu-24.04, environment `release` | release line and CI gate again; `scripts/release-finalize.sh`: rebuild comparison (`scripts/compare-rebuild.py`: packages and programs identical, bundles except their SBOM; `robodr-pulsard` recorded) into the signed `REPRODUCIBILITY-<version>.txt` with every job's toolchain inputs appended, **SBOM gate** (all six SBOM archives, every file complete per `metadata_to_cyclonedx.py --check --require-complete` and valid per the official `cyclonedx validate` 1.5, pinned by SHA-256), `robodr-<ver>.openvex.json` (section 10), `robodr-<ver>.intoto.jsonl` (SLSA v1 provenance of every asset, section 9), per-arch sums re-checked, `SHA256SUMS`; `scripts/release-sign.sh` (minisign, self-verified with the public key variable); provenance verified against the signed set; `actions/attest-build-provenance` (pinned by SHA) attests every asset in `SHA256SUMS`; uploads; publishes with `--latest` from the release line |
+| `publish` (tag push only) | ubuntu-24.04, environment `release` | release line and CI gate again; `scripts/release-finalize.sh`: rebuild comparison (`scripts/compare-rebuild.py`: packages and programs identical, bundles except their SBOM; `robodr-pulsard` recorded) into the signed `REPRODUCIBILITY-<version>.txt` with every job's toolchain inputs appended, **SBOM gate** (all six SBOM archives; the `robodr` and `.rpm` ones must contain a `robodr-pulsard` SBOM, the `robodr-focal` ones must not; every file complete per `metadata_to_cyclonedx.py --check --require-complete`, which requires the eBPF objects in a `robodr-pulsard` SBOM, and valid per the official `cyclonedx validate` 1.5, pinned by SHA-256), `robodr-<ver>.openvex.json` (section 10), `robodr-<ver>.intoto.jsonl` (SLSA v1 provenance of every asset, section 9), per-arch sums re-checked, `SHA256SUMS`; `scripts/release-sign.sh` (minisign, self-verified with the public key variable); provenance verified against the signed set; `actions/attest-build-provenance` (pinned by SHA) attests every asset in `SHA256SUMS`; uploads; publishes with `--latest` from the release line |
 | `publish-dry-run` (`workflow_dispatch` only) | ubuntu-24.04, no environment | the same `release-finalize.sh`, signed with a **throwaway** key generated in the job, verified; the set and `TEST-ONLY-dry-run-minisign.pub` uploaded as the workflow artifact `release-dry-run-<sha>`; nothing published, no secret, no attestation |
 
 The build jobs have `contents: read` only and hand their assets over as
@@ -126,8 +126,12 @@ the repository.
    repository settings: branch protection of `main` and `release/*` with
    `ci.yml`'s jobs as required status checks and required reviews; a tag
    ruleset for `v*` (only maintainers create, no update or deletion).
-   `ci.yml` runs on pushes to `main`; for an LTS line it must also run on
-   pushes to `release/**` (one trigger line in `ci.yml`).
+   These settings are not applied by anything in the repository; an
+   administrator sets them. `ci.yml` runs on pushes to `main` only, so an
+   LTS release commit on `release/X.Y` has no CI run of its own: start
+   `ci.yml` by hand on that branch (`workflow_dispatch`, which the gate
+   counts; the run uses the commit's own `ci.yml`), or add a `release/**`
+   push trigger to `ci.yml`.
 2. Release commit on main (or on `release/X.Y`, section 6) via a reviewed PR:
    - `VERSION` = the new version (`0.1.0-alpha.2`, `0.1.0-rc.1`, `0.1.0`);
    - `Cargo.toml` `[workspace.package] version` = the same, then
@@ -231,7 +235,8 @@ or attestation is touched.
   work directory and shredded at the end.
 - After `publish`: asset set complete, every signature verifies with the
   public key file, `SHA256SUMS` covers every asset, the release is
-  "Latest", the SLSA provenance verifies against the assets,
+  "Latest" (for a pre-release version, such as the default dry-run tag,
+  `--latest=false` was requested instead), the SLSA provenance verifies against the assets,
   `install-bundle.sh verify --pubkey --tarball` passes for each bundle and
   refuses a tampered one or a foreign key, and
   `scripts/deb-install-smoke.sh` on every `.deb`.
@@ -302,8 +307,8 @@ released from a protected branch `release/0.1`:
 4. The release is published with `--latest=false`: the repository's
    "Latest" stays the newest `main` release.
 
-The scheduled vulnerability scan (section 10) covers the newest release of
-every `X.Y` line automatically.
+The scheduled vulnerability scan (section 10) covers every `X.Y` line
+automatically.
 
 ## 7. Secure delivery: RPKs and the 2-of-N signing ceremony
 
@@ -362,7 +367,10 @@ with the release minisign key and trusted comment first**, and builds with
 and verifies all of it with only the exported public key (`gpgv`,
 `rpm -K`) before handing the tree over as the artifact
 `robodr-pkg-repo-<tag>`. Configuration: environment `package-repo` (required
-reviewers) with secrets `REPO_GPG_PRIVATE_KEY` (ASCII-armoured) and
+reviewers; deployment restricted to tags matching `v*`, like `release`, so
+only a tagged commit's own, reviewed `pkg-repo.yml` reaches the key: a
+`release` event runs on its tag, and a manual run must be started from the
+tag, not from a branch, which may carry a modified workflow) with secrets `REPO_GPG_PRIVATE_KEY` (ASCII-armoured) and
 `REPO_GPG_PASSPHRASE`, variable `ROBODR_REPO_GPG_FINGERPRINT`. The OpenPGP
 repository key is generated in the key ceremony (section 2; RSA 4096 or
 Ed25519 per the customers' RHEL crypto policy) and its fingerprint is given
@@ -383,9 +391,16 @@ completed by `scripts/release-sbom-augment.sh`
 see: Rust `std`/`core`/`alloc` of the pinned toolchain; for the musl builds
 `musl` (version read from rust-std's `libc.a`) and `libunwind` with the
 SHA-256 of the archives linked; for `robodr-pulsard` every embedded eBPF
-object (`*.bpf.o`, SHA-256, `GPL-2.0-only`); and a `formulation` naming
+object (`*.bpf.o`, SHA-256, `GPL-2.0-only`): only the build-script outputs
+whose bytes occur in the built `robodr-pulsard` are listed (stale or
+duplicate build directories, and objects built only for Pulsar's tests,
+are left out), and an eBPF ELF object in the program that no `*.bpf.o`
+accounts for fails the build; and a `formulation` naming
 rustc (release, commit, LLVM), cargo, cargo-cyclonedx and the C compilers.
-`publish` refuses to sign unless all six archives are present and every
+`robodr-focal` does not ship `robodr-pulsard`, so its archives leave out
+that crate's SBOM. `publish` refuses to sign unless all six archives are
+present, the `robodr` and `.rpm` archives contain a `robodr-pulsard` SBOM
+(with its eBPF objects) and the `robodr-focal` ones do not, and every
 file passes `metadata_to_cyclonedx.py --check --require-complete` and
 `cyclonedx validate --input-version v1_5 --fail-on-errors`. The delivery
 RPKs carry one merged SBOM per package. (Installing the SBOM into
@@ -417,10 +432,12 @@ justifications and an impact statement; `affected` with an action;
 `fixed`; `under_investigation`). Each release publishes
 `robodr-<ver>.openvex.json` generated from it.
 
-`.github/workflows/vuln-scan.yml` runs daily on the newest release of every
-`X.Y` line: cargo-deny with an **empty** configuration (no waiver of the
-tag's `deny.toml` can hide an advisory) and osv-scanner (pinned by SHA-256)
-on the tag's `Cargo.lock`. Every advisory found must have an applicable
+`.github/workflows/vuln-scan.yml` runs daily, for every `X.Y` line, on its
+newest final release and, when one is newer, its newest pre-release
+(`scripts/vuln-scan-tags.py`: semantic-version precedence, so `v0.2.0`
+ranks above `v0.2.0-rc.1`; `sort -V` would not): cargo-deny with an
+**empty** configuration (no waiver of the tag's `deny.toml` can hide an
+advisory) and osv-scanner (pinned by SHA-256) on the tag's `Cargo.lock`. Every advisory found must have an applicable
 statement in the current `statements.json` (`scripts/vex.py coverage`), or
 the workflow fails: assess the advisory, add the statement on `main`, and
 if the release is affected, patch it (section 6 for an older line). Each run
@@ -433,14 +450,18 @@ Every build and rebuild job records what it took from outside the
 repository (`scripts/release-toolchain-inputs.sh`): the container image
 digest, `rustc -vV`, a hash of the target's rust-std, and every C / eBPF
 toolchain package with its version and a fingerprint (rpm's
-`SHA256HEADER`; for dpkg the SHA-256 of the package's file list with
-contents digests). `publish` appends all records to
+`SHA256HEADER`; for dpkg the SHA-256 of the package's installed
+`md5sums` list: dpkg keeps only MD5 digests of the installed files, so
+this detects a changed package but is not a cryptographic hash of the
+`.deb`). `publish` appends all records to
 `REPRODUCIBILITY-<version>.txt`, so drift between the build and the
 independent rebuild, or between two releases, is visible and signed.
 
 `scripts/release-toolchain-inputs.lock` turns records into enforced pins:
 for a job label with lines there, any other version or fingerprint fails
-the build. It is empty on purpose: apt.llvm.org (the eBPF clang of the
+the build. It is empty, so today nothing is pinned and the toolchain
+inputs are only recorded (and signed with the record). It is empty on
+purpose: apt.llvm.org (the eBPF clang of the
 `.deb` build) and Rocky's AppStream do not keep superseded builds, so a pin
 only holds once those packages come from a **hash-pinned mirror** under our
 control (an apt/dnf snapshot repository; hosting is an infrastructure

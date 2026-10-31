@@ -5,7 +5,9 @@ built, and again right before anything is signed).
     release-gate.py line --commit SHA --version V [--git-dir DIR]
         Which release line the tagged commit belongs to. Accepted:
           * on origin/main (an ancestor of refs/remotes/origin/main):
-            line=main, latest=true;
+            line=main, latest=true, except for a pre-release version
+            (X.Y.Z-pre: the release is created with --prerelease, and
+            GitHub never makes a pre-release "Latest"), latest=false;
           * otherwise on origin/release/X.Y, where X.Y is the version's
             major.minor (a long-term-support branch; protect it like main):
             line=release/X.Y, latest=false (an older line never becomes the
@@ -38,7 +40,7 @@ import subprocess
 import sys
 import time
 
-SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 GOOD_EVENTS = {"push", "workflow_dispatch", "schedule"}
 
@@ -69,7 +71,9 @@ def release_line(commit: str, version: str, git_dir: str | None = None) -> tuple
     if main is None:
         raise Refused("origin/main not fetched (checkout with fetch-depth: 0)")
     if main:
-        return "main", True
+        # A pre-release (a '-' suffix before any '+build') is created with
+        # --prerelease, and GitHub never makes a pre-release "Latest".
+        return "main", m.group(4) is None
     branch = f"release/{m.group(1)}.{m.group(2)}"
     if on(f"refs/remotes/origin/{branch}"):
         return branch, False
@@ -217,6 +221,14 @@ def self_test() -> int:
         def test_main(self):
             self.assertEqual(release_line(self.main, "0.2.0", self.d), ("main", True))
             self.assertEqual(release_line(self.base, "0.1.0", self.d), ("main", True))
+            # Build metadata is not a pre-release.
+            self.assertEqual(release_line(self.main, "0.2.0+build.1", self.d), ("main", True))
+
+        def test_prerelease_never_latest(self):
+            # GitHub cannot make a pre-release "Latest"; the release is
+            # created with --prerelease for any version with a '-'.
+            self.assertEqual(release_line(self.main, "0.1.0-alpha.3", self.d), ("main", False))
+            self.assertEqual(release_line(self.main, "0.2.0-rc.1+b.2", self.d), ("main", False))
 
         def test_lts_branch(self):
             self.assertEqual(release_line(self.lts, "0.1.3", self.d), ("release/0.1", False))

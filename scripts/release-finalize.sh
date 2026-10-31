@@ -13,7 +13,10 @@
 #  3. SBOM gate: the six SBOM archives (robodr, robodr .rpm, robodr-focal;
 #     amd64, arm64) must exist and every CycloneDX file in them must pass
 #     `metadata_to_cyclonedx.py --check --require-complete` (Rust std, musl,
-#     eBPF, formulation present) and, with ROBODR_CYCLONEDX_CLI set, the
+#     formulation present; a robodr-pulsard SBOM lists its embedded eBPF
+#     objects); the robodr and robodr .rpm archives (which ship
+#     robodr-pulsard) must contain a robodr-pulsard SBOM, the robodr-focal
+#     ones (which do not) must not; and, with ROBODR_CYCLONEDX_CLI set, the
 #     official schema validation (`cyclonedx validate --input-version v1_5
 #     --fail-on-errors`). Without the CLI the gate fails unless
 #     ROBODR_ALLOW_NO_CYCLONEDX_CLI=1 (local dry runs only).
@@ -69,6 +72,22 @@ for t in "robodr-$version-amd64" "robodr-$version-arm64" "robodr-$version-rpm-am
     fi
     mkdir -p "$work/$t"
     tar -xzf "$tgz" -C "$work/$t" --no-same-owner --no-same-permissions
+    has_pulsard=0
+    if roots="$(python3 "$here/metadata_to_cyclonedx.py" --list-roots "$work/$t")"; then
+        if grep -qx robodr-pulsard <<<"$roots"; then has_pulsard=1; fi
+    else
+        echo "release-finalize: FAIL: $t: cannot read its SBOMs" >&2
+        rc=1
+    fi
+    if [[ "$t" == robodr-focal-* ]]; then
+        if [[ $has_pulsard == 1 ]]; then
+            echo "release-finalize: FAIL: $t: a robodr-pulsard SBOM, but robodr-focal does not ship robodr-pulsard" >&2
+            rc=1
+        fi
+    elif [[ $has_pulsard == 0 ]]; then
+        echo "release-finalize: FAIL: $t: no robodr-pulsard SBOM (its eBPF objects would be unrecorded)" >&2
+        rc=1
+    fi
     while IFS= read -r -d '' f; do
         n=$((n + 1))
         python3 "$here/metadata_to_cyclonedx.py" --check "$f" --require-complete >/dev/null || {

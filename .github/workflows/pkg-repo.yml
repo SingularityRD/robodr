@@ -8,7 +8,9 @@
 #   secret   REPO_GPG_PRIVATE_KEY   ASCII-armoured secret key (signing subkey)
 #   secret   REPO_GPG_PASSPHRASE    its passphrase (may be empty)
 #   variable ROBODR_REPO_GPG_FINGERPRINT  the primary key fingerprint (40 hex)
-#   environment "package-repo" holding the secrets, with required reviewers.
+#   environment "package-repo" holding the secrets, with required reviewers
+#   and deployments restricted to v* tags (a manual run starts from the
+#   tag, never from a branch whose copy of this file could be modified).
 # dry_run: true signs with a throwaway OpenPGP key instead (no environment,
 # no secret), to test the workflow; its output says TEST-ONLY.
 #

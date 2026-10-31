@@ -25,7 +25,9 @@
 #
 # Gates before anything is built (`prepare`) and again right before signing
 # (`publish`), scripts/release-gate.py:
-#  * line: the tagged commit is on main (the release becomes "Latest") or
+#  * line: the tagged commit is on main (the release becomes "Latest",
+#    unless the version is a pre-release, which GitHub never makes
+#    "Latest") or
 #    on release/X.Y for version X.Y.* (a long-term-support line; never
 #    "Latest"). Protect release/* like main (required reviews and checks).
 #  * ci: ci.yml has a completed, successful push / workflow_dispatch /
@@ -144,6 +146,11 @@ env:
   # SHA-256 of the v0.27.2 cyclonedx-linux-x64 release binary, recorded from
   # its download on 2026-10-31 (the project publishes no checksum file for
   # this release): bump both together and re-check the hash on two hosts.
+  # A second download on 2026-10-31 (same network path, so not an
+  # independent host) gave the same hash; that binary ran: it validated an
+  # augmented robodr-pulsard SBOM (metadata_to_cyclonedx.py output) and
+  # rejected one with an invalid component type. A cargo-cyclonedx SBOM has
+  # not been validated with it yet (first GitHub dry run).
   CYCLONEDX_CLI_VERSION: 0.27.2
   CYCLONEDX_CLI_SHA256: 5e1595542a6367378a3944bbd3008caab3de65d572345361d3b9597b1dbbaaa0
 
@@ -169,6 +176,7 @@ jobs:
       - name: Release tooling self-tests (gates, SBOM, RPK, VEX, provenance, toolchain record)
         run: |
           python3 scripts/release-gate.py --self-test
+          python3 scripts/vuln-scan-tags.py --self-test
           python3 scripts/metadata_to_cyclonedx.py --self-test
           python3 scripts/release-rpk.py --self-test
           python3 scripts/vex.py --self-test
@@ -274,7 +282,8 @@ jobs:
         run: |
           if [ "$DRY_RUN" = true ]; then echo "dry run: no release created"; exit 0; fi
           pre=""
-          case "$VERSION" in *-*) pre="--prerelease" ;; esac
+          # Same rule as release-gate.py (latest=false): a '-' before any '+build'.
+          case "${VERSION%%+*}" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --draft --verify-tag $pre \
             --title "RoboDR $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
@@ -593,6 +602,10 @@ jobs:
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          # robodr-focal does not ship robodr-pulsard (not built here), so
+          # its SBOM (cargo-cyclonedx writes one per workspace crate) is not
+          # part of this package's SBOM set.
+          rm -f dist/sbom/*robodr-pulsard*.cdx.json
           scripts/release-sbom-augment.sh dist/sbom
       - name: robodr-focal package, offline bundle and SBOM archive
         env:
@@ -936,8 +949,14 @@ jobs:
           fetch-depth: 0
       - name: Release line and CI (again, right before signing)
         id: line
+        # No pipe: the default `bash -e` shell has no pipefail, so
+        # `gate | tee` would hide a refusal. The output reaches
+        # $GITHUB_OUTPUT only when the gate accepted.
         run: |
-          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" | tee -a "$GITHUB_OUTPUT"
+          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" > "$RUNNER_TEMP/line"
+          cat "$RUNNER_TEMP/line"
+          grep -qxE 'latest=(true|false)' "$RUNNER_TEMP/line" || { echo "::error::release line output missing"; exit 1; }
+          cat "$RUNNER_TEMP/line" >> "$GITHUB_OUTPUT"
           python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
       - name: Install minisign, rpm2archive (rebuild comparison) and cyclonedx-cli (SBOM schema)
         run: |
@@ -1004,7 +1023,8 @@ jobs:
             echo '```'
           } >> "$RUNNER_TEMP/notes.md"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
-          # An older release line (release/X.Y) never becomes "Latest".
+          # An older release line (release/X.Y) or a pre-release never
+          # becomes "Latest" (release-gate.py line).
           case "$LATEST" in true|false) ;; *) echo "::error::release line output missing"; exit 1 ;; esac
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$LATEST"
 
