@@ -41,10 +41,11 @@
 # static-pie in Rust's target; aarch64-unknown-linux-musl is not, so its
 # linker defaults to scripts/static-pie-ld (rust-lld with rustc's own
 # static-pie link: rcrt1.o, -pie --no-dynamic-linker -z text; tested by
-# scripts/test-static-pie-ld.sh). Every binary must be ET_DYN; a non-PIE
-# arm64 binary is accepted (with a WARNING) only when the caller set
-# CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER to something else and
-# ROBODR_REQUIRE_STATIC_PIE is not 1 (release.yml sets it).
+# scripts/test-static-pie-ld.sh). Every binary must be ET_DYN, whatever
+# linker the caller set; a non-PIE binary FAILS the build (exit 1) unless
+# ROBODR_ALLOW_NON_PIE=1 (local experiments with another linker; then a
+# WARNING, and the result is not a release build). ROBODR_REQUIRE_STATIC_PIE=1
+# (release.yml) overrides ROBODR_ALLOW_NON_PIE.
 #
 # Check only (no build): --check-dir DIR checks the robodr-* binaries in DIR
 # exactly as after a build and copies nothing.
@@ -86,8 +87,7 @@ command -v readelf >/dev/null || { echo "build-static: readelf (binutils) not fo
 linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
 # Is a non-PIE binary tolerated (see "Executable layout")?
 pie_optional=0
-if [[ "$triple" == aarch64-unknown-linux-musl && -n "${!linker_var:-}" &&
-    "${!linker_var}" != */static-pie-ld && "${ROBODR_REQUIRE_STATIC_PIE:-0}" != 1 ]]; then
+if [[ "${ROBODR_ALLOW_NON_PIE:-0}" == 1 && "${ROBODR_REQUIRE_STATIC_PIE:-0}" != 1 ]]; then
     pie_optional=1
 fi
 
@@ -106,7 +106,7 @@ check_bins() {
         etype="$(od -An -tu2 -j16 -N2 "$f" | tr -d '[:space:]')"
         if [[ "$etype" != 3 ]]; then
             if [[ $pie_optional == 1 ]]; then
-                echo "build-static: WARNING $b: not position-independent (e_type $etype): $linker_var=${!linker_var} overrides scripts/static-pie-ld" >&2
+                echo "build-static: WARNING $b: not position-independent (e_type $etype; ROBODR_ALLOW_NON_PIE=1, not a release build)" >&2
             else
                 echo "build-static: FAIL $b: not position-independent (e_type $etype, want 3 ET_DYN: static-pie)" >&2
                 rc=1
