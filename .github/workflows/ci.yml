@@ -103,6 +103,9 @@ jobs:
         with:
           # The rule validator calibrates against vendor/pulsar's source and rules.
           submodules: recursive
+          # check-doc-facts.py's stamp check resolves "Verified at commit"
+          # stamps against the history.
+          fetch-depth: 0
           persist-credentials: false
       - name: Python self-tests
         run: |
@@ -113,7 +116,17 @@ jobs:
           python3 scripts/check-packages.py --self-test
           python3 scripts/third_party_notices.py --self-test
           python3 scripts/compare-rebuild.py --self-test
+          python3 scripts/check-detection-catalog.py --self-test
+          python3 scripts/check-doc-facts.py --self-test
           scripts/ci-install-ebpf-toolchain.sh --self-test
+      - name: Customer detection catalog in step with the rule catalog
+        # docs/customer/detection-catalog.md's generated tables against
+        # crates/robodr-ocsf/src/builder.rs (regenerate with --write).
+        run: python3 scripts/check-detection-catalog.py
+      - name: Document facts in step with the code
+        # Contract version, workspace members, fuzz targets, action catalog,
+        # "Verified at commit" stamps, evidence links, Pulsar pin.
+        run: python3 scripts/check-doc-facts.py
       - name: Package variants consistent (programs, workflows, maintainer scripts)
         # Every robodr-* program classified per package variant, every
         # ROBODR_DEB_REQUIRE list complete, deb and rpm scripts stopping and

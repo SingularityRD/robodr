@@ -614,7 +614,7 @@ same units).
 | Job | Required | What |
 |---|---|---|
 | `lockfile` | yes | Committed `Cargo.lock` has no local/patched/git/unknown sources; if none is committed, generate + upload the bootstrap lock and **fail** (every other job also fails without it) |
-| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants and the drop-in examples `robodr-focal` ships in step), `scripts/check-packages.py` (programs per variant, `ROBODR_DEB_REQUIRE` lists, deb/rpm scripts), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts, the rpm scriptlets and the focal / BTF helpers |
+| `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants and the drop-in examples `robodr-focal` ships in step), `scripts/check-packages.py` (programs per variant, `ROBODR_DEB_REQUIRE` lists, deb/rpm scripts), `scripts/check-detection-catalog.py` (customer detection catalog against the rule catalog), `scripts/check-doc-facts.py` (contract version, member and fuzz-target counts, action catalog, stamps, evidence links, Pulsar pin; full history checked out for the stamps), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts, the rpm scriptlets and the focal / BTF helpers |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
 | `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, `robodr-pulsard`). No kernel load |
 | `msrv` | yes | `cargo +1.87.0 check` of the pure crates |
