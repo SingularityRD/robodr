@@ -143,6 +143,7 @@ PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
 NEVER_PACKAGED = {
     "robodr-safety-replay": "test tool of robodr-deliverd",
     "robodr-release": "SOC / build-side delivery artifact tool",
+    "robodr-signer": "key-ceremony check tool, used next to robodr-release (the PKCS#11 adapter script is packaged)",
 }
 # build-deb.sh requires these whatever ROBODR_DEB_REQUIRE says.
 ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch",

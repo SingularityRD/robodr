@@ -29,6 +29,7 @@ members = [
     "crates/robodr-ros2-pipeline",
     "crates/robodr-rtps",
     "crates/robodr-seal",
+    "crates/robodr-signer",
     # Throughput benchmarks (sensor-box sizing, regression gate).
     "benches",
     # Pulsar-dependent (need pulsar + tokio; cannot build without crates.io):
@@ -86,6 +87,7 @@ robodr-release = { path = "crates/robodr-release" }
 robodr-responder = { path = "crates/robodr-responder" }
 robodr-ros2-pipeline = { path = "crates/robodr-ros2-pipeline" }
 robodr-seal = { path = "crates/robodr-seal" }
+robodr-signer = { path = "crates/robodr-signer" }
 robodr-sensor-ros2 = { path = "crates/robodr-sensor-ros2" } # Pulsar-dependent
 robodr-threat-forward = { path = "crates/robodr-threat-forward" } # Pulsar-dependent
 

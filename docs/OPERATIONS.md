@@ -260,8 +260,10 @@ private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
 > `blackbox.allow_hmac: true`, and `robodr-blackbox`, the diode tools and
 > `robodr-spool-export` need `--allow-hmac`; each use then prints a
 > warning. Migrate with `robodr-blackbox rotate --allow-hmac` (4.3). The Ed25519 code
-> is the audited `ed25519-dalek` crate; a TPM-held, non-exportable key is
-> still planned.
+> is the audited `ed25519-dalek` crate. Robot keys can be **sealed to the
+> TPM at rest** (4.7); a TPM-resident, non-exportable signing key is still
+> planned. Commissioning and release keys can stay in a **PKCS#11 token or
+> HSM** (4.6).
 
 ### 4.2 Generate a key
 
@@ -555,6 +557,141 @@ The Ed25519 implementation is the audited `ed25519-dalek` crate (strict
 verification), wrapped by `robodr-blackbox` and pinned to the RFC 8032 test
 vectors; key files, key ids and signatures are unchanged from the earlier
 in-crate implementation.
+
+### 4.6 Signing keys in a token or HSM (PKCS#11)
+
+**available** (SALES-READINESS T36). Every key argument of
+`robodr-commission` (`--sign-key`: profile, root, operator keys) and
+`robodr-release sign --key` (release, root, operator keys) takes either a
+key file (4.2) or a **signer file** (`robodr-signer/v1`). A signer file
+holds no secret: it names an external signer command and pins the key's
+public half. The key stays in the token; for each signature the tool runs
+the command, hands it the document on stdin and reads the 64-byte Ed25519
+signature from stdout. **Every signature is verified against the pinned
+public key before it is used**, so a wrong token, slot or key id, or a
+misbehaving adapter, fails the command and writes nothing. The protocol
+(cleared environment, deadline, output cap, trusted-path checks of the
+signer file and of the command and its directories) is documented in
+`crates/robodr-signer/src/lib.rs`.
+
+The shipped adapter `/usr/lib/robodr/robodr-signer-pkcs11` drives OpenSC's
+`pkcs11-tool` (OpenSC 0.25 or later; `CKM_EDDSA`, pure Ed25519) with any
+PKCS#11 module that offers Ed25519: YubiKey 5 (firmware 5.7 or later),
+Nitrokey 3, SoftHSM 2, network HSMs. On the signing station:
+
+```sh
+# 1. Generate the key ON the token
+pkcs11-tool --module /usr/lib/x86_64-linux-gnu/libykcs11.so --login \
+    --keypairgen --key-type EC:edwards25519 --id 01 --label oem-root-2026
+# 2. Write the signer file (reads and pins the token's public key)
+/usr/lib/robodr/robodr-signer-pkcs11 signer-file \
+    --module /usr/lib/x86_64-linux-gnu/libykcs11.so --id 01 \
+    --key-id oem-root-2026 --pin-env ROBODR_PKCS11_PIN > oem-root.signer.json
+chmod 0644 oem-root.signer.json   # owned by root or you, not group/other-writable
+# 3. Check it (a real test signature: PIN, touch)
+read -rs ROBODR_PKCS11_PIN && export ROBODR_PKCS11_PIN
+robodr-signer check --key oem-root.signer.json   # key_id, fingerprint, "external"
+# 4. Use it wherever a key file went
+robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub \
+    --operators operators.json --sign-key oem-root.signer.json
+robodr-release sign --key oem-root.signer.json --target trust.json
+```
+
+`robodr-signer check` prints the key's `public_key_hex` and `fingerprint`
+(for `--root` pins and trust files). The PIN comes from the environment
+variable named by `--pin-env` (listed in the signer file's `pass_env`) or
+from `--pin-file`; with neither, `pkcs11-tool` asks on the terminal. It
+never appears on a command line. The adapter is in the `robodr` package;
+`robodr-signer` (the check tool) is built from the source tree like
+`robodr-release` (`cargo build --release -p robodr-signer`).
+
+Limits: tested end to end against SoftHSM 2 (`ROBODR_PKCS11=1 cargo test
+-p robodr-signer`). YubiKey, Nitrokey and network HSMs use the same
+adapter and mechanism but have not been tested on the hardware yet.
+`robodr-commission keygen` and `robodr-release keygen` make file keys
+only: token keys are generated with the vendor's or OpenSC's tools. Any
+other signer (a vendor CLI, a KMS client) can be used by writing a command
+that follows the same protocol.
+
+### 4.7 Robot keys sealed to the TPM
+
+**available** (SALES-READINESS T66; systemd 250 or newer and a TPM 2.0;
+not in the focal package). By default the robot's private keys are
+root-only files that systemd hands to each service (`LoadCredential=`).
+They can instead be stored **sealed to the unit's TPM** as systemd
+encrypted credentials: a copied disk or SD card then no longer yields
+them. systemd decrypts them at service start into the same place
+(`/run/credentials/robodr-agentd.service/<name>`), so `agentd.json` does
+not change.
+
+```sh
+sudo install -d -m 0750 -o root -g robodr-agentd /etc/robodr/credstore.encrypted
+sudo systemd-creds encrypt --with-key=host+tpm2 --tpm2-pcrs=7 --name=blackbox.key \
+    /etc/robodr/keys/agentd-blackbox.key /etc/robodr/credstore.encrypted/blackbox.key
+sudo chgrp robodr-agentd /etc/robodr/credstore.encrypted/blackbox.key
+sudo chmod 0640 /etc/robodr/credstore.encrypted/blackbox.key
+sudo install -D -m 0644 \
+    /usr/share/doc/robodr/examples/robodr-agentd.service.d/15-tpm-credentials.conf.example \
+    /etc/systemd/system/robodr-agentd.service.d/15-tpm-credentials.conf
+sudo systemctl daemon-reload && sudo systemctl restart robodr-agentd
+sudo robodr-agentd --config /etc/robodr/agentd.json --check-config   # "key blackbox: host+tpm2"
+```
+
+Keep the plaintext key file only until the service has started from the
+sealed credential and its public key is safely with the verifiers; then
+destroy it (on flash storage overwriting is unreliable: rely on the
+volume's encryption, see 9). Seal the other keys (`finding.key`,
+`cp-tls.key`, `anchor-tls.key`, `executor.key`) the same way, replacing
+their drop-in's `LoadCredential=` by `LoadCredentialEncrypted=`.
+`host+tpm2` needs both the TPM and the root-only
+`/var/lib/systemd/credential.secret`; `--tpm2-pcrs=7` binds the credential
+to the Secure Boot state, so a firmware or Secure Boot change needs
+re-sealing: plan it with firmware updates. The sealed file is readable by
+the `robodr-agentd` group only so that agentd can read its header (it
+never decrypts it; the ciphertext is useless without the TPM and the host
+secret).
+
+**What agentd reports.** `status.json` carries `key_protection`:
+
+```json
+"key_protection": {
+  "require": "none", "all_tpm2": false, "fallback": true,
+  "keys": [ { "role": "blackbox",
+              "path": "/run/credentials/robodr-agentd.service/blackbox.key",
+              "protection": "host+tpm2", "tpm2": true, "fallback": false,
+              "sealed_source": "/etc/robodr/credstore.encrypted/blackbox.key" },
+            { "role": "finding_signing",
+              "path": "/run/credentials/robodr-agentd.service/finding.key",
+              "protection": "plain-credential", "tpm2": false, "fallback": true } ]
+}
+```
+
+`protection` is `tpm2` or `host+tpm2` (sealed to this TPM), `host` (host
+key file only), `null` (no confidentiality), `unknown` (sealed source
+unreadable or not recognised), `plain-credential` (a credential without a
+sealed source: `LoadCredential=` from a plain file) or `file` (a plain key
+file outside the credentials directory). Everything but `tpm2` and
+`host+tpm2` is the **fallback** and is flagged (`fallback: true`).
+`robodr-agentd --check-config` prints one line per key. To refuse to
+start unless every key is sealed to the TPM, add to `agentd.json`:
+
+```json
+"key_protection": { "require": "tpm2" }
+```
+
+(`credentials_dir`, default `/run/credentials/robodr-agentd.service`, and
+`encrypted_dir`, default `/etc/robodr/credstore.encrypted`, are optional.)
+
+Limits: sealing protects keys **at rest**. While the service runs, the key
+is in its private credential ramfs and memory and the TPM does not make the
+signatures; root on a running unit can still read it. The report matches a
+credential to `<encrypted_dir>/<name>` by name and reads only the header;
+it does not read the unit file, so it catches a missing or weaker seal, not
+a root user who deliberately misconfigures the unit. `robodr-executor`,
+`robodr-uplink` and the exporters can be sealed with the same systemd
+mechanism but do not report it. Tested against swtpm (`ROBODR_SWTPM=1
+cargo test -p robodr-agentd --test key_protection`), not yet on a hardware
+TPM.
 
 ## 5. Commissioning: learn, sign off, lock
 

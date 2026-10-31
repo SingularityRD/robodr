@@ -18,6 +18,8 @@ description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeli
 robodr-buildinfo = { workspace = true }
 robodr-agent = { workspace = true }
 robodr-blackbox = { workspace = true }
+# Classification of systemd encrypted credentials (key_protection, T66).
+robodr-signer = { workspace = true }
 zeroize = { workspace = true }
 # std_msgs / Odometry decoders of the live safety-state feed.
 robodr-cdr = { workspace = true }

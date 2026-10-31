@@ -198,6 +198,10 @@ install_dropin() { # <unit>.service.d/<file>
 for b in robodr-commission robodr-replay robodr-ros2-watch; do
     install_bin "$b" usr/bin 1
 done
+# Key providers (T36): the PKCS#11 external signer adapter a
+# robodr-signer/v1 signer file names (robodr-commission --sign-key / --key).
+install -D -m 0755 "$here/../crates/robodr-signer/adapters/robodr-signer-pkcs11" \
+    "$pkg/usr/lib/robodr/robodr-signer-pkcs11"
 for b in robodr-blackbox robodr-diode-pack robodr-diode-unpack; do
     install_bin "$b" usr/bin 0 || true
 done
@@ -254,6 +258,9 @@ elif install_bin robodr-pulsard usr/sbin 0; then
 fi
 if install_bin robodr-agentd usr/sbin 0; then
     install -D -m 0644 "$unit_src/robodr-agentd.service" "$pkg/$units/robodr-agentd.service"
+    # TPM-sealed key credentials (T66; LoadCredentialEncrypted=, systemd
+    # >= 250: the focal variant's file only says it is not available).
+    install_dropin robodr-agentd.service.d/15-tpm-credentials.conf.example
     install_dropin robodr-agentd.service.d/20-finding-key.conf.example
     install_dropin robodr-agentd.service.d/30-control-plane.conf.example
     # Passive sensor box (tap / port mirror; docs/UNITREE.md): agentd drop-in,

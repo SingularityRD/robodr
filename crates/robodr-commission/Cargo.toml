@@ -24,6 +24,9 @@ robodr-blackbox = { workspace = true }
 # Both are pure RoboDR crates (events + serde), no new third-party code.
 robodr-firewall = { workspace = true }
 robodr-responder = { workspace = true }
+# Key providers for --sign-key / --key (T36): a key file or an external
+# signer (PKCS#11 token, HSM) named by a robodr-signer/v1 signer file.
+robodr-signer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -1,0 +1,23 @@
+[package]
+name = "robodr-signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Key providers (SALES-READINESS T36, T66): one Ed25519 signer abstraction for commissioning and release keys (a robodr-blackbox key file, or an external signer command such as the shipped PKCS#11 adapter for YubiKey/Nitrokey/HSM tokens), and the classification of systemd encrypted credentials (TPM2-sealed or not) for the robot-side key report."
+
+[dependencies]
+# Ed25519 keys, key files, the Signer trait and signature verification.
+robodr-blackbox = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-signer"
+path = "src/bin/robodr-signer.rs"
+# Same crate name as the library: keep it out of rustdoc to avoid a collision.
+doc = false

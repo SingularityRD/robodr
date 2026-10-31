@@ -2690,6 +2690,7 @@ dependencies = [
  "robodr-responder",
  "robodr-ros2-pipeline",
  "robodr-rtps",
+ "robodr-signer",
  "rustls",
  "rustls-webpki",
  "serde",
@@ -2771,6 +2772,7 @@ dependencies = [
  "robodr-firewall",
  "robodr-responder",
  "robodr-rtps",
+ "robodr-signer",
  "serde",
  "serde_json",
 ]
@@ -3006,6 +3008,7 @@ dependencies = [
  "robodr-diode",
  "robodr-pkg",
  "robodr-seal",
+ "robodr-signer",
  "serde",
  "serde_json",
 ]
@@ -3072,6 +3075,15 @@ dependencies = [
  "pulsar-core",
  "robodr-ros2-pipeline",
  "tokio",
+]
+
+[[package]]
+name = "robodr-signer"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

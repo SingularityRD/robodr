@@ -459,6 +459,9 @@ struct Status<'a> {
     /// executor v1 link counters (absent when the executor is off).
     #[serde(skip_serializing_if = "Option::is_none")]
     executor: Option<crate::executor_link::LinkStats>,
+    /// How each private key is protected at rest (T66): TPM-sealed or the
+    /// flagged file fallback.
+    key_protection: &'a crate::key_protection::KeyReport,
     /// Early-warning probes (sales-readiness T5 - T7, T40, T41).
     self_health: &'a SelfView,
 }
@@ -3140,6 +3143,7 @@ impl<'a> Daemon<'a> {
             queue_bytes_max: self.budget.max(),
             control_plane: self.control.as_ref().map(ControlPlane::status),
             executor: self.executor.as_ref().map(|l| l.stats()),
+            key_protection: &self.r.key_protection,
             self_health: &self.self_view,
         };
         let res = serde_json::to_vec_pretty(&status)

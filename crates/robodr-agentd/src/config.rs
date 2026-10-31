@@ -128,6 +128,10 @@
 //!   group/other-writable, not this robot's own keys), optional `evidence`.
 //!   Needs `finding_signing` (answers are signed). Requests are judged and
 //!   recorded, never executed; see [`crate::control`].
+//! * `key_protection` (optional, [`crate::key_protection::KeyProtectionSection`]):
+//!   `{"require": "tpm2"}` refuses to start unless every private key is a
+//!   TPM-sealed systemd credential; without it every key is classified and
+//!   reported in `status.json` (`key_protection`, the file fallback flagged).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -275,6 +279,10 @@ pub struct DaemonConfig {
     /// = nothing is executed.
     #[serde(default)]
     pub executor: Option<crate::executor_link::ExecutorSection>,
+    /// How the private keys must be protected at rest (see
+    /// [`crate::key_protection`]); absent = report only.
+    #[serde(default)]
+    pub key_protection: Option<crate::key_protection::KeyProtectionSection>,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -908,6 +916,9 @@ pub struct Resolved {
     pub robot_model: Option<robodr_cdr::UnitreeModel>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
+    /// How each private key is protected at rest (`status.json`
+    /// `key_protection`; see [`crate::key_protection`]).
+    pub key_protection: crate::key_protection::KeyReport,
     /// Safety configuration files that claim more than the commissioning
     /// signed (`crate::commissioned`): one `robot.agent.config_unattested`
     /// finding each at start.
@@ -1762,6 +1773,9 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             );
         }
     }
+    // Last: every key path above is valid. Refuses the configuration when
+    // `key_protection.require` is "tpm2" and a key is not TPM-sealed.
+    let key_protection = crate::key_protection::assess(&config)?;
     Ok(Resolved {
         config,
         sensor,
@@ -1788,6 +1802,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         firewall_joint,
         robot_model,
         warnings,
+        key_protection,
         config_unattested: commissioned.findings,
     })
 }
