@@ -667,9 +667,13 @@ In each container, `scripts/systemd-lifecycle.sh` runs these steps:
 6. Roll back to N-1.
 7. Purge.
 
-After each step the key, `agentd.json` and every black-box segment written
-before must be unchanged, and `robodr-blackbox verify` must report INTACT
-across the whole chain.
+After the upgrade and after the rollback, the key, `agentd.json` and every
+black-box segment written before must be unchanged, and
+`robodr-blackbox verify` must report INTACT across the whole chain. Every
+segment is hashed in full except the newest one at the time of the
+snapshot, which agentd may append to after it starts again: only its first
+4 KiB are compared (`scripts/lifecycle-state.sh`, tested by
+`scripts/test-lifecycle-state.sh` in `ci.yml`).
 
 N-1 is the latest GitHub release's package, checked against that release's
 `SHA256SUMS`. Until a release exists, N-1 is the same `.deb` relabelled
