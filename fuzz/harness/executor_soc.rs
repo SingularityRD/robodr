@@ -28,8 +28,14 @@
 //!   its id, action, `ttl_s`, target, origin key id and `requested_by`
 //!   equal the signed body's `request_id`, `action`, `ttl_seconds`,
 //!   parameters, the request's `key_id` and `requested_by`
-//!   ([`signed_body_matches`], an oracle written independently of
-//!   `verify`'s own comparison);
+//!   ([`signed_body_matches`], which reads the body as JSON rather than
+//!   through `verify`'s types). The scalar fields are compared
+//!   independently; the parameters-to-target mapping restates the same
+//!   documented derivation as the executor (`rollback_config` without
+//!   `config` means `profile`; `quarantine_node` targets the participant
+//!   when `participant_guid` parses as a GUID prefix, else the node named
+//!   by `participant_guid`, else the one named by `node`), so an
+//!   error in that derivation itself would not be caught here;
 //! * the same approval is never accepted twice (`soc_nonce_replayed`), and
 //!   never by an executor of another robot (`soc_signature_invalid`);
 //! * a planner order never carries an approval (`approval_missing`);
@@ -177,7 +183,9 @@ fn approval(order: &Order) {
 /// Whether `order` is the order its SOC request's body describes, checked
 /// field by field against the body as JSON (not through `verify`'s own
 /// types): the binding that makes the signature an approval of *this*
-/// order. `Err` names the first field that differs.
+/// order. `Err` names the first field that differs. The target mapping
+/// mirrors the executor's derivation (see the module comment), so it checks
+/// that `verify` applies it, not that the derivation is right.
 pub fn signed_body_matches(order: &Order) -> Result<(), String> {
     use robodr_executor::net::GuidPrefix;
     use robodr_executor::order::Target;
