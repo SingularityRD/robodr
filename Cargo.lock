@@ -2710,6 +2710,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-benches"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-agentd",
+ "robodr-blackbox",
+ "robodr-capture",
+ "robodr-commission",
+ "robodr-correlate",
+ "robodr-events",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-blackbox"
 version = "0.1.0-alpha.1"
 dependencies = [

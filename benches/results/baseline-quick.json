@@ -1,0 +1,58 @@
+{
+  "host": {
+    "arch": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "profile": "release",
+    "version": "0.1.0-alpha.1"
+  },
+  "quick": true,
+  "results": [
+    {
+      "datagrams_in_capture": 15172,
+      "datagrams_per_s": 83094.16013125329,
+      "datagrams_processed": 15172,
+      "dropped_at_input": 0,
+      "findings_spooled": 0,
+      "motion_events": 10000,
+      "motion_hz": 1000,
+      "participants": 10,
+      "peak_rss_kib": 25544,
+      "realtime_factor": 54.76809921648648,
+      "rogue_share": 0.0,
+      "topics_per_participant": 5,
+      "valid": true,
+      "virtual_seconds": 10,
+      "wall_s": 0.182588042,
+      "workload": "agentd/p10-t5-m1000hz-rogue0"
+    },
+    {
+      "datagrams_in_capture": 15174,
+      "datagrams_per_s": 64427.87896989833,
+      "datagrams_processed": 15174,
+      "dropped_at_input": 0,
+      "findings_spooled": 97,
+      "motion_events": 9995,
+      "motion_hz": 1000,
+      "participants": 10,
+      "peak_rss_kib": 26084,
+      "realtime_factor": 42.45939038480186,
+      "rogue_share": 0.01,
+      "topics_per_participant": 5,
+      "valid": true,
+      "virtual_seconds": 10,
+      "wall_s": 0.235519161,
+      "workload": "agentd/p10-t5-m1000hz-rogue1"
+    },
+    {
+      "correlated_findings": 810,
+      "groups": 100,
+      "peak_rss_kib": 4268,
+      "pending_groups": 204,
+      "signals": 200000,
+      "signals_per_s": 721423.1502943084,
+      "wall_s": 0.277229806,
+      "workload": "correlate/s200000-g100"
+    }
+  ]
+}
