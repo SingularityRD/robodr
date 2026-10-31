@@ -214,8 +214,8 @@ files (under `crates/`) or harnesses that fail if the mitigation breaks;
 | T | Request altered or re-targeted to another robot | Signature covers target and robot id; answers bound to the request signature | same | — |
 | R | SOC denies having sent a request | Request, signature, body and decision kept in the black box; re-verifiable offline | `robodr-agentd/tests/rev5_evidence.rs` | — |
 | I | Evidence export leaks keys or files | Exports carry only black-box frames, signed manifest; no key material | `robodr-agentd/tests/control_plane.rs`, `robodr-blackbox/tests/export.rs` | — |
-| D | Slowloris / flood locks the SOC out | Per-source and pre-auth slot caps, handshake and write deadlines, per-key rate limits; flood costs only the control plane | RESULTS S1 (pass), S2 (**fail**) | Multi-source slowloris holds the slots (W2-4, 4-2 GAP-28); mitigation `IPAddressAllow=` |
-| E | A valid key asks for more than it should | Seven catalog actions only, `authority: request`, no motion fields; judged against the live safety state, policy ceiling and morphology; the executor decides again | `robodr-responder/tests/plan_matrix.rs`, `robodr-responder/tests/fall_prone_review.rs`, `robodr-agentd/tests/review_safety_regressions.rs` | No per-key action scopes; two-person rule asserted by the SOC (GAP-07) |
+| D | Slowloris / flood locks the SOC out | Per-source and pre-auth slot caps, handshake and write deadlines, per-key rate limits; flood costs only the control plane | RESULTS S1 (pass), S2 (**fail** before T39); `robodr-agentd/tests/control_plane.rs` slowloris tests | Multi-source slowloris holds the general slots; `soc_sources` keeps a reserved slot for the SOC (in process only, lab re-run open; W2-4, 4-2 GAP-28); reported as `control_plane_saturated`; mitigation `IPAddressAllow=` |
+| E | A valid key asks for more than it should | Seven catalog actions only, `authority: request`, no motion fields; judged against the live safety state, policy ceiling and morphology; the executor decides again | `robodr-responder/tests/plan_matrix.rs`, `robodr-responder/tests/fall_prone_review.rs`, `robodr-agentd/tests/review_safety_regressions.rs` | Per-key action scopes (agentd `control_plane.soc_keys`, executor `soc.key_scopes`, configured separately) bound what one key may ask; two-person rule asserted by the SOC (GAP-07) |
 
 ### TB6: findings → SOC analysts and LLM agents
 
@@ -299,7 +299,7 @@ Taken from [`iec-62443-4-2-gap-analysis.md`](iec-62443-4-2-gap-analysis.md)
 | FR | GA target | Main gap to the target |
 |---|---|---|
 | FR1 IAC | SL-C 2 | SL 3 needs hardware-protected keys (GAP-04) |
-| FR2 UC | SL-C 2 | Per-key scopes, on-robot approval verification (GAP-07) |
+| FR2 UC | SL-C 2 | On-robot approval verification (GAP-07; per-key scopes closed in code) |
 | FR3 SI | SL-C 3 | First signed release (GAP-12); field validation |
 | FR4 DC | SL-C 2 | Evidence at rest relies on host encryption (H3) |
 | FR5 RDF | SL-C 2 | Gateway coverage limits (GAP-25) |
@@ -318,7 +318,7 @@ Taken from [`iec-62443-4-2-gap-analysis.md`](iec-62443-4-2-gap-analysis.md)
    anchors remains, and the TPM anchor is swtpm-tested only.
 5. **SOC trust** (TA5): a stolen SOC key plus client certificate can
    request any catalog action the safety state allows; no per-key scopes.
-6. **Control-plane slot exhaustion** by a multi-source slowloris (GAP-28).
+6. **Control-plane slot exhaustion** by a multi-source slowloris (GAP-28): the SOC's `soc_sources` keep a reserved slot (in process only); other clients are locked out while it lasts.
 7. **Personal data in findings** without a redaction option
    ([`data-handling.md`](../customer/data-handling.md)).
 
