@@ -1,0 +1,223 @@
+# RoboDR nightly: the long-running checks no pull request waits for
+# (T58 and T80 of docs/SALES-READINESS.md; docs/BUILD.md "Nightly"):
+#
+#   fuzz     every cargo-fuzz target for FUZZ_SECONDS (default 1 h) under
+#            AddressSanitizer, starting from the committed seeds plus the
+#            corpus grown by earlier nights (actions/cache, per target). A
+#            crash, leak, timeout or invariant violation fails the run,
+#            uploads the reproducer and opens (or comments on) one issue per
+#            target labelled `fuzz-crash`.
+#   redteam  tools/e2e/nightly-redteam.sh: the network-side red team
+#            (REDTEAM.md R1-R4) against a live agentd in a network namespace,
+#            with assertions; results.json uploaded; a regression fails.
+#
+# A 24 h campaign does not fit a GitHub-hosted job (6 h limit): run this
+# workflow by hand with fuzz_seconds up to 19800 per target, or on a
+# self-hosted runner (docs/BUILD.md "Nightly").
+name: Nightly
+
+on:
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "seconds per fuzz target (max 19800 on hosted runners)"
+        default: "3600"
+      targets:
+        description: "space-separated fuzz targets (empty: all)"
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  ROBODR_CRATES_MIRROR: ${{ vars.ROBODR_CRATES_MIRROR }}
+  CARGO_FUZZ_VERSION: 0.13.1
+  FUZZ_TOOLCHAIN: nightly-2026-09-01
+  FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '3600' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  fuzz-build:
+    # Builds every target once (ASan, debug assertions) and hands the
+    # binaries to the per-target jobs.
+    name: Fuzz build
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchains
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - name: Setup (mirror)
+        run: scripts/ci-setup.sh
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+      - name: Build all targets
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz build --debug-assertions
+      - name: Target list
+        id: list
+        env:
+          WANT: ${{ inputs.targets }}
+        run: |
+          all=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list)
+          if [ -n "$WANT" ]; then
+            for t in $WANT; do
+              printf '%s\n' "$all" | grep -qx "$t" || { echo "::error::unknown fuzz target $t"; exit 1; }
+            done
+            all=$WANT
+          fi
+          json=$(printf '%s\n' $all | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          echo "targets=$json" >> "$GITHUB_OUTPUT"
+          echo "$json"
+      - name: Bundle the fuzz binaries
+        run: |
+          mkdir -p fuzz-bin
+          for t in $(cargo "+$FUZZ_TOOLCHAIN" fuzz list); do
+            cp "fuzz/target/x86_64-unknown-linux-gnu/release/$t" fuzz-bin/
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-bin-${{ github.run_id }}
+          path: fuzz-bin
+          if-no-files-found: error
+          retention-days: 2
+
+  # ---------------------------------------------------------------------------
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    needs: fuzz-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        target: ${{ fromJSON(needs.fuzz-build.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fuzz-bin-${{ github.run_id }}
+          path: fuzz-bin
+      - name: Grown corpus of earlier nights
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: corpus-grown
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz for ${{ env.FUZZ_SECONDS }} s
+        id: run
+        run: |
+          chmod +x "fuzz-bin/$TARGET"
+          mkdir -p corpus-grown artifacts
+          set +e
+          # New units go to corpus-grown; the committed seeds are read only.
+          "fuzz-bin/$TARGET" corpus-grown "fuzz/corpus/$TARGET" \
+            -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2560 -timeout=30 \
+            -artifact_prefix=artifacts/ -print_final_stats=1 2>&1 | tail -n 200 > run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          tail -n 40 run.log
+          grep -E '^stat::|DONE' run.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - name: Minimise the grown corpus
+        if: steps.run.outputs.status == '0'
+        run: |
+          mkdir -p corpus-min
+          "fuzz-bin/$TARGET" -merge=1 corpus-min corpus-grown -rss_limit_mb=2560 >/dev/null 2>&1 || true
+          if [ -n "$(ls -A corpus-min)" ]; then rm -rf corpus-grown && mv corpus-min corpus-grown; fi
+          echo "corpus: $(ls corpus-grown | wc -l) units"
+      - name: Save the grown corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: corpus-grown
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload the reproducer
+        if: steps.run.outputs.status != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            artifacts
+            run.log
+          retention-days: 90
+      - name: Open or update the crash issue
+        if: steps.run.outputs.status != '0' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="fuzz: $TARGET fails (nightly)"
+          body=$(printf 'Nightly fuzzing of `%s` failed at %s.\n\nRun: %s (artifact `fuzz-crash-%s-%s`: reproducer + log).\n\n```\n%s\n```\n\nReproduce: `cargo +nightly fuzz run %s <reproducer>` (fuzz/README.md).' \
+            "$TARGET" "$GITHUB_SHA" "$RUN_URL" "$TARGET" "$GITHUB_RUN_ID" "$(grep -E 'ERROR|panicked|SUMMARY|assert' run.log | head -n 20)" "$TARGET")
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label fuzz-crash \
+            --search "\"$title\" in:title" --json number --jq '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh label create fuzz-crash --repo "$GITHUB_REPOSITORY" --color B60205 \
+              --description "Nightly fuzzing found a failure" 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label fuzz-crash --body "$body"
+          fi
+      - name: Fail on a finding
+        if: steps.run.outputs.status != '0'
+        run: |
+          echo "::error::fuzz target $TARGET failed (exit ${{ steps.run.outputs.status }}); reproducer in the run's artifacts"
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  redteam:
+    # T80: the network-side red team as a regression gate (REDTEAM.md R1-R4,
+    # tools/e2e/nightly-redteam.sh). The AutoSecOps-side scenarios (control
+    # plane, executor, ingest: R5-R7) need the AutoSecOps stack and are not
+    # run here.
+    name: Red team (network side, live agentd in a netns)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: nightly-redteam
+      - name: Setup (mirror, --locked)
+        run: scripts/ci-setup.sh
+      - name: Release binaries
+        run: cargo build --release $CARGO_LOCKED -p robodr-agentd -p robodr-blackbox -p robodr-commission
+      - name: Red team (root)
+        run: sudo env ROBODR_BIN=target/release tools/e2e/nightly-redteam.sh "$RUNNER_TEMP/redteam"
+      - name: Upload results
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/redteam" || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: redteam-${{ github.run_id }}
+          path: ${{ runner.temp }}/redteam
+          if-no-files-found: warn
+          retention-days: 90
