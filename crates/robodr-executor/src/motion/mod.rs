@@ -39,7 +39,8 @@
 //! The protocols are implemented here ([`rtps`] + [`cdr`]: ROS 2 topics,
 //! services and the Unitree SDK request / response over RTPS; [`mavlink`]:
 //! MAVLink 2) and tested against in-process simulated peers
-//! (`tests/motion.rs`); see the README for what was verified only that way.
+//! (`motion_tests.rs`) and, for `nav2`, real Fast DDS / Cyclone DDS peers
+//! (`tools/e2e/ros2-peer/`); see the README for what was verified how.
 
 pub mod adapters;
 pub mod cdr;
@@ -80,14 +81,24 @@ impl AdapterKind {
     }
 }
 
-/// The RMW whose service conventions the ROS 2 adapters follow.
+/// The RMW whose service conventions the ROS 2 adapters follow (the
+/// robot's ROS 2 nodes' `RMW_IMPLEMENTATION`; sales-readiness T18). Other
+/// RMWs (`rmw_connextdds`, `rmw_zenoh_cpp`, `rmw_gurumdds`) are refused by
+/// the configuration: Connext and GurumDDS correlate replies their own
+/// way, Zenoh does not speak RTPS at all (README, "Motion adapters").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rmw {
-    /// `rmw_cyclonedds_cpp` (request header in the payload). The only one
-    /// implemented: `rmw_fastrtps` carries it in the inline QoS.
+    /// `rmw_cyclonedds_cpp`: the request header (client id, sequence
+    /// number) leads the request and reply payloads.
     #[default]
     Cyclonedds,
+    /// `rmw_fastrtps_cpp` / `rmw_fastrtps_dynamic_cpp` (the ROS 2
+    /// default): the payload is the bare request; the request carries the
+    /// client's reply reader as its related sample identity (inline QoS)
+    /// and the reply names the request (that reader, or the request
+    /// writer, and the request's sequence number) the same way.
+    Fastrtps,
 }
 
 fn default_timeout_ms() -> u64 {

@@ -237,8 +237,37 @@ fn correlation() -> (u64, i64) {
     (client, seq)
 }
 
-/// A service call with the `rmw_cyclonedds` request header: the reply
-/// whose header carries our client id and sequence number.
+/// Length of the `rmw_cyclonedds` request header (client id, sequence
+/// number) after the 4-octet encapsulation header.
+const CDDS_HEADER: usize = 16;
+
+/// `payload` (encapsulation, header, body) without the `rmw_cyclonedds`
+/// request header. The header is 16 octets, so the body's CDR alignment
+/// (relative to the end of the encapsulation) is unchanged.
+fn without_header(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let (encap, rest) = payload
+        .split_first_chunk::<4>()
+        .ok_or("payload shorter than its encapsulation")?;
+    let body = rest
+        .get(CDDS_HEADER..)
+        .ok_or("payload shorter than its request header")?;
+    let mut out = encap.to_vec();
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
+/// A service call. `request` is the `rmw_cyclonedds` payload (with its
+/// request header `client`, `seq`); the answer is the reply's payload
+/// **without** a request header (encapsulation and body), whichever RMW
+/// the peer runs (`p.rmw`, sales-readiness T18):
+///
+/// - `cyclonedds`: the reply whose header carries our client id and
+///   sequence number;
+/// - `fastrtps`: the request is sent without the header, with a random
+///   sequence number and our reply reader as its related sample identity;
+///   the reply is the sample whose related sample identity names our
+///   reply reader or our request writer (both with fresh random entity
+///   keys) and that sequence number.
 fn call_service(
     p: &Ros2Peer,
     service: &str,
@@ -252,23 +281,51 @@ fn call_service(
     let name = service.trim_start_matches('/');
     let req_topic = format!("rq/{name}Request");
     let rep_topic = format!("rr/{name}Reply");
+    let (payload, sn, qos) = match p.rmw {
+        super::Rmw::Cyclonedds => (request.to_vec(), 1, None),
+        super::Rmw::Fastrtps => {
+            // Review F10 for this RMW: the correlation is the GUIDs (fresh
+            // random entity keys) and a random sequence number. Kept below
+            // 2^16 + 2: a real Fast DDS reader (Humble) never delivers a
+            // first sample numbered near 2^31 (tools/e2e/ros2-peer).
+            let sn = 2 + i64::from(rtps::random_u64() as u16);
+            let qos =
+                rtps::related_identity_qos(rtps::guid_of(part.prefix, rep_r), rtps::SN_UNKNOWN);
+            (without_header(request)?, sn, Some(qos))
+        }
+    };
     let send = |part: &mut Participant| -> std::io::Result<()> {
         part.announce()?;
         part.announce_writer(req_w, &req_topic, &format!("{srv_type}Request_"))?;
         part.announce_reader(rep_r, &rep_topic, &format!("{srv_type}Response_"))?;
-        part.publish(req_w, 1, request)
+        part.publish_with(req_w, sn, qos.as_deref(), &payload)
     };
     send(&mut part).map_err(|e| format!("send: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
     let peer = p.peer_prefix()?;
+    let ours = [
+        rtps::guid_of(part.prefix, rep_r),
+        rtps::guid_of(part.prefix, req_w),
+    ];
+    let rmw = p.rmw;
     part.wait(
         deadline,
         Duration::from_millis(p.resend_ms),
         send,
         |r: &Received| {
             from_peer(peer, r)?;
-            let mut d = Dec::open(&r.payload).ok()?;
-            (d.u64().ok()? == client && d.i64().ok()? == seq).then(|| r.payload.clone())
+            match rmw {
+                super::Rmw::Cyclonedds => {
+                    let mut d = Dec::open(&r.payload).ok()?;
+                    (d.u64().ok()? == client && d.i64().ok()? == seq)
+                        .then(|| without_header(&r.payload).ok())
+                        .flatten()
+                }
+                super::Rmw::Fastrtps => {
+                    let (g, s) = r.related?;
+                    (ours.contains(&g) && s == sn).then(|| r.payload.clone())
+                }
+            }
         },
     )
 }
@@ -282,12 +339,9 @@ fn from_peer(peer: Option<[u8; 12]>, r: &Received) -> Option<()> {
     }
 }
 
-/// Skip the request header of a reply.
+/// The body of a reply ([`call_service`] removed any request header).
 fn reply_body(payload: &[u8]) -> Result<Dec<'_>, String> {
-    let mut d = Dec::open(payload)?;
-    d.u64()?;
-    d.i64()?;
-    Ok(d)
+    Dec::open(payload)
 }
 
 fn nav2_pause(m: &MotionSection) -> Result<String, String> {
@@ -332,11 +386,15 @@ fn nav2_zero_twists(n: &super::Nav2Adapter) -> Result<String, String> {
         Participant::open(n.ros2.peer()?, n.ros2.prefix()?).map_err(|e| format!("socket: {e}"))?;
     let topic = format!("rt{}", n.cmd_vel_topic);
     let tw = rtps::fresh_entity(0x03);
-    part.announce().map_err(|e| format!("send: {e}"))?;
-    part.announce_writer(tw, &topic, "geometry_msgs::msg::dds_::Twist_")
-        .map_err(|e| format!("send: {e}"))?;
     let z = cdr::zero_twist();
     for sn in 1..=i64::from(n.zero_twists) {
+        // Announced with every twist (T18, found against a real Cyclone
+        // DDS): a peer drops samples of a writer it has not matched yet,
+        // and an announcement that arrived before it knew this participant
+        // is not repeated by anyone else.
+        part.announce().map_err(|e| format!("send: {e}"))?;
+        part.announce_writer(tw, &topic, "geometry_msgs::msg::dds_::Twist_")
+            .map_err(|e| format!("send: {e}"))?;
         part.publish(tw, sn, &z).map_err(|e| format!("send: {e}"))?;
         std::thread::sleep(Duration::from_millis(n.zero_twist_interval_ms));
     }
