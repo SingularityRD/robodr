@@ -895,6 +895,10 @@ pub struct Resolved {
     pub robot_model: Option<robodr_cdr::UnitreeModel>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
+    /// Safety configuration files that claim more than the commissioning
+    /// signed (`crate::commissioned`): one `robot.agent.config_unattested`
+    /// finding each at start.
+    pub config_unattested: Vec<String>,
 }
 
 impl std::fmt::Debug for KeyBytes {
@@ -1232,7 +1236,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     }
     warnings.extend(sensor.profile_trust.warnings());
     let policy_text = read_capped(&config.policy_path, MAX_CONFIG_BYTES)?;
-    let policy = ResponsePolicy::from_json(&policy_text)
+    let mut policy = ResponsePolicy::from_json(&policy_text)
         .map_err(|e| format!("{}: {e}", config.policy_path.display()))?;
     if !policy.oem_validated {
         warnings.push(
@@ -1264,6 +1268,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         })?),
     };
     sensor.pipeline.motion.robot_model = robot_model;
+    let mut joint_text: Option<(PathBuf, String)> = None;
     let firewall_joint = match config
         .firewall
         .as_ref()
@@ -1273,6 +1278,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         Some(p) => {
             require_abs("firewall.joint_config", p)?;
             let text = read_capped(p, MAX_CONFIG_BYTES)?;
+            joint_text = Some((p.clone(), text.clone()));
             let fc = robodr_firewall::FirewallConfig::from_json(&text)
                 .map_err(|e| format!("{}: {e}", p.display()))?;
             if !fc.channels.is_empty() {
@@ -1384,6 +1390,25 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     let t = load_profile_checked(&sensor.profile_path, &sensor.profile_trust, chain.as_ref())?;
     if let Some(a) = &t.alarm {
         warnings.push(format!("CRITICAL: {a}"));
+    }
+    // T11 / T12: the policy's oem_validated and the firewall joint file
+    // count only as bound into the trusted locked profile (see
+    // `crate::commissioned`).
+    let commissioned = crate::commissioned::apply(
+        t.accepted
+            .as_ref()
+            .filter(|_| t.loaded.file_check.is_ok())
+            .map(|_| &t.loaded.profile),
+        &config.policy_path,
+        &policy_text,
+        &mut policy,
+        joint_text
+            .as_ref()
+            .map(|(p, text)| (p.as_path(), text.as_str())),
+    );
+    warnings.extend(commissioned.warnings.iter().cloned());
+    if t.lab_only {
+        warnings.push(robodr_commission::poc::LAB_ONLY_BANNER.to_string());
     }
     let safety_feed = match &config.safety_feed {
         None => None,
@@ -1746,6 +1771,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         firewall_joint,
         robot_model,
         warnings,
+        config_unattested: commissioned.findings,
     })
 }
 

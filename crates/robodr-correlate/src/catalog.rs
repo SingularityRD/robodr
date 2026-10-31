@@ -175,6 +175,9 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // robodr-agentd executor link (failed revert, executor journal reset)
     "robot.agent.executor_revert_failed",
     "robot.agent.executor_journal_reset",
+    // robodr-agentd commissioning: a safety configuration file (response
+    // policy, firewall joint config) not bound to the trusted locked profile
+    "robot.agent.config_unattested",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",

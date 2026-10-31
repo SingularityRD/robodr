@@ -1417,6 +1417,32 @@ impl<'a> Daemon<'a> {
             self.stats.health_findings += 1;
             self.emit(o);
         }
+        // T11 / T12: a safety configuration file that claims more than the
+        // commissioning signed (`crate::commissioned`). Observe-only.
+        for detail in self.r.config_unattested.clone() {
+            let _ = writeln!(self.log, "robodr-agentd: {}", sanitize(&detail));
+            let dev = robodr_events::Deviation::new(
+                crate::commissioned::CONFIG_UNATTESTED,
+                robodr_events::Severity::High,
+                detail,
+            );
+            let subject = Subject {
+                node: Some("robodr-agentd".into()),
+                ..Subject::default()
+            };
+            let now = self.clock.now();
+            let safety = self.r.config.context.safety_state;
+            let o = self.agent.handle_external(
+                now,
+                Detector::SelfHealth,
+                "agentd:config_unattested",
+                subject,
+                dev,
+                safety,
+            );
+            self.stats.health_findings += 1;
+            self.emit(o);
+        }
     }
 
     fn main_loop(&mut self, should_stop: &dyn Fn() -> bool) -> StopReason {
