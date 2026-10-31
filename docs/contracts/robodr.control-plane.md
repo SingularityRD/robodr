@@ -47,13 +47,21 @@ that as "not applied", never as success.
   most `max_connections_per_source` (default 2, 1..=16) of all of them.
   When every pre-authentication slot a new connection may use is busy, it
   cuts the **oldest** pre-authentication connection that has spent
-  `pre_auth_evict_after_ms` (default 100, 100..=5000) in its handshake or
-  request read (`connections_evicted`; the cut peer sees the connection
-  close); a source at its per-source share only cuts one of its own.
-  `soc_sources` (up to 16 networks, `"10.20.0.0/24"` or an address) gets
-  `reserved_connections` (default 1, 1..=4) extra pre-authentication
-  slots nobody else may take, and a connection from a listed address cuts
-  an unlisted peer's handshake at once; an unlisted connection never cuts a
+  `pre_auth_evict_after_ms` in its handshake or request read
+  (`connections_evicted`; the cut peer sees the connection close; the cut
+  is not counted as a TLS or authentication failure); a source at its
+  per-source share only cuts one of its own. `pre_auth_evict_after_ms` is
+  0 (never cut by age) or 100..=5000; default **100 without
+  `soc_sources`, 0 with them**. Cutting by age is a trade: it keeps a
+  slowloris peer from holding a slot for longer, but under legitimate
+  overload (more clients than slots, round trips longer than the setting)
+  clients cut each other's handshakes and few or none may finish, and
+  clients behind one NAT address at its per-source share cut their own.
+  `soc_sources` (up to 16 networks, `"10.20.0.0/24"` or an address; a /0
+  is refused) gets `reserved_connections` (default 1, 1..=4) extra
+  pre-authentication slots nobody else may take, and a connection from a
+  listed address cuts an unlisted peer's handshake at once (whatever
+  `pre_auth_evict_after_ms` says); an unlisted connection never cuts a
   listed one, and authenticated connections are never cut. `soc_sources`
   is about availability only: a listed address still needs the client
   certificate and a SOC key. Otherwise over a cap the connection is closed
@@ -316,42 +324,6 @@ Body errors are answered with an HTTP error (§7) and recorded
 `authority_not_allowed`, `invalid_request_id`, `invalid_field`,
 `invalid_request`.
 
-### 4.2 Per-key scopes (`control_plane.soc_keys`)
-
-A `soc_keys` entry is either a key file path (the key may request every
-action with any valid `ttl_seconds`) or a scoped key:
-
-```json
-"soc_keys": [
-  "/etc/robodr/soc/soc-ir-lead.pub",
-  {"path": "/etc/robodr/soc/soc-tier1.pub",
-   "allowed_actions": ["record_evidence", "isolate_network"],
-   "max_ttl_seconds": 900}
-]
-```
-
-`allowed_actions`: 1..=7 distinct catalog names (absent: every action);
-`max_ttl_seconds`: 1..=86400 (absent: 86400). agentd checks the scope of
-the key that signed the request **before** anything else about it (before
-the `request_id` is looked up, so an out-of-scope request learns nothing
-about other requests): a submission whose action is not allowed is
-refused **403 `action_not_permitted`**, one whose `ttl_seconds` is above
-the key's limit **403 `ttl_above_key_limit`**. A revert is refused
-`action_not_permitted` when the stored request's action is not in the
-reverting key's scope (a key lifts only what it may ask for; an unknown
-id is still 404). Both are answered signed, recorded as
-`robodr.control_plane_rejected` (§8) and reported as
-`robot.agent.control_plane_invalid` (Medium), never judged. GET, the
-snapshot (`key_scope`, §3.1) and the evidence API are not scoped.
-
-Limits: the scope is enforced by agentd. robodr-executor verifies the
-SOC signature on every order itself (§6a) but does not yet apply these
-scopes (planned with the executor's own key configuration), so a
-compromised agentd process could still pass it an out-of-scope request
-that a configured SOC key signed. The robot still cannot verify the SOC's
-internal approval process (the two-person names are asserted by the SOC,
-§4).
-
 ### 4.1 Judgment (Cyber-Jidoka)
 
 `record_evidence` is judged first and always accepted: it is evidence
@@ -383,6 +355,52 @@ An `unknown` safety state does not refuse by itself: the planner needs a
 human's approval there, and the SOC's (approved) request stands for it; the
 answer's `state.notes` says so. A refusal is final: agentd never retries it
 and a consumer must not either.
+
+### 4.2 Per-key scopes (`control_plane.soc_keys`)
+
+A `soc_keys` entry is either a key file path (the key may request every
+action with any valid `ttl_seconds`) or a scoped key:
+
+```json
+"soc_keys": [
+  "/etc/robodr/soc/soc-ir-lead.pub",
+  {"path": "/etc/robodr/soc/soc-tier1.pub",
+   "allowed_actions": ["record_evidence", "isolate_network"],
+   "max_ttl_seconds": 900}
+]
+```
+
+`allowed_actions`: 1..=7 distinct catalog names (absent: every action);
+`max_ttl_seconds`: 1..=86400 (absent: 86400). For a **submission**
+agentd checks the scope of the key that signed it before anything else
+about it (before its `request_id` is looked up, so an out-of-scope
+submission learns nothing about other requests): an action that is not
+allowed is refused **403 `action_not_permitted`**, a `ttl_seconds` above
+the key's limit **403 `ttl_above_key_limit`**. `max_ttl_seconds` bounds
+only `ttl_seconds`: the actions that take no `ttl_seconds` (§4 table:
+`quarantine_node`, `safe_pause`, `request_safe_state`, `rollback_config`)
+stay in force until they are reverted or an operator restores the robot,
+whatever `max_ttl_seconds` says; leave them out of `allowed_actions` to
+keep a key from requesting them. A **revert**
+looks the id up first (an unknown id is 404) and is then refused 403
+`action_not_permitted` when the stored request's action is not in the
+reverting key's scope (a key lifts only what it may ask for); the
+refusal does not name the stored action, but a 403 instead of a 404
+tells the key the id exists (GET, below, shows any stored request to
+every configured key anyway). Both refusals are answered signed,
+recorded as `robodr.control_plane_rejected` (§8) and reported as
+`robot.agent.control_plane_invalid` (Medium), never judged. GET, the
+snapshot (`key_scope`, §3.1) and the evidence API are not scoped. agentd
+holds one scope per configured key and refuses to start otherwise; a key
+it holds no scope for may request nothing.
+
+Limits: the scope is enforced by agentd. robodr-executor verifies the
+SOC signature on every order itself (§6a) but does not yet apply these
+scopes (planned with the executor's own key configuration), so a
+compromised agentd process could still pass it an out-of-scope request
+that a configured SOC key signed. The robot still cannot verify the SOC's
+internal approval process (the two-person names are asserted by the SOC,
+§4).
 
 ## 5. Request state
 
@@ -1226,12 +1244,20 @@ another robot), 13 (signed in the removed v1 domain); all 401
   listener spend handshakes (bounded by `max_connections`, the per-source
   cap and the 5 s deadline, which a byte-at-a-time peer cannot stretch) and
   drop or delay requests and answers. From several source addresses,
-  reopening handshakes faster than `pre_auth_evict_after_ms`, it can still
-  keep the general TCP pre-authentication slots busy (never the unix
-  socket's); the SOC's own addresses, configured as `soc_sources`, keep a
-  reserved slot and cut the attacker's handshakes (W2-4: 20/20 SOC requests
-  during the attack, `slowloris_cannot_lock_the_listed_soc_out`). Without
+  reopening handshakes faster than `pre_auth_evict_after_ms` (or at all,
+  when nothing is cut by age), it can still keep the general TCP
+  pre-authentication slots busy (never the unix socket's); the SOC's own
+  addresses, configured as `soc_sources`, keep a reserved slot and cut the
+  attacker's handshakes (in process, 4 attacker addresses with 2
+  connections each: 20/20 SOC requests during the attack,
+  `slowloris_cannot_lock_the_listed_soc_out`; the same attack without
+  `soc_sources` and without cutting by age: the SOC is locked out,
+  `without_soc_sources_the_same_slowloris_locks_the_soc_out`). Without
   `soc_sources` the SOC competes with the attacker for the general slots.
+  Cutting by age (the default without `soc_sources`) has not been measured
+  under legitimate load over long round trips (§1: clients may cut each
+  other), and the S2 re-run in the network-namespace lab with release
+  binaries is still to do.
 * Tested with synthetic traffic, an in-process signing client and an
   OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
   not against a deployed SOC or across a real network.
@@ -1434,3 +1460,8 @@ Additive, no version change (`robodr-control-plane/v2`).
   `connections_evicted`), and `soc_sources` get `reserved_connections`
   slots of their own. A SOC client may see a connection closed during
   its TLS handshake under load (it retries, as for a refused connect).
+* Review follow-up: with `soc_sources` nothing is cut by age unless
+  `pre_auth_evict_after_ms` is set (0 now also means "never"); a cut
+  handshake no longer counts in `tls_failures` / `unauthenticated`;
+  `soc_sources` refuses a /0; the revert refusal no longer names the
+  stored request's action; a key without a scope may request nothing.
