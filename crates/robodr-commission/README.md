@@ -502,13 +502,18 @@ completes it.
 
 ## Review page (`report-html`)
 
-`report-html --report report.json --out report.html [--signoff S] [--note
-TEXT]` renders the learn report (configuration, runs, warnings, sign-off
-items with their confirmation state and signer key ids, motion channels,
-participants, topics, services, overflow, anomalies) as one HTML page to
-review, archive with the commissioning record and print to PDF. It is a
-view: it names the SHA-256 of the files it shows, which stay the signed
-artifacts. Every string is escaped (topic names come off the bus), the
+`report-html --report report.json --out report.html [--signoff S
+[--operators O]] [--note TEXT]` renders the learn report (configuration,
+runs, warnings, sign-off items with their confirmation state and the
+signatures, motion channels, participants, topics, services, overflow,
+anomalies) as one HTML page to review, archive with the commissioning
+record and print to PDF. It is a view: it names the SHA-256 of the files it
+shows, which stay the signed artifacts. The page flags a sign-off whose
+items no longer match its `items_sha256`. The key ids in `S.sig` are shown
+as **UNVERIFIED** unless `--operators` is given; with it, every signature is
+checked over the exact sign-off bytes against that operators file, and the
+page lists the operators with a valid signature and every problem. It does
+not check the quorum or the other `lock` rules. Every string is escaped (topic names come off the bus), the
 page has no script and a `default-src 'none'` CSP, and tables are capped
 at 5000 rows.
 

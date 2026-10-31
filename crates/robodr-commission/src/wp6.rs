@@ -9,10 +9,10 @@ use super::{
 use robodr_commission::firewall_draft::{draft_firewall, DraftOptions};
 use robodr_commission::ops::{manifest_path_for, Manifest};
 use robodr_commission::profile_file::MAX_PROFILE_BYTES;
-use robodr_commission::report_html::{render, RenderInputs};
+use robodr_commission::report_html::{render, RenderInputs, SignatureView};
 use robodr_commission::signoff::{
-    bound_config_item, bound_config_subject, draft_digest, sha256_hex, signoff_sig_path, Signoff,
-    BOUND_CONFIG_KIND,
+    bound_config_item, bound_config_subject, draft_digest, sha256_hex, signoff_sig_path,
+    verify_signoff_signatures, OperatorTrust, Signoff, BOUND_CONFIG_KIND,
 };
 use robodr_commission::trust::bound::{
     digest_for_role, summarize, ROLE_EXECUTOR_MOTION, ROLE_JOINT_FIREWALL, ROLE_MOTION_FIREWALL,
@@ -298,15 +298,28 @@ pub(super) fn cmd_firewall_draft(argv: &[String]) -> Outcome {
 }
 
 pub(super) fn cmd_report_html(argv: &[String]) -> Outcome {
-    let a = Args::parse(argv, &["report", "out", "signoff", "note"], &["force"])?;
+    let a = Args::parse(
+        argv,
+        &["report", "out", "signoff", "note", "operators"],
+        &["force"],
+    )?;
     if let Some(p) = a.positionals.first() {
         return Err(format!("unexpected argument {p:?}").into());
     }
     let report_path = a.required("report")?;
     let out = a.required("out")?;
     let so_path = a.one("signoff")?;
+    let ops_path = a.one("operators")?;
+    if ops_path.is_some() && so_path.is_none() {
+        return Err(
+            "--operators checks the sign-off's signatures: give --signoff too"
+                .to_string()
+                .into(),
+        );
+    }
     let mut inputs = vec![report_path];
     inputs.extend(so_path);
+    inputs.extend(ops_path);
     distinct_paths(&[out], &inputs)?;
     let force = a.switch("force");
     precheck_outputs(&[out], force)?;
@@ -319,24 +332,33 @@ pub(super) fn cmd_report_html(argv: &[String]) -> Outcome {
             let st = read_text(sp, MAX_SIGNOFF_BYTES)?;
             let so: Signoff =
                 serde_json::from_str(&st).map_err(|e| format!("{sp}: not a sign-off: {e}"))?;
-            Some((so, file_digest(st.as_bytes()), sp))
+            Some((so, file_digest(st.as_bytes()), sp, st))
         }
     };
-    let sig_ids = match &so {
-        None => Vec::new(),
-        Some((_, _, sp)) => {
+    // The key ids in the .sig file are only claims; with --operators they
+    // are checked over the exact sign-off bytes (review WP6).
+    let signatures = match &so {
+        None => SignatureView::Missing,
+        Some((_, _, sp, st)) => {
             let sig = signoff_sig_path(Path::new(sp)).display().to_string();
-            load_signoff_sigs(&sig)?
-                .map(|s| s.signatures.into_iter().map(|x| x.key_id).collect())
-                .unwrap_or_default()
+            match (load_signoff_sigs(&sig)?, ops_path) {
+                (None, _) => SignatureView::Missing,
+                (Some(s), None) => {
+                    SignatureView::Unverified(s.signatures.into_iter().map(|x| x.key_id).collect())
+                }
+                (Some(s), Some(op)) => {
+                    let trust = OperatorTrust::load(Path::new(op))?;
+                    SignatureView::Verified(verify_signoff_signatures(st.as_bytes(), &s, &trust))
+                }
+            }
         }
     };
     let html = render(
         &r,
         &RenderInputs {
             report_digest: file_digest(rt.as_bytes()),
-            signoff: so.as_ref().map(|(s, d, _)| (s, d.clone())),
-            signature_key_ids: sig_ids,
+            signoff: so.as_ref().map(|(s, d, _, _)| (s, d.clone())),
+            signatures,
             title_note: a.one("note")?.map(str::to_string),
         },
     );

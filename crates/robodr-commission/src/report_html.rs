@@ -3,8 +3,9 @@
 //!
 //! The review of a draft used to mean reading `report.json` and editing the
 //! sign-off JSON by hand. This renders the report (and, when given, the
-//! sign-off list with its confirmation state and the operator signatures'
-//! digest) into one HTML file the OEM and the site can read, archive with
+//! sign-off list with its confirmation state and the operator signatures,
+//! [`SignatureView`]: unverified key ids, or checked against an operators
+//! file) into one HTML file the OEM and the site can read, archive with
 //! the commissioning record and print to PDF from any browser (print
 //! styles included). It is a **view**: the files it was rendered from stay
 //! the artifacts that are signed and verified; the page names their
@@ -19,7 +20,7 @@
 //! counted), so a report from a flooded bus still renders.
 
 use crate::learner::{CommissioningReport, ParticipantStatus, WarningLevel};
-use crate::signoff::Signoff;
+use crate::signoff::{SignatureVerdict, Signoff};
 use crate::stats::SpeedStats;
 use std::fmt::Write as _;
 
@@ -33,11 +34,26 @@ pub struct RenderInputs<'a> {
     pub report_digest: String,
     /// The sign-off list and `sha256:` of its bytes.
     pub signoff: Option<(&'a Signoff, String)>,
-    /// `(signer key id, ...)` of `<signoff>.sig`, if any (listed; they are
-    /// verified by `lock`, not here).
-    pub signature_key_ids: Vec<String>,
+    /// The operator signatures of `<signoff>.sig`, as far as they were
+    /// checked ([`SignatureView`]).
+    pub signatures: SignatureView,
     /// Free text, e.g. site / unit / date, shown in the header (escaped).
     pub title_note: Option<String>,
+}
+
+/// What the page says about the sign-off's operator signatures (review
+/// WP6: key ids read from the `.sig` file were shown as if verified).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SignatureView {
+    /// No `.sig` file next to the sign-off.
+    #[default]
+    Missing,
+    /// The key ids the `.sig` file lists. **Not verified** (no operators
+    /// file was given): anyone can write a key id into that file.
+    Unverified(Vec<String>),
+    /// Checked with `signoff::verify_signoff_signatures` against an
+    /// operators file over the exact sign-off bytes.
+    Verified(SignatureVerdict),
 }
 
 /// HTML-escape `s` and drop control characters (newline and tab become a
@@ -83,6 +99,40 @@ fn set<'a>(it: impl IntoIterator<Item = &'a String>) -> String {
         .map(|s| esc(s))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The signatures cell of the sign-off section.
+fn signatures_html(v: &SignatureView) -> String {
+    match v {
+        SignatureView::Missing => "<span class=\"warn\">none</span>".into(),
+        SignatureView::Unverified(ids) if ids.is_empty() => {
+            "<span class=\"warn\">none</span>".into()
+        }
+        SignatureView::Unverified(ids) => format!(
+            "<span class=\"warn\">UNVERIFIED</span> key ids listed in the .sig file: {} \
+             (render with --operators to check them; `lock` verifies them)",
+            set(ids)
+        ),
+        SignatureView::Verified(verdict) => {
+            let mut s = if verdict.signers.is_empty() {
+                "<span class=\"warn\">no valid signature</span>".to_string()
+            } else {
+                format!(
+                    "<span class=\"ok\">valid</span>: {}",
+                    verdict
+                        .signers
+                        .iter()
+                        .map(|(op, ids)| format!("{} ({})", esc(op), set(ids)))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            };
+            for p in &verdict.problems {
+                let _ = write!(s, "<br><span class=\"warn\">{}</span>", esc(p));
+            }
+            s
+        }
+    }
 }
 
 /// Write a table: header cells, then rows (already escaped cells). Rows
@@ -234,19 +284,27 @@ pub fn render(report: &CommissioningReport, inp: &RenderInputs<'_>) -> String {
             o,
             "<section id=\"signoff-meta\"><h2>Sign-off</h2><dl><dt>operator</dt><dd>{}</dd>\
              <dt>bound draft</dt><dd>{}</dd><dt>item digest</dt><dd>{}</dd>\
-             <dt>signatures (key ids, verified by lock)</dt><dd>{}</dd></dl></section>",
+             <dt>{}</dt><dd>{}</dd></dl></section>",
             if so.operator.trim().is_empty() {
                 "<span class=\"warn\">not named</span>".to_string()
             } else {
                 esc(&so.operator)
             },
             esc(&so.profile_sha256),
-            esc(&so.items_sha256),
-            if inp.signature_key_ids.is_empty() {
-                "<span class=\"warn\">none</span>".to_string()
+            if so.items_intact() {
+                esc(&so.items_sha256)
             } else {
-                set(&inp.signature_key_ids)
-            }
+                format!(
+                    "{} <span class=\"warn\">DOES NOT MATCH the items (edited after the list \
+                     was made)</span>",
+                    esc(&so.items_sha256)
+                )
+            },
+            match &inp.signatures {
+                SignatureView::Verified(_) => "signatures (verified against the operators file)",
+                _ => "signatures (NOT verified here)",
+            },
+            signatures_html(&inp.signatures)
         );
         table(
             &mut o,
@@ -548,12 +606,44 @@ mod tests {
             &RenderInputs {
                 report_digest: "sha256:ab".into(),
                 signoff: Some((&so, "sha256:cd".into())),
-                signature_key_ids: vec!["alice".into()],
+                signatures: SignatureView::Unverified(vec!["alice".into()]),
                 ..Default::default()
             },
         );
         assert!(html.contains("0 unconfirmed sign-off item(s)"), "{html}");
         assert!(html.contains("Alice"));
+        // Review (WP6): key ids read from the .sig file are not shown as
+        // verified.
+        assert!(!html.contains("verified by lock"), "{html}");
+        assert!(html.contains("signatures (NOT verified here)"), "{html}");
+        assert!(html.contains("UNVERIFIED</span> key ids"), "{html}");
+        let mut edited = so.clone();
+        if let Some(i) = edited.items.first_mut() {
+            i.reason.push_str(" (edited)");
+        }
+        let verdict = crate::signoff::SignatureVerdict {
+            signers: [("Alice".to_string(), ["alice".to_string()].into())].into(),
+            problems: vec!["key \"mallory\" is not in the operators trust list".into()],
+        };
+        let html = render(
+            &r,
+            &RenderInputs {
+                report_digest: "sha256:ab".into(),
+                signoff: Some((&edited, "sha256:cd".into())),
+                signatures: SignatureView::Verified(verdict),
+                ..Default::default()
+            },
+        );
+        assert!(html.contains("DOES NOT MATCH the items"), "{html}");
+        assert!(html.contains("signatures (verified against the operators file)"));
+        assert!(
+            html.contains("<span class=\"ok\">valid</span>: Alice (alice)"),
+            "{html}"
+        );
+        assert!(
+            html.contains("is not in the operators trust list"),
+            "{html}"
+        );
     }
 
     #[test]

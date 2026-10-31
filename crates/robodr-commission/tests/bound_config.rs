@@ -351,6 +351,43 @@ fn bind_in_steps_keeps_the_earlier_binding_items() {
         s(&ops),
     ]);
     assert_eq!(code(&o), 0, "{}", err(&o));
+    // report-html shows the .sig key ids as unverified unless given the
+    // operators file, then as checked (review WP6).
+    let html = c.d.join("r.html");
+    let o = run(&[
+        "report-html",
+        "--report",
+        s(&c.report),
+        "--out",
+        s(&html),
+        "--signoff",
+        s(&so3),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let h = std::fs::read_to_string(&html).unwrap();
+    assert!(h.contains("UNVERIFIED"), "{h}");
+    let o = run(&[
+        "report-html",
+        "--report",
+        s(&c.report),
+        "--out",
+        s(&html),
+        "--signoff",
+        s(&so3),
+        "--operators",
+        s(&ops),
+        "--force",
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let h = std::fs::read_to_string(&html).unwrap();
+    assert!(
+        h.contains("signatures (verified against the operators file)"),
+        "{h}"
+    );
+    assert!(
+        h.contains("<span class=\"ok\">valid</span>: alice [LAB-ONLY]"),
+        "{h}"
+    );
     let o = run(&[
         "lock",
         "--in",
