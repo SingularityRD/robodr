@@ -260,7 +260,7 @@ docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
 docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer
                         documents (support matrix, detection catalog, performance,
                         POC guide, quick start, known limitations, drafts).
-fuzz/                   37 cargo-fuzz targets (RTPS, capture, black box, OCSF,
+fuzz/                   41 cargo-fuzz targets (RTPS, capture, black box, OCSF,
                         commissioning, firewall, pipeline config, control-plane
                         requests; own workspace) + std-only smoke runs in the
                         crates' tests.
@@ -328,7 +328,7 @@ qemu. No release has been cut or signed. GitHub CI has run once in full
 - **Hardening (S10)**: `sha2` (HMAC as a wiping RFC 2104 wrapper over it)
   instead of hand-written crypto,
   `forbid(unsafe_code)` where possible, panic-family calls denied in daemon
-  code, 37 fuzz targets (CI runs each for 60 s; an earlier campaign ran 10
+  code, 41 fuzz targets (CI runs each for 60 s; an earlier campaign ran 10
   of them for 630 s each, no crash).
 
 **Not verified:**
