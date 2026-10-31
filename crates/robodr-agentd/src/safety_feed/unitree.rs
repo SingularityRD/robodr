@@ -24,7 +24,10 @@
 //! # Low state (`unitree_low`)
 //!
 //! A sample whose Unitree CRC does not match is **undecodable** (`unknown`,
-//! `robot.safety_state.undecodable_sample`): it is corrupt or forged. Else
+//! `robot.safety_state.undecodable_sample`): it is corrupted. The Unitree
+//! CRC is an unkeyed CRC32 that anyone can recompute, so it detects
+//! corruption only: a forged sample with a correct CRC decodes normally,
+//! and writer pinning and the IP binding are the anti-forgery controls. Else
 //! the claim is the motion level from the fastest joint, max `|dq|` over
 //! every motor slot on the wire (rad/s), against `moving_above` /
 //! `fast_above`; a non-finite `dq` reads `unknown`.
@@ -237,7 +240,7 @@ pub fn decode_low(
         return Err(if m.crc_ok().is_none() {
             "wrong message type".into()
         } else {
-            "Unitree CRC mismatch (corrupt or forged)".into()
+            "Unitree CRC mismatch (corrupted sample)".into()
         });
     }
     let dqs: Vec<f32> = match &m {
