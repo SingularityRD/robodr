@@ -90,6 +90,11 @@ pub const MAX_DEPOT_WRAPS: usize = 16;
 pub const MAX_DEPOT_WRAP_BYTES: usize = 256;
 
 /// What the package is (closed set, §4.2; no "run this script" kind).
+///
+/// There is no `rpm` kind (T53): RoboDR delivers `.deb` packages to
+/// Debian / Ubuntu units only, and a manifest saying `"kind": "rpm"` does
+/// not parse (`docs/SECURE-DELIVERY.md` §4.2). RoboDR itself reaches RPM
+/// hosts through its signed offline bundle, not through RPKs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -940,6 +945,23 @@ mod tests {
         assert_eq!(parse_manifest(&b).unwrap(), m);
         assert_eq!(m.dir_name(), "rpk_nav-stack_7_arm64");
         assert_ne!(rpk_digest(&b), sha256_hex(&b));
+    }
+
+    /// T53: deb only. An `rpm` kind (or any other kind outside the closed
+    /// set) is refused as malformed, never read as some other kind.
+    #[test]
+    fn an_rpm_kind_does_not_parse() {
+        let b = to_canonical(&good()).unwrap();
+        let s = String::from_utf8(b).unwrap();
+        assert!(s.contains(r#""kind":"files""#), "{s}");
+        for k in ["rpm", "RPM", "deb ", "srpm"] {
+            let bad = s.replace(r#""kind":"files""#, &format!(r#""kind":"{k}""#));
+            assert_eq!(
+                parse_manifest(bad.as_bytes()).unwrap_err().code,
+                Code::Malformed,
+                "{k}"
+            );
+        }
     }
 
     #[test]

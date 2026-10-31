@@ -335,6 +335,36 @@ fn postinst_leaves_the_deliverd_restart_to_the_agent_under_its_marker() {
     assert!(under.contains(&"try-restart robodr-agentd.service".to_string()));
 }
 
+/// T53: deb only. A unit without a dpkg database (an RPM-based host) gets
+/// an explicit refusal before anything is unpacked, naming why; no dpkg
+/// tool is run (so this needs neither root nor dpkg).
+#[test]
+fn a_deb_on_a_unit_without_dpkg_is_refused_as_deb_only() {
+    let u = Unit::new("deb-on-rpm-host");
+    // No dpkg_root(&u): <dpkg_root>/var/lib/dpkg/status does not exist.
+    let r = deb_rpk(&u, 1, b"!<arch>\nnot really a deb\n", false);
+    let b = u.bundle(1, None, std::slice::from_ref(&r));
+    u.pack("p1", 1, &[r], &[b]);
+    let mut e = u.open();
+    let reps = u.run(&mut e, 4);
+    assert!(
+        reps.iter().any(|r| r
+            .refused
+            .iter()
+            .any(|x| x.contains("kind deb needs a Debian / Ubuntu unit")
+                && x.contains("RoboDR delivers no RPM packages"))),
+        "{reps:?}"
+    );
+    assert!(u.notes_of("robodr.deliver.activating").is_empty());
+    // Nothing staged.
+    assert!(!u
+        .cfg
+        .state_dir
+        .join("debs")
+        .read_dir()
+        .is_ok_and(|mut d| d.next().is_some()));
+}
+
 const RULES_OK: &str = r#"[[rules]]
 name = "robodr-delivered-test"
 type = "Exec"
