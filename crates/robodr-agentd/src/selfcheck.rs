@@ -58,7 +58,8 @@ pub struct SelfHealthSection {
     /// Period of the `robot.agent.health` record, 1 000 ..= 3 600 000 ms
     /// (default 60 000). 0 switches the record off (the early warnings
     /// stay on): only for replay and tests, a SOC then cannot tell a
-    /// silent robot from a quiet one.
+    /// silent robot from a quiet one. A producer cap below contract 2.5
+    /// (`findings.max_contract_minor` < 5) also switches it off.
     pub health_record_ms: u64,
     /// Medium at this many days before a certificate / CRL expires
     /// (1 ..= 365, default 14).

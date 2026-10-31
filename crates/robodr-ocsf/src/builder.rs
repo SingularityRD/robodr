@@ -113,8 +113,12 @@ impl RobotContext {
 
     /// The contract minor findings are built for: [`CONTRACT_MINOR`],
     /// lowered by [`RobotContext::max_contract_minor`]. Below the current
-    /// minor a finding is built exactly as a producer of that minor would
-    /// build it, so that minor's validator accepts it:
+    /// minor a finding has the wire format of that minor, so that minor's
+    /// validator accepts it. It is not what a producer of that minor would
+    /// have sent: such a producer never emitted the ids catalogued later,
+    /// while this build still builds them (the caller decides whether to
+    /// send them; `robodr-agentd` drops its `robot.agent.health` record
+    /// below 2.5):
     ///
     /// * the rule catalog of that minor applies ([`rule_info_for_contract`]):
     ///   an id catalogued later gets the generic entry (title "RoboDR

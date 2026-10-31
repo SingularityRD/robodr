@@ -101,3 +101,30 @@ fn health_record_is_an_observe_only_finding_with_its_record() {
     assert_eq!(env4.entity_context.agent_health, None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The contract version agentd states in the record's `versions[]` is the
+/// one the agent's findings carry, including under a producer cap.
+#[test]
+fn contract_version_follows_the_producer_cap() {
+    let dir = tmpdir("health-contract-version");
+    let a = build(config(&dir, demo_profile(true), validated_policy()));
+    assert_eq!(a.contract_version(), robodr_ocsf::CONTRACT_VERSION);
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir = tmpdir("health-contract-version-capped");
+    let mut cfg = config(&dir, demo_profile(true), validated_policy());
+    cfg.max_contract_minor = Some(4);
+    let mut capped = build(cfg);
+    assert_eq!(capped.contract_version(), "2.4.0");
+    let o = capped.handle_external(
+        at(1_000_000),
+        Detector::SelfHealth,
+        "agentd",
+        subject(),
+        Deviation::new("robot.agent.input_silent", Severity::High, "x"),
+        SafetyState::Idle,
+    );
+    let env = parse_and_validate(&o.finding.unwrap().value).unwrap();
+    assert_eq!(env.contract_version, capped.contract_version());
+    let _ = std::fs::remove_dir_all(&dir);
+}

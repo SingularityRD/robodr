@@ -796,16 +796,24 @@ box, and exported on every path (Kafka, HTTPS uplink, diode) unchanged.
 * **Producer cap** (`findings.max_contract_minor` in `robodr-agentd`'s
   configuration, `RobotContext::max_contract_minor` in `robodr-ocsf`): a
   robot whose SOC still validates an older minor `m` (0 ≤ `m` ≤ the
-  current minor) builds every finding for contract `2.m.0`, exactly as a
-  producer of that minor would: `contract_version` is `2.m.0`; the
-  catalog of minor `m` applies, so an id catalogued later carries the
-  generic entry (title "RoboDR model-profile deviation", data source
-  `robodr`, no techniques) under its own rule id; below 2.5 a per-rule
-  host id is sent as `robot.host.pulsar_threat` (with that id's finding
-  identity; the detail still names the Pulsar rule) and
-  `entity_context.agent_health` is left out (the `robot.agent.health`
-  finding still goes out every period, with the generic entry). A cap
-  above this build's minor is refused at load. Only findings agentd
+  current minor) builds every finding in the wire format of contract
+  `2.m.0`, which a validator of that minor accepts: `contract_version` is
+  `2.m.0`; the catalog of minor `m` applies, so an id catalogued later
+  carries the generic entry (title "RoboDR model-profile deviation", data
+  source `robodr`, no techniques) under its own rule id; below 2.5 a
+  per-rule host id is sent as `robot.host.pulsar_threat` (with that id's
+  finding identity; the detail still names the Pulsar rule) and
+  `entity_context.agent_health` is left out. This is not what a producer
+  of minor `m` sent: such a producer never emitted the ids catalogued
+  after `m`, while a capped agentd still sends them (for example
+  `robot.agent.disk_low` or `robot.agent.clock_jump` below 2.5), under
+  the generic title, so a SOC rule must match them by `rule_id`, not by
+  title. The one exception is the periodic `robot.agent.health` record:
+  below 2.5 agentd does not send it (`daemon.self_health.health_record_ms`
+  is treated as 0, the start-up log says so and `status.json` shows
+  `health_record_ms` 0), because it would be a Low finding every period
+  titled as a deviation that reports none. A cap above this build's minor
+  is refused at load. Only findings agentd
   builds are capped: `robodr-deliverd` always labels its `robot.deliver.*`
   and `robot.seal.*` findings with this build's version (their entries are
   2.2 / 2.3 ones, which an older 2.x validator from 2.3 on applies
