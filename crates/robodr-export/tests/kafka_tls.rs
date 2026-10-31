@@ -571,3 +571,55 @@ fn cli_tls_crl_file() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(c.total(), 2);
 }
+
+/// T6: `--check` states when the client certificate and each CRL in use
+/// expire, and fails on an expired one.
+#[test]
+fn cli_check_reports_credential_expiry() {
+    let pki = Pki::new();
+    let t = TempDir::new("kafka-tls-expiry");
+    let spool = spool_with(&t, 1);
+    fs::create_dir_all(t.path().join("soc")).unwrap();
+    let check = |c: &Cluster, extra: &[&str]| {
+        let o = Command::new(PUBLISH)
+            .args(["--bootstrap", &c.bootstrap()[0], "--check"])
+            .args(["--spool".as_ref(), spool.as_os_str()])
+            .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
+            .args(extra)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    let p = |n: &str| pki.p(n).to_str().unwrap().to_string();
+    // Mutual TLS with a client certificate valid until 2125.
+    let c = tls_cluster(&pki, "server", true);
+    let (ca, cert, key) = (p("ca.pem"), p("client.pem"), p("client.key"));
+    let (code, out) = check(
+        &c,
+        &["--tls-ca", &ca, "--tls-cert", &cert, "--tls-key", &key],
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("ok   tls-cert expires in "), "{out}");
+    // An expired client certificate (2001) fails the check.
+    let (cert, key) = (p("expired.pem"), p("expired.key"));
+    let (code, out) = check(
+        &c,
+        &["--tls-ca", &ca, "--tls-cert", &cert, "--tls-key", &key],
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("FAIL tls-cert expired "), "{out}");
+    assert!(!out.contains("check passed"), "{out}");
+    // A CRL in use: its nextUpdate (2125).
+    let c = tls_cluster(&pki, "crl-server", false);
+    let (ca, crl) = (p("crl-ca.pem"), p("crl-ca.crl.pem"));
+    let (code, out) = check(&c, &["--tls-ca", &ca, "--tls-crl-file", &crl]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("ok   crl:") && l.contains(" expires in ")),
+        "{out}"
+    );
+}
