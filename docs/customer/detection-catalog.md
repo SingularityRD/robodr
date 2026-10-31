@@ -9,6 +9,12 @@
 > code disagree. Verification levels (V0–V3) are those of
 > [`support-matrix.md`](support-matrix.md). Nothing here has been verified
 > on a customer robot.
+>
+> This page is the customer guide: how to read a finding, what each
+> detection needs, what is not detected. The full generated reference,
+> with each rule's description, the ATT&CK for ICS technique names and
+> every shipped host rule, is
+> [`detection-rules.md`](detection-rules.md).
 
 ## How to read a finding
 

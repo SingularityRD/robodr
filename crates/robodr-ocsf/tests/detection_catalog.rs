@@ -178,7 +178,10 @@ fn render() -> String {
          contract {CONTRACT_VERSION} (`docs/contracts/robodr.findings.md`). Generated from the \
          trusted rule catalog the sensor uses to write each finding's `title`, `description`, \
          `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, \
-         so this page and the findings cannot disagree: a test fails when they do.\n\n"
+         so this page and the findings cannot disagree: a test fails when they do.\n\n\
+         This is the full generated reference. How to read a finding, what each detection \
+         needs and what is not detected are in the customer guide, \
+         [`detection-catalog.md`](detection-catalog.md).\n\n"
     ));
     o.push_str(
         "* **Rule id** is `ocsf.finding_info.analytic.uid` and `ocsf.unmapped.robodr.rule_id`; \
