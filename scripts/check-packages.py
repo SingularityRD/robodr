@@ -18,6 +18,10 @@ Static checks (no package needed; CI job `scripts`):
      try-restart (on upgrade) exactly the same units: every shipped
      service except robodr-firewall-gw-rules.service, which is never
      stopped on purpose (its ruleset keeps a fail-closed bridge closed).
+     The units in GATED (gateway, executor; T9) are never try-restarted
+     on upgrade: the deb postinst / rpm post hand exactly them to
+     mark_pending_restart (install-bundle.sh restarts them through the
+     safety-state gate).
 
   8. Service identities (review: one uid shared by the exporters and the
      gateway let each read the others' credentials): no two units run as
@@ -134,6 +138,9 @@ UNITS = {
     "robodr-depot": ["robodr-depot.service"],
 }
 NOT_STOPPED = {"robodr-firewall-gw-rules.service"}
+# Restarted on upgrade only through the safety-state gate (T9): the
+# maintainer scripts mark them pending, never try-restart them.
+GATED = {"robodr-executor.service", "robodr-firewall-gw.service"}
 
 # Units that used to share the robodr user, and their own users now.
 OWN_USER = {
@@ -312,7 +319,8 @@ def unit_loops(text: str) -> dict[str, set[str]]:
     for m in FOR_RE.finditer(text):
         units = set(re.findall(r"robodr-[a-z0-9-]+\.service", m.group(1)))
         body = m.group(2)
-        verb = "try-restart" if "try-restart" in body else "stop" if "systemctl stop" in body else "other"
+        verb = ("try-restart" if "try-restart" in body else "stop" if "systemctl stop" in body
+                else "pending" if "mark_pending_restart" in body else "other")
         if units and verb != "other":
             # postinst stops the migration's four units in a loop of its own
             # (guarded by is-active): keep the larger list per verb.
@@ -336,15 +344,26 @@ def check_scripts(root: Path) -> list[str]:
         ("rpm/preun", "stop"),
     ]
     for rel, verb in checks:
-        loops = unit_loops((pk / rel).read_text())
-        got = loops.get(verb)
-        if got is None:
-            errs.append(f"packaging/{rel}: no `for u in ...` loop that runs systemctl {verb}")
-            continue
-        for u in sorted(want - got):
-            errs.append(f"packaging/{rel}: does not {verb} {u}")
-        for u in sorted(got - want):
-            errs.append(f"packaging/{rel}: {verb}s {u}, which is not a shipped, stoppable unit")
+        errs += check_unit_loops(rel, verb, unit_loops((pk / rel).read_text()), want)
+    return errs
+
+
+def check_unit_loops(rel: str, verb: str, loops: dict[str, set[str]], want: set[str]) -> list[str]:
+    errs = []
+    if verb == "try-restart":
+        # T9: the gated units go to mark_pending_restart instead.
+        pend = loops.get("pending")
+        if pend != GATED:
+            errs.append(f"packaging/{rel}: marks {sorted(pend or [])} pending-restart, want exactly {sorted(GATED)}")
+        want = want - GATED
+    got = loops.get(verb)
+    if got is None:
+        return errs + [f"packaging/{rel}: no `for u in ...` loop that runs systemctl {verb}"]
+    for u in sorted(want - got):
+        errs.append(f"packaging/{rel}: does not {verb} {u}")
+    for u in sorted(got - want):
+        errs.append(f"packaging/{rel}: {verb}s {u}, which is not a shipped, stoppable unit"
+                    + (" (a gated unit: only through the safety-state gate)" if u in GATED else ""))
     return errs
 
 
@@ -884,6 +903,14 @@ def self_test() -> int:
 
     loops = unit_loops("for u in a.service robodr-x.service robodr-y.service; do\n    systemctl try-restart \"$u\" || true\ndone\n")
     expect("loop parse", [] if loops.get("try-restart") == {"robodr-x.service", "robodr-y.service"} else [str(loops)], True)
+    gated_ok = ("for u in robodr-a.service; do\n    systemctl try-restart \"$u\" || true\ndone\n"
+                "for u in robodr-executor.service robodr-firewall-gw.service; do\n    mark_pending_restart \"$u\"\ndone\n")
+    want_t = {"robodr-a.service"} | GATED
+    expect("gated units pending", check_unit_loops("t", "try-restart", unit_loops(gated_ok), want_t), True)
+    expect("gated unit try-restarted", check_unit_loops("t", "try-restart", unit_loops(
+        gated_ok.replace("robodr-a.service;", "robodr-a.service robodr-executor.service;")), want_t), False)
+    expect("gated unit not pending", check_unit_loops("t", "try-restart", unit_loops(
+        gated_ok.replace(" robodr-firewall-gw.service; do\n    mark", "; do\n    mark")), want_t), False)
 
     def ent(kind="f", mode=0o644, owner="root", digest="x"):
         return Entry(kind, mode, owner, "root", digest)
