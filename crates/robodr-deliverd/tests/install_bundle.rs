@@ -101,20 +101,28 @@ fn write_exec(p: &Path, text: &str) {
 }
 
 /// The fake systemd of the test: `is-active` from `<sd>/active/<unit>`
-/// (and not `<sd>/crashing/<unit>`), every other verb logged to
-/// `<sd>/log`; `try-restart` of a unit in `<sd>/crash-on-restart` makes it
-/// crash. Inside the dpkg chroot the state is `/fake-sd`.
+/// (and neither `<sd>/crashing/<unit>` nor `<sd>/failed/<unit>`), every
+/// other verb logged to `<sd>/log`; `try-restart` of a unit in
+/// `<sd>/crash-on-restart` makes it crash. A failed unit (one that hit its
+/// start limit) is left alone by `try-restart` and comes back only with
+/// `start`, as with systemd. Inside the dpkg chroot the state is `/fake-sd`.
 const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
 if [ -d /fake-sd ]; then d=/fake-sd; else d=$FAKE_SD; fi
 case "$1" in
 is-active)
     shift
     [ "$1" != --quiet ] || shift
-    [ -e "$d/active/$1" ] && [ ! -e "$d/crashing/$1" ]
+    [ -e "$d/active/$1" ] && [ ! -e "$d/crashing/$1" ] && [ ! -e "$d/failed/$1" ]
+    ;;
+is-failed)
+    shift
+    [ "$1" != --quiet ] || shift
+    [ -e "$d/failed/$1" ]
     ;;
 *)
     echo "$*" >>"$d/log"
     if [ "$1" = try-restart ] && [ -e "$d/crash-on-restart/$2" ]; then : >"$d/crashing/$2"; fi
+    if [ "$1" = start ]; then rm -f "$d/failed/$2"; fi
     ;;
 esac
 "#;
@@ -164,6 +172,7 @@ fn dpkg_root(dir: &Path) -> PathBuf {
         "fake-sd/active",
         "fake-sd/crashing",
         "fake-sd/crash-on-restart",
+        "fake-sd/failed",
     ] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
@@ -223,13 +232,30 @@ fn the_rpm_post_scriptlet_carries_the_same_gated_restart_block() {
     assert!(deb.contains("\nmark_pending_restart() {"), "{deb}");
 }
 
+/// The text between `# >>> NAME` and `# <<< NAME` in `file`.
+fn block_of(file: &str, name: &str) -> String {
+    let t = std::fs::read_to_string(repo().join(file)).unwrap();
+    let a = t
+        .find(&format!("# >>> {name}"))
+        .unwrap_or_else(|| panic!("{file}: no {name} block"));
+    let b = t.find(&format!("# <<< {name}")).unwrap();
+    t[a..b].to_string()
+}
+
+/// The maintainer scripts' `gateway_migration_gate` block (review L11:
+/// in the pre-install scripts too).
+fn migration_gate_block() -> String {
+    block_of("packaging/deb/postinst", "gateway_migration_gate")
+}
+
 /// What the real postinst does on upgrade with the gated units (and,
 /// first, the migration gate).
 fn upgrade_postinst() -> String {
     format!(
-        "#!/bin/sh\nset -e\n{}\nstopped=\"\"\ngateway_migration_gate\n\
+        "#!/bin/sh\nset -e\n{}\n{}\nstopped=\"\"\ngateway_migration_gate\n\
          for u in robodr-executor.service robodr-firewall-gw.service; do\n    mark_pending_restart \"$u\"\ndone\n",
-        gated_block()
+        gated_block(),
+        migration_gate_block()
     )
 }
 
@@ -241,7 +267,22 @@ fn stub_deb(dir: &Path, version: &str, postinst: &str) -> PathBuf {
 /// A stub `robodr` package with `postinst` and the executables `files`
 /// (path inside the package, content).
 fn stub_deb_with(dir: &Path, version: &str, postinst: &str, files: &[(&str, &str)]) -> PathBuf {
-    let st = dir.join(format!("stage-{version}"));
+    stub_pkg(dir, "robodr", version, "", &[("postinst", postinst)], files)
+}
+
+/// A stub package `package` (formats RBF1:1) with the extra control
+/// lines `control`, the maintainer scripts `scripts` (name, text) and
+/// the executables `files` (path inside the package, content).
+fn stub_pkg(
+    dir: &Path,
+    package: &str,
+    version: &str,
+    control: &str,
+    scripts: &[(&str, &str)],
+    files: &[(&str, &str)],
+) -> PathBuf {
+    let st = dir.join(format!("stage-{package}-{version}"));
+    let _ = std::fs::remove_dir_all(&st);
     for (p, text) in files {
         write_exec(&st.join(p), text);
     }
@@ -251,19 +292,21 @@ fn stub_deb_with(dir: &Path, version: &str, postinst: &str, files: &[(&str, &str
     std::fs::write(
         st.join("DEBIAN/control"),
         format!(
-            "Package: robodr\nVersion: {version}\nArchitecture: all\nMaintainer: test <t@invalid>\n\
-             Description: stub robodr package for the install-bundle test\n"
+            "Package: {package}\nVersion: {version}\nArchitecture: all\nMaintainer: test <t@invalid>\n\
+             {control}Description: stub robodr package for the install-bundle test\n"
         ),
     )
     .unwrap();
-    write_exec(&st.join("DEBIAN/postinst"), postinst);
+    for (name, text) in scripts {
+        write_exec(&st.join("DEBIAN").join(name), text);
+    }
     std::fs::write(st.join("usr/lib/robodr/stub-version"), version).unwrap();
     std::fs::write(
         st.join("usr/share/robodr/formats"),
         "blackbox_write=RBF1:1\nblackbox_read=RBF1:1\n",
     )
     .unwrap();
-    let deb = dir.join(format!("robodr_{version}_all.deb"));
+    let deb = dir.join(format!("{package}_{version}_all.deb"));
     ok(&Command::new("dpkg-deb")
         .args(["--root-owner-group", "-Zxz", "--build"])
         .arg(&st)
@@ -1156,5 +1199,221 @@ fn a_rollback_below_the_floor_is_refused_for_the_floor_first() {
         "{}",
         out(&o)
     );
+    assert_eq!(u.installed(), "0.2.0-1");
+}
+
+/// Review M7: a unit that failed on the bad release (here: hit its start
+/// limit, so the rollback's `try-restart` leaves it alone) is started
+/// again by the automatic rollback and by `rollback` (reset-failed, then
+/// start), so "the previous release is back" holds. A failed gateway is
+/// started only while the safety state allows it.
+#[test]
+fn a_rollback_starts_again_what_failed_on_the_bad_release() {
+    if !available("rollback_restore", &[]) {
+        return;
+    }
+    let u = Unit::new("restore", true);
+    u.migrated();
+    let pi = upgrade_postinst();
+    let good = format!("{pi}exit 0\n");
+    let bad = format!(
+        "{pi}: >/fake-sd/failed/{AG}\n[ ! -e /fake-sd/fail-gw ] || : >/fake-sd/failed/{GW}\n"
+    );
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", &good), "b1");
+    let b2 = bundle(&u.dir, &stub_deb(&u.dir, "0.2.0-1", &bad), "b2");
+    ok(&u.run(&b1, &["install"], true));
+    u.active(AG);
+    u.safety("idle");
+    u.clear_log();
+    let o = u.run(&b2, &["install", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("AUTOMATIC ROLLBACK to 0.1.0-1")
+            && out(&o).contains("rolled back to 0.1.0-1; it is healthy"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.1.0-1");
+    let log = u.log();
+    assert!(
+        log.contains(&format!("reset-failed {AG}\nstart {AG}\n")),
+        "{log}"
+    );
+    // `rollback` after --no-auto-rollback does the same: agentd is failed
+    // (not active) when it starts, and comes back.
+    let o = u.run(
+        &b2,
+        &["install", "--health-timeout", "2", "--no-auto-rollback"],
+        true,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(u.sd.join("failed").join(AG).exists());
+    ok(&u.run(&b1, &["rollback", "0.1.0-1", "--health-timeout", "2"], true));
+    assert!(!u.sd.join("failed").join(AG).exists());
+    // A gateway that failed on the bad release while the robot moves: the
+    // rollback does not start it (and reports the unit unhealthy).
+    u.active(GW);
+    std::fs::write(u.sd.join("fail-gw"), "").unwrap();
+    let o = u.run(
+        &b2,
+        &["install", "--no-auto-rollback", "--health-timeout", "1"],
+        true,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(u.sd.join("failed").join(GW).exists());
+    u.safety("moving_fast");
+    u.clear_log();
+    let o = u.run(&b1, &["rollback", "0.1.0-1", "--health-timeout", "1"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains(&format!(
+            "{GW} is not running and the safety state does not allow"
+        )),
+        "{}",
+        out(&o)
+    );
+    assert!(!u.log().contains(&format!("start {GW}")), "{}", u.log());
+    assert!(u.log().contains(&format!("start {AG}")), "{}", u.log());
+    assert_eq!(u.installed(), "0.1.0-1");
+}
+
+/// Review H6: a variant switch (robodr -> robodr-focal, which conflicts
+/// with and replaces robodr). dpkg calls the old variant's real prerm
+/// with `remove in-favour robodr-focal`: it stops nothing (the gateway is
+/// not stopped behind the safety-state gate's back) and records the
+/// switch; the new variant's real `variant_switch` block takes the
+/// upgrade path. A switch is never deferred.
+#[test]
+fn a_variant_switch_stops_nothing_and_is_an_upgrade() {
+    if !available("variant_switch", &[]) {
+        return;
+    }
+    let u = Unit::new("switch", true);
+    u.migrated();
+    let prerm = std::fs::read_to_string(repo().join("packaging/deb/prerm")).unwrap();
+    let pi = upgrade_postinst();
+    let focal_pi = format!(
+        "{pi}{}\necho \"from=$from_version\" >/switch-seen\n\
+         rm -f /var/lib/robodr/.variant-switch\n",
+        block_of("packaging/deb/postinst", "variant_switch")
+    );
+    let std1 = stub_pkg(
+        &u.dir,
+        "robodr",
+        "0.1.0-1",
+        "Conflicts: robodr-focal\nReplaces: robodr-focal\n",
+        &[("postinst", &pi), ("prerm", &prerm)],
+        &[],
+    );
+    let focal1 = stub_pkg(
+        &u.dir,
+        "robodr-focal",
+        "0.1.0-1",
+        "Conflicts: robodr\nReplaces: robodr\n",
+        &[("postinst", &focal_pi), ("prerm", &prerm)],
+        &[],
+    );
+    let b1 = bundle(&u.dir, &std1, "b1");
+    let b2 = bundle(&u.dir, &focal1, "b2");
+    ok(&u.run(&b1, &["install"], true));
+    for s in [GW, EX, AG] {
+        u.active(s);
+    }
+    // Never deferred.
+    u.safety("moving_fast");
+    let o = u.run(
+        &b2,
+        &["install", "--allow-variant-switch", "--defer-restart"],
+        true,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(out(&o).contains("switches the variant"), "{}", out(&o));
+    // Through the open gate: nothing stopped, the switch seen as one.
+    u.safety("idle");
+    u.clear_log();
+    let o = ok(&u.run(
+        &b2,
+        &["install", "--allow-variant-switch", "--health-timeout", "2"],
+        true,
+    ));
+    assert!(o.contains("health OK"), "{o}");
+    assert!(!u.log().contains("stop"), "{}", u.log());
+    assert_eq!(
+        std::fs::read_to_string(u.root.join("switch-seen")).unwrap(),
+        "from=variant-switch\n"
+    );
+    assert!(!u.root.join("var/lib/robodr/.variant-switch").exists());
+    // A plain first install of a variant is still one.
+    let fresh = Unit::new("switch-fresh", true);
+    ok(&fresh.run(&b2, &["install"], true));
+    assert_eq!(
+        std::fs::read_to_string(fresh.root.join("switch-seen")).unwrap(),
+        "from=\n"
+    );
+}
+
+/// Review L11: the gateway migration gate runs in the pre-install script
+/// too. A raw `dpkg -i` that would have to stop the running gateway is
+/// refused before a file is unpacked: the installed release stays
+/// installed and configured (with the postinst gate alone, the new files
+/// were unpacked and left unconfigured, and the gateway failed at the
+/// next boot). With the gate's answer (`ROBODR_GATED_RESTART=allow`) it
+/// installs.
+#[test]
+fn the_migration_gate_refuses_before_anything_is_unpacked() {
+    if !available("preinst_gate", &[]) {
+        return;
+    }
+    let u = Unit::new("preinst", true);
+    let preinst = std::fs::read_to_string(repo().join("packaging/deb/preinst")).unwrap();
+    assert!(preinst.contains(&migration_gate_block()));
+    let pi = upgrade_postinst();
+    let b1 = bundle(
+        &u.dir,
+        &stub_deb(&u.dir, "0.1.0-1", "#!/bin/sh\nexit 0\n"),
+        "b1",
+    );
+    ok(&u.run(&b1, &["install"], true));
+    let deb2 = stub_pkg(
+        &u.dir,
+        "robodr",
+        "0.2.0-1",
+        "",
+        &[("preinst", &preinst), ("postinst", &pi)],
+        &[],
+    );
+    u.active(GW);
+    let dpkg_i = |allow: bool| {
+        let mut c = Command::new("dpkg");
+        c.arg(format!("--root={}", u.root.display()))
+            .arg("-i")
+            .arg(&deb2)
+            .env("PATH", &u.path);
+        if allow {
+            c.env("ROBODR_GATED_RESTART", "allow");
+        } else {
+            c.env_remove("ROBODR_GATED_RESTART");
+        }
+        c.output().unwrap()
+    };
+    let o = dpkg_i(false);
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(
+        out(&o).contains("must stop robodr-firewall-gw"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.1.0-1", "files were unpacked");
+    let st = Command::new("dpkg-query")
+        .arg(format!(
+            "--admindir={}",
+            u.root.join("var/lib/dpkg").display()
+        ))
+        .args(["-W", "-f", "${db:Status-Abbrev}${Version}", "robodr"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&st.stdout).trim(), "ii 0.1.0-1");
+    assert!(!u.log().contains("stop"), "{}", u.log());
+    ok(&dpkg_i(true));
     assert_eq!(u.installed(), "0.2.0-1");
 }

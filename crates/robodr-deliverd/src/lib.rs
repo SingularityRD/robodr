@@ -87,6 +87,7 @@ pub mod rules;
 pub mod runner;
 pub mod safety;
 pub mod sealing;
+pub mod selfpkg;
 pub mod state;
 pub mod store;
 pub mod users;

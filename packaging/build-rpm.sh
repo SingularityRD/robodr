@@ -11,7 +11,7 @@
 # modes as the robodr .deb, all root:root; only the binaries differ (built
 # against another glibc). scripts/check-packages.py compares the two.
 # The .deb's conffiles become %config(noreplace). The scriptlets
-# (packaging/rpm/{post,preun,postun}) are the counterparts of the deb
+# (packaging/rpm/{pre,post,preun,postun}) are the counterparts of the deb
 # maintainer scripts. Only the standard `robodr` package exists as an RPM:
 # robodr-focal is for systemd 245, which no supported RPM distribution has.
 #
@@ -93,7 +93,7 @@ if (cd "$payload" && find . | grep -q '[][*?%{}" \\]'); then
     echo "build-rpm: a payload path contains a character rpm would expand" >&2
     exit 1
 fi
-for s in post preun postun; do
+for s in pre post preun postun; do
     if grep -q '%' "$here/rpm/$s"; then
         echo "build-rpm: packaging/rpm/$s contains '%' (rpm macro expansion)" >&2
         exit 1
@@ -142,9 +142,10 @@ done < <(cd "$payload" && find . | LC_ALL=C sort)
 synopsis="RoboDR - Robot Detection & Response (protective only)"
 spec="$work/top/SPECS/robodr.spec"
 awk -v payload="$payload" -v version="$rpm_version" -v release="$rpm_release" \
-    -v synopsis="$synopsis" -v post="$here/rpm/post" -v preun="$here/rpm/preun" \
+    -v synopsis="$synopsis" -v pre="$here/rpm/pre" -v post="$here/rpm/post" -v preun="$here/rpm/preun" \
     -v postun="$here/rpm/postun" -v files="$files" -v packager="$packager" '
     function slurp(f,   line) { while ((getline line < f) > 0) { if (line !~ /^#!/) print line } close(f) }
+    /^@PRE@$/ { slurp(pre); next }
     /^@POST@$/ { slurp(post); next }
     /^@PREUN@$/ { slurp(preun); next }
     /^@POSTUN@$/ { slurp(postun); next }

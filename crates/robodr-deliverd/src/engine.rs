@@ -1803,6 +1803,13 @@ impl Engine {
             if let Some(why) = self.deb_conflict(&it.name, &it.digest, &pack_dir, &ver, d) {
                 return self.refuse_item(idx, "invalid", why, rep);
             }
+            // 3c. RoboDR's own package: install-bundle.sh's rules
+            // (review H6, M8, M9; crate::selfpkg).
+            if crate::install::ROBODR_PACKAGES.contains(&d.package.as_str()) {
+                if let Some(why) = self.robodr_conflict(&it.name, &m, &ver, d) {
+                    return self.refuse_item(idx, "invalid", why, rep);
+                }
+            }
         }
         // 4. The gate. A window is judged only on a time nobody local can
         // set (review L3): with an untrusted clock and no signed time it
@@ -2067,6 +2074,106 @@ impl Engine {
                     designated.unwrap_or("none configured")
                 ));
             }
+        }
+        None
+    }
+
+    /// Why the staged `.deb` `d` of RoboDR's own package `name` may not be
+    /// installed by the agent, or `None` ([`crate::selfpkg`]: no variant
+    /// switch, no dpkg downgrade, a first delivery adopts the installed
+    /// version as the rollback target, the security floors, the black-box
+    /// format gate).
+    fn robodr_conflict(
+        &self,
+        name: &str,
+        m: &Manifest,
+        ver: &Ver,
+        d: &crate::state::DebInfo,
+    ) -> Option<String> {
+        use crate::selfpkg;
+        let inst = self.installer();
+        let root = inst.dpkg_root();
+        for other in crate::install::ROBODR_PACKAGES
+            .iter()
+            .filter(|p| **p != d.package)
+        {
+            if let Some((st, v)) = inst.deb_state(other).filter(|(st, _)| !selfpkg::absent(st)) {
+                return Some(format!(
+                    "variant switch: dpkg has {other} {v} ({st}) and this RPK is {}: the switch \
+                     removes {other} through its own prerm and is an operator action \
+                     (install-bundle.sh install --allow-variant-switch), never delivered by the \
+                     agent",
+                    d.package
+                ));
+            }
+        }
+        if let Some((st, v)) = inst
+            .deb_state(&d.package)
+            .filter(|(st, _)| !selfpkg::absent(st))
+        {
+            if st != "installed" {
+                return Some(format!(
+                    "dpkg has {} {v} in the state {st}: it is finished by the operator first \
+                     (install-bundle.sh restart-pending, OPERATIONS.md 7)",
+                    d.package
+                ));
+            }
+            match inst.deb_version_lt(&d.version, &v) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Some(format!(
+                        "{} {} is older than the installed {v}: the agent never downgrades \
+                         RoboDR (install-bundle.sh rollback goes back to a kept release)",
+                        d.package, d.version
+                    ))
+                }
+                Err(e) => return Some(e),
+            }
+            // Review M8: without an earlier version of its own the agent
+            // could not roll a failing release back.
+            if !self.state.installed.contains_key(name) && d.version != v {
+                return Some(format!(
+                    "first delivery of {} to this unit: the agent holds no earlier version of it \
+                     to roll back to. Deliver the installed release ({v}) first: the agent then \
+                     keeps it as the rollback target of every later delivery",
+                    d.package
+                ));
+            }
+        }
+        for (what, floor) in selfpkg::floors(&root) {
+            match inst.deb_version_lt(&d.version, &floor) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Some(format!(
+                        "{} {} is below {what} {floor}: releases below it are known to be \
+                         vulnerable; there is no override",
+                        d.package, d.version
+                    ))
+                }
+                Err(e) => return Some(e),
+            }
+        }
+        let formats = match inst.deb_member(m, ver, selfpkg::FORMATS_MEMBER) {
+            Ok(f) => f.map(|b| String::from_utf8_lossy(&b).into_owned()),
+            Err(e) => return Some(e),
+        };
+        let reads = selfpkg::reads_of(formats.as_deref());
+        let segs = match selfpkg::segments(&selfpkg::blackbox_dirs(&root)) {
+            Ok(s) => s,
+            Err(e) => return Some(format!("the black-box format gate: {e}")),
+        };
+        if let Some((f, seg, n)) =
+            selfpkg::unreadable(&reads, &selfpkg::written_formats(&root), &segs)
+        {
+            return Some(format!(
+                "{} {} reads the black-box formats [{}], but {} is {f} ({n} segment(s)): it \
+                 could neither verify nor extend that evidence. Export and archive the chain \
+                 first, or deliver a release that reads {f} (OPERATIONS.md 7)",
+                d.package,
+                d.version,
+                reads.join(", "),
+                seg.display()
+            ));
         }
         None
     }

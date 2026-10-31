@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 pub const MAX_ENTRIES: usize = 200_000;
 /// Longest path (bytes).
 pub const MAX_PATH: usize = 4096;
+/// The largest member [`parse_tar_grab`] reads into memory.
+pub const MAX_GRAB: u64 = 64 * 1024;
 /// Most bytes of dpkg file lists read for [`owners`].
 pub const MAX_LIST_BYTES: u64 = 512 * 1024 * 1024;
 /// Most file lists read for [`owners`].
@@ -195,6 +197,17 @@ pub fn normalise(name: &[u8]) -> Result<Option<String>, String> {
 /// a bad checksum, a truncated archive, an unknown entry type or a link /
 /// directory / device entry with data is an error.
 pub fn parse_tar(r: &mut dyn Read) -> Result<Vec<Entry>, String> {
+    parse_tar_grab(r, None).map(|(e, _)| e)
+}
+
+/// [`parse_tar`], and the content of the regular file `want` (a
+/// normalised member name, at most [`MAX_GRAB`] bytes; a larger one is an
+/// error) when the archive has it.
+pub fn parse_tar_grab(
+    r: &mut dyn Read,
+    want: Option<&str>,
+) -> Result<(Vec<Entry>, Option<Vec<u8>>), String> {
+    let mut grabbed = None;
     let mut out = Vec::new();
     let mut buf = [0u8; 512];
     let mut long_name: Option<Vec<u8>> = None;
@@ -204,7 +217,7 @@ pub fn parse_tar(r: &mut dyn Read) -> Result<Vec<Entry>, String> {
             return Err("tar: no end-of-archive marker".into());
         }
         if buf.iter().all(|b| *b == 0) {
-            return Ok(out);
+            return Ok((out, grabbed));
         }
         let sum = octal(&buf[148..156])?;
         let calc: u64 = buf
@@ -270,12 +283,23 @@ pub fn parse_tar(r: &mut dyn Read) -> Result<Vec<Entry>, String> {
                 ))
             }
         };
+        let path = normalise(&name)?;
         if kind == EntryKind::File {
-            skip(r, size)?;
+            if want.is_some() && path.as_deref() == want {
+                if size > MAX_GRAB {
+                    return Err(format!(
+                        "tar: {} is larger than {MAX_GRAB} bytes",
+                        want.unwrap_or_default()
+                    ));
+                }
+                grabbed = Some(read_data(r, size, MAX_GRAB)?);
+            } else {
+                skip(r, size)?;
+            }
         } else if size != 0 {
             return Err("tar: a link, directory or device entry with data".into());
         }
-        if let Some(path) = normalise(&name)? {
+        if let Some(path) = path {
             if out.len() >= MAX_ENTRIES {
                 return Err(format!("tar: more than {MAX_ENTRIES} entries"));
             }

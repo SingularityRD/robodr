@@ -1005,6 +1005,29 @@ impl Installer<'_> {
         Ok(())
     }
 
+    /// The content of the regular file `path` (relative, e.g.
+    /// `usr/share/robodr/formats`) in the prepared `.deb` of `v`; `None`
+    /// when the package has no such file.
+    pub fn deb_member(&self, m: &Manifest, v: &Ver, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let deb = self.deb_path(m, v)?;
+        let argv = [
+            self.cfg.install.dpkg_deb.to_string_lossy().into_owned(),
+            "--fsys-tarfile".into(),
+            deb.to_string_lossy().into_owned(),
+        ];
+        runner::run_reader(
+            &argv,
+            Duration::from_secs(u64::from(self.cfg.install.dpkg_timeout_s)),
+            |r| {
+                let (_, got) = debfs::parse_tar_grab(r, Some(path))?;
+                std::io::copy(&mut r.take(1024 * 1024), &mut std::io::sink())
+                    .map_err(|e| e.to_string())?;
+                Ok(got)
+            },
+        )
+        .map_err(|e| format!("reading {path} from the .deb: {e}"))
+    }
+
     fn deb_path(&self, m: &Manifest, v: &Ver) -> Result<PathBuf, String> {
         let f = m
             .payload_files()

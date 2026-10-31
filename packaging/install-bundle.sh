@@ -793,6 +793,7 @@ variant_of_name() { # tarball file name
 # other one unless --allow-variant-switch: robodr-focal has no
 # robodr-pulsard, so a switch silently removes a detection layer.
 check_variant() { # package installed-lines
+    switching=0
     others=$(printf '%s\n' "$2" | awk -v p="$1" 'NF && $1 != p { print $1 }')
     [ -n "$others" ] || return 0
     o=$(echo "$others" | head -n1)
@@ -800,6 +801,19 @@ check_variant() { # package installed-lines
         die 1 "REFUSED: $o is installed and this release is $1: installing it REPLACES $o (dpkg removes it; robodr-focal has no robodr-pulsard). Pass --allow-variant-switch if this switch is deliberate."
     fi
     echo "install-bundle: WARNING: switching from $o to $1 (--allow-variant-switch)"
+    switching=1
+}
+
+# A variant switch through the gate (review H6): the removal of the old
+# variant runs ITS prerm, and that of a release before the fix stops every
+# RoboDR unit, the gateway and the executor included, and deletes the
+# executor's nft table. So a switch with running gated units needs the gate
+# open (or --allow-gateway-restart): it is never deferred.
+check_switch_gate() { # what
+    [ "$switching" -eq 1 ] || return 0
+    if [ "$gate" = defer ]; then
+        die 1 "REFUSED: $1 switches the variant, and the old variant's removal may stop$gated_active (its prerm, in releases before the fix) whatever the safety state; that cannot be deferred. Run it when the robot is idle or in its safe state, or with --allow-gateway-restart."
+    fi
 }
 
 # ------------------------------------------------------------- services
@@ -811,6 +825,15 @@ active_units() {
     have_systemd || return 0
     for u in $all_units; do
         if systemctl is-active --quiet "$u" 2>/dev/null; then echo "$u"; fi
+    done
+}
+
+# The RoboDR units in the failed state now (one per line): a rollback
+# brings them back too (restore_units).
+failed_units() {
+    have_systemd || return 0
+    for u in $all_units; do
+        if systemctl is-failed --quiet "$u" 2>/dev/null; then echo "$u"; fi
     done
 }
 
@@ -980,6 +1003,38 @@ restart_pending() { # gate-decision
     rm -f "$pending_file"
 }
 
+# Start again every unit of ACTIVE (what ran before the change) that is
+# not active now (review M7): a unit that failed on the release just
+# replaced, or hit its start limit, is not restarted by the maintainer
+# scripts' try-restart (it only restarts running units), and a variant
+# switch from a release whose prerm stopped every unit leaves them all
+# stopped. reset-failed clears the start limit first. The gateway and the
+# executor only with the gate decided open (or overridden), or while the
+# live safety state allows it now; otherwise they stay down (the bridge
+# fails closed) and the operator is told how to start them.
+restore_units() { # active-units gate-decision
+    have_systemd || return 0
+    for u in $1; do
+        if systemctl is-active --quiet "$u" 2>/dev/null; then continue; fi
+        case " $gated_units " in
+        *" $u "*)
+            case "$2" in
+            open | override) ;;
+            *)
+                if ! gate_open; then
+                    echo "install-bundle: WARNING: $u is not running and the safety state does not allow starting it now ($gate_why): start it when the robot is idle or in its safe state (systemctl reset-failed $u; systemctl start $u)" >&2
+                    continue
+                fi
+                ;;
+            esac
+            ;;
+        esac
+        echo "install-bundle: starting $u again (it ran before and is not active now)"
+        systemctl reset-failed "$u" 2>/dev/null || true
+        systemctl start "$u" || echo "install-bundle: WARNING: starting $u failed" >&2
+    done
+}
+
 # Whether the unit is healthy now: every unit in ACTIVE is active, and
 # agentd's heartbeat is fresh if agentd is among them. Sets $health_why.
 healthy_now() { # active-units
@@ -1092,6 +1147,7 @@ bb_dirs=""
 accept_unreadable=""
 allow_downgrade=0
 allow_variant_switch=0
+switching=0
 allow_gateway_restart=0
 defer_restart=0
 auto_rollback=1
@@ -1224,6 +1280,7 @@ EOF
     before=$(active_units)
     pick_bundle_reader "$pkgfile"
     decide_gate "$before" "installing $ver" "$pkgfile"
+    check_switch_gate "installing $ver"
     ring_note "$ver"
     floor_from_ring
     if [ -f "$bundle/security-floor" ]; then
@@ -1238,6 +1295,7 @@ EOF
     recheck_pre_gate "installing $ver" "$pkgfile"
     pkg_install_gated "$pkgfile"
     restart_pending "$gate" || true
+    if [ "$switching" -eq 1 ]; then restore_units "$before" "$gate"; fi
     if ! health_check "$before"; then
         if [ "$auto_rollback" -ne 1 ]; then
             die 1 "$new_pkg $ver is installed but the unit is not healthy (--no-auto-rollback): check the units, then '$0 rollback <version>'"
@@ -1281,6 +1339,7 @@ EOF
         esac
         pkg_install_gated "$pkgfile"
         restart_pending "$gate" || true
+        restore_units "$before" "$gate"
         if health_check "$before"; then
             echo "install-bundle: rolled back to $prev_ver; it is healthy" >&2
         else
@@ -1391,7 +1450,11 @@ rollback)
     precheck_floor "$version_arg"
     # The safety-state gate, before anything on the unit changes.
     before=$(active_units)
+    # What failed on the release rolled back from comes back too (review
+    # M7), and is then part of the health check.
+    restore=$(printf '%s\n%s\n' "$before" "$(failed_units)" | sed '/^$/d')
     decide_gate "$before" "rolling back to $version_arg" "$pkgfile"
+    check_switch_gate "rolling back to $version_arg"
     floor_from_ring
     check_floor "$version_arg"
     fmt=$(mktemp)
@@ -1402,7 +1465,8 @@ rollback)
     recheck_pre_gate "rolling back to $version_arg" "$pkgfile"
     pkg_install_gated "$pkgfile"
     restart_pending "$gate" || true
-    health_check "$before" || die 1 "rolled back to $version_arg, but the unit is not healthy: check the units"
+    restore_units "$restore" "$gate"
+    health_check "$restore" || die 1 "rolled back to $version_arg, but the unit is not healthy: check the units"
     ;;
 *)
     die 2 "unknown command $cmd (verify|install|list|rollback|restart-pending|prune|ring)"
