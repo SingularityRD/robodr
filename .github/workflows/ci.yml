@@ -141,6 +141,8 @@ jobs:
         run: sh scripts/test-btf-check.sh
       - name: systemd lifecycle state checks (sealed segments hashed in full)
         run: bash scripts/test-lifecycle-state.sh
+      - name: nightly red team assertions (tools/e2e/nightly_redteam_checks.py)
+        run: python3 tools/e2e/test_nightly_redteam_checks.py
       - name: Validate Pulsar rules (rules/) against vendor/pulsar
         # One rule that fails to load disables Pulsar's whole rules-engine.
         run: python3 scripts/validate_rules.py --pulsar-src vendor/pulsar --strict

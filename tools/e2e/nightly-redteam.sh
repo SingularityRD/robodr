@@ -21,7 +21,8 @@
 #                 GUIDs (REDTEAM.md F1 amplification), RSS bounded;
 #   R3 malformed  agentd alive, RSS bounded;
 #   R4 safety     robot.safety_state.untrusted_source raised; the safety
-#                 state never taken from the spoof (not "idle"); the
+#                 state never taken from the spoof (status.json reads
+#                 "unknown" once the feed is stale, not "idle"); the
 #                 unprivileged write to the PLC socket refused;
 #   end           agentd exits 0 on SIGTERM, black box RESULT: INTACT.
 # OUT_DIR gets commission.log, agentd.log, steps.jsonl, verify.txt and
@@ -108,53 +109,5 @@ pid=""
 verify_rc=0
 "$B/robodr-blackbox" verify "$rt/blackbox" --keyring "$rt/blackbox.key.pub" >"$out/verify.txt" 2>&1 || verify_rc=$?
 
-python3 - "$out" "$rc" "$verify_rc" "${ROBODR_RSS_LIMIT_KIB:-65536}" <<'PY'
-import json, sys
-out, agentd_rc, verify_rc, rss_limit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-steps = {}
-for line in open(f"{out}/steps.jsonl"):
-    line = line.strip()
-    if line.startswith("{"):
-        s = json.loads(line)
-        steps[s["step"]] = s
-checks = []
-def check(name, ok, detail):
-    checks.append({"check": name, "pass": bool(ok), "detail": detail})
-def found(step, uid):
-    return steps.get(step, {}).get("new_findings", {}).get(uid, 0)
-for st in ("rogue", "spray", "malformed", "safety"):
-    check(f"{st}: step ran", st in steps, list(steps))
-    s = steps.get(st, {})
-    check(f"{st}: agentd alive", s.get("agentd_alive"), s.get("agentd_alive"))
-    rss = s.get("rss_kib_after") or 0
-    check(f"{st}: RSS under {rss_limit} KiB", 0 < rss < rss_limit, rss)
-check("R1 rogue: unknown_participant", found("rogue", "robot.ros2.unknown_participant") > 0,
-      steps.get("rogue", {}).get("new_findings"))
-check("R1 rogue: unauthorized_motion_writer",
-      found("rogue", "robot.ros2.unauthorized_motion_writer") > 0, steps.get("rogue", {}).get("new_findings"))
-spray = steps.get("spray", {}).get("new_findings", {})
-check("R2 spray: detected (discovery_flood or unknown_participant)",
-      found("spray", "robot.ros2.discovery_flood") + found("spray", "robot.ros2.unknown_participant") > 0, spray)
-# REDTEAM.md F1: 3000 sprayed GUIDs once made about 5000 findings; they are
-# aggregated now. A tenth of the packets is the regression bound.
-check("R2 spray: no finding amplification (< 300 findings for 3000 GUIDs)",
-      sum(spray.values()) < 300, sum(spray.values()))
-check("R4 safety: untrusted_source", found("safety", "robot.safety_state.untrusted_source") > 0,
-      steps.get("safety", {}).get("new_findings"))
-check("R4 safety: state not taken from the spoof",
-      steps.get("safety", {}).get("safety_state") not in ("idle",), steps.get("safety", {}).get("safety_state"))
-unpriv = steps.get("safety", {}).get("info", {}).get("unprivileged_socket", "")
-check("R4 safety: unprivileged PLC socket write refused", "Permission" in unpriv or "denied" in unpriv, unpriv)
-check("agentd exit 0 on SIGTERM", agentd_rc == 0, agentd_rc)
-verify = open(f"{out}/verify.txt").read()
-check("black box INTACT", verify_rc == 0 and "RESULT: INTACT" in verify, verify.strip().splitlines()[-1:] )
-json.dump({"checks": checks, "steps": steps}, open(f"{out}/results.json", "w"), indent=1)
-bad = [c for c in checks if not c["pass"]]
-for c in checks:
-    print(f"nightly-redteam: {'PASS' if c['pass'] else 'FAIL'} {c['check']}: {c['detail']}")
-if bad:
-    for c in bad:
-        print(f"::error::nightly red team: {c['check']}: {c['detail']}")
-    sys.exit(1)
-print(f"nightly-redteam: all {len(checks)} checks passed")
-PY
+# The assertions (tested by tools/e2e/test_nightly_redteam_checks.py).
+python3 "$H/nightly_redteam_checks.py" "$out" "$rc" "$verify_rc" "${ROBODR_RSS_LIMIT_KIB:-65536}"
