@@ -113,6 +113,18 @@ fn main() -> ExitCode {
                 robodr_ros2_pipeline::sanitize(w)
             );
         }
+        for k in &resolved.key_protection.keys {
+            eprintln!(
+                "robodr-agentd: key {}: {}{}",
+                k.role,
+                k.protection,
+                if k.fallback {
+                    " (not TPM-sealed: file fallback, flagged in status.json)"
+                } else {
+                    ""
+                }
+            );
+        }
         eprintln!("robodr-agentd: configuration OK");
         return ExitCode::SUCCESS;
     }

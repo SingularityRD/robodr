@@ -116,6 +116,9 @@ pub mod gateway_feed;
 pub mod health;
 pub mod host;
 pub mod input;
+/// How the private keys are protected at rest (T66; `status.json`
+/// `key_protection`).
+pub mod key_protection;
 pub mod notify;
 pub mod profile_chain;
 pub mod safety;

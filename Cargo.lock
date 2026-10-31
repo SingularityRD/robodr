@@ -2688,6 +2688,7 @@ dependencies = [
  "robodr-responder",
  "robodr-ros2-pipeline",
  "robodr-rtps",
+ "robodr-signer",
  "rustls",
  "rustls-webpki",
  "serde",
