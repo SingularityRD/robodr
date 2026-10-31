@@ -20,12 +20,17 @@ checklist of UNITREE.md 3.1 as far as an image can.
 packaging/sensor-box/image/build-image.sh \
     --bundle robodr-$V-amd64-offline.tar.gz \
     --pubkey /etc/robodr-trust/robodr-release.pub \
+    --expect-version $V \
     --out dist/sensor-box
 ```
 
 `build-image.sh` checks the bundle's minisign signature against the
 release key you hold (out of band, never from the download; a key next to
-the bundle is refused) **before** extracting anything, then the bundle's
+the bundle is refused) **before** extracting anything, and the signature's
+signed trusted comment: it must name the bundle's file name (a correctly
+signed older bundle renamed to look like a newer one is refused) and, with
+`--expect-version`, be exactly `robodr $V <file>` as `release.yml` signs it
+(an older release is not built by mistake). Then it checks the bundle's
 `SHA256SUMS`, takes its one `robodr_*.deb`, and runs mkosi with it. The
 recipe's post-install script checks the package digest again before
 installing it. There is no switch to build from an unsigned bundle.

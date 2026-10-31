@@ -1145,8 +1145,8 @@ def self_test() -> int:
     rootconf = real_img["mkosi.repart/10-root.conf"].replace(b"ReadOnly=yes", b"")
     expect("writable root", check_image_recipe_texts({**real_img, "mkosi.repart/10-root.conf": rootconf}), False)
     bi = real_img["build-image.sh"].decode()
-    moved = bi.replace("minisign -Vq -p", "true -p").replace(
-        "(cd \"$top\" && sha256sum", "minisign -Vq -p \"$pubkey\" -m \"$bundle\"\n(cd \"$top\" && sha256sum")
+    moved = bi.replace("minisign -VQ -p", "true -p").replace(
+        "(cd \"$top\" && sha256sum", "minisign -VQ -p \"$pubkey\" -m \"$bundle\"\n(cd \"$top\" && sha256sum")
     expect("extract before verify", check_image_recipe_texts({**real_img, "build-image.sh": moved.encode()}), False)
     bypass = bi + "\n[ -n \"${ROBODR_ALLOW_UNSIGNED:-}\" ] && exit 0\n"
     expect("unsigned switch", check_image_recipe_texts({**real_img, "build-image.sh": bypass.encode()}), False)
