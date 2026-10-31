@@ -813,11 +813,12 @@ box, and exported on every path (Kafka, HTTPS uplink, diode) unchanged.
   is treated as 0, the start-up log says so and `status.json` shows
   `health_record_ms` 0), because it would be a Low finding every period
   titled as a deviation that reports none. A cap above this build's minor
-  is refused at load. Only findings agentd
-  builds are capped: `robodr-deliverd` always labels its `robot.deliver.*`
-  and `robot.seal.*` findings with this build's version (their entries are
-  2.2 / 2.3 ones, which an older 2.x validator from 2.3 on applies
-  unchanged).
+  is refused at load. `robodr-deliverd` has the same setting
+  (`findings.max_contract_minor` in its configuration, same bounds);
+  give it the same value as agentd's, since both write into the same
+  spool. Its `robot.deliver.*` and `robot.seal.*` entries are 2.2 / 2.3
+  ones, so a cap below 2 (or below 3 for `robot.seal.*`) sends them
+  under the generic entry.
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
