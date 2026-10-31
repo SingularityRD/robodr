@@ -183,7 +183,7 @@ morphology, safety system not engaged, state known).
 | `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel`; **latched** (below) | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
 | | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch, **only** on the SOC's two-person signed revert with the safety state re-checked (never at TTL, restart or emergency disable) |
 | | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode; **latched** (below) | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
-| `request_safe_state` | `px4` (hold, or RTL when the policy's `safe_state` is `return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
+| `request_safe_state` | `px4` (hold, or RTL when the policy sets `safe_state: return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
 | `rollback_config` | `rollback` (`config: program`) | the site's OEM-validated program, `--verify` afterwards | not reversible: `applied`; `config: profile` is refused (`not_executor_action`: the profile's anti-rollback chain) |
 
 `SpeedLevel` is a firmware speed range, not a cap: on its own anyone on

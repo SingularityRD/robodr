@@ -95,6 +95,10 @@ rpm)
     ;;
 focal)
     SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+    # As release.yml's robodr-focal job: robodr-focal does not ship
+    # robodr-pulsard, so its SBOM is not in the bundle (the rebuild
+    # comparison fails on a member present in one bundle only).
+    rm -f dist/sbom/*robodr-pulsard*.cdx.json
     deb="$(packaging/build-deb.sh --variant focal --bin-dir "$stage" --arch "$arch" --out "$out")"
     packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out "$out" >/dev/null
     (cd "$out" && sha256sum robodr-focal*) >"$out/PACKAGES-$kind-$arch.sha256"
