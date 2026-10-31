@@ -60,9 +60,37 @@ Restart=on-failure
 RestartSec=5s
 # Probes are detached on SIGTERM; give the daemon time to do it cleanly.
 TimeoutStopSec=30s
+
+# --- Resources ---------------------------------------------------------------
 # Detection should survive memory pressure longer than ordinary services,
-# but never outlive the robot's own control stack (do not use -1000).
+# but never outlive the robot's own control stack (do not use -1000). A
+# negative OOMScoreAdjust is only safe with a hard cap: without MemoryMax= a
+# runaway daemon (event storm, leak, a probe flooding its perf buffers) would
+# push the kernel's OOM killer onto the motion stack instead (sales-readiness
+# T76). With the caps below it hits its own cgroup limit first: only
+# robodr-pulsard is killed, Restart=on-failure brings it back, and the gap
+# is visible (journal, missing heartbeats).
+#   * MemoryMax= is the whole cgroup, including the BPF maps and perf ring
+#     buffers Pulsar locks (LimitMEMLOCK=infinity: kernels >= 5.11 charge
+#     them to the memory cgroup, not to RLIMIT_MEMLOCK). MemoryHigh=
+#     throttles (reclaim) before the hard cap; MemorySwapMax=0 keeps the
+#     detector out of swap (a swapped probe consumer drops events).
+#   * CPUQuota= bounds the user-space side (event decoding, rules, the
+#     ROS 2 sensor) to one CPU on a multi-core companion computer, so an
+#     event storm costs detection latency and dropped events (reported by
+#     Pulsar), never the control stack's CPU time. The eBPF programs run in
+#     the kernel and are not charged to the quota.
+#   * TasksMax= bounds threads (tokio workers, one per module).
+# PROVISIONAL: the values are estimates from a development VM, not measured
+# on the target (sales-readiness B6). Size them from the commissioning run
+# (systemctl show -p MemoryPeak,CPUUsageNSec robodr-pulsard) and override
+# with a drop-in, never by deleting the caps.
 OOMScoreAdjust=-500
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+CPUQuota=100%
+TasksMax=128
 
 # --- Identity and capabilities ---------------------------------------------
 # User=root (implicit; Pulsar asserts euid 0). Bounding set = everything the

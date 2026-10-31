@@ -1,0 +1,16 @@
+# RoboDR sensor box image: first-boot key generation and configuration
+# (robodr-setup init), then start what is commissioned (every boot).
+[Unit]
+Description=RoboDR sensor box: first-boot keys and start of commissioned units
+Documentation=file:/usr/share/doc/robodr/sensor-box-image/README.md man:robodr-setup(8)
+After=robodr-image-early.service network-online.target time-sync.target systemd-tmpfiles-setup.service systemd-sysusers.service
+Requires=robodr-image-early.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/robodr-image/robodr-image-late
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

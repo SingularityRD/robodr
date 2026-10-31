@@ -1,0 +1,115 @@
+# Example Prometheus alerting rules for RoboDR (robodr-metrics, textfile
+# collector of node_exporter). Installed as
+# /usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml.
+#
+# Copy into your Prometheus rule_files and adjust thresholds and labels
+# (`severity`, routing) to your site. Every metric named here is produced
+# by robodr-metrics from a real robodr-agentd status.json; the test
+# crates/robodr-ops/tests/metrics.rs fails if a rule names one that the
+# exporter does not write.
+#
+# The `instance` label is node_exporter's (one per robot / sensor box).
+groups:
+  - name: robodr
+    rules:
+      # The exporter itself stopped (timer disabled, unit failing): every
+      # other RoboDR alert below would go silent with it.
+      - alert: RoboDRMetricsStale
+        expr: time() - robodr_metrics_last_run_timestamp_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "robodr-metrics has not refreshed {{ $labels.instance }} for over 2 minutes"
+          description: "Check robodr-metrics.timer / robodr-metrics.service (journalctl -u robodr-metrics)."
+
+      # robodr-agentd's status.json is missing or unparseable.
+      - alert: RoboDRAgentStatusUnreadable
+        expr: robodr_agentd_status_readable == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "robodr-agentd status unreadable on {{ $labels.instance }}"
+          description: "The agent is not installed, not started, or its spool is not readable by robodr-metrics."
+
+      # The agent is not running, hung (status not rewritten within its
+      # stale_after_ms), or from a previous boot: the robot is unmonitored.
+      - alert: RoboDRAgentNotFresh
+        expr: robodr_agentd_status_readable == 1 and robodr_agentd_fresh == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "robodr-agentd on {{ $labels.instance }} is stopped or hung"
+          description: "status.json is stale; systemctl status robodr-agentd, journalctl -u robodr-agentd."
+
+      # Blind: an input is silent or ended, no data yet, or the pipeline lags.
+      - alert: RoboDRAgentBlind
+        expr: robodr_agentd_state{state="unknown"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RoboDR monitoring state UNKNOWN on {{ $labels.instance }}"
+          description: "The agent is (partly) blind; the reasons are in status.json (robodr-support-bundle collects it)."
+
+      # Degraded: drops, observe-only profile, spool or black-box trouble.
+      - alert: RoboDRAgentDegraded
+        expr: robodr_agentd_state{state="degraded"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RoboDR monitoring DEGRADED on {{ $labels.instance }}"
+
+      - alert: RoboDREvidenceDegraded
+        expr: robodr_agentd_evidence_degraded == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RoboDR evidence recording degraded on {{ $labels.instance }}"
+          description: "The black box is not recording normally; findings may lack signed evidence."
+
+      # Findings dropped because the spool is full of unacknowledged records
+      # (no exporter running, or the SOC not acknowledging).
+      - alert: RoboDRSpoolDropping
+        expr: increase(robodr_agentd_spool_dropped_full[15m]) > 0 or increase(robodr_agentd_spool_write_errors[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "RoboDR is dropping findings on {{ $labels.instance }} (spool full or write errors)"
+
+      - alert: RoboDRInputQueueNearFull
+        expr: robodr_agentd_queue_bytes / robodr_agentd_queue_bytes_max > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "robodr-agentd input queue above 80% on {{ $labels.instance }}"
+
+      - alert: RoboDRBlackBoxAnchorFailures
+        expr: increase(robodr_agentd_blackbox_anchor_failures[30m]) > 0 or increase(robodr_agentd_blackbox_mark_failures[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Black-box head anchoring failing on {{ $labels.instance }}"
+
+      # Uplink (connected sites): blocked = refused until something is fixed.
+      - alert: RoboDRUplinkBlocked
+        expr: robodr_uplink_state{state="blocked"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "robodr-uplink blocked on {{ $labels.instance }}"
+          description: "The SOC refuses the batches (key not registered, contract mismatch, TLS). See uplink-status.json last_error."
+
+      - alert: RoboDRUplinkNoDelivery
+        expr: robodr_uplink_last_delivery_age_seconds > 3600 and robodr_uplink_backlog_spool_ready > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No batch acknowledged by the SOC for an hour while findings wait on {{ $labels.instance }}"

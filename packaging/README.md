@@ -13,6 +13,7 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-agentd.service.d/40-sensor-box.conf.example` | `/usr/share/doc/robodr/examples/` | **sensor box only**: passive tap / port-mirror mode of `robodr-agentd` (`CAP_NET_RAW` only, all IP denied, waits for the writable data mount; [`docs/UNITREE.md`](../docs/UNITREE.md)) |
 | `sensor-box/10-robodr-capture.network.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: systemd-networkd file for the capture NIC (no address, no ARP, no IPv6 link-local, promiscuous) |
 | `sensor-box/nftables.conf.example` | `/usr/share/doc/robodr/examples/sensor-box/` | **sensor box only**: host firewall (capture NIC silent, uplink to the Kafka broker set, NTP and admin SSH only, no forwarding) |
+| `sensor-box/image/` | (build time) | **sensor box image recipe** (mkosi, Ubuntu 24.04): `build-image.sh` verifies a signed offline bundle (minisign, then `SHA256SUMS`) and builds a disk image with a read-only root, writable `/var`, `/etc/robodr` as an overlay on `/var`, a strict default host firewall, and keys generated on the box at first boot (`robodr-setup init`); see its [README](sensor-box/image/README.md). Not yet built and booted on reference hardware (B7) |
 | `systemd/robodr-spool-export.service` | `/usr/lib/systemd/system/` | robot-side findings exporter for **diode sites**: agentd spool -> signed batches in `/var/lib/robodr/export/diode`; `User=robodr-spool` (its own user, group `robodr`), `PrivateNetwork=yes`, key via `LoadCredential=` (`/etc/robodr/keys/diode.key`), settings in `/etc/robodr/spool-export.env` (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service` | `/usr/lib/systemd/system/` | findings publisher for **connected sites**, running on the unit or sensor box: agentd spool -> Kafka; `User=robodr-kafka`, `IPAddressDeny=any` plus the broker drop-in, settings in `/etc/robodr/kafka-publish.env`. Conflicts with the exporter above (only if the binary is built) |
 | `systemd/robodr-kafka-publish.service.d/50-brokers.conf.example` | `/usr/share/doc/robodr/examples/` | `IPAddressAllow=` for **every** Kafka broker (the publisher connects to each partition leader, not only to the bootstrap broker) |
@@ -26,6 +27,11 @@ operator installs on a robot. The procedures that use it are in
 | `systemd/robodr-pulsard.service.d/10-cap-sys-admin.conf.example` | `/usr/share/doc/robodr/examples/` | opt-in for kernels < 5.8 |
 | `btf/robodr-btf-check` | `/usr/lib/robodr/` of **`robodr`** (with `robodr-pulsard`) | `ExecStartPre=` of `robodr-pulsard.service`: on a kernel without BTF, reads `[pulsar] btf_path` from `pulsar.toml`, refuses any path but `/etc/robodr/btf/vmlinux`, and refuses to start when that file was not generated for the running kernel or was replaced (stamp `vmlinux.kernel` = `uname -r`, `uname -v`, SHA-256 of the file); no-op while `btf_path` is unset (tests: `scripts/test-btf-check.sh`) ([`docs/UNITREE.md`](../docs/UNITREE.md) 3.2.1) |
 | `systemd/robodr-pulsard.service.d/30-host-threats.conf.example` | `/usr/share/doc/robodr/examples/` | optional drop-in: `SupplementaryGroups=robodr-agentd` so `robodr-threat-forward` can reach agentd's `0660` host-threat socket (OPERATIONS 6.4) |
+| `metrics/robodr-metrics.service.example`, `metrics/robodr-metrics.timer.example` | `/usr/share/doc/robodr/examples/metrics/` | optional: refresh `/run/robodr-metrics/robodr.prom` every 15 s with `robodr-metrics` for node_exporter's textfile collector (no listening port; root with `CAP_DAC_READ_SEARCH` only, `PrivateNetwork=yes`, key and evidence trees hidden); `man robodr-metrics` |
+| `metrics/robodr-alerts.example.yml` | `/usr/share/doc/robodr/examples/metrics/` | example Prometheus alert rules (exporter stale, agent unreadable / stale / blind / degraded, evidence degraded, spool dropping, queue near full, anchor failures, uplink blocked / not delivering); `crates/robodr-ops/tests/metrics.rs` fails if a rule names a metric the exporter does not write |
+| `modules-load.d/robodr.conf.example` | `/usr/share/doc/robodr/examples/modules-load.d/` | kernel modules of the enforcing units (`nf_tables` for `robodr-executor`; the gateway's, commented out) for `/etc/modules-load.d/` |
+| `demo/README.md` (+ `fixtures/captures/ros2-jazzy/fastrtps_{baseline,rogue_cmd_vel}.pcap`) | `/usr/share/doc/robodr/demo/` (with `SHA256SUMS`) | demo without a robot: learn a profile from the clean run, replay the rogue `/cmd_vel` run with `robodr-ros2-watch` |
+| `../docs/customer/*.md` except `*-draft.md` | `/usr/share/doc/robodr/customer/` | the customer documents (quick start, known limitations, support matrix, security white paper, PSIRT process); drafts are never shipped (`scripts/check-packages.py`) |
 | `tmpfiles.d/robodr.conf` | `/usr/lib/tmpfiles.d/` | directories, modes, owners |
 | `sysusers.d/robodr.conf` | `/usr/lib/sysusers.d/` | the `robodr` system user |
 | `etc/pulsar.base.toml` | header of `/etc/robodr/pulsar.toml` | daemon config (conffile) |
@@ -56,6 +62,8 @@ The units, tmpfiles and sysusers fragments were checked with
 | `robodr-commission` | **not a service**: run by an operator, as needed | commissioning is a deliberate, human-reviewed act (learn, sign off, lock). A timer or unit that re-learns a profile automatically would let an attacker who is present during learning become "normal". |
 | `robodr-replay`, `robodr-ros2-watch` | operator tools | offline analysis and lab replay |
 | `robodr-enroll` | **not a service**: root-only operator tool (`/usr/sbin`) | enrollment, key rotation, revocation lists, SOC profiles and ring information (OPERATIONS 8.6); every step is a deliberate operator act, nothing is applied by the SOC on its own |
+| `robodr-setup`, `robodr-support-bundle` | **not services**: root-only operator tools (`/usr/sbin`) | first-boot preflight, keys, role configuration and key fingerprints; a redacted diagnostics bundle for support (never keys, credentials or evidence). Deliberate operator acts; neither overwrites anything |
+| `robodr-metrics` | operator tool (`/usr/bin`), optionally run by the example timer `robodr-metrics.timer` (not installed as a unit) | renders the status files as a Prometheus textfile; opens no port |
 | `robodr-deliverd` | systemd service on the **unit**, root with a bounded capability set, no network | installs delivered RPKs (dpkg, `/opt` / `/etc` install roots, dropping to probe users); runs only after commissioning and `init-anchor` (OPERATIONS 11) |
 | `robodr-seal` | **not a service**: root-only operator tool (`/usr/sbin`) | the unit's TPM (provisioning, refused without an owner and lockout authorization), enrolment, signed PCR policies, the sealed runtime volume, crypto-erase (OPERATIONS 12). `robodr-deliverd.service` reaches the TPM through `DeviceAllow=/dev/tpmrm0 rw` under `DevicePolicy=closed` (not `PrivateDevices=yes`, which would hide it); TPM session files go to `/run/robodr-seal` (tmpfs) |
 | `robodr-depot` | systemd service on the **depot box** (never a robot), user `robodr-depot` (member of `robodr` for the spool), no capabilities, `ProtectSystem=strict`, TCP only; its other commands are operator tools run as the same user | the site depot (Sprint 14a, OPERATIONS 13): `serve` gives each enrolled unit its own pack over mutual TLS and takes its reports; imports, enrolments, approvals, rollouts and media packs are deliberate operator acts. The database anchor uses the box's TPM (`DeviceAllow=/dev/tpmrm0 rw`, group `tss` through the drop-in `50-tpm-anchor.conf.example`). `robodr-deliverd.service` needs the drop-in `50-depot-lan.conf.example` for LAN pulls (TCP to the depot only) and the erase trigger socket |
@@ -119,6 +127,20 @@ stalled loop (slow fsync, hang) is killed and restarted. `robodr-pulsard` stays
 with `WatchdogSec=` set, systemd would kill a healthy daemon. For it,
 `Restart=on-failure` with a start limit (5 starts in 300 s) covers crashes.
 Neither watchdog has been exercised under a real systemd yet.
+
+Every long-running unit caps its own cgroup with `MemoryMax=` (and most with
+`MemoryHigh=`), so a runaway RoboDR daemon is killed inside its own limit and
+restarted, instead of pushing the kernel's OOM killer onto the robot's motion
+stack. `robodr-pulsard` keeps `OOMScoreAdjust=-500` (detection outlives
+ordinary services) but is now bounded: `MemoryHigh=384M`, `MemoryMax=512M`
+(BPF maps and perf buffers are charged to this cgroup on kernels >= 5.11),
+`MemorySwapMax=0`, `CPUQuota=100%` (one CPU for the user-space side; the eBPF
+programs run in the kernel) and `TasksMax=128`. These values are provisional,
+estimated on a development VM; size them on the target from the commissioning
+run (`systemctl show -p MemoryPeak,CPUUsageNSec robodr-pulsard`) and override
+them with a drop-in, never by removing them. `scripts/check-packages.py`
+(check 11) fails a long-running unit without `MemoryMax=` and
+`robodr-pulsard.service` without `CPUQuota=`.
 
 ## Filesystem layout
 
@@ -282,8 +304,10 @@ packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-lin
 packaging/make-bundle.sh --deb dist/robodr-focal_*_arm64.deb --sbom-dir dist/sbom --out dist
 ```
 
-`build-deb.sh` requires `robodr-commission`, `robodr-replay` and
-`robodr-ros2-watch`. It adds every other packaged program if it was built
+`build-deb.sh` requires `robodr-commission`, `robodr-replay`,
+`robodr-ros2-watch` and the operator tools `robodr-setup`,
+`robodr-support-bundle` and `robodr-metrics` (pure, built by every
+workspace build). It adds every other packaged program if it was built
 (`robodr-pulsard`, `robodr-agentd`, `robodr-blackbox`, `robodr-diode-pack`,
 `robodr-diode-unpack`, `robodr-spool-export`, `robodr-kafka-publish`,
 `robodr-uplink`, `robodr-enroll`, `robodr-executor`, `robodr-firewall-gw`,

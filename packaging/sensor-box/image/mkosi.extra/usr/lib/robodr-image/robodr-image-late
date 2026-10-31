@@ -1,0 +1,80 @@
+#!/bin/sh
+# robodr-image-late: every boot, after the network and time services
+# (robodr-image-late.service).
+#
+#  1. First boot (no /var/lib/robodr-image/firstboot.done): generates the
+#     unit's keys ON THE BOX and writes its agentd.json with
+#     `robodr-setup init` (host preflight first: a FAIL stops it and nothing
+#     is written; the unit fails visibly and runs again at the next boot).
+#     The key fingerprints go to the console and the journal, for
+#     registration with the SOC. No key is ever in the image.
+#  2. Starts what is commissioned: robodr-agentd once /etc/robodr/profile.json
+#     and agentd.json exist (installed by the commissioning procedure,
+#     OPERATIONS.md section 5), and the exporter named by ROBODR_EXPORTER
+#     once its settings file exists. Units are started for this boot only
+#     (the root, and with it /etc/systemd/system, is read-only).
+set -eu
+. "${ROBODR_IMAGE_ROOT:-}/usr/lib/robodr-image/common.sh"
+
+marker="$STATE/firstboot.done"
+if [ ! -e "$marker" ]; then
+    unit="$(get ROBODR_UNIT_ID)"
+    capture="$(get ROBODR_CAPTURE_IF)"
+    site="$(get ROBODR_SITE)"
+    role="$(get ROBODR_ROLE)"
+    role="${role:-unitree-sensor-box}"
+    valid unit_id "$unit" || die "first boot: ROBODR_UNIT_ID missing or invalid in /etc/robodr/provision.env (README.md, Provisioning); no keys generated"
+    valid iface "$capture" || die "first boot: ROBODR_CAPTURE_IF missing or invalid in /etc/robodr/provision.env; no keys generated"
+    valid role "$role" || die "first boot: ROBODR_ROLE $role is not robot or unitree-sensor-box"
+    set -- init --role "$role" --unit-id "$unit" --interface "$capture" --json
+    if [ -n "$site" ]; then
+        valid site "$site" || die "first boot: ROBODR_SITE is invalid"
+        set -- "$@" --site "$site"
+    fi
+    if [ -n "$R" ]; then
+        set -- "$@" --root "$R"
+    fi
+    out="$STATE/setup.json"
+    if ! robodr-setup "$@" >"$out.tmp"; then
+        cat "$out.tmp" >&2 || true
+        rm -f "$out.tmp"
+        die "first boot: robodr-setup init failed (see above); fix the FAIL checks, it runs again at the next boot"
+    fi
+    chmod 0600 "$out.tmp"
+    mv "$out.tmp" "$out"
+    fp="$(robodr-setup fingerprints ${R:+--root "$R"})"
+    printf '%s\n' "$fp" >"$STATE/fingerprints.txt"
+    log "first boot done: keys generated on this box; register these with the SOC:"
+    printf '%s\n' "$fp" >&2
+    if [ -z "$R" ] && [ -w /dev/console ]; then
+        printf '\nRoboDR sensor box %s: key fingerprints\n%s\n\n' "$unit" "$fp" >/dev/console || true
+    fi
+    # The keys live on /var (through the /etc/robodr overlay): say so when
+    # it is not encrypted.
+    src="$(findmnt -n -o SOURCE --target "$R/var" 2>/dev/null || true)"
+    case "$src" in
+    /dev/mapper/* | /dev/dm-*) ;;
+    *) log "WARNING: /var ($src) is not on dm-crypt: the keys are not encrypted at rest (README.md, Encryption)" ;;
+    esac
+    : >"$marker"
+fi
+
+# 2. Start what is commissioned (this boot only).
+if [ -f "$R/etc/robodr/agentd.json" ] && [ -f "$R/etc/robodr/profile.json" ]; then
+    systemctl start --no-block robodr-agentd.service
+else
+    log "robodr-agentd not started: not commissioned yet (no /etc/robodr/profile.json)"
+fi
+exporter="$(get ROBODR_EXPORTER)"
+case "${exporter:-none}" in
+none) ;;
+uplink | kafka-publish | spool-export)
+    if [ -f "$R/etc/robodr/$exporter.env" ]; then
+        systemctl start --no-block "robodr-$exporter.service"
+    else
+        log "robodr-$exporter not started: /etc/robodr/$exporter.env missing"
+    fi
+    ;;
+*) log "ROBODR_EXPORTER=$exporter is invalid; no exporter started" ;;
+esac
+exit 0

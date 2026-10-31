@@ -2908,6 +2908,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-ops"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-agentd",
+ "robodr-blackbox",
+ "robodr-commission",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "robodr-pkg"
 version = "0.1.0-alpha.1"
 dependencies = [

@@ -1,0 +1,51 @@
+#!/bin/sh
+# mkosi post-installation script, run inside the image being built.
+# Installs the RoboDR .deb that build-image.sh verified (signature and
+# SHA256SUMS of the offline bundle) and passed in as the extra tree
+# /var/cache/robodr-image/, and configures the sensor box role.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+pkgdir=/var/cache/robodr-image
+set -- "$pkgdir"/robodr_*.deb
+[ "$#" -eq 1 ] && [ -f "$1" ] || { echo "postinst: expected exactly one robodr_*.deb in $pkgdir (run build-image.sh)" >&2; exit 1; }
+# The digest build-image.sh recorded after verifying the bundle: the file
+# installed is the file verified.
+(cd "$pkgdir" && sha256sum -c --quiet robodr.deb.sha256)
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y --no-install-recommends "$1"
+rm -rf "$pkgdir"
+
+# Sensor box role: passive agent drop-in active (CAP_NET_RAW only, no IP).
+ex=/usr/share/doc/robodr/examples
+install -D -m 0644 "$ex/robodr-agentd.service.d/40-sensor-box.conf.example" \
+    /usr/lib/systemd/system/robodr-agentd.service.d/40-sensor-box.conf
+
+# Host firewall from the writable /etc/robodr (strict default installed at
+# first boot by robodr-image-early).
+ln -sf /etc/robodr/nftables.conf /etc/nftables.conf
+
+# No forwarding, no IPv6 autoconfiguration on unconfigured links.
+cat >/usr/lib/sysctl.d/60-robodr-sensor-box.conf <<'SYSCTL'
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.default.autoconf = 0
+SYSCTL
+
+# Units: the image's own, networking, time, firewall. RoboDR's units stay
+# disabled (robodr-image-late starts what is commissioned at each boot).
+systemctl enable robodr-etc-overlay.service robodr-image-early.service \
+    robodr-image-late.service systemd-networkd.service systemd-timesyncd.service \
+    nftables.service
+systemctl mask systemd-networkd-wait-online.service
+
+# Nothing secret or unit-specific in the image: no machine id, no SSH host
+# keys, no RoboDR keys (generated on the box at first boot).
+: >/etc/machine-id
+rm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
+if [ -d /etc/robodr/keys ] && [ -n "$(ls -A /etc/robodr/keys)" ]; then
+    echo "postinst: /etc/robodr/keys is not empty in the image" >&2
+    exit 1
+fi

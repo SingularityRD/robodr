@@ -1,0 +1,258 @@
+.\" robodr-executor(8). Source of truth: the USAGE text and module docs in
+.\" crates/robodr-executor/src/bin/robodr-executor.rs, the crate README
+.\" (crates/robodr-executor/README.md) and docs/OPERATIONS.md section 6.5.
+.\" Keep them in sync.
+.TH ROBODR\-EXECUTOR 8 "2026-10-31" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-executor \- carry out RoboDR's reversible response actions (nftables, motion adapters) with a TTL
+.SH SYNOPSIS
+.B robodr\-executor \-\-config
+.I FILE
+.RB [ \-\-check\-config ]
+.br
+.B robodr\-executor status \-\-config
+.I FILE
+.br
+.B robodr\-executor revert\-all \-\-config
+.I FILE
+.RB [ \-\-reason
+.IR TEXT ]
+.br
+.B robodr\-executor rearm \-\-config
+.I FILE
+.RB [ \-\-reason
+.IR TEXT ]
+.br
+.B robodr\-executor stop\-cleanup \-\-config
+.I FILE
+.br
+.B robodr\-executor keygen \-\-out
+.I FILE
+.br
+.B robodr\-executor seal\-journal \-\-config
+.I FILE
+.br
+.B robodr\-executor \-\-version
+.SH DESCRIPTION
+.B robodr\-executor
+is executor v1 of RoboDR: the only process that changes the robot host in
+response to a finding. It runs as its own unit and user
+.RB ( robodr\-exec ),
+holds
+.B CAP_NET_ADMIN
+and no other capability, and changes exactly one nftables table,
+.BR "inet robodr" ,
+plus the configured motion adapters.
+.PP
+It is
+.B off by default.
+.BR robodr\-agentd (8)
+sends it nothing unless
+.B executor.enabled
+is
+.B true
+in
+.IR agentd.json ;
+until then every accepted request stays
+.BR recorded_not_executed .
+Leave it off for the first field period, and enable it only after the
+response policy is OEM-validated and the robot's motion control path,
+management and control buses are listed in
+.IR executor.json .
+.PP
+Actions:
+.TP
+.B isolate_network
+drops all traffic in, out and forwarded, except loopback, the management
+and uplink allow-list, the robot's control buses, the motion control path,
+the robot's DDS discovery and what every host needs (DHCP, path MTU
+discovery, IPv6 neighbour and router discovery, MLD). Always with a TTL.
+.TP
+.B quarantine_node
+drops RTPS sent by one participant's GUID prefix, and UDP from and to the
+addresses and SPDP locators it was seen at, never inside the motion
+control path. Always with a TTL.
+.TP
+.B record_evidence
+runs inside agentd (a signed black-box note); never reverted.
+.TP
+.BR restrict_motion ", " safe_pause ", " request_safe_state ", " rollback_config
+only through the platform
+.B motion adapters
+of the
+.B motion
+section of
+.I executor.json
+(gateway restriction file, Unitree sport speed level, Nav2, ros2_control,
+PX4, the site's rollback program), each refused unless the site set its
+.BR "oem_validated: true" .
+Without a
+.B motion
+section
+.B restrict_motion
+is recorded as advisory and the others are refused
+.RB ( not_executor_action ).
+See the crate README, "Motion adapters", for what each adapter does and
+does not revert.
+.PP
+Every action follows the same sequence: precheck against the executor's
+.B own
+response policy and configuration (re-read from disk before every order;
+an unreadable file refuses), a fresh safety-state check from agentd
+(within 500 ms; in observe mode, while the safety system is engaged, or in
+an unknown safety state nothing happens), a write-ahead journal entry, one
+atomic
+.B nft
+transaction, a read-back that must match exactly, and the commit with its
+deadline. Expiry and reverts run on their own thread. Within a boot the
+TTL runs on
+.BR CLOCK_BOOTTIME :
+a wall-clock step can never make an action outlive its TTL.
+.SH OPTIONS
+.TP
+.BI \-\-config " FILE"
+the executor configuration, schema
+.B robodr\-executor\-config/v1
+(packaged unit:
+.IR /etc/robodr/executor.json ;
+examples under
+.IR /usr/share/doc/robodr/examples/ ).
+.TP
+.B \-\-check\-config
+validate the configuration, the response policy and the SOC public keys,
+print a summary (robot, morphology, whether the policy is OEM-validated,
+allow-list and motion-path entries) and exit; changes nothing.
+.TP
+.BI \-\-reason " TEXT"
+recorded in the journal by
+.B revert\-all
+and
+.BR rearm .
+.TP
+.BI \-\-out " FILE"
+.RB ( keygen )
+where to write the new link key.
+.SH COMMANDS
+.TP
+(none)
+run the executor (the systemd unit's
+.BR ExecStart= ).
+It reconciles the table with its journal, then serves agentd on
+.I /run/robodr\-executor/executor.sock
+(mode 0660, group
+.BR robodr ;
+newline-delimited JSON, HMAC-SHA-256 under the link key, timestamp
+window and nonce cache; at most 8 connections).
+.TP
+.B status
+print the journal (active, held and reverting actions with their
+deadlines); read-only.
+.TP
+.B revert\-all
+revert every active action now (incident over, or before maintenance),
+and undo motion actions.
+.TP
+.B rearm
+end an operator's emergency disable, or acknowledge a journal reset, so
+orders are accepted again. Works on the journal only, as root, with the
+executor
+.B stopped
+.RB ( "systemctl stop robodr\-executor"
+first). agentd's socket has no re-arm: the key it holds cannot lift the
+operator's fence.
+.TP
+.B stop\-cleanup
+the unit's
+.BR ExecStopPost= :
+after any run that did not end in success (crash, watchdog kill, failed
+start, start limit) it deletes table
+.B inet robodr
+and marks the journal, so no rule is left without the process that
+enforces its TTL. A clean stop keeps the actions for the next start.
+.TP
+.B keygen
+write a new 32-byte link key (mode 0600, never overwrites) shared by agentd
+and the executor through systemd credentials.
+.TP
+.B seal\-journal
+one-time upgrade of an unsealed executor v1 journal to the sealed format,
+executor stopped; refused once the journal was ever written sealed.
+.SH EMERGENCY DISABLE
+.B "nft delete table inet robodr"
+as root lifts every RoboDR rule at once. The running executor notices the
+missing table, drops its actions without re-applying them, and refuses
+every order until an operator runs
+.BR rearm .
+.SH RESTART AND REBOOT
+At start the journal decides: an action still being applied when the
+process died is reverted; one whose deadline passed is reverted; one still
+active on the same boot is re-applied and verified; one active across a
+.B reboot
+is
+.B held
+and re-applied only when agentd supplies a fresh, known, not-engaged
+safety state. An unreadable journal, one that fails its seal (edited,
+truncated, another key), a missing sealed journal without the package's
+.I first\-start
+marker, or an older copy put back (agentd's anchor is ahead) is not
+believed: the table is deleted, the SOC replay store fenced, and every
+order refused until
+.BR rearm .
+.SH EXIT STATUS
+.TP
+.B 0
+clean stop, or the command succeeded.
+.TP
+.B 1
+runtime failure (the start path deletes table
+.B inet robodr
+before it exits).
+.TP
+.B 2
+usage or configuration error.
+.SH FILES
+.TP
+.I /etc/robodr/executor.json
+configuration (also motion adapters, Sprint 8).
+.TP
+.I /etc/robodr/keys/executor.key
+link key (0600 root), handed to the unit as
+.I /run/credentials/robodr\-executor.service/executor.key
+and to agentd with the drop-in example
+.IR 30\-executor.conf.example .
+.TP
+.I /var/lib/robodr/executor/
+journal
+.RI ( journal.json ,
+sealed), SOC replay store
+.RI ( soc_nonces.json ),
+the
+.I first\-start
+marker created by the package on first install; 0700
+.BR robodr\-exec .
+.TP
+.I /run/robodr\-executor/executor.sock
+agentd's connection.
+.SH SYSTEMD UNIT
+.B robodr\-executor.service
+is installed
+.B disabled.
+.BR Type=notify ,
+.BR WatchdogSec=30s ,
+.BR User=robodr\-exec ,
+.B CapabilityBoundingSet=CAP_NET_ADMIN
+only,
+.BR ExecStopPost=robodr\-executor " stop\-cleanup".
+Kernel requirement: nf_tables (see the modules-load.d example
+.IR /usr/share/doc/robodr/examples/modules\-load.d/robodr.conf.example ;
+.B robodr\-setup preflight
+checks it).
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-setup (8),
+.BR nft (8),
+.I /usr/share/doc/robodr/OPERATIONS.md
+(section 6.5),
+the crate README
+.I crates/robodr\-executor/README.md
+in the source tree.

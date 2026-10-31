@@ -428,6 +428,10 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "robodr-commission",
         "robodr-replay",
         "robodr-ros2-watch",
+        // Always required too (crates/robodr-ops).
+        "robodr-setup",
+        "robodr-support-bundle",
+        "robodr-metrics",
         "robodr-enroll",
         "robodr-uplink",
         "robodr-executor",
@@ -456,6 +460,26 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         .unwrap();
     ok(&o);
     let deb = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+    // The operator tools are always required: a tree without one is refused.
+    let partial = dir.join("bin-partial");
+    std::fs::create_dir_all(&partial).unwrap();
+    for e in std::fs::read_dir(&bins).unwrap() {
+        let e = e.unwrap();
+        if e.file_name() != "robodr-metrics" {
+            std::fs::copy(e.path(), partial.join(e.file_name())).unwrap();
+        }
+    }
+    let o = Command::new("bash")
+        .arg(repo().join("packaging/build-deb.sh"))
+        .args(["--bin-dir"])
+        .arg(&partial)
+        .args(["--arch", arch, "--out"])
+        .arg(dir.join("partial-out"))
+        .env("SOURCE_DATE_EPOCH", "1790000000")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("required binary"), "{}", stderr(&o));
     // A release build (ROBODR_RELEASE=1) refuses the development
     // placeholder maintainer, and an unset one.
     for m in [
@@ -517,12 +541,31 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "./usr/share/man/man8/robodr-depot.8.gz",
         "./usr/share/doc/robodr/examples/depot.example.json",
         "./usr/share/doc/robodr/examples/robodr-depot.service.d/50-tpm-anchor.conf.example",
+        // Operator tools, their man pages and examples (T68-T70, T87).
+        "./usr/sbin/robodr-setup",
+        "./usr/sbin/robodr-support-bundle",
+        "./usr/bin/robodr-metrics",
+        "./usr/share/man/man8/robodr-setup.8.gz",
+        "./usr/share/man/man8/robodr-support-bundle.8.gz",
+        "./usr/share/man/man1/robodr-metrics.1.gz",
+        "./usr/share/man/man8/robodr-executor.8.gz",
+        "./usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
+        "./usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
+        // Customer documentation and demo data (T49).
+        "./usr/share/doc/robodr/customer/quick-start.md",
+        "./usr/share/doc/robodr/customer/known-limitations.md",
+        "./usr/share/doc/robodr/demo/fastrtps_rogue_cmd_vel.pcap",
+        "./usr/share/doc/robodr/demo/SHA256SUMS",
     ] {
         assert!(list.contains(want), "{want} missing from the .deb:\n{list}");
     }
     assert!(
         !list.contains("robodr-safety-replay"),
         "the replay helper must not ship:\n{list}"
+    );
+    assert!(
+        !list.contains("-draft.md"),
+        "draft customer documents must not ship:\n{list}"
     );
     let tmpf = ok(&sh(Command::new("sh").arg("-c").arg(format!(
         "dpkg-deb --fsys-tarfile {} | tar -xOf - ./usr/lib/tmpfiles.d/robodr.conf",

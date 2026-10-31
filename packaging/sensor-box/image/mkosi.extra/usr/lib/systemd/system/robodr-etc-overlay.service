@@ -1,0 +1,18 @@
+# RoboDR sensor box image: writable /etc/robodr on the read-only root.
+[Unit]
+Description=RoboDR sensor box: /etc/robodr overlay on /var
+Documentation=file:/usr/share/doc/robodr/sensor-box-image/README.md
+DefaultDependencies=no
+RequiresMountsFor=/var
+Conflicts=shutdown.target
+Before=local-fs.target systemd-tmpfiles-setup.service shutdown.target
+# Only on the read-only image root.
+ConditionPathIsReadWrite=!/etc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/robodr-image/robodr-etc-overlay
+
+[Install]
+WantedBy=local-fs.target

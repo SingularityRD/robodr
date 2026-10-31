@@ -1,0 +1,149 @@
+.\" robodr-metrics(1). Source of truth: the USAGE text in
+.\" crates/robodr-ops/src/bin/robodr-metrics.rs and the module docs of
+.\" crates/robodr-ops/src/metrics.rs. Keep them in sync.
+.TH ROBODR\-METRICS 1 "2026-10-31" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-metrics \- Prometheus textfile exporter of RoboDR's status files
+.SH SYNOPSIS
+.B robodr\-metrics
+.RB [ \-\-agentd\-status
+.I FILE
+|
+.BR \-\-no\-agentd ]
+.RB [ \-\-uplink\-status
+.I FILE
+|
+.BR \-\-no\-uplink ]
+.RB [ \-\-out
+.I FILE
+|
+.BR \-\-stdout ]
+.SH DESCRIPTION
+Renders
+.BR robodr\-agentd (8)'s
+.I status.json
+and
+.BR robodr\-uplink (1)'s
+.I uplink\-status.json
+in the Prometheus text exposition format, for node_exporter's textfile
+collector. RoboDR opens no port for monitoring: the scraper sees only the
+file. The file holds counters and states; no finding content, error text,
+batch id or health reason is exported, and the only label values are the
+robot id, the profile and safety states, input names and the uplink
+state, escaped.
+.PP
+Freshness is judged exactly as agentd defines it: running, written on this
+boot, younger than its
+.B stale_after_ms
+by
+.BR CLOCK_MONOTONIC .
+A stopped, hung or previous-boot agent is
+.B robodr_agentd_fresh 0
+and
+.BR robodr_agentd_state{state=\(dqunknown\(dq} " 1",
+never a stale "ok". A missing or unreadable status file is
+.BR "robodr_agentd_status_readable 0" ,
+and the file is still written.
+.SH METRICS
+.TP
+.B robodr_metrics_last_run_timestamp_seconds
+when the file was written; alert on its age to catch a stopped exporter.
+.TP
+.BR robodr_agentd_status_readable ", " robodr_agentd_running ", " robodr_agentd_fresh
+0 or 1.
+.TP
+.BI robodr_agentd_state{state=} ok|degraded|unknown
+one-hot effective monitoring state.
+.TP
+.BR robodr_agentd_status_age_seconds ", " robodr_agentd_uptime_seconds ", " robodr_agentd_health_reasons
+.TP
+.BR robodr_agentd_queue_bytes ", " robodr_agentd_queue_bytes_max ", " robodr_agentd_evidence_degraded ", " robodr_agentd_signs_findings
+.TP
+.B robodr_agentd_info{robot_id,profile_status,safety_state}
+always 1.
+.TP
+.BI robodr_agentd_input_ FIELD {input}
+per-input counters.
+.TP
+.BI robodr_agentd_ SECTION _ PATH
+every numeric counter of the status sections
+.BR daemon ", " agent ", " spool ", " pipeline ", " blackbox ,
+.BR discovery_flood ", " correlation ", " control_plane ", " executor ,
+.B safety_feed
+(type
+.BR untyped :
+counters of the running process, reset on restart; use
+.BR rate() / increase() ).
+.TP
+.BR robodr_uplink_status_readable ", " robodr_uplink_state{state}
+uplink state
+.RB ( ok ", " retrying ", " blocked ", " starting ).
+.TP
+.BR robodr_uplink_status_age_seconds ", " robodr_uplink_last_success_age_seconds ", " robodr_uplink_last_delivery_age_seconds ", " robodr_uplink_stuck_seconds
+by the wall clock.
+.TP
+.BI robodr_uplink_ FIELD
+its counters (backlog as
+.BR robodr_uplink_backlog_* ).
+.SH OPTIONS
+.TP
+.BI \-\-agentd\-status " FILE"
+default
+.IR /var/lib/robodr/spool/agentd/status.json .
+.TP
+.B \-\-no\-agentd
+no agentd metrics (a SOC relay).
+.TP
+.BI \-\-uplink\-status " FILE"
+default
+.IR /var/lib/robodr/export/uplink/uplink\-status.json ,
+read only when it exists (an explicitly named file that is missing is
+exported as unreadable).
+.TP
+.B \-\-no\-uplink
+no uplink metrics.
+.TP
+.BI \-\-out " FILE"
+absolute,
+.IR *.prom ;
+written atomically (temporary file, fsync, rename), mode 0644. Default
+.IR /run/robodr\-metrics/robodr.prom .
+.TP
+.B \-\-stdout
+print instead.
+.SH SETUP
+The package ships an example service and timer (every 15 s) and example
+alert rules in
+.IR /usr/share/doc/robodr/examples/metrics/ :
+.PP
+.nf
+install \-m 0644 robodr\-metrics.service.example /etc/systemd/system/robodr\-metrics.service
+install \-m 0644 robodr\-metrics.timer.example /etc/systemd/system/robodr\-metrics.timer
+systemctl daemon\-reload && systemctl enable \-\-now robodr\-metrics.timer
+.fi
+.PP
+Point node_exporter at the directory
+.RB ( \-\-collector.textfile.directory=/run/robodr\-metrics )
+or symlink
+.I /run/robodr\-metrics/robodr.prom
+into the directory it already reads. The example service runs with
+.B CAP_DAC_READ_SEARCH
+only (to read the 0600 uplink status), no network, a read-only OS, and the
+key and evidence trees hidden. Load
+.I robodr\-alerts.example.yml
+into Prometheus and adjust the thresholds; every metric it names is checked
+against the exporter's output in the test suite.
+.SH EXIT STATUS
+.TP
+.B 0
+written.
+.TP
+.B 1
+the output could not be written.
+.TP
+.B 2
+usage error.
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-uplink (1),
+.BR robodr\-support\-bundle (8)

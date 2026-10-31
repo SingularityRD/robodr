@@ -45,6 +45,22 @@ Static checks (no package needed; CI job `scripts`):
      needs, and `publish` runs scripts/compare-rebuild.py before it writes
      SHA256SUMS and signs.
 
+  11. Resource caps (sales-readiness T76): every long-running service
+     (regular and focal; Type= other than oneshot) sets MemoryMax=, so a
+     runaway RoboDR daemon hits its own cgroup limit before it can push the
+     OOM killer onto the robot's motion stack; the units in CPU_CAPPED
+     (event-driven detectors that an event storm could make spin) also set
+     CPUQuota=. (The inline gateway is deliberately not CPU-capped: it is a
+     real-time process in the motion path, where throttling is latency.)
+
+  12. The sensor box image recipe (packaging/sensor-box/image, T77): the
+     root partition is read-only (ReadOnly=yes), build-image.sh verifies
+     the bundle's minisign signature before it extracts anything and then
+     its SHA256SUMS, has no unsigned switch, the post-install script checks
+     the package digest and refuses an image with keys, the first-boot
+     script generates the keys with robodr-setup init, and no file of the
+     recipe holds key material.
+
   5a. Every unit (regular and focal) and every unit with each of its
      drop-in examples applied: with SecureBits=noroot / noroot-locked, a
      process of uid 0 gets capabilities on execve only through the ambient
@@ -58,7 +74,9 @@ Package checks (`--deb FILE ... --rpm FILE ...`; CI jobs `package-*`):
      /etc/robodr, no private key material (PEM private keys, minisign
      secret keys) anywhere in the payload; exactly the variant's programs,
      each unit together with its program, and a man page for every
-     shipped program that has one in man/.
+     shipped program that has one in man/; the customer documentation
+     (no drafts), the demo captures and the operator examples
+     (SHIPPED_DOCS).
   6. robodr .deb vs robodr .rpm of the same architecture: the same paths
      with the same modes, and byte-identical content except the programs
      (built in different userlands).
@@ -112,6 +130,11 @@ PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
     "robodr-seal": ("usr/sbin", BOTH),
     "robodr-depot": ("usr/sbin", BOTH),
     "robodr-enroll": ("usr/sbin", BOTH),
+    # Operator tools (crates/robodr-ops): first-boot setup, support bundle,
+    # metrics textfile exporter.
+    "robodr-setup": ("usr/sbin", BOTH),
+    "robodr-support-bundle": ("usr/sbin", BOTH),
+    "robodr-metrics": ("usr/bin", BOTH),
     # Pulsar-bound (glibc, eBPF, needs BTF): not static, not on systemd 245.
     "robodr-pulsard": ("usr/sbin", frozenset({STD})),
     # Base station only: use the robodr package there.
@@ -122,7 +145,8 @@ NEVER_PACKAGED = {
     "robodr-release": "SOC / build-side delivery artifact tool",
 }
 # build-deb.sh requires these whatever ROBODR_DEB_REQUIRE says.
-ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch"}
+ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch",
+                   "robodr-setup", "robodr-support-bundle", "robodr-metrics"}
 
 # program -> units installed with it.
 UNITS = {
@@ -149,6 +173,8 @@ OWN_USER = {
     "robodr-uplink.service": "robodr-uplink",
     "robodr-firewall-gw.service": "robodr-gw",
 }
+# Units that must also cap their CPU time (check 11).
+CPU_CAPPED = {"robodr-pulsard.service"}
 # The only capabilities the firewall ruleset's commands need.
 RULES_CAPS = {"CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SYS_MODULE"}
 
@@ -177,6 +203,21 @@ ALLOWED_ROOTS = ("/usr/", "/etc/robodr")
 NOTICE_FILES = (
     "/usr/share/doc/robodr/THIRD_PARTY_NOTICES",
     "/usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER",
+)
+# Every variant ships the customer documentation, the demo data and the
+# operator examples (sales-readiness T49, T70, T87).
+SHIPPED_DOCS = (
+    "/usr/share/doc/robodr/customer/quick-start.md",
+    "/usr/share/doc/robodr/customer/known-limitations.md",
+    "/usr/share/doc/robodr/customer/support-matrix.md",
+    "/usr/share/doc/robodr/demo/README.md",
+    "/usr/share/doc/robodr/demo/SHA256SUMS",
+    "/usr/share/doc/robodr/demo/fastrtps_baseline.pcap",
+    "/usr/share/doc/robodr/demo/fastrtps_rogue_cmd_vel.pcap",
+    "/usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
+    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.service.example",
+    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.timer.example",
+    "/usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
 )
 SECRET_MARKERS = (
     re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -415,6 +456,65 @@ def check_units_caps(root: Path) -> list[str]:
     return errs
 
 
+def check_unit_resources_text(name: str, text: str) -> list[str]:
+    if (unit_values(text, "Type") or ["simple"])[-1] == "oneshot":
+        return []
+    errs = []
+    if not unit_values(text, "MemoryMax"):
+        errs.append(f"{name}: long-running service without MemoryMax= (a runaway daemon is not capped by its own cgroup)")
+    if Path(name).name in CPU_CAPPED and not unit_values(text, "CPUQuota"):
+        errs.append(f"{name}: without CPUQuota= (an event storm must not take the robot's CPU)")
+    return errs
+
+
+def check_unit_resources(root: Path) -> list[str]:
+    errs = []
+    sysd = root / "packaging" / "systemd"
+    for d in (sysd, sysd / "focal"):
+        for unit in sorted(d.glob("*.service")):
+            errs += check_unit_resources_text(str(unit.relative_to(sysd)), unit.read_text())
+    return errs
+
+
+def check_image_recipe_texts(files: dict[str, bytes]) -> list[str]:
+    """files: path relative to packaging/sensor-box/image -> content."""
+    errs = []
+    t = {k: v.decode("utf-8", "replace") for k, v in files.items()}
+    where = "packaging/sensor-box/image"
+    root = t.get("mkosi.repart/10-root.conf", "")
+    if unit_values(root, "Type") != ["root"] or unit_values(root, "ReadOnly") != ["yes"]:
+        errs.append(f"{where}/mkosi.repart/10-root.conf: the root partition must be Type=root, ReadOnly=yes")
+    code = "\n".join(ln for ln in t.get("build-image.sh", "").splitlines() if not ln.lstrip().startswith("#"))
+    v, x = code.find("minisign -V"), code.find("tar ")
+    if v < 0 or x < 0 or v > x:
+        errs.append(f"{where}/build-image.sh: must verify the minisign signature before extracting the bundle")
+    if x < 0 or "sha256sum -c" not in code[x:]:
+        errs.append(f"{where}/build-image.sh: must check the bundle's SHA256SUMS after extracting it")
+    if re.search(r"unsigned|minisign -V[^\n]*\|\|\s*true", code, re.I):
+        errs.append(f"{where}/build-image.sh: has a way around the signature check")
+    post = t.get("mkosi.postinst.chroot", "")
+    if "sha256sum -c" not in post or "/etc/robodr/keys" not in post:
+        errs.append(f"{where}/mkosi.postinst.chroot: must check the package digest and refuse an image with keys")
+    late = t.get("mkosi.extra/usr/lib/robodr-image/robodr-image-late", "")
+    if 'robodr-setup "$@"' not in late or "set -- init" not in late:
+        errs.append(f"{where}/robodr-image-late: first boot must generate the keys with robodr-setup init")
+    for name, body in sorted(files.items()):
+        if name.endswith((".key", ".pem")):
+            errs.append(f"{where}/{name}: key file in the image recipe")
+        for m in SECRET_MARKERS:
+            if m.search(body):
+                errs.append(f"{where}/{name}: contains private key material")
+    return errs
+
+
+def check_image_recipe(root: Path) -> list[str]:
+    d = root / "packaging" / "sensor-box" / "image"
+    if not d.is_dir():
+        return ["packaging/sensor-box/image: missing"]
+    files = {str(f.relative_to(d)): f.read_bytes() for f in sorted(d.rglob("*")) if f.is_file()}
+    return check_image_recipe_texts(files)
+
+
 def unit_values(text: str, key: str) -> list[str]:
     """Every value of KEY= in a unit (in order; an empty one resets)."""
     out: list[str] = []
@@ -608,6 +708,8 @@ def static_checks(root: Path) -> list[str]:
         + check_build_deb(root)
         + check_scripts(root)
         + check_units_caps(root)
+        + check_unit_resources(root)
+        + check_image_recipe(root)
         + check_identities(root)
         + check_rules_unit(root)
         + check_release_workflow(root)
@@ -771,6 +873,12 @@ def check_package(label: str, variant: str, entries: dict[str, Entry], contents:
     for p in NOTICE_FILES:
         if p not in entries:
             errs.append(f"{label}: lacks {p} (scripts/third_party_notices.py)")
+    for p in SHIPPED_DOCS:
+        if p not in entries:
+            errs.append(f"{label}: lacks {p} (packaging/build-deb.sh)")
+    for p in entries:
+        if p.startswith("/usr/share/doc/robodr/customer/") and p.endswith("-draft.md"):
+            errs.append(f"{label}: ships the draft {p}")
     for prog in sorted(progs):
         for page in sorted((root / "man").glob(f"{prog}.[1-8]")):
             sec = page.suffix[1:]
@@ -922,11 +1030,15 @@ def self_test() -> int:
     for page in (ROOT / "man").glob("robodr-*.[1-8]"):
         if page.stem in base or any(k.endswith("/" + page.stem) for k in base):
             base[f"/usr/share/man/man{page.suffix[1:]}/{page.name}.gz"] = ent()
-    for n in NOTICE_FILES:
+    for n in NOTICE_FILES + SHIPPED_DOCS:
         base[n] = ent()
     expect("clean package", check_package("t", STD, base, {}, ROOT), True)
     no_notices = {k: v for k, v in base.items() if not k.endswith("/THIRD_PARTY_NOTICES")}
     expect("notices missing", check_package("t", STD, no_notices, {}, ROOT), False)
+    no_demo = {k: v for k, v in base.items() if not k.endswith("/fastrtps_rogue_cmd_vel.pcap")}
+    expect("demo capture missing", check_package("t", STD, no_demo, {}, ROOT), False)
+    expect("draft shipped", check_package(
+        "t", STD, {**base, "/usr/share/doc/robodr/customer/eula-draft.md": ent()}, {}, ROOT), False)
     expect("setuid", check_package("t", STD, {**base, "/usr/bin/robodr-replay": ent(mode=0o4755)}, {}, ROOT), False)
     expect("not root", check_package("t", STD, {**base, "/usr/share/x": ent(owner="robodr")}, {}, ROOT), False)
     expect("state in payload", check_package("t", STD, {**base, "/var/lib/robodr/x": ent()}, {}, ROOT), False)
@@ -996,6 +1108,26 @@ def self_test() -> int:
     expect("rules full caps", check_rules_unit_text("r", rules.replace(
         "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE", "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN")), False)
     expect("rules no ProtectSystem", check_rules_unit_text("r", rules.replace("ProtectSystem=strict", "")), False)
+    # 11. Resource caps: the real units pass; pulsard without its caps fails.
+    expect("unit resources ok", check_unit_resources(ROOT), True)
+    pulsard = (pk / "systemd" / "robodr-pulsard.service").read_text()
+    expect("pulsard without MemoryMax", check_unit_resources_text("p", pulsard.replace("MemoryMax=512M\n", "")), False)
+    expect("pulsard without CPUQuota", check_unit_resources_text(
+        "robodr-pulsard.service", pulsard.replace("CPUQuota=100%\n", "")), False)
+    expect("oneshot needs no cap", check_unit_resources_text("o", "[Service]\nType=oneshot\nExecStart=/bin/true\n"), True)
+    # 12. The sensor box image recipe.
+    img = pk / "sensor-box" / "image"
+    real_img = {str(f.relative_to(img)): f.read_bytes() for f in img.rglob("*") if f.is_file()}
+    expect("image recipe ok", check_image_recipe_texts(real_img), True)
+    rootconf = real_img["mkosi.repart/10-root.conf"].replace(b"ReadOnly=yes", b"")
+    expect("writable root", check_image_recipe_texts({**real_img, "mkosi.repart/10-root.conf": rootconf}), False)
+    bi = real_img["build-image.sh"].decode()
+    moved = bi.replace("minisign -Vq -p", "true -p").replace(
+        "(cd \"$top\" && sha256sum", "minisign -Vq -p \"$pubkey\" -m \"$bundle\"\n(cd \"$top\" && sha256sum")
+    expect("extract before verify", check_image_recipe_texts({**real_img, "build-image.sh": moved.encode()}), False)
+    bypass = bi + "\n[ -n \"${ROBODR_ALLOW_UNSIGNED:-}\" ] && exit 0\n"
+    expect("unsigned switch", check_image_recipe_texts({**real_img, "build-image.sh": bypass.encode()}), False)
+    expect("key in recipe", check_image_recipe_texts({**real_img, "mkosi.extra/etc/robodr/keys/a.key": b"x"}), False)
     # 10. The release workflow.
     rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
     expect("release workflow ok", check_release_workflow_text(rel), True)
@@ -1005,7 +1137,7 @@ def self_test() -> int:
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
     expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 53
+    total = 64
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
