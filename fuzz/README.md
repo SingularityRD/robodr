@@ -195,6 +195,20 @@ accepted (`Retry-After:\r\r\n` gave the value `"\r"`): the head reader now
 refuses a bare CR or NUL (`uplink::http`, regression test
 `bare_cr_and_nul_in_the_head_are_refused`). Under libFuzzer they run in
 CI's 60 s smoke and in the nightly campaign (`.github/workflows/nightly.yml`).
+First libFuzzer runs (`nightly-2026-09-01`, `cargo-fuzz` 0.13.1,
+AddressSanitizer + debug assertions, `-max_total_time=45`, seeded from a copy
+of `fuzz/corpus/<target>/`, one at a time on a shared 4-core sandbox). **No
+crash, leak, timeout or invariant violation:**
+
+| target | runs | exec/s | coverage (edges) | corpus at end |
+|---|---:|---:|---:|---:|
+| `uplink_http` | 1 255 647 | 27 296 | 1 418 | 824 |
+| `kafka_sasl` | 125 527 | 2 728 | 1 095 | 394 |
+| `executor_proto` | 1 584 765 | 34 451 | 3 165 | 2 004 |
+| `executor_soc` | 1 035 531 | 22 511 | 4 887 | 2 105 |
+
+`kafka_sasl` is slow by design (each accepted server-first message costs
+4 096 to 8 192 PBKDF2 rounds).
 
 ### Smoke runs
 
