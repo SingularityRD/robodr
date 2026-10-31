@@ -113,7 +113,10 @@ fn main() -> ExitCode {
         }
     };
     if is_version_request(&v) {
-        println!("robodr-spool-export {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-spool-export", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     let parsed = parse_args_with_switches(

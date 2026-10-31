@@ -15,6 +15,7 @@ description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeli
 # TLS stack (mutual TLS, `src/control/tls.rs`), the same crates and versions
 # robodr-uplink uses (workspace Cargo.toml).
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-agent = { workspace = true }
 robodr-blackbox = { workspace = true }
 zeroize = { workspace = true }

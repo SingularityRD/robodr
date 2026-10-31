@@ -15,6 +15,7 @@ description = "Site depot (docs/SECURE-DELIVERY.md §4, §5, §6, §8, Sprints 1
 # reused); TPM evidence, re-wrapping and leases robodr-seal's; findings go
 # through robodr-deliverd's spool writer into the site agentd's spool.
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-deliverd = { workspace = true }
 # `--flag value` argument parser shared with the diode, release and seal binaries.

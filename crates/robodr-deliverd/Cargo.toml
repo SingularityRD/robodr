@@ -16,6 +16,7 @@ description = "On-unit delivery agent (docs/SECURE-DELIVERY.md §4.2, §6, Sprin
 # robodr-ocsf records spooled into agentd's spool (robodr-agentd::spool
 # format); the safety state is read from agentd's status.json.
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-agentd = { workspace = true }
 robodr-blackbox = { workspace = true }
 # `--flag value` argument parser shared with the diode and release binaries.

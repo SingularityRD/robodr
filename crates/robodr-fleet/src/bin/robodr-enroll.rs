@@ -700,7 +700,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if a.flag("--version") {
-        println!("robodr-enroll {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-enroll", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     match run(&a) {

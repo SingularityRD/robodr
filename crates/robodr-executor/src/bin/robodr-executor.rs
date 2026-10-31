@@ -196,7 +196,10 @@ fn keygen(out: &PathBuf) -> ExitCode {
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "--version") {
-        println!("robodr-executor {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-executor", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     if argv.iter().any(|a| a == "--help" || a == "-h") {

@@ -4,6 +4,7 @@ members = [
     "crates/robodr-agent",
     "crates/robodr-agentd",
     "crates/robodr-blackbox",
+    "crates/robodr-buildinfo",
     "crates/robodr-capture",
     "crates/robodr-cdr",
     "crates/robodr-commission",
@@ -62,6 +63,7 @@ robodr-executor = { path = "crates/robodr-executor" }
 robodr-export = { path = "crates/robodr-export" }
 robodr-rtps = { path = "crates/robodr-rtps" }
 robodr-blackbox = { path = "crates/robodr-blackbox" }
+robodr-buildinfo = { path = "crates/robodr-buildinfo" }
 robodr-capture = { path = "crates/robodr-capture" }
 robodr-cdr = { path = "crates/robodr-cdr" }
 robodr-commission = { path = "crates/robodr-commission" }

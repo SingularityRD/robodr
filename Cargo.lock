@@ -2657,6 +2657,7 @@ name = "robodr-agent"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-cdr",
  "robodr-commission",
  "robodr-events",
@@ -2675,6 +2676,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-agent",
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-capture",
  "robodr-cdr",
  "robodr-commission",
@@ -2700,6 +2702,7 @@ name = "robodr-blackbox"
 version = "0.1.0-alpha.1"
 dependencies = [
  "ed25519-dalek",
+ "robodr-buildinfo",
  "robodr-events",
  "rustls",
  "rustls-webpki",
@@ -2709,6 +2712,10 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "robodr-buildinfo"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "robodr-capture"
@@ -2730,6 +2737,7 @@ name = "robodr-commission"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-capture",
  "robodr-cdr",
  "robodr-events",
@@ -2754,6 +2762,7 @@ dependencies = [
  "robodr-agent",
  "robodr-agentd",
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-capture",
  "robodr-commission",
  "robodr-diode",
@@ -2776,6 +2785,7 @@ dependencies = [
  "p256",
  "robodr-agentd",
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-deliverd",
  "robodr-diode",
  "robodr-events",
@@ -2799,6 +2809,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "reed-solomon",
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-events",
  "robodr-ocsf",
  "serde",
@@ -2818,6 +2829,7 @@ name = "robodr-executor"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-cdr",
  "robodr-executor",
  "robodr-firewall-gw",
@@ -2834,6 +2846,7 @@ dependencies = [
  "robodr-agent",
  "robodr-agentd",
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-diode",
  "robodr-events",
  "robodr-export",
@@ -2875,6 +2888,7 @@ name = "robodr-fleet"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-commission",
  "robodr-events",
  "robodr-export",
@@ -2922,6 +2936,7 @@ dependencies = [
  "clap",
  "clap-verbosity-flag",
  "pulsar",
+ "robodr-buildinfo",
  "robodr-sensor-ros2",
  "robodr-threat-forward",
  "tokio",
@@ -2932,6 +2947,7 @@ name = "robodr-release"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-diode",
  "robodr-pkg",
  "robodr-seal",
@@ -2953,6 +2969,7 @@ name = "robodr-ros2-pipeline"
 version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-capture",
  "robodr-cdr",
  "robodr-commission",
@@ -2979,6 +2996,7 @@ dependencies = [
  "hmac 0.12.1",
  "p256",
  "robodr-blackbox",
+ "robodr-buildinfo",
  "robodr-diode",
  "robodr-pkg",
  "serde",

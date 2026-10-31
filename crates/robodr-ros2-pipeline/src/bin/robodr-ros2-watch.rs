@@ -38,7 +38,10 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Version => {
-            println!("robodr-ros2-watch {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                robodr_buildinfo::version_line("robodr-ros2-watch", env!("CARGO_PKG_VERSION"))
+            );
             return ExitCode::SUCCESS;
         }
         Command::Run(a) => a,

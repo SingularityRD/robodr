@@ -107,7 +107,10 @@ pub fn main_with_env() -> i32 {
 /// Run one command line (without the program name).
 pub fn run(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-release {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-release", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     // Help only as the whole command line: a stray -h spliced into a

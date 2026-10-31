@@ -340,7 +340,10 @@ fn main() -> ExitCode {
         Err(e) => return usage_exit(&e),
     };
     if matches!(v.as_slice(), [only] if only == "--version") {
-        println!("robodr-uplink {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-uplink", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     if let Some((_, rest)) = v.split_first().filter(|(first, _)| *first == "reinject") {

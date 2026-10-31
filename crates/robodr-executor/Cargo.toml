@@ -13,6 +13,7 @@ description = "RoboDR executor v1: reversible containment actions (isolate_netwo
 # Pure crate: std + RoboDR crates + serde only. nftables is driven through the
 # `nft` binary (JSON in and out), never through a shell.
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-responder = { workspace = true }
 # Parsing the replies of the motion adapters' ROS 2 peers (src/motion/rtps.rs).

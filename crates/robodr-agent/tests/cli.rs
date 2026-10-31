@@ -286,7 +286,11 @@ fn version_and_help_exit_0() {
         assert_eq!(o.status.code(), Some(0), "{name} --version");
         assert_eq!(
             String::from_utf8_lossy(&o.stdout),
-            format!("{name} {}\n", env!("CARGO_PKG_VERSION")),
+            // Names the build (commit, SOURCE_DATE_EPOCH, target), not only the version.
+            format!(
+                "{}\n",
+                robodr_buildinfo::version_line(name, env!("CARGO_PKG_VERSION"))
+            ),
             "{name} --version"
         );
         let o = std::process::Command::new(exe)

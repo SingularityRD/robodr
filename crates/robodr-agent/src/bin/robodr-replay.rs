@@ -538,7 +538,10 @@ fn main() -> ExitCode {
         }
     };
     if argv.len() == 1 && matches!(argv[0].as_str(), "-V" | "--version") {
-        println!("robodr-replay {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-replay", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     let (cmd, rest) = match argv.first().map(String::as_str) {
