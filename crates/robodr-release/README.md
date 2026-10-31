@@ -110,7 +110,14 @@ directory. Run `verify` afterwards.
 
 ## Limits
 
-* Keys are files (0600) on the signing station, not HSM- or TPM-held.
+* Keys are files (0600) on the signing station **or** stay in a PKCS#11
+  token / HSM: `sign --key` also takes a `robodr-signer/v1` signer file
+  whose external command (`robodr-signer-pkcs11`, OpenSC `pkcs11-tool`,
+  `CKM_EDDSA`) signs, and every signature is checked against the public
+  key pinned in that file (`crates/robodr-signer`, `docs/OPERATIONS.md`
+  4.6). Tested against SoftHSM 2; YubiKey / Nitrokey / network HSMs are
+  driven the same way but not yet tested on hardware. `keygen` still makes
+  file keys only: a token key is generated on the token.
 * Only `public` RPKs are built; sealing is Sprint 13c.
 * `--now` defaults to the system clock of the verifying host; a clock
   before 1970 is an error. Trust file expiry is judged on that clock.

@@ -1348,7 +1348,9 @@ and seeds follow the format changes.
 
 Not in 13a: sealed RPKs and wrapped keys (13c), the entry-station scan
 and signed entry report (§6.1), anything on a unit (13b) or a depot (14a).
-Signing keys are files on the signing station, not HSM-held.
+Signing keys were files on the signing station, not HSM-held (since
+SALES-READINESS T36 they can stay in a PKCS#11 token or HSM behind a
+`robodr-signer/v1` signer file: `docs/OPERATIONS.md` 4.6).
 
 ### 13b requirements (from the 13a review)
 
