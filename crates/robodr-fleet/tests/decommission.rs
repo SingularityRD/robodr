@@ -292,8 +292,8 @@ fn abort_before_sending_and_reenrollment_after_decommission() {
     decommission::submit(&ctx, &mut Direct { soc: &soc }).unwrap();
     assert_eq!(active_keys(&soc), 0);
     // No second decommission. Re-commissioning starts from new keys and an
-    // empty fleet state directory: the SOC never registers a key id twice
-    // (§4), so the kept black-box key cannot be enrolled again.
+    // empty fleet state directory: the unit refuses to enroll on the
+    // decommissioned state directory, even with --reuse-existing-keys.
     assert!(decommission::prepare(&ctx, "transfer")
         .unwrap_err()
         .contains("Re-commissioning"));
@@ -301,7 +301,20 @@ fn abort_before_sending_and_reenrollment_after_decommission() {
         .borrow_mut()
         .issue_token("tok-2", ROBOT, Some(SITE), 3_600_000, [0x44; 32]);
     let err = enroll::prepare(&ctx, &t, &Default::default()).unwrap_err();
-    assert!(err.contains("reuse"), "{err}");
+    assert!(err.contains("was decommissioned"), "{err}");
+    let err = enroll::prepare(
+        &ctx,
+        &t,
+        &enroll::EnrollOptions {
+            reuse_existing_keys: true,
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("was decommissioned"), "{err}");
+    // The SOC side refuses too: it never registers a key id twice (§4), so
+    // the kept black-box key cannot be enrolled again even on a fresh state
+    // directory.
+    std::fs::remove_file(ctx.path(decommission::STATE_FILE)).unwrap();
     enroll::prepare(
         &ctx,
         &t,
@@ -313,4 +326,28 @@ fn abort_before_sending_and_reenrollment_after_decommission() {
     let e = enroll::submit(&ctx, &mut Direct { soc: &soc }).unwrap_err();
     assert!(e.contains("409 key_conflict"), "{e}");
     assert_eq!(active_keys(&soc), 0);
+}
+
+#[test]
+fn enrollment_on_a_decommissioned_state_dir_is_refused_even_with_fresh_keys() {
+    let (u, soc) = enrolled("decom-fresh-keys");
+    let ctx = u.ctx();
+    decommission::prepare(&ctx, "end_of_life").unwrap();
+    decommission::submit(&ctx, &mut Direct { soc: &soc }).unwrap();
+    // The operator moves the kept black-box key away (the uplink and
+    // finding keys are shredded already), so enrollment would generate
+    // three fresh keys the SOC has never seen.
+    std::fs::remove_file(&u.cfg.blackbox_key).unwrap();
+    let t = soc
+        .borrow_mut()
+        .issue_token("tok-3", ROBOT, Some(SITE), 3_600_000, [0x55; 32]);
+    let err = enroll::prepare(&ctx, &t, &Default::default()).unwrap_err();
+    assert!(err.contains("was decommissioned"), "{err}");
+    assert!(err.contains("Re-commissioning"), "{err}");
+    // Nothing was generated or stored for the refused enrollment.
+    assert!(!u.cfg.blackbox_key.exists());
+    assert_eq!(
+        decommission::current(&ctx).unwrap().map(|d| d.phase),
+        Some(Phase::Done)
+    );
 }

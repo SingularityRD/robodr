@@ -1012,9 +1012,13 @@ impl AnchorReceiver {
     /// * A new unit, or a unit whose key changed, is loaded from its state
     ///   file and re-verified, as at start.
     ///
-    /// A request that took a slot before the reload and is still waiting
-    /// for its state lock finds the slot retired and is refused (`retry`),
-    /// so it never writes over the state the new slot loaded.
+    /// The state locks of the slots that leave (removed or re-keyed) are
+    /// held from before the new state is loaded until the new roster is
+    /// committed, and the slots are marked retired before those locks are
+    /// released. A request that took such a slot before the reload and is
+    /// still waiting for its state lock therefore finds it retired and is
+    /// refused (`retry`), so it never writes over the state the new slot
+    /// loaded.
     pub fn reload_units(
         &self,
         units: Vec<UnitKey>,
@@ -1025,11 +1029,28 @@ impl AnchorReceiver {
         }
         let udir = self.dir.join(UNITS_DIR);
         let mut roster = self.roster_mut();
+        // Old slots that leave the roster (removed, or re-keyed: replaced by
+        // a new slot). Their state locks are taken now and held until the
+        // new roster is committed, and `broken` is set before they are
+        // released: a request that took one of these slots before the
+        // reload (advance() clones the slot and drops the roster lock) can
+        // neither write the state file while the new slot loads it nor
+        // after the commit.
+        let incoming: HashMap<&str, &str> = units
+            .iter()
+            .map(|u| (u.unit.as_str(), u.verifier.key_id()))
+            .collect();
+        let retiring: Vec<Arc<UnitSlot>> = roster
+            .units
+            .iter()
+            .filter(|(unit, slot)| incoming.get(unit.as_str()) != Some(&slot.verifier.key_id()))
+            .map(|(_, slot)| Arc::clone(slot))
+            .collect();
+        drop(incoming);
+        let mut retired_guards: Vec<MutexGuard<'_, UnitState>> =
+            retiring.iter().map(|s| lock(&s.state)).collect();
         let mut next: HashMap<String, Arc<UnitSlot>> = HashMap::new();
         let mut rep = Reloaded::default();
-        // Old slots replaced by a new one or removed: retired once the new
-        // roster is complete (all or nothing).
-        let mut replaced: Vec<Arc<UnitSlot>> = Vec::new();
         let mut broken = Vec::new();
         for u in units {
             if !valid_unit_id(&u.unit) {
@@ -1044,9 +1065,8 @@ impl AnchorReceiver {
                 rep.kept += 1;
                 continue;
             }
-            // New or re-keyed: load under the old slot's state lock, so no
-            // request on it writes the file meanwhile.
-            let guard = old.map(|o| lock(&o.state));
+            // New or re-keyed: a re-keyed unit's old slot is locked above,
+            // so no request on it writes the file while it is loaded here.
             let st = match load_unit(&udir, &u.unit, &*u.verifier) {
                 Ok(st) => st,
                 Err(e) => {
@@ -1057,9 +1077,7 @@ impl AnchorReceiver {
                     }
                 }
             };
-            drop(guard);
-            if let Some(o) = old {
-                replaced.push(Arc::clone(o));
+            if old.is_some() {
                 rep.rekeyed.push(u.unit.clone());
             } else {
                 rep.added.push(u.unit.clone());
@@ -1073,17 +1091,19 @@ impl AnchorReceiver {
             );
         }
         let bindings = binding_map(&next, bindings)?;
-        for (unit, slot) in &roster.units {
+        for unit in roster.units.keys() {
             if !next.contains_key(unit) {
                 rep.removed.push(unit.clone());
-                replaced.push(Arc::clone(slot));
             }
         }
-        for s in &replaced {
-            lock(&s.state).broken = Some(SLOT_RETIRED.into());
+        #[cfg(test)]
+        tests::reload_hook();
+        for g in &mut retired_guards {
+            g.broken = Some(SLOT_RETIRED.into());
         }
         roster.units = next;
         roster.bindings = bindings;
+        drop(retired_guards);
         drop(roster);
         for (unit, e) in broken {
             self.write_alert(&unit, "state_unusable", &e, None, None);
@@ -2150,6 +2170,57 @@ mod tests {
             Some(SLOT_RETIRED),
             "the replaced slot must refuse further writes"
         );
+    }
+
+    thread_local! {
+        /// Called by `reload_units` after the new roster is built and
+        /// before it is committed (test only).
+        static RELOAD_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn reload_hook() {
+        RELOAD_HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    #[test]
+    fn a_rekeyed_slot_is_never_writable_during_the_reload() {
+        let d = TmpDir::new("reload-rekey-gap");
+        let r = receiver(&d.0);
+        r.advance(&mark(5, 1)).unwrap();
+        // A request that took the slot before the reload and has not yet
+        // taken its state lock.
+        let old = r.slot("ugv-07").unwrap();
+        let probe = Arc::clone(&old);
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let seen2 = Arc::clone(&seen);
+        RELOAD_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                // The new slot has loaded the state file. If the old slot's
+                // lock can be taken now, it must already refuse writes.
+                let r = match probe.state.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => "locked".to_string(),
+                    Ok(g) => format!("free, broken={:?}", g.broken),
+                    Err(std::sync::TryLockError::Poisoned(_)) => "poisoned".to_string(),
+                };
+                *lock(&seen2) = Some(r);
+            }))
+        });
+        let res = r.reload_units(vec![unit("ugv-07", &other_key())], &[]);
+        RELOAD_HOOK.with(|h| *h.borrow_mut() = None);
+        res.unwrap();
+        let seen = lock(&seen).clone();
+        assert!(
+            seen.as_deref() == Some("locked")
+                || seen.as_deref() == Some(&format!("free, broken={:?}", Some(SLOT_RETIRED))),
+            "between loading the new slot and retiring the old one, a request on the old \
+             slot could write the state file: {seen:?}"
+        );
+        assert_eq!(lock(&old.state).broken.as_deref(), Some(SLOT_RETIRED));
     }
 
     #[test]

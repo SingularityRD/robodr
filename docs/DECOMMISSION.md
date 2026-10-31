@@ -58,17 +58,58 @@ absent).
 Stopping `robodr-firewall-gw` does **not** take it out of the path: its
 rules stay and, with `on_gateway_down: fail_closed` (default), the bridge
 keeps dropping motion commands; `apt purge` leaves them too (OPERATIONS
-6.6). With the unit in a safe state:
+6.6). Stopping `robodr-firewall-gw-rules` removes nothing either: it has
+no stop action by design, and the package ships no teardown. The ruleset
+(`robodr-firewall-gw ruleset --config /etc/robodr/firewall-gw.json` prints
+it) installs, in the gateway box's network namespace:
+
+* jumps from `FORWARD` to the chains `ROBODR_GW` (queue), `ROBODR_GW_OBS`
+  (observe copies) and, with `webrtc`, `ROBODR_GW_RTC`, and jumps from the
+  `raw` table's `PREROUTING` to `ROBODR_GW_RAW`, all matched on the bridge
+  ports (`physdev`);
+* the nft bridge table `robodr_gw_l2` (drops everything but IPv4 and ARP
+  from the controller port: IPv6, VLAN and PPPoE stay blocked while it is
+  there) and, with `webrtc`, `robodr_gw_rtc`;
+* the `net.bridge.*` sysctls (`bridge-nf-call-iptables`, `-ip6tables`,
+  `-arptables`, `bridge-nf-filter-vlan-tagged`, `-pppoe-tagged` set to 1;
+  runtime values only, not written to any sysctl file).
+
+A chain cannot be deleted while a jump to it remains, so the jumps go
+first. With the unit in a safe state, as root:
 
 ```sh
-sudo systemctl disable --now robodr-firewall-gw robodr-firewall-gw-rules
-sudo iptables -F ROBODR_GW && sudo iptables -X ROBODR_GW   # the queue chain
-# then remove the bridge / re-cable the motion link as it was before
-# commissioning (site wiring record).
+systemctl disable --now robodr-firewall-gw robodr-firewall-gw-rules
+# queue.controller_port and queue.robot_port of /etc/robodr/firewall-gw.json:
+CTRL=enp2s0 ROBOT=enp3s0
+IPT=iptables   # the variant the ruleset ran with (its IPTABLES variable)
+while $IPT -D FORWARD -m physdev --physdev-in "$CTRL" -j ROBODR_GW 2>/dev/null; do :; done
+while $IPT -D FORWARD -m physdev --physdev-in "$CTRL" -j ROBODR_GW_RTC 2>/dev/null; do :; done
+while $IPT -D FORWARD -m physdev --physdev-in "$ROBOT" -j ROBODR_GW_OBS 2>/dev/null; do :; done
+for P in "$CTRL" "$ROBOT"; do
+  while $IPT -t raw -D PREROUTING -m physdev --physdev-in "$P" -j ROBODR_GW_RAW 2>/dev/null; do :; done
+done
+for C in ROBODR_GW ROBODR_GW_OBS ROBODR_GW_RTC; do
+  if $IPT -n -L "$C" >/dev/null 2>&1; then $IPT -F "$C"; $IPT -X "$C"; fi
+done
+if $IPT -t raw -n -L ROBODR_GW_RAW >/dev/null 2>&1; then
+  $IPT -t raw -F ROBODR_GW_RAW; $IPT -t raw -X ROBODR_GW_RAW
+fi
+nft delete table bridge robodr_gw_l2 2>/dev/null || true
+nft delete table bridge robodr_gw_rtc 2>/dev/null || true
+# check: both print nothing
+$IPT-save | grep ROBODR
+nft list tables | grep robodr_gw
 ```
 
-Proof: a motion command reaches the actuator controller without the
-gateway (bench test), recorded in the site log.
+Then remove the bridge / re-cable the motion link as it was before
+commissioning (site wiring record), and set the five `net.bridge.*`
+sysctls back to the values in that record (or reboot: with the rules unit
+disabled nothing sets them again; if `/etc/modules-load.d/robodr.conf`
+was installed for the gateway, remove its `br_netfilter` line first).
+
+Proof: the empty output of the checks above, and a motion command reaching
+the actuator controller without the gateway (bench test), recorded in the
+site log.
 
 ## 4. Retire the unit's keys at the SOC
 
@@ -88,7 +129,10 @@ the enrollment. The black-box key stays until step 8.
 * `--reason`: `end_of_life`, `transfer` or `repair`.
 * Air-gapped unit: `--request-out FILE`, carry it to the SOC, import it
   there, carry the answer back, `robodr-enroll decommission --answer FILE
-  --receipt-out FILE`.
+  --receipt-out FILE`. The request file has no expiry: whoever imports it
+  retires the unit's keys. Keep it in custody like the evidence export
+  and delete it from the media once the answer is back (fleet-api §5.6,
+  "Request age and request files").
 * Network down or no answer: run the same command again; the stored
   request is resent unchanged and the SOC answers with its stored answer.
   A request that may have reached the SOC is never dropped on the unit.
@@ -175,7 +219,8 @@ as SP 800-88 §4.7 describes.
 
 A decommissioned unit is commissioned again as a new one: after step 8 it
 gets fresh keys, an empty `/var/lib/robodr`, a new enrollment token
-(`robodr-enroll` refuses to enroll on top of a decommissioned state, and
+(`robodr-enroll` refuses to enroll while the fleet state directory holds a
+decommission record, `decommission.json`, whatever keys are on disk; and
 the SOC never registers a key id twice), a new depot enrolment and a new
 anchor-receiver entry.
 

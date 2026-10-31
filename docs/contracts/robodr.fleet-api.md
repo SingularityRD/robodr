@@ -548,6 +548,24 @@ operators did not plan is an incident. Retiring the keys of a unit that is
 lost, stolen or suspected compromised is a SOC-side operator action (no
 request from the unit), outside this API.
 
+**Request age and request files.** Processing above does not look at
+`created_at_ms`, and a stored request stays valid: the unit resends it
+unchanged after a lost answer, at any later time, and that must keep
+working. Online, §2.5 limits who can send it (a fresh timestamp and a
+signature by the listed `uplink` key on each HTTP request). A request
+**file** (`--request-out`, air-gapped units) carries no such freshness:
+whoever holds it can have it imported, at any time, and the import retires
+every key of the unit and so silences its monitoring. A request file is
+therefore handled as sensitive media (custody from the unit to the SOC
+like the black-box export it accompanies, never left on shared media).
+A SOC's file import must show the request (robot, reason, `created_at_ms`,
+listed keys) to an operator and apply it only on that operator's explicit
+confirmation; it may in addition refuse requests older than a bound the
+site sets, provided a replay of an already-applied request still gets the
+stored answer. The reference implementation in this repository
+(`crates/robodr-fleet/tests/common/soc.rs`) has no file import and no age
+bound; both are SOC (AutoSecOps) work.
+
 **Robot side.** `robodr-enroll decommission --reason R` refuses while an
 enrollment or a rotation is unfinished and when a key file does not hold
 the registered key; it builds the request once (stored byte-exact; resent

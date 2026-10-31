@@ -15,7 +15,10 @@
 //!    `relay` key (diode importer, `--diode-out`) authenticates at ingest
 //!    only, so this step is skipped for it and its registration is
 //!    confirmed by the first delivered batch; likewise when the SOC does
-//!    not serve the fleet API (`404 not_found`).
+//!    not serve the fleet API (exactly `404 not_found`, the contract's
+//!    answer for an unserved route: a `warn` line, exit 0). Any other 404
+//!    (another code, or a body that is not a contract error) fails the
+//!    check: the key is not confirmed.
 //!
 //! Nothing is written to the state directory, no lock is taken (it runs
 //! next to the service), and no batch id is consumed (the probe's random
@@ -205,7 +208,10 @@ pub fn run(
             ));
             done(lines, Outcome::Ok)
         }
-        Ok(r) if r.status == 404 => {
+        // Only the contract's own answer for an unserved route; any other
+        // 404 (a proxy's page, a wrong base path, an unknown code) leaves
+        // the key unconfirmed and fails below.
+        Ok(r) if r.status == 404 && code(&r) == "not_found" => {
             lines.push(
                 "warn key registration not checked: the SOC does not serve the fleet API; \
                  the first delivered batch confirms the key"
@@ -221,6 +227,11 @@ pub fn run(
                 }
                 "stale_timestamp" => "the unit clock is more than 300 s off the SOC's",
                 "bad_signature" => "the SOC registered another public key under this key id",
+                _ if r.status == 404 => {
+                    "the fleet ring endpoint answered with neither no_ring nor the contract's \
+                     not_found (a proxy or another service in the path?): the key is not \
+                     confirmed"
+                }
                 _ => "see the SOC's audit log",
             };
             done(

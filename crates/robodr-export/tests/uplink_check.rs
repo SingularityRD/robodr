@@ -29,6 +29,9 @@ enum Fleet {
     Served,
     /// No fleet API at all (`404 not_found`).
     Absent,
+    /// A 404 that is not the contract's `not_found` (a proxy's or another
+    /// service's page): the key is not confirmed, so the check fails.
+    Foreign404,
 }
 
 struct Soc {
@@ -93,6 +96,13 @@ impl Soc {
         if target == "/api/robot-edr/v2/fleet/ring" && method == "GET" {
             if self.fleet == Fleet::Absent {
                 return json(404, "not_found");
+            }
+            if self.fleet == Fleet::Foreign404 {
+                return HttpResponse {
+                    status: 404,
+                    retry_after: None,
+                    body: b"<html>Not Found</html>".to_vec(),
+                };
             }
             let (Some(id), Some(ts), Some(sig)) = (
                 header(h, "X-RoboDR-Key-Id"),
@@ -207,6 +217,14 @@ fn check_reports_each_failure_with_its_cause() {
     let r = run(&mut soc, false, NOW);
     assert!(
         matches!(&r.outcome, Outcome::Failed(e) if e.contains("bad_signature")),
+        "{r:?}"
+    );
+    // A 404 other than the contract's `not_found` (here a proxy page): the
+    // key was not confirmed, so the check must not pass.
+    let mut soc = Soc::new(Fleet::Foreign404);
+    let r = run(&mut soc, false, NOW);
+    assert!(
+        matches!(&r.outcome, Outcome::Failed(e) if e.contains("404 unknown")),
         "{r:?}"
     );
 }

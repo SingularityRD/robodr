@@ -22,7 +22,8 @@ Notes:
   output says `skip key registration`; the first delivered batch
   (`uplink-status.json` `last_delivery_at_ms`) confirms it. The same holds
   for a SOC that does not serve the fleet API (`warn key registration not
-  checked`).
+  checked`, exit 0), recognised only by the contract's `404 not_found`
+  answer on the fleet ring path; any other 404 there fails the check.
 * None of the checks take the services' locks; they run while the
   services run.
 * What the checks do not prove: that a finding travels end to end through
