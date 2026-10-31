@@ -101,7 +101,20 @@ Restart=on-failure
 RestartSec=10s
 # Exit 2 = usage / configuration error: restarting cannot fix it.
 RestartPreventExitStatus=2
+# Exit 3 = its own binary was replaced (RoboDR's package upgraded by the
+# agent itself; the postinst leaves this restart to it, T52): a clean stop
+# after the pass, started again on the new binary.
+SuccessExitStatus=3
+RestartForceExitStatus=3
 # A pass in progress finishes (or is recovered from its intent after a kill).
+# SIGTERM goes to the agent only: the dpkg run or probe it is waiting for
+# finishes with the pass instead of being signalled half-way, but only
+# within TimeoutStopSec=. At the timeout the agent, dpkg and anything else
+# left get SIGKILL, and the next start recovers from the write-ahead intent
+# (a half-done dpkg run is rolled back). install.dpkg_timeout_s (default
+# 900 s, up to 7200 s), and a pass's health probes together, can exceed
+# 5 min: raise TimeoutStopSec= in a drop-in where passes take that long.
+KillMode=mixed
 TimeoutStopSec=5min
 # Never the reason the motion stack is OOM-killed; below the robot's
 # processes for CPU and disk.

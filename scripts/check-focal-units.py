@@ -78,6 +78,7 @@ KNOWN_245 = {
     # [Service]
     "Type", "RemainAfterExit", "NotifyAccess", "ExecStart", "ExecStartPre", "ExecStartPost",
     "ExecStopPost", "Restart", "RestartSec", "RestartPreventExitStatus",
+    "SuccessExitStatus", "RestartForceExitStatus", "KillMode",
     "TimeoutStopSec", "TimeoutStartSec", "WatchdogSec", "EnvironmentFile",
     "Environment", "OOMScoreAdjust", "MemoryHigh", "MemoryMax",  # 231
     "TasksMax", "Nice", "IOSchedulingClass", "IOSchedulingPriority",
