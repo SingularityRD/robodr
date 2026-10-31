@@ -3000,6 +3000,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-signer"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-threat-forward"
 version = "0.1.0-alpha.1"
 dependencies = [
