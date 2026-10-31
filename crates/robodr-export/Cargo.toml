@@ -16,6 +16,7 @@ description = "Exporters for robodr.findings: agentd spool -> diode packer (robo
 # robodr_blackbox::tls); zeroize serves its SASL/SCRAM (hashes: the wiping
 # wrappers of robodr_blackbox::crypto).
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-agentd = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-diode = { workspace = true }

@@ -11,6 +11,7 @@ repository.workspace = true
 description = "One-way (data diode / controlled media) export of RoboDR findings and black-box bundles from an air-gapped unit to the SOC."
 
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-ocsf = { workspace = true }
 serde = { workspace = true }

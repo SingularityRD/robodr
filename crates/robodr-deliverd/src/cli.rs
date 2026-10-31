@@ -136,7 +136,10 @@ pub fn main_deliverd() -> i32 {
 /// Run one `robodr-deliverd` command line (without the program name).
 pub fn run_deliverd(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-deliverd {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-deliverd", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     if matches!(args.as_slice(), [a] if a == "--help" || a == "-h") {
@@ -576,7 +579,10 @@ pub fn main_replay() -> i32 {
 /// Run one `robodr-safety-replay` command line.
 pub fn run_replay(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-safety-replay {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-safety-replay", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     let a = match parse_args_with_switches(

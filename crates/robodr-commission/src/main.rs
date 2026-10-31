@@ -441,7 +441,10 @@ fn main() -> ExitCode {
             Ok(())
         }
         "--version" | "version" => {
-            println!("robodr-commission {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                robodr_buildinfo::version_line("robodr-commission", env!("CARGO_PKG_VERSION"))
+            );
             Ok(())
         }
         other => Err(Failure::Error(format!(

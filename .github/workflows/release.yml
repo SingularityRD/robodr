@@ -1,41 +1,73 @@
-# RoboDR release. Triggered by pushing a tag v<VERSION> (e.g. v0.1.0-alpha.2).
-# Procedure and verification on the air-gapped side: docs/OPERATIONS.md.
+# RoboDR release. Triggered by pushing a tag v<VERSION> (e.g. v0.1.0-alpha.2)
+# on main or on a release/X.Y long-term-support branch; or run by hand
+# (workflow_dispatch) as a DRY RUN that builds, checks and signs everything
+# with a throwaway key and publishes nothing (job publish-dry-run).
+# Procedure and verification on the air-gapped side: docs/OPERATIONS.md and
+# docs/RELEASE.md.
 #
 # Conventions copied from ci.yml (docs/BUILD.md):
-#  * Actions are pinned by full commit SHA (only GitHub's own checkout,
-#    upload-artifact and download-artifact; no third-party actions: the
-#    release is created and filled with the preinstalled `gh` CLI), and
-#    container images by multi-arch index digest. Cargo tools pinned by
-#    version + --locked.
+#  * Actions are pinned by full commit SHA (GitHub's own checkout,
+#    upload-artifact, download-artifact and attest-build-provenance; no
+#    third-party actions: the release is created and filled with the
+#    preinstalled `gh` CLI), and container images by multi-arch index
+#    digest. Cargo tools pinned by version + --locked; downloaded tools
+#    (cyclonedx-cli) by version + SHA-256.
 #  * Build jobs only read the repository (contents: read) and hand their
 #    assets to `publish` as workflow artifacts; only `prepare` (draft) and
 #    `publish` (upload, sign, publish) can write the release.
 #  * Every build is --locked against the COMMITTED Cargo.lock
 #    (scripts/ci-setup.sh fails without one), SOURCE_DATE_EPOCH = the tagged
-#    commit's time, --remap-path-prefix for checkout and CARGO_HOME.
+#    commit's time, --remap-path-prefix for checkout and CARGO_HOME. Every
+#    binary's --version names the commit (GITHUB_SHA), SOURCE_DATE_EPOCH and
+#    target (crates/robodr-buildinfo).
 #  * No build cache (rust-cache) in release jobs: a poisoned cache must not
 #    be able to reach a signed artefact.
+#
+# Gates before anything is built (`prepare`) and again right before signing
+# (`publish`), scripts/release-gate.py:
+#  * line: the tagged commit is on main (the release becomes "Latest") or
+#    on release/X.Y for version X.Y.* (a long-term-support line; never
+#    "Latest"). Protect release/* like main (required reviews and checks).
+#  * ci: ci.yml has a completed, successful push / workflow_dispatch /
+#    schedule run for exactly the tagged commit (waited for up to 2 h;
+#    pull_request runs test a merge commit and do not count). Make ci.yml's
+#    jobs required checks of main and release/* in branch protection.
 #
 # Outputs, per architecture (amd64, arm64; docs/BUILD.md "Package matrix"):
 #   robodr_<debver>_<arch>.deb                  Debian package, built in Ubuntu
 #                                               22.04 (glibc 2.35): Ubuntu 22.04 /
 #                                               24.04, JetPack 6, Debian 12 / 13
 #   robodr-<ver>-<arch>-offline.tar.gz          its air-gapped install bundle
-#   robodr-<ver>-<arch>-sbom.tar.gz             CycloneDX SBOMs (cargo-cyclonedx)
+#   robodr-<ver>-<arch>-sbom.tar.gz             CycloneDX 1.5 SBOMs (cargo-cyclonedx
+#                                               + Rust std, eBPF objects, toolchain)
 #   SHA256SUMS-<arch>                           per-arch hashes (build job)
 #   robodr-<rpmver>-1.<x86_64|aarch64>.rpm      RPM, built in Rocky Linux 9
 #                                               (glibc 2.34): RHEL / Rocky / Alma 9,
 #                                               Fedora
 #   robodr-<ver>-<arch>-rpm-offline.tar.gz      its air-gapped install bundle
 #                                               (same install-bundle.sh, rpm -U)
+#   robodr-<ver>-rpm-<arch>-sbom.tar.gz         its CycloneDX SBOMs
 #   SHA256SUMS-rpm-<arch>                       per-arch hashes (build-rpm job)
-#   robodr-focal_<debver>_<arch>.deb            static (musl) build for systemd
+#   robodr-focal_<debver>_<arch>.deb            static-pie (musl) build for systemd
 #                                               245 / glibc 2.31 hosts (JetPack 5,
 #                                               Ubuntu 20.04)
 #   robodr-focal-<ver>-<arch>-offline.tar.gz    its install bundle
+#   robodr-focal-<ver>-<arch>-sbom.tar.gz       its CycloneDX SBOMs (+ musl, libunwind)
 #   SHA256SUMS-focal-<arch>                     per-arch hashes (build-static job)
-# and once: SHA256SUMS (all assets) plus a minisign signature (*.minisig) for
-# every asset and for SHA256SUMS.
+# and once:
+#   robodr-<ver>-rpk.tar.gz                     UNSIGNED secure-delivery RPKs (robodr,
+#                                               robodr-focal, rules) and
+#                                               DELIVERY-MANIFEST.json for the
+#                                               offline 2-of-N ceremony (job delivery)
+#   REPRODUCIBILITY-<ver>.txt                   independent-rebuild result and the
+#                                               toolchain inputs of every build
+#   robodr-<ver>.openvex.json                   OpenVEX (security/vex/statements.json)
+#   robodr-<ver>.intoto.jsonl                   SLSA v1 provenance of every asset
+#   SHA256SUMS                                  all assets
+# plus a minisign signature (*.minisig) for every asset and for SHA256SUMS,
+# and a GitHub (Sigstore) build-provenance attestation of every asset in
+# SHA256SUMS (`gh attestation verify <file> -R <repo>`: an online check; the
+# minisign signatures stay the offline root of trust).
 #
 # Signing: minisign, because its signatures verify fully offline with one
 # pinned public key on the entry station (no transparency-log or OIDC
@@ -49,10 +81,10 @@
 #            ROBODR_RELEASE=1, so an unset or placeholder value (.invalid,
 #            example.*, localhost) fails them (packaging/release-maintainer.sh)
 #   environment "release" holding the secrets, with required reviewers.
-# TODO(cosign): add keyless cosign signatures / SLSA provenance as a second,
-# online-verifiable layer. That needs sigstore/cosign-installer: pin it by
-# full commit SHA (resolved with `git ls-remote --tags`) before adding it;
-# do not use a tag ref.
+# A dry run (workflow_dispatch) never enters the "release" environment: its
+# publish-dry-run job generates a throwaway minisign key, signs, verifies,
+# and uploads everything with the TEST-ONLY public key as a workflow
+# artifact. The delivery keys (RPK release quorum) never reach CI at all.
 #
 # Reproducibility, two layers:
 #  1. In each build job the pure binaries are built twice from different
@@ -76,13 +108,21 @@
 #     byte is compared, and whether the rebuilt robodr-pulsard matched is
 #     recorded in REPRODUCIBILITY-<version>.txt, a signed release asset that
 #     is also appended to the release notes.
-# The tagged commit must be on main (git merge-base --is-ancestor), checked
-# in `prepare` and again in `publish` before anything is signed.
+#
+# Toolchain inputs: every build and rebuild job records what it got from
+# outside the repository (container digest, rustc, the target's rust-std,
+# every C / eBPF toolchain package with version and fingerprint;
+# scripts/release-toolchain-inputs.sh), checked against
+# scripts/release-toolchain-inputs.lock where that has lines for the job;
+# `publish` appends all records to REPRODUCIBILITY-<version>.txt.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  # Dry run from any branch: everything is built, checked and signed with a
+  # throwaway key; nothing is published and no secret is used.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -96,44 +136,71 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   ROBODR_CRATES_MIRROR: ${{ vars.ROBODR_CRATES_MIRROR }}
-  # Same pin as ci.yml.
+  # Same pin as ci.yml. --spec-version 1.5: the release SBOMs carry a
+  # CycloneDX 1.5 formulation (scripts/metadata_to_cyclonedx.py --augment).
   CARGO_CYCLONEDX_VERSION: 0.5.9
+  CYCLONEDX_ARGS: --spec-version 1.5
+  # Official CycloneDX schema validation of every release SBOM (publish).
+  # SHA-256 of the v0.27.2 cyclonedx-linux-x64 release binary, recorded from
+  # its download on 2026-10-31 (the project publishes no checksum file for
+  # this release): bump both together and re-check the hash on two hosts.
+  CYCLONEDX_CLI_VERSION: 0.27.2
+  CYCLONEDX_CLI_SHA256: 5e1595542a6367378a3944bbd3008caab3de65d572345361d3b9597b1dbbaaa0
 
 jobs:
   # ---------------------------------------------------------------------------
   prepare:
-    name: Check tag, create draft release
+    name: Check tag, release line and CI; create draft release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # gh api .../actions/workflows/ci.yml/runs (the CI gate).
+      actions: read
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      latest: ${{ steps.line.outputs.latest }}
+      dry_run: ${{ steps.mode.outputs.dry_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Every branch: the tagged commit must be on main.
+          # Every branch: the tagged commit must be on main or release/X.Y.
           fetch-depth: 0
-      - name: The tagged commit is on main
+      - name: Release tooling self-tests (gates, SBOM, RPK, VEX, provenance, toolchain record)
         run: |
-          commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
-          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null ||
-            { echo "::error::origin/main not fetched"; exit 1; }
-          if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
-            echo "::error::tag $GITHUB_REF_NAME points at $commit, which is not on main: only reviewed, merged commits are released"
-            exit 1
-          fi
-      - name: Tag, VERSION, CHANGELOG and Cargo.lock agree
+          python3 scripts/release-gate.py --self-test
+          python3 scripts/metadata_to_cyclonedx.py --self-test
+          python3 scripts/release-rpk.py --self-test
+          python3 scripts/vex.py --self-test
+          python3 scripts/slsa-provenance.py --self-test
+          scripts/release-toolchain-inputs.sh --self-test
+      - name: Release or dry run
+        id: mode
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+          push)
+            test "$GITHUB_REF_TYPE" = tag || { echo "::error::a release is a tag push"; exit 1; }
+            echo "dry_run=false" >> "$GITHUB_OUTPUT" ;;
+          workflow_dispatch)
+            echo "::notice::DRY RUN of $GITHUB_REF_NAME ($GITHUB_SHA): nothing is published; signed with a throwaway key"
+            echo "dry_run=true" >> "$GITHUB_OUTPUT" ;;
+          *) echo "::error::unexpected event $GITHUB_EVENT_NAME"; exit 1 ;;
+          esac
+      - name: VERSION, CHANGELOG, Cargo.toml and Cargo.lock agree (and the tag, for a release)
         id: meta
+        env:
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
         run: |
           version="$(tr -d '[:space:]' < VERSION)"
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version); tag must be v$version"
-            exit 1
-          fi
-          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
-            echo "::error file=CHANGELOG.md::no '## [$version]' section"
-            exit 1
+          if [ "$DRY_RUN" = false ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($version); tag must be v$version"
+              exit 1
+            fi
+            if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+              echo "::error file=CHANGELOG.md::no '## [$version]' section"
+              exit 1
+            fi
           fi
           # The binaries print CARGO_PKG_VERSION (--version, agentd's
           # product_version in every finding, the SBOM): it must be the
@@ -159,21 +226,53 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Release line (main, or release/X.Y long-term support)
+        id: line
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: |
+          if python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" > "$RUNNER_TEMP/line"; then
+            cat "$RUNNER_TEMP/line" >> "$GITHUB_OUTPUT"
+            cat "$RUNNER_TEMP/line"
+          elif [ "$DRY_RUN" = true ]; then
+            echo "::warning::dry run of a commit that could not be released from (not on main or release/X.Y)"
+            printf 'line=none\nlatest=false\n' >> "$GITHUB_OUTPUT"
+          else
+            exit 1
+          fi
+      - name: CI passed for this commit (ci.yml)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" ||
+              echo "::warning::dry run of a commit without a green CI run"
+          else
+            python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --wait-minutes 120
+          fi
       - name: Release notes from CHANGELOG
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
         run: |
-          awk -v v="$VERSION" '
-            index($0, "## [" v "]") == 1 { on = 1; next }
+          heading="## [$VERSION]"
+          [ "$DRY_RUN" = true ] && heading="## [Unreleased]"
+          awk -v h="$heading" '
+            index($0, h) == 1 { on = 1; next }
             on && /^## \[/ { exit }
             on { print }
           ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          [ "$DRY_RUN" = true ] && [ ! -s "$RUNNER_TEMP/notes.md" ] && echo "(dry run)" > "$RUNNER_TEMP/notes.md"
           test -s "$RUNNER_TEMP/notes.md"
-      - name: Create draft release
+      - name: Create draft release (not in a dry run)
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
         run: |
+          if [ "$DRY_RUN" = true ]; then echo "dry run: no release created"; exit 0; fi
           pre=""
           case "$VERSION" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
@@ -215,6 +314,7 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      ROBODR_BUILD_IMAGE: docker.io/library/ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
     steps:
       - name: git for actions/checkout (the image has none)
         run: |
@@ -232,6 +332,12 @@ jobs:
           scripts/ci-install-ebpf-toolchain.sh
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
+      - name: Toolchain inputs (recorded; checked against the lock)
+        run: |
+          mkdir -p dist/release
+          scripts/release-toolchain-inputs.sh "deb-$ARCH" --lock scripts/release-toolchain-inputs.lock \
+            > "dist/release/TOOLCHAIN-INPUTS-deb-$ARCH.txt"
+          cat "dist/release/TOOLCHAIN-INPUTS-deb-$ARCH.txt"
       - name: Reproducibility proof (pure binaries, two paths)
         env:
           REPRO_REQUIRE_BINARIES: "1"
@@ -242,14 +348,24 @@ jobs:
         run: |
           test -s dist/repro/SHA256SUMS
           (cd target/release && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro/SHA256SUMS")
+      - name: --version names this commit, SOURCE_DATE_EPOCH and target
+        run: |
+          epoch="$(git log -1 --format=%ct)"
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          for b in robodr-agentd robodr-executor robodr-uplink robodr-seal; do
+            o="$(target/release/$b --version)"
+            echo "$o"
+            case "$o" in *"$VERSION (commit $GITHUB_SHA, source-date-epoch $epoch, target $triple)"*) ;; *) exit 1 ;; esac
+          done
       - name: Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
-      - name: SBOM (CycloneDX)
+      - name: SBOM (CycloneDX 1.5; + Rust std, eBPF objects, toolchain)
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          scripts/release-sbom-augment.sh dist/sbom target/release/build
       - name: Debian package (Depends from dpkg-shlibdeps, libc6 floor checked)
         env:
           # A release must never ship without the daemons and their tools.
@@ -286,9 +402,10 @@ jobs:
     # robodr .rpm in a Rocky Linux 9 container: glibc 2.34, OpenSSL 3,
     # SQLite 3.34, the oldest RPM userland supported (RHEL / Rocky / Alma 9,
     # Fedora). Same file tree as the .deb (build-deb.sh --stage-only), own
-    # binaries (another glibc), own reproducibility proof. The SBOM tarball
-    # of the build job covers it (same Cargo.lock, same crates); the system
-    # libraries it links are the distribution's, as for the .deb.
+    # binaries (another glibc), own reproducibility proof and its own SBOM
+    # archive (robodr-<ver>-rpm-<arch>-sbom.tar.gz: the same crates, another
+    # toolchain userland). The system libraries it links are the
+    # distribution's, as for the .deb.
     name: Build and package robodr .rpm (${{ matrix.arch }})
     needs: prepare
     runs-on: ${{ matrix.runner }}
@@ -314,6 +431,7 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      ROBODR_BUILD_IMAGE: quay.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
     steps:
       - name: git for actions/checkout
         run: dnf install -y --setopt=install_weak_deps=False git
@@ -329,6 +447,12 @@ jobs:
           scripts/ci-install-ebpf-toolchain.sh
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
+      - name: Toolchain inputs (recorded; checked against the lock)
+        run: |
+          mkdir -p dist/release
+          scripts/release-toolchain-inputs.sh "rpm-$ARCH" --lock scripts/release-toolchain-inputs.lock \
+            > "dist/release/TOOLCHAIN-INPUTS-rpm-$ARCH.txt"
+          cat "dist/release/TOOLCHAIN-INPUTS-rpm-$ARCH.txt"
       - name: Reproducibility proof (pure binaries, two paths)
         env:
           REPRO_REQUIRE_BINARIES: "1"
@@ -341,6 +465,13 @@ jobs:
           (cd target/release && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro/SHA256SUMS")
       - name: Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
+      - name: SBOM (CycloneDX 1.5; + Rust std, eBPF objects, toolchain)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          scripts/release-sbom-augment.sh dist/sbom target/release/build
       - name: RPM package (generated GLIBC requirement checked)
         env:
           ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal robodr-depot
@@ -354,7 +485,11 @@ jobs:
           python3 scripts/check-packages.py --rpm "$rpm"
           # Offline bundle for RPM hosts (install-bundle.sh drives rpm -U).
           packaging/make-bundle.sh --rpm "$rpm" --out dist/release
-          (cd dist/release && sha256sum robodr-*.rpm robodr-*-rpm-offline.tar.gz > "SHA256SUMS-rpm-$ARCH")
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mode=go-w \
+              --mtime="@$SOURCE_DATE_EPOCH" \
+              --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              -C dist -cf - sbom | gzip -9 -n > "dist/release/robodr-$VERSION-rpm-$ARCH-sbom.tar.gz"
+          (cd dist/release && sha256sum robodr-*.rpm robodr-*-rpm-offline.tar.gz robodr-*-rpm-*-sbom.tar.gz > "SHA256SUMS-rpm-$ARCH")
           cat "dist/release/SHA256SUMS-rpm-$ARCH"
       - name: Hand the assets to smoke and publish
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -366,12 +501,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   build-static:
-    # robodr-focal: the pure binaries as static musl executables (no libc6
-    # dependency) with systemd 245 units, for Ubuntu 20.04 / NVIDIA JetPack 5
-    # hosts such as Unitree EDU computers (docs/UNITREE.md 3.2, docs/BUILD.md
-    # "Static (musl) build"). Both targets are cross-linked with rust-lld on
-    # the x86-64 runner (ring's C/assembly built with clang); no
-    # robodr-pulsard (needs a BTF kernel).
+    # robodr-focal: the pure binaries as static-pie musl executables (no
+    # libc6 dependency, image randomised by ASLR) with systemd 245 units, for
+    # Ubuntu 20.04 / NVIDIA JetPack 5 hosts such as Unitree EDU computers
+    # (docs/UNITREE.md 3.2, docs/BUILD.md "Static (musl) build"). Both
+    # targets are cross-linked with rust-lld on the x86-64 runner (arm64
+    # through scripts/static-pie-ld; ring's C/assembly built with clang);
+    # no robodr-pulsard (needs a BTF kernel).
     name: Build and package robodr-focal (${{ matrix.arch }})
     needs: prepare
     runs-on: ubuntu-24.04
@@ -389,6 +525,9 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
       TARGET: ${{ matrix.target }}
+      # build-static.sh: every binary must be ET_DYN (static-pie).
+      ROBODR_REQUIRE_STATIC_PIE: "1"
+      ROBODR_REQUIRE_STATIC_PIE_TEST: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -400,43 +539,62 @@ jobs:
           rustup target add "$TARGET"
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
-      - name: Linker (rust-lld, self-contained musl)
-        run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: qemu-user (arm64 smoke runs and the static-pie linker test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+      - name: Linker (rust-lld; arm64 through scripts/static-pie-ld), tested
+        run: |
+          if [ "$TARGET" = aarch64-unknown-linux-musl ]; then
+            linker="$GITHUB_WORKSPACE/scripts/static-pie-ld"
+            scripts/test-static-pie-ld.sh
+          else
+            linker=rust-lld
+          fi
+          echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=$linker" >> "$GITHUB_ENV"
       - name: Pinned C compiler (clang 18.1.3, ring's C/assembly; scripts/c-toolchain.sh)
         # ci-repro.sh / build-static.sh set CC_<triple> to it and fail on
         # any other compiler (no fallback to cc).
         run: scripts/ci-install-clang.sh
+      - name: Toolchain inputs (recorded; checked against the lock)
+        run: |
+          mkdir -p dist/release
+          scripts/release-toolchain-inputs.sh "focal-$ARCH" --lock scripts/release-toolchain-inputs.lock \
+            > "dist/release/TOOLCHAIN-INPUTS-focal-$ARCH.txt"
+          cat "dist/release/TOOLCHAIN-INPUTS-focal-$ARCH.txt"
       - name: Reproducibility proof (pure binaries, two paths, musl)
         env:
           REPRO_REQUIRE_BINARIES: "1"
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: scripts/ci-repro.sh dist/repro-static
-      - name: Static release build, checked (no interpreter, no shared library)
+      - name: Static release build, checked (static-pie, no interpreter, no shared library)
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           scripts/build-static.sh "$TARGET" --out "dist/static/$TARGET"
       - name: Released static binaries == reproduced binaries
         run: (cd "dist/static/$TARGET" && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro-static/SHA256SUMS")
-      - name: Smoke run (native, or qemu-user for arm64)
+      - name: Smoke run (native, or qemu-user for arm64); --version names the build
         run: |
           run=""
-          if [ "$ARCH" = arm64 ]; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends qemu-user-static
-            run=qemu-aarch64-static
-          fi
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot; do
-            $run "dist/static/$TARGET/$b" --version
+          [ "$ARCH" = arm64 ] && run=qemu-aarch64-static
+          epoch="$(git log -1 --format=%ct)"
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-deliverd robodr-seal robodr-depot; do
+            o="$($run "dist/static/$TARGET/$b" --version)"
+            echo "$o"
+            case "$o" in *"$VERSION (commit $GITHUB_SHA, source-date-epoch $epoch, target $TARGET)"*) ;; *) exit 1 ;; esac
           done
+          # robodr-firewall-gw prints its version only (until the gateway merge).
+          $run "dist/static/$TARGET/robodr-firewall-gw" --version
       - name: Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
-      - name: SBOM (CycloneDX)
+      - name: SBOM (CycloneDX 1.5; + Rust std, musl, libunwind, toolchain)
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
-      - name: robodr-focal package and offline bundle
+          scripts/release-sbom-augment.sh dist/sbom
+      - name: robodr-focal package, offline bundle and SBOM archive
         env:
           ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot
           ROBODR_RELEASE: "1"
@@ -445,7 +603,16 @@ jobs:
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           deb=$(packaging/build-deb.sh --variant focal --bin-dir "dist/static/$TARGET" --arch "$ARCH" --out dist/release)
           test "$(dpkg-deb -f "$deb" Depends)" = "systemd (>= 245)"
+          # The packaged programs are the checked static-pie ones.
+          dpkg-deb -x "$deb" "$RUNNER_TEMP/focal-root"
+          mkdir -p "$RUNNER_TEMP/focal-bins"
+          cp "$RUNNER_TEMP"/focal-root/usr/bin/robodr-* "$RUNNER_TEMP"/focal-root/usr/sbin/robodr-* "$RUNNER_TEMP/focal-bins/"
+          scripts/build-static.sh "$TARGET" --check-dir "$RUNNER_TEMP/focal-bins"
           packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out dist/release
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mode=go-w \
+              --mtime="@$SOURCE_DATE_EPOCH" \
+              --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              -C dist -cf - sbom | gzip -9 -n > "dist/release/robodr-focal-$VERSION-$ARCH-sbom.tar.gz"
           (cd dist/release && sha256sum robodr-focal* > "SHA256SUMS-focal-$ARCH")
           cat "dist/release/SHA256SUMS-focal-$ARCH"
       - name: Hand the assets to smoke and publish
@@ -526,6 +693,7 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      ROBODR_BUILD_IMAGE: docker.io/library/ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
     steps:
       - name: git for actions/checkout (the image has none)
         run: |
@@ -559,6 +727,8 @@ jobs:
           ROBODR_RELEASE: "1"
           DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
         run: scripts/ci-rebuild.sh deb "$ARCH" dist/rebuild "$RUNNER_TEMP/release"
+      - name: Toolchain inputs of the rebuild (recorded)
+        run: scripts/release-toolchain-inputs.sh "rebuild-deb-$ARCH" > "dist/rebuild/TOOLCHAIN-INPUTS-rebuild-deb-$ARCH.txt"
       - name: Hand the rebuild to publish
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -593,6 +763,7 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      ROBODR_BUILD_IMAGE: quay.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
     steps:
       - name: git for actions/checkout
         run: dnf install -y --setopt=install_weak_deps=False git
@@ -622,6 +793,8 @@ jobs:
           ROBODR_RELEASE: "1"
           DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
         run: scripts/ci-rebuild.sh rpm "$ARCH" dist/rebuild "$RUNNER_TEMP/release"
+      - name: Toolchain inputs of the rebuild (recorded)
+        run: scripts/release-toolchain-inputs.sh "rebuild-rpm-$ARCH" > "dist/rebuild/TOOLCHAIN-INPUTS-rebuild-rpm-$ARCH.txt"
       - name: Hand the rebuild to publish
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -650,6 +823,7 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
       TARGET: ${{ matrix.target }}
+      ROBODR_REQUIRE_STATIC_PIE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -662,8 +836,11 @@ jobs:
           scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust" "$TARGET"
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
-      - name: Linker (rust-lld, self-contained musl)
-        run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: Linker (rust-lld; arm64 through scripts/static-pie-ld, as build-static)
+        run: |
+          linker=rust-lld
+          [ "$TARGET" = aarch64-unknown-linux-musl ] && linker="$GITHUB_WORKSPACE/scripts/static-pie-ld"
+          echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=$linker" >> "$GITHUB_ENV"
       - name: Pinned C compiler (clang 18.1.3; scripts/c-toolchain.sh)
         run: scripts/ci-install-clang.sh
       - name: Install cargo-cyclonedx
@@ -674,6 +851,8 @@ jobs:
           ROBODR_RELEASE: "1"
           DEB_MAINTAINER: ${{ vars.ROBODR_MAINTAINER }}
         run: scripts/ci-rebuild.sh focal "$ARCH" dist/rebuild
+      - name: Toolchain inputs of the rebuild (recorded)
+        run: scripts/release-toolchain-inputs.sh "rebuild-focal-$ARCH" > "dist/rebuild/TOOLCHAIN-INPUTS-rebuild-focal-$ARCH.txt"
       - name: Hand the rebuild to publish
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -683,14 +862,70 @@ jobs:
           retention-days: 90
 
   # ---------------------------------------------------------------------------
+  delivery:
+    # Secure delivery (docs/SECURE-DELIVERY.md, docs/RELEASE.md "Secure
+    # delivery"): the release's robodr and robodr-focal .deb and the rules of
+    # this commit as UNSIGNED RPKs, built with this commit's robodr-release
+    # (each twice; digests must agree), plus DELIVERY-MANIFEST.json. The
+    # release quorum signs them offline (2-of-N); no delivery key is in CI.
+    name: Unsigned delivery RPKs
+    needs: [prepare, build, build-static]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: robodr-release of this commit
+        run: cargo build --release --locked -p robodr-release
+      - name: The .deb packages and SBOM archives of the build jobs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/assets
+      - name: Build the RPKs and the delivery manifest
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python3 scripts/release-rpk.py --version "$VERSION" --assets "$RUNNER_TEMP/assets" \
+            --rules rules/robodr --robodr-release target/release/robodr-release --out dist/delivery/rpk
+          mkdir -p dist/delivery-asset
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mode=go-w \
+              --mtime="@$SOURCE_DATE_EPOCH" \
+              --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+              -C dist/delivery -cf - rpk | gzip -9 -n > "dist/delivery-asset/robodr-$VERSION-rpk.tar.gz"
+          cat dist/delivery/rpk/DELIVERY-MANIFEST.json
+      - name: Hand the RPK archive to publish
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-rpk-${{ github.sha }}
+          path: dist/delivery-asset
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
   publish:
-    name: Checksums, sign, publish
-    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static]
+    name: Checksums, provenance, sign, publish
+    if: github.event_name == 'push'
+    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static, delivery]
     runs-on: ubuntu-24.04
     # Secrets live in this environment only; give it required reviewers.
     environment: release
     permissions:
       contents: write
+      actions: read
+      # actions/attest-build-provenance (Sigstore certificate via OIDC, and
+      # the attestation store).
+      id-token: write
+      attestations: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       GH_TOKEN: ${{ github.token }}
@@ -699,18 +934,22 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: The tagged commit is on main (again, right before signing)
+      - name: Release line and CI (again, right before signing)
+        id: line
         run: |
-          commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
-          if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
-            echo "::error::tag $GITHUB_REF_NAME points at $commit, which is not on main"
-            exit 1
-          fi
-      - name: Install minisign (and rpm2archive for the rebuild comparison)
+          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" | tee -a "$GITHUB_OUTPUT"
+          python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+      - name: Install minisign, rpm2archive (rebuild comparison) and cyclonedx-cli (SBOM schema)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends minisign rpm
           minisign -v
+          curl -fsSL -o "$RUNNER_TEMP/cyclonedx" \
+            "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v$CYCLONEDX_CLI_VERSION/cyclonedx-linux-x64"
+          echo "$CYCLONEDX_CLI_SHA256  $RUNNER_TEMP/cyclonedx" | sha256sum --strict -c
+          chmod +x "$RUNNER_TEMP/cyclonedx"
+          echo "ROBODR_CYCLONEDX_CLI=$RUNNER_TEMP/cyclonedx" >> "$GITHUB_ENV"
+          echo "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1" >> "$GITHUB_ENV"
       - name: Download the build jobs' assets
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -725,54 +964,31 @@ jobs:
           path: ${{ runner.temp }}/rebuild
       - name: List assets
         run: ls -l "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild"
-      - name: Independent rebuild == release (binaries, packages, bundles), recorded
-        # Fails (nothing is signed) on any difference except robodr-pulsard's
-        # own reproducibility, which is recorded either way in the signed
-        # REPRODUCIBILITY-<version>.txt (scripts/compare-rebuild.py).
-        run: |
-          python3 scripts/compare-rebuild.py --release "$RUNNER_TEMP/rel" --rebuild "$RUNNER_TEMP/rebuild" \
-            --version "$VERSION" --out "$RUNNER_TEMP/rel/REPRODUCIBILITY-$VERSION.txt"
-          cat "$RUNNER_TEMP/rel/REPRODUCIBILITY-$VERSION.txt"
-      - name: Check per-arch hashes, write SHA256SUMS
-        working-directory: ${{ runner.temp }}/rel
-        run: |
-          for a in amd64 arm64 rpm-amd64 rpm-arm64 focal-amd64 focal-arm64; do
-            test -s "SHA256SUMS-$a"
-            sha256sum --strict -c "SHA256SUMS-$a"
-          done
-          rm -f SHA256SUMS *.minisig
-          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%P\n' | LC_ALL=C sort |
-            xargs -r -d '\n' sha256sum > SHA256SUMS
-          cat SHA256SUMS
-      - name: Sign (minisign)
-        working-directory: ${{ runner.temp }}/rel
+      - name: Rebuild comparison, toolchain record, SBOM gate, VEX, provenance, SHA256SUMS
+        # Fails (nothing is signed) on any rebuild difference except
+        # robodr-pulsard's own reproducibility (recorded either way), on an
+        # incomplete or schema-invalid SBOM, or on a per-arch hash mismatch.
+        run: scripts/release-finalize.sh "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild" "$VERSION"
+      - name: Sign (minisign) and self-verify with the published public key
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: |
-          test -n "$MINISIGN_SECRET_KEY" || { echo "::error::MINISIGN_SECRET_KEY secret is not set"; exit 1; }
-          umask 077
-          key="$RUNNER_TEMP/minisign.key"
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
-          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
-          for f in $(find . -maxdepth 1 -type f ! -name '*.minisig' -printf '%P\n' | LC_ALL=C sort); do
-            if [ -n "$MINISIGN_PASSWORD" ]; then
-              printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$f" -t "robodr $VERSION $f"
-            else
-              minisign -S -s "$key" -m "$f" -t "robodr $VERSION $f" < /dev/null
-            fi
-          done
-      - name: Self-verify signatures with the published public key
-        working-directory: ${{ runner.temp }}/rel
-        env:
           PUBKEY: ${{ vars.ROBODR_MINISIGN_PUBKEY }}
         run: |
           test -n "$PUBKEY" || { echo "::error::repository variable ROBODR_MINISIGN_PUBKEY is not set"; exit 1; }
-          for f in $(find . -maxdepth 1 -type f ! -name '*.minisig' -printf '%P\n'); do
-            minisign -V -q -P "$PUBKEY" -m "$f"
-          done
+          scripts/release-sign.sh "$RUNNER_TEMP/rel" "$VERSION" "$PUBKEY"
+      - name: Provenance matches the signed assets
+        run: |
+          python3 scripts/slsa-provenance.py verify --provenance "$RUNNER_TEMP/rel/robodr-$VERSION.intoto.jsonl" \
+            --assets "$RUNNER_TEMP/rel" --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME"
+      - name: GitHub build-provenance attestation (Sigstore) of every asset in SHA256SUMS
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/rel/SHA256SUMS
       - name: Upload assets, checksums and signatures, publish
         working-directory: ${{ runner.temp }}/rel
+        env:
+          LATEST: ${{ steps.line.outputs.latest }}
         run: |
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber ./*
           # The reproducibility record (signed asset) in the release notes too.
@@ -784,8 +1000,77 @@ jobs:
             echo "Signed record: \`REPRODUCIBILITY-$VERSION.txt\` (with \`.minisig\`, listed in \`SHA256SUMS\`)."
             echo
             echo '```'
-            cat "REPRODUCIBILITY-$VERSION.txt"
+            sed -n '1,/^Toolchain inputs/p' "REPRODUCIBILITY-$VERSION.txt"
             echo '```'
           } >> "$RUNNER_TEMP/notes.md"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          # An older release line (release/X.Y) never becomes "Latest".
+          case "$LATEST" in true|false) ;; *) echo "::error::release line output missing"; exit 1 ;; esac
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$LATEST"
+
+  # ---------------------------------------------------------------------------
+  publish-dry-run:
+    # workflow_dispatch only: the publish job's checks and signing with a
+    # THROWAWAY minisign key generated here (no environment, no secret, no
+    # release, no attestation); the signed set and the TEST-ONLY public key
+    # are a workflow artifact. Verify it like a release:
+    #   minisign -V -p TEST-ONLY-dry-run-minisign.pub -m <asset>
+    name: Dry run - checksums, provenance, sign with a throwaway key
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, build, build-rpm, build-static, smoke, rebuild-deb, rebuild-rpm, rebuild-static, delivery]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install minisign, rpm2archive and cyclonedx-cli
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign rpm
+          curl -fsSL -o "$RUNNER_TEMP/cyclonedx" \
+            "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v$CYCLONEDX_CLI_VERSION/cyclonedx-linux-x64"
+          echo "$CYCLONEDX_CLI_SHA256  $RUNNER_TEMP/cyclonedx" | sha256sum --strict -c
+          chmod +x "$RUNNER_TEMP/cyclonedx"
+          echo "ROBODR_CYCLONEDX_CLI=$RUNNER_TEMP/cyclonedx" >> "$GITHUB_ENV"
+          echo "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1" >> "$GITHUB_ENV"
+      - name: Download the build jobs' assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rel
+      - name: Download the independent rebuilds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rebuild-*-${{ github.sha }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rebuild
+      - name: Rebuild comparison, toolchain record, SBOM gate, VEX, provenance, SHA256SUMS
+        run: scripts/release-finalize.sh "$RUNNER_TEMP/rel" "$RUNNER_TEMP/rebuild" "$VERSION"
+      - name: Sign with a throwaway key (TEST ONLY) and verify
+        run: |
+          umask 077
+          k="$RUNNER_TEMP/TEST-ONLY-key"
+          mkdir -p "$k"
+          pw="$(head -c 24 /dev/urandom | base64)"
+          printf '%s\n%s\n' "$pw" "$pw" | minisign -G -p "$k/TEST-ONLY.pub" -s "$k/TEST-ONLY.key" >/dev/null
+          MINISIGN_SECRET_KEY="$(cat "$k/TEST-ONLY.key")" MINISIGN_PASSWORD="$pw" \
+            scripts/release-sign.sh "$RUNNER_TEMP/rel" "$VERSION" "$(sed -n 2p "$k/TEST-ONLY.pub")"
+          shred -u "$k/TEST-ONLY.key"
+          mkdir -p dist/dry-run
+          cp "$RUNNER_TEMP"/rel/* dist/dry-run/
+          cp "$k/TEST-ONLY.pub" dist/dry-run/TEST-ONLY-dry-run-minisign.pub
+          python3 scripts/slsa-provenance.py verify --provenance "dist/dry-run/robodr-$VERSION.intoto.jsonl" \
+            --assets "$RUNNER_TEMP/rel" --commit "$GITHUB_SHA"
+      - name: Hand the dry-run release to the person who started it
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dry-run-${{ github.sha }}
+          path: dist/dry-run
+          if-no-files-found: error
+          retention-days: 14

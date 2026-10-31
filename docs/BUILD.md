@@ -444,18 +444,27 @@ the **pinned clang** for both triples (`CC_<triple>` = `clang-18` 18.1.3,
 [C toolchain](#c-toolchain): missing or another version fails the build;
 ring needs no libc headers beyond what clang finds, verified 2026-10-26
 with clang 18 for both triples), then **refuses** any `robodr-*` binary
-that is not an ELF for the target machine, has a `PT_INTERP` program
-header or a `DT_NEEDED` entry, and writes the binaries and `SHA256SUMS`
-to `dist/static/<triple>/`. `build-deb.sh --variant focal` repeats the
-static check, so a dynamic binary can never reach `robodr-focal`, whose
-only dependency is `systemd (>= 245)`.
+that is not an ELF for the target machine, is not position-independent
+(`e_type` ET_DYN: static-pie), has a `PT_INTERP` program header, a
+`DT_NEEDED` entry or text relocations, and writes the binaries and
+`SHA256SUMS` to `dist/static/<triple>/` (`--check-dir DIR` runs the checks
+alone; release.yml re-runs them on the programs inside the focal `.deb`).
+`build-deb.sh --variant focal` repeats the static check, so a dynamic
+binary can never reach `robodr-focal`, whose only dependency is
+`systemd (>= 245)`.
 
 | | x86_64-unknown-linux-musl | aarch64-unknown-linux-musl |
 |---|---|---|
-| Linker | rust-lld | rust-lld (cross) |
-| Layout | static-pie (ASLR of the image) | static, **not PIE**: the Rust target has no static-pie support, so the executable image is at a fixed address (stack, heap and mappings are still randomised) |
+| Linker | rust-lld | `scripts/static-pie-ld` (rust-lld, cross) |
+| Layout | static-pie (ASLR of the image) | static-pie (ASLR of the image). Rust's target links it static non-PIE; `scripts/static-pie-ld` makes rustc's own static-pie link of it (rcrt1.o, crtbeginS/crtendS, `-pie --no-dynamic-linker -z text`; the code is already PIC) and refuses any other link shape. `scripts/test-static-pie-ld.sh` (run by release.yml before the build): ET_DYN, no INTERP/NEEDED/TEXTREL, another load address on every run, panics unwind. A caller-set `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld` gives the old non-PIE binaries, accepted with a WARNING unless `ROBODR_REQUIRE_STATIC_PIE=1` (release.yml) |
 | C compiler (ring) | pinned `clang-18` 18.1.3 | pinned `clang-18` 18.1.3 (cross, `--target` added by the `cc` crate) |
-| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER=rust-lld` with `scripts/ci-repro.sh`, which pins `CC_<triple>` like `build-static.sh`) | same |
+| Reproducible | yes (`CARGO_BUILD_TARGET=<triple>` + `CARGO_TARGET_<TRIPLE>_LINKER` as above with `scripts/ci-repro.sh`, which pins `CC_<triple>` like `build-static.sh`) | same |
+
+**Verified 2026-10-31** (Ubuntu 24.04, Rust 1.98.1, clang 18.1.3):
+`scripts/build-static.sh aarch64-unknown-linux-musl` with
+`ROBODR_REQUIRE_STATIC_PIE=1`: 19 binaries, all `ELF 64-bit LSB pie
+executable, ARM aarch64, static-pie linked`; each `--version` under
+qemu-aarch64 printed its build line; `robodr-blackbox keygen` ran.
 
 Runtime differences from the glibc build to keep in mind: the musl resolver
 reads `/etc/hosts` and `/etc/resolv.conf` but not `nsswitch.conf` (give

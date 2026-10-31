@@ -68,7 +68,10 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-V" | "--version" => {
-                println!("robodr-agentd {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "{}",
+                    robodr_buildinfo::version_line("robodr-agentd", env!("CARGO_PKG_VERSION"))
+                );
                 return ExitCode::SUCCESS;
             }
             "--check-config" => check = true,

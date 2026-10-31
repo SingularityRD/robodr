@@ -305,7 +305,10 @@ fn main() -> ExitCode {
             Ok(())
         }
         Some("-V" | "--version") if argv.len() == 1 => {
-            println!("robodr-blackbox {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                robodr_buildinfo::version_line("robodr-blackbox", env!("CARGO_PKG_VERSION"))
+            );
             Ok(())
         }
         _ => Err(Fail::Usage("missing or unknown subcommand".into())),

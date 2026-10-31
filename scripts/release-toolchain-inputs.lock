@@ -1,0 +1,16 @@
+# Toolchain-input lock of the release builds (scripts/release-toolchain-inputs.sh).
+#
+# Format: one "LABEL KEY VALUE" line per enforced input, LABEL being the job
+# label (deb-amd64, deb-arm64, rpm-amd64, rpm-arm64, focal-amd64,
+# focal-arm64). For a label with lines here, every listed KEY must be
+# recorded with exactly that VALUE or the release build FAILS; labels
+# without lines are only recorded (a WARNING in the job log).
+#
+# Empty on purpose until the hash-pinned package mirror exists
+# (docs/RELEASE.md, "Release toolchain inputs"): apt.llvm.org (the eBPF
+# clang of the .deb build) and Rocky's AppStream do not keep superseded
+# builds, so locking today's versions would only break the next release.
+# Once the mirror serves them, copy the build's TOOLCHAIN-INPUTS lines
+# (they are in the signed REPRODUCIBILITY-<version>.txt) here, e.g.
+#   deb-amd64 pkg:clang-20 1:20.1.8~++20250708063434+... amd64 <sha256>
+# and change them only in a reviewed commit.

@@ -82,8 +82,11 @@ fn long_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION.get_or_init(|| {
         format!(
-            "{}\npulsar: {} (commit {})",
+            "{} (commit {}, source-date-epoch {}, target {})\npulsar: {} (commit {})",
             env!("CARGO_PKG_VERSION"),
+            robodr_buildinfo::COMMIT,
+            robodr_buildinfo::SOURCE_DATE_EPOCH,
+            robodr_buildinfo::TARGET,
             pulsar::metadata::VERSION,
             pulsar::metadata::GIT_SHA
         )

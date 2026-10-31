@@ -15,6 +15,7 @@ description = "Fleet lifecycle on the robot (robodr-enroll): one-time enrollment
 # lists and anti-rollback are robodr-commission's; keys, signatures and the
 # fleet journal are robodr-blackbox's.
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-blackbox = { workspace = true }
 robodr-commission = { workspace = true }
 robodr-events = { workspace = true }

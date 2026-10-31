@@ -1,0 +1,87 @@
+#!/bin/sh
+# Linker for the static (musl) release builds that turns rustc's static,
+# non-PIE link of aarch64-unknown-linux-musl into a static-pie link
+# (docs/BUILD.md "Static (musl) build", SALES-READINESS T86).
+#
+#   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$PWD/scripts/static-pie-ld
+#
+# Why: Rust's x86_64-unknown-linux-musl target links static-pie (the
+# executable image is randomised by ASLR), but aarch64-unknown-linux-musl
+# does not set `static-position-independent-executables`, so rustc links it
+# with crt1.o and -static at a fixed address. The code is already
+# position-independent (the target's relocation model is pic); only the
+# link is not. This wrapper receives rustc's GNU-ld style arguments (rustc
+# picks the plain `ld` flavour from the name ending in "-ld") and runs
+# rust-lld, which rustc puts first on the linker's PATH, with exactly the
+# changes rustc itself makes for a static-pie target:
+#   .../self-contained/crt1.o      -> rcrt1.o (start code that applies its
+#                                     own relocations before libc starts)
+#   .../self-contained/crtbegin.o  -> crtbeginS.o
+#   .../self-contained/crtend.o    -> crtendS.o
+#   -static                        -> -static -pie --no-dynamic-linker -z text
+# All from the same rust-std "self-contained" directory rustc named.
+#
+# Fail closed: unless every one of those four appears exactly once (the
+# shape of rustc's StaticNoPicExe link), it refuses (exit 1) instead of
+# linking something else. A build script or proc macro is a HOST link and
+# never reaches this linker (the variable is per target). Any other link
+# kind (a cdylib, a test harness built for the target) has the same shape
+# and becomes static-pie too.
+#
+# ROBODR_STATIC_PIE_LD_REAL: the lld to run (default: rust-lld -flavor gnu).
+# Self-test: scripts/static-pie-ld --self-test
+set -eu
+
+if [ "${1:-}" = "--self-test" ]; then
+    exec sh "$(dirname "$0")/test-static-pie-ld.sh"
+fi
+
+n_crt1=0 n_begin=0 n_end=0 n_static=0
+for a in "$@"; do
+    case "$a" in
+    */self-contained/crt1.o) n_crt1=$((n_crt1 + 1)) ;;
+    */self-contained/crtbegin.o) n_begin=$((n_begin + 1)) ;;
+    */self-contained/crtend.o) n_end=$((n_end + 1)) ;;
+    -static) n_static=$((n_static + 1)) ;;
+    -pie | --pie | -no-pie | --no-pie | -shared | --shared | -Bshareable | -dynamic-linker | --dynamic-linker | --dynamic-linker=*)
+        echo "static-pie-ld: refusing: unexpected link option $a (not rustc's static executable link)" >&2
+        exit 1
+        ;;
+    esac
+done
+if [ "$n_crt1" != 1 ] || [ "$n_begin" != 1 ] || [ "$n_end" != 1 ] || [ "$n_static" != 1 ]; then
+    echo "static-pie-ld: refusing: expected exactly one self-contained crt1.o, crtbegin.o, crtend.o and -static" \
+        "(got $n_crt1 $n_begin $n_end $n_static); is this rustc's static musl link?" >&2
+    exit 1
+fi
+
+# Rebuild the argument list with the substitutions, preserving order.
+first=1
+for a in "$@"; do
+    if [ "$first" = 1 ]; then
+        set --
+        first=0
+    fi
+    case "$a" in
+    */self-contained/crt1.o) a="${a%crt1.o}rcrt1.o" ;;
+    */self-contained/crtbegin.o) a="${a%crtbegin.o}crtbeginS.o" ;;
+    */self-contained/crtend.o) a="${a%crtend.o}crtendS.o" ;;
+    esac
+    if [ "$a" = -static ]; then
+        set -- "$@" -static -pie --no-dynamic-linker -z text
+    else
+        set -- "$@" "$a"
+    fi
+done
+for o in "$@"; do
+    case "$o" in
+    */self-contained/rcrt1.o | */self-contained/crtbeginS.o | */self-contained/crtendS.o)
+        [ -f "$o" ] || { echo "static-pie-ld: $o missing in the target's rust-std" >&2; exit 1; } ;;
+    esac
+done
+
+if [ -n "${ROBODR_STATIC_PIE_LD_REAL:-}" ]; then
+    # shellcheck disable=SC2086 # deliberately word-split (command + flags)
+    exec ${ROBODR_STATIC_PIE_LD_REAL} "$@"
+fi
+exec rust-lld -flavor gnu "$@"
