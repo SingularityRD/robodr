@@ -29,6 +29,7 @@ bad() {
 fixture() {
     python3 - "$here" "$@" <<'EOF'
 import importlib.util, json, os, sys
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("m2c", os.path.join(sys.argv[1], "metadata_to_cyclonedx.py"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
