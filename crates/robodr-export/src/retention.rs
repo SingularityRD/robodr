@@ -293,10 +293,12 @@ fn out_payload(dir: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
 /// consumer (another publisher or uplink on the same `out/`) would lose the
 /// batches this one has finished.
 ///
-/// A batch whose payload cannot be removed (typically: this tool may not
-/// write the importer's `out/<batch>/`) does not stop the others: the
-/// pass goes on and returns the first error, with its path, beside what it
-/// did. The callers report it ([`out_prune_failure`]) and go on
+/// A batch that cannot be measured (its payload or `done/` marker cannot
+/// be read) is skipped, so it is neither pruned nor ranked against the
+/// bounds; a batch whose payload cannot be removed (typically: this tool
+/// may not write the importer's `out/<batch>/`) is left as it is. Neither
+/// stops the others: the pass goes on and returns the first error, with
+/// its path, beside what it did. The callers report it ([`out_prune_failure`]) and go on
 /// delivering: pruning `out/` is housekeeping, never a reason to stop
 /// delivering findings.
 pub fn prune_diode_out(
@@ -309,11 +311,7 @@ pub fn prune_diode_out(
     if r.is_unbounded() {
         return (rep, None);
     }
-    let cands = match out_candidates(out, done_dir) {
-        Ok(c) => c,
-        Err(e) => return (rep, Some(e)),
-    };
-    let mut first_err = None;
+    let (cands, mut first_err) = out_candidates(out, done_dir);
     let items: Vec<(SystemTime, u64)> = cands.iter().map(|c| (c.modified, c.bytes)).collect();
     for (c, over) in cands.iter().zip(r.over(&items, now)) {
         if !over {
@@ -338,53 +336,77 @@ fn at(p: &Path, e: io::Error) -> io::Error {
     io::Error::new(e.kind(), format!("{}: {e}", p.display()))
 }
 
-/// The batch directories of `out/` that still have a payload.
-fn out_candidates(out: &Path, done_dir: &Path) -> io::Result<Vec<Candidate>> {
+/// The batch directories of `out/` that still have a payload, and the
+/// first error met while listing them. A batch that cannot be measured
+/// is left out (never pruned) and the others still are: leaving one out
+/// only ever ranks fewer batches against the bounds, so the pass prunes
+/// less, never more. A failed `read_dir` of `out/` itself, or of its
+/// listing, ends the listing there.
+fn out_candidates(out: &Path, done_dir: &Path) -> (Vec<Candidate>, Option<io::Error>) {
+    let mut cands = Vec::new();
     let rd = match fs::read_dir(out) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(at(out, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (cands, None),
+        Err(e) => return (cands, Some(at(out, e))),
     };
-    let mut cands = Vec::new();
+    let mut first_err = None;
     for e in rd {
-        let e = e.map_err(|x| at(out, x))?;
-        let Some(name) = e.file_name().to_str().map(str::to_string) else {
-            continue;
+        let e = match e {
+            Ok(e) => e,
+            Err(x) => {
+                first_err.get_or_insert(at(out, x));
+                break;
+            }
         };
-        let path = e.path();
-        let is_dir = e.file_type().map_err(|x| at(&path, x))?.is_dir();
-        if !crate::publish::valid_batch_name(&name) || !is_dir {
-            continue;
+        match out_candidate(&e, done_dir) {
+            Ok(Some(c)) => cands.push(c),
+            Ok(None) => {}
+            Err(x) => {
+                first_err.get_or_insert(x);
+            }
         }
-        let payload = out_payload(&path).map_err(|x| at(&path, x))?;
-        if payload.is_empty() {
-            // A tombstone already.
-            continue;
-        }
-        let mut bytes = 0u64;
-        for (p, is_dir) in &payload {
-            bytes = bytes.saturating_add(if *is_dir {
-                tree_bytes(p, 3).map_err(|x| at(p, x))?
-            } else {
-                file_meta(p).map_err(|x| at(p, x))?.map_or(0, |m| m.1)
-            });
-        }
-        let marker = done_dir.join(&name);
-        let modified = match file_meta(&marker).map_err(|x| at(&marker, x))? {
-            Some((t, _)) => t,
-            None => e
-                .metadata()
-                .and_then(|m| m.modified())
-                .map_err(|x| at(&path, x))?,
-        };
-        cands.push(Candidate {
-            name,
-            paths: payload.into_iter().map(|(p, _)| p).collect(),
-            modified,
-            bytes,
+    }
+    (cands, first_err)
+}
+
+/// One entry of `out/` as a candidate (`None`: not a batch directory, or
+/// a tombstone already).
+fn out_candidate(e: &fs::DirEntry, done_dir: &Path) -> io::Result<Option<Candidate>> {
+    let Some(name) = e.file_name().to_str().map(str::to_string) else {
+        return Ok(None);
+    };
+    let path = e.path();
+    let is_dir = e.file_type().map_err(|x| at(&path, x))?.is_dir();
+    if !crate::publish::valid_batch_name(&name) || !is_dir {
+        return Ok(None);
+    }
+    let payload = out_payload(&path).map_err(|x| at(&path, x))?;
+    if payload.is_empty() {
+        // A tombstone already.
+        return Ok(None);
+    }
+    let mut bytes = 0u64;
+    for (p, is_dir) in &payload {
+        bytes = bytes.saturating_add(if *is_dir {
+            tree_bytes(p, 3).map_err(|x| at(p, x))?
+        } else {
+            file_meta(p).map_err(|x| at(p, x))?.map_or(0, |m| m.1)
         });
     }
-    Ok(cands)
+    let marker = done_dir.join(&name);
+    let modified = match file_meta(&marker).map_err(|x| at(&marker, x))? {
+        Some((t, _)) => t,
+        None => e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map_err(|x| at(&path, x))?,
+    };
+    Ok(Some(Candidate {
+        name,
+        paths: payload.into_iter().map(|(p, _)| p).collect(),
+        modified,
+        bytes,
+    }))
 }
 
 /// Remove one batch's payload if it is finished (`Ok(false)`: held).
@@ -817,6 +839,48 @@ mod tests {
         assert_eq!((rep.removed, rep.removed_bytes), (1, 10));
         let u = dir_usage(&out, 4).unwrap();
         assert_eq!((u.entries, u.bytes), (3, 14), "two tombstones, one file");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// One batch that cannot be measured (here: its `done/` marker path
+    /// is longer than PATH_MAX, so `lstat` fails with ENAMETOOLONG; works
+    /// as root too) does not stop the pass for the other batches: it is
+    /// skipped, never pruned, and its error is returned.
+    #[test]
+    fn an_unmeasurable_batch_does_not_stop_the_others() {
+        let d = tmp("unmeasurable");
+        let out = d.join("out");
+        fsutil::mkdir(&out).unwrap();
+        // done/ deep enough that done/<128-byte name> exceeds PATH_MAX
+        // (4096 with the NUL) while done/<short name> does not.
+        let base = d.join("done");
+        let mut done = base.clone();
+        let target = 4096 - 1 - 128 + 5;
+        while done.as_os_str().len() + 201 <= target {
+            done.push("a".repeat(200));
+        }
+        let pad = target - done.as_os_str().len() - 1;
+        done.push("b".repeat(pad));
+        fs::create_dir_all(&done).unwrap();
+        let (short, long) = ("rdd_a_1".to_string(), "r".repeat(128));
+        for b in [&short, &long] {
+            fsutil::mkdir(&out.join(b)).unwrap();
+            fs::write(out.join(b).join("records.jsonl"), [b'x'; 10]).unwrap();
+            fs::write(out.join(b).join("MANIFEST.json"), b"m").unwrap();
+        }
+        fs::write(done.join(&short), b"").unwrap();
+        assert!(fs::symlink_metadata(done.join(&long))
+            .is_err_and(|e| e.kind() != io::ErrorKind::NotFound));
+        let r = Retention {
+            max_count: Some(0),
+            ..Default::default()
+        };
+        let (rep, e) = prune_diode_out(&out, &done, &r, SystemTime::now());
+        let e = e.expect("the unmeasurable batch is reported");
+        assert!(e.to_string().contains(&long), "{e}");
+        assert_eq!((rep.removed, rep.held), (1, 0), "{rep:?}");
+        assert!(!out.join(&short).join("records.jsonl").exists(), "pruned");
+        assert!(out.join(&long).join("records.jsonl").exists(), "skipped");
         let _ = fs::remove_dir_all(&d);
     }
 
