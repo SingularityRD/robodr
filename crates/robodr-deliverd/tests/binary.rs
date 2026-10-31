@@ -295,3 +295,41 @@ fn run_exits_3_after_its_own_binary_is_replaced() {
     assert_eq!(st.code(), Some(3), "{st:?} {err}");
     assert!(err.contains("replaced on disk"), "{err}");
 }
+
+/// `self-check` (run by the old agent on a binary that replaced it, before
+/// that install commits): exit 0 when the configuration, the state file
+/// and the keys load; 1 when one of them does not; nothing is written.
+#[test]
+fn self_check_loads_what_run_needs_without_writing() {
+    let u = Unit::new("bin-self-check");
+    let cfgp = u.dir().join("deliverd.json");
+    std::fs::write(&cfgp, serde_json::to_vec_pretty(&u.cfg).unwrap()).unwrap();
+    let c = cfgp.to_str().unwrap();
+    let o = deliverd(&["self-check", "--config", c]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("self-check ok"));
+    // Read only: no journal opened, no state written.
+    assert!(!u.cfg.state_path().exists());
+    assert!(u.cfg.blackbox.dir.read_dir().unwrap().next().is_none());
+
+    // A state file it cannot parse.
+    std::fs::write(u.cfg.state_path(), b"{not json").unwrap();
+    let o = deliverd(&["self-check", "--config", c]);
+    assert_eq!(o.status.code(), Some(1));
+    std::fs::remove_file(u.cfg.state_path()).unwrap();
+
+    // The black-box key unreadable.
+    std::fs::remove_file(&u.cfg.blackbox.key).unwrap();
+    let o = deliverd(&["self-check", "--config", c]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("black-box key"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

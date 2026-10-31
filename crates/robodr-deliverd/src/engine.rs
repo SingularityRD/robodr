@@ -127,6 +127,9 @@ pub struct Engine {
     nv: Option<(robodr_seal::tpm::Tpm, u32)>,
     /// The LUKS front end erase uses (`None`: the system's tools).
     luks: Option<std::sync::Arc<robodr_seal::luks::Luks>>,
+    /// The agent's own binary: a deb install that replaced it commits
+    /// only once the replacement passes `self-check` ([`crate::own`]).
+    self_check: Option<crate::own::SelfCheck>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -382,6 +385,7 @@ impl Engine {
             hw_gen,
             nv,
             luks: None,
+            self_check: None,
         };
         e.load_anchor();
         e.journal.note(
@@ -587,6 +591,13 @@ impl Engine {
     /// The state (read only).
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Judge a deb install that replaced the agent's own binary by running
+    /// the replacement's `self-check` too (`run` and `once` set it; `None`:
+    /// no such check, e.g. the library used in-process).
+    pub fn set_self_check(&mut self, c: Option<crate::own::SelfCheck>) {
+        self.self_check = c;
     }
 
     /// The configuration.
@@ -2339,7 +2350,20 @@ impl Engine {
             }
             self.save()?;
         }
-        let report = health::run(&self.cfg, &m.health, &txn.to);
+        let mut report = health::run(&self.cfg, &m.health, &txn.to);
+        // RoboDR's own package replaced this binary: the new one must be
+        // able to start before the install commits, while this (old)
+        // process can still roll it back.
+        if txn.to.kind == robodr_pkg::rpk::Kind::Deb {
+            if let Some((passed, detail)) = self.self_check.as_ref().and_then(|c| c.judge()) {
+                report.passed &= passed;
+                report.checks.push(health::CheckResult {
+                    check: crate::own::SelfCheck::LABEL.into(),
+                    passed,
+                    detail,
+                });
+            }
+        }
         let ev = self.journal.note(
             kinds::HEALTH,
             json!({"name": txn.name, "serial": txn.to.serial, "passed": report.passed,

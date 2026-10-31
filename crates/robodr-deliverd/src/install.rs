@@ -76,7 +76,10 @@
 //! cgroup) and the package would be left half-configured. The agent
 //! instead finishes its pass (health gate, commit or rollback) on the old
 //! binary and then exits with [`crate::cli::EXIT_RESTART`] because its
-//! own executable was replaced; the unit restarts it on the new one. The
+//! own executable was replaced; the unit restarts it on the new one.
+//! Before that pass commits, its health gate also runs the new binary's
+//! `self-check` and rolls the package back if it fails ([`crate::own`]).
+//! The
 //! marker only ever skips that one restart; the agent notices a replaced
 //! binary by itself, so a marker set by anyone else costs nothing but
 //! the restart postinst would have done.

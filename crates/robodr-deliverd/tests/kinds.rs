@@ -288,6 +288,150 @@ fn maintainer_scripts_see_the_deliverd_install_marker() {
     );
 }
 
+/// RoboDR's own package `robodr` (as from the designated programme),
+/// shipping `usr/sbin/robodr-deliverd` as a shell script running `body`:
+/// it stands in for a self-upgrade that replaces the agent's binary.
+fn agent_rpk(u: &Unit, serial: u64, version: &str, body: &str) -> PathBuf {
+    let st = u.work.join(format!("agent-stage-{version}"));
+    let _ = std::fs::remove_dir_all(&st);
+    std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
+    std::fs::create_dir_all(st.join("usr/sbin")).unwrap();
+    std::fs::write(
+        st.join("DEBIAN/control"),
+        format!(
+            "Package: robodr\nVersion: {version}\nArchitecture: all\n\
+             Maintainer: RoboDR tests <tests@invalid>\nDescription: stub\n"
+        ),
+    )
+    .unwrap();
+    let exe = st.join("usr/sbin/robodr-deliverd");
+    std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = u.work.join(format!("robodr_{version}.deb"));
+    let o = Command::new("dpkg-deb")
+        .args(["--root-owner-group", "-Zxz", "--build"])
+        .arg(&st)
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let deb = std::fs::read(&out).unwrap();
+    let mut s = spec("robodr", serial, Kind::Deb);
+    s.sbom_path = Some("sbom.cdx.json".into());
+    s.health = vec![HealthCheck::FilePresent {
+        path: format!(
+            "{}/usr/sbin/robodr-deliverd",
+            u.cfg.install.dpkg_root.as_ref().unwrap().display()
+        ),
+    }];
+    u.rpk(&s, &[("robodr.deb", &deb), ("sbom.cdx.json", SBOM)])
+}
+
+fn package_version(u: &Unit, package: &str) -> String {
+    let o = Command::new("dpkg-query")
+        .arg(format!(
+            "--admindir={}",
+            u.cfg
+                .install
+                .dpkg_root
+                .as_ref()
+                .unwrap()
+                .join("var/lib/dpkg")
+                .display()
+        ))
+        .args(["-W", "-f", "${Version}", package])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// T52 follow-up: a deb install that replaced the agent's own binary
+/// commits only if the NEW binary passes `self-check`, judged by the old
+/// process while it can still roll back. A replacement that cannot start
+/// is rolled back to the previous version; one that can is installed and
+/// was called as `<path> self-check --config <file>`.
+#[test]
+fn a_self_upgrade_whose_new_binary_fails_self_check_is_rolled_back() {
+    if !dpkg_available("deb_self_check") {
+        return;
+    }
+    let u = Unit::with("deb-self-check", |v| {
+        v["install"]["robodr_programme"] = PROGRAMME.into();
+    });
+    let root = dpkg_root(&u);
+    let r1 = agent_rpk(&u, 1, "1.0", "exit 0");
+    let b1 = u.bundle(1, None, std::slice::from_ref(&r1));
+    u.pack("p1", 1, &[r1], std::slice::from_ref(&b1));
+    let mut e = u.open();
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr 1".to_string()]),
+        "{reps:?}"
+    );
+    // The agent now "runs" version 1's binary.
+    let exe = root.join("usr/sbin/robodr-deliverd");
+    let cfg_file = u.work.join("deliverd.json");
+    e.set_self_check(Some(robodr_deliverd::own::SelfCheck {
+        exe: robodr_deliverd::own::OwnBinary::of(&exe).unwrap(),
+        config: cfg_file.clone(),
+    }));
+
+    // 2.0 passes its declared checks, but its binary cannot start.
+    let r2 = agent_rpk(&u, 2, "2.0", "echo cannot start >&2\nexit 1");
+    let b2 = u.bundle(2, Some(bundle_hash(&b1)), std::slice::from_ref(&r2));
+    u.pack("p2", 2, &[r2], std::slice::from_ref(&b2));
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.rolled_back == vec!["robodr 2 -> 1".to_string()]),
+        "{reps:?}"
+    );
+    assert_eq!(package_version(&u, "robodr"), "1.0");
+    let failed: Vec<_> = u
+        .notes_of("robodr.deliver.health")
+        .into_iter()
+        .filter(|n| n["serial"] == 2)
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["passed"], false);
+    let check = failed[0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "robodr-deliverd self-check")
+        .cloned()
+        .unwrap();
+    assert_eq!(check["passed"], false);
+    assert!(
+        check["detail"].as_str().unwrap().contains("cannot start"),
+        "{check}"
+    );
+
+    // 3.0's binary passes its self-check: installed.
+    let args = root.join("self-check-args");
+    let r3 = agent_rpk(
+        &u,
+        3,
+        "3.0",
+        &format!("echo \"$@\" >{}\nexit 0", args.display()),
+    );
+    let b3 = u.bundle(3, Some(bundle_hash(&b2)), std::slice::from_ref(&r3));
+    u.pack("p3", 3, &[r3], &[b3]);
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr 3".to_string()]),
+        "{reps:?}"
+    );
+    assert_eq!(package_version(&u, "robodr"), "3.0");
+    assert_eq!(
+        std::fs::read_to_string(&args).unwrap(),
+        format!("self-check --config {}\n", cfg_file.display())
+    );
+    assert!(u.black_box_verifies());
+}
+
 /// T52, the package side: the upgrade-restart loop of RoboDR's postinst
 /// (between its `restart_on_upgrade` markers), with `systemctl` replaced
 /// by a shell function that logs. Under the agent's marker every unit but

@@ -80,6 +80,7 @@ pub mod install;
 pub mod journal;
 pub mod lan;
 pub mod media;
+pub mod own;
 pub mod rekey;
 pub mod replay;
 pub mod rules;
