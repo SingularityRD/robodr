@@ -166,6 +166,14 @@ jobs:
           persist-credentials: false
           # Every branch: the tagged commit must be on main or release/X.Y.
           fetch-depth: 0
+      - name: Release tooling self-tests (gates, SBOM, RPK, VEX, provenance, toolchain record)
+        run: |
+          python3 scripts/release-gate.py --self-test
+          python3 scripts/metadata_to_cyclonedx.py --self-test
+          python3 scripts/release-rpk.py --self-test
+          python3 scripts/vex.py --self-test
+          python3 scripts/slsa-provenance.py --self-test
+          scripts/release-toolchain-inputs.sh --self-test
       - name: Release or dry run
         id: mode
         run: |
