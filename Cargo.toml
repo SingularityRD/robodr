@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/robodr-agent",
     "crates/robodr-agentd",
+    "crates/robodr-attack-sim",
     "crates/robodr-blackbox",
     "crates/robodr-capture",
     "crates/robodr-cdr",
