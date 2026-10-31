@@ -8,9 +8,11 @@ The trusted rule catalog lives in crates/robodr-ocsf/src/builder.rs:
 `host_rule_title`. The contract version of each catalog function ("Since")
 is read from `rule_info_for_contract`, the function validators use: a call
 gated by `with_X` takes the version of the `CATALOG_<major>_<minor>_MINOR`
-constant in `with_X`, an ungated call 1.0, and a catalog function called by
-another inherits its caller's version. A catalog function that
-`rule_info_for_contract` does not reach fails the check. This script renders
+constant in `with_X`, the first call (ungated) 1.0, and a catalog function
+called by another inherits its caller's version. Comments are ignored; any
+other catalog call in `rule_info_for_contract` (a second ungated call, an
+`if with_X { .. }` gate) and a catalog function `rule_info_for_contract`
+does not reach fail the check. This script renders
 the table between the GENERATED markers of the customer detection catalog.
 
     scripts/check-detection-catalog.py           # exit 1 when the doc drifted
@@ -102,16 +104,54 @@ def functions(src: str) -> dict[str, str]:
     return out
 
 
+def strip_comments(text: str) -> str:
+    """`text` with its Rust `//` and `/* */` comments blanked (newlines
+    kept), string and char literals left intact: a catalog function named
+    in a comment is not a call."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        elif c == "'" and (text.startswith("\\", i + 1) or text[i + 2 : i + 3] == "'"):
+            # A char literal ('"', '\'', 'x'); otherwise a lifetime.
+            j = text.find("'", i + 3 if text[i + 1] == "\\" else i + 2)
+            j = n - 1 if j == -1 else j
+            out.append(text[i : j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j == -1 else j
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def since_map(src: str, fns: dict[str, str]) -> dict[str, str]:
     """Contract version that added each catalog function's entries, read
     from `rule_info_for_contract`: a call gated by `with_X` gets the version
     named by the one `CATALOG_<major>_<minor>_MINOR` constant in `with_X`'s
     definition, an ungated call the base version 1.0, and a catalog
-    function another one calls inherits its caller's version."""
+    function another one calls inherits its caller's version. Only the
+    first catalog call may be ungated: any other gate style fails rather
+    than giving its entries version 1.0. Comments are not calls."""
     body = fns.get("rule_info_for_contract")
     if body is None:
         fail(["rule_info_for_contract not found"])
         return {}
+    body = strip_comments(body)
     minors = {m.group(1): int(m.group(2)) for m in U64_CONST.finditer(src)}
     problems: list[str] = []
     gate: dict[str, str] = {}
@@ -135,14 +175,21 @@ def since_map(src: str, fns: dict[str, str]) -> dict[str, str]:
             problems.append(f"{m.group(2)} gated by {m.group(1)}, which has no version")
             continue
         since[m.group(2)] = gate[m.group(1)]
-    for m in CALL.finditer(body):
-        if m.start(1) not in gated_at:
+    for k, m in enumerate(CALL.finditer(body)):
+        if m.start(1) in gated_at:
+            continue
+        if k == 0:
             since[m.group(1)] = BASE_VERSION
+        else:
+            problems.append(
+                f"{m.group(1)}: catalog call in rule_info_for_contract that is neither the "
+                "first (base) call nor gated as `with_X.then(|| catalog_Y(..))`"
+            )
     changed = True
     while changed:
         changed = False
         for name, ver in list(since.items()):
-            text = fns.get(name, "")
+            text = strip_comments(fns.get(name, ""))
             for m in CALL.finditer(text, text.find("(") + 1):
                 callee = m.group(1)
                 if callee == name:
@@ -475,6 +522,48 @@ def self_test() -> int:
     # The version follows rule_info_for_contract's wiring, not a list here.
     moved = B.replace("with_2_3.then(|| catalog_2_3(rule))", "with_2_5.then(|| catalog_2_3(rule))")
     check({e["id"]: e for e in parse(moved, H)}["robot.depot.c"]["since"] == "2.5")
+    # A catalog call in a comment of rule_info_for_contract is not a call:
+    # it neither moves an entry to 1.0 nor counts as a second base call.
+    commented = B.replace(
+        "    catalog_1_0(rule)\n",
+        "    // catalog_2_3(rule) used to be ungated; /* catalog_2_5(rule) */\n    catalog_1_0(rule)\n",
+    )
+    check({e["id"]: e for e in parse(commented, H)}["robot.depot.c"]["since"] == "2.3")
+    check({e["id"]: e for e in parse(commented, H)}["robot.agent.d"]["since"] == "2.5")
+    # Nor is one in a catalog function's body (no inherited version). A
+    # `//` inside a string literal is not a comment: the text after it is
+    # still scanned (here it is a conflicting call, so the check fails).
+    callee_comment = B.replace(
+        "    catalog_1_3_wave7(rule)\n",
+        '    // see catalog_2_5(rule)\n    let _ = "http://x catalog_2_3(";\n    catalog_1_3_wave7(rule)\n',
+    )
+    must_fail(callee_comment, "catalog_2_3 reached as", "a // in a string taken as a comment")
+    callee_comment = callee_comment.replace('    let _ = "http://x catalog_2_3(";\n', "")
+    check({e["id"]: e for e in parse(callee_comment, H)}["robot.agent.d"]["since"] == "2.5")
+    # A gate in another style than `with_X.then(|| catalog_Y(..))` fails
+    # instead of giving the entries version 1.0.
+    must_fail(
+        B.replace(
+            "        .or_else(|| with_2_3.then(|| catalog_2_3(rule)).flatten())\n",
+            "        .or_else(|| if with_2_3 { catalog_2_3(rule) } else { None })\n",
+        ),
+        "catalog_2_3",
+        "if-gated catalog call",
+    )
+    # So does a second ungated call, and an ungated call after a gated one.
+    must_fail(
+        B.replace("    catalog_1_0(rule)\n", "    catalog_1_0(rule)\n        .or_else(|| catalog_2_3(rule))\n"),
+        "catalog_2_3",
+        "second ungated catalog call",
+    )
+    must_fail(
+        B.replace(
+            "        .unwrap_or(GENERIC)",
+            "        .or_else(|| catalog_1_3_wave7(rule))\n        .unwrap_or(GENERIC)",
+        ),
+        "catalog_1_3_wave7",
+        "ungated call after a gated one",
+    )
     # A stale doc fails and names the missing ids; the regenerated one passes.
     problems = drift(B, doc, H)
     check("missing from the doc: robot.depot.c" in problems, problems)
