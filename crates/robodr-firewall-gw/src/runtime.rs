@@ -353,6 +353,7 @@ pub fn run(
     let mut packets = 0u64;
     let mut stamped = 0u64;
     let mut last_now = 0u64;
+    let mut id_gaps = nfq::IdGaps::default();
     let observe = gw.mode() == GatewayMode::Observe;
     let mut send_err: Option<String> = None;
     while !stop() && !sys::shutdown_requested() {
@@ -372,6 +373,10 @@ pub fn run(
             nfq::parse_packets(buf.get(..n).unwrap_or_default(), |item| {
                 let Item::Packet(p) = item else { return };
                 packets += 1;
+                let shed = id_gaps.observe(p.id);
+                if shed > 0 {
+                    gw.overload.note_shed(shed);
+                }
                 let (verdict, payload) = if p.cap_len.is_some() || p.hw_protocol != 0x0800 {
                     // Truncated copy or not IPv4: nothing the gateway can
                     // decide on.
@@ -775,6 +780,8 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
             "findings_total": gw.findings.total,
             "overload": {
                 "late_pending": gw.overload.pending(),
+                "shed_pending": gw.overload.shed_pending(),
+                "shed_total": gw.overload.shed_total,
                 "reports": gw.overload.reports,
             },
             "findings_feed": events.feed.as_ref().map(|f| {

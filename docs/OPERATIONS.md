@@ -2475,6 +2475,7 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `suppressed` growing while the controller runs normally | frames refused with nothing to emit: wrong `allowed_src_ips` / sources, a rate window that does not match the controller's loop, or an attack |
 | `rewrite_failed` > 0 | a limited / substitute frame could not be written and verified (suppressed instead): report it |
 | `late` > 0 | packets read more than `max_queue_delay_ns` after arrival: the box is overloaded or not running the unit's real-time priority (reported as `robot.gateway.overload`, at most once per `overload_interval_ms`) |
+| `overload.shed_total` > 0 | packets the kernel queued for the gateway but never delivered (gaps in the NFQUEUE packet ids): the gateway reads too slowly; dropped, or forwarded unchecked with `on_gateway_down: bypass` (also in `robot.gateway.overload`) |
 | `undecidable`, `rtps_malformed`, `unsupported_sample` | malformed or fragmented motion traffic: misconfiguration or an attack |
 | `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
 | `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |

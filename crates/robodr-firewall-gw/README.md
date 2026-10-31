@@ -639,8 +639,17 @@ overloaded box sent one Critical `internal_fault` per burst (RESULTS O1:
 1,364 in a 2 h soak). An `internal_fault` the firewall raises itself (a
 defensive post-condition failing after a check: non-finite output, output
 over the speed limits, an invalid joint frame after acceptance) is still
-written to the events file and the feed as a Critical finding. Status:
-`overload.late_pending`, `overload.reports`, `gateway.late`.
+written to the events file and the feed as a Critical finding. **Shed**
+packets go into the same finding and count toward `overload_high_late`:
+the run loop watches the kernel's NFQUEUE packet ids, which number a
+queue's packets in order, and a gap means packets the kernel numbered but
+never delivered to the gateway (a full netlink receive buffer: dropped,
+or accepted unchecked with `on_gateway_down: bypass`). A packet the kernel
+drops because the queue already holds `queue.max_len` packets may not
+leave a gap and is then not counted; the gateway does not read the
+kernel's own counters (`/proc/net/netfilter/nfnetlink_queue`, which the
+unit's `ProcSubset=pid` hides). Status: `overload.late_pending`, `overload.shed_pending`,
+`overload.shed_total`, `overload.reports`, `gateway.late`.
 
 Decision summaries (sales-readiness T19, `src/summary.rs`): over the same
 feed the gateway writes a `robodr-gateway-summary/v1` line at start, every
