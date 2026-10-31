@@ -27,7 +27,13 @@
 //!   material (certificate chain, key, client CA, CRLs: an expired or
 //!   unusable CRL fails here as it would refuse every unit at `serve`),
 //!   re-verifies every unit's stored state and probes the listen address.
-//!   Exit 0 when everything loads, 2 otherwise.
+//!   With TLS it prints the days left on the server certificate and each
+//!   unit CRL in use (`warn` within 14 days; an expired certificate
+//!   fails). Exit 0 when everything loads, 2 otherwise.
+//!
+//! **Credential expiry.** With TLS, `serve` logs the server certificate
+//! and each unit CRL in use within 14 days of expiry (and after it), once
+//! per day count, on stderr.
 //!
 //! **Unit-list reload.** `serve` watches the configuration file and the
 //! unit public-key files it names (every `reload_poll_ms`, default 5000,
@@ -453,27 +459,30 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
     // live in its state directory.
     let r = Arc::new(open_receiver(&c)?);
     let crl_state = c.state_dir.join(robodr_blackbox::crl::STATE_FILE);
+    // The credentials whose expiry the reload thread logs.
+    let mut expiry: Option<(Option<i64>, Option<Arc<robodr_blackbox::crl::CrlStats>>)> = None;
     let (tls, mode) = match &c.tls {
-        Some(t) => (
-            Some(
-                robodr_blackbox::tls::load_server_tls_with_crl_state(
-                    &robodr_blackbox::tls::ServerTlsFiles {
-                        cert_chain: t.cert_chain.clone(),
-                        key_file: t.key_file.clone(),
-                        client_ca: t.client_ca.clone(),
-                        crl_files: t.crl_files.clone(),
-                    },
-                    Some(&crl_state),
-                )
-                .map_err(|e| format!("tls: {e}"))?
-                .config,
-            ),
-            if t.client_ca.is_some() {
-                "mutual TLS"
-            } else {
-                "TLS"
-            },
-        ),
+        Some(t) => {
+            let st = robodr_blackbox::tls::load_server_tls_with_crl_state(
+                &robodr_blackbox::tls::ServerTlsFiles {
+                    cert_chain: t.cert_chain.clone(),
+                    key_file: t.key_file.clone(),
+                    client_ca: t.client_ca.clone(),
+                    crl_files: t.crl_files.clone(),
+                },
+                Some(&crl_state),
+            )
+            .map_err(|e| format!("tls: {e}"))?;
+            expiry = Some((st.not_after, st.crl.clone()));
+            (
+                Some(st.config),
+                if t.client_ca.is_some() {
+                    "mutual TLS"
+                } else {
+                    "TLS"
+                },
+            )
+        }
         None if c.allow_plaintext => (None, "PLAIN TCP (allow_plaintext)"),
         None => {
             return Err("serve needs \"tls\" (or, for a lab or a private link only,                         \"allow_plaintext\": true)"
@@ -523,9 +532,13 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
         let started = c.clone();
         let poll = Duration::from_millis(c.reload_poll_ms.unwrap_or(DEFAULT_RELOAD_POLL_MS));
         let mut seen = config_fingerprint(&path);
+        let mut logged = std::collections::BTreeMap::new();
         let spawned = std::thread::Builder::new()
             .name("anchor-reload".into())
             .spawn(move || loop {
+                if let Some((na, crl)) = &expiry {
+                    warn_expiring(&credentials(*na, crl.as_deref()), &mut logged);
+                }
                 std::thread::sleep(poll);
                 let now = config_fingerprint(&path);
                 if now != seen {
@@ -544,6 +557,60 @@ fn serve(raw: &[String]) -> Result<(), Fail> {
 }
 
 const DEFAULT_RELOAD_POLL_MS: u64 = 5000;
+
+/// A credential this close to expiry (whole days) is a `check` warning and
+/// is logged by `serve` once per day count (agentd's default
+/// `credential_warn_days`).
+const CREDENTIAL_WARN_DAYS: i64 = 14;
+
+/// The credentials `serve` depends on, with their days left now: the
+/// server certificate (`notAfter`) and each unit CRL in use
+/// (`crl:<issuer>`, its `nextUpdate`).
+fn credentials(
+    not_after: Option<i64>,
+    crl: Option<&robodr_blackbox::crl::CrlStats>,
+) -> Vec<(String, i64)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let days = |exp: i64| exp.saturating_sub(now).div_euclid(86_400);
+    let mut v = Vec::new();
+    if let Some(na) = not_after {
+        v.push(("server certificate".to_string(), days(na)));
+    }
+    for u in crl.map(|c| c.status().in_use).unwrap_or_default() {
+        if let Some(nu) = u.next_update {
+            v.push((format!("crl:{}", u.issuer), days(nu)));
+        }
+    }
+    v
+}
+
+/// Log each credential within [`CREDENTIAL_WARN_DAYS`] (or expired) once
+/// per day count (`logged`: the count last logged per name).
+fn warn_expiring(creds: &[(String, i64)], logged: &mut std::collections::BTreeMap<String, i64>) {
+    for (name, d) in creds {
+        if *d > CREDENTIAL_WARN_DAYS {
+            logged.remove(name);
+            continue;
+        }
+        if logged.get(name) == Some(d) {
+            continue;
+        }
+        logged.insert(name.clone(), *d);
+        if *d < 0 {
+            eprintln!(
+                "robodr-anchor-receiver: {name} expired {} day(s) ago: install a fresh one",
+                d.unsigned_abs()
+            );
+        } else {
+            eprintln!(
+                "robodr-anchor-receiver: {name} expires in {d} day(s): install a fresh one \
+                 before then"
+            );
+        }
+    }
+}
 
 /// `check`: everything `serve` loads, without serving; read-only.
 fn check(raw: &[String]) -> Result<(), Fail> {
@@ -594,19 +661,30 @@ fn check(raw: &[String]) -> Result<(), Fail> {
                 crl_files: t.crl_files.clone(),
             };
             match robodr_blackbox::tls::load_server_tls_with_crl_state(&files, None) {
-                Ok(_) => println!(
-                    "ok   TLS: certificate chain, key{}{}",
-                    if t.client_ca.is_some() {
-                        ", client CA (mutual TLS)"
-                    } else {
-                        ""
-                    },
-                    if t.crl_files.is_empty() {
-                        ""
-                    } else {
-                        ", CRLs current"
+                Ok(st) => {
+                    println!(
+                        "ok   TLS: certificate chain, key{}{}",
+                        if t.client_ca.is_some() {
+                            ", client CA (mutual TLS)"
+                        } else {
+                            ""
+                        },
+                        if t.crl_files.is_empty() {
+                            ""
+                        } else {
+                            ", CRLs current"
+                        }
+                    );
+                    for (name, d) in credentials(st.not_after, st.crl.as_deref()) {
+                        if d < 0 {
+                            failed.push(format!("{name} expired {} day(s) ago", d.unsigned_abs()));
+                        } else if d <= CREDENTIAL_WARN_DAYS {
+                            println!("warn {name} expires in {d} day(s)");
+                        } else {
+                            println!("ok   {name} expires in {d} day(s)");
+                        }
                     }
-                ),
+                }
                 Err(e) => failed.push(format!("tls: {e}")),
             }
         }

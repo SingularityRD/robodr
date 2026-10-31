@@ -585,3 +585,59 @@ fn receiver_reloads_its_unit_list_while_serving_and_check_validates_the_config()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
 }
+
+/// T6: with TLS, `check` prints the days left on the server certificate
+/// and each unit CRL in use, and fails on an expired server certificate.
+#[test]
+fn check_reports_tls_credential_expiry() {
+    use std::os::unix::fs::PermissionsExt;
+    let k = keys();
+    let d = TestDir::new("ra-expiry");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tls");
+    for n in [
+        "server.pem",
+        "server.key",
+        "expired.pem",
+        "expired.key",
+        "crl-ca.pem",
+        "crl-ca.crl.pem",
+    ] {
+        std::fs::copy(src.join(n), d.sub(n)).unwrap();
+        let mode = if n.ends_with(".key") { 0o600 } else { 0o644 };
+        std::fs::set_permissions(d.sub(n), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let check = |leaf: &str| {
+        let path = d.sub(&format!("{leaf}.json"));
+        let c = serde_json::json!({
+            "listen": "127.0.0.1:0", "state_dir": d.sub("state"), "key_file": k.recv_secret,
+            "units": [{"unit": UNIT, "public_key": k.unit_pub}],
+            "tls": {"cert_chain": d.sub(&format!("{leaf}.pem")),
+                    "key_file": d.sub(&format!("{leaf}.key")),
+                    "client_ca": d.sub("crl-ca.pem"),
+                    "crl_files": [d.sub("crl-ca.crl.pem")]}
+        });
+        std::fs::write(&path, c.to_string()).unwrap();
+        let o = bin("receiver")
+            .args(["check", "--config"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    // Certificate and CRL valid until 2125.
+    let (code, out) = check("server");
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("ok   server certificate expires in "), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("ok   crl:") && l.contains(" expires in ")),
+        "{out}"
+    );
+    // A server certificate that expired in 2001.
+    let (code, out) = check("expired");
+    assert_eq!(code, Some(2), "{out}");
+    assert!(out.contains("FAIL server certificate expired "), "{out}");
+}

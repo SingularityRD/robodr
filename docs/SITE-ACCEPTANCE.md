@@ -13,7 +13,7 @@ installed service (its unit file or drop-in), plus the check flag.
 | 2 | `robodr-enroll check` | SOC fleet / approval key files; TLS to the SOC (CA bundle, pins, CRLs); the URL is the fleet API; once enrolled: the uplink key file is the registered one and the SOC accepts it; a published ring document verifies | 0 ok, 1 failed, 3 SOC not reached |
 | 3 | `robodr-uplink <service options> --check` | TLS (CA bundle, pins, CRLs); the URL is the RoboDR ingest API (an empty batch, refused with `400 empty_batch` before authentication: nothing sent or stored); for a `--spool` (uplink) key, the SOC accepts it (read-only fleet request) | 0 passed, 1 failed |
 | 3' | `robodr-kafka-publish <service options> --check` | the client certificate and CRLs have not expired (WARN within 14 days), the Kafka cluster answers with this TLS / SASL configuration and the topic's metadata is readable; nothing produced | 0 passed, 1 failed |
-| 4 | `robodr-anchor-receiver check --config /etc/robodr-anchor-receiver/receiver.json` (base station) | configuration, every unit key, the receiver key, the TLS chain / key / client CA / CRLs (an expired CRL fails here), every unit's stored state, the listen address | 0 ok, 2 failed |
+| 4 | `robodr-anchor-receiver check --config /etc/robodr-anchor-receiver/receiver.json` (base station) | configuration, every unit key, the receiver key, the TLS chain / key / client CA / CRLs (an expired CRL or server certificate fails here; days left printed, warn within 14 days), every unit's stored state, the listen address | 0 ok, 2 failed |
 
 Notes:
 

@@ -57,6 +57,10 @@ whose key changed is re\-verified from its state file as at start. A
 configuration that does not load is refused as a whole and the previous
 list stays in force. Other changes (listen, keys, TLS, limits) need a
 restart; they are logged as ignored. Each reload is one line on stderr.
+.IP
+Credential expiry: with \fBtls\fR, the server certificate and each unit
+CRL in use are logged on stderr within 14 days of expiry (and after it),
+once per day count.
 .TP
 .B ingest
 Apply mark files written on a robot by
@@ -73,8 +77,10 @@ while \fBserve\fR runs.
 Site acceptance: load everything \fBserve\fR loads (configuration, every
 robot key, the receiver key, the TLS chain, key, client CA and CRLs: an
 expired or unusable CRL fails here), re\-verify every robot's stored state
-and probe the listen address (in use by a running receiver is fine). One
-line per step; exit 0 when all pass, 2 otherwise. Read\-only; works while
+and probe the listen address (in use by a running receiver is fine). With
+\fBtls\fR, one line each for the server certificate and every unit CRL in
+use with the days left (\fBwarn\fR within 14 days; an expired certificate
+fails). One line per step; exit 0 when all pass, 2 otherwise. Read\-only; works while
 \fBserve\fR runs.
 .SH CONFIGURATION
 JSON, unknown fields refused, paths absolute:
