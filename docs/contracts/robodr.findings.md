@@ -684,7 +684,7 @@ response).
 | `robot.agent.executor_unreachable` | Response executor unreachable | High | once per outage, after `executor_unreachable_ms` (default 30 s) without an answer |
 | `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | Low | reserved in 2.5 for the control plane (a fenced request is not an authentication failure) |
 | `robot.agent.selftest` | Agent field acceptance self-test | Low | reserved in 2.5 for the field acceptance self-test |
-| `robot.gateway.overload` | In-path gateway overloaded | Medium; High above the gateway's threshold | reserved in 2.5 for `robodr-firewall-gw` (aggregated per interval; `robot.firewall.internal_fault` stays for real faults) |
+| `robot.gateway.overload` | In-path gateway overloaded | Medium; High from the gateway's `overload_high_late` late packets in one interval (default 1000) | `robodr-firewall-gw`: at most once per `overload_interval_ms` (default 60 s) while packets are read later than `max_queue_delay_ns`; the gateway no longer reports those packets as `robot.firewall.internal_fault` |
 | `robot.host.<rule>` | the Pulsar rule's name without its `RoboDR: ` prefix | the Pulsar rule's | per Pulsar threat (data source `host_runtime`) |
 
 Catalog sentences (`finding_info.desc`):

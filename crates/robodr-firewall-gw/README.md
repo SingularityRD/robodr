@@ -622,7 +622,22 @@ The gateway counts its own decisions (`src/findings.rs`, findings contract
 `sequence_jump`, `port_bypass_risk`, `restriction_changed`,
 `findings_dropped`) per (rule, channel) on the decision path (no I/O, no
 allocation for repeats) and reports one aggregated deviation per
-housekeeping period. With `findings_socket` (agentd's `gateway_feed`
+housekeeping period.
+
+Late packets (read more than `max_queue_delay_ns` after arrival) are
+reported as `robot.gateway.overload` (findings contract 2.5,
+sales-readiness T8): the decision path counts them, and housekeeping
+reports one finding per `overload_interval_ms` (default 60 s) at most,
+opened at the first tick that sees a late packet: Medium, High when the
+interval held `overload_high_late` (default 1000) or more, with the count
+and the first late packet's channel. The packets themselves still get the
+firewall's fault verdict (`fault_policy`); only the report changes. The
+gateway asks the firewall for a fault verdict for late packets only, so
+the firewall's `robot.firewall.internal_fault` deviations are dropped from
+the events file and the feed (the firewall's `faults` counter in the
+status file keeps them); before, an overloaded box sent one Critical
+`internal_fault` per burst (RESULTS O1: 1,364 in a 2 h soak). Status:
+`overload.late_pending`, `overload.reports`, `gateway.late`. With `findings_socket` (agentd's `gateway_feed`
 socket) those and the Motion Firewall's own deviations (`robot.firewall.*`)
 go to agentd as JSON lines (`robodr-gateway-finding/v1`, `src/feed.rs`),
 which turns each into a finding of its normal pipeline (black box, spool,
@@ -858,6 +873,7 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `observe.enabled`, `observe.nflog_group` | `true`, 4174 | robot-side NFLOG copies ("Robot-side observation") |
 | `channels[]` | — | `firewall_channel`, `codec`, `topic`, `udp_ports`, `allowed_src_ips`, `allowed_src_macs` (RTPS), `legacy_sources` (IP → firewall source), `allowed_api_ids` (sport, loco, arm actions), `allowed_high_modes`, `allow_battery_off` (go `LowCmd_`, default `false`), `robot_model` / `allowed_fsm_ids` / `max_velocity_duration_s` (loco; `robot_model` also for arm actions), `weight_slot` / `max_weight` / `engage_max_q_error` / `lowstate_max_age_ms` / `lowstate_topic` / `engage_first_step` / `engage_stable_frames` / `engage_stable_q` (arm SDK), `max_weight_step` / `max_weight_rate_per_s` (arm SDK, hand SDK), `note` (free text) |
 | `max_queue_delay_ns` | 5 ms | late packets get the fault verdict |
+| `overload_interval_ms`, `overload_high_late` | 60000, 1000 | late packets reported as one `robot.gateway.overload` per interval at most (`1000..=3600000` ms); High from this many late packets in one interval (at least 1) |
 | `events_path`, `events_max_bytes` | none, 64 MiB | firewall deviations as JSON lines |
 | `status_path` | none | counters, firewall stats, recv→verdict latency |
 | `housekeeping_ms` | 100 | events, status, state file, watchdog |
@@ -866,7 +882,9 @@ The Go2 example's `allowed_api_ids` (and the test fixture's) include
 `Damp` (1001, `ROBOT_SPORT_API_ID_DAMP`, `unitree_sdk2`
 `include/unitree/robot/go2/sport/sport_api.hpp:19`), which makes the robot
 go limp and settle to the ground: it is kept as the operator's soft stop,
-but anyone who can present an allowed source can send it. List only the
+but anyone who can present an allowed source can send it. While a
+`restrict_motion` restriction is in force it is refused like every other
+non-velocity call; `StopMove` (1003) still passes. List only the
 calls the site's controller uses.
 
 The Go2 example's sport channel needs a twist channel
@@ -1079,12 +1097,9 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   stack would send unchecked motion samples. The check only sees
   discovery while it runs and only what crosses the bridge: the
   commissioning capture (Deployment) is a required step.
-- **No new finding types**: gateway-only conditions (malformed datagrams,
-  replays, fragmented motion samples, rewrite failures) are counters in the
-  status file, not findings; the firewall's own rules (`crc_invalid`,
-  `rejected_*`, `joint_*`, `internal_fault`, ...) are written to
-  `events_path`. Feeding that file into agentd and dedicated rule ids
-  (contract 2.2) are follow-ups.
+- **Counters, not findings**: malformed datagrams, replays and rewrite
+  failures are counters in the status file only; the findings the gateway
+  does report are listed in "Gateway findings and the agentd feed".
 - **Non-motor fields**: only `bms_cmd.off` is refused (see "Non-motor
   `LowCmd_` fields"); `led` / `fan` / `gpio` are forwarded as sent, and so
   are the sport API's non-velocity calls listed in `allowed_api_ids`

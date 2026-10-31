@@ -776,6 +776,61 @@ fn late_packet_gets_the_fault_verdict() {
     assert_eq!(gw.firewall().stats().faults, 1);
 }
 
+/// Sales-readiness T8 (RESULTS O1): a burst of late packets became one
+/// Critical `robot.firewall.internal_fault` per housekeeping tick (1,364 in
+/// a 2 h soak). The verdict is unchanged (the fault policy still applies);
+/// the report is one `robot.gateway.overload` per interval, Medium, High
+/// from `overload_high_late`. Other firewall deviations still pass.
+#[test]
+fn late_packets_are_reported_as_overload_not_internal_fault() {
+    let fx = Fixture::G1;
+    let mut cfg = gateway_config(fx);
+    cfg.overload_high_late = 3;
+    let mut gw = Gateway::new(&cfg, &profile(fx), &firewall(fx)).unwrap();
+    let good = frame(fx, 0.0);
+    assert_eq!(
+        run(&mut gw, &lowcmd_pkt(fx, PREFIX, 1, &good), T0).0,
+        Verdict::Accept
+    );
+    let late = |gw: &mut Gateway, sn: i64, now: u64| {
+        let mut p = lowcmd_pkt(fx, PREFIX, sn, &frame(fx, 0.1));
+        let m = PacketMeta {
+            now_ns: now,
+            queue_delay_ns: Some(50 * MS),
+            instant: Instant::now(),
+            src_mac: None,
+        };
+        gw.process(&mut p, m)
+    };
+    assert_eq!(late(&mut gw, 2, T0 + 2 * MS), Verdict::AcceptModified);
+    assert_eq!(gw.firewall().stats().faults, 1);
+    let fw = gw.drain_firewall_deviations();
+    assert!(
+        fw.iter()
+            .all(|d| d.rule_str() != robodr_firewall::rules::INTERNAL_FAULT),
+        "{fw:?}"
+    );
+    assert_eq!(gw.overload.pending(), 1);
+    let mode = robodr_events::Mode::Enforce;
+    let s = 1_000_000_000;
+    assert!(gw.overload.tick(10 * s, mode).is_none());
+    let o = gw.overload.tick(70 * s, mode).unwrap();
+    assert_eq!(o.deviation.rule_str(), "robot.gateway.overload");
+    assert_eq!(o.deviation.severity, robodr_events::Severity::Medium);
+    assert_eq!(o.count, 1);
+    assert!(o.channel.is_some());
+    for sn in 3..6 {
+        late(&mut gw, sn, T0 + sn as u64 * MS);
+    }
+    assert!(gw.overload.tick(100 * s, mode).is_none());
+    let o = gw.overload.tick(160 * s, mode).unwrap();
+    assert_eq!(o.deviation.severity, robodr_events::Severity::High);
+    // A real deviation (a foreign writer's rejection) is not filtered.
+    let mut p = lowcmd_pkt(fx, FOREIGN, 1, &good);
+    gw.process(&mut p, meta(T0 + 10 * MS));
+    assert!(!gw.drain_firewall_deviations().is_empty());
+}
+
 #[test]
 fn sport_move_limit_substitute_allowlist_alias() {
     let mut gw = gateway(Fixture::Go2);

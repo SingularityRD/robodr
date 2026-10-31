@@ -537,8 +537,7 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
     };
     gw.tick_webrtc(sys::monotonic_ns());
     let mut out: Vec<(robodr_events::Deviation, Option<String>, u64)> = gw
-        .firewall_mut()
-        .drain_deviations()
+        .drain_firewall_deviations()
         .into_iter()
         .map(|d| (d, None, 1))
         .collect();
@@ -553,6 +552,9 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
             .into_iter()
             .map(|g| (g.deviation, g.channel, g.count)),
     );
+    if let Some(g) = gw.overload.tick(sys::monotonic_ns(), mode) {
+        out.push((g.deviation, g.channel, g.count));
+    }
     for (d, channel, count) in &out {
         if let Some(feed) = events.feed.as_mut() {
             if let Some(l) = crate::feed::line(d, channel.as_deref(), *count) {
@@ -631,6 +633,10 @@ fn housekeeping(cfg: &GatewayConfig, gw: &mut Gateway, events: &mut Events, hist
             })),
             "restriction_error": events.restriction_error,
             "findings_total": gw.findings.total,
+            "overload": {
+                "late_pending": gw.overload.pending(),
+                "reports": gw.overload.reports,
+            },
             "findings_feed": events.feed.as_ref().map(|f| {
                 let s = f.status();
                 json!({

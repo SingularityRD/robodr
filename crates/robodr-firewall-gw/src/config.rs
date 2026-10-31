@@ -822,6 +822,15 @@ pub struct GatewayConfig {
     /// (per `fault_policy`; a humanoid holds). Default 5 ms.
     #[serde(default = "default_max_queue_delay")]
     pub max_queue_delay_ns: u64,
+    /// Overload reporting (`robot.gateway.overload`): late packets (above)
+    /// are reported as one finding per this many ms at most. Default 60000
+    /// (`1000..=3600000`).
+    #[serde(default = "default_overload_interval")]
+    pub overload_interval_ms: u64,
+    /// Late packets in one overload interval from which the finding is
+    /// High instead of Medium. Default 1000 (at least 1).
+    #[serde(default = "default_overload_high_late")]
+    pub overload_high_late: u64,
     /// Deviations (JSON lines). Default: none written (stats only).
     #[serde(default)]
     pub events_path: Option<PathBuf>,
@@ -861,6 +870,12 @@ pub struct GatewayConfig {
 
 fn default_max_queue_delay() -> u64 {
     5_000_000
+}
+fn default_overload_interval() -> u64 {
+    60_000
+}
+fn default_overload_high_late() -> u64 {
+    1_000
 }
 fn default_events_max() -> u64 {
     64 << 20
@@ -1078,6 +1093,12 @@ impl GatewayConfig {
         }
         if self.max_queue_delay_ns == 0 || self.max_queue_delay_ns > 1_000_000_000 {
             return Err("max_queue_delay_ns must be in 1..=1e9".into());
+        }
+        if !(1_000..=3_600_000).contains(&self.overload_interval_ms) {
+            return Err("overload_interval_ms must be in 1000..=3600000".into());
+        }
+        if self.overload_high_late == 0 {
+            return Err("overload_high_late must be at least 1".into());
         }
         let mut topics = std::collections::BTreeSet::new();
         let mut ports = std::collections::BTreeSet::new();

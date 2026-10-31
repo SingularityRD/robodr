@@ -443,6 +443,8 @@ pub struct Gateway {
     /// The gateway's own findings (`crate::findings`), drained at
     /// housekeeping.
     pub findings: GatewayFindings,
+    /// Late-packet accounting (`robot.gateway.overload`, T8).
+    pub overload: crate::findings::Overload,
     /// The `restrict_motion` restriction in force (`crate::restrict`).
     restriction: Option<Restriction>,
     /// When the restriction in force ends, on the monotonic clock (ms;
@@ -786,6 +788,10 @@ impl Gateway {
             webrtc_out: Vec::new(),
             stats: GatewayStats::default(),
             findings: GatewayFindings::default(),
+            overload: crate::findings::Overload::new(
+                cfg.overload_interval_ms,
+                cfg.overload_high_late,
+            ),
             restriction: None,
             restriction_deadline_ms: None,
         })
@@ -885,6 +891,28 @@ impl Gateway {
             .and_then(|i| self.channels.get(i))
             .map(|c| c.name.as_str());
         self.findings.note(rule, name, detail);
+    }
+
+    /// Count a packet read later than `max_queue_delay_ns` (decided with
+    /// the firewall's fault verdict; reported as `robot.gateway.overload`).
+    fn note_late(&mut self, ci: usize) {
+        self.stats.late += 1;
+        let name = self.channels.get(ci).map(|c| c.name.as_str());
+        self.overload.note_late(name);
+    }
+
+    /// The Motion Firewall's pending deviations, without its
+    /// `robot.firewall.internal_fault` events: the gateway asks the firewall
+    /// for a fault verdict only for a late packet (every `fault_verdict` /
+    /// `joint_fault_verdict` call here is behind `late`), which
+    /// [`Self::overload`] reports as `robot.gateway.overload` once per
+    /// interval instead of one Critical fault per burst (RESULTS O1,
+    /// sales-readiness T8). The firewall's own counters (`faults`) keep
+    /// them.
+    pub fn drain_firewall_deviations(&mut self) -> Vec<robodr_events::Deviation> {
+        let mut out = self.fw.drain_deviations();
+        out.retain(|d| d.rule_str() != robodr_firewall::rules::INTERNAL_FAULT);
+        out
     }
 
     /// Decide one queued packet (the IPv4 packet, rewritten in place when
@@ -1488,7 +1516,7 @@ impl Gateway {
                     .and_then(|c| c.writers.get(&s.writer))
                     .is_some_and(|w| w.bound.is_some() || w.last_sn.is_some());
             if late {
-                self.stats.late += 1;
+                self.note_late(ci);
             }
             // The parser's ranges lie inside `d`; one that does not is
             // suppressed (fail closed).
@@ -1587,7 +1615,7 @@ impl Gateway {
         }
         // 4. Decide.
         if late {
-            self.stats.late += 1;
+            self.note_late(ci);
         }
         let Some(slot) = d.get_mut(range.clone()) else {
             self.stats.suppressed += 1;
@@ -2693,10 +2721,11 @@ impl Gateway {
         let late = meta
             .queue_delay_ns
             .is_some_and(|q| q > self.max_queue_delay_ns);
+        let codec = ch.codec;
         if late {
-            self.stats.late += 1;
+            self.note_late(ci);
         }
-        let o = match ch.codec {
+        let o = match codec {
             Codec::Go1HighCmd => self.legacy_high(ci, frame, source, meta.now_ns, late),
             Codec::Go1LowCmd => self.legacy_low(ci, frame, source, meta.now_ns, late, false),
             Codec::Go1LowCmdCompressed => {
