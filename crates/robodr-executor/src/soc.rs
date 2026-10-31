@@ -673,12 +673,27 @@ pub fn scoped_ttl(
     }
 }
 
+/// The `soc.key_scopes` entries that name no key of `keys` (the loaded
+/// `soc.keys`): a typo or a stale entry.
+pub fn stale_scopes<'a>(soc: &'a crate::config::SocSection, keys: &[SocKey]) -> Vec<&'a str> {
+    soc.key_scopes
+        .keys()
+        .filter(|id| !keys.iter().any(|k| &k.key_id == *id))
+        .map(String::as_str)
+        .collect()
+}
+
 /// T67: the key `key_id` may approve (or revert: `what`) `action` with
 /// `ttl` ([`scoped_ttl`]). A key without a `soc.key_scopes` entry approves
 /// every action up to `ttl.max_s`, unless `soc.require_key_scopes` is set
-/// (`key_scope_denied` then).
+/// (`key_scope_denied` then), **or** a `soc.key_scopes` entry names a key
+/// id none of `keys` (the loaded `soc.keys`) has: a mistyped or stale
+/// entry would otherwise leave the key it was meant for unscoped, so every
+/// key without an entry approves nothing until the entry is fixed (review
+/// of T67: fail closed).
 pub fn check_scope(
     soc: &crate::config::SocSection,
+    keys: &[SocKey],
     key_id: &str,
     action: robodr_responder::ActionId,
     ttl: Option<u64>,
@@ -692,6 +707,23 @@ pub fn check_scope(
                 format!(
                     "SOC key {key:?} has no soc.key_scopes entry and soc.require_key_scopes is \
                      set: it may {what} no action"
+                ),
+            ));
+        }
+        let stale = stale_scopes(soc, keys);
+        if !stale.is_empty() {
+            return Err(refuse(
+                codes::KEY_SCOPE_DENIED,
+                format!(
+                    "SOC key {key:?} has no soc.key_scopes entry, and soc.key_scopes names key \
+                     id(s) no configured SOC key has ({}): a mistyped or stale entry would leave \
+                     its key unscoped, so a key without an entry may {what} no action until \
+                     soc.key_scopes is fixed",
+                    stale
+                        .iter()
+                        .map(|s| format!("{:?}", crate::net::clip(s)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             ));
         }

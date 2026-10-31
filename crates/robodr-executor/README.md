@@ -580,11 +580,19 @@ named; it bounds `restrict_motion`, `quarantine_node` and
 over-shared tier-1 key cannot isolate the robot for a day or pause it. A
 key without an entry approves every action up to `ttl.max_s` (the
 behaviour before scopes), unless `soc.require_key_scopes: true`, which
-makes such a key approve nothing. The executor enforces this itself with
-its own configuration (agentd's check of the same key is not trusted for
-it); a held action is re-armed after a reboot only while the scope of the
-key that approved it, as configured then, still allows it (otherwise
-reverted, `key_scope_denied`). Two-person actions still need two
+makes such a key approve nothing. A `soc.key_scopes` entry whose key id
+no key of `soc.keys` has (a typo, or a key removed from `soc.keys`) also
+makes every key without an entry approve and revert nothing
+(`key_scope_denied`, naming the entry) until it is fixed: a mistyped id
+would otherwise leave the key it was meant for unscoped. `--check-config` fails
+on such an entry and a start logs it. The executor enforces this itself
+with its own configuration (agentd's check of the same key is not trusted
+for it); a held control-plane action is re-armed after a reboot only
+while the key that approved it is still in `soc.keys` and its scope, as
+configured then, still allows the action and the TTL it was approved and
+applied with (the signed one, else the `ttl.default_s` in force at
+approval; a later change of `ttl.default_s` does not change it).
+Otherwise it is reverted (`approval_key_removed`, `key_scope_denied`). Two-person actions still need two
 `approved_by` names in the body the key signed; a second, independent
 signature is not implemented.
 

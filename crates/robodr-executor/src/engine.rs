@@ -944,34 +944,43 @@ impl Engine {
             ));
         };
         // Review F9 (b): an approval is only as good as its key; a key the
-        // site removed (or that no longer loads) re-arms nothing.
+        // site removed (or that no longer loads) re-arms nothing. Every
+        // control-plane order is checked (review of T67: not only those
+        // flagged `human_approved`; the executor sets that flag on every
+        // control-plane order it verified).
         if let crate::order::Origin::ControlPlane { key_id, .. } = &order.origin {
-            if order.human_approved {
-                let keys = self.soc_keys()?;
-                if !keys.iter().any(|k| &k.key_id == key_id) {
-                    return Err(Refusal::new(
-                        codes::APPROVAL_KEY_REMOVED,
-                        format!(
-                            "approved with SOC key {:?}, which is no longer configured \
-                             (soc.keys): not re-armed",
-                            crate::net::clip(key_id)
-                        ),
-                    ));
-                }
-                // T67: the key's scope as configured now.
-                let c = &self.cfg.config;
-                crate::soc::check_scope(
-                    &c.soc,
-                    key_id,
-                    order.action,
-                    crate::soc::scoped_ttl(order.action, order.ttl_s, c.ttl.default_s),
-                    "approve",
-                )
-                .map_err(|mut r| {
-                    r.reason = format!("{}: not re-armed", r.reason);
-                    r
-                })?;
+            let keys = self.soc_keys()?;
+            if !keys.iter().any(|k| &k.key_id == key_id) {
+                return Err(Refusal::new(
+                    codes::APPROVAL_KEY_REMOVED,
+                    format!(
+                        "approved with SOC key {:?}, which is no longer configured \
+                         (soc.keys): not re-armed",
+                        crate::net::clip(key_id)
+                    ),
+                ));
             }
+            // T67: the key's scope as configured now, bounding the TTL the
+            // order was approved and applied with (the signed one, else the
+            // `ttl.default_s` in force at approval, kept in the entry), not
+            // today's `ttl.default_s`.
+            let c = &self.cfg.config;
+            crate::soc::check_scope(
+                &c.soc,
+                &keys,
+                key_id,
+                order.action,
+                crate::soc::scoped_ttl(
+                    order.action,
+                    order.ttl_s.or(Some(en.ttl_s)),
+                    c.ttl.default_s,
+                ),
+                "approve",
+            )
+            .map_err(|mut r| {
+                r.reason = format!("{}: not re-armed", r.reason);
+                r
+            })?;
         }
         let p = decision::precheck(order, &self.policy, &self.cfg)?;
         Ok(p.effect)
@@ -1042,6 +1051,14 @@ impl Engine {
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Tests: change the journal state and save it (as an older build or
+    /// an interrupted run would have left it).
+    #[cfg(test)]
+    pub(crate) fn edit_state_saved(&mut self, f: impl FnOnce(&mut State)) {
+        f(&mut self.state);
+        let _ = self.save();
     }
 
     pub fn policy(&self) -> &ResponsePolicy {
@@ -1388,6 +1405,7 @@ impl Engine {
                     let c = &self.cfg.config;
                     crate::soc::check_scope(
                         &c.soc,
+                        &keys,
                         key_id,
                         order.action,
                         crate::soc::scoped_ttl(order.action, order.ttl_s, c.ttl.default_s),
@@ -1670,6 +1688,7 @@ impl Engine {
                 if let Some(s) = soc {
                     crate::soc::check_scope(
                         &self.cfg.config.soc,
+                        &keys,
                         &s.key_id,
                         action,
                         None,

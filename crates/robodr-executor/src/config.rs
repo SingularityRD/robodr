@@ -211,7 +211,8 @@ pub struct SocSection {
     /// What each SOC key (by key id) may approve and revert, and for how
     /// long (sales-readiness T67, [`crate::soc::check_scope`]): refused
     /// `key_scope_denied` otherwise. A key without an entry approves every
-    /// action up to `ttl.max_s` unless `require_key_scopes` is set.
+    /// action up to `ttl.max_s` unless `require_key_scopes` is set or an
+    /// entry names a key id no loaded `soc.keys` key has (then nothing).
     #[serde(default)]
     pub key_scopes: std::collections::BTreeMap<String, crate::soc::KeyScope>,
     /// Every SOC key must have a `key_scopes` entry (a key without one

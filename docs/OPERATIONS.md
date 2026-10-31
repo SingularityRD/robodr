@@ -2089,7 +2089,10 @@ table.
      `{"soc:tier1": {"actions": ["quarantine_node"], "max_ttl_s": 900}}`;
      anything else signed with that key is refused `key_scope_denied`.
      `soc.require_key_scopes: true` makes a key without an entry approve
-     nothing (recommended once every key has one).
+     nothing (recommended once every key has one). An entry whose key id
+     matches no key in `soc.keys` (a typo, or a key you removed) makes
+     every key without an entry approve and revert nothing until you fix
+     or remove the entry; `robodr-executor --check-config` fails on it.
    * `network.quarantine.cidrs`: the networks where a participant may be
      quarantined (its SPDP locators must be there, on the robot's DDS
      ports); empty refuses every quarantine (`locator_out_of_scope`).
