@@ -185,6 +185,7 @@
 
 mod frag;
 mod parse;
+pub mod secured_prefix;
 pub mod security;
 mod user;
 pub mod vendor;

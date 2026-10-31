@@ -103,7 +103,8 @@ pub mod pipeline;
 pub mod profile_trust;
 pub mod ratelimit;
 pub mod sanitize;
-pub mod secured_prefix;
+/// Moved to `robodr-rtps` (the commissioning learner uses it too).
+pub use robodr_rtps::secured_prefix;
 pub mod socket;
 pub mod source;
 pub mod sros2;

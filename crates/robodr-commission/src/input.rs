@@ -79,7 +79,7 @@ use robodr_capture::{CaptureError, CaptureFile, RtpsDatagrams};
 use robodr_events::RobotEvent;
 use robodr_rtps::{hex12, EndpointKind, FragmentReassembler, Guid, PayloadKind, UserDataWalker};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -392,10 +392,67 @@ pub struct CaptureDiagnostics {
     /// `unitree_legacy.command_senders`, to be confirmed by the operator.
     #[serde(default)]
     pub unitree_legacy_command_senders: BTreeSet<String>,
+    /// Source IPs of SPDP announcements that advertise locators a capture
+    /// cannot inspect (shared memory, TCP, unknown kinds), with those
+    /// transports (`shared memory (shm)`), at most
+    /// [`MAX_UNINSPECTED_HOSTS`]: traffic over them is not in the capture
+    /// and was not learned (the sensor reports the same SPDP as
+    /// `robot.capture.unsupported_transport`).
+    #[serde(default)]
+    pub uninspected_transports: BTreeMap<String, BTreeSet<String>>,
+    /// Participants (GUID prefix hex) whose own SPDP the sensor's identity
+    /// resolver would not match to an identity learned from it, at most
+    /// [`MAX_UNVERIFIED_PREFIXES`]: the learner takes an identity's
+    /// `vendor` from the first two prefix bytes, and the resolver accepts
+    /// them only as the SPDP's `PID_VENDORID` or as the subject hash of a
+    /// claimed PKI-DH certificate subject it can rebuild
+    /// (`robodr_rtps::secured_prefix`). Value: why, for the warning.
+    #[serde(default)]
+    pub identity_prefix_unverified: BTreeMap<String, String>,
 }
 
 /// Most legacy command senders listed in [`CaptureDiagnostics`].
 pub const MAX_LEGACY_SENDERS: usize = 64;
+/// Most hosts listed in [`CaptureDiagnostics::uninspected_transports`].
+pub const MAX_UNINSPECTED_HOSTS: usize = 64;
+/// Most participants listed in
+/// [`CaptureDiagnostics::identity_prefix_unverified`].
+pub const MAX_UNVERIFIED_PREFIXES: usize = 64;
+
+/// Why the sensor's identity resolver would not accept the identity
+/// `vendor` the learner takes from this participant's GUID prefix (its
+/// first two bytes), or `None` if it would. Same rule as
+/// `robodr_ros2_pipeline::identity`: the SPDP's `PID_VENDORID` must be
+/// present and equal those bytes, or the PKI-DH certificate subject it
+/// claims must hash to the prefix (DDS-Security §9.3.3).
+pub fn identity_prefix_unverified(spdp: &robodr_rtps::SpdpInfo) -> Option<String> {
+    let p = spdp.guid_prefix;
+    let [h0, h1, ..] = p;
+    let Some(vendor) = spdp.vendor_id else {
+        return Some("its SPDP has no vendor id (PID_VENDORID)".into());
+    };
+    if vendor == [h0, h1] {
+        return None;
+    }
+    let [v0, v1] = vendor;
+    let shown = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).take(128).collect() };
+    match spdp.security.pki_identity_subject() {
+        Some(s) if robodr_rtps::secured_prefix::prefix_matches_subject(&p, s) => None,
+        Some(s) => Some(format!(
+            "its GUID prefix does not derive from the certificate subject it claims ({:?}) in \
+             a subject form RoboDR rebuilds, and its vendor id {:02x}{:02x} is not the \
+             prefix's first two bytes",
+            shown(s),
+            v0,
+            v1
+        )),
+        None => Some(format!(
+            "its vendor id {:02x}{:02x} is not the prefix's first two bytes and it claims no \
+             PKI-DH certificate subject",
+            v0, v1
+        )),
+    }
+}
 
 impl CaptureDiagnostics {
     /// Fragmented discovery was seen but at least one sample was not
@@ -459,6 +516,23 @@ impl CaptureDiagnostics {
         for (a, b) in pairs {
             *a = a.saturating_add(b);
         }
+        for (ip, t) in &o.uninspected_transports {
+            if self.uninspected_transports.len() < MAX_UNINSPECTED_HOSTS
+                || self.uninspected_transports.contains_key(ip)
+            {
+                self.uninspected_transports
+                    .entry(ip.clone())
+                    .or_default()
+                    .extend(t.iter().cloned());
+            }
+        }
+        for (g, why) in &o.identity_prefix_unverified {
+            if self.identity_prefix_unverified.len() < MAX_UNVERIFIED_PREFIXES {
+                self.identity_prefix_unverified
+                    .entry(g.clone())
+                    .or_insert_with(|| why.clone());
+            }
+        }
     }
 }
 
@@ -489,6 +563,8 @@ pub struct PcapSource<R: Read> {
     legacy_commands: u64,
     legacy_undecodable: u64,
     legacy_senders: BTreeSet<String>,
+    uninspected_transports: BTreeMap<String, BTreeSet<String>>,
+    identity_prefix_unverified: BTreeMap<String, String>,
 }
 
 /// Options of the capture inputs.
@@ -570,6 +646,8 @@ impl<R: Read> PcapSource<R> {
             legacy_commands: 0,
             legacy_undecodable: 0,
             legacy_senders: BTreeSet::new(),
+            uninspected_transports: BTreeMap::new(),
+            identity_prefix_unverified: BTreeMap::new(),
         })
     }
 }
@@ -672,6 +750,7 @@ impl<R: Read> EventSource for PcapSource<R> {
                         ips.insert(src_ip.clone());
                     }
                 }
+                self.note_spdp(spdp, &src_ip);
             }
             for e in &report.endpoints {
                 // A motion command writer announced by its own participant.
@@ -748,11 +827,43 @@ impl<R: Read> EventSource for PcapSource<R> {
             unitree_legacy_commands: self.legacy_commands,
             unitree_legacy_undecodable: self.legacy_undecodable,
             unitree_legacy_command_senders: self.legacy_senders.clone(),
+            uninspected_transports: self.uninspected_transports.clone(),
+            identity_prefix_unverified: self.identity_prefix_unverified.clone(),
         })
     }
 }
 
 impl<R: Read> PcapSource<R> {
+    /// Transports the capture cannot inspect, and identities the sensor
+    /// would not resolve (see [`CaptureDiagnostics`]), from one SPDP.
+    fn note_spdp(&mut self, spdp: &robodr_rtps::SpdpInfo, src_ip: &str) {
+        let t = spdp.uninspected_transports();
+        if !t.is_empty()
+            && (self.uninspected_transports.len() < MAX_UNINSPECTED_HOSTS
+                || self.uninspected_transports.contains_key(src_ip))
+        {
+            self.uninspected_transports
+                .entry(src_ip.to_owned())
+                .or_default()
+                .extend(t.iter().map(|(t, k)| format!("{} ({k})", t.name())));
+        }
+        // Only a participant's own announcement: a relayed copy's vendor
+        // id is the relayed participant's claim all the same, but the
+        // learner keys identities on own announcements.
+        if spdp.source == spdp.guid_prefix
+            && self.identity_prefix_unverified.len() < MAX_UNVERIFIED_PREFIXES
+        {
+            let g = hex12(&spdp.guid_prefix);
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.identity_prefix_unverified.entry(g)
+            {
+                if let Some(why) = identity_prefix_unverified(spdp) {
+                    e.insert(why);
+                }
+            }
+        }
+    }
+
     /// One Unitree legacy UDP datagram (see [`PcapSource::new_with_options`]).
     fn legacy_event(&mut self, pkt: &robodr_capture::RtpsPacket, position: u64) {
         use robodr_cdr::unitree_legacy::LegacyFrame;
@@ -997,6 +1108,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn diagnostics_lists_merge_within_their_bounds() {
+        let one = |i: usize| CaptureDiagnostics {
+            uninspected_transports: [(format!("10.0.0.{i}"), ["shm".to_string()].into())].into(),
+            identity_prefix_unverified: [(format!("{i:024x}"), "why".to_string())].into(),
+            ..CaptureDiagnostics::default()
+        };
+        let mut sum = CaptureDiagnostics::default();
+        for i in 0..MAX_UNINSPECTED_HOSTS.max(MAX_UNVERIFIED_PREFIXES) + 10 {
+            sum.add(&one(i));
+        }
+        assert_eq!(sum.uninspected_transports.len(), MAX_UNINSPECTED_HOSTS);
+        assert_eq!(
+            sum.identity_prefix_unverified.len(),
+            MAX_UNVERIFIED_PREFIXES
+        );
+        // A listed host still gains transports.
+        let mut tcp = one(0);
+        tcp.uninspected_transports
+            .insert("10.0.0.0".into(), ["tcp".to_string()].into());
+        sum.add(&tcp);
+        assert_eq!(sum.uninspected_transports["10.0.0.0"].len(), 2);
     }
 
     #[test]

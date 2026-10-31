@@ -3059,7 +3059,6 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
- "sha2 0.10.9",
  "toml",
 ]
 
@@ -3069,6 +3068,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-events",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

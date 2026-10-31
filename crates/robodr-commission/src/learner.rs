@@ -3564,6 +3564,51 @@ impl Learner {
                     ),
                 );
             }
+            for (ip, transports) in &c.uninspected_transports {
+                let shm = transports.iter().any(|t| t.starts_with("shared memory"));
+                let why = if shm {
+                    "DDS traffic between participants on that host over shared memory never \
+                     reaches a network interface: it is not in this capture and nothing of it \
+                     was learned (motion commands included), and the sensor will not see it \
+                     either"
+                } else {
+                    "RoboDR does not decode RTPS over these transports: traffic on them was \
+                     not learned"
+                };
+                warn(
+                    Warn,
+                    "unsupported_transport",
+                    ip,
+                    format!(
+                        "{}: participant(s) on {ip} advertise {} locators; {why}. Commission \
+                         the robot with UDP-only DDS transports (docs/DDS-TRANSPORTS.md)",
+                        r.label,
+                        transports
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+            for (g, why) in &c.identity_prefix_unverified {
+                if !accepted.contains(g.as_str()) {
+                    continue;
+                }
+                warn(
+                    Warn,
+                    "identity_prefix_unverified",
+                    g,
+                    format!(
+                        "{}: participant {g}: {why}. Its learned identity takes `vendor` from \
+                         the prefix, so the sensor will not resolve a new instance of it (a \
+                         new GUID prefix, e.g. after a restart) to that identity and reports \
+                         it as an unknown participant (docs/DDS-TRANSPORTS.md, SROS 2 \
+                         limits)",
+                        r.label
+                    ),
+                );
+            }
         }
 
         // Motion channels.

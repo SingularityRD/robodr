@@ -50,7 +50,11 @@ profile with its trust (signature, metadata, revocation, anti\-rollback
 decision), the SROS 2 keystore when set, and
 .B /dev/shm
 of the host running the check for DDS shared\-memory segments (a warning
-only when some are found; run the check on the robot). Read\-only: the
+only when some are found, a
+.B note:
+line otherwise; run the check on the robot: nothing in the configuration
+identifies the robot host, so a workstation running ROS gets the warning
+too). Read\-only: the
 anti\-rollback state file is not written, nothing is captured. Warnings and
 errors go to stderr, a summary to stdout. Limits that hold for every
 deployment (shared\-memory transports are invisible to the capture; what an
@@ -63,6 +67,11 @@ With
 .BR \-\-check\-config :
 warnings fail too, including a profile the daemon would refuse to enforce
 (it would run observe\-only).
+.B note:
+lines never fail it: with an SROS 2 keystore whose governance protects
+discovery, the note that the writer and motion\-envelope checks have
+nothing to inspect passes
+.BR \-\-strict .
 .SH OPTIONS
 .TP
 .BI \-\-profile " file"

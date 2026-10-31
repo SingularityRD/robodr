@@ -10,8 +10,8 @@ publish = false
 repository.workspace = true
 description = "Pulsar-independent ROS 2 / DDS detection pipeline for RoboDR: datagram sources (multicast socket, passive capture, pcap replay), RTPS parsing, profile deviations, motion user-DATA decoding, bounded dedup, sanitised findings."
 
-# Pure crate: std + RoboDR crates + serde (+ toml for the config check, sha2 for
-# the DDS-Security prefix check) only, so it builds and tests offline.
+# Pure crate: std + RoboDR crates + serde (+ toml for the config check) only,
+# so it builds and tests offline.
 # The Pulsar glue lives in robodr-sensor-ros2.
 
 [dependencies]
@@ -30,9 +30,6 @@ serde_json = { workspace = true }
 # Pulsar would ignore (both already in the lock through Pulsar).
 toml = { workspace = true }
 serde_ignored = { workspace = true }
-# SHA-256 of a claimed certificate subject (DDS-Security GUID prefix check,
-# `secured_prefix`); already in the workspace lock.
-sha2 = { workspace = true }
 
 [dev-dependencies]
 # Ed25519 keys to sign test profiles (profile_trust tests).

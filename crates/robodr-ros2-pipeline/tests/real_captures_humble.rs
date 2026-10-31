@@ -268,6 +268,39 @@ fn humble_default_shared_memory_transport_is_reported_per_host() {
     assert_eq!(rest, teleop_left(), "{:#?}", r.findings);
 }
 
+/// T14: `learn` warned about nothing when the commissioning capture showed
+/// shared-memory transports; the profile then silently lacked every
+/// same-host command. It now warns per host, like the sensor's finding.
+#[test]
+fn humble_learn_warns_about_shared_memory_per_host() {
+    let c = commission("fastrtps_shm_default.pcap");
+    let w: Vec<_> = c
+        .report
+        .warnings
+        .iter()
+        .filter(|w| w.code == "unsupported_transport")
+        .collect();
+    assert_eq!(
+        w.iter().map(|w| w.subject.as_str()).collect::<Vec<_>>(),
+        [ROBOT_IP, TELEOP_IP]
+    );
+    for w in &w {
+        assert_eq!(w.level, robodr_commission::WarningLevel::Warn);
+        assert!(w.message.contains("shared memory (shm)"), "{w:?}");
+        assert!(w.message.contains("docs/DDS-TRANSPORTS.md"), "{w:?}");
+    }
+    // A UDP-only capture has none.
+    let c = commission("fastrtps_baseline.pcap");
+    assert!(
+        !c.report
+            .warnings
+            .iter()
+            .any(|w| w.code == "unsupported_transport"),
+        "{:#?}",
+        c.report.warnings
+    );
+}
+
 // --- T78: SROS 2 (DDS-Security, Enforce) -----------------------------------
 
 const FOREIGN_CA_IP: &str = "10.77.10.67";
@@ -360,6 +393,53 @@ fn sros2_learned_run_is_blind_to_topics_and_says_so() {
         .any(|w| w.code == "protected_discovery"));
     let v = keystore().visibility();
     assert!(v.iter().any(|l| l.contains("no topic")), "{v:?}");
+}
+
+/// Review (phase 3): `learn` takes a secured participant's identity
+/// `vendor` from its GUID prefix, the resolver accepts it only when the
+/// claimed subject rebuilds to that prefix. When it does not (here: the
+/// controller's subject altered in every SPDP, same length), `learn` now
+/// says the identity will not resolve instead of leaving a silent,
+/// persistent unknown-participant finding for later.
+#[test]
+fn sros2_learn_warns_when_a_secured_prefix_does_not_verify() {
+    let unverified = |c: &Commissioning| -> Vec<(String, String)> {
+        c.report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "identity_prefix_unverified")
+            .map(|w| (w.subject.clone(), w.message.clone()))
+            .collect()
+    };
+    let clean = commission("fastrtps_sros2_baseline.pcap");
+    assert_eq!(unverified(&clean), []);
+
+    let mut bytes = std::fs::read(fixture("fastrtps_sros2_baseline.pcap")).unwrap();
+    let (from, to) = (
+        br"/CN=\/lab\/base_controller",
+        br"/CN=\/lab\/base_controllez",
+    );
+    let mut n = 0;
+    let mut i = 0;
+    while let Some(at) = bytes[i..].windows(from.len()).position(|w| w == from) {
+        bytes[i + at..i + at + from.len()].copy_from_slice(to);
+        i += at + from.len();
+        n += 1;
+    }
+    assert!(n > 0);
+    let mut l = Learner::new(LearnConfig {
+        model: "lab-ugv".into(),
+        ..LearnConfig::default()
+    })
+    .unwrap();
+    l.ingest(&mut PcapSource::new("altered.pcap", &bytes[..]).unwrap())
+        .unwrap();
+    let w = unverified(&l.finish());
+    assert_eq!(w.len(), 1, "{w:#?}");
+    // The controller (prefix af0c854b646f...), not the teleop.
+    assert!(w[0].0.starts_with("af0c854b646f"), "{w:?}");
+    assert!(w[0].1.contains("base_controllez"), "{w:?}");
+    assert!(w[0].1.contains("vendor id 010f"), "{w:?}");
 }
 
 #[test]
