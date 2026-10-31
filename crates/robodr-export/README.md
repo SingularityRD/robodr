@@ -681,8 +681,11 @@ partitioner all agreed with the real brokers.
   the proxy.
 * **Idempotence** is on by default (contract §4, `enable.idempotence=true`)
   and verified against the fake broker (sequence numbers, epochs,
-  five-batch duplicate window); `scripts/kafka-it.sh` has not yet been run
-  against real brokers with it. With `--no-idempotence` (brokers that
+  five-batch duplicate window) and against a single-node Kafka 3.9.1
+  (`scripts/kafka-tls-it.sh`, run by hand on 2026-10-31: all 17 tests,
+  including a crash resumed without duplicate, SCRAM-SHA-256/512 over TLS
+  and the epoch bump below; not yet in CI, and no multi-broker cluster).
+  With `--no-idempotence` (brokers that
   refuse InitProducerId to this principal) delivery is at-least-once: a
   lost response duplicates a request's records. Either way consumers may
   drop duplicates on `event-uid` (contract §2). Epoch bumps (KIP-360) are
