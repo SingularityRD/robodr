@@ -234,9 +234,11 @@ jobs:
         # a tampered extracted directory refused). rpm (rpm, rpmbuild,
         # rpm2archive): the RPM bundle tests, in a separate rpm root.
         run: |
-          bin=$(cargo test -p robodr-fleet --test packaging $CARGO_LOCKED --no-run 2>&1 |
+          # --color never: the job sets CARGO_TERM_COLOR=always, whose escape
+          # codes would split "Executable tests/packaging.rs" for sed.
+          bin=$(cargo test -p robodr-fleet --test packaging $CARGO_LOCKED --no-run --color never 2>&1 |
             sed -n 's/.*Executable tests\/packaging.rs (\(.*\))$/\1/p')
-          test -x "$bin"
+          if [ ! -x "$bin" ]; then echo "packaging test binary not found: '$bin'" >&2; exit 1; fi
           sudo env ROBODR_REQUIRE_DPKG_TEST=1 ROBODR_REQUIRE_RPM_TEST=1 "$bin"
       - name: Build did not modify tracked files
         run: |
