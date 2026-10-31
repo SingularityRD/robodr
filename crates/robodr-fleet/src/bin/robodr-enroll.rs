@@ -50,7 +50,7 @@ usage:
   robodr-enroll decommission [--answer FILE] [--receipt-out FILE]   (resume / show the receipt)
   robodr-enroll decommission --abort
 check: SOC keys, TLS (CA bundle, pins, CRLs), the fleet API and, once enrolled, request
-authentication with the uplink key; read-only (site acceptance, docs/OPERATIONS.md).
+authentication with the uplink key; read-only (site acceptance, docs/SITE-ACCEPTANCE.md).
 decommission: retires every key of the unit at the SOC (request signed by its uplink,
 finding and blackbox keys), then shreds the uplink and finding keys; procedure:
 docs/DECOMMISSION.md.
