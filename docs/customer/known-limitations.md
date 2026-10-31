@@ -219,6 +219,20 @@
   `robodr-anchor-receiver` and `robodr-depot` only log them, and the
   site-acceptance checks print the days left. The robot's remote head
   anchor client and `robodr-deliverd` do not warn.
+- **Per-finding signatures do not cross the diode.** On a connected path
+  each finding can carry its detached signature to the SOC. Across a
+  diode only the batch is signed (the manifest, checked by
+  `robodr-diode-unpack`); the findings the importer emits have no
+  signature, so the SOC's verifier must run with `--policy optional`
+  (`integrations/verify/robodr_verify.py`) or the Rust `Optional` policy
+  there, and an unsigned finding passes as `unsigned`. Anyone who can
+  produce to the findings topic downstream of the importer can then
+  inject findings that cannot be told apart from imported ones by
+  signature: restrict produce rights on that topic (Kafka ACLs) to the
+  importer. The SIEM content still never shows such a finding as
+  `verified`, and its "Unverified findings" detection lists it. Carrying
+  the signatures across (a signed per-finding sidecar in the batch) is
+  not implemented (contract §8).
 - **Robot keys are files by default.** agentd's private keys can instead
   be sealed to the robot's TPM as systemd encrypted credentials (systemd
   250 or newer, not the focal package): that protects them **at rest**

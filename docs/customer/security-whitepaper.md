@@ -150,8 +150,17 @@ still files.
   (motion items need a quorum), is bound to its content, and has
   anti-rollback state. Revocation lists can revoke signing keys.
 - **Findings.** Optional detached per-finding signatures, carried
-  unchanged through the ingest API. Ingest batches are signed over the
-  exact body bytes.
+  unchanged through Kafka (`robodr-kafka-publish`) and the ingest API.
+  Ingest batches are signed over the exact body bytes. Per-finding
+  signatures do **not** cross the diode: there a batch is authenticated
+  as a whole by its unit-bound manifest signature, which the importer
+  checks, and the findings it emits carry no signature. A SOC behind a
+  diode therefore runs signature checks in the optional policy, and
+  whoever can produce to its findings topic (after the importer) can
+  inject findings that look the same as imported ones: the produce ACL on
+  that topic is the trust boundary
+  ([`known-limitations.md`](known-limitations.md), "Security of RoboDR
+  itself"; contract §8).
 - **Evidence exports.** The control plane's evidence API exports
   black-box frames exactly as stored, as `RBBXBND1` bundles with a
   manifest signed by the finding key, in signed, size-bounded, resumable
