@@ -2,7 +2,7 @@ id: fe6b8de9-21fa-5a82-9636-d0f3eda7daf3
 name: RoboDR - Correlated intrusion
 description: |
   Several independent RoboDR sensors agree on one intrusion (robot.correlate.* findings cite every contributing detection). Observe-only: alerts, never responds.
-  RoboDR rule ids (docs/customer/detection-catalog.md):
+  RoboDR rule ids (docs/customer/detection-rules.md):
     - robot.correlate.*
 severity: High
 requiredDataConnectors: []
