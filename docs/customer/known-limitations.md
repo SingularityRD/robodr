@@ -121,9 +121,11 @@
   sent. Its findings reach agentd (and so the SOC) through agentd's
   `gateway_feed`; that channel is trusted by uid, so a process running as
   root or as the gateway's user can claim any gateway finding. On an
-  overloaded host a frame decided late gets the fail-safe verdict and a
-  Critical `robot.firewall.internal_fault` (seen on a shared VM in the
-  lab soak). It has not run on a robot, a real Cyclone DDS stack or a
+  overloaded host a frame decided late gets the fail-safe verdict (seen
+  on a shared VM in the lab soak); the gateway reports such frames as
+  `robot.gateway.overload` (Medium, High from `overload_high_late` late
+  frames in one interval), at most once per `overload_interval_ms`. It
+  has not run on a robot, a real Cyclone DDS stack or a
   real sensor box. Start in `mode: observe`.
 - **Humanoids and other balancing robots:** RoboDR never executes a pause
   or safe state on a humanoid, never terminates processes on a balancing
