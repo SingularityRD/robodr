@@ -257,7 +257,7 @@ files (under `crates/`) or harnesses that fail if the mitigation breaks;
 |---|---|---|---|---|
 | S | Spoofed writer or sequence numbers | `allowed_src_ips` / `allowed_src_macs`, sequence state bound to (GUID, IP, MAC), writer-binding conflict findings | `robodr-firewall-gw/tests/gateway.rs`, `robodr-firewall-gw/tests/hardening.rs`, `robodr-firewall-gw/tests/netns_e2e.rs` | Same IP and MAC on the controller segment (GAP-25) |
 | T | Out-of-envelope command | Per-channel limits, trajectory checks (splines, NaN, time), hold of the last accepted frame; never originates a datagram | `robodr-firewall-gw/tests/trajectory.rs`, `robodr-firewall-gw/tests/review_motion.rs`, `robodr-firewall/tests/joint_properties.rs` | Channel configuration file not signed (SALES-READINESS T11) |
-| D | Gateway down or overloaded | `fail_closed` default, watchdog, FIFO priority; late packets get the fault verdict | `robodr-firewall-gw/tests/netns_e2e.rs`; RESULTS O1 | Overload reported as Critical `internal_fault`; p99 latency unmeasured on a target box (GAP-14, GAP-25) |
+| D | Gateway down or overloaded | `fail_closed` default, watchdog, FIFO priority; late packets get the fault verdict | `robodr-firewall-gw/tests/netns_e2e.rs`; RESULTS O1 | Overload reported as `robot.gateway.overload` (aggregated per interval, T8); p99 latency unmeasured on a target box (GAP-14, GAP-25) |
 
 ### TB11: SOC fleet documents → robot
 

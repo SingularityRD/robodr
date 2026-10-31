@@ -403,7 +403,19 @@ impl Firewall {
     /// the platform's [`FaultPolicy`]. Recorded as `robot.firewall.internal_fault`.
     pub fn fault_verdict(&mut self, cmd: &Command, now: u64) -> Verdict {
         self.stats.checked = self.stats.checked.saturating_add(1);
-        self.fault(cmd, now)
+        self.fault(cmd, now, true)
+    }
+
+    /// [`Self::fault_verdict`] for a command the caller **chose not to
+    /// evaluate** because it arrived too late (gateway queue delay over its
+    /// deadline): the same verdict, substitute and `faults` count, but no
+    /// `robot.firewall.internal_fault` event, because nothing inside the
+    /// firewall failed and the caller reports the overload itself
+    /// (`robot.gateway.overload`). A fault the firewall raises on its own
+    /// (a failed post-condition) is still recorded.
+    pub fn late_verdict(&mut self, cmd: &Command, now: u64) -> Verdict {
+        self.stats.checked = self.stats.checked.saturating_add(1);
+        self.fault(cmd, now, false)
     }
 
     /// Source, rate and timestamp check of a request that commands **no
@@ -497,7 +509,7 @@ impl Firewall {
             Ok(acc) => {
                 let Some(ch) = self.policy.channels.get(ch_idx) else {
                     // evaluate() only accepts known channels.
-                    return self.fault(cmd, now);
+                    return self.fault(cmd, now, true);
                 };
                 // Defensive post-condition: finite and within speed limits.
                 let lim = speed_limits(ch.kind, &ch.limits);
@@ -506,7 +518,7 @@ impl Firewall {
                 let finite = acc.out.iter().all(|x| x.is_finite());
                 let within = m0 <= l0 * (1.0 + POST_CHECK_TOL) && m1 <= l1 * (1.0 + POST_CHECK_TOL);
                 if !(finite && within) {
-                    return self.fault(cmd, now);
+                    return self.fault(cmd, now, true);
                 }
                 if let Some(p) = self.pairs.get_mut(acc.pair_idx) {
                     *p = acc.pair_new;
@@ -824,7 +836,7 @@ impl Firewall {
 
     fn accept(&mut self, cmd: &Command, now: u64, ch_idx: usize, acc: Accepted) -> Verdict {
         let Some(kind) = self.policy.channels.get(ch_idx).map(|c| c.kind) else {
-            return self.fault(cmd, now);
+            return self.fault(cmd, now, true);
         };
         let action = if self.observe {
             EventAction::ObservedOnly
@@ -1101,22 +1113,25 @@ impl Firewall {
         }
     }
 
-    /// Internal fault handling per [`FaultPolicy`].
-    fn fault(&mut self, cmd: &Command, now: u64) -> Verdict {
+    /// Internal fault handling per [`FaultPolicy`]; `record` false for a
+    /// late command ([`Self::late_verdict`]): no `internal_fault` event.
+    fn fault(&mut self, cmd: &Command, now: u64, record: bool) -> Verdict {
         self.stats.faults = self.stats.faults.saturating_add(1);
         let ch_idx = usize::from(cmd.channel.0);
         let (rule, sev) = reject_rule(RejectReason::InternalFault);
         let fail_open = self.observe || self.policy.platform.fault_policy == FaultPolicy::FailOpen;
         if fail_open {
-            self.push_event(
-                rule,
-                sev,
-                cmd,
-                now,
-                EventAction::ObservedOnly,
-                f64::NAN,
-                f64::NAN,
-            );
+            if record {
+                self.push_event(
+                    rule,
+                    sev,
+                    cmd,
+                    now,
+                    EventAction::ObservedOnly,
+                    f64::NAN,
+                    f64::NAN,
+                );
+            }
             self.commit_forwarded(cmd, now, ch_idx);
             self.stats.passed = self.stats.passed.saturating_add(1);
             self.stats.would_have = self.stats.would_have.saturating_add(1);
@@ -1132,15 +1147,17 @@ impl Firewall {
         if let Some((_, raw)) = sub {
             self.commit(ch_idx, raw, now, [0.0; 2], false);
         }
-        self.push_event(
-            rule,
-            sev,
-            cmd,
-            now,
-            EventAction::Rejected(sub.map(|(s, _)| s.kind)),
-            f64::NAN,
-            f64::NAN,
-        );
+        if record {
+            self.push_event(
+                rule,
+                sev,
+                cmd,
+                now,
+                EventAction::Rejected(sub.map(|(s, _)| s.kind)),
+                f64::NAN,
+                f64::NAN,
+            );
+        }
         self.stats.rejected = self.stats.rejected.saturating_add(1);
         Verdict::Rejected {
             reason: RejectReason::InternalFault,

@@ -383,7 +383,7 @@ impl Firewall {
                     }
                 });
                 if !ok {
-                    return self.fault_joint(cmd, now);
+                    return self.fault_joint(cmd, now, true);
                 }
                 if let Some(p) = self.pairs.get_mut(acc.pair_idx) {
                     *p = acc.pair_new;
@@ -400,7 +400,18 @@ impl Firewall {
     /// unchecked input.
     pub fn joint_fault_verdict(&mut self, cmd: &JointCommand, now: u64) -> JointVerdict {
         self.stats.checked = self.stats.checked.saturating_add(1);
-        self.fault_joint(cmd, now)
+        self.fault_joint(cmd, now, true)
+    }
+
+    /// [`Self::joint_fault_verdict`] for a frame the caller **chose not to
+    /// evaluate** because it arrived too late: the same verdict, substitute
+    /// and `faults` count, but no `robot.firewall.internal_fault` event
+    /// (the caller reports the overload as `robot.gateway.overload`). A
+    /// `joint_hold_exceeded` event is still recorded, and so is a fault the
+    /// firewall raises on its own (a failed post-condition).
+    pub fn joint_late_verdict(&mut self, cmd: &JointCommand, now: u64) -> JointVerdict {
+        self.stats.checked = self.stats.checked.saturating_add(1);
+        self.fault_joint(cmd, now, false)
     }
 
     fn evaluate_joint(&mut self, cmd: &JointCommand, now: u64) -> Result<JAccepted, JRejection> {
@@ -1028,7 +1039,9 @@ impl Firewall {
         }
     }
 
-    fn fault_joint(&mut self, cmd: &JointCommand, now: u64) -> JointVerdict {
+    /// Fault handling per [`FaultPolicy`]; `record` false for a late frame
+    /// ([`Self::joint_late_verdict`]): no `internal_fault` event.
+    fn fault_joint(&mut self, cmd: &JointCommand, now: u64, record: bool) -> JointVerdict {
         self.stats.faults = self.stats.faults.saturating_add(1);
         let (rule, sev) = reject_rule(RejectReason::InternalFault);
         let key = (cmd.channel, cmd.source);
@@ -1042,15 +1055,17 @@ impl Firewall {
         let fail_open = self.observe
             || (!humanoid && self.policy.platform.fault_policy == FaultPolicy::FailOpen);
         if fail_open {
-            self.record(
-                rule,
-                sev,
-                key,
-                now,
-                EventAction::ObservedOnly,
-                (f64::NAN, f64::NAN),
-                None,
-            );
+            if record {
+                self.record(
+                    rule,
+                    sev,
+                    key,
+                    now,
+                    EventAction::ObservedOnly,
+                    (f64::NAN, f64::NAN),
+                    None,
+                );
+            }
             self.stats.passed = self.stats.passed.saturating_add(1);
             self.stats.would_have = self.stats.would_have.saturating_add(1);
             return JointVerdict::Passed {
@@ -1067,7 +1082,19 @@ impl Firewall {
                 exceeded: None,
             },
         };
-        self.record_rejection(cmd, now, rule, sev, emitted, (f64::NAN, f64::NAN), None);
+        if record {
+            self.record_rejection(cmd, now, rule, sev, emitted, (f64::NAN, f64::NAN), None);
+        } else if let Some((age, mx)) = emitted.exceeded {
+            self.record(
+                rules::JOINT_HOLD_EXCEEDED,
+                Severity::Critical,
+                key,
+                now,
+                EventAction::Rejected(emitted.sub.map(|s| s.kind)),
+                (age as f64, mx as f64),
+                None,
+            );
+        }
         self.stats.rejected = self.stats.rejected.saturating_add(1);
         JointVerdict::Rejected {
             reason: RejectReason::InternalFault,

@@ -1,5 +1,5 @@
-//! Proof that `Firewall::check` (and `fault_verdict`, `drain_events`) never
-//! touch the heap after construction.
+//! Proof that `Firewall::check` (and `fault_verdict`, `late_verdict`,
+//! `drain_events`) never touch the heap after construction.
 //!
 //! A counting `GlobalAlloc` wrapper around the system allocator counts
 //! allocations made **on the current thread** (thread-local counter, so the
@@ -94,6 +94,7 @@ fn exercise(f: &mut Fx, rounds: u64) -> usize {
         f.fw.check(&twist_cmd(f.nav, f.base, s + 20, vx(0.1)), now - 1);
         // Gateway-declared fault.
         f.fw.fault_verdict(&cmds[0], now);
+        f.fw.late_verdict(&cmds[0], now);
         // Drain without allocating every few rounds; let the buffer overflow
         // in between so the drop path runs too.
         if i % 4 == 3 {
@@ -367,6 +368,7 @@ fn exercise_joint(f: &mut JFx, rounds: u64) -> (usize, [bool; 64]) {
             reached[r as usize] = true;
         }
         f.fw.joint_fault_verdict(&pin(f.nominal(s + 12)), t + 100_000);
+        f.fw.joint_late_verdict(&pin(f.nominal(s + 13)), t + 100_000);
         // A twist on the joint channel through `check`.
         f.fw.check(&twist_cmd(f.ctl, f.low, s, vx(0.1)), t + 100_000);
         now = t + 3 * MS;

@@ -2475,6 +2475,7 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `suppressed` growing while the controller runs normally | frames refused with nothing to emit: wrong `allowed_src_ips` / sources, a rate window that does not match the controller's loop, or an attack |
 | `rewrite_failed` > 0 | a limited / substitute frame could not be written and verified (suppressed instead): report it |
 | `late` > 0 | packets read more than `max_queue_delay_ns` after arrival: the box is overloaded or not running the unit's real-time priority (reported as `robot.gateway.overload`, at most once per `overload_interval_ms`) |
+| `overload.shed_total` > 0 | packets the kernel queued for the gateway but never delivered (gaps in the NFQUEUE packet ids): the gateway reads too slowly; dropped, or forwarded unchecked with `on_gateway_down: bypass` (also in `robot.gateway.overload`) |
 | `undecidable`, `rtps_malformed`, `unsupported_sample` | malformed or fragmented motion traffic: misconfiguration or an attack |
 | `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
 | `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |
@@ -2519,6 +2520,17 @@ while the chain is flushed.
   (set `rtps.state_file`) and `unknown_writers: pass`; or the controller's
   participant changed and its identity / GUID is not in the firewall's
   `allowed_sources`.
+* `enforced_writer_table_full` findings (`discovery.enforced_refused`
+  rising): the enforced writer table (`rtps.max_enforced_writers`) is full
+  of writers that were all seen within `rtps.enforced_idle_evict_s`.
+  Stale GUIDs from controller restarts age out on their own; a table held
+  by fresh entries means many enforced writers or forged SEDP
+  announcements on the controller segment (investigate the sender). New
+  writers are probed meanwhile (a fragmented or key-only sample of theirs
+  is removed). To reset the table: stop the gateway (the kernel applies
+  `on_gateway_down`), delete `rtps.state_file`, start the gateway, then
+  restart the controller-side ROS 2 graph so its SEDP crosses the bridge
+  again.
 * Large IP datagrams from the controller side disappear: defragmentation
   did not run (another ruleset flushed the `raw` table); re-run the rules
   unit.
@@ -2541,7 +2553,8 @@ while the chain is flushed.
   `pending`, `dropped`, `last_error`; agentd counts
   `daemon.gateway_findings`; past 4 lines (8 Critical) per rule, channel
   and minute agentd folds the rest into one aggregate per minute, kept in
-  the black box line by line (`daemon.gateway_folded`,
+  the black box line by line up to 1024 folded lines (and 1024 Critical
+  ones) a minute (`daemon.gateway_folded`, `daemon.gateway_unrecorded`,
   `daemon.gateway_aggregates`; agentd README, "In-path gateway feed").
   An idle gateway writes a heartbeat line
   every 5 s (`daemon.gateway_heartbeats`), so a quiet gateway is not

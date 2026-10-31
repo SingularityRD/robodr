@@ -458,18 +458,28 @@ channel). An idle gateway writes a heartbeat line
 (`robodr-gateway-heartbeat/v1`, every 5 s): activity on the input, never a
 finding, so a quiet gateway is not reported silent. Flood limit
 (sales-readiness T82): per (rule, channel) and 60 s window the first 4
-lines (8 for Critical ones) are reported one by one, at most 256 lines a
-window in all, at most 128 (rule, channel) pairs counted; a line past its
+lines (8 for Critical ones) are reported one by one, at most 256 lines
+below Critical a window in all and, from a budget of their own, 64
+Critical lines; at most 128 (rule, channel) pairs are counted, plus 32
+that only a Critical line may open, so a flood of low-severity lines on
+new channel names cannot hide a new Critical finding. A line past its
 budget is recorded in the black box only and folded into one aggregate per
 (rule, channel) with the most severe folded severity (Critical stays
 Critical) and the summed count, reported when the window closes (or at
 stop); lines of uncounted pairs go to one `robot.gateway.findings_dropped`
-aggregate. The gateway's decision summaries
+aggregate. The black box takes at most 1024 folded lines below Critical
+and 1024 Critical ones a window; the rest are only counted in their
+aggregate, whose detail says how many were not recorded. The gateway's decision summaries
 (`robodr-gateway-summary/v1`: mode, fail behaviour, file digests and
 decision counters at start, every minute and at stop; T19) are parsed as
 strictly and appended to the black box as notes (`gateway summary`, start
-and stop critical), never findings. Status: `daemon.gateway_findings`,
-`daemon.gateway_folded`, `daemon.gateway_aggregates`,
+and stop critical), never findings. A note proves what agentd received,
+not that the gateway wrote it: the socket checks the peer's uid
+(root and `allowed_uids`), the lines carry no gateway signature, so a process
+allowed on the socket can write a summary of its choosing. Status:
+`daemon.gateway_findings`,
+`daemon.gateway_folded`, `daemon.gateway_unrecorded`,
+`daemon.gateway_aggregates`,
 `daemon.gateway_summaries`, `daemon.gateway_summary_errors`,
 `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
 same path; with `socket_mode: "0660"` give the gateway's user the daemon's

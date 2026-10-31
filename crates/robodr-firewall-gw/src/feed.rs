@@ -45,6 +45,10 @@ pub const MAX_BACKLOG: usize = 1024;
 pub const RETRY: Duration = Duration::from_secs(1);
 /// Write timeout per housekeeping flush.
 pub const WRITE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Longest the last write at stop may take ([`Feed::close_flush`]): an
+/// agentd that reads, but slowly, must not hold the gateway's shutdown for
+/// backlog x [`WRITE_TIMEOUT`].
+pub const CLOSE_BUDGET: Duration = Duration::from_millis(500);
 
 /// One line.
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +159,21 @@ impl Feed {
 
     /// Write what is waiting (housekeeping).
     pub fn flush(&mut self, now: Instant) {
+        self.flush_until(now, None);
+    }
+
+    /// The last write at stop: as [`Feed::flush`], but it stops writing
+    /// once [`CLOSE_BUDGET`] has passed (what is left is lost, counted in
+    /// `dropped`).
+    pub fn close_flush(&mut self, now: Instant) {
+        self.flush_until(now, Some(now + CLOSE_BUDGET));
+        if !self.backlog.is_empty() {
+            self.dropped = self.dropped.saturating_add(self.backlog.len() as u64);
+            self.backlog.clear();
+        }
+    }
+
+    fn flush_until(&mut self, now: Instant, deadline: Option<Instant>) {
         if self.backlog.is_empty() {
             return;
         }
@@ -176,6 +195,10 @@ impl Feed {
             }
         }
         while let Some(l) = self.backlog.front() {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                self.last_error = Some("close budget spent".into());
+                return;
+            }
             let Some(c) = self.conn.as_mut() else {
                 return;
             };
@@ -239,8 +262,9 @@ impl FeedThread {
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             // Closing: one last write of what waits (a
-                            // stop summary), then end.
-                            f.flush(Instant::now());
+                            // stop summary), bounded by CLOSE_BUDGET, then
+                            // end.
+                            f.close_flush(Instant::now());
                             return;
                         }
                     }
@@ -267,7 +291,8 @@ impl FeedThread {
     }
 
     /// Stop the thread after it wrote what is waiting (one connect and
-    /// one write pass, each bounded by [`WRITE_TIMEOUT`] per line).
+    /// one write pass, [`WRITE_TIMEOUT`] per write and [`CLOSE_BUDGET`] in
+    /// all, plus a housekeeping flush already under way).
     pub fn close(mut self) {
         let handle = self.handle.take();
         drop(self);
@@ -372,6 +397,53 @@ mod heartbeat_tests {
         assert_eq!(f.pending(), 1);
         assert_eq!(f.heartbeats, 2);
         assert_eq!(f.sent, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use std::io::Read as _;
+
+    /// Verifier finding (GW+WP11): the last write at stop wrote the whole
+    /// backlog, each write bounded by WRITE_TIMEOUT only, so an agentd that
+    /// reads, but slowly, held the gateway's shutdown for up to backlog x
+    /// 50 ms. The last write now stops after CLOSE_BUDGET.
+    #[test]
+    fn the_last_write_at_stop_is_bounded_by_a_slow_reader() {
+        let dir = std::env::temp_dir().join(format!("robodr-gw-feed-cl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feed.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            // About 200 KB/s, until the writer goes away.
+            loop {
+                std::thread::sleep(Duration::from_millis(20));
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let mut f = Feed::new(path);
+        let big = "x".repeat(4000);
+        for _ in 0..MAX_BACKLOG {
+            f.push(big.clone());
+        }
+        let t0 = Instant::now();
+        f.close_flush(t0);
+        let took = t0.elapsed();
+        // 4 MB at about 200 KB/s would take some 20 s.
+        assert!(took < CLOSE_BUDGET + Duration::from_secs(1), "{took:?}");
+        assert_eq!(f.pending(), 0);
+        assert!(f.sent < MAX_BACKLOG as u64);
+        assert_eq!(f.sent + f.dropped, MAX_BACKLOG as u64);
+        drop(f);
+        reader.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

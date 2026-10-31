@@ -831,6 +831,58 @@ fn late_packets_are_reported_as_overload_not_internal_fault() {
     assert!(!gw.drain_firewall_deviations().is_empty());
 }
 
+/// A `robot.firewall.internal_fault` the Motion Firewall raises itself (a
+/// failed post-condition: a real invariant violation, Critical) still
+/// reaches the events file and the feed; only late packets are reported as
+/// overload instead. Before, every `internal_fault` was filtered out.
+#[test]
+fn genuine_internal_fault_is_reported_late_packet_is_not() {
+    let fx = Fixture::G1;
+    let mut gw = gateway(fx);
+    let good = frame(fx, 0.0);
+    assert_eq!(
+        run(&mut gw, &lowcmd_pkt(fx, PREFIX, 1, &good), T0).0,
+        Verdict::Accept
+    );
+    let _ = gw.drain_firewall_deviations();
+    // A late packet: fault verdict, `faults` counted, no internal_fault.
+    let mut p = lowcmd_pkt(fx, PREFIX, 2, &frame(fx, 0.1));
+    let m = PacketMeta {
+        now_ns: T0 + 2 * MS,
+        queue_delay_ns: Some(50 * MS),
+        instant: Instant::now(),
+        src_mac: None,
+    };
+    assert_eq!(gw.process(&mut p, m), Verdict::AcceptModified);
+    assert_eq!(gw.firewall().stats().faults, 1);
+    let devs = gw.drain_firewall_deviations();
+    assert!(
+        devs.iter()
+            .all(|d| d.rule_str() != robodr_firewall::rules::INTERNAL_FAULT),
+        "{devs:?}"
+    );
+    // A fault raised inside the firewall (the same path as its defensive
+    // post-conditions) is not dropped.
+    let cmd = JointCommand::new(
+        robodr_firewall::SourceId(0),
+        robodr_firewall::ChannelId(0),
+        T0 + 3 * MS,
+        good_joint_frame(),
+    );
+    let _ = gw.firewall_mut().joint_fault_verdict(&cmd, T0 + 3 * MS);
+    let devs = gw.drain_firewall_deviations();
+    assert!(
+        devs.iter()
+            .any(|d| d.rule_str() == robodr_firewall::rules::INTERNAL_FAULT),
+        "{devs:?}"
+    );
+}
+
+fn good_joint_frame() -> robodr_firewall::JointFrame {
+    let m = robodr_firewall::MotorCmd::enabled(0.0, 0.0, 1.0, 1.0, 0.0);
+    robodr_firewall::JointFrame::from_slice(&[m; 4], Some(true)).unwrap()
+}
+
 #[test]
 fn sport_move_limit_substitute_allowlist_alias() {
     let mut gw = gateway(Fixture::Go2);

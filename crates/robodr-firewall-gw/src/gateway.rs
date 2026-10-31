@@ -770,6 +770,10 @@ impl Gateway {
             binding_takeover_ns: cfg.rtps.binding_takeover_ns,
             discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile))
                 .with_max_enforced(cfg.rtps.max_enforced_writers)
+                .with_enforced_idle_evict(
+                    (cfg.rtps.enforced_idle_evict_s > 0)
+                        .then(|| std::time::Duration::from_secs(cfg.rtps.enforced_idle_evict_s)),
+                )
                 .with_channel_types(
                     cfg.channels
                         .iter()
@@ -905,18 +909,15 @@ impl Gateway {
         self.overload.note_late(name);
     }
 
-    /// The Motion Firewall's pending deviations, without its
-    /// `robot.firewall.internal_fault` events: the gateway asks the firewall
-    /// for a fault verdict only for a late packet (every `fault_verdict` /
-    /// `joint_fault_verdict` call here is behind `late`), which
-    /// [`Self::overload`] reports as `robot.gateway.overload` once per
-    /// interval instead of one Critical fault per burst (RESULTS O1,
-    /// sales-readiness T8). The firewall's own counters (`faults`) keep
-    /// them.
+    /// The Motion Firewall's pending deviations. A late packet is decided
+    /// with `late_verdict` / `joint_late_verdict` (the fault policy without
+    /// an event), which [`Self::overload`] reports as
+    /// `robot.gateway.overload` once per interval instead of one Critical
+    /// fault per burst (RESULTS O1, sales-readiness T8). A
+    /// `robot.firewall.internal_fault` the firewall raises itself (a failed
+    /// post-condition) is reported like every other deviation.
     pub fn drain_firewall_deviations(&mut self) -> Vec<robodr_events::Deviation> {
-        let mut out = self.fw.drain_deviations();
-        out.retain(|d| d.rule_str() != robodr_firewall::rules::INTERNAL_FAULT);
-        out
+        self.fw.drain_deviations()
     }
 
     /// Decide one queued packet (the IPv4 packet, rewritten in place when
@@ -1104,6 +1105,7 @@ impl Gateway {
     /// or a suppression could not be applied.
     fn rtps(&mut self, d: &mut [u8], src: Ipv4Addr, meta: PacketMeta) -> Result<bool, RtpsError> {
         let mut samples = std::mem::take(&mut self.samples);
+        self.discovery.set_now(meta.instant);
         let r = rtps::walk(d, WalkOptions::default(), &mut samples);
         let out = match r {
             Err(_) => Err(RtpsError::Malformed),
@@ -1164,7 +1166,7 @@ impl Gateway {
             for (g, w) in ch.writers.iter_mut() {
                 let hit = hints.iter().any(|h| {
                     if h.whole_participant {
-                        h.guid[..12] == g[..12]
+                        crate::rtps::guid_prefix(&h.guid) == crate::rtps::guid_prefix(g)
                     } else {
                         h.guid == *g
                     }
@@ -1403,8 +1405,7 @@ impl Gateway {
         }
         let full = hex(writer);
         let prefix = full.get(..24).unwrap_or("");
-        let mut prefix_arr = [0u8; 12];
-        prefix_arr.copy_from_slice(&writer[..12]);
+        let prefix_arr = crate::rtps::guid_prefix(writer);
         let s = self
             .fw
             .source_id(&full)
@@ -1798,7 +1799,7 @@ impl Gateway {
         };
         let cmd = JointCommand::new(source, id, now, frame);
         let v = if late && decoded.is_some() {
-            self.fw.joint_fault_verdict(&cmd, now)
+            self.fw.joint_late_verdict(&cmd, now)
         } else {
             self.fw.check_joint(&cmd, now)
         };
@@ -1926,7 +1927,7 @@ impl Gateway {
             motion: capped.unwrap_or(motion),
         };
         let v = if late {
-            self.fw.fault_verdict(&cmd, now)
+            self.fw.late_verdict(&cmd, now)
         } else {
             self.fw.check(&cmd, now)
         };
@@ -2565,7 +2566,7 @@ impl Gateway {
             }
         };
         let access = if late {
-            self.fw.fault_verdict(&cmd, now).is_passed()
+            self.fw.late_verdict(&cmd, now).is_passed()
         } else {
             self.fw.check_access(&cmd, now)
         };
@@ -2685,7 +2686,7 @@ impl Gateway {
         };
         let cmd = JointCommand::new(source, id, now, frame);
         let v = if late && decoded.is_some() {
-            self.fw.joint_fault_verdict(&cmd, now)
+            self.fw.joint_late_verdict(&cmd, now)
         } else {
             self.fw.check_joint(&cmd, now)
         };
@@ -2890,7 +2891,7 @@ impl Gateway {
         };
         let cmd = JointCommand::new(source, id, now, jf);
         let v = if late && decoded.is_some() {
-            self.fw.joint_fault_verdict(&cmd, now)
+            self.fw.joint_late_verdict(&cmd, now)
         } else {
             self.fw.check_joint(&cmd, now)
         };

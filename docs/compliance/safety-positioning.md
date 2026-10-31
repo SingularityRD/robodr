@@ -163,10 +163,12 @@ executor's `restrict_motion` restriction file.
 - Latency was measured on a shared development VM only (median added
   ≈ 20–70 µs); the p99 < 1 ms acceptance gate must be measured on the
   target sensor box.
-- Under CPU pressure a late sample gets the fault verdict and is reported
-  as a Critical `robot.firewall.internal_fault`, also when the cause is
-  overload rather than a fault (1,364 in a 2 h soak on a shared VM,
-  [`tools/e2e/RESULTS.md`](../../tools/e2e/RESULTS.md) O1).
+- Under CPU pressure a late sample gets the fault verdict (1,364 in a 2 h
+  soak on a shared VM, [`tools/e2e/RESULTS.md`](../../tools/e2e/RESULTS.md)
+  O1). It is reported as `robot.gateway.overload` (Medium, High from
+  `overload_high_late`), at most once per `overload_interval_ms`; a fault
+  the firewall raises itself stays a Critical
+  `robot.firewall.internal_fault`.
 - The channel configuration (limits, allowed sources) is a plain file,
   not signed or anti-rollback protected like the profile.
 - Not run on a real robot, a real Cyclone DDS stack or a real sensor box.

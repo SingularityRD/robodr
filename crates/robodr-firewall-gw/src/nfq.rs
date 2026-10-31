@@ -356,6 +356,29 @@ pub fn build_packet_msg(
 #[cfg(target_os = "linux")]
 pub use socket::Queue;
 
+/// Gaps in the kernel's NFQUEUE packet ids (T8, shed packets). The kernel
+/// numbers the packets of a queue in order and delivers them in that
+/// order; an id that skips ahead means packets it numbered but never
+/// delivered to the gateway (a full netlink receive buffer: dropped, or
+/// accepted unchecked when the queue fails open). An id at or below the
+/// last one (wrap-around, a rebound queue) starts counting afresh.
+#[derive(Debug, Clone, Default)]
+pub struct IdGaps {
+    last: Option<u32>,
+}
+
+impl IdGaps {
+    /// Note packet `id`; returns how many ids it skipped.
+    pub fn observe(&mut self, id: u32) -> u64 {
+        let skipped = match self.last {
+            Some(l) if id > l => u64::from(id - l - 1),
+            _ => 0,
+        };
+        self.last = Some(id);
+        skipped
+    }
+}
+
 // FFI: std has no netlink socket API (AF_NETLINK / NETLINK_NETFILTER,
 // `sockaddr_nl`, netlink socket options); this module is the only place the
 // queue touches the kernel.
@@ -605,6 +628,19 @@ mod socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_gaps_count_skipped_packet_ids() {
+        let mut g = IdGaps::default();
+        assert_eq!(g.observe(5), 0, "the first id is the baseline");
+        assert_eq!(g.observe(6), 0);
+        assert_eq!(g.observe(10), 3);
+        // Wrap-around or a rebound queue: afresh, no false gap.
+        assert_eq!(g.observe(2), 0);
+        assert_eq!(g.observe(3), 0);
+        assert_eq!(g.observe(u32::MAX), u64::from(u32::MAX) - 4);
+        assert_eq!(g.observe(1), 0);
+    }
 
     #[test]
     fn packet_roundtrip_and_verdict_layout() {

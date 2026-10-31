@@ -59,7 +59,9 @@ maximum datagram rate per core has not been measured.
 
 The tails are the shared VM's. In S the gateway read 0.46 % of LowCmd
 frames more than its 5 ms queue-delay bound after arrival and gave them the
-fail-safe verdict (a Critical `robot.firewall.internal_fault` per burst):
+fail-safe verdict (then reported as a Critical
+`robot.firewall.internal_fault` per burst; the gateway now reports late
+packets as `robot.gateway.overload`, at most once per interval):
 the designed behaviour of an overloaded box, which must be re-measured on
 a sensor box with an RT kernel.
 

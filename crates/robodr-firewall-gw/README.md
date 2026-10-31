@@ -232,7 +232,7 @@ segment, `allowed_src_macs`) on every channel.
 | `unitree_hg_lowcmd` | RTPS DATA `unitree_hg::msg::dds_::LowCmd_` on `rt/lowcmd` (G1, H1-2) | joint, 35 slots | `mode_pr` / `mode_machine` passed through (pinnable) |
 | `unitree_go_lowcmd` | RTPS DATA `unitree_go::msg::dds_::LowCmd_` (Go2, B2, H1) | joint, 20 slots | |
 | `unitree_sport_request` | RTPS DATA `unitree_api::msg::dds_::Request_` on `rt/api/sport/request` | twist | `Move` (1008) decided as `(vx, vy, 0)/(0, 0, vyaw)`; a malformed `Move` as non-finite; `StopMove` always allowed, queries pass; other calls only if listed in `allowed_api_ids` (**required**; `[]` = velocity, stop and queries only), then a zero-velocity check (source, rate); an api id outside `i32` (aliasing) is suppressed |
-| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes only if listed in `allowed_high_modes` (**required**; `[0]` = idle only), then a zero-velocity check; `bms.off` non-zero refused |
+| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes only if listed in `allowed_high_modes` (**required**; `[0]` = idle only), then a zero-velocity check; under a `restrict_motion` restriction only mode 2 (velocity capped) and mode 0 (if listed) pass, every other listed mode is refused; `bms.off` non-zero refused |
 | `go1_low_cmd` | UDP uncompressed `LowCmd` (734 octets), default port 8007 | joint, 20 slots | `bms.off` non-zero refused (integrity failure); any other length is undecidable (dropped) |
 | `go1_low_cmd_compressed` | UDP compressed `LowCmd` (614 octets, `LOW_CMD_LENGTH` of `unitree_legged_sdk` v3.8.6: what a real Go1 client sends), default port 8007 | joint, 20 slots | layout from the library's `refineCmd` (below, "Go1 compressed `LowCmd`"); `tau` / `Kp` / `Kd` are `i16` fixed point (÷256 / ÷32 / ÷16), a limited value is written as the step on the safe side of the bound and one beyond `i16` is refused (suppressed); holds ride on the last accepted 614-octet frame; any other length is dropped. Cannot share its port with `go1_low_cmd` |
 | `unitree_a2_lowcmd` | RTPS DATA on an A2 / AS2 `rt/lowcmd`, **inferred** `unitree_go::msg::dds_::LowCmd_` | joint, 20 slots | decided exactly as `unitree_go_lowcmd`; refused at start unless the firewall channel has `require_crc`, the profile records the channel's type (learned from the robot's SEDP; any other type than the go `LowCmd_` is refused), and `on_gateway_down` is not `bypass`; `allow_battery_off` refused (below, "A2 / AS2") |
@@ -631,13 +631,25 @@ reports one finding per `overload_interval_ms` (default 60 s) at most,
 opened at the first tick that sees a late packet: Medium, High when the
 interval held `overload_high_late` (default 1000) or more, with the count
 and the first late packet's channel. The packets themselves still get the
-firewall's fault verdict (`fault_policy`); only the report changes. The
-gateway asks the firewall for a fault verdict for late packets only, so
-the firewall's `robot.firewall.internal_fault` deviations are dropped from
-the events file and the feed (the firewall's `faults` counter in the
-status file keeps them); before, an overloaded box sent one Critical
-`internal_fault` per burst (RESULTS O1: 1,364 in a 2 h soak). Status:
-`overload.late_pending`, `overload.reports`, `gateway.late`.
+firewall's fault verdict (`fault_policy`); only the report changes: the
+gateway decides them with the firewall's `late_verdict` /
+`joint_late_verdict`, which apply the fault policy and count `faults` in
+the status file but record no `robot.firewall.internal_fault`; before, an
+overloaded box sent one Critical `internal_fault` per burst (RESULTS O1:
+1,364 in a 2 h soak). An `internal_fault` the firewall raises itself (a
+defensive post-condition failing after a check: non-finite output, output
+over the speed limits, an invalid joint frame after acceptance) is still
+written to the events file and the feed as a Critical finding. **Shed**
+packets go into the same finding and count toward `overload_high_late`:
+the run loop watches the kernel's NFQUEUE packet ids, which number a
+queue's packets in order, and a gap means packets the kernel numbered but
+never delivered to the gateway (a full netlink receive buffer: dropped,
+or accepted unchecked with `on_gateway_down: bypass`). A packet the kernel
+drops because the queue already holds `queue.max_len` packets may not
+leave a gap and is then not counted; the gateway does not read the
+kernel's own counters (`/proc/net/netfilter/nfnetlink_queue`, which the
+unit's `ProcSubset=pid` hides). Status: `overload.late_pending`, `overload.shed_pending`,
+`overload.shed_total`, `overload.reports`, `gateway.late`.
 
 Decision summaries (sales-readiness T19, `src/summary.rs`): over the same
 feed the gateway writes a `robodr-gateway-summary/v1` line at start, every
@@ -647,8 +659,12 @@ the decision counters since the previous line (`packets`, `accepted`,
 `modified`, `dropped`, `samples`, `passed`, `limited`, `substituted`,
 `suppressed`, `late`, `undecidable`), the firewall's fault verdicts and the
 id of the restriction in force. agentd appends each as a black-box note
-(signed and chained; start and stop critical), so what the gateway
-enforced and how it decided is in the signed record; the individual
+(signed and chained; start and stop critical), so what agentd received as
+the gateway's summary is in the signed record. The signature proves
+receipt, not authorship: the feed socket checks the peer's uid (root
+and `allowed_uids`) but the lines carry no signature of the gateway, so any
+process allowed on the socket can write a summary claiming enforce mode
+and the expected digests. The individual
 verdicts stay in the status and events files. A stop that is not clean (a
 crash, SIGKILL) writes no stop line; the next start line shows the
 restart. Lines that wait while agentd is away share the feed's bounded
@@ -661,8 +677,10 @@ responder, correlation). The socket is connected, and written with a
 thread only hands lines over a bounded channel (256, non-blocking; a full
 channel drops the line, counted), so agentd being slow or away never
 delays a decision. While agentd is away up to 1024 lines wait on the feed
-thread (oldest dropped, counted: status `findings_feed`). The events file
-keeps everything either way.
+thread (oldest dropped, counted: status `findings_feed`). At stop the
+feed thread writes what waits for 500 ms at most (a slow agentd cannot
+hold the shutdown); the rest is lost to the feed. The events file keeps
+everything either way.
 
 ## `restrict_motion` (restriction file)
 
@@ -881,7 +899,8 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `rtps.malformed_datagram` | `drop` | whole-datagram policy |
 | `rtps.unknown_writers` | `probe` | `probe` or `pass` |
 | `rtps.max_writers`, `rtps.max_writers_per_channel` | 4096, 16 | not-enforced writers remembered (least recently used evicted: it is then unknown and probed again); per-channel sequence state |
-| `rtps.max_enforced_writers` | 1024 | writers ever classified as enforced (`1..=65536`); **never evicted or removed** (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer is refused (finding `fragmented_command`, reason `enforced_writer_table_full`) and probed, also with `unknown_writers: pass` |
+| `rtps.max_enforced_writers` | 1024 | writers classified as enforced (`1..=65536`); **never downgraded or removed** by discovery (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer replaces the one seen longest ago (by a sample or an announcement) if that one has been idle for `rtps.enforced_idle_evict_s` (`discovery.enforced_evicted`), else it is refused (finding `fragmented_command`, reason `enforced_writer_table_full`; `discovery.enforced_refused`) and probed. A full table stays full, so unknown writers (an evicted one included) are probed, also with `unknown_writers: pass` |
+| `rtps.enforced_idle_evict_s` | 3600 | how long an enforced writer must have sent no sample and had no announcement before a new enforced writer may take its place in a full table; `0` = never (`60..=31536000` otherwise). An active writer is never evicted; a flood of fresh forged announcements on an enforced topic can still hold the table, and a new writer is then refused and probed |
 | `rtps.state_file` | none | persisted writer → channel map (format `robodr-firewall-gw-writers/v2`, v1 still read): the enforced table and the not-enforced writers. Read only if a regular file (symlinks refused), owned by root or the directory's owner and not group / world writable; written through an `O_EXCL` 0600 temporary file |
 | `rtps.max_sn_jump` | 64 | largest sequence-number step decided at once (larger: held until confirmed) |
 | `rtps.binding_takeover_ns` | 1 s | silence after which another (IP, MAC) may continue an authorised GUID's stream |
@@ -1088,8 +1107,10 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   SPDP / SEDP; `discovery.misaddressed`) is ignored, as the robot ignores
   it; a not-enforced announcement or a removal sent by another participant
   than the writer's own is ignored (`discovery.relayed_ignored`); a writer
-  ever classified as enforced stays enforced (own table, never evicted,
-  persisted; `discovery.enforced_kept`); the not-enforced table evicts the
+  ever classified as enforced stays enforced (own table, persisted;
+  `discovery.enforced_kept`; evicted only from a full table, idle for
+  `rtps.enforced_idle_evict_s`, to make room for a new enforced writer,
+  after which it is probed); the not-enforced table evicts the
   least recently used; only the standard builtin entity ids are discovery
   (a user writer with builtin kind bits is decided). Until the robot's
   participants are known (observation off, or its SPDP not seen yet) an

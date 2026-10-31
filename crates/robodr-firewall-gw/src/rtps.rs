@@ -76,6 +76,25 @@ const PID_SENTINEL: u16 = 0x0001;
 pub type GuidPrefix = [u8; 12];
 pub type Guid = [u8; 16];
 
+/// The participant prefix of a GUID (its first 12 octets).
+pub fn guid_prefix(g: &Guid) -> GuidPrefix {
+    g.first_chunk::<12>().copied().unwrap_or_default()
+}
+
+/// The entity id of a GUID (its last 4 octets).
+pub fn guid_entity(g: &Guid) -> [u8; 4] {
+    g.last_chunk::<4>().copied().unwrap_or_default()
+}
+
+/// The GUID of `entity` in participant `prefix`.
+pub fn guid_of(prefix: &GuidPrefix, entity: &[u8; 4]) -> Guid {
+    let mut g = [0u8; 16];
+    for (d, s) in g.iter_mut().zip(prefix.iter().chain(entity)) {
+        *d = *s;
+    }
+    g
+}
+
 /// The standard builtin writer entity ids (DDSI-RTPS 2.5 §9.3.1.3,
 /// DDS-Security 1.1 §7.4.7.1, DDS-XTypes 1.3 §7.6.3.3.4): SPDP, SEDP
 /// topics / publications / subscriptions, participant message, their
@@ -149,15 +168,11 @@ pub struct Sample {
 
 impl Sample {
     pub fn writer_prefix(&self) -> GuidPrefix {
-        let mut p = [0u8; 12];
-        p.copy_from_slice(&self.writer[..12]);
-        p
+        guid_prefix(&self.writer)
     }
 
     pub fn writer_entity(&self) -> [u8; 4] {
-        let mut e = [0u8; 4];
-        e.copy_from_slice(&self.writer[12..]);
-        e
+        guid_entity(&self.writer)
     }
 }
 
@@ -311,9 +326,7 @@ pub fn walk(d: &[u8], opts: WalkOptions, out: &mut Vec<Sample>) -> Result<Summar
                 let hi = u32_at(d, body + 12, le).ok_or(WalkError::Malformed)?;
                 let lo = u32_at(d, body + 16, le).ok_or(WalkError::Malformed)?;
                 let sn = (i64::from(hi as i32) << 32) | i64::from(lo);
-                let mut writer = [0u8; 16];
-                writer[..12].copy_from_slice(&source);
-                writer[12..].copy_from_slice(&writer_id);
+                let writer = guid_of(&source, &writer_id);
                 let after_qos = if flags & FLAG_Q != 0 {
                     skip_parameter_list(d, qos_start, end, le)?
                 } else {

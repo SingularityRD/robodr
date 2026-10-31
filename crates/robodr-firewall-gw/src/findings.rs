@@ -217,9 +217,12 @@ impl GatewayFindings {
 /// ([`Overload::note_late`], a counter only); housekeeping
 /// ([`Overload::tick`]) opens a window at the first tick that sees one and
 /// reports the window once it is `interval_ns` old: one finding per
-/// interval at most, Medium, High from `high_late` late packets in it.
-/// The packets themselves were decided by the firewall's fault verdict
-/// (`fault_policy`); only the reporting changes.
+/// interval at most, Medium, High from `high_late` late or shed packets in
+/// it. The late packets themselves were decided by the firewall's fault
+/// verdict (`fault_policy`); only the reporting changes. **Shed** packets
+/// ([`Overload::note_shed`]) are the gaps in the kernel's NFQUEUE packet
+/// ids: packets the kernel queued for the gateway but never delivered
+/// (`crate::nfq::IdGaps`).
 #[derive(Debug, Clone)]
 pub struct Overload {
     interval_ns: u64,
@@ -228,6 +231,10 @@ pub struct Overload {
     start_ns: Option<u64>,
     /// Late packets not yet reported.
     late: u64,
+    /// Shed packets not yet reported.
+    shed: u64,
+    /// Shed packets since start (status).
+    pub shed_total: u64,
     /// The channel of the first of them (`None`: not a channel's).
     first_channel: Option<String>,
     /// Findings reported (status).
@@ -241,6 +248,8 @@ impl Overload {
             high_late,
             start_ns: None,
             late: 0,
+            shed: 0,
+            shed_total: 0,
             first_channel: None,
             reports: 0,
         }
@@ -254,22 +263,35 @@ impl Overload {
         self.late = self.late.saturating_add(1);
     }
 
+    /// Count `n` shed packets (never delivered to the gateway).
+    pub fn note_shed(&mut self, n: u64) {
+        self.shed = self.shed.saturating_add(n);
+        self.shed_total = self.shed_total.saturating_add(n);
+    }
+
     /// Late packets counted and not yet reported.
     pub fn pending(&self) -> u64 {
         self.late
     }
 
+    /// Shed packets counted and not yet reported.
+    pub fn shed_pending(&self) -> u64 {
+        self.shed
+    }
+
     /// Housekeeping at monotonic `now_ns`: the finding of a window that is
     /// `interval_ns` old, in `mode`.
     pub fn tick(&mut self, now_ns: u64, mode: Mode) -> Option<GatewayDeviation> {
-        if self.late == 0 {
+        if self.late == 0 && self.shed == 0 {
             return None;
         }
         let start = *self.start_ns.get_or_insert(now_ns);
         if now_ns.saturating_sub(start) < self.interval_ns {
             return None;
         }
-        let count = std::mem::take(&mut self.late);
+        let late = std::mem::take(&mut self.late);
+        let shed = std::mem::take(&mut self.shed);
+        let count = late.saturating_add(shed);
         self.start_ns = None;
         self.reports = self.reports.saturating_add(1);
         let severity = if count >= self.high_late {
@@ -277,11 +299,22 @@ impl Overload {
         } else {
             Severity::Medium
         };
-        let mut d = format!(
-            "{count} packet(s) read later than max_queue_delay_ns in the last {} s, decided \
-             with the firewall's fault verdict (fault_policy)",
-            now_ns.saturating_sub(start) / 1_000_000_000
-        );
+        let secs = now_ns.saturating_sub(start) / 1_000_000_000;
+        let mut parts = Vec::new();
+        if late > 0 {
+            parts.push(format!(
+                "{late} packet(s) read later than max_queue_delay_ns, decided with the \
+                 firewall's fault verdict (fault_policy)"
+            ));
+        }
+        if shed > 0 {
+            parts.push(format!(
+                "{shed} packet(s) queued by the kernel but never delivered to the gateway \
+                 (gaps in the NFQUEUE packet ids: dropped, or with on_gateway_down: bypass \
+                 accepted unchecked)"
+            ));
+        }
+        let mut d = format!("in the last {secs} s: {}", parts.join("; "));
         if severity == Severity::High {
             d.push_str(&format!(
                 " (at or above overload_high_late {})",
@@ -371,5 +404,36 @@ mod tests {
         assert_eq!(d.deviation.severity, Severity::High);
         assert!(d.deviation.is_observe_only());
         assert_eq!(o.reports, 2);
+    }
+
+    /// Not-done item of T8: the catalog sentence names shed packets, but
+    /// only late packets were counted. Shed packets (NFQUEUE id gaps) now
+    /// open and fill the window too, and count toward the High threshold.
+    #[test]
+    fn shed_packets_are_reported_as_overload() {
+        const S: u64 = 1_000_000_000;
+        let mut o = Overload::new(60_000, 100);
+        o.note_shed(7);
+        assert_eq!(o.shed_pending(), 7);
+        assert!(o.tick(S, Mode::Enforce).is_none());
+        let d = o.tick(61 * S, Mode::Enforce).unwrap();
+        assert_eq!(d.deviation.rule_str(), rules::OVERLOAD);
+        assert_eq!(d.deviation.severity, Severity::Medium);
+        assert_eq!(d.count, 7);
+        assert!(d
+            .deviation
+            .detail
+            .contains("7 packet(s) queued by the kernel"));
+        assert!(!d.deviation.detail.contains("max_queue_delay_ns"));
+        o.note_shed(60);
+        for _ in 0..40 {
+            o.note_late(Some("/lowcmd"));
+        }
+        assert!(o.tick(100 * S, Mode::Enforce).is_none());
+        let d = o.tick(160 * S, Mode::Enforce).unwrap();
+        assert_eq!(d.deviation.severity, Severity::High);
+        assert_eq!(d.count, 100);
+        assert!(d.deviation.detail.contains("40 packet(s) read later"));
+        assert_eq!(o.shed_total, 67);
     }
 }
