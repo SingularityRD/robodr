@@ -360,7 +360,11 @@ qemu. No release has been cut or signed. GitHub CI has run once in full
   the host rules were never loaded into a running rules engine on a robot.
 - Kafka and the anchor receiver use TLS (plain TCP only when explicitly
   allowed); mutual TLS authenticates hosts, not robot ids. Every TLS path
-  checks CRLs (no OCSP). Keys are files, not TPM-held.
+  checks CRLs (no OCSP). Robot keys are files by default; agentd's keys
+  can be sealed to the TPM at rest (systemd 250+, tested on swtpm only),
+  and offline signing keys can live in a PKCS#11 token (tested with
+  SoftHSM only; needs OpenSC 0.25+); see
+  [`docs/customer/known-limitations.md`](docs/customer/known-limitations.md).
   The executor verifies the SOC's signed request itself, but not the
   SOC's internal approval process.
 - Reviews were done by independent AI agents, not humans; there has been no

@@ -579,7 +579,13 @@ misbehaving adapter, fails the command and writes nothing. The protocol
 (cleared environment, deadline, output cap, trusted-path checks of the
 signer file and of the command and its directories; the command runs in
 its own process group, killed as a whole on a timeout) is documented in
-`crates/robodr-signer/src/lib.rs`.
+`crates/robodr-signer/src/lib.rs`. Because of that process group, a
+Ctrl-C at the terminal stops the calling tool but not the signer command;
+the shipped adapter therefore runs each `pkcs11-tool` under its own
+deadline (`--timeout SECONDS`, default 110, via coreutils `timeout`), so
+a `pkcs11-tool` left waiting on the token ends at the latest then.
+`signer-file --timeout N` writes the option into the command and sets
+`timeout_ms` to N + 10 seconds (default 120000).
 
 The shipped adapter `/usr/lib/robodr/robodr-signer-pkcs11` drives OpenSC's
 `pkcs11-tool` (OpenSC 0.25 or later; `CKM_EDDSA`, pure Ed25519) with any
@@ -608,16 +614,19 @@ robodr-release sign --key oem-root.signer.json --target trust.json
 (for `--root` pins and trust files). `sign` and `signer-file` need one
 PIN source: the environment variable named by `--pin-env` (listed in the
 signer file's `pass_env`) or the first line of `--pin-file`, which must be
-a regular file owned by you or root with no group or other access (mode
-0600 or 0400; anything else is refused). There is no terminal prompt: the
+a non-empty regular file owned by you or root with no group or other
+permission bits (e.g. mode 0600 or 0400; any group or other bit is
+refused). There is no terminal prompt: the
 external signer runs in its own process group with the message on stdin,
 so it cannot read the terminal. The PIN never appears on a command line:
 the adapter hands it to `pkcs11-tool` as `--pin env:VAR`. That form is
 documented for OpenSC 0.25 and tested only with 0.25; a `pkcs11-tool`
 without it would send the text `env:VAR` as the PIN and spend one of the
 token's PIN retries (a YubiKey PIV locks after 3). The adapter therefore
-reads the OpenSC version (`opensc-tool
---info`) and refuses to log in below 0.25 or when the version cannot be
+reads the OpenSC version with the `opensc-tool --info` in the same
+directory as the `pkcs11-tool` it found in `PATH` (an `opensc-tool`
+elsewhere may belong to another OpenSC install), and refuses to log in
+when there is none there, below 0.25, or when the version cannot be
 read. Ubuntu 22.04 (0.22) and Debian 12 (0.23) ship older releases:
 install OpenSC 0.25 or later on the signing station. The adapter is in
 the `robodr` package;
@@ -704,7 +713,11 @@ start unless every key is sealed to the TPM, add to `agentd.json`:
 Under systemd, agentd also compares `credentials_dir` with the directory
 systemd gave it (`$CREDENTIALS_DIRECTORY`); if they differ, no key counts
 as a credential (`protection: "file"`, with a `detail`). `--check-config`
-run from a shell has no such variable and trusts the configured directory.
+run from a shell has no such variable and trusts the configured directory
+for its report. The daemon itself, with `require: "tpm2"`, refuses to start
+(exit 2) when `$CREDENTIALS_DIRECTORY` is not set: started outside a unit
+with credentials, it cannot hold a TPM-sealed credential, whatever the
+configured directory contains.
 
 Limits: sealing protects keys **at rest**. While the service runs, the key
 is in its private credential ramfs and memory and the TPM does not make the

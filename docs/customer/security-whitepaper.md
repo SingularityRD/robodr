@@ -110,7 +110,13 @@ tool accepts a key on its command line.
 
 Limits:
 
-- keys are files, not TPM-held;
+- keys are files by default. agentd's keys can be sealed to the TPM at
+  rest (systemd encrypted credentials; decrypted into the service's memory
+  at run time, the TPM does not sign; tested on swtpm only), and offline
+  signing keys can live in a PKCS#11 token (tested with SoftHSM only;
+  OpenSC 0.25 or later on the signing station, PIN from an environment
+  variable or file). Limits in
+  [`known-limitations.md`](known-limitations.md);
 - rotation and distribution are manual
   ([`docs/OPERATIONS.md`](../OPERATIONS.md) section 4);
 - legacy HMAC keys are refused unless explicitly allowed
