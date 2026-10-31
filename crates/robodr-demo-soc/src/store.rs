@@ -8,10 +8,11 @@
 //! `unsigned` (accepted only for robots that do not require signatures).
 //!
 //! **Time to SOC** (T64) = arrival time at this SOC minus the finding's own
-//! detection time `ocsf.time` (sensor clock). It is meaningful for live
-//! captures with synchronised clocks; for a replayed capture `ocsf.time` is
-//! the capture's packet time, so values outside `0..=MAX_TTS_MS` are counted
-//! as `not_comparable` instead of skewing the percentiles.
+//! detection time `ocsf.time` (the sensor's clock when it reported the
+//! finding, also for replayed captures), per robot and overall. Clocks must
+//! be synchronised; values outside `0..=MAX_TTS_MS` (clock skew, findings
+//! re-sent from an old spool) are counted as `not_comparable` instead of
+//! skewing the percentiles.
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -29,6 +30,7 @@ pub struct Store {
     recent: VecDeque<Value>,
     seen_uids: HashSet<String>,
     tts_ms: Vec<u64>,
+    tts_by_robot: BTreeMap<String, Vec<u64>>,
     not_comparable: u64,
     by_rule: BTreeMap<String, u64>,
     by_severity: BTreeMap<String, u64>,
@@ -91,8 +93,16 @@ impl Store {
                 .and_then(Value::as_u64)
                 .and_then(|t| received_unix_ms.checked_sub(t))
                 .filter(|d| *d <= MAX_TTS_MS);
+            let robot = finding
+                .pointer("/entity_context/robot/id")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
             match tts {
-                Some(d) => self.tts_ms.push(d),
+                Some(d) => {
+                    self.tts_ms.push(d);
+                    self.tts_by_robot.entry(robot).or_default().push(d);
+                }
                 None => self.not_comparable += 1,
             }
             let rule = finding
@@ -143,27 +153,35 @@ impl Store {
     }
 
     pub fn metrics(&self) -> Value {
-        let mut v = self.tts_ms.clone();
-        v.sort_unstable();
-        let pct = |p: f64| -> Option<u64> {
-            if v.is_empty() {
-                return None;
-            }
-            let i = ((p * (v.len() - 1) as f64).round() as usize).min(v.len() - 1);
-            v.get(i).copied()
-        };
+        let mut by_robot = serde_json::Map::new();
+        for (robot, v) in &self.tts_by_robot {
+            by_robot.insert(robot.clone(), percentiles(v));
+        }
+        let mut all = percentiles(&self.tts_ms);
+        if let Some(o) = all.as_object_mut() {
+            o.insert("not_comparable".into(), json!(self.not_comparable));
+        }
         json!({
             "findings": self.total,
             "by_rule": self.by_rule,
             "by_severity": self.by_severity,
             "by_verification": self.by_verification,
-            "time_to_soc_ms": {
-                "count": v.len(),
-                "p50": pct(0.5), "p90": pct(0.9), "p99": pct(0.99), "max": v.last(),
-                "not_comparable": self.not_comparable,
-            },
+            "time_to_soc_ms": all,
+            "time_to_soc_ms_by_robot": by_robot,
         })
     }
+}
+
+/// Count, p50, p90, p99 and max of `v` (nearest rank).
+fn percentiles(v: &[u64]) -> Value {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    let pct = |p: f64| -> Option<u64> {
+        let last = v.len().checked_sub(1)?;
+        v.get(((p * last as f64).round() as usize).min(last))
+            .copied()
+    };
+    json!({"count": v.len(), "p50": pct(0.5), "p90": pct(0.9), "p99": pct(0.99), "max": v.last()})
 }
 
 #[cfg(test)]
@@ -200,7 +218,8 @@ mod tests {
         assert_eq!(m["by_verification"]["unsigned"], 1);
         assert_eq!(m["time_to_soc_ms"]["p50"], 1000);
         assert_eq!(m["time_to_soc_ms"]["max"], 1000);
-        // Old replay times are not comparable.
+        assert_eq!(m["time_to_soc_ms_by_robot"]["?"]["count"], 2);
+        // Times outside 0..=MAX_TTS_MS (skew, old spools) are not comparable.
         let body = line("d", "robot.x.y", 1, true);
         assert_eq!(s.ingest(body.as_bytes(), &json!({}), MAX_TTS_MS + 10), 1);
         assert_eq!(s.metrics()["time_to_soc_ms"]["not_comparable"], 1);
