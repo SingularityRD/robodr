@@ -1672,6 +1672,39 @@ hard-fail one would cut the robot off. A CRL is a signed file that travels
 over the same configuration channel as the CA bundle, so it is the only
 revocation mechanism.
 
+**Renewing CRLs on an air-gapped site.** A CRL past its `nextUpdate`
+refuses every peer of its CA (fail closed), so a renewed CRL must reach
+every host that lists it before then:
+
+1. On the (offline) CA, issue the CRL with a `nextUpdate` longer than the
+   time it takes to carry a file to every host, plus a margin
+   (`openssl ca -gencrl -crldays N -out new.crl.pem`; the CRL number must
+   go up, `crlnumber` in the `openssl ca` configuration).
+2. Carry it in on the same channel as the CA bundle (media, the site's
+   configuration channel) and check it before installing:
+   `openssl crl -in new.crl.pem -CAfile ca.pem -noout -crlnumber -nextupdate`
+   (the signature must verify under the CA, the number must be higher than
+   the one in use).
+3. On each host, write it next to the old file and `mv` it over the
+   configured path (`tls.crl_files`, `--crl-file`, `--tls-crl-file`,
+   `soc.crl_files`). The file is re-read on its next use, no restart.
+4. Confirm: agentd `status.json` `control_plane.tls.crl.in_use` shows the
+   new CRL number; `<state>/uplink-status.json` `credentials` shows the new
+   `days_to_expiry`; `robodr-kafka-publish ... --check`,
+   `robodr-anchor-receiver check` and `robodr-enroll check` print the days
+   left on each CRL in use.
+
+What warns before a CRL or certificate lapses: agentd raises
+`robot.agent.credential_expiring` for the control plane's server
+certificate and CRLs (Medium within `daemon.self_health.credential_warn_days`,
+default 14; High within `credential_critical_days`, default 3, or once
+expired). `robodr-uplink` (its CRLs), `robodr-kafka-publish` (its client
+certificate and CRLs) and `robodr-anchor-receiver serve` (its server
+certificate and unit CRLs) log a line on stderr within 14 days of expiry,
+once per day count; `robodr-depot serve` does the same for its server
+certificate. Do not remove a lapsed CRL from the configuration to get
+peers through: that switches revocation off for that path.
+
 **Evidence export (`control_plane.evidence`).** The SOC lists the retained
 evidence (`GET .../evidence`), asks for an export of a finding's evidence
 links (or a seq / time range), downloads it in chunks (resumable, they
