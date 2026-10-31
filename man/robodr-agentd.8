@@ -10,6 +10,12 @@ robodr\-agentd \- RoboDR live daemon: ROS 2 discovery and events \(-> decision c
 .I agentd.json
 .RB [ \-\-check\-config ]
 .PP
+.B robodr\-agentd selftest
+.B \-\-config
+.I agentd.json
+.RB [ \-\-timeout
+.IR secs ]
+.PP
 .B robodr\-agentd
 .RB ( \-h | \-\-help | \-V | \-\-version )
 .SH DESCRIPTION
@@ -50,6 +56,36 @@ Validate the configuration and load every file it names (profile, policy,
 monitor config, key file), print warnings, then exit without starting.
 The profile trust and anti\-rollback decision is made, but the state file is
 not written (only a starting daemon records an accepted version).
+.TP
+.B selftest
+Field acceptance self\-test against the daemon already running with this
+configuration (only
+.B spool.dir
+is read; no key or profile). Writes a request with a fresh nonce into the
+spool; the daemon takes it on its next tick (at most one per second) and
+spools a Low, observe\-only
+.B robot.agent.selftest
+finding with the nonce in its detail. The command then waits until the
+exporter moves that record to
+.I acked/
+(exit 0) or
+.I rejected/
+(exit 1), or until the deadline (exit 1). What
+.I acked/
+proves depends on the exporter:
+.B robodr\-uplink
+moves a record there after the SOC accepted it,
+.B robodr\-kafka\-publish
+after the broker acknowledged it,
+.B robodr\-spool\-export
+after it was committed into the diode outbox (the far side of the diode
+is then confirmed at the SOC by the nonce). Exit 2: usage or configuration
+error.
+.TP
+.BI \-\-timeout " secs"
+Deadline of
+.BR selftest ,
+1 to 3600 seconds (default 120).
 .TP
 .BR \-h ", " \-\-help
 Print the usage and exit 0.
@@ -256,6 +292,11 @@ Runtime failure (for example the black box could not be sealed).
 .B 2
 Usage or configuration error, including an argument that is not valid UTF\-8;
 nothing was started. The systemd unit does not restart on this status.
+.PP
+.B selftest
+exits 0 when the exporter acknowledged the self\-test finding, 1 when that
+was not proven (request not taken, finding not spooled, rejected, or not
+acknowledged in time) and 2 on a usage or configuration error.
 .SH FILES
 .TP
 .I /etc/robodr/agentd.json

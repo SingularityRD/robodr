@@ -683,7 +683,7 @@ response).
 | `robot.agent.disk_low` | Agent storage running out of space | Medium (free < `disk_warn_percent`, default 10 %); High (free < `disk_critical_percent`, default 3 %) | per filesystem on each escalation |
 | `robot.agent.executor_unreachable` | Response executor unreachable | High | once per outage, after `executor_unreachable_ms` (default 30 s) without an answer |
 | `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | Low | reserved in 2.5 for the control plane (a fenced request is not an authentication failure) |
-| `robot.agent.selftest` | Agent field acceptance self-test | Low | reserved in 2.5 for the field acceptance self-test |
+| `robot.agent.selftest` | Agent field acceptance self-test | Low | `robodr-agentd`: once per operator request (`robodr-agentd selftest`, at most one per second); the detail carries the request's nonce |
 | `robot.gateway.overload` | In-path gateway overloaded | Medium; High from the gateway's `overload_high_late` late packets in one interval (default 1000) | `robodr-firewall-gw`: at most once per `overload_interval_ms` (default 60 s) while packets are read later than `max_queue_delay_ns`; the gateway no longer reports those packets as `robot.firewall.internal_fault` |
 | `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | High | once per file at agentd start (response policy, Motion Firewall joint configuration claiming more than the signed commissioning) |
 | `robot.capture.unsupported_transport` | DDS transport not inspected (shared memory, TCP) | Medium | producer `robodr-ros2-pipeline`, data source `ros2_dds_discovery`; one per host and transport set, rate limited like every `robot.capture.*` rule |
