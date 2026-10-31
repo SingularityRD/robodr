@@ -93,6 +93,7 @@
 )]
 
 pub mod binding;
+pub mod check;
 pub mod config;
 pub mod dedup;
 pub mod identity;

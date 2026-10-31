@@ -674,6 +674,7 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    sudo install -m 0644 -o root -g root revocations-N.json /etc/robodr/profile-revocations.json
    # profile-state dirs come from tmpfiles.d/robodr.conf (systemd-tmpfiles --create)
    sudoedit /etc/robodr/pulsar.toml      # domain_id, capture, binding, profile_trust
+   sudo robodr-ros2-watch --check-config /etc/robodr/pulsar.toml   # offline, read-only
    sudoedit /etc/robodr/agentd.json      # robot id, policy, paths, sensor.profile_trust
    sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
    sudo systemctl enable --now robodr-pulsard robodr-agentd
