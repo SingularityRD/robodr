@@ -1,0 +1,163 @@
+.\" robodr-support-bundle(8). Source of truth: the USAGE text in
+.\" crates/robodr-ops/src/bin/robodr-support-bundle.rs and the module docs
+.\" of crates/robodr-ops/src/{bundle,redact}.rs. Keep them in sync.
+.TH ROBODR\-SUPPORT\-BUNDLE 8 "2026-10-31" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-support\-bundle \- collect a redacted diagnostics bundle for RoboDR support
+.SH SYNOPSIS
+.B robodr\-support\-bundle
+.RB [ \-\-out\-dir
+.IR DIR ]
+.RB [ \-\-since
+.IR TIME ]
+.RB [ \-\-journal\-lines
+.IR N ]
+.RB [ \-\-no\-journal ]
+.RB [ \-\-no\-tar ]
+.RB [ \-\-root
+.IR DIR ]
+.SH DESCRIPTION
+Collects what RoboDR support needs to diagnose a unit into
+.IB DIR /robodr\-support\- HOST \- UTC .tar.gz
+(mode 0600) and prints its path; the archive's SHA-256 goes to stderr.
+Run it as root for the complete picture (journal, nftables, every status
+file). Review the bundle before you send it: it is yours.
+.SS Collected
+.IP \(bu 2
+OS release, kernel, uptime, memory, free space, network interfaces, time
+synchronisation;
+.IP \(bu 2
+the RoboDR package state and
+.B dpkg \-\-verify
+/
+.B rpm \-V
+(modified files), the SHA-256 of every installed
+.B robodr\-*
+program;
+.IP \(bu 2
+the state of every
+.B robodr*
+unit
+.RB ( "systemctl show" :
+restarts, results, memory and CPU) and its unit files with drop-ins
+.RB ( "systemctl cat" ,
+redacted);
+.IP \(bu 2
+the journal of the
+.B robodr*
+units and the kernel for
+.B \-\-since
+(default
+.BR \-48h ,
+at most
+.B \-\-journal\-lines
+lines, default 20000), redacted;
+.IP \(bu 2
+.BR "nft list ruleset" ;
+.IP \(bu 2
+the daemons' status files
+.RI ( status.json ", " uplink\-status.json ,
+\&...), redacted;
+.IP \(bu 2
+count and total size of the files in the black box, the spool queues, the
+diode outbox and the kept releases (never names or content);
+.IP \(bu 2
+the configuration files directly in
+.I /etc/robodr
+.RI ( *.json ", " *.toml ", " *.env ", " *.conf ),
+redacted;
+.IP \(bu 2
+this host's
+.B robodr\-setup preflight
+and the current
+.B robodr\-metrics
+output.
+.SS Never collected
+Keys and credentials
+.RI ( /etc/robodr/keys ", " /etc/robodr/kafka ", " /etc/robodr\-depot/keys ,
+.IR /etc/robodr\-anchor\-receiver ", " /run/credentials ),
+evidence
+.RI ( /var/lib/robodr/blackbox ),
+findings (the spool queues), control-plane state and evidence exports,
+diode batches, commissioning workspaces, archives, fleet, delivery, depot
+and executor state, release packages. Files are read only from explicit
+paths, a symlink is never followed, and every path is checked against this
+list (it is also in the manifest as
+.BR never_collected ).
+.SS Redaction
+A value whose name reads like a secret
+.RB ( secret ", " password ", " passphrase ", " token ", " private ,
+.BR psk ", " api_key ", " bearer ", " authorization ", " cookie ", " sasl )
+is replaced by
+.BR <redacted> ,
+unless the name says it is a reference
+.RB ( *_file ", " *_path ", " *_dir ", " *_socket ", " *_id ", " *_ids ):
+a key file's path helps support, the key does not. JSON is redacted
+structurally, other text line by line
+.RB ( NAME=value ", " "NAME = value" ", " \(dqname\(dq: " value ,
+.BR Environment=NAME=value );
+PEM private-key blocks are dropped whole.
+.SS Fail closed
+Before the bundle is packed, every file is scanned for key material (PEM
+and OpenSSH private keys, minisign secret keys, RoboDR secret key files).
+Any hit deletes the whole bundle and exits 1, naming the file: report that
+to RoboDR support without the bundle.
+.SS Layout
+.TP
+.I manifest.json
+format
+.BR robodr\-support\-bundle/1 :
+every file with its size, SHA-256, source command or path, and whether it
+was redacted; every item that could not be collected and why; the
+never-collected list.
+.TP
+.I SHA256SUMS
+.B sha256sum \-c
+format, over every file including the manifest.
+.SH OPTIONS
+.TP
+.BI \-\-out\-dir " DIR"
+where the bundle is written (default
+.IR /var/tmp ).
+.TP
+.BI \-\-since " TIME"
+journal window, a
+.BR journalctl (1)
+time such as
+.B \-48h
+or
+.BR "\(dq2026\-10\-30 12:00\(dq" .
+.TP
+.BI \-\-journal\-lines " N"
+most journal lines of the RoboDR units (default 20000).
+.TP
+.B \-\-no\-journal
+leave the journal out.
+.TP
+.B \-\-no\-tar
+leave the bundle as a directory (0700).
+.TP
+.BI \-\-root " DIR"
+read files under
+.I DIR
+instead of
+.I /
+(tests, a mounted image).
+.SH EXIT STATUS
+.TP
+.B 0
+the bundle was written.
+.TP
+.B 1
+failed, or key material was found (nothing is left behind).
+.TP
+.B 2
+usage error.
+.PP
+Commands run with a fixed search path, an empty environment, a 30 s
+timeout and bounded output; a missing command is recorded in the manifest,
+not an error.
+.SH SEE ALSO
+.BR robodr\-setup (8),
+.BR robodr\-metrics (1),
+.I /usr/share/doc/robodr/SECURITY.md

@@ -1,0 +1,269 @@
+.\" robodr-setup(8). Source of truth: the USAGE text in
+.\" crates/robodr-ops/src/bin/robodr-setup.rs and the module docs of
+.\" crates/robodr-ops/src/{preflight,setup}.rs. Keep them in sync.
+.TH ROBODR\-SETUP 8 "2026-10-31" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-setup \- first-boot setup of a RoboDR unit: host preflight, keys, role configuration, fingerprints
+.SH SYNOPSIS
+.B robodr\-setup preflight
+.RB [ \-\-json ]
+.RB [ \-\-min\-free\-mib
+.IR N ]
+.RB [ \-\-state\-dir
+.IR DIR ]
+.RB [ \-\-ignore\-check
+.IR ID ]...
+.br
+.B robodr\-setup keys \-\-unit\-id
+.I ID
+.RB [ \-\-role
+.IR ROLE ]
+.RB [ \-\-key
+.IR KIND ]...
+.RB [ \-\-keys\-dir
+.IR DIR ]
+.br
+.B robodr\-setup config \-\-role
+.I ROLE
+.B \-\-unit\-id
+.I ID
+.RB [ \-\-site
+.IR SITE ]
+.RB [ \-\-interface
+.IR IF ]...
+.RB [ \-\-examples
+.IR DIR ]
+.RB [ \-\-out
+.IR FILE ]
+.br
+.B robodr\-setup fingerprints
+.RB [ \-\-keys\-dir
+.IR DIR ]
+.RB [ \-\-json ]
+.br
+.B robodr\-setup init \-\-role
+.I ROLE
+.B \-\-unit\-id
+.I ID
+.RB [ \-\-site
+.IR SITE ]
+.RB [ \-\-interface
+.IR IF ]...
+.RB [ \-\-key
+.IR KIND ]...
+.RB [ \-\-ignore\-check
+.IR ID ]...
+.RB [ \-\-json ]
+.PP
+Every subcommand also takes
+.BI \-\-root " DIR"
+(operate on the file tree under
+.IR DIR ,
+for image staging and tests; commands such as
+.B systemctl
+still query the running host).
+.SH DESCRIPTION
+Replaces the manual first-boot steps of the quick start (requirements,
+keys, configuration, key registration) with one checked sequence. Run it
+as root after installing the package (the offline bundle installer installs
+the units disabled).
+.B Nothing that exists is ever overwritten:
+an existing key or configuration is kept and reported, so the command can
+be re-run safely and can never replace a key the SOC already trusts.
+.PP
+.B init
+runs
+.BR preflight ,
+and stops with exit 1 (generating and writing nothing) if any check
+fails; then
+.BR keys ,
+.B config
+(not for
+.BR soc\-relay )
+and
+.BR fingerprints .
+.SH PREFLIGHT
+Each check is
+.BR OK ,
+.B WARN
+(RoboDR runs with something reduced),
+.B FAIL
+(a RoboDR unit cannot run, or would run wrongly) or
+.B SKIP
+(not applicable to the installed package:
+.B robodr\-focal
+has no
+.BR robodr\-pulsard ).
+.TP
+.B kernel.btf
+.I /sys/kernel/btf/vmlinux
+or an external BTF
+.I /etc/robodr/btf/vmlinux
+stamped for the running kernel. WARN without any (no host behaviour
+detection; network detection is unaffected); FAIL for an external BTF of
+another kernel or without its stamp.
+.TP
+.B bpffs
+.I /sys/fs/bpf
+mounted as
+.BR bpf .
+WARN otherwise
+.RB ( robodr\-pulsard
+refuses to start).
+.TP
+.B nf_tables
+loaded, built in, or a module of the running kernel. WARN otherwise
+.RB ( robodr\-executor
+and
+.B robodr\-firewall\-gw
+cannot enforce).
+.TP
+.B systemd
+PID 1 is systemd 247 or newer (245 for
+.BR robodr\-focal ).
+FAIL otherwise.
+.TP
+.B glibc
+at least the
+.B libc6
+floor of the installed
+.B robodr
+package (2.35 when it cannot be read). FAIL otherwise: use
+.BR robodr\-focal .
+.TP
+.B clock
+FAIL when the wall clock is before this release was built (evidence and
+finding timestamps would be wrong); WARN when not NTP-synchronised.
+.TP
+.B disk
+free space on the file system of
+.B \-\-state\-dir
+(default
+.IR /var/lib/robodr ):
+FAIL below
+.B \-\-min\-free\-mib
+(default 2048), WARN below twice that.
+.TP
+.B keys.dir
+.I /etc/robodr/keys
+a root-owned directory without group or other access. FAIL otherwise;
+WARN when missing (the package creates it).
+.PP
+.BI \-\-ignore\-check " ID"
+downgrades that check's FAIL to a WARN that says it was ignored (for
+example
+.B clock
+on an isolated lab bench).
+.B keys.dir
+cannot be ignored.
+.SH ROLES
+.TP
+.B robot
+on-robot agent on a ROS 2 companion computer
+.RI ( agentd.example.json ).
+.TP
+.B unitree\-edu
+Unitree EDU development computer
+.RI ( agentd.unitree\-edu.example.json ).
+.TP
+.B unitree\-sensor\-box
+passive sensor box on a tap or mirror port
+.RI ( agentd.unitree\-sensor\-box.example.json ).
+.TP
+.B soc\-relay
+SOC side of an air-gapped site
+.RB ( robodr\-diode\-unpack " and " robodr\-uplink
+under a
+.B relay
+key): keys only, no agent configuration.
+.SH KEYS
+Ed25519 keys in the
+.B robodr\-blackbox
+key format, written exactly like
+.B robodr\-blackbox keygen
+does: the secret 0600 (exclusive create, no symlink followed), the public
+half next to it as
+.I .pub
+(0644). The secret is never printed. A directory that group or others can
+reach is refused.
+.TP
+.B blackbox
+.I agentd\-blackbox.key
+(robodr-agentd's
+.BR LoadCredential= ),
+bound to the unit id (agentd requires the binding to equal
+.BR robot.id ).
+The default for every role but
+.BR soc\-relay .
+.TP
+.B finding
+.I agentd\-finding.key
+(finding signatures; drop-in
+.IR 20\-finding\-key.conf.example ).
+.TP
+.B uplink
+.I uplink.key
+(robodr-uplink; the
+.B relay
+key on a SOC relay, its default).
+.TP
+.B diode
+.I diode.key
+(robodr-spool-export).
+.SH CONFIGURATION
+.B config
+writes the role's example with the unit id in
+.B robot.id
+and
+.BR sensor.profile_trust.expect_unit_id ,
+the site and capture interfaces when given, validated by robodr-agentd's
+own parser, to
+.B \-\-out
+(default
+.IR /etc/robodr/agentd.json ,
+0640, group
+.BR robodr ).
+Values that still read like an example are listed for review. Check the
+result with
+.B robodr\-agentd \-\-check\-config
+once the commissioned profile, its trust file and the response policy are
+installed.
+.SH FINGERPRINTS
+For every
+.I *.pub
+in the key directory: key id, algorithm, device binding,
+.B key sha256
+(SHA-256 of the 32 raw public key bytes, the same value
+.BR robodr\-commission (1)
+uses for key revocation) and the SHA-256 of the file. Register the key ids
+with the SOC over a channel you trust (read them out, or compare after
+copying the
+.I .pub
+files on vetted media). Secret key files are never opened.
+.SH EXIT STATUS
+.TP
+.B 0
+done (preflight: no FAIL).
+.TP
+.B 1
+a preflight check failed (init: nothing was generated or written), or an
+error.
+.TP
+.B 2
+usage error.
+.SH FILES
+.TP
+.I /etc/robodr/keys/
+keys (0700 root).
+.TP
+.I /etc/robodr/agentd.json
+the role configuration.
+.TP
+.I /usr/share/doc/robodr/examples/
+the role examples.
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-blackbox (1),
+.BR robodr\-commission (1),
+.BR robodr\-support\-bundle (8),
+.I /usr/share/doc/robodr/customer/quick\-start.md
