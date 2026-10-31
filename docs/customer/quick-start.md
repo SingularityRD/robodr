@@ -153,8 +153,23 @@ What reports from the first minute, and what needs the draft or more
 configuration, is in the [detection catalog](detection-catalog.md#what-each-detection-needs):
 packet and discovery health, agent self-health and (where
 `robodr-pulsard` runs) host detections need no profile content; graph and
-motion rules report against the draft. There is no `poc-init` helper yet;
-the steps above are manual.
+motion rules report against the draft.
+
+For step 6, `robodr-commission poc-init --dir <new directory> [--operator
+<name>]` builds the whole **LAB-ONLY** signing chain in one go, on the
+commissioning workstation: a trust root, a profile signing key and one
+operator key (secret keys mode 0600, all in that one directory), a
+one-operator `operators.json` (motion quorum 1), and the files to install
+on the unit (`trust-roots.json`, the root-signed `profile-trust.json` and
+its `.sig`). The trust file is marked `lab_only`, every key id starts with
+`lab-only-` and the operator name ends in `[LAB-ONLY]`: `verify-profile`
+prints a LAB-ONLY banner, and agentd (and the executor, when its
+`commissioning` section is set) warns at every start.
+It refuses a directory that already exists. Its `LAB-ONLY-README.txt` lists
+the remaining commands (`bind`, `signoff`, `lock`, `verify-profile`).
+**Never use a lab chain on a production unit**: nothing in it is reusable;
+production commissioning builds a new chain with an offline trust root and
+two or more operators ([OPERATIONS section 5](../OPERATIONS.md)).
 
 ## 5. Start the agent
 

@@ -85,7 +85,12 @@
     ([`crates/robodr-executor/README.md`](../../crates/robodr-executor/README.md),
     "Trust boundary").
   - A failed revert or a corrupt executor journal is reported in the
-    request state, the black box and `status.json`, not yet as a finding.
+    request state, the black box and `status.json`, and (since findings
+    contract 2.4) as a High finding: `robot.agent.executor_revert_failed`
+    once per request until a revert of it succeeds,
+    `robot.agent.executor_journal_reset` each time. agentd raises both from
+    the events the executor reports to it (not the executor itself); a SOC
+    with validators older than 2.4 sees them under the generic entry.
 - **The Motion Firewall records only in the passive modes** (tap, mirror
   port, on-robot agent): a command outside the envelope is reported but
   still reaches the motors ([`docs/UNITREE.md`](../UNITREE.md) section 5).
