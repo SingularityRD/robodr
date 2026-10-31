@@ -64,6 +64,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod wp6;
+
 const USAGE: &str = "\
 robodr-commission: learn, review, lock and verify a RoboDR model profile
 
@@ -123,6 +125,16 @@ USAGE:
   robodr-commission diff    <old.json> <new.json> [--json]
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
                           [--unitree-legacy] [--unitree-legacy-port N]...
+  robodr-commission bind    --in draft.json --out bound.json [--signoff draft.signoff.json]
+                          [--response-policy policy.json] [--motion-firewall firewall.json]
+                          [--joint-firewall joint.json] [--executor-config executor.json]
+                          [--force]
+  robodr-commission firewall-draft --in draft.json --report report.json --out firewall.json
+                          --max-angular RAD_PER_S [--ceiling-linear M_PER_S]
+                          [--morphology wheeled|quadruped|humanoid|arm|other] [--force]
+  robodr-commission report-html --report report.json --out report.html
+                          [--signoff signoff.json] [--note TEXT] [--force]
+  robodr-commission poc-init --dir DIR [--operator NAME]
   robodr-commission merge   --out merged.json <a.json> <b.json> [...]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
                           [--hard-cap-torque 400] [--hard-cap-kp 1000]
@@ -210,6 +222,20 @@ USAGE:
   --state, 1 refused). migrate-legacy re-issues a locked profile from
   before metadata existed (content unchanged, its digest recorded as
   parent).
+  bind writes the digest of each safety-relevant file into a copy of the
+  draft (bound_config: response_policy, motion_firewall, joint_firewall,
+  executor_motion = the executor.json `motion` section) plus a sign-off
+  list with one bound_config item per file (a motion item: motion_quorum
+  applies) and the manifest. After lock + sign the unit honours
+  oem_validated / the firewall envelope only for exactly these files.
+  firewall-draft proposes the Motion Firewall channel file from a learn
+  report (envelopes capped by the OEM ceilings, observed writers as
+  allowed_sources); exit 1 when channels still need the OEM's specs.
+  report-html renders a learn report (and sign-off state) as one inert
+  HTML page for review, archive and print-to-PDF.
+  poc-init creates a LAB-ONLY single-operator signing chain (keys, roots,
+  operators, root-signed trust file marked lab_only) for a proof of
+  concept; units accept it but report it loudly. Never for production.
   Outputs never overwrite an existing file or follow a symlink unless
   --force (symlinks are refused even then).
 
@@ -406,6 +432,10 @@ fn main() -> ExitCode {
         "merge" => cmd_merge(rest),
         "signoff" => cmd_signoff(rest),
         "operators" => cmd_operators(rest),
+        "bind" => wp6::cmd_bind(rest),
+        "firewall-draft" => wp6::cmd_firewall_draft(rest),
+        "report-html" => wp6::cmd_report_html(rest),
+        "poc-init" => wp6::cmd_poc_init(rest),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -1099,6 +1129,12 @@ struct VerifyReport {
     rollback: Option<String>,
     revocation_serial: Option<u64>,
     refused: Option<String>,
+    /// `bound_config` of the trusted profile (role -> digest).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    bound_config: BTreeMap<String, String>,
+    /// Accepted under a lab-only (`poc-init`) trust file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    lab_only: bool,
 }
 
 fn cmd_verify_profile(argv: &[String]) -> Outcome {
@@ -1168,6 +1204,8 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
         rollback: None,
         revocation_serial: None,
         refused: None,
+        bound_config: BTreeMap::new(),
+        lab_only: false,
     };
     match eval.result {
         Ok(acc) => {
@@ -1187,6 +1225,8 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
             r.rollback = acc.decision.map(|d| format!("{d:?}"));
             r.revocation_serial = acc.record.as_ref().and_then(|s| s.revocation_serial);
             r.trusted = v.profile.locked;
+            r.bound_config = v.profile.bound_config.clone();
+            r.lab_only = v.lab_only;
             if !v.profile.locked {
                 r.refused = Some("unlocked draft: observe-only, nothing to trust".into());
             }
@@ -1219,6 +1259,12 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
         );
         if let Some(ops) = &r.attested_by {
             println!("  attested by operators {ops:?}");
+        }
+        for (role, d) in &r.bound_config {
+            println!("  binds {role} {d}");
+        }
+        if r.lab_only {
+            println!("  {}", robodr_commission::poc::LAB_ONLY_BANNER);
         }
     } else {
         println!(
@@ -1383,6 +1429,7 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
             min_profile_version: floor,
             require_attestation,
             operators: operators.as_ref(),
+            lab_only: false,
         },
     );
     // Check what a unit will check (without roots here: the root signature

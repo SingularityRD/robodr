@@ -2733,6 +2733,8 @@ dependencies = [
  "robodr-capture",
  "robodr-cdr",
  "robodr-events",
+ "robodr-firewall",
+ "robodr-responder",
  "robodr-rtps",
  "serde",
  "serde_json",
