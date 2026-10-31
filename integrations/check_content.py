@@ -8,7 +8,7 @@
    Elastic pipeline, the Sentinel DCR) exists in the contract schema
    (docs/contracts/robodr-finding.schema.json).
 3. Every RoboDR rule id the content names is in the detection catalog
-   (docs/customer/detection-catalog.md); a `robot.x.*` prefix must match at
+   (docs/customer/detection-rules.md); a `robot.x.*` prefix must match at
    least one catalog id.
 4. The Elastic and Sentinel detection rules are what gen_detections.py
    generates, and Splunk's saved searches name the same rule ids.
@@ -38,7 +38,7 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCHEMA = os.path.join(ROOT, "docs/contracts/robodr-finding.schema.json")
-CATALOG = os.path.join(ROOT, "docs/customer/detection-catalog.md")
+CATALOG = os.path.join(ROOT, "docs/customer/detection-rules.md")
 TOP = (
     "contract_version finding_id external_id data_source title description severity "
     "timestamp entity_context mitre_predictions evidence_links anomaly_score "

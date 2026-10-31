@@ -119,7 +119,7 @@ def write(root):
                 f"name: {d['name']}",
                 "description: |",
                 f"  {d['desc']} Observe-only: alerts, never responds.",
-                "  RoboDR rule ids (docs/customer/detection-catalog.md):",
+                "  RoboDR rule ids (docs/customer/detection-rules.md):",
                 rules_yaml.replace("  - ", "    - "),
                 f"severity: {d['sentinel_sev']}",
                 "requiredDataConnectors: []",
