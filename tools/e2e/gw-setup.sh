@@ -76,6 +76,9 @@ if webrtc == "1":
                      "max_sessions": 1}
 json.dump(cfg, open(f"{gw}/gateway.json", "w"), indent=2)
 PY
+# Enforce mode needs the envelope signed for the profile (T11).
+"$B/robodr-commission" sign-firewall --firewall firewall.json --profile profile.json \
+  --sign-key prof.key --force 2>/dev/null
 "$B/robodr-firewall-gw" check-config --config gateway.json
 for ns in ctrl gw rob atk; do ip netns add "$PFX-$ns"; done
 ip link add c0 netns $PFX-ctrl type veth peer name gc0 netns $PFX-gw

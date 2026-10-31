@@ -98,6 +98,8 @@ USAGE:
                           [--hard-cap-position-step 0.5]
   robodr-commission sign    --profile locked.json --sign-key signing.key
                           [--operators operators.json] [--allow-unattested] [--force]
+  robodr-commission sign-firewall --firewall firewall.json --profile locked.json
+                          --sign-key signing.key [--force]
   robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
                           [--expect-platform P] [--expect-unit U]
                           [--state profile-state.json] [--allow-rollback sha256:HEX]
@@ -427,6 +429,7 @@ fn main() -> ExitCode {
         "learn" => cmd_learn(rest),
         "lock" => cmd_lock(rest),
         "sign" => cmd_sign(rest),
+        "sign-firewall" => cmd_sign_firewall(rest),
         "verify-profile" => cmd_verify_profile(rest),
         "keygen" => cmd_keygen(rest),
         "trust-keys" => cmd_trust_keys(rest),
@@ -1118,6 +1121,44 @@ fn cmd_sign(argv: &[String]) -> Outcome {
     eprintln!(
         "signed {profile} ({}) by {} -> {sig_out}",
         sig.profile_digest, sig.key_id
+    );
+    Ok(())
+}
+
+/// Sign a Motion Firewall configuration for the locked profile it belongs
+/// to (sales-readiness T11): `<firewall>.sig`, bound to the profile's
+/// digest (`trust::firewall_signed_bytes`). An enforcing
+/// `robodr-firewall-gw` refuses a firewall file without a valid one from
+/// the key that signed its profile.
+fn cmd_sign_firewall(argv: &[String]) -> Outcome {
+    let a = Args::parse(argv, &["firewall", "profile", "sign-key"], &["force"])?;
+    if let Some(p) = a.positionals.first() {
+        return Err(format!("unexpected argument {p:?}").into());
+    }
+    let firewall = a.required("firewall")?;
+    let profile = a.required("profile")?;
+    let key_path = a.required("sign-key")?;
+    let sig_out = sig_path_for(Path::new(firewall)).display().to_string();
+    distinct_paths(&[sig_out.as_str()], &[firewall, profile, key_path])?;
+    let key = robodr_signer::load(Path::new(key_path))?;
+    let ptext = read_text(profile, MAX_PROFILE_BYTES)?;
+    let p = parse_profile_text(&ptext).map_err(|e| format!("{profile}: {e}"))?;
+    if !p.locked {
+        return Err(
+            format!("{profile}: not locked (an envelope is signed for a locked profile)").into(),
+        );
+    }
+    let ftext = read_text(firewall, MAX_PROFILE_BYTES)?;
+    robodr_firewall::FirewallConfig::from_json(&ftext)
+        .map_err(|e| format!("{firewall}: not a valid firewall configuration: {e:?}"))?;
+    let pdigest = file_digest(ptext.as_bytes());
+    let signed = robodr_commission::trust::firewall_signed_bytes(&pdigest, ftext.as_bytes());
+    let sig = ProfileSignature::create_for(SigKind::FirewallConfig, &signed, &key)
+        .map_err(|e| e.to_string())?;
+    write_file(&sig_out, &sig.to_text(), a.switch("force"))?;
+    eprintln!(
+        "signed {firewall} for {profile} ({pdigest}) by {} -> {sig_out}",
+        sig.key_id
     );
     Ok(())
 }

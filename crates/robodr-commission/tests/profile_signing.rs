@@ -1143,3 +1143,112 @@ fn lock_embeds_attestation_and_sign_refuses_unattested_cli() {
         .contains("attestation"));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Sales-readiness T11: `sign-firewall` signs a Motion Firewall
+/// configuration for a locked profile; the signature verifies over the
+/// profile's digest and the file, under the profile key, and nothing else
+/// (another profile, an edited file, a profile signature's domain).
+#[test]
+fn sign_firewall_binds_the_envelope_to_the_locked_profile() {
+    use robodr_commission::trust::{
+        firewall_signed_bytes, load_trust_keys, ProfileSignature, SigKind,
+    };
+    let d = tmpdir("fwsig");
+    let (key, trust) = keygen(&d, "oem-a");
+    let (p, so) = draft(&d);
+    let locked = d.join("locked.json");
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&p),
+        "--signoff",
+        s(&so),
+        "--out",
+        s(&locked),
+        "--platform",
+        "ugv-x1",
+        "--profile-version",
+        "1",
+        "--locked-at",
+        "1790000000",
+        "--sign-key",
+        s(&key),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let fw = d.join("firewall.json");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/firewall.unitree-go2.example.json"),
+        &fw,
+    )
+    .unwrap();
+    // A draft profile is refused.
+    let o = run(&[
+        "sign-firewall",
+        "--firewall",
+        s(&fw),
+        "--profile",
+        s(&p),
+        "--sign-key",
+        s(&key),
+    ]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    let o = run(&[
+        "sign-firewall",
+        "--firewall",
+        s(&fw),
+        "--profile",
+        s(&locked),
+        "--sign-key",
+        s(&key),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let sig = ProfileSignature::parse_for(
+        SigKind::FirewallConfig,
+        &std::fs::read_to_string(sig_of(&fw)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sig.key_id, "oem-a");
+    let ring = load_trust_keys(&trust).unwrap();
+    let pd = file_digest(&std::fs::read(&locked).unwrap());
+    let text = std::fs::read(&fw).unwrap();
+    sig.verify_for(
+        SigKind::FirewallConfig,
+        &firewall_signed_bytes(&pd, &text),
+        &ring,
+    )
+    .unwrap();
+    let other = format!("sha256:{}", "1".repeat(64));
+    assert!(sig
+        .verify_for(
+            SigKind::FirewallConfig,
+            &firewall_signed_bytes(&other, &text),
+            &ring
+        )
+        .is_err());
+    let mut edited = text.clone();
+    edited.push(b' ');
+    assert!(sig
+        .verify_for(
+            SigKind::FirewallConfig,
+            &firewall_signed_bytes(&pd, &edited),
+            &ring
+        )
+        .is_err());
+    // Domain separation: not a profile signature.
+    assert!(ProfileSignature::parse(&std::fs::read_to_string(sig_of(&fw)).unwrap()).is_err());
+    // Not a firewall configuration: refused.
+    let bogus = d.join("bogus.json");
+    std::fs::write(&bogus, "{\"x\":1}").unwrap();
+    let o = run(&[
+        "sign-firewall",
+        "--firewall",
+        s(&bogus),
+        "--profile",
+        s(&locked),
+        "--sign-key",
+        s(&key),
+    ]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    let _ = std::fs::remove_dir_all(&d);
+}

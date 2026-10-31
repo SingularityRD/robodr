@@ -85,6 +85,15 @@ robodr\-commission \- learn, review, lock and verify a RoboDR model profile
 .I signing.key
 .RB [ \-\-force ]
 .PP
+.B robodr\-commission sign\-firewall
+.B \-\-firewall
+.I firewall.json
+.B \-\-profile
+.I locked.json
+.B \-\-sign\-key
+.I signing.key
+.RB [ \-\-force ]
+.PP
 .B robodr\-commission verify\-profile
 .B \-\-profile
 .I locked.json
@@ -508,6 +517,15 @@ sign. Keep the signing key on the commissioning
 station, never on the robot; install only the trust file on the robot.
 .B sign
 signs an already locked profile (offline signing station).
+.B sign\-firewall
+signs a Motion Firewall configuration for a locked profile:
+.IR firewall.json .sig
+.RB ( robodr\-firewall\-config\-sig/v1 )
+covers the profile file's digest and the configuration's exact bytes, so it
+is valid for that profile only. An enforcing
+.BR robodr\-firewall\-gw (8)
+refuses a configuration without a valid signature by the key that signed its
+profile. Sign with the profile's key, after reviewing the envelope.
 .PP
 The loaders (sensor pipeline,
 .BR robodr\-agentd (8),

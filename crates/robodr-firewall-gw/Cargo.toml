@@ -40,6 +40,8 @@ testkit = []
 
 [dev-dependencies]
 robodr-firewall-gw = { path = ".", features = ["testkit"] }
+# tests/firewall_signature.rs: profile / envelope signing keys.
+robodr-blackbox = { workspace = true }
 
 [[bin]]
 name = "robodr-firewall-gw"

@@ -166,6 +166,11 @@ pub const ROOTS_FORMAT: &str = "robodr-trust-roots/v1";
 pub const TRUST_SIG_FORMAT: &str = "robodr-profile-trust-sig/v1";
 /// Domain separation prefix of a trust file's signed message.
 pub const TRUST_SIG_DOMAIN: &[u8] = b"robodr-profile-trust-sig/v1\0";
+/// `format` of a Motion Firewall configuration's detached signature
+/// (`<firewall.json>.sig`, sales-readiness T11).
+pub const FIREWALL_SIG_FORMAT: &str = "robodr-firewall-config-sig/v1";
+/// Domain separation prefix of a firewall configuration's signed message.
+pub const FIREWALL_SIG_DOMAIN: &[u8] = b"robodr-firewall-config-sig/v1\0";
 /// `kind` of the black-box note recording an accepted profile.
 pub const ACCEPTED_NOTE_KIND: &str = "robodr.profile_accepted";
 /// Top-level member of a black-box note that carries an [`AcceptedState`]
@@ -445,6 +450,10 @@ pub enum SigKind {
     Profile,
     /// `<trust>.sig` ([`TRUST_SIG_FORMAT`], [`TRUST_SIG_DOMAIN`]).
     TrustFile,
+    /// `<firewall.json>.sig` ([`FIREWALL_SIG_FORMAT`],
+    /// [`FIREWALL_SIG_DOMAIN`]); the signed bytes are
+    /// [`firewall_signed_bytes`].
+    FirewallConfig,
 }
 
 impl SigKind {
@@ -453,6 +462,7 @@ impl SigKind {
         match self {
             Self::Profile => SIG_FORMAT,
             Self::TrustFile => TRUST_SIG_FORMAT,
+            Self::FirewallConfig => FIREWALL_SIG_FORMAT,
         }
     }
 
@@ -461,8 +471,22 @@ impl SigKind {
         match self {
             Self::Profile => SIG_DOMAIN,
             Self::TrustFile => TRUST_SIG_DOMAIN,
+            Self::FirewallConfig => FIREWALL_SIG_DOMAIN,
         }
     }
+}
+
+/// What a firewall configuration's signature covers (T11): the digest of
+/// the locked profile it belongs to ([`file_digest`] of the profile file),
+/// a newline, then the firewall file's exact bytes. The envelope is bound
+/// to that profile: it cannot be paired with another (older or newer)
+/// profile, so the profile's anti-rollback covers it too.
+pub fn firewall_signed_bytes(profile_digest: &str, firewall: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(profile_digest.len() + 1 + firewall.len());
+    b.extend_from_slice(profile_digest.as_bytes());
+    b.push(b'\n');
+    b.extend_from_slice(firewall);
+    b
 }
 
 /// `kind.domain() || bytes`.

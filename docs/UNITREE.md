@@ -586,6 +586,18 @@ start-up and confirm every port either side receives RTPS on is queued.
 
 **Upgrading an existing gateway configuration:**
 
+* **Sign the firewall file before upgrading an enforcing gateway**
+  (sales-readiness T11): `robodr-commission sign-firewall --firewall
+  firewall.json --profile <locked profile> --sign-key <the profile's key>`
+  writes `firewall.json.sig`; an enforcing gateway without a valid one,
+  by the key that signed the profile, does not start. Re-sign after every
+  change of the firewall file or of the profile.
+* **802.1Q VLANs** (T44): tagged frames from the controller port are
+  dropped unless their id is in `queue.vlan_ids`; the listed VLANs' IPv4
+  is decided like untagged traffic. IPv6 and PPPoE stay dropped.
+* **Overload is `robot.gateway.overload`** (T8): late packets are no longer
+  reported as Critical `robot.firewall.internal_fault`; one finding per
+  `overload_interval_ms` (60 s), High from `overload_high_late` (1000).
 * **Go2 / B2 in enforce mode need a channel for every motion service**
   (gateway review, finding 3): a Go2 (`robot_model: go2` / `go2w`, or no
   `robot_model` and a sport channel) adds `unitree_obstacles_avoid_request`

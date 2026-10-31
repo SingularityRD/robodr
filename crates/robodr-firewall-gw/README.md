@@ -872,7 +872,7 @@ oneshot unit), or `fail_closed` would mean nothing.
 |---|---|---|
 | `mode` | — | `enforce` (requires a locked, trusted profile and an enforcing platform) or `observe` (decide, record would-haves, forward everything unchanged) |
 | `profile`, `profile_trust` | — | as agentd's `sensor.profile_path` / `sensor.profile_trust`; the anti-rollback state is read, never written |
-| `firewall` | — | `robodr_firewall::FirewallConfig` JSON (channels, joint channels, platform: morphology, `fail_behaviour`, `fault_policy`, `foreign_source_action`) |
+| `firewall` | — | `robodr_firewall::FirewallConfig` JSON (channels, joint channels, platform: morphology, `fail_behaviour`, `fault_policy`, `foreign_source_action`). In `enforce` mode `<firewall>.sig` is required (below, "Signed envelope") |
 | `queue.num`, `queue.max_len` | —, 1024 | NFQUEUE number and kernel queue length |
 | `queue.on_gateway_down` | `fail_closed` | see above |
 | `queue.controller_port`, `queue.robot_port` | — | bridge port names (ruleset) |
@@ -916,9 +916,32 @@ its choices. They are tested to build (`tests/gateway.rs`
 `shipped_channel_examples_build`) against a profile listing their channels.
 
 `robodr-firewall-gw check-config --config <json>` validates everything
-(configuration, profile with its trust checks, firewall compile, channel ↔
-codec ↔ slot count ↔ profile `motion_types`, the humanoid / bypass rule)
-without touching the network.
+(configuration, profile with its trust checks, the firewall file's
+signature in enforce mode, firewall compile, channel ↔ codec ↔ slot count ↔
+profile `motion_types`, the humanoid / bypass rule) without touching the
+network.
+
+**Signed envelope (sales-readiness T11).** The firewall file holds the
+envelope the gateway enforces (joint limits, steps, allowed sources); it
+used to be read as plain JSON, so whoever could write it could widen every
+limit. In `enforce` mode the gateway now refuses to start unless
+`<firewall>.sig` (`robodr-firewall-config-sig/v1`, written by
+`robodr-commission sign-firewall --firewall <file> --profile <locked
+profile> --sign-key <key>`) is a valid Ed25519 signature, **by the key that
+signed the accepted profile**, verified against `profile_trust.trusted_keys`
+(authenticated by `trust_roots` when configured), over the profile file's
+digest and the firewall file's exact bytes. An edited file, a signature
+made for another profile (an older envelope cannot be paired with a newer
+profile, so the profile's anti-rollback covers it) or another key is
+refused. `observe` mode starts without one and warns. The signature is
+checked at start (and by `check-config`); the decision summaries record the
+digests (above). Not covered: the gateway configuration itself
+(`firewall-gw.json`: channels, allowlists, ports) is not signed, and
+agentd still reads its `firewall.joint_config` unsigned (its verdicts
+there are recording-only). **Migration:** an existing enforcing
+installation must sign its firewall file before the upgrade, or the
+gateway does not start (`on_gateway_down` then applies; `fail_closed`
+stops motion traffic).
 
 ## Deployment
 

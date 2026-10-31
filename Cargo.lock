@@ -2934,6 +2934,7 @@ dependencies = [
 name = "robodr-firewall-gw"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "robodr-blackbox",
  "robodr-capture",
  "robodr-cdr",
  "robodr-commission",

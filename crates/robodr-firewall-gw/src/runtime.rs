@@ -78,13 +78,21 @@ pub fn load_with_provenance(
     String,
 > {
     let mut notes = Vec::new();
-    let profile_sha256 = std::fs::read(&cfg.profile)
-        .ok()
-        .map(|b| robodr_commission::trust::file_digest(&b));
-    let (loaded, _commit) = robodr_ros2_pipeline::profile_trust::load_profile_deferred(
+    let t = robodr_ros2_pipeline::profile_trust::load_profile_checked(
         &cfg.profile,
         &cfg.profile_trust,
+        None,
     )?;
+    // The digest of the bytes the trust check accepted; for a profile it
+    // did not accept (observe only) the file as read now.
+    let accepted = t.accepted.as_ref().map(|a| a.digest.clone());
+    let signer = t.signed_by.clone();
+    let profile_sha256 = accepted.clone().or_else(|| {
+        std::fs::read(&cfg.profile)
+            .ok()
+            .map(|b| robodr_commission::trust::file_digest(&b))
+    });
+    let loaded = t.loaded;
     let mut profile = loaded.profile;
     if let Err(e) = &loaded.file_check {
         if cfg.mode == GatewayMode::Enforce {
@@ -101,12 +109,99 @@ pub fn load_with_provenance(
     let text = read_capped(&cfg.firewall, crate::config::MAX_CONFIG_BYTES)?;
     let fw = FirewallConfig::from_json(&text)
         .map_err(|e| format!("{}: {e:?}", cfg.firewall.display()))?;
+    // Sales-readiness T11: in enforce mode the envelope must be signed for
+    // this very profile by the key that signed the profile.
+    if cfg.mode == GatewayMode::Enforce {
+        match (accepted.as_deref(), signer.as_deref()) {
+            (Some(d), Some(k)) => verify_firewall_signature(cfg, &text, d, k)?,
+            _ => {
+                return Err(format!(
+                    "{}: cannot be verified: the profile {} is not a trusted, signed locked \
+                     profile (enforce needs both)",
+                    cfg.firewall.display(),
+                    cfg.profile.display()
+                ))
+            }
+        }
+    } else if verify_firewall_signature(
+        cfg,
+        &text,
+        accepted.as_deref().unwrap_or(""),
+        signer.as_deref().unwrap_or(""),
+    )
+    .is_err()
+    {
+        notes.push(format!(
+            "{}: no valid signature for the profile (`robodr-commission sign-firewall`); \
+             enforce mode would refuse it",
+            cfg.firewall.display()
+        ));
+    }
     let prov = crate::summary::Provenance {
         config_sha256: cfg.source_sha256.clone(),
         firewall_sha256: Some(robodr_commission::trust::file_digest(text.as_bytes())),
         profile_sha256,
     };
     Ok((profile, fw, notes, prov))
+}
+
+/// Sales-readiness T11: `<firewall>.sig` (`robodr-firewall-config-sig/v1`,
+/// `robodr-commission sign-firewall`) must be a valid signature, by
+/// `signer` (the key that signed the accepted profile), over
+/// `firewall_signed_bytes(profile_digest, text)`, verified against the
+/// profile trust file (authenticated by the trust roots when configured).
+pub fn verify_firewall_signature(
+    cfg: &GatewayConfig,
+    text: &str,
+    profile_digest: &str,
+    signer: &str,
+) -> Result<(), String> {
+    use robodr_commission::trust::{
+        firewall_signed_bytes, load_trust_file, load_trust_roots, read_optional_sig, sig_path_for,
+        ProfileSignature, SigKind,
+    };
+    let fw = cfg.firewall.display();
+    let sig_path = sig_path_for(&cfg.firewall);
+    let sig_text = read_optional_sig(&sig_path)
+        .map_err(|e| format!("{}: {e}", sig_path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{fw}: unsigned ({} missing): sign it for the locked profile with \
+                 `robodr-commission sign-firewall --firewall {fw} --profile {} --sign-key <key>`",
+                sig_path.display(),
+                cfg.profile.display()
+            )
+        })?;
+    let sig = ProfileSignature::parse_for(SigKind::FirewallConfig, &sig_text)
+        .map_err(|e| format!("{}: {e}", sig_path.display()))?;
+    if sig.key_id != signer {
+        return Err(format!(
+            "{}: signed by key {:?}, the profile by {signer:?}",
+            sig_path.display(),
+            sig.key_id
+        ));
+    }
+    let keys = cfg
+        .profile_trust
+        .trusted_keys
+        .as_ref()
+        .ok_or_else(|| format!("{fw}: profile_trust.trusted_keys is needed to verify it"))?;
+    let roots = match &cfg.profile_trust.trust_roots {
+        Some(p) => Some(load_trust_roots(p).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let tf = load_trust_file(keys, roots.as_ref()).map_err(|e| e.to_string())?;
+    sig.verify_for(
+        SigKind::FirewallConfig,
+        &firewall_signed_bytes(profile_digest, text.as_bytes()),
+        &tf.keys,
+    )
+    .map_err(|e| {
+        format!(
+            "{}: {e} (signed for another profile, or the file changed since it was signed)",
+            sig_path.display()
+        )
+    })
 }
 
 /// Recv -> verdict latency histogram (1 µs buckets up to 20 ms, then one

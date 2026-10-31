@@ -170,6 +170,8 @@ robodr-commission lock    --in profile.json --signoff signoff.json --out locked.
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
 robodr-commission sign    --profile locked.json --sign-key signing.key
                           [--operators operators.json] [--allow-unattested] [--force]
+robodr-commission sign-firewall --firewall firewall.json --profile locked.json
+                          --sign-key signing.key [--force]
 robodr-commission verify-profile --profile locked.json --trusted-keys trust.json
                           [--expect-platform P] [--expect-unit U]
                           [--state profile-state.json] [--allow-rollback sha256:HEX] [--json]
