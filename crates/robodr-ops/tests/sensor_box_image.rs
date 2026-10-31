@@ -200,6 +200,64 @@ fn early_accepts_only_an_ip_address_for_ntp() {
         .contains("NTP=2001:db8::123"));
 }
 
+/// `valid ntp` (common.sh) accepts well-formed IPv4 and IPv6 addresses only:
+/// a malformed one (999.1.1.1, ":::") would be written to timesyncd and
+/// never sync.
+#[test]
+fn ntp_address_validation_rejects_malformed_addresses() {
+    let b = BoxRoot::new("img-ntp-valid", "\n", 0);
+    let check = |a: &str| -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(". \"$ROBODR_IMAGE_ROOT/usr/lib/robodr-image/common.sh\"; valid ntp \"$1\"")
+            .arg("sh")
+            .arg(a)
+            .env("ROBODR_IMAGE_ROOT", &b.t.0)
+            .status()
+            .unwrap()
+            .success()
+    };
+    for good in [
+        "192.0.2.123",
+        "0.0.0.0",
+        "255.255.255.255",
+        "2001:db8::123",
+        "::1",
+        "fe80::1",
+        "1:2:3:4:5:6:7:8",
+        "1:2:3:4:5:6:7::",
+        "::2:3:4:5:6:7:8",
+        "::ffff:192.0.2.1",
+        "64:ff9b::192.0.2.1",
+        "1:2:3:4:5:6:192.0.2.1",
+    ] {
+        assert!(check(good), "{good} refused");
+    }
+    for bad in [
+        "999.1.1.1",
+        "256.0.0.1",
+        "01.2.3.4",
+        "1.2.3",
+        "1.2.3.4.5",
+        ":::",
+        "::::::::",
+        "1:2:3:4:5:6:7:8:9",
+        "1:2:3:4:5:6:7",
+        ":1::2",
+        "1::2:",
+        "1::2::3",
+        "12345::1",
+        "g::1",
+        "fe80::1%eth0",
+        "::ffff:999.0.0.1",
+        "1:2:3:4:5:6:7:192.0.2.1",
+        "pool.ntp.example",
+        "",
+    ] {
+        assert!(!check(bad), "{bad:?} accepted");
+    }
+}
+
 /// The firewall goes in before anything else can fail; and whatever
 /// happens to robodr-image-early, nftables.service (robodr-nft-load) loads
 /// a ruleset: the site's, or the strict default (fail closed).

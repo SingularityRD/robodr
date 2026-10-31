@@ -62,10 +62,11 @@ or as `/etc/robodr/provision.env` (`KEY=VALUE` lines: `ROBODR_UNIT_ID`,
 `ROBODR_EXPORTER` = `none` | `uplink` | `kafka-publish` | `spool-export`).
 Every value is validated; the file is parsed, never sourced.
 
-`robodr.ntp` / `ROBODR_NTP` must be an **IP address** (IPv4 or IPv6), not
-a host name: the strict default firewall lets no DNS out, so a name would
-never resolve and the clock would never be set. A host name is ignored
-with a message in the journal. The root is read-only, so there is no other
+`robodr.ntp` / `ROBODR_NTP` must be an **IP address** (IPv4 dotted quad,
+or IPv6 including `::ffff:192.0.2.1`; no zone index), not a host name: the
+strict default firewall lets no DNS out, so a name would never resolve and
+the clock would never be set. A host name or a malformed address
+(`999.1.1.1`, `:::`) is ignored with a message in the journal. The root is read-only, so there is no other
 place for an NTP setting on the box.
 
 ## Boot
@@ -87,7 +88,14 @@ place for an NTP setting on the box.
    `nftables.service` runs after it and loads `/etc/robodr/nftables.conf`
    through `robodr-nft-load`; when that file is missing or `nft` refuses
    it, the shipped strict default is loaded instead and the unit fails
-   visibly: the box never comes up without a host firewall.
+   visibly: the box never comes up without a host firewall. This relies on
+   systemd not running `nftables.service`'s `ExecStop=` (`nft flush
+   ruleset`) when its `ExecStart=` fails. Checked on 2026-10-31 under
+   systemd 255 with Ubuntu 24.04's own `nftables.service`, this drop-in and
+   the real `nft` in a container (not yet on a built image, B7): with the
+   site file missing or refused the unit is `failed` and the strict default
+   stays loaded; a refused file on `systemctl reload` loads the strict
+   default, the reload fails and the unit stays `active`.
 3. `robodr-image-late.service`: at **first boot**, `robodr-setup init`
    (host preflight, then the black-box key bound to the unit id, then
    `agentd.json` for the role). A failed preflight check stops it with

@@ -27,15 +27,49 @@ valid() {
     iface)
         printf '%s' "$2" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._@-]{0,14}$' ;;
     ntp)
-        # An IP address only (v4 dotted quad, or v6 hex and colons): the
-        # strict default firewall lets no DNS out, so a host name would
-        # never resolve and the clock would never be set.
-        printf '%s' "$2" | grep -Eq '^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7})$' ;;
+        # An IP address only: the strict default firewall lets no DNS out,
+        # so a host name would never resolve and the clock would never be
+        # set. A malformed address would never sync either.
+        valid_ipv4 "$2" || valid_ipv6 "$2" ;;
     role)
         case "$2" in robot | unitree-sensor-box) return 0 ;; *) return 1 ;; esac ;;
     exporter)
         case "$2" in none | uplink | kafka-publish | spool-export) return 0 ;; *) return 1 ;; esac ;;
     *) return 1 ;;
+    esac
+}
+
+# valid_ipv4 A: a dotted quad, every octet 0-255 (no leading zeros, which
+# some resolvers read as octal).
+valid_ipv4() {
+    printf '%s' "$1" | grep -Eq '^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$'
+}
+
+# valid_ipv6 A: RFC 4291 text form: eight groups of 1-4 hex digits, or
+# fewer with exactly one "::"; the last two groups may be a dotted quad
+# (::ffff:192.0.2.1). No zone index (fe80::1%eth0).
+valid_ipv6() {
+    v6_a=$1
+    case "$v6_a" in *:*) ;; *) return 1 ;; esac
+    printf '%s' "$v6_a" | grep -Eq '^[0-9A-Fa-f:.]{2,45}$' || return 1
+    case "$v6_a" in
+    *.*)
+        v6_v4=${v6_a##*:}
+        valid_ipv4 "$v6_v4" || return 1
+        v6_a="${v6_a%"$v6_v4"}0:0" ;;
+    esac
+    case "$v6_a" in *:::* | *::*::* | :[!:]* | *[!:]:) return 1 ;; esac
+    v6_n=0
+    v6_rest=$v6_a
+    while [ -n "$v6_rest" ]; do
+        v6_g=${v6_rest%%:*}
+        [ ${#v6_g} -le 4 ] || return 1
+        [ -z "$v6_g" ] || v6_n=$((v6_n + 1))
+        case "$v6_rest" in *:*) v6_rest=${v6_rest#*:} ;; *) v6_rest= ;; esac
+    done
+    case "$v6_a" in
+    *::*) [ "$v6_n" -le 7 ] ;;
+    *) [ "$v6_n" -eq 8 ] ;;
     esac
 }
 
