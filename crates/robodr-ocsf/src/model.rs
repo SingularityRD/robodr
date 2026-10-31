@@ -389,16 +389,42 @@ pub struct CredentialExpiry {
     pub days_to_expiry: i64,
 }
 
-/// The kernel's clock discipline (`adjtimex(2)`).
+/// Where [`ClockHealth::synchronized`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSource {
+    /// The kernel's clock discipline (`adjtimex(2)`, read only).
+    Adjtimex,
+    /// `adjtimex(2)` failed; systemd-timesyncd's marker file
+    /// (`/run/systemd/timesync/synchronized`) was touched recently. Only
+    /// ever `synchronized: true`, without an error estimate.
+    Timesyncd,
+}
+
+/// The robot's clock: the kernel's clock discipline (`adjtimex(2)`) or,
+/// where that call fails, systemd-timesyncd's marker file; and the agent's
+/// own wall-clock jump count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockHealth {
     /// `false`: the kernel reports the clock unsynchronised (`STA_UNSYNC`
-    /// / `TIME_ERROR`); absent: not known on this platform.
+    /// / `TIME_ERROR`); absent: not known (see `adjtimex_errno`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synchronized: Option<bool>,
     /// The kernel's maximum error estimate (ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_error_ms: Option<u64>,
+    /// Where `synchronized` came from (present exactly with it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ClockSource>,
+    /// `adjtimex(2)` failed with this `errno` (1, `EPERM`: a system-call
+    /// filter refused it, as the shipped systemd unit's `@clock` filter
+    /// does). Absent: it answered, or the platform has no `adjtimex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjtimex_errno: Option<u32>,
+    /// Milliseconds since systemd-timesyncd last touched its marker file
+    /// `/run/systemd/timesync/synchronized` (absent: no such file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timesync_age_ms: Option<u64>,
     /// Wall-clock jumps against the monotonic clock since start.
     pub wall_jumps: u64,
 }

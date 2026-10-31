@@ -224,6 +224,9 @@ pub fn health_value(robot: &str, seq: u64) -> String {
         clock: ClockHealth {
             synchronized: Some(true),
             max_error_ms: Some(3),
+            source: Some(robodr_ocsf::ClockSource::Adjtimex),
+            adjtimex_errno: None,
+            timesync_age_ms: None,
             wall_jumps: 0,
         },
         disks: vec![DiskHealth {

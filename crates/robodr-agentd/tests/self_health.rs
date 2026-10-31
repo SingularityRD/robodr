@@ -100,6 +100,128 @@ fn t5_health_record_is_periodic_and_carries_the_agent_state() {
     assert!(hb.counters.health_findings >= 1, "the silence finding");
 }
 
+/// Refuse `adjtimex(2)` and `clock_adjtime(2)` with EPERM on the calling
+/// thread and the threads it starts, as the shipped unit's
+/// `ProtectClock=yes` / `SystemCallFilter=~@clock` does. `false` where this
+/// test cannot install the filter.
+#[allow(unsafe_code)]
+fn deny_clock_syscalls_like_the_unit() -> bool {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        use std::ffi::{c_int, c_ulong};
+        #[repr(C)]
+        struct SockFilter {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *const SockFilter,
+        }
+        extern "C" {
+            fn prctl(
+                option: c_int,
+                arg2: c_ulong,
+                arg3: c_ulong,
+                arg4: c_ulong,
+                arg5: c_ulong,
+            ) -> c_int;
+        }
+        // (AUDIT_ARCH_*, __NR_adjtimex, __NR_clock_adjtime)
+        #[cfg(target_arch = "x86_64")]
+        const ARCH: (u32, u32, u32) = (0xC000_003E, 159, 305);
+        #[cfg(target_arch = "aarch64")]
+        const ARCH: (u32, u32, u32) = (0xC000_00B7, 171, 266);
+        const LD_ABS_W: u16 = 0x20;
+        const JEQ_K: u16 = 0x15;
+        const RET_K: u16 = 0x06;
+        let f = |code, jt, jf, k| SockFilter { code, jt, jf, k };
+        let prog = [
+            f(LD_ABS_W, 0, 0, 4),            // 0: arch
+            f(JEQ_K, 0, 3, ARCH.0),          // 1: other arch -> allow
+            f(LD_ABS_W, 0, 0, 0),            // 2: syscall nr
+            f(JEQ_K, 2, 0, ARCH.1),          // 3: adjtimex -> EPERM
+            f(JEQ_K, 1, 0, ARCH.2),          // 4: clock_adjtime -> EPERM
+            f(RET_K, 0, 0, 0x7fff_0000),     // 5: allow
+            f(RET_K, 0, 0, 0x0005_0000 | 1), // 6: errno EPERM
+        ];
+        let fprog = SockFprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr(),
+        };
+        // SAFETY: plain prctl(2) calls; `fprog` and `prog` outlive them
+        // (the kernel copies the program).
+        unsafe {
+            prctl(38, 1, 0, 0, 0) == 0 // PR_SET_NO_NEW_PRIVS
+                && prctl(22, 2, &fprog as *const SockFprog as c_ulong, 0, 0) == 0
+            // PR_SET_SECCOMP, FILTER
+        }
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        false
+    }
+}
+
+/// T7 under the shipped unit: its seccomp filter refuses `adjtimex(2)`, so
+/// the kernel clock is not known. The record and `status.json` must say
+/// the probe was refused (`adjtimex_errno` 1) instead of looking like a
+/// platform without one, and claim no synchronisation state from it.
+#[test]
+fn t7_refused_clock_probe_is_reported() {
+    let s = setup("clock-refused", &robot_profile(true));
+    let cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        json!({"self_health": {"health_record_ms": 1000,
+            "disk_warn_percent": 1, "disk_critical_percent": 0,
+            "clock_unsynced_grace_ms": 0}}),
+    );
+    let r = s.resolve(&cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    let h: Run = std::thread::spawn(move || {
+        if !deny_clock_syscalls_like_the_unit() {
+            return (Err("seccomp filter not installed".into()), String::new());
+        }
+        let mut log = Vec::new();
+        let res = robodr_agentd::run(&r, &|| s2.load(Ordering::SeqCst), &mut log)
+            .map_err(|e| e.to_string());
+        (res, String::from_utf8_lossy(&log).into_owned())
+    });
+    let st = wait_for(15, "a health record", || {
+        let st = status(&s.spool)?;
+        (st["self_health"]["health_records"].as_u64()? >= 1).then_some(st)
+    });
+    let log = finish(stop, h);
+    let clock = &st["self_health"]["clock"];
+    assert_eq!(clock["adjtimex_errno"], 1, "{st}");
+    assert!(clock.get("max_error_ms").is_none(), "{clock}");
+    // Without a fresh timesyncd marker nothing is claimed.
+    if clock.get("timesync_age_ms").is_none() {
+        assert!(clock.get("synchronized").is_none(), "{clock}");
+    }
+    let found = spooled(&s.spool);
+    let rec = found
+        .iter()
+        .find_map(|(_, e)| e.entity_context.agent_health.as_ref())
+        .unwrap_or_else(|| panic!("no health record\n{log}"));
+    assert_eq!(rec.clock.adjtimex_errno, Some(1));
+    // A refused probe never raises clock_unsynced (grace 0 here).
+    assert!(!rules(&found)
+        .iter()
+        .any(|r| r == "robot.agent.clock_unsynced"));
+}
+
 /// The record can be switched off (replay, tests); the early warnings stay.
 #[test]
 fn t5_health_record_off_emits_none() {
@@ -122,19 +244,24 @@ fn t5_health_record_off_emits_none() {
 }
 
 /// T40 fault injection: the spool on a small tmpfs that is nearly full is
-/// a High `robot.agent.disk_low` before anything is dropped. Needs root
-/// (mount); skipped otherwise.
+/// a High `robot.agent.disk_low` before anything is dropped. Mounting needs
+/// root: as root the test mounts directly, otherwise through passwordless
+/// `sudo -n` (CI runners), owned by the test's own user; it is skipped
+/// (with a message) only where neither works.
 #[test]
 fn t40_a_nearly_full_spool_filesystem_is_reported_before_it_fills() {
-    if !is_root() {
-        eprintln!("skipped: needs root to mount a tmpfs");
+    let Some(as_root) = privileged() else {
+        eprintln!("skipped: needs root or passwordless sudo to mount a tmpfs");
         return;
-    }
+    };
     let s = setup("disk-low", &robot_profile(true));
     let mnt = s.dir.join("small-spool");
     std::fs::create_dir_all(&mnt).unwrap();
-    let ok = std::process::Command::new("mount")
-        .args(["-t", "tmpfs", "-o", "size=4m,mode=0700", "tmpfs"])
+    let (uid, gid) = ids();
+    let ok = as_root("mount")
+        .args(["-t", "tmpfs", "-o"])
+        .arg(format!("size=4m,mode=0700,uid={uid},gid={gid}"))
+        .arg("tmpfs")
         .arg(&mnt)
         .status()
         .is_ok_and(|s| s.success());
@@ -142,13 +269,13 @@ fn t40_a_nearly_full_spool_filesystem_is_reported_before_it_fills() {
         eprintln!("skipped: mount -t tmpfs failed");
         return;
     }
-    struct Umount(std::path::PathBuf);
+    struct Umount(std::path::PathBuf, fn(&str) -> std::process::Command);
     impl Drop for Umount {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("umount").arg(&self.0).status();
+            let _ = (self.1)("umount").arg(&self.0).status();
         }
     }
-    let _guard = Umount(mnt.clone());
+    let _guard = Umount(mnt.clone(), as_root);
     // Leave about 2 % free (High below 3 %).
     std::fs::write(mnt.join("ballast"), vec![0u8; 4 * 1024 * 1024 - 80 * 1024]).unwrap();
     let spool = mnt.join("spool");
@@ -198,13 +325,33 @@ fn t40_a_nearly_full_spool_filesystem_is_reported_before_it_fills() {
     assert!(d["free_bytes"].as_u64().unwrap() * 100 < 3 * d["total_bytes"].as_u64().unwrap());
 }
 
-fn is_root() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .map(|l| l.split_whitespace().nth(1) == Some("0"))
-        })
-        .unwrap_or(false)
+/// The test's real uid and gid.
+fn ids() -> (u32, u32) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u32::MAX)
+    };
+    (field("Uid:"), field("Gid:"))
+}
+
+/// How to run a command as root: directly, or through `sudo -n`.
+fn privileged() -> Option<fn(&str) -> std::process::Command> {
+    fn direct(c: &str) -> std::process::Command {
+        std::process::Command::new(c)
+    }
+    fn sudo(c: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.args(["-n", c]);
+        cmd
+    }
+    if ids().0 == 0 {
+        return Some(direct as fn(&str) -> std::process::Command);
+    }
+    let ok = sudo("true").status().is_ok_and(|s| s.success());
+    ok.then_some(sudo as fn(&str) -> std::process::Command)
 }

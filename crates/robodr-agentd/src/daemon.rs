@@ -2604,8 +2604,10 @@ impl<'a> Daemon<'a> {
     /// Probe credentials, clock, disks and reachability, refresh
     /// [`SelfView`] and report what got worse ([`crate::selfcheck`]).
     fn early_warnings(&mut self) {
-        use crate::selfcheck::{credential, fs_space, kernel_clock};
-        use robodr_ocsf::{ClockHealth, DiskHealth, ReachState, Reachability};
+        use crate::selfcheck::{
+            clock_health, credential, file_age_ms, fs_space, kernel_clock, TIMESYNC_MARKER,
+        };
+        use robodr_ocsf::{DiskHealth, ReachState, Reachability};
         let now_ms = self.now_ms();
         let wall_ms = self.clock.now().wall_ns / 1_000_000;
         // Credentials: the control plane's own certificate and its CRLs.
@@ -2626,14 +2628,16 @@ impl<'a> Daemon<'a> {
                 }
             }
         }
-        // Clock.
+        // Clock: adjtimex(2), refused under the shipped unit's seccomp
+        // filter (the record then says so), else timesyncd's marker.
         let kernel = kernel_clock();
         let wall_jumps = self.agent.stats().wall_clock_jumps;
-        let clock = ClockHealth {
-            synchronized: kernel.map(|k| k.synchronized),
-            max_error_ms: kernel.map(|k| k.max_error_us / 1000),
+        let clock = clock_health(
+            kernel,
+            file_age_ms(std::path::Path::new(TIMESYNC_MARKER), wall_ms),
             wall_jumps,
-        };
+        );
+        let kernel = kernel.ok();
         // Disks.
         let mut dirs: Vec<(&str, &std::path::Path)> = vec![
             ("blackbox", self.r.config.blackbox.dir.as_path()),
