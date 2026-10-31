@@ -593,6 +593,8 @@ struct Daemon<'a> {
     /// Health records emitted, and when the last one was (daemon ms).
     health_records: u64,
     health_record_at_ms: u64,
+    /// When the last self-test request was taken (daemon ms).
+    selftest_at_ms: Option<u64>,
     /// The packet timeline of a pcap replay (`None` for a live capture:
     /// handling time is the observation time there).
     replay: Option<ReplayTimeline>,
@@ -1354,6 +1356,7 @@ impl<'a> Daemon<'a> {
             self_view: SelfView::default(),
             health_records: 0,
             health_record_at_ms: 0,
+            selftest_at_ms: None,
             replay: r
                 .sensor
                 .capture
@@ -2030,23 +2033,36 @@ impl<'a> Daemon<'a> {
     }
 
     fn emit(&mut self, o: Outcome) {
+        let _ = self.emit_spooled(o);
+    }
+
+    /// [`Self::emit`], returning the spooled record's path or why the
+    /// finding was not spooled.
+    fn emit_spooled(&mut self, o: Outcome) -> Result<std::path::PathBuf, String> {
         self.stats.outcomes += 1;
         // Critical findings have a share of the spool lesser ones cannot
         // fill (red team F1, `spool` module docs); health findings their
-        // own reserve.
-        let class = if o.detector == Detector::SelfHealth {
+        // own reserve. The self-test takes the ordinary share: it must
+        // meet what a real finding below Critical would meet.
+        let class = if o.deviation.rule_str() == crate::selftest::RULE {
+            SpoolClass::Normal
+        } else if o.detector == Detector::SelfHealth {
             SpoolClass::Health
         } else if o.deviation.severity >= robodr_events::Severity::Critical {
             SpoolClass::Critical
         } else {
             SpoolClass::Normal
         };
-        match &o.finding {
+        let spooled = match &o.finding {
             Some(f) => match self.spool.write_from(f, class, &o.source) {
-                Ok(_) => self.stats.findings_spooled += 1,
-                Err(SpoolError::Full) => {}
+                Ok(p) => {
+                    self.stats.findings_spooled += 1;
+                    Ok(p)
+                }
+                Err(SpoolError::Full) => Err(SpoolError::Full.to_string()),
                 Err(e) => {
                     let _ = writeln!(self.log, "robodr-agentd: {e}");
+                    Err(e.to_string())
                 }
             },
             None => {
@@ -2057,8 +2073,12 @@ impl<'a> Daemon<'a> {
                     sanitize(o.deviation.rule_str()),
                     sanitize(&o.finding_errors.join("; "))
                 );
+                Err(format!(
+                    "finding not built: {}",
+                    o.finding_errors.join("; ")
+                ))
             }
-        }
+        };
         if !o.evidence.errors.is_empty() {
             let _ = writeln!(
                 self.log,
@@ -2068,6 +2088,7 @@ impl<'a> Daemon<'a> {
             );
         }
         self.correlate(&o);
+        spooled
     }
 
     /// A forwarder heartbeat: liveness (already counted by the input) and
@@ -2249,6 +2270,7 @@ impl<'a> Daemon<'a> {
             || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
             || rule == health_rules::CORRELATION_PRESSURE
             || rule == crate::selfcheck::rules::HEALTH
+            || rule == crate::selftest::RULE
             || crate::host::is_host_rule(rule)
         {
             return;
@@ -2884,6 +2906,79 @@ impl<'a> Daemon<'a> {
         self.emit(o);
     }
 
+    /// Field acceptance self-test ([`crate::selftest`]): take a pending
+    /// request from the spool, spool the Low, observe-only
+    /// `robot.agent.selftest` finding with its nonce, and answer with the
+    /// record's name (or why it was not spooled). At most one request per
+    /// [`crate::selftest::MIN_INTERVAL_MS`].
+    fn selftest(&mut self) {
+        let now_ms = self.now_ms();
+        if self
+            .selftest_at_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) < crate::selftest::MIN_INTERVAL_MS)
+        {
+            return;
+        }
+        let nonce = match crate::selftest::take_request(self.spool.root()) {
+            None => return,
+            Some(Ok(n)) => n,
+            Some(Err(e)) => {
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: self-test request ignored: {}",
+                    sanitize(&e)
+                );
+                return;
+            }
+        };
+        self.selftest_at_ms = Some(now_ms);
+        let _ = writeln!(self.log, "robodr-agentd: self-test {nonce} requested");
+        let dev = robodr_events::Deviation::new(
+            crate::selftest::RULE,
+            robodr_events::Severity::Low,
+            crate::selftest::detail(&nonce),
+        );
+        let subject = Subject {
+            node: Some("robodr-agentd".into()),
+            ..Subject::default()
+        };
+        let safety = self.safety();
+        let now = self.clock.now();
+        let o = self.agent.handle_external(
+            now,
+            Detector::SelfHealth,
+            "agentd:selftest",
+            subject,
+            dev,
+            safety,
+        );
+        let spooled = self.emit_spooled(o);
+        let answer = crate::selftest::Answer {
+            nonce,
+            record: spooled
+                .as_ref()
+                .ok()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string),
+            error: spooled.err(),
+        };
+        let res = serde_json::to_vec(&answer)
+            .map_err(|e| e.to_string())
+            .and_then(|b| {
+                self.spool
+                    .write_side_file(crate::selftest::ANSWER_FILE, &b)
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = res {
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: self-test answer not written: {}",
+                sanitize(&e)
+            );
+        }
+    }
+
     fn snapshots(&self) -> Vec<InputSnapshot> {
         self.inputs
             .iter()
@@ -3001,6 +3096,7 @@ impl<'a> Daemon<'a> {
         self.control_findings();
         self.early_warnings();
         self.health_record();
+        self.selftest();
         self.evidence_incidents();
         self.retention_tick();
         self.mark_head();
