@@ -1,29 +1,47 @@
 #!/bin/sh
 # robodr-image-early: every boot, before networking
-# (robodr-image-early.service). Never fails the boot.
+# (robodr-image-early.service).
 #
-#  1. First boot: writes /etc/robodr/provision.env (the writable overlay,
+#  1. Host firewall, first: installs the strict default ruleset as
+#     /etc/robodr/nftables.conf (/etc/nftables.conf points there) when there
+#     is none: only loopback and replies, nothing on the capture NIC.
+#  2. First boot: writes /etc/robodr/provision.env (the writable overlay,
 #     robodr-etc-overlay.service) from the kernel command line
 #     (robodr.unit_id= robodr.capture_if= robodr.uplink_if= robodr.site=
 #     robodr.ntp= robodr.role= robodr.exporter=), each value validated; an
-#     existing file is never changed.
-#  2. Host firewall: installs the strict default ruleset as
-#     /etc/robodr/nftables.conf (/etc/nftables.conf points there) when there
-#     is none: only loopback and replies, nothing on the capture NIC.
+#     existing file is never changed. robodr.ntp= must be an IP address:
+#     the strict default firewall lets no DNS out.
 #  3. Runtime network and time configuration under /run (the root file
 #     system is read-only): the capture NIC silent and promiscuous
 #     (networkd example, Name= from provisioning), the uplink by DHCP unless
 #     the site put its own *.network files in /etc/robodr/network/, NTP.
+#
+# Missing or invalid provisioning is logged, not an error. The script exits
+# non-zero (the unit fails, robodr-image-late does not run) only when it
+# cannot write what it must, e.g. /etc/robodr not writable because the
+# overlay is missing. The host firewall does not depend on it: the
+# nftables.service drop-in (robodr-nft-load) loads the shipped strict
+# default whenever /etc/robodr/nftables.conf is missing or does not load.
 set -eu
 . "${ROBODR_IMAGE_ROOT:-}/usr/lib/robodr-image/common.sh"
 
+# 1. Host firewall: strict default until the site installs its own. Before
+# anything else, so that a later failure cannot leave the box without it.
+if [ ! -e "$R/etc/robodr/nftables.conf" ]; then
+    install -m 0640 "$R/usr/lib/robodr-image/nftables.default.conf" "$R/etc/robodr/nftables.conf"
+    log "installed the strict default host firewall (/etc/robodr/nftables.conf)"
+fi
+
 install -d -m 0700 "$STATE"
 
-# 1. Provisioning from the kernel command line, first boot only.
+# 2. Provisioning from the kernel command line, first boot only.
 if [ ! -f "$PROVISION" ]; then
     tmp="$PROVISION.tmp"
     : >"$tmp"
     chmod 0640 "$tmp"
+    # Split on white space only: no pathname expansion of what the boot
+    # loader passed.
+    set -f
     for arg in $(cat "$R/proc/cmdline" 2>/dev/null || true); do
         key=""
         case "$arg" in
@@ -39,10 +57,13 @@ if [ ! -f "$PROVISION" ]; then
         val="${arg#*=}"
         if valid "$kind" "$val"; then
             echo "$key=$val" >>"$tmp"
+        elif [ "$kind" = ntp ]; then
+            log "ignoring robodr.ntp: not an IP address (the strict default firewall lets no DNS out, so a host name never resolves)"
         else
             log "ignoring invalid ${arg%%=*} on the kernel command line"
         fi
     done
+    set +f
     if [ -s "$tmp" ]; then
         mv "$tmp" "$PROVISION"
         log "provisioning written to /etc/robodr/provision.env from the kernel command line"
@@ -50,12 +71,6 @@ if [ ! -f "$PROVISION" ]; then
         rm -f "$tmp"
         log "not provisioned: no /etc/robodr/provision.env and no robodr.* kernel parameters (README.md, Provisioning)"
     fi
-fi
-
-# 2. Host firewall: strict default until the site installs its own.
-if [ ! -e "$R/etc/robodr/nftables.conf" ]; then
-    install -m 0640 "$R/usr/lib/robodr-image/nftables.default.conf" "$R/etc/robodr/nftables.conf"
-    log "installed the strict default host firewall (/etc/robodr/nftables.conf)"
 fi
 
 # 3. Runtime network and time configuration.
@@ -86,5 +101,7 @@ if [ -n "$ntp" ] && valid ntp "$ntp"; then
     install -d -m 0755 "$R/run/systemd/timesyncd.conf.d"
     printf '[Time]\nNTP=%s\n' "$ntp" >"$R/run/systemd/timesyncd.conf.d/50-robodr.conf"
     chmod 0644 "$R/run/systemd/timesyncd.conf.d/50-robodr.conf"
+elif [ -n "$ntp" ]; then
+    log "ROBODR_NTP in provision.env is not an IP address; NTP not configured (the strict default firewall lets no DNS out)"
 fi
 exit 0

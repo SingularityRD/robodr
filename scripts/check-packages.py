@@ -62,8 +62,10 @@ Static checks (no package needed; CI job `scripts`):
      the bundle's minisign signature before it extracts anything and then
      its SHA256SUMS, has no unsigned switch, the post-install script checks
      the package digest and refuses an image with keys, the first-boot
-     script generates the keys with robodr-setup init, and no file of the
-     recipe holds key material.
+     script generates the keys with robodr-setup init, nftables.service
+     loads the host firewall through robodr-nft-load (which falls back to
+     the shipped strict default), and no file of the recipe holds key
+     material.
 
   5a. Every unit (regular and focal) and every unit with each of its
      drop-in examples applied: with SecureBits=noroot / noroot-locked, a
@@ -509,6 +511,12 @@ def check_image_recipe_texts(files: dict[str, bytes]) -> list[str]:
     late = t.get("mkosi.extra/usr/lib/robodr-image/robodr-image-late", "")
     if 'robodr-setup "$@"' not in late or "set -- init" not in late:
         errs.append(f"{where}/robodr-image-late: first boot must generate the keys with robodr-setup init")
+    drop = t.get("mkosi.extra/usr/lib/systemd/system/nftables.service.d/50-robodr-image.conf", "")
+    load = t.get("mkosi.extra/usr/lib/robodr-image/robodr-nft-load", "")
+    if unit_values(drop, "ExecStart") != ["/usr/lib/robodr-image/robodr-nft-load"] or \
+            "nftables.default.conf" not in load:
+        errs.append(f"{where}: nftables.service must load the firewall through robodr-nft-load, "
+                    "which falls back to the strict default (no box without a host firewall)")
     for name, body in sorted(files.items()):
         if name.endswith((".key", ".pem")):
             errs.append(f"{where}/{name}: key file in the image recipe")
@@ -1142,6 +1150,8 @@ def self_test() -> int:
     expect("extract before verify", check_image_recipe_texts({**real_img, "build-image.sh": moved.encode()}), False)
     bypass = bi + "\n[ -n \"${ROBODR_ALLOW_UNSIGNED:-}\" ] && exit 0\n"
     expect("unsigned switch", check_image_recipe_texts({**real_img, "build-image.sh": bypass.encode()}), False)
+    no_drop = {k: v for k, v in real_img.items() if "nftables.service.d" not in k}
+    expect("no firewall fallback", check_image_recipe_texts(no_drop), False)
     expect("key in recipe", check_image_recipe_texts({**real_img, "mkosi.extra/etc/robodr/keys/a.key": b"x"}), False)
     # 10. The release workflow.
     rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
@@ -1152,7 +1162,7 @@ def self_test() -> int:
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
     expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 66
+    total = 67
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

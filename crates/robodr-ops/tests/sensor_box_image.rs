@@ -66,6 +66,12 @@ impl BoxRoot {
         );
         stub(&stubs, "systemctl", &format!("echo \"systemctl $*\" >>{l}"));
         stub(&stubs, "findmnt", "echo /dev/vda3");
+        // nft refuses a ruleset that contains BROKEN.
+        stub(
+            &stubs,
+            "nft",
+            &format!("echo \"nft $*\" >>{l}\n! grep -q BROKEN \"$2\""),
+        );
         BoxRoot { t, stubs, log }
     }
 
@@ -162,6 +168,94 @@ fn early_provisions_from_the_command_line_and_renders_runtime_config() {
     assert!(b
         .read("/run/systemd/network/50-site-uplink.network")
         .contains("10.0.0.5"));
+}
+
+/// robodr.ntp must be an IP address: the strict default firewall lets no
+/// DNS out, so a host name would never resolve.
+#[test]
+fn early_accepts_only_an_ip_address_for_ntp() {
+    let b = BoxRoot::new(
+        "img-ntp-name",
+        "robodr.unit_id=sb-07 robodr.ntp=pool.ntp.example\n",
+        0,
+    );
+    let o = b.run("robodr-image-early");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!b.read("/etc/robodr/provision.env").contains("NTP"));
+    assert!(err(&o).contains("not an IP address"), "{}", err(&o));
+    assert!(!b
+        .t
+        .path("/run/systemd/timesyncd.conf.d/50-robodr.conf")
+        .exists());
+    // From provision.env too.
+    b.t.put("/etc/robodr/provision.env", "ROBODR_NTP=ntp.site.example\n");
+    let o = b.run("robodr-image-early");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("not an IP address"), "{}", err(&o));
+    // IPv6 is an address.
+    let b = BoxRoot::new("img-ntp-v6", "robodr.ntp=2001:db8::123\n", 0);
+    assert!(b.run("robodr-image-early").status.success());
+    assert!(b
+        .read("/run/systemd/timesyncd.conf.d/50-robodr.conf")
+        .contains("NTP=2001:db8::123"));
+}
+
+/// The firewall goes in before anything else can fail; and whatever
+/// happens to robodr-image-early, nftables.service (robodr-nft-load) loads
+/// a ruleset: the site's, or the strict default (fail closed).
+#[test]
+fn the_host_firewall_never_depends_on_early_succeeding() {
+    let b = BoxRoot::new("img-fw-first", "robodr.unit_id=sb-07\n", 0);
+    // Provisioning cannot be written (here: its temporary name is taken).
+    std::fs::create_dir_all(b.t.path("/etc/robodr/provision.env.tmp")).unwrap();
+    let o = b.run("robodr-image-early");
+    assert!(!o.status.success());
+    assert!(
+        b.read("/etc/robodr/nftables.conf").contains("policy drop"),
+        "firewall not installed before the failure: {}",
+        err(&o)
+    );
+
+    let unit = std::fs::read_to_string(
+        recipe().join("mkosi.extra/usr/lib/systemd/system/nftables.service.d/50-robodr-image.conf"),
+    )
+    .unwrap();
+    assert!(unit.contains("ExecStart=\nExecStart=/usr/lib/robodr-image/robodr-nft-load"));
+    assert!(unit.contains("After=robodr-image-early.service"));
+
+    // The site's ruleset loads: only it.
+    let b = BoxRoot::new("img-nft-site", "\n", 0);
+    b.t.put("/etc/robodr/nftables.conf", "site rules\n");
+    let o = b.run("robodr-nft-load");
+    assert!(o.status.success(), "{}", err(&o));
+    let root = b.t.0.display().to_string();
+    assert_eq!(
+        b.calls(),
+        format!("nft -f {root}/etc/robodr/nftables.conf\n")
+    );
+    // Refused by nft: the default instead, and the unit fails visibly.
+    b.t.put("/etc/robodr/nftables.conf", "BROKEN\n");
+    std::fs::remove_file(&b.log).unwrap();
+    let o = b.run("robodr-nft-load");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        b.calls().ends_with(&format!(
+            "nft -f {root}/usr/lib/robodr-image/nftables.default.conf\n"
+        )),
+        "{}",
+        b.calls()
+    );
+    assert!(err(&o).contains("did not load"), "{}", err(&o));
+    // Missing (overlay or early failed): the default.
+    std::fs::remove_file(b.t.path("/etc/robodr/nftables.conf")).unwrap();
+    std::fs::remove_file(&b.log).unwrap();
+    let o = b.run("robodr-nft-load");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        b.calls(),
+        format!("nft -f {root}/usr/lib/robodr-image/nftables.default.conf\n")
+    );
+    assert!(err(&o).contains("missing"), "{}", err(&o));
 }
 
 #[test]

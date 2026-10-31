@@ -37,7 +37,7 @@ installing it. There is no switch to build from an unsigned bundle.
 | Partitions | ESP (systemd-boot), **root read-only** (GPT read-only flag and `ro`), `/var` writable (label `var`, `nodev,nosuid`, grown to the disk at first boot), `/tmp` tmpfs |
 | Packages | kernel, systemd (networkd, timesyncd), nftables, iproute2, minisign, tpm2-tools, tcpdump, `robodr`; no SSH server, no compiler, no desktop |
 | RoboDR | `robodr-agentd` with the sensor-box drop-in (`CAP_NET_RAW` only, no IP) active; all RoboDR units **disabled** (see "Boot") |
-| Host | no forwarding, no IPv6 autoconfiguration (sysctl), `/etc/nftables.conf` -> `/etc/robodr/nftables.conf` |
+| Host | no forwarding, no IPv6 autoconfiguration (sysctl), `/etc/nftables.conf` -> `/etc/robodr/nftables.conf`; `nftables.service` loads it through `robodr-nft-load` (drop-in), which falls back to the shipped strict default |
 | Not in the image | keys, machine id, SSH host keys, random seed, site configuration (the post-install script fails the build if `/etc/robodr/keys` is not empty) |
 
 ## Provisioning
@@ -57,19 +57,32 @@ or as `/etc/robodr/provision.env` (`KEY=VALUE` lines: `ROBODR_UNIT_ID`,
 `ROBODR_EXPORTER` = `none` | `uplink` | `kafka-publish` | `spool-export`).
 Every value is validated; the file is parsed, never sourced.
 
+`robodr.ntp` / `ROBODR_NTP` must be an **IP address** (IPv4 or IPv6), not
+a host name: the strict default firewall lets no DNS out, so a name would
+never resolve and the clock would never be set. A host name is ignored
+with a message in the journal. The root is read-only, so there is no other
+place for an NTP setting on the box.
+
 ## Boot
 
 1. `robodr-etc-overlay.service`: `/etc/robodr` becomes writable as an
    overlay whose upper layer is on `/var`
    (`/var/lib/robodr-image/etc-robodr/upper`). Everything the box writes
    (provisioning, configuration, keys, profile, firewall) persists there.
-2. `robodr-image-early.service` (before networking): the provisioning file
-   from the kernel command line at first boot; the **strict default
-   firewall** (loopback, DHCP and NTP only; the box records but delivers
-   nothing until the site installs its own `/etc/robodr/nftables.conf`
-   from the example); the capture NIC's networkd file under `/run` (silent,
-   promiscuous, `Name=` from provisioning); the uplink by DHCP, or the
-   site's own `/etc/robodr/network/*.network`; NTP.
+2. `robodr-image-early.service` (before networking): first the **strict
+   default firewall** (loopback, DHCP and NTP only; the box records but
+   delivers nothing until the site installs its own
+   `/etc/robodr/nftables.conf` from the example); then the provisioning
+   file from the kernel command line at first boot; the capture NIC's
+   networkd file under `/run` (silent, promiscuous, `Name=` from
+   provisioning); the uplink by DHCP, or the site's own
+   `/etc/robodr/network/*.network`; NTP. It fails (and
+   `robodr-image-late` does not run) only when it cannot write, e.g. when
+   the `/etc/robodr` overlay is missing.
+   `nftables.service` runs after it and loads `/etc/robodr/nftables.conf`
+   through `robodr-nft-load`; when that file is missing or `nft` refuses
+   it, the shipped strict default is loaded instead and the unit fails
+   visibly: the box never comes up without a host firewall.
 3. `robodr-image-late.service`: at **first boot**, `robodr-setup init`
    (host preflight, then the black-box key bound to the unit id, then
    `agentd.json` for the role). A failed preflight check stops it with

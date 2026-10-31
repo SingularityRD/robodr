@@ -27,7 +27,10 @@ valid() {
     iface)
         printf '%s' "$2" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._@-]{0,14}$' ;;
     ntp)
-        printf '%s' "$2" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$' ;;
+        # An IP address only (v4 dotted quad, or v6 hex and colons): the
+        # strict default firewall lets no DNS out, so a host name would
+        # never resolve and the clock would never be set.
+        printf '%s' "$2" | grep -Eq '^(([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7})$' ;;
     role)
         case "$2" in robot | unitree-sensor-box) return 0 ;; *) return 1 ;; esac ;;
     exporter)
