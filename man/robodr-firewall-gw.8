@@ -1,0 +1,253 @@
+.\" robodr-firewall-gw(8). Source of truth: the USAGE text in
+.\" crates/robodr-firewall-gw/src/bin/robodr-firewall-gw.rs, the crate README
+.\" (crates/robodr-firewall-gw/README.md), the units in packaging/systemd/
+.\" and docs/OPERATIONS.md section 6.6. Keep them in sync.
+.TH ROBODR\-FIREWALL\-GW 8 "2026-10-31" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.SH NAME
+robodr\-firewall\-gw \- RoboDR in\-path Motion Firewall gateway: decide every motion datagram that crosses a bridge (NFQUEUE)
+.SH SYNOPSIS
+.B robodr\-firewall\-gw run \-\-config
+.I FILE
+.br
+.B robodr\-firewall\-gw check\-config \-\-config
+.I FILE
+.br
+.B robodr\-firewall\-gw ruleset \-\-config
+.I FILE
+.br
+.B robodr\-firewall\-gw webrtc\-block \-\-peer
+.I IPV4
+.RB [ \-\-flow
+.IR PEER_PORT , ROBOT_IP , ROBOT_PORT ]
+.RB [ \-\-timeout\-s
+.IR 1..86400 ]
+.br
+.B robodr\-firewall\-gw
+.RB ( \-h | \-\-help | \-V | \-\-version )
+.SH DESCRIPTION
+.B robodr\-firewall\-gw
+runs on a sensor box that bridges the robot controller's network port and
+the robot's. A netfilter ruleset (rendered by the
+.B ruleset
+command) hands every UDP datagram entering from the controller side on the
+DDS port ranges and the configured legacy ports to an NFQUEUE. For each one
+the gateway decodes the motion command (Unitree SDK2 RTPS
+.BR LowCmd_ ,
+sport / loco / arm requests, arm SDK, hands, ROS 2
+.B /cmd_vel
+and joint trajectories, Go1 legacy UDP), asks the Motion Firewall
+(robodr\-firewall) for a verdict against the locked profile's envelope and
+the firewall configuration, and accepts the datagram unchanged, rewrites it
+in place (a limited value, a hold of the last accepted frame, a removed
+sample) or drops it. It never originates traffic and opens no IP socket.
+.PP
+It is
+.B not a safety\-rated device.
+It is a cyber\-security control in front of the robot's own safety
+functions (e\-stop, safety controller, motor drivers' protections), which
+remain primary. It can only pass, reduce, hold or remove commands that
+cross the bridge.
+.PP
+While the gateway is not running the kernel applies the ruleset's
+.BR queue.on_gateway_down :
+.B fail_closed
+(default) drops the queued motion datagrams;
+.B bypass
+lets them pass unchecked (refused for humanoid joint channels).
+.SH COMMANDS
+.TP
+.B run
+Load and check the configuration, the profile (with its trust checks) and
+the firewall configuration, bind the NFQUEUE and decide until
+.B SIGTERM
+or
+.BR SIGINT .
+Notifies systemd
+.RB ( READY=1 ,
+.B WATCHDOG=1
+every
+.BR housekeeping_ms ,
+.BR STOPPING=1 ).
+Needs
+.B CAP_NET_ADMIN
+only.
+.TP
+.B check\-config
+Everything
+.B run
+checks before binding the queue, without touching the network:
+configuration, profile and its trust checks, in
+.B enforce
+mode the firewall file's signature, firewall compile, channel / codec /
+slot count / profile
+.B motion_types
+agreement, the humanoid / bypass rule. Prints a one\-line summary.
+.TP
+.B ruleset
+Print the idempotent POSIX
+.BR sh (1)
+setup script for this configuration: bridge netfilter sysctls; an nft
+.B bridge
+table that bridges only IPv4 and ARP from the controller port (and
+single\-tagged IPv4 / ARP of the VLANs in
+.BR queue.vlan_ids );
+untracked traffic with IPv4 defragmentation before the queue; the
+.B ROBODR_GW
+chain that drops fragments and queues the DDS and legacy ports; the
+.B ROBODR_GW_OBS
+chain that copies the robot side's UDP to NFLOG; the WebRTC section when
+configured.
+.B robodr\-firewall\-gw\-rules.service
+runs it at boot. The rules are meant to stay when the gateway stops.
+.TP
+.B webrtc\-block
+Print the
+.BR nft (8)
+command that adds a Go2 WebRTC peer (or one flow of it) to the
+.B blocked_peers
+.RB ( blocked_flows )
+set of the ruleset's
+.B bridge robodr_gw_rtc
+table for
+.B \-\-timeout\-s
+seconds (default 600). Run the printed command as root.
+.SH CONFIGURATION
+A JSON file (unknown keys refused), by default
+.IR /etc/robodr/firewall\-gw.json ;
+examples in
+.IR /usr/share/doc/robodr/examples/ .
+The main keys:
+.TP
+.B mode
+.B enforce
+(requires a locked, trusted profile and a signed firewall file) or
+.B observe
+(decide and record what enforcement would have done; forward everything
+unchanged).
+.TP
+.BR profile ", " profile_trust
+The locked model profile and its trust settings (as agentd's
+.B sensor.profile_trust ;
+the anti\-rollback state is read, never written).
+.TP
+.B firewall
+The Motion Firewall configuration (channels, joint channels, platform). In
+.B enforce
+mode
+.IB firewall .sig
+must exist: a signature by the key that signed the profile, over the
+profile's digest and the file's bytes, written by
+.BR "robodr\-commission sign\-firewall" .
+An unsigned, edited, or re\-paired file refuses the start (exit 2).
+.TP
+.B queue
+.BR num ,
+.BR max_len ,
+.BR on_gateway_down ,
+.BR controller_port ,
+.BR robot_port ,
+.BR vlan_ids .
+.TP
+.B rtps
+Domain ids, extra port ranges, the malformed\-datagram and unknown\-writer
+policies, the writer tables and the persisted writer
+.BR state_file .
+.TP
+.B channels
+One entry per enforced channel: the firewall channel, the codec, source
+allowlists (IP, MAC), and the codec's own keys
+.RB ( allowed_api_ids
+is required for the sport,
+.B obstacles_avoid
+and
+.B uwbswitch
+request codecs,
+.B allowed_high_modes
+for
+.BR go1_high_cmd ).
+.TP
+.BR max_queue_delay_ns ", " overload_interval_ms ", " overload_high_late
+A datagram read later than
+.B max_queue_delay_ns
+(default 5 ms) gets the firewall's fault verdict; such late datagrams are
+reported as one
+.B robot.gateway.overload
+finding per interval at most.
+.TP
+.BR events_path ", " status_path ", " findings_socket ", " restriction_path
+The deviations file, the status / counters file, agentd's
+.B gateway_feed
+socket, and the
+.B restrict_motion
+restriction file written by
+.BR robodr\-executor (8).
+.PP
+The complete reference is the crate README, section "Configuration".
+.SH FINDINGS AND RECORDS
+With
+.BR findings_socket ,
+the gateway's own findings
+.RB ( robot.gateway.* ,
+aggregated per housekeeping period), the Motion Firewall's deviations
+.RB ( robot.firewall.* )
+and decision summaries
+.RB ( robodr\-gateway\-summary/v1 :
+mode, fail behaviour, the digests of the configuration, firewall and
+profile files, decision counters; at start, every 60 s and at a clean
+stop) go to
+.BR robodr\-agentd (8),
+which turns the findings into findings of its pipeline and appends the
+summaries to its signed black box. The feed is written from its own
+thread; the decision path never waits for it.
+.SH FILES
+.TP
+.I /etc/robodr/firewall\-gw.json
+Configuration.
+.TP
+.I /var/lib/robodr/firewall\-gw/
+State directory of the unit (status file, events file, writer state file).
+.TP
+.I /usr/lib/systemd/system/robodr\-firewall\-gw.service
+The gateway
+.RB ( Type=notify ,
+user
+.BR robodr\-gw ,
+.B CAP_NET_ADMIN
+only, FIFO priority 40, watchdog 2 s).
+.TP
+.I /usr/lib/systemd/system/robodr\-firewall\-gw\-rules.service
+Oneshot that renders and applies the ruleset at boot, before
+.BR network\-pre.target .
+.SH SIGNALS
+.B SIGTERM
+and
+.B SIGINT
+stop the gateway cleanly (final housekeeping, stop summary). There is no
+reload signal: a changed configuration, profile or firewall file takes
+effect at the next start, and a changed queue, port or VLAN setting needs
+the ruleset re\-applied
+.RB ( "systemctl restart robodr\-firewall\-gw\-rules robodr\-firewall\-gw" ).
+.SH EXIT STATUS
+.TP
+.B 0
+Clean stop, or the command succeeded.
+.TP
+.B 1
+Runtime failure (NFQUEUE, signals).
+.TP
+.B 2
+Usage or configuration error, including a profile that fails its trust
+checks or an unsigned firewall file in
+.B enforce
+mode (the unit does not restart on it).
+.SH SEE ALSO
+.BR robodr\-agentd (8),
+.BR robodr\-executor (8),
+.BR robodr\-commission (1),
+.BR nft (8),
+.BR iptables (8),
+.BR systemd.service (5)
+.PP
+.I /usr/share/doc/robodr/OPERATIONS.md
+(section 6.6),
+.I /usr/share/doc/robodr/UNITREE.md

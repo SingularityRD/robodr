@@ -549,6 +549,7 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "./usr/share/man/man8/robodr-support-bundle.8.gz",
         "./usr/share/man/man1/robodr-metrics.1.gz",
         "./usr/share/man/man8/robodr-executor.8.gz",
+        "./usr/share/man/man8/robodr-firewall-gw.8.gz",
         "./usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
         "./usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
         // Customer documentation and demo data (T49).
