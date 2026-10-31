@@ -27,8 +27,13 @@
 //!   unchanged (the SOC answers with its stored answer, §5.6) and the
 //!   decommission completes.
 //! * **Crash safety**: the request is stored before it is sent; the answer
-//!   is stored before any key is shredded; every completion step is
-//!   idempotent, so re-running the command after a crash finishes it.
+//!   is stored before any key is shredded; re-running the command after a
+//!   crash finishes it. The journal notes are not exactly-once: a crash
+//!   between storing the request and its `prepared` note leaves the
+//!   journal without that note (the re-run returns the stored request;
+//!   the final `decommissioned` note still carries the request digest),
+//!   and a crash right after the final note is sealed writes that note a
+//!   second time on the re-run.
 //! * **What is destroyed here, and what is not**: the uplink and finding
 //!   secret keys (retired at the SOC: they authenticate nothing any more)
 //!   are shredded. The black-box key is **kept**: it signs the final journal
@@ -129,7 +134,9 @@ fn check_reason(reason: &str) -> Result<(), String> {
 
 /// Build (or return the unfinished) decommission request. Refused while
 /// an enrollment or a key rotation is unfinished, and when the key files
-/// do not hold the keys the SOC has registered.
+/// do not hold the keys the SOC has registered. The `prepared` journal note
+/// is written after the request is stored, only by the call that builds
+/// it (see "Crash safety" in the module docs).
 pub fn prepare(ctx: &Ctx, reason: &str) -> Result<Decommission, String> {
     check_reason(reason)?;
     if let Some(d) = current(ctx)? {
@@ -331,8 +338,10 @@ pub fn complete(ctx: &Ctx) -> Result<Decommission, String> {
         .map_err(|e| format!("stored answer: {e}"))?
         .payload_digest();
     // The journal note comes first: it is signed by the black-box key and
-    // names the receipt; it is written once (the note carries the answer
-    // digest, a re-run after a crash finds it in `journal_noted`).
+    // names the receipt. A re-run after the note is marked
+    // (`journal_noted`) does not write it again; a crash after the seal
+    // and before the mark is stored writes it a second time (same content:
+    // at least once, at most twice).
     if !journal_noted(ctx, &d)? {
         let mut j = ctx.journal(&d.robot_id)?;
         j.note(&serde_json::json!({

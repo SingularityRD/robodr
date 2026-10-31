@@ -58,6 +58,20 @@ pub fn prepare(ctx: &Ctx, token_text: &str, opt: &EnrollOptions) -> Result<Prepa
             e.robot_id, e.workspace, e.request_id
         ));
     }
+    // A decommissioned state directory (decommission.json: the receipt) is
+    // never enrolled again, whatever keys are on disk: re-commissioning
+    // starts from an empty fleet state directory.
+    if let Some(d) = crate::decommission::current(ctx)? {
+        return Err(format!(
+            "this unit was decommissioned ({}, phase {:?}); a decommissioned fleet state \
+             directory is not enrolled again. Archive {} (the receipt), then re-commission \
+             from new keys and an empty fleet state directory (docs/DECOMMISSION.md, \
+             \"Re-commissioning\")",
+            d.decommission_id,
+            d.phase,
+            ctx.path(crate::decommission::STATE_FILE).display()
+        ));
+    }
     let token = Token::parse(token_text).map_err(|e| format!("token: {e}"))?;
     let tp = &token.payload;
     if let Some(p) = ctx.load::<PendingEnroll>(PENDING)? {

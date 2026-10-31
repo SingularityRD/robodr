@@ -216,7 +216,8 @@ as SP 800-88 §4.7 describes.
 
 A decommissioned unit is commissioned again as a new one: after step 8 it
 gets fresh keys, an empty `/var/lib/robodr`, a new enrollment token
-(`robodr-enroll` refuses to enroll on top of a decommissioned state, and
+(`robodr-enroll` refuses to enroll while the fleet state directory holds a
+decommission record, `decommission.json`, whatever keys are on disk; and
 the SOC never registers a key id twice), a new depot enrolment and a new
 anchor-receiver entry.
 
