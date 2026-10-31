@@ -603,6 +603,11 @@ fn fill(b: &mut Builder<'_>, host: &str, now: u64) -> Result<(), String> {
     let inputs = crate::metrics::Inputs {
         agentd: read_json(crate::metrics::AGENTD_STATUS),
         uplink: read_json(crate::metrics::UPLINK_STATUS),
+        units: Some(
+            b.runner
+                .stdout("systemctl", &crate::metrics::units_show_args())
+                .ok_or_else(|| "systemctl show failed".to_string()),
+        ),
         now_mono_ms: robodr_agentd::notify::monotonic_ms(),
         boot_id: std::fs::read_to_string(rooted(&b.opts.root, "/proc/sys/kernel/random/boot_id"))
             .unwrap_or_default()

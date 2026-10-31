@@ -2986,6 +2986,7 @@ dependencies = [
  "robodr-agentd",
  "robodr-blackbox",
  "robodr-commission",
+ "robodr-export",
  "serde",
  "serde_json",
  "sha2 0.10.9",

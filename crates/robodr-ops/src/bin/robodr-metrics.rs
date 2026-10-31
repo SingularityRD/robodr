@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use robodr_ops::args::{argv, Args};
+use robodr_ops::exec::{Host, Runner};
 use robodr_ops::metrics::{self, Inputs, AGENTD_STATUS, DEFAULT_OUT, UPLINK_STATUS};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -12,8 +13,9 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage: robodr-metrics [--agentd-status FILE | --no-agentd] [--uplink-status FILE | --no-uplink]
-                      [--out FILE | --stdout]
-Renders robodr-agentd's status.json and robodr-uplink's uplink-status.json as
+                      [--no-units] [--out FILE | --stdout]
+Renders robodr-agentd's status.json, robodr-uplink's uplink-status.json and the
+systemd state of RoboDR's units (systemctl show; --no-units skips it) as
 Prometheus text (node_exporter textfile collector). Defaults:
   --agentd-status /var/lib/robodr/spool/agentd/status.json
   --uplink-status /var/lib/robodr/export/uplink/uplink-status.json (skipped when absent)
@@ -90,7 +92,7 @@ fn run() -> Result<(), (u8, String)> {
     let a = Args::parse(
         &raw,
         &["agentd-status", "uplink-status", "out"],
-        &["stdout", "no-agentd", "no-uplink"],
+        &["stdout", "no-agentd", "no-uplink", "no-units"],
     )
     .map_err(|e| (2, e))?;
     if let Some(p) = a.positional.first() {
@@ -122,9 +124,21 @@ fn run() -> Result<(), (u8, String)> {
                 .then(|| read_json(Path::new(UPLINK_STATUS))),
         }
     };
+    let units = (!a.flag("no-units")).then(|| {
+        let host = Host {
+            timeout: std::time::Duration::from_secs(10),
+            cap: 1 << 20,
+        };
+        match host.run("systemctl", &metrics::units_show_args()) {
+            Ok(o) if o.ok() && !o.truncated => Ok(o.stdout_text()),
+            Ok(o) => Err(format!("systemctl show exited {:?}", o.code)),
+            Err(e) => Err(e.to_string()),
+        }
+    });
     let inputs = Inputs {
         agentd,
         uplink,
+        units,
         now_mono_ms: robodr_agentd::notify::monotonic_ms(),
         boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .unwrap_or_default()

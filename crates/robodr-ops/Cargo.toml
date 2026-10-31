@@ -38,3 +38,6 @@ path = "src/bin/robodr-metrics.rs"
 [dev-dependencies]
 # The key fingerprint definition robodr-setup must match (revocation lists).
 robodr-commission = { workspace = true }
+# The uplink status type the exporter reads (tests build their fixture by
+# serialising it, so a renamed field breaks the tests, not the alerts).
+robodr-export = { workspace = true }

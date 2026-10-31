@@ -113,3 +113,37 @@ groups:
           severity: warning
         annotations:
           summary: "No batch acknowledged by the SOC for an hour while findings wait on {{ $labels.instance }}"
+
+      # systemd's view of RoboDR's own units (robodr-metrics asks
+      # `systemctl show`). Covers daemons that write no status file, above
+      # all robodr-pulsard (host behaviour detection).
+      - alert: RoboDRUnitStateUnreadable
+        expr: robodr_units_readable == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "robodr-metrics cannot read RoboDR's unit states on {{ $labels.instance }}"
+          description: "systemctl show failed (systemd not answering, or the exporter's sandbox blocks it)."
+
+      # A unit crashed and was not restarted, or systemd gave up restarting
+      # it (start limit): that detector or exporter is off.
+      - alert: RoboDRUnitFailed
+        expr: robodr_unit_failed == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.unit }} has FAILED on {{ $labels.instance }}"
+          description: "systemctl status {{ $labels.unit }}; journalctl -u {{ $labels.unit }}. The robot runs on, unwatched by this unit."
+
+      # Restarted again and again: a crash loop, or killed at its own
+      # MemoryMax= (an event storm can do this to robodr-pulsard, whose
+      # detection has a gap at every restart).
+      - alert: RoboDRUnitRestartLoop
+        expr: increase(robodr_unit_restarts[30m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.unit }} restarted 3+ times in 30 minutes on {{ $labels.instance }}"
+          description: "journalctl -u {{ $labels.unit }}; \"killed by the OOM killer\" there means it hit its MemoryMax= (systemctl show -p MemoryPeak {{ $labels.unit }})."
