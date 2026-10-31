@@ -554,13 +554,15 @@ fn keys_dir(p: &Probe<'_>, o: &Options) -> Check {
     let path = p.path(dir);
     let md = match std::fs::symlink_metadata(&path) {
         Ok(md) => md,
-        Err(_) => return check(
-            ID,
-            Level::Warn,
-            format!(
+        Err(_) => {
+            return check(
+                ID,
+                Level::Warn,
+                format!(
                 "{dir} missing (the package's systemd-tmpfiles creates /etc/robodr/keys 0700 root)"
             ),
-        ),
+            )
+        }
     };
     if !md.is_dir() {
         return check(
