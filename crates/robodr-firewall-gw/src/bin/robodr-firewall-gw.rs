@@ -91,7 +91,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "check-config" | "run" => {
-            let (profile, fw, notes) = match runtime::load(&cfg) {
+            let (profile, fw, notes, provenance) = match runtime::load_with_provenance(&cfg) {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("robodr-firewall-gw: {e}");
@@ -108,6 +108,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            gw.provenance = provenance;
             if cmd == "check-config" {
                 println!(
                     "robodr-firewall-gw: configuration ok ({} channel(s), mode {:?}, queue {}, on_gateway_down {:?})",

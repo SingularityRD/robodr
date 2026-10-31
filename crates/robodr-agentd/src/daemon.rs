@@ -301,6 +301,10 @@ pub struct DaemonStats {
     pub host_threats: u64,
     /// In-path gateway findings taken from the gateway feed.
     pub gateway_findings: u64,
+    /// Gateway decision summaries recorded in the black box (T19).
+    pub gateway_summaries: u64,
+    /// Gateway decision summaries the black box could not take.
+    pub gateway_summary_errors: u64,
     /// Gateway lines folded by the feed limit (recorded in the black box,
     /// reported in an aggregate; `crate::gateway_feed`, T82).
     pub gateway_folded: u64,
@@ -1671,6 +1675,7 @@ impl<'a> Daemon<'a> {
             }
             Payload::Host(crate::host::HostLine::Threat(t)) => self.host_threat(&t),
             Payload::Gateway(g) => self.gateway_finding(&g),
+            Payload::GatewaySummary(g) => self.gateway_summary(&g),
             Payload::GatewayHeartbeat(hb) => {
                 // Activity on the input (it is not silent); the gateway's
                 // own drops count as upstream drops, as a forwarder's.
@@ -2119,6 +2124,17 @@ impl<'a> Daemon<'a> {
             return;
         }
         self.gateway_report(g);
+    }
+
+    /// A gateway decision summary (T19): a black-box note, signed and
+    /// chained like every record; start and stop are critical notes.
+    fn gateway_summary(&mut self, g: &crate::gateway_feed::GatewaySummary) {
+        let now = self.clock.now();
+        let critical = g.event != crate::gateway_feed::SummaryEvent::Interval;
+        match self.agent.record_note(now, "gateway summary", g, critical) {
+            Ok(_) => self.stats.gateway_summaries += 1,
+            Err(_) => self.stats.gateway_summary_errors += 1,
+        }
     }
 
     /// An aggregate of folded gateway lines: reported like a line.

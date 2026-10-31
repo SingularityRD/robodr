@@ -59,7 +59,28 @@ fn read_capped(path: &Path, max: u64) -> Result<String, String> {
 /// `on_gateway_down` behaviour applies. In observe mode it is used
 /// unlocked (observe only).
 pub fn load(cfg: &GatewayConfig) -> Result<(Profile, FirewallConfig, Vec<String>), String> {
+    load_with_provenance(cfg).map(|(p, f, n, _)| (p, f, n))
+}
+
+/// [`load`], with the digests of the files as read (decision summaries,
+/// `crate::summary`): the configuration's from [`GatewayConfig::load`],
+/// the firewall configuration's from the text parsed here, the profile's
+/// from a read just before its checks.
+pub fn load_with_provenance(
+    cfg: &GatewayConfig,
+) -> Result<
+    (
+        Profile,
+        FirewallConfig,
+        Vec<String>,
+        crate::summary::Provenance,
+    ),
+    String,
+> {
     let mut notes = Vec::new();
+    let profile_sha256 = std::fs::read(&cfg.profile)
+        .ok()
+        .map(|b| robodr_commission::trust::file_digest(&b));
     let (loaded, _commit) = robodr_ros2_pipeline::profile_trust::load_profile_deferred(
         &cfg.profile,
         &cfg.profile_trust,
@@ -80,7 +101,12 @@ pub fn load(cfg: &GatewayConfig) -> Result<(Profile, FirewallConfig, Vec<String>
     let text = read_capped(&cfg.firewall, crate::config::MAX_CONFIG_BYTES)?;
     let fw = FirewallConfig::from_json(&text)
         .map_err(|e| format!("{}: {e:?}", cfg.firewall.display()))?;
-    Ok((profile, fw, notes))
+    let prov = crate::summary::Provenance {
+        config_sha256: cfg.source_sha256.clone(),
+        firewall_sha256: Some(robodr_commission::trust::file_digest(text.as_bytes())),
+        profile_sha256,
+    };
+    Ok((profile, fw, notes, prov))
 }
 
 /// Recv -> verdict latency histogram (1 µs buckets up to 20 ms, then one
@@ -219,6 +245,12 @@ pub fn run(
     let notifier = sys::Notifier::from_env();
     notifier.notify("READY=1\nSTATUS=deciding");
     let mut events = Events::open(cfg);
+    let mut summary = crate::summary::Summarizer::new(cfg.queue.on_gateway_down, Instant::now());
+    if let Some(feed) = events.feed.as_mut() {
+        if let Some(l) = summary.line(crate::summary::Event::Start, gw, Instant::now()) {
+            feed.push(l);
+        }
+    }
     let mut hist = LatencyHist::default();
     let mut work: Vec<u8> = Vec::with_capacity(65_536);
     let started = Instant::now();
@@ -298,6 +330,11 @@ pub fn run(
             events.observe_unavailable = observe_unavailable;
             events.observe_overruns = log.as_ref().map_or(0, |l| l.overruns);
             housekeeping(cfg, gw, &mut events, &hist);
+            if let Some(feed) = events.feed.as_mut() {
+                if let Some(l) = summary.due(gw, Instant::now()) {
+                    feed.push(l);
+                }
+            }
             notifier.notify("WATCHDOG=1");
         }
     }
@@ -305,6 +342,14 @@ pub fn run(
     events.observe_overruns = log.as_ref().map_or(0, |l| l.overruns);
     housekeeping(cfg, gw, &mut events, &hist);
     notifier.notify("STOPPING=1");
+    // The stop summary, then the feed thread writes what is waiting
+    // (bounded by its write timeout) before the process ends.
+    if let Some(mut feed) = events.feed.take() {
+        if let Some(l) = summary.line(crate::summary::Event::Stop, gw, Instant::now()) {
+            feed.push(l);
+        }
+        feed.close();
+    }
     Ok(RunReport {
         packets,
         stamped,

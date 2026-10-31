@@ -219,6 +219,7 @@ pub const HANDOFF: usize = 256;
 #[derive(Debug)]
 pub struct FeedThread {
     tx: std::sync::mpsc::SyncSender<String>,
+    handle: Option<std::thread::JoinHandle<()>>,
     status: std::sync::Arc<std::sync::Mutex<FeedStatus>>,
     handoff_dropped: u64,
 }
@@ -228,7 +229,7 @@ impl FeedThread {
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(HANDOFF);
         let status = std::sync::Arc::new(std::sync::Mutex::new(FeedStatus::default()));
         let st = std::sync::Arc::clone(&status);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("gw-feed".into())
             .spawn(move || {
                 let mut f = Feed::new(path);
@@ -236,7 +237,12 @@ impl FeedThread {
                     match rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(l) => f.push(l),
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // Closing: one last write of what waits (a
+                            // stop summary), then end.
+                            f.flush(Instant::now());
+                            return;
+                        }
                     }
                     while let Ok(l) = rx.try_recv() {
                         f.push(l);
@@ -254,9 +260,20 @@ impl FeedThread {
             })?;
         Ok(Self {
             tx,
+            handle: Some(handle),
             status,
             handoff_dropped: 0,
         })
+    }
+
+    /// Stop the thread after it wrote what is waiting (one connect and
+    /// one write pass, each bounded by [`WRITE_TIMEOUT`] per line).
+    pub fn close(mut self) {
+        let handle = self.handle.take();
+        drop(self);
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
     }
 
     /// Hand a line to the thread (never blocks; a full hand-off drops it).

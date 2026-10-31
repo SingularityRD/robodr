@@ -446,8 +446,14 @@ budget is recorded in the black box only and folded into one aggregate per
 (rule, channel) with the most severe folded severity (Critical stays
 Critical) and the summed count, reported when the window closes (or at
 stop); lines of uncounted pairs go to one `robot.gateway.findings_dropped`
-aggregate. Status: `daemon.gateway_findings`, `daemon.gateway_folded`,
-`daemon.gateway_aggregates`, `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
+aggregate. The gateway's decision summaries
+(`robodr-gateway-summary/v1`: mode, fail behaviour, file digests and
+decision counters at start, every minute and at stop; T19) are parsed as
+strictly and appended to the black box as notes (`gateway summary`, start
+and stop critical), never findings. Status: `daemon.gateway_findings`,
+`daemon.gateway_folded`, `daemon.gateway_aggregates`,
+`daemon.gateway_summaries`, `daemon.gateway_summary_errors`,
+`daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
 same path; with `socket_mode: "0660"` give the gateway's user the daemon's
 group. Test: `tests/gateway_feed.rs` (the gateway's own writer against a
 running daemon).

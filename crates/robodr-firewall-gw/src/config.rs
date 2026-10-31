@@ -873,6 +873,11 @@ pub struct GatewayConfig {
     /// model.
     #[serde(default)]
     pub robot_model: Option<String>,
+    /// `sha256:<hex>` of the file this configuration was read from
+    /// ([`GatewayConfig::load`]; not a key of the file). Recorded in the
+    /// decision summaries (`crate::summary`).
+    #[serde(skip)]
+    pub source_sha256: Option<String>,
 }
 
 fn default_max_queue_delay() -> u64 {
@@ -922,7 +927,9 @@ impl GatewayConfig {
                 path.display()
             ));
         }
-        Self::from_json(&s)
+        let mut c = Self::from_json(&s)?;
+        c.source_sha256 = Some(robodr_commission::trust::file_digest(s.as_bytes()));
+        Ok(c)
     }
 
     /// Gateway review, finding 3: in enforce mode a Go2 (`robot_model`

@@ -445,6 +445,9 @@ pub struct Gateway {
     pub findings: GatewayFindings,
     /// Late-packet accounting (`robot.gateway.overload`, T8).
     pub overload: crate::findings::Overload,
+    /// Digests of the files this gateway started from (decision summaries,
+    /// `crate::summary`; set by the binary).
+    pub provenance: crate::summary::Provenance,
     /// The `restrict_motion` restriction in force (`crate::restrict`).
     restriction: Option<Restriction>,
     /// When the restriction in force ends, on the monotonic clock (ms;
@@ -792,6 +795,7 @@ impl Gateway {
                 cfg.overload_interval_ms,
                 cfg.overload_high_late,
             ),
+            provenance: crate::summary::Provenance::default(),
             restriction: None,
             restriction_deadline_ms: None,
         })

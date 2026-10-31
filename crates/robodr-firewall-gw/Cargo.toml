@@ -24,6 +24,8 @@ robodr-rtps = { workspace = true }
 robodr-capture = { workspace = true }
 # Profile loading with the commissioning + trust checks, identity resolver.
 robodr-ros2-pipeline = { workspace = true }
+# File digests (`sha256:<hex>`) for the decision summaries' provenance.
+robodr-commission = { workspace = true }
 robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -637,7 +637,22 @@ the firewall's `robot.firewall.internal_fault` deviations are dropped from
 the events file and the feed (the firewall's `faults` counter in the
 status file keeps them); before, an overloaded box sent one Critical
 `internal_fault` per burst (RESULTS O1: 1,364 in a 2 h soak). Status:
-`overload.late_pending`, `overload.reports`, `gateway.late`. With `findings_socket` (agentd's `gateway_feed`
+`overload.late_pending`, `overload.reports`, `gateway.late`.
+
+Decision summaries (sales-readiness T19, `src/summary.rs`): over the same
+feed the gateway writes a `robodr-gateway-summary/v1` line at start, every
+60 s and at a clean stop: the mode, `on_gateway_down`, the `sha256:`
+digests of the configuration, firewall and profile files as read at start,
+the decision counters since the previous line (`packets`, `accepted`,
+`modified`, `dropped`, `samples`, `passed`, `limited`, `substituted`,
+`suppressed`, `late`, `undecidable`), the firewall's fault verdicts and the
+id of the restriction in force. agentd appends each as a black-box note
+(signed and chained; start and stop critical), so what the gateway
+enforced and how it decided is in the signed record; the individual
+verdicts stay in the status and events files. A stop that is not clean (a
+crash, SIGKILL) writes no stop line; the next start line shows the
+restart. Lines that wait while agentd is away share the feed's bounded
+backlog. With `findings_socket` (agentd's `gateway_feed`
 socket) those and the Motion Firewall's own deviations (`robot.firewall.*`)
 go to agentd as JSON lines (`robodr-gateway-finding/v1`, `src/feed.rs`),
 which turns each into a finding of its normal pipeline (black box, spool,

@@ -258,10 +258,95 @@ fn a_feed_flood_is_folded_into_one_aggregate() {
         .unwrap();
     assert_eq!(agg.1.severity, Severity::Critical);
     let v = &agg.1.entity_context.detail.value;
-    assert!(v.contains(&format!(
-        "{} gateway lines, gateway count {},",
-        N - per_key,
-        2 * (N - per_key)
-    )), "{v}");
+    assert!(
+        v.contains(&format!(
+            "{} gateway lines, gateway count {},",
+            N - per_key,
+            2 * (N - per_key)
+        )),
+        "{v}"
+    );
     assert_verified(&s.blackbox, None, &found);
+}
+
+/// Sales-readiness T19 (GAP-24): the gateway's decision summaries (what it
+/// enforced: mode, fail behaviour, file digests; how it decided: counters)
+/// were a local file only. Now each summary the gateway's own
+/// `Summarizer` writes is a black-box note, in the signed chain; editing
+/// it afterwards breaks verification.
+#[test]
+fn gateway_summaries_are_signed_black_box_notes() {
+    use robodr_firewall_gw::summary::{Event, Summarizer};
+    let s = setup("gw-summary", &robot_profile(true));
+    let run = s.dir.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = run.join("gateway-feed.sock");
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "unix_socket", "path": run.join("events.sock")}]),
+        serde_json::json!({}),
+    );
+    cfg["gateway_feed"] = serde_json::json!({
+        "socket_path": sock,
+        "allowed_uids": [robodr_agentd::config::effective_uid()],
+    });
+    let r = s.resolve(&cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    let h = std::thread::spawn(move || {
+        let mut log = Vec::new();
+        let res = robodr_agentd::run(&r, &|| s2.load(Ordering::SeqCst), &mut log)
+            .map_err(|e| e.to_string());
+        (res, String::from_utf8_lossy(&log).into_owned())
+    });
+    wait_for(10, "socket", || sock.exists().then_some(()));
+
+    let mut gw = robodr_firewall_gw::testkit::gateway(robodr_firewall_gw::testkit::Fixture::G1);
+    gw.provenance.firewall_sha256 = Some(format!("sha256:{}", "7".repeat(64)));
+    let t0 = Instant::now();
+    let mut sum = Summarizer::new(robodr_firewall_gw::OnGatewayDown::FailClosed, t0);
+    let mut f = Feed::new(sock.clone());
+    f.push(sum.line(Event::Start, &gw, t0).unwrap());
+    gw.stats.packets = 4242;
+    gw.stats.limited = 77;
+    f.push(sum.line(Event::Stop, &gw, t0).unwrap());
+    f.flush(Instant::now());
+    assert_eq!(f.sent, 2, "{:?}", f.last_error);
+    wait_for(10, "summaries", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["gateway_summaries"].as_u64()? == 2).then_some(())
+    });
+    stop.store(true, Ordering::SeqCst);
+    let (res, log) = h.join().unwrap();
+    res.unwrap_or_else(|e| panic!("{e}\n{log}"));
+    assert_eq!(
+        notes_with(&s.blackbox, "robodr-gateway-summary/v1"),
+        2,
+        "{log}"
+    );
+    assert_eq!(notes_with(&s.blackbox, "\"packets\":4242"), 1);
+    let found = spooled(&s.spool);
+    assert_verified(&s.blackbox, None, &found);
+
+    // Tamper: the stop summary's counters rewritten in place.
+    let mut hit = 0;
+    for e in std::fs::read_dir(&s.blackbox).unwrap() {
+        let p = e.unwrap().path();
+        let Ok(mut b) = std::fs::read(&p) else {
+            continue;
+        };
+        let needle = b"\"limited\":77";
+        if let Some(i) = b.windows(needle.len()).position(|w| w == needle) {
+            b[i + needle.len() - 2] = b'0';
+            std::fs::write(&p, &b).unwrap();
+            hit += 1;
+        }
+    }
+    assert_eq!(hit, 1, "the note is in one segment");
+    let report = robodr_agent::verify_blackbox(&s.blackbox, &verifier(), None, Some(ROBOT));
+    assert!(
+        report.map_or(true, |r| !r.is_intact()),
+        "an edited gateway summary must break the chain"
+    );
 }

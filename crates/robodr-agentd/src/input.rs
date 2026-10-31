@@ -144,6 +144,9 @@ pub enum Payload {
     Gateway(Box<crate::gateway_feed::GatewayLine>),
     /// The gateway's idle heartbeat (see [`crate::gateway_feed`]).
     GatewayHeartbeat(crate::gateway_feed::GatewayHeartbeat),
+    /// A decision summary of the gateway (see [`crate::gateway_feed`]):
+    /// recorded in the black box.
+    GatewaySummary(Box<crate::gateway_feed::GatewaySummary>),
 }
 
 /// Turns one trimmed, non-empty, non-comment line into a payload, or says
@@ -300,7 +303,8 @@ impl Feed {
             | Payload::Safety(_)
             | Payload::Host(_)
             | Payload::Gateway(_)
-            | Payload::GatewayHeartbeat(_) => EVENT_ESTIMATE_BYTES,
+            | Payload::GatewayHeartbeat(_)
+            | Payload::GatewaySummary(_) => EVENT_ESTIMATE_BYTES,
         };
         self.send_sized(payload, size)
     }

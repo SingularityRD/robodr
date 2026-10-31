@@ -148,6 +148,7 @@ pub mod rtps;
 pub mod ruleset;
 pub mod runtime;
 pub mod sport;
+pub mod summary;
 pub mod sys;
 #[cfg(feature = "testkit")]
 #[doc(hidden)]

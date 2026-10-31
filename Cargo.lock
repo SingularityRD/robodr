@@ -2936,6 +2936,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "robodr-capture",
  "robodr-cdr",
+ "robodr-commission",
  "robodr-events",
  "robodr-firewall",
  "robodr-firewall-gw",

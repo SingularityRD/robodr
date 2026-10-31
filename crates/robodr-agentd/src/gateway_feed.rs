@@ -78,6 +78,101 @@ impl<'de> Deserialize<'de> for HeartbeatTag {
         }
     }
 }
+/// The decision summary line's tag (`robodr_firewall_gw::summary::FORMAT`,
+/// sales-readiness T19): what the gateway enforced (its mode, fail
+/// behaviour, the digests of its configuration, firewall and profile
+/// files) and how it decided (counters since the previous line), at start,
+/// every minute and at stop. Never a finding: agentd appends it to the
+/// black box as a note (`gateway summary`; start and stop critical), so it
+/// is signed and chained like every record.
+pub const SUMMARY_FORMAT: &str = "robodr-gateway-summary/v1";
+
+/// What a summary line says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryEvent {
+    Start,
+    Interval,
+    Stop,
+}
+
+/// The decision counters of a summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryCounters {
+    pub packets: u64,
+    pub accepted: u64,
+    pub modified: u64,
+    pub dropped: u64,
+    pub samples: u64,
+    pub passed: u64,
+    pub limited: u64,
+    pub substituted: u64,
+    pub suppressed: u64,
+    pub late: u64,
+    pub undecidable: u64,
+}
+
+/// A gateway decision summary (strict: unknown keys, another format, a
+/// malformed digest or restriction id are malformed lines).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewaySummary {
+    pub format: String,
+    pub event: SummaryEvent,
+    pub mode: robodr_events::Mode,
+    pub on_gateway_down: OnGatewayDown,
+    pub config_sha256: Option<String>,
+    pub firewall_sha256: Option<String>,
+    pub profile_sha256: Option<String>,
+    pub interval_ms: u64,
+    pub counters: SummaryCounters,
+    pub firewall_faults: u64,
+    pub restriction: Option<String>,
+}
+
+/// The gateway's `queue.on_gateway_down`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnGatewayDown {
+    FailClosed,
+    Bypass,
+}
+
+fn digest_ok(d: &Option<String>) -> bool {
+    d.as_deref().is_none_or(|d| {
+        d.strip_prefix("sha256:").is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    })
+}
+
+fn parse_summary(t: &str) -> Result<Payload, String> {
+    let s: GatewaySummary =
+        serde_json::from_str(t).map_err(|e| format!("not a gateway summary: {e}"))?;
+    if s.format != SUMMARY_FORMAT {
+        return Err(format!("format must be {SUMMARY_FORMAT}"));
+    }
+    if !digest_ok(&s.config_sha256)
+        || !digest_ok(&s.firewall_sha256)
+        || !digest_ok(&s.profile_sha256)
+    {
+        return Err("a digest must be sha256:<64 lowercase hex>".into());
+    }
+    if s.restriction.as_deref().is_some_and(|r| {
+        r.is_empty()
+            || r.len() > 128
+            || !r
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".:_-".contains(&b))
+    }) {
+        return Err("restriction must match [A-Za-z0-9._:-]{1,128}".into());
+    }
+    Ok(Payload::GatewaySummary(Box::new(s)))
+}
+
 /// Longest accepted detail (characters).
 pub const MAX_DETAIL: usize = 1024;
 /// Longest accepted rule id / channel name.
@@ -327,6 +422,9 @@ pub fn parse_gateway_line(t: &str) -> Result<Payload, String> {
             serde_json::from_str(t).map_err(|e| format!("not a gateway heartbeat: {e}"))?;
         return Ok(Payload::GatewayHeartbeat(h));
     }
+    if serde_json::from_str::<Tag<'_>>(t).is_ok_and(|g| g.format == SUMMARY_FORMAT) {
+        return parse_summary(t);
+    }
     let l: GatewayLine =
         serde_json::from_str(t).map_err(|e| format!("not a gateway finding: {e}"))?;
     if l.format != FORMAT {
@@ -536,6 +634,35 @@ mod tests {
         let over = out.iter().find(|l| l.rule == OVERFLOW_RULE).unwrap();
         assert_eq!(over.severity, Critical);
         assert!(robodr_ocsf::builder::rule_known(OVERFLOW_RULE));
+    }
+
+    /// T19: the gateway's decision summary is parsed strictly.
+    #[test]
+    fn summary_lines_are_strict() {
+        let d = format!("sha256:{}", "ab".repeat(32));
+        let good = format!(
+            r#"{{"format":"robodr-gateway-summary/v1","event":"interval","mode":"enforce","on_gateway_down":"fail_closed","config_sha256":"{d}","firewall_sha256":null,"profile_sha256":"{d}","interval_ms":60000,"counters":{{"packets":10,"accepted":8,"modified":1,"dropped":1,"samples":10,"passed":8,"limited":1,"substituted":0,"suppressed":1,"late":0,"undecidable":0}},"firewall_faults":0,"restriction":"r-1"}}"#
+        );
+        match parse_gateway_line(&good) {
+            Ok(Payload::GatewaySummary(s)) => {
+                assert_eq!(s.event, SummaryEvent::Interval);
+                assert_eq!(s.counters.limited, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        for bad in [
+            good.replace(
+                "\"restriction\":\"r-1\"}",
+                "\"restriction\":\"r-1\",\"x\":1}",
+            ),
+            good.replace("interval\"", "sometimes\""),
+            good.replace(&d, "sha256:XYZ"),
+            good.replace("r-1", "r 1\n"),
+            good.replace("\"late\":0,", ""),
+            good.replace("fail_closed", "fail_open"),
+        ] {
+            assert!(parse_gateway_line(&bad).is_err(), "{bad}");
+        }
     }
 
     /// Red team 2026-10-30 (gateway feed spoofing, G3): a line naming
