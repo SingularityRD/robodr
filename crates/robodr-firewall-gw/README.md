@@ -631,12 +631,15 @@ reports one finding per `overload_interval_ms` (default 60 s) at most,
 opened at the first tick that sees a late packet: Medium, High when the
 interval held `overload_high_late` (default 1000) or more, with the count
 and the first late packet's channel. The packets themselves still get the
-firewall's fault verdict (`fault_policy`); only the report changes. The
-gateway asks the firewall for a fault verdict for late packets only, so
-the firewall's `robot.firewall.internal_fault` deviations are dropped from
-the events file and the feed (the firewall's `faults` counter in the
-status file keeps them); before, an overloaded box sent one Critical
-`internal_fault` per burst (RESULTS O1: 1,364 in a 2 h soak). Status:
+firewall's fault verdict (`fault_policy`); only the report changes: the
+gateway decides them with the firewall's `late_verdict` /
+`joint_late_verdict`, which apply the fault policy and count `faults` in
+the status file but record no `robot.firewall.internal_fault`; before, an
+overloaded box sent one Critical `internal_fault` per burst (RESULTS O1:
+1,364 in a 2 h soak). An `internal_fault` the firewall raises itself (a
+defensive post-condition failing after a check: non-finite output, output
+over the speed limits, an invalid joint frame after acceptance) is still
+written to the events file and the feed as a Critical finding. Status:
 `overload.late_pending`, `overload.reports`, `gateway.late`.
 
 Decision summaries (sales-readiness T19, `src/summary.rs`): over the same

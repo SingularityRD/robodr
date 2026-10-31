@@ -189,3 +189,115 @@ fn humanoid_joint_fault_holds_whatever_the_fault_policy() {
             .all(|e| e.action != EventAction::ObservedOnly));
     }
 }
+
+/// `late_verdict` / `joint_late_verdict`: the fault policy's verdict and
+/// substitute and the `faults` count of `fault_verdict`, without an
+/// `internal_fault` event (the gateway reports late packets as overload);
+/// a fault the firewall raises itself is still recorded.
+#[test]
+fn late_verdict_applies_the_fault_policy_without_an_event() {
+    let (mut fw, s, c) = firewall(PlatformConfig::default(), true);
+    let late = fw.late_verdict(&twist(s, c, 1, 0.1), 1);
+    let fault = fw.fault_verdict(&twist(s, c, 2, 0.1), 2);
+    assert_eq!(late.reject_reason(), Some(RejectReason::InternalFault));
+    assert_eq!(fault.reject_reason(), Some(RejectReason::InternalFault));
+    assert!(late.output().unwrap().motion.is_zero());
+    assert!(fault.output().unwrap().motion.is_zero());
+    assert_eq!(fw.stats().faults, 2);
+    let devs = fw.drain_deviations();
+    assert_eq!(devs.len(), 1, "only fault_verdict records: {devs:?}");
+    // Fail-open: the original passes, still without an event.
+    let (mut fw, s, c) = firewall(
+        PlatformConfig {
+            fault_policy: FaultPolicy::FailOpen,
+            ..Default::default()
+        },
+        true,
+    );
+    assert!(fw.late_verdict(&twist(s, c, 1, 0.1), 1).is_passed());
+    assert!(fw.events().as_slice().is_empty());
+    // A failed post-condition is recorded.
+    fw.inject_fault = true;
+    fw.check(&twist(s, c, 10 * MS, 0.1), 10 * MS);
+    assert_eq!(fw.events().as_slice().len(), 1);
+    assert_eq!(fw.events().as_slice()[0].rule, rules::INTERNAL_FAULT);
+}
+
+#[test]
+fn joint_late_verdict_holds_without_an_event() {
+    let mut p = Profile {
+        model: "humanoid".into(),
+        locked: true,
+        ..Default::default()
+    };
+    p.participants.insert(P.into());
+    p.writer_topics.insert("/lowcmd".into());
+    p.motion_envelopes.insert(
+        "/lowcmd".into(),
+        Envelope {
+            max_joint_speed: Some(30.0),
+            ..Default::default()
+        },
+    );
+    let spec = JointChannelSpec {
+        allowed_sources: vec![format!("{P}00000103")],
+        motors: vec![
+            MotorLimits {
+                kp_min: 5.0,
+                max_dq_step: Some(0.5),
+                ..MotorLimits::enabled((-1.0, 1.0), 10.0, 20.0, 100.0, 5.0)
+            };
+            4
+        ],
+        rate: Some(JointRate::around(500.0)),
+        ..Default::default()
+    };
+    let platform = PlatformConfig {
+        morphology: Morphology::Humanoid,
+        fail_behaviour: FailBehaviour::HoldLast {
+            max_hold_ns: 50 * MS,
+        },
+        fault_policy: FaultPolicy::FailHold,
+        ..Default::default()
+    };
+    let pol = Policy::compile_with_joints(
+        &p,
+        platform,
+        &BTreeMap::new(),
+        &BTreeMap::from([("/lowcmd".to_string(), spec)]),
+    )
+    .unwrap();
+    let mut fw = Firewall::new(pol);
+    let s = fw.source_id(&format!("{P}00000103")).unwrap();
+    let c = fw.channel_id("/lowcmd").unwrap();
+    let m = MotorCmd::enabled(0.1, 0.0, 1.0, 40.0, 1.0);
+    let frame = JointFrame::from_slice(&[m; 4], Some(true)).unwrap();
+    assert!(fw
+        .check_joint(&JointCommand::new(s, c, 10 * MS, frame), 10 * MS)
+        .is_passed());
+    let v = fw.joint_late_verdict(&JointCommand::new(s, c, 12 * MS, frame), 12 * MS);
+    assert_eq!(v.reject_reason(), Some(RejectReason::InternalFault));
+    assert_eq!(v.substitute_kind(), Some(SubstituteKind::HoldLast));
+    assert_eq!(fw.stats().faults, 1);
+    assert!(fw.events().as_slice().is_empty());
+    // A hold that outlives max_hold_ns is still reported.
+    let v = fw.joint_late_verdict(&JointCommand::new(s, c, 100 * MS, frame), 100 * MS);
+    assert_eq!(v.reject_reason(), Some(RejectReason::InternalFault));
+    assert!(fw
+        .events()
+        .as_slice()
+        .iter()
+        .all(|e| e.rule != rules::INTERNAL_FAULT));
+    assert!(fw
+        .events()
+        .as_slice()
+        .iter()
+        .any(|e| e.rule == rules::JOINT_HOLD_EXCEEDED));
+    let fault = fw.joint_fault_verdict(&JointCommand::new(s, c, 102 * MS, frame), 102 * MS);
+    assert_eq!(fault.reject_reason(), Some(RejectReason::InternalFault));
+    assert!(fw
+        .events()
+        .as_slice()
+        .iter()
+        .any(|e| e.rule == rules::INTERNAL_FAULT));
+}

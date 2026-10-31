@@ -168,7 +168,10 @@ the low-level joint section).
 
 Inside the library, a fault means the post-condition check failed. The gateway
 should call `Firewall::fault_verdict` when it cannot run `check` before its
-deadline. If the gateway **crashes**, the decision is outside this crate and the
+deadline; `Firewall::late_verdict` (and `joint_late_verdict`) give the same
+verdict, substitute and `faults` count without recording an
+`internal_fault` event, for a gateway that reports its own overload
+(`robodr-firewall-gw` does, as `robot.gateway.overload`). If the gateway **crashes**, the decision is outside this crate and the
 platform's own command timeout (for example a `cmd_vel` watchdog) applies. The
 gateway must be deployed so that this timeout exists.
 
@@ -567,7 +570,7 @@ the robot's own compute, gateway in the loop, under load — is still to be meas
   in-path inline-bridge gateway (NFQUEUE) decodes `unitree_go` / `unitree_hg`
   `LowCmd_` strictly, passes the decoded `crc_ok`, `mode_pr` /
   `mode_machine` into the `JointFrame`, resolves the writer to a
-  `SourceId`, calls `check_joint` per frame (and `joint_fault_verdict` for a
+  `SourceId`, calls `check_joint` per frame (and `joint_late_verdict` for a
   packet read too late), re-encodes a `Limited` frame or a substitute in
   place with a freshly computed CRC and the remaining non-motor fields, and
   removes the sample when the verdict emits nothing. See
