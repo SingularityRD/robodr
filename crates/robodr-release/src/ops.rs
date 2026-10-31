@@ -230,6 +230,17 @@ struct LoadedAnchor {
 /// the legacy `FILE` / `FILE.sig` pair otherwise). A mirror that differs
 /// from the record (a crash between its writes) is rewritten from it.
 fn load_anchor(anchor: &Path, pins: &[String], site: &str) -> Result<LoadedAnchor, Fail> {
+    load_anchor_with(anchor, pins, site, true)
+}
+
+/// [`load_anchor`]; `repair`: rewrite a mirror that differs from the
+/// record (otherwise nothing is written).
+fn load_anchor_with(
+    anchor: &Path,
+    pins: &[String],
+    site: &str,
+    repair: bool,
+) -> Result<LoadedAnchor, Fail> {
     let cp = anchor_chain_path(anchor);
     if fs::symlink_metadata(&cp).is_err() {
         let (doc, sig) = read_trust_files(anchor).map_err(|e| prefix(e, "trust anchor"))?;
@@ -259,7 +270,7 @@ fn load_anchor(anchor: &Path, pins: &[String], site: &str) -> Result<LoadedAncho
         .ok_or_else(|| anchor_refusal("empty chain"))?;
     if let Some((d, s)) = chain.last() {
         let same = read_trust_files(anchor).is_ok_and(|(md, ms)| &md == d && &ms == s);
-        if !same {
+        if !same && repair {
             // Best effort: the record is authoritative.
             let _ = write_replace(&sig_path(anchor), s);
             let _ = write_replace(anchor, d);
@@ -273,6 +284,12 @@ fn load_anchor(anchor: &Path, pins: &[String], site: &str) -> Result<LoadedAncho
 /// Not checked for expiry.
 pub fn read_anchor(anchor: &Path, pins: &[String], site: &str) -> Result<VerifiedTrust, Fail> {
     Ok(load_anchor(anchor, pins, site)?.trust)
+}
+
+/// [`read_anchor`] without writing anything: a mirror that differs from
+/// the record is left as it is (the record is what is verified).
+pub fn read_anchor_only(anchor: &Path, pins: &[String], site: &str) -> Result<VerifiedTrust, Fail> {
+    Ok(load_anchor_with(anchor, pins, site, false)?.trust)
 }
 
 impl SiteTrust {

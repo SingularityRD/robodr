@@ -210,10 +210,17 @@ the new binary's
 .B self\-check
 (check
 .BR "robodr\-deliverd self\-check" );
-if it fails, the package is rolled back. A new binary that passes it but
-fails later in
-.B run
-is not rolled back automatically.
+if it fails, the package is rolled back. The check runs only when the
+switch being judged replaced the binary. If the security floor blocks
+that rollback, the agent does not exit 3 into the failing binary but
+keeps running until it is stopped (a restart starts the failing binary).
+Not rolled back automatically: a new binary that passes it but fails
+later in
+.BR run ,
+and an agent killed between the switch and the end of the gate (its next
+start runs the new binary). When the agent cannot resolve its own
+executable, the check is skipped and the journal records
+.BR robodr.deliver.self_check_unavailable .
 .PP
 Every step is recorded in the agent's black box
 .RI ( /var/lib/robodr/blackbox/deliverd ,
@@ -243,10 +250,13 @@ One pass; prints a JSON report
 Validate the configuration and exit.
 .TP
 .B self\-check
-Load what
+Check what
 .B run
-needs before it starts (configuration, state file, black-box and finding
-keys) without writing anything; exit 0 if all of it loads, 1 otherwise.
+needs before it starts, without writing anything: the configuration,
+the black-box and finding keys, the journal's segments, the state file
+(and that it is this unit's and site's), a start the high-water record
+would not lock, the TPM settings of the anti-rollback NV counter and the
+trust anchor; exit 0 if all of it holds, 1 otherwise.
 The running agent runs it on a new
 .B robodr\-deliverd
 that its own deb install put in place and rolls that install back if it

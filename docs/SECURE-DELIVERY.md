@@ -598,10 +598,22 @@ finishes the pass on the old binary, notices that its executable was
 replaced (path now naming another inode) and exits 3, on which the unit
 restarts it (`RestartForceExitStatus=3`). Before that pass commits, the
 health gate also runs the new binary (`robodr-deliverd self-check
---config <file>`: configuration, state file and keys load) and rolls the
-package back if it fails, while the old binary can still do so. A new
+--config <file>`: read only, what the start needs: the keys, the
+journal's segments, the state file and its unit and site, a start the
+high-water record would not lock, the anti-rollback NV counter's TPM
+settings and the trust anchor) and rolls the package back if it fails,
+while the old binary can still do so. The gate runs only when the switch
+being judged replaced the binary (its device and inode, taken right
+before the switch, changed). If the rollback cannot restore the binary
+(the security floor blocks it), the old agent does not exit 3 into the
+failing binary but keeps running until it is stopped. Not covered: a new
 binary that passes `self-check` but fails later in `run` is not rolled
-back automatically (systemd's start limit, then an operator). The unit's
+back automatically (systemd's start limit, then an operator); nor is an
+agent killed between the switch and the end of the gate (power loss, the
+stop timeout below): its next start runs the new binary, which judges
+the gate again without a self-check of itself (it has started). When the
+agent cannot know its own executable, the check is skipped and the
+journal says so (`robodr.deliver.self_check_unavailable`). The unit's
 `KillMode=mixed` keeps an operator's stop from signalling a dpkg run in
 progress for up to `TimeoutStopSec=` (5 min); a longer run is killed at
 that timeout and recovered from the intent at the next start (a

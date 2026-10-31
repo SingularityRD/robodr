@@ -48,6 +48,9 @@ pub mod kinds {
     /// generation, trust version, deployment, chain heads, time floor),
     /// carried over under the new key.
     pub const REKEYED: &str = "robodr.deliver.rekeyed";
+    /// The agent cannot check a replacement of its own binary (T52):
+    /// `/proc/self/exe` or the configuration path did not resolve.
+    pub const SELF_CHECK_UNAVAILABLE: &str = "robodr.deliver.self_check_unavailable";
     /// Sealing (13c): a sealed item's key could not be unsealed.
     pub const UNSEAL_FAILED: &str = "robodr.seal.unseal_failed";
     /// Sealing (13c): an erase trigger reported tamper.
