@@ -14,11 +14,17 @@
 //! | `kernel.btf` | `/sys/kernel/btf/vmlinux`, or an external BTF stamped for the running kernel | no BTF (no `robodr-pulsard`) | external BTF stamped for another kernel |
 //! | `bpffs` | `/sys/fs/bpf` is a `bpf` mount | not mounted (`robodr-pulsard` refuses to start) | |
 //! | `nf_tables` | loaded, built in, a module of the running kernel, or `nft list tables` works | none (executor / gateway cannot enforce) | |
-//! | `systemd` | PID 1 is systemd >= 247 (245 for `robodr-focal`) | | older, or not PID 1 |
+//! | `systemd` | PID 1 is systemd and the running manager is >= 247 (245 for `robodr-focal`) | | older, or not PID 1 |
 //! | `glibc` | >= the package's `libc6` floor | | older |
 //! | `clock` | after the build date and NTP-synchronised | not synchronised / unknown | before the build date |
 //! | `disk` | free >= 2 x minimum on the state disk | free < 2 x minimum | free < minimum |
-//! | `keys.dir` | `/etc/robodr/keys` root-owned 0700 | missing (created by the package) | group/other access, not root's, or a symlink |
+//! | `keys.dir` | the key directory ([`Options::keys_dir`], `/etc/robodr/keys`) root-owned 0700 | missing (created by the package) | group/other access, not root's, or a symlink |
+//!
+//! The systemd version is the running manager's (`systemctl show -p
+//! Version --value`, asked of PID 1), not the installed binary's: after an
+//! upgrade without a reboot they differ. Only when the manager does not
+//! answer is the installed `systemctl --version` used, and the detail says
+//! so.
 
 use crate::exec::Runner;
 use crate::rooted;
@@ -96,6 +102,9 @@ pub struct Options {
     /// Unix time this release was built (`SOURCE_DATE_EPOCH`); a wall clock
     /// before it is wrong.
     pub build_epoch: u64,
+    /// The key directory `robodr-setup keys` / `init` write to
+    /// (`--keys-dir`).
+    pub keys_dir: String,
 }
 
 /// The build time compiled in (`SOURCE_DATE_EPOCH` of the release build),
@@ -113,6 +122,7 @@ impl Default for Options {
             state_dir: "/var/lib/robodr".into(),
             min_free_mib: 2048,
             build_epoch: build_epoch(),
+            keys_dir: "/etc/robodr/keys".into(),
         }
     }
 }
@@ -150,7 +160,7 @@ pub fn run(p: &Probe<'_>, o: &Options) -> Vec<Check> {
         glibc(p, o),
         clock(p, o),
         disk(p, o),
-        keys_dir(p),
+        keys_dir(p, o),
     ]
 }
 
@@ -299,6 +309,17 @@ fn systemd_version(text: &str) -> Option<u32> {
     f.next()?.parse().ok()
 }
 
+/// The manager's `Version` property: `255.4-1ubuntu8`, `247.3-7+deb11u4`,
+/// `249` -> the leading number.
+fn manager_version(text: &str) -> Option<u32> {
+    let digits: String = text
+        .trim()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 fn systemd(p: &Probe<'_>, o: &Options) -> Check {
     const ID: &str = "systemd";
     let min = match o.variant {
@@ -320,18 +341,39 @@ fn systemd(p: &Probe<'_>, o: &Options) -> Check {
             ),
         );
     }
-    match p
+    let installed = || {
+        p.runner
+            .stdout("systemctl", &["--version"])
+            .as_deref()
+            .and_then(systemd_version)
+    };
+    let (version, how) = match p
         .runner
-        .stdout("systemctl", &["--version"])
+        .stdout("systemctl", &["show", "-p", "Version", "--value"])
         .as_deref()
-        .and_then(systemd_version)
+        .and_then(manager_version)
     {
-        Some(v) if v >= min => check(ID, Level::Ok, format!("systemd {v} (>= {min})")),
+        Some(v) => {
+            let note = match installed() {
+                Some(i) if i != v => {
+                    format!("; systemd {i} is installed, reboot to run it")
+                }
+                _ => String::new(),
+            };
+            (Some(v), format!("running{note}"))
+        }
+        None => (
+            installed(),
+            "installed systemctl; the running manager did not answer".to_string(),
+        ),
+    };
+    match version {
+        Some(v) if v >= min => check(ID, Level::Ok, format!("systemd {v} (>= {min}, {how})")),
         Some(v) => check(
             ID,
             Level::Fail,
             format!(
-                "systemd {v} is older than {min}{}",
+                "systemd {v} ({how}) is older than {min}{}",
                 if o.variant == Variant::Standard {
                     ": use the robodr-focal package (systemd 245) on this host"
                 } else {
@@ -506,23 +548,27 @@ fn disk(p: &Probe<'_>, o: &Options) -> Check {
     }
 }
 
-fn keys_dir(p: &Probe<'_>) -> Check {
+fn keys_dir(p: &Probe<'_>, o: &Options) -> Check {
     const ID: &str = "keys.dir";
-    let path = p.path("/etc/robodr/keys");
-    let md =
-        match std::fs::symlink_metadata(&path) {
-            Ok(md) => md,
-            Err(_) => return check(
+    let dir = o.keys_dir.as_str();
+    let path = p.path(dir);
+    let md = match std::fs::symlink_metadata(&path) {
+        Ok(md) => md,
+        Err(_) => {
+            return check(
                 ID,
                 Level::Warn,
-                "/etc/robodr/keys missing (the package's systemd-tmpfiles creates it 0700 root)",
+                format!(
+                "{dir} missing (the package's systemd-tmpfiles creates /etc/robodr/keys 0700 root)"
             ),
-        };
+            )
+        }
+    };
     if !md.is_dir() {
         return check(
             ID,
             Level::Fail,
-            "/etc/robodr/keys is not a directory (a symlink is refused)",
+            format!("{dir} is not a directory (a symlink is refused)"),
         );
     }
     let mode = md.mode() & 0o7777;
@@ -530,7 +576,7 @@ fn keys_dir(p: &Probe<'_>) -> Check {
         return check(
             ID,
             Level::Fail,
-            format!("/etc/robodr/keys is owned by uid {}, not root", md.uid()),
+            format!("{dir} is owned by uid {}, not root", md.uid()),
         );
     }
     if mode & 0o077 != 0 {
@@ -538,12 +584,12 @@ fn keys_dir(p: &Probe<'_>) -> Check {
             ID,
             Level::Fail,
             format!(
-                "/etc/robodr/keys has mode {mode:04o}: group/other can reach the secret keys \
-                 (want 0700; systemd-tmpfiles --create resets it)"
+                "{dir} has mode {mode:04o}: group/other can reach the secret keys \
+                 (want 0700; systemd-tmpfiles --create resets /etc/robodr/keys)"
             ),
         );
     }
-    check(ID, Level::Ok, format!("/etc/robodr/keys mode {mode:04o}"))
+    check(ID, Level::Ok, format!("{dir} mode {mode:04o}"))
 }
 
 #[cfg(test)]
@@ -557,6 +603,10 @@ mod tests {
             Some(255)
         );
         assert_eq!(systemd_version("nope 1"), None);
+        assert_eq!(manager_version("255.4-1ubuntu8\n"), Some(255));
+        assert_eq!(manager_version("247.3-7+deb11u4"), Some(247));
+        assert_eq!(manager_version("249"), Some(249));
+        assert_eq!(manager_version(""), None);
         assert_eq!(version_pair("2.39"), Some((2, 39)));
         assert_eq!(version_pair("2.35-0ubuntu3"), Some((2, 35)));
         assert_eq!(

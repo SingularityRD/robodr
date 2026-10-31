@@ -11,6 +11,8 @@ robodr\-setup \- first-boot setup of a RoboDR unit: host preflight, keys, role c
 .IR N ]
 .RB [ \-\-state\-dir
 .IR DIR ]
+.RB [ \-\-keys\-dir
+.IR DIR ]
 .RB [ \-\-ignore\-check
 .IR ID ]...
 .br
@@ -51,6 +53,8 @@ robodr\-setup \- first-boot setup of a RoboDR unit: host preflight, keys, role c
 .IR IF ]...
 .RB [ \-\-key
 .IR KIND ]...
+.RB [ \-\-keys\-dir
+.IR DIR ]
 .RB [ \-\-ignore\-check
 .IR ID ]...
 .RB [ \-\-json ]
@@ -121,9 +125,15 @@ and
 cannot enforce).
 .TP
 .B systemd
-PID 1 is systemd 247 or newer (245 for
+PID 1 is systemd, and the running manager
+.RB ( "systemctl show \-p Version" )
+is 247 or newer (245 for
 .BR robodr\-focal ).
-FAIL otherwise.
+FAIL otherwise. The detail names an installed version that differs from
+the running one (reboot to run it). Only when the manager does not answer
+is the installed
+.B systemctl \-\-version
+used, and the detail says so.
 .TP
 .B glibc
 at least the
@@ -147,9 +157,13 @@ FAIL below
 (default 2048), WARN below twice that.
 .TP
 .B keys.dir
-.I /etc/robodr/keys
-a root-owned directory without group or other access. FAIL otherwise;
-WARN when missing (the package creates it).
+the key directory
+.RB ( \-\-keys\-dir ,
+default
+.IR /etc/robodr/keys )
+is a root-owned directory without group or other access. FAIL otherwise;
+WARN when missing (the package creates
+.IR /etc/robodr/keys ).
 .PP
 .BI \-\-ignore\-check " ID"
 downgrades that check's FAIL to a WARN that says it was ignored (for
@@ -195,6 +209,11 @@ reach is refused.
 .BR LoadCredential= ),
 bound to the unit id (agentd requires the binding to equal
 .BR robot.id ).
+An existing one bound to another unit id (a box re-provisioned under a new
+id) is refused with exit 1 before any key is written: retire the old key
+(move it and its
+.I .pub
+away, revoke it at the SOC) or use the old id.
 The default for every role but
 .BR soc\-relay .
 .TP

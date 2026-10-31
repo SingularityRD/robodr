@@ -35,10 +35,21 @@
 //!   `robodr_uplink_last_delivery_age_seconds`,
 //!   `robodr_uplink_stuck_seconds`, and its numeric fields as
 //!   `robodr_uplink_<field>` (backlog as `robodr_uplink_backlog_<field>`).
+//!   An uplink state other than ok / retrying / blocked / starting is
+//!   exported as `state="other"`.
+//! * `robodr_units_readable` and, for every RoboDR service in
+//!   [`ROBODR_UNITS`] that systemd has loaded (`systemctl show`),
+//!   `robodr_unit_active{unit}`, `robodr_unit_failed{unit}` (0 or 1) and
+//!   `robodr_unit_restarts{unit}` (systemd's `NRestarts`: automatic
+//!   restarts since the unit was last started by hand). A unit that systemd
+//!   gave up on, or one an event storm keeps getting killed (for example
+//!   `robodr-pulsard` at its `MemoryMax=`), is visible here even when the
+//!   daemon itself writes no status file.
 //!
 //! Free text (health reasons, error messages, batch ids) is never exported:
 //! label values are limited to the robot id, the profile and safety states,
-//! input names and the uplink state, each escaped.
+//! input names, the uplink state (one of five fixed values) and unit names
+//! (from [`ROBODR_UNITS`]), each escaped.
 
 use robodr_agentd::State;
 use serde_json::Value;
@@ -50,6 +61,32 @@ pub const AGENTD_STATUS: &str = "/var/lib/robodr/spool/agentd/status.json";
 pub const UPLINK_STATUS: &str = "/var/lib/robodr/export/uplink/uplink-status.json";
 /// Default output (the example unit's RuntimeDirectory).
 pub const DEFAULT_OUT: &str = "/run/robodr-metrics/robodr.prom";
+
+/// RoboDR's long-running services (`packaging/systemd/*.service`, checked
+/// by the test suite): the only unit names ever exported.
+pub const ROBODR_UNITS: &[&str] = &[
+    "robodr-agentd.service",
+    "robodr-anchor-receiver.service",
+    "robodr-deliverd.service",
+    "robodr-depot.service",
+    "robodr-executor.service",
+    "robodr-firewall-gw-rules.service",
+    "robodr-firewall-gw.service",
+    "robodr-kafka-publish.service",
+    "robodr-pulsard.service",
+    "robodr-spool-export.service",
+    "robodr-uplink.service",
+];
+
+/// The `systemctl show` arguments whose output [`Inputs::units`] holds.
+pub fn units_show_args() -> Vec<&'static str> {
+    let mut a = vec!["show", "--property=Id,LoadState,ActiveState,NRestarts"];
+    a.extend_from_slice(ROBODR_UNITS);
+    a
+}
+
+/// Uplink states exported by name; anything else is `other`.
+const UPLINK_STATES: &[&str] = &["ok", "retrying", "blocked", "starting"];
 
 /// Sections of agentd's `status.json` exported as counters.
 const AGENTD_SECTIONS: &[&str] = &[
@@ -185,12 +222,17 @@ impl Exposition {
     }
 
     /// Every numeric or boolean leaf of `v` as `<prefix>_<path>`
-    /// (`untyped`); arrays are skipped (unbounded label sets).
+    /// (`untyped`); arrays are skipped (unbounded label sets), and so are
+    /// wall-clock times at any depth (`*_at_ms`, `*_since_ms`): a time is
+    /// not a counter.
     fn flatten(&mut self, prefix: &str, v: &Value, help: &str, skip: &[&str]) {
         match v {
             Value::Object(o) => {
                 for (k, x) in o {
-                    if skip.contains(&k.as_str()) {
+                    if skip.contains(&k.as_str())
+                        || k.ends_with("_at_ms")
+                        || k.ends_with("_since_ms")
+                    {
                         continue;
                     }
                     self.flatten(&format!("{prefix}_{}", metric_name(k)), x, help, &[]);
@@ -226,6 +268,9 @@ pub struct Inputs {
     pub agentd: Option<Result<Value, String>>,
     /// `uplink-status.json`, likewise.
     pub uplink: Option<Result<Value, String>>,
+    /// Output of `systemctl` with [`units_show_args`]: `None` = not
+    /// asked; `Some(Err)` = systemd did not answer.
+    pub units: Option<Result<String, String>>,
     /// `CLOCK_MONOTONIC`, ms.
     pub now_mono_ms: u64,
     /// This boot's id (`/proc/sys/kernel/random/boot_id`).
@@ -252,7 +297,75 @@ pub fn render(inp: &Inputs) -> String {
     if let Some(u) = &inp.uplink {
         uplink(&mut e, u, inp);
     }
+    if let Some(u) = &inp.units {
+        units(&mut e, u);
+    }
     e.render()
+}
+
+/// `systemctl show` output: one `Key=Value` block per unit, blocks
+/// separated by an empty line.
+fn show_blocks(text: &str) -> Vec<Vec<(&str, &str)>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if let Some(kv) = line.split_once('=') {
+            cur.push(kv);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn units(e: &mut Exposition, st: &Result<String, String>) {
+    e.gauge(
+        "robodr_units_readable",
+        "1 if systemd answered for RoboDR's units (systemctl show).",
+        u8::from(st.is_ok()),
+    );
+    let Ok(text) = st else { return };
+    for block in show_blocks(text) {
+        let get = |k: &str| block.iter().find(|(x, _)| *x == k).map(|(_, v)| *v);
+        let Some(unit) = get("Id").and_then(|id| ROBODR_UNITS.iter().find(|u| **u == id)) else {
+            continue;
+        };
+        // Not installed (not-found) or masked: nothing to watch.
+        if get("LoadState") != Some("loaded") {
+            continue;
+        }
+        let active = get("ActiveState").unwrap_or("");
+        e.add(
+            "robodr_unit_active",
+            "1 if the RoboDR unit is active (running).",
+            "gauge",
+            &[("unit", unit)],
+            u8::from(active == "active").to_string(),
+        );
+        e.add(
+            "robodr_unit_failed",
+            "1 if systemd put the RoboDR unit in the failed state (crashed and not restarted, or gave up restarting it).",
+            "gauge",
+            &[("unit", unit)],
+            u8::from(active == "failed").to_string(),
+        );
+        if let Some(n) = get("NRestarts").and_then(|n| n.trim().parse::<u64>().ok()) {
+            e.add(
+                "robodr_unit_restarts",
+                "Automatic restarts of the RoboDR unit by systemd since it was last started by hand (NRestarts).",
+                "untyped",
+                &[("unit", unit)],
+                n.to_string(),
+            );
+        }
+    }
 }
 
 fn agentd(e: &mut Exposition, st: &Result<Value, String>, inp: &Inputs) {
@@ -395,15 +508,18 @@ fn uplink(e: &mut Exposition, st: &Result<Value, String>, inp: &Inputs) {
     if !ok {
         return;
     }
-    let state = v["state"].as_str().unwrap_or("unknown");
-    let mut known = vec!["ok", "retrying", "blocked", "starting"];
-    if !known.contains(&state) {
-        known.push(state);
-    }
-    for k in known {
+    // A state this exporter does not know is `other`: the label never
+    // carries text from the file.
+    let raw = v["state"].as_str().unwrap_or("");
+    let state = UPLINK_STATES
+        .iter()
+        .copied()
+        .find(|s| *s == raw)
+        .unwrap_or("other");
+    for k in UPLINK_STATES.iter().copied().chain(["other"]) {
         e.add(
             "robodr_uplink_state",
-            "robodr-uplink delivery state (blocked = refused until something is fixed).",
+            "robodr-uplink delivery state (blocked = refused until something is fixed; other = a state this exporter does not know).",
             "gauge",
             &[("state", k)],
             u8::from(k == state).to_string(),
@@ -440,19 +556,11 @@ fn uplink(e: &mut Exposition, st: &Result<Value, String>, inp: &Inputs) {
             e.add(&format!("robodr_uplink_{name}"), help, "gauge", &[], a);
         }
     }
-    let mut skip: Vec<&str> = UPLINK_SKIP.to_vec();
-    if let Some(o) = v.as_object() {
-        skip.extend(
-            o.keys()
-                .map(String::as_str)
-                .filter(|k| k.ends_with("_at_ms") || k.ends_with("_since_ms")),
-        );
-    }
     e.flatten(
         "robodr_uplink",
         v,
         "Counter from robodr-uplink uplink-status.json.",
-        &skip,
+        UPLINK_SKIP,
     );
 }
 
@@ -465,6 +573,13 @@ mod tests {
         assert_eq!(metric_name("a.b-C__d"), "a_b_c_d");
         assert_eq!(metric_name("9x"), "_9x");
         assert_eq!(label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn show_output_is_split_per_unit() {
+        let b = show_blocks("Id=a\nLoadState=loaded\n\nId=b\nX=1=2\n\n\n");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[1], vec![("Id", "b"), ("X", "1=2")]);
     }
 
     #[test]

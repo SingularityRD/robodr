@@ -4,14 +4,18 @@
 //!
 //! 1. **Redaction** of what is collected: a value whose *name* reads like a
 //!    secret ([`is_secret_name`]: `secret`, `password`, `passphrase`,
-//!    `token`, `private`, `psk`, `api_key`, `bearer`, `authorization`,
-//!    `cookie`, `sasl`) is replaced by [`REDACTED`], unless the name says it
-//!    is a reference to one (`*_file`, `*_path`, `*_dir`, `*_socket`,
-//!    `*_id`, `*_ids`): a key file's *path* helps support, the key does
-//!    not. JSON is redacted structurally; text (TOML, env files, unit
-//!    files, the journal) line by line (`NAME=value`, `NAME = value`,
-//!    `"name": value`, `Environment=NAME=value`). PEM private-key blocks
-//!    are dropped whole.
+//!    `token`, `private`, `psk`, `api_key`, `hmac`, `bearer`,
+//!    `authorization`, `cookie`, `sasl`, or a name that is or ends in
+//!    `key` such as `hmac_key` / `ROBODR_SIGNING_KEY`, except `public_key`
+//!    / `pub_key`) is replaced by [`REDACTED`], unless the name says it is
+//!    a reference to one (`*_file`, `*_path`, `*_dir`, `*_socket`, `*_id`,
+//!    `*_ids`): a key file's *path* helps support, the key does not. JSON
+//!    is redacted structurally; text (TOML, env files, unit files, the
+//!    journal) line by line (`NAME=value`, `NAME = value`, `"name": value`,
+//!    `Environment=NAME=value`). PEM private-key blocks are dropped whole.
+//!    Independently of names, the user information of every URL
+//!    (`scheme://user:password@host`) is replaced by [`REDACTED`]
+//!    ([`scrub_url_userinfo`]), in JSON strings and in text.
 //! 2. **A final scan** ([`secret_markers`]) of every file of the finished
 //!    bundle for key material that redaction should have removed (PEM
 //!    private keys, minisign secret keys, RoboDR secret key files
@@ -38,6 +42,7 @@ const SECRET_WORDS: &[&str] = &[
     "cookie",
     "sasl",
     "credential_value",
+    "hmac",
 ];
 const REFERENCE_SUFFIXES: &[&str] = &["_file", "_path", "_dir", "_socket", "_id", "_ids"];
 
@@ -51,7 +56,43 @@ pub fn is_secret_name(name: &str) -> bool {
     if REFERENCE_SUFFIXES.iter().any(|s| n.ends_with(s)) {
         return false;
     }
-    SECRET_WORDS.iter().any(|w| n.contains(w))
+    if SECRET_WORDS.iter().any(|w| n.contains(w)) {
+        return true;
+    }
+    // `key`, `hmac_key`, `ROBODR_SIGNING_KEY`: a key itself. Public keys
+    // and lists of trusted (public) keys (`trusted_keys`) are not secret.
+    (n == "key" || n.ends_with("_key")) && !(n.ends_with("public_key") || n.ends_with("pub_key"))
+}
+
+/// `text` with the user information of every URL (`scheme://user:pw@`)
+/// replaced by [`REDACTED`]; `None` when there is none.
+pub fn scrub_url_userinfo(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut changed = false;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        // The authority ends at the path, query, fragment or anything that
+        // cannot be part of a URL in a log line or a setting.
+        let end = tail
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>' | '`') || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let (authority, after) = tail.split_at(end);
+        match authority.rfind('@') {
+            Some(at) if at > 0 => {
+                out.push_str(REDACTED);
+                out.push_str(authority.get(at..).unwrap_or_default());
+                changed = true;
+            }
+            _ => out.push_str(authority),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    changed.then_some(out)
 }
 
 /// Redact a JSON document; `None` when it is not JSON.
@@ -73,8 +114,12 @@ fn redact_value(v: &mut Value) {
             }
         }
         Value::Array(a) => a.iter_mut().for_each(redact_value),
-        Value::String(s) if !secret_markers(s.as_bytes()).is_empty() => {
-            *s = REDACTED.into();
+        Value::String(s) => {
+            if !secret_markers(s.as_bytes()).is_empty() {
+                *s = REDACTED.into();
+            } else if let Some(r) = scrub_url_userinfo(s) {
+                *s = r;
+            }
         }
         _ => {}
     }
@@ -99,6 +144,11 @@ fn redact_assignment(line: &str) -> Option<String> {
 
 /// Redact text line by line (see the module docs).
 pub fn redact_text(text: &str) -> String {
+    let named = redact_names(text);
+    scrub_url_userinfo(&named).unwrap_or(named)
+}
+
+fn redact_names(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_pem = false;
     for line in text.split_inclusive('\n') {
@@ -197,6 +247,10 @@ mod tests {
             "api-key",
             "token",
             "ROBODR_KAFKA_SASL_PASSWORD",
+            "hmac_key",
+            "ROBODR_SIGNING_KEY",
+            "key",
+            "hmac",
         ] {
             assert!(is_secret_name(s), "{s}");
         }
@@ -209,6 +263,10 @@ mod tests {
             "tick_ms",
             "secret_dir",
             "trusted_keys",
+            "public_key",
+            "ROBODR_PUB_KEY",
+            "signing_key_file",
+            "keyring_path",
         ] {
             assert!(!is_secret_name(s), "{s}");
         }
@@ -243,6 +301,33 @@ mod tests {
         assert!(r.contains("tail\n"), "{r}");
         assert!(r.contains("# password=comment-kept"), "{r}");
         assert!(secret_markers(r.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn url_userinfo_is_scrubbed() {
+        let t = "ROBODR_UPLINK_URL=https://robot:hunter2@soc.example:8443/ingest?x=1\n\
+                 log: connecting to \"kafka://svc%40x:p@ss@broker:9093\" now\n\
+                 plain https://soc.example/a@b and mailto:a@b ftp://@host/\n";
+        let r = redact_text(t);
+        assert!(!r.contains("hunter2") && !r.contains("robot:"), "{r}");
+        assert!(
+            r.contains("https://<redacted>@soc.example:8443/ingest?x=1"),
+            "{r}"
+        );
+        assert!(!r.contains("p@ss") && !r.contains("svc%40x"), "{r}");
+        assert!(r.contains("kafka://<redacted>@broker:9093"), "{r}");
+        // An @ in the path, an address without a scheme and an empty
+        // userinfo are left alone.
+        assert!(
+            r.contains("https://soc.example/a@b and mailto:a@b ftp://@host/"),
+            "{r}"
+        );
+        let j = redact_json(r#"{"endpoint":"https://u:pw@h/x","n":"no url"}"#).unwrap();
+        assert!(
+            !j.contains("u:pw") && j.contains("https://<redacted>@h/x"),
+            "{j}"
+        );
+        assert!(scrub_url_userinfo("nothing here").is_none());
     }
 
     #[test]

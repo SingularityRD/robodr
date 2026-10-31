@@ -1,12 +1,15 @@
 //! robodr-metrics against a real robodr-agentd status.json (captured from
-//! `tests/binary.rs` of robodr-agentd) and an uplink status: freshness,
+//! `tests/binary.rs` of robodr-agentd), an uplink status serialised from
+//! robodr-uplink's own `Status` type and `systemctl show` output: freshness,
 //! format validity, no free text, and the example alert rules naming only
 //! metrics the exporter writes.
 
 mod common;
 
 use common::*;
-use robodr_ops::metrics::{render, Inputs};
+use robodr_export::retention::{StateUsage, Usage};
+use robodr_export::uplink::service::{Backlog, Snapshot, Status, StatusError, STATUS_FORMAT};
+use robodr_ops::metrics::{render, units_show_args, Inputs, ROBODR_UNITS};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::process::Command;
@@ -31,6 +34,7 @@ fn live() -> (Value, Inputs) {
     let inp = Inputs {
         agentd: Some(Ok(s.clone())),
         uplink: None,
+        units: None,
         now_mono_ms: 101_000,
         boot_id: "boot-a".into(),
         now_wall_ms: 1_793_408_003_000,
@@ -175,28 +179,55 @@ fn a_stale_hung_or_stopped_agent_is_unknown_never_ok() {
     );
 }
 
+/// What robodr-uplink writes as `uplink-status.json`: its own `Status`
+/// type serialised, so a renamed or removed field fails to compile here or
+/// fails the alert-rule test below, instead of silently disabling an alert.
 fn uplink_status() -> Value {
-    json!({
-        "format": "robodr-uplink-status/1",
-        "state": "blocked",
-        "updated_at_ms": 1_793_408_000_000u64,
-        "pid": 4242,
-        "last_success_at_ms": 1_793_400_000_000u64,
-        "last_delivery_at_ms": null,
-        "last_error": { "at_ms": 1, "kind": "refused", "status": 401, "code": "unknown_key",
-                        "message": "secret detail from server", "retry_after_s": null },
-        "consecutive_failures": 7,
-        "stuck_since_ms": 1_793_407_000_000u64,
-        "pending_failed_runs": 7,
-        "next_attempt_at_ms": 1_793_408_060_000u64,
-        "dead_letter_malformed": 0,
-        "quarantined_unreadable": 0,
-        "pending_batch_id": "b-123",
-        "pending_source": "spool",
-        "pending_lines": 12,
-        "backlog": { "spool_ready": 40, "diode_batches": null, "reinject_generations": 0 },
-        "sent_lines_total": 100, "accepted_total": 88, "rejected_total": 0, "dead_lettered_total": 0
-    })
+    let s = Status {
+        format: STATUS_FORMAT.into(),
+        state: "blocked".into(),
+        updated_at_ms: 1_793_408_000_000,
+        pid: 4242,
+        last_success_at_ms: Some(1_793_400_000_000),
+        last_delivery_at_ms: None,
+        last_error: Some(StatusError {
+            at_ms: 1,
+            kind: "refused".into(),
+            status: Some(401),
+            code: Some("unknown_key".into()),
+            message: "secret detail from server".into(),
+            retry_after_s: None,
+        }),
+        consecutive_failures: 7,
+        stuck_since_ms: Some(1_793_407_000_000),
+        pending_failed_runs: 7,
+        next_attempt_at_ms: Some(1_793_408_060_000),
+        dead_letter_malformed: 0,
+        quarantined_unreadable: 0,
+        snapshot: Snapshot {
+            pending_batch_id: Some("b-123".into()),
+            pending_source: Some("spool".into()),
+            pending_lines: 12,
+            backlog: Backlog {
+                spool_ready: Some(40),
+                diode_batches: None,
+                reinject_generations: 0,
+            },
+            sent_lines_total: 100,
+            accepted_total: 88,
+            rejected_total: 0,
+            dead_lettered_total: 0,
+            state_usage: Some(StateUsage {
+                done_markers: Usage {
+                    entries: 3,
+                    bytes: 300,
+                },
+                measured_at_ms: 1_793_408_000_000,
+                ..Default::default()
+            }),
+        },
+    };
+    serde_json::to_value(s).unwrap()
 }
 
 #[test]
@@ -230,6 +261,10 @@ fn uplink_states_ages_and_counters() {
         Some("40")
     );
     assert!(sample(&t, "robodr_uplink_last_delivery_age_seconds").is_none());
+    assert_eq!(
+        sample(&t, "robodr_uplink_state_usage_done_markers_entries").as_deref(),
+        Some("3")
+    );
     // Times, the pid, error text and batch ids are not counters.
     for absent in [
         "robodr_uplink_pid",
@@ -237,9 +272,112 @@ fn uplink_states_ages_and_counters() {
         "secret detail",
         "b-123",
         "last_error",
+        "measured_at",
     ] {
         assert!(!t.contains(absent), "{absent}: {t}");
     }
+}
+
+/// A state the exporter does not know is `other`: no text from the file
+/// ever reaches a label value.
+#[test]
+fn an_unknown_uplink_state_is_other() {
+    let (_, mut inp) = live();
+    let mut u = uplink_status();
+    u["state"] = json!("weird \"free\" text");
+    inp.uplink = Some(Ok(u));
+    let t = render(&inp);
+    assert_valid(&t);
+    assert_eq!(
+        sample(&t, "robodr_uplink_state{state=\"other\"}").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        sample(&t, "robodr_uplink_state{state=\"blocked\"}").as_deref(),
+        Some("0")
+    );
+    assert!(!t.contains("weird"), "{t}");
+    assert_eq!(t.matches("robodr_uplink_state{").count(), 5, "{t}");
+}
+
+/// `systemctl show` output as systemd 255 prints it for these properties.
+fn show_output() -> String {
+    let mut s = String::new();
+    for u in ROBODR_UNITS {
+        let (load, active, restarts) = match *u {
+            "robodr-agentd.service" => ("loaded", "active", 0),
+            // Killed at MemoryMax= by an event storm, restarted 4 times.
+            "robodr-pulsard.service" => ("loaded", "activating", 4),
+            "robodr-uplink.service" => ("loaded", "failed", 1),
+            "robodr-executor.service" => ("loaded", "inactive", 0),
+            _ => ("not-found", "inactive", 0),
+        };
+        s.push_str(&format!(
+            "Id={u}\nLoadState={load}\nActiveState={active}\nNRestarts={restarts}\n\n"
+        ));
+    }
+    // A unit the exporter never asked for is ignored.
+    s.push_str("Id=evil\"\nLoadState=loaded\nActiveState=failed\nNRestarts=9\n");
+    s
+}
+
+#[test]
+fn unit_states_and_restarts() {
+    let (_, mut inp) = live();
+    inp.units = Some(Ok(show_output()));
+    let t = render(&inp);
+    assert_valid(&t);
+    assert_eq!(sample(&t, "robodr_units_readable").as_deref(), Some("1"));
+    let s = |m: &str, u: &str| sample(&t, &format!("{m}{{unit=\"{u}\"}}"));
+    assert_eq!(
+        s("robodr_unit_active", "robodr-agentd.service").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        s("robodr_unit_active", "robodr-pulsard.service").as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        s("robodr_unit_restarts", "robodr-pulsard.service").as_deref(),
+        Some("4")
+    );
+    assert_eq!(
+        s("robodr_unit_failed", "robodr-uplink.service").as_deref(),
+        Some("1")
+    );
+    // Installed but not started (not enabled on this robot): not failed.
+    assert_eq!(
+        s("robodr_unit_failed", "robodr-executor.service").as_deref(),
+        Some("0")
+    );
+    // Not installed: not exported. Unknown units: never exported.
+    assert!(s("robodr_unit_active", "robodr-depot.service").is_none());
+    assert!(!t.contains("evil"), "{t}");
+    // systemd did not answer.
+    inp.units = Some(Err("System has not been booted with systemd".into()));
+    let t = render(&inp);
+    assert_valid(&t);
+    assert_eq!(sample(&t, "robodr_units_readable").as_deref(), Some("0"));
+    assert!(!t.contains("robodr_unit_active"));
+    assert!(!t.contains("booted"));
+}
+
+/// The exporter asks for exactly the services the packages ship.
+#[test]
+fn unit_list_matches_the_packaged_services() {
+    let mut shipped: Vec<String> = std::fs::read_dir(repo().join("packaging/systemd"))
+        .unwrap()
+        .filter_map(|e| e.unwrap().file_name().into_string().ok())
+        .filter(|n| n.starts_with("robodr-") && n.ends_with(".service"))
+        .collect();
+    shipped.sort();
+    let mut ours: Vec<String> = ROBODR_UNITS.iter().map(|s| s.to_string()).collect();
+    ours.sort();
+    assert_eq!(ours, shipped);
+    let args = units_show_args();
+    assert_eq!(args[0], "show");
+    assert!(args[1].contains("NRestarts") && args[1].contains("ActiveState"));
+    assert_eq!(args.len(), 2 + ROBODR_UNITS.len());
 }
 
 /// Every `robodr_*` metric named in the example alert rules is written by
@@ -253,6 +391,7 @@ fn alert_rules_name_only_exported_metrics() {
     let mut u = uplink_status();
     u["last_delivery_at_ms"] = json!(1_793_400_000_000u64);
     inp.uplink = Some(Ok(u));
+    inp.units = Some(Ok(show_output()));
     let t = render(&inp);
     let exported: BTreeSet<&str> = t
         .lines()
@@ -291,6 +430,7 @@ fn cli_writes_atomically_and_validates_arguments() {
             "--agentd-status",
             st.to_str().unwrap(),
             "--no-uplink",
+            "--no-units",
             "--out",
             out.to_str().unwrap(),
         ])
@@ -313,7 +453,12 @@ fn cli_writes_atomically_and_validates_arguments() {
         .output()
         .unwrap();
     assert!(o.status.success());
-    assert!(String::from_utf8_lossy(&o.stdout).contains("robodr_agentd_status_readable 0"));
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(text.contains("robodr_agentd_status_readable 0"));
+    // Without --no-units systemd is asked: answered or not, the family is
+    // there (this test may run where PID 1 is not systemd).
+    assert!(text.contains("robodr_units_readable "), "{text}");
+    assert_valid(&text);
     for bad in [
         vec!["--out", "relative.prom"],
         vec!["--out", "/tmp/x.txt"],

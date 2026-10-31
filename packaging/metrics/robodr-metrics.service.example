@@ -18,7 +18,9 @@
 # robodr-uplink's uplink-status.json (0600 robodr-uplink), so it runs as
 # root with CAP_DAC_READ_SEARCH only (read any file, write nothing it does
 # not own), no network, a read-only OS, and the key and evidence trees
-# hidden. It writes only its RuntimeDirectory.
+# hidden. It writes only its RuntimeDirectory. It also asks systemd for
+# the state of RoboDR's units (`systemctl show`, a read-only query over
+# AF_UNIX); robodr_units_readable 0 says when that is not answered.
 
 [Unit]
 Description=RoboDR metrics (Prometheus textfile)

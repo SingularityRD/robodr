@@ -14,6 +14,7 @@ robodr\-metrics \- Prometheus textfile exporter of RoboDR's status files
 .I FILE
 |
 .BR \-\-no\-uplink ]
+.RB [ \-\-no\-units ]
 .RB [ \-\-out
 .I FILE
 |
@@ -25,12 +26,14 @@ Renders
 and
 .BR robodr\-uplink (1)'s
 .I uplink\-status.json
+and the systemd state of RoboDR's services
+.RB ( "systemctl show" )
 in the Prometheus text exposition format, for node_exporter's textfile
 collector. RoboDR opens no port for monitoring: the scraper sees only the
 file. The file holds counters and states; no finding content, error text,
 batch id or health reason is exported, and the only label values are the
-robot id, the profile and safety states, input names and the uplink
-state, escaped.
+robot id, the profile and safety states, input names, the uplink state
+(one of five fixed values) and RoboDR's own unit names, escaped.
 .PP
 Freshness is judged exactly as agentd defines it: running, written on this
 boot, younger than its
@@ -77,14 +80,33 @@ counters of the running process, reset on restart; use
 .TP
 .BR robodr_uplink_status_readable ", " robodr_uplink_state{state}
 uplink state
-.RB ( ok ", " retrying ", " blocked ", " starting ).
+.RB ( ok ", " retrying ", " blocked ", " starting ;
+any other value is
+.BR other ).
 .TP
 .BR robodr_uplink_status_age_seconds ", " robodr_uplink_last_success_age_seconds ", " robodr_uplink_last_delivery_age_seconds ", " robodr_uplink_stuck_seconds
 by the wall clock.
 .TP
 .BI robodr_uplink_ FIELD
 its counters (backlog as
-.BR robodr_uplink_backlog_* ).
+.BR robodr_uplink_backlog_* ;
+times are not exported as counters).
+.TP
+.B robodr_units_readable
+1 if systemd answered
+.BR "systemctl show" .
+.TP
+.BR robodr_unit_active{unit} ", " robodr_unit_failed{unit}
+0 or 1, for every RoboDR service systemd has loaded (installed and not
+masked). A unit systemd gave up restarting is
+.BR failed .
+.TP
+.B robodr_unit_restarts{unit}
+systemd's
+.B NRestarts
+(automatic restarts since the unit was last started by hand): a crash
+loop, or a daemon killed again and again at its
+.BR MemoryMax= .
 .SH OPTIONS
 .TP
 .BI \-\-agentd\-status " FILE"
@@ -102,6 +124,9 @@ exported as unreadable).
 .TP
 .B \-\-no\-uplink
 no uplink metrics.
+.TP
+.B \-\-no\-units
+do not ask systemd for the unit states.
 .TP
 .BI \-\-out " FILE"
 absolute,

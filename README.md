@@ -156,6 +156,12 @@ crates/
   robodr-depot/           Site depot for air-gapped delivery: bundle import
                           with entry-station report, unit enrolment, staged
                           rollouts. Binary: robodr-depot.
+  robodr-ops/             Operator tools. Binaries: robodr-setup (host
+                          preflight, first-boot keys and role configuration,
+                          key fingerprints), robodr-support-bundle (redacted
+                          diagnostics; never keys or evidence), robodr-metrics
+                          (Prometheus textfile of the status files and unit
+                          states).
   robodr-correlate/       Weak-signal correlation engine: declarative JSON rules
                           (sequence, co-occurrence, threshold, distinct sources)
                           combine already-reported findings into

@@ -1,0 +1,22 @@
+#!/bin/sh
+# robodr-nft-load: nftables.service's ExecStart= and ExecReload= on the
+# sensor box image (drop-in nftables.service.d/50-robodr-image.conf).
+#
+# Loads the site's /etc/robodr/nftables.conf (robodr-image-early installs
+# the strict default there at first boot). When that file is missing (the
+# /etc/robodr overlay or robodr-image-early failed) or nft refuses it, it
+# loads the shipped strict default instead and exits 1: the unit shows
+# failed, but the box is never left without a host firewall (fail closed).
+set -u
+. "${ROBODR_IMAGE_ROOT:-}/usr/lib/robodr-image/common.sh"
+
+site="$R/etc/robodr/nftables.conf"
+default="$R/usr/lib/robodr-image/nftables.default.conf"
+if [ -f "$site" ]; then
+    nft -f "$site" && exit 0
+    log "the host firewall /etc/robodr/nftables.conf did not load: loading the strict default instead"
+else
+    log "/etc/robodr/nftables.conf is missing: loading the strict default host firewall"
+fi
+nft -f "$default" || die "the strict default host firewall did not load either"
+exit 1

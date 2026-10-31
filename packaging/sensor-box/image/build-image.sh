@@ -4,12 +4,18 @@
 #   packaging/sensor-box/image/build-image.sh \
 #       --bundle robodr-<V>-<arch>-offline.tar.gz \
 #       --pubkey /etc/robodr-trust/robodr-release.pub \
-#       [--out DIR] [--mkosi PATH]
+#       [--expect-version V] [--out DIR] [--mkosi PATH]
 #
 # 1. Verifies the bundle with minisign against --pubkey (the release key you
 #    received out of band; never one from the bundle or its download
 #    location), BEFORE anything in it is extracted or read. There is no
-#    "unsigned" switch.
+#    "unsigned" switch. The signature's trusted comment (signed too) must
+#    name the bundle's file name, as release.yml signs it ("robodr
+#    <version> <file>", or minisign's default "file:<file>"), so a signed
+#    older bundle renamed to look like a newer one is refused. With
+#    --expect-version V it must be exactly "robodr V <file>": the release
+#    you meant to build, not an older correctly signed one (downgrade).
+#    The trusted comment is printed either way.
 # 2. Extracts it into a private directory, checks its SHA256SUMS, and takes
 #    exactly one robodr_<ver>_<arch>.deb (the standard package; this image
 #    is Ubuntu 24.04).
@@ -25,11 +31,12 @@ export PATH
 umask 077
 
 here="$(cd "$(dirname "$0")" && pwd)"
-bundle="" pubkey="" out="$PWD/dist/sensor-box" mkosi=mkosi
+bundle="" pubkey="" out="$PWD/dist/sensor-box" mkosi=mkosi version=""
 while [ $# -gt 0 ]; do
     case "$1" in
     --bundle) bundle="$2"; shift 2 ;;
     --pubkey) pubkey="$2"; shift 2 ;;
+    --expect-version) version="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
     --mkosi) mkosi="$2"; shift 2 ;;
     -h | --help) sed -n '2,/^set -eu/p' "$0" | sed '$d'; exit 0 ;;
@@ -48,9 +55,27 @@ if [ "$bdir" = "$kdir" ]; then
     exit 1
 fi
 command -v minisign >/dev/null || { echo "build-image: minisign not found" >&2; exit 1; }
+case "$version" in
+*[!A-Za-z0-9.+~_-]*) echo "build-image: --expect-version $version: not a version" >&2; exit 2 ;;
+esac
 
-# 1. Signature, before anything is extracted.
-minisign -Vq -p "$pubkey" -m "$bundle" || { echo "build-image: signature check FAILED for $bundle" >&2; exit 1; }
+# 1. Signature (and its signed trusted comment), before anything is
+# extracted.
+name="$(basename "$bundle")"
+tc="$(minisign -VQ -p "$pubkey" -m "$bundle")" || { echo "build-image: signature check FAILED for $bundle" >&2; exit 1; }
+tc="$(printf '%s\n' "$tc" | head -n 1)"
+named=0
+set -f
+for w in $(printf '%s' "$tc" | tr '\t' ' '); do
+    case "$w" in "$name" | "file:$name") named=1 ;; esac
+done
+set +f
+[ "$named" -eq 1 ] || { echo "build-image: REFUSED: the signature of $name is valid but its trusted comment ('$tc') names another file" >&2; exit 1; }
+if [ -n "$version" ] && [ "$tc" != "robodr $version $name" ]; then
+    echo "build-image: REFUSED: trusted comment '$tc' is not 'robodr $version $name' (--expect-version): another release than the one expected" >&2
+    exit 1
+fi
+echo "build-image: signature OK ($name; trusted comment: $tc)"
 
 # 2. Private extraction and checksums.
 work="$(mktemp -d)"

@@ -40,8 +40,18 @@ AssertPathExists=|/etc/robodr/btf/vmlinux
 AssertPathExists=/etc/robodr/pulsar.toml
 After=local-fs.target network.target
 Wants=network.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# No start limit: systemd never gives up on the detector. Its memory and
+# CPU caps (below) make it killable from outside: an event storm an
+# attacker causes (process or file flood) can push it to MemoryMax= again
+# and again. With a start limit, a few such kills in a row would leave host
+# detection off until someone intervened. Instead it is restarted every
+# RestartSec= for as long as it fails; each restart is a detection gap and
+# is counted (NRestarts), which robodr-metrics exports
+# (robodr_unit_restarts, robodr_unit_failed; example alerts
+# RoboDRUnitRestartLoop, RoboDRUnitFailed). A configuration that never
+# starts (no BTF, a stale external BTF) costs one failed start attempt per
+# RestartSec=, visible in the journal.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -57,7 +67,14 @@ ExecStart=/usr/sbin/robodr-pulsard --config-file /etc/robodr/pulsar.toml
 # every period. Follow-up: send READY=1 after modules start and WATCHDOG=1
 # from the bus loop, then switch to Type=notify + WatchdogSec=30s.
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
+# The kernel's OOM killer acting inside this cgroup (MemoryMax=) stops the
+# whole unit instead of letting it run on in whatever state the kill left
+# it; Restart=on-failure then starts it again. (Shown with a stand-in
+# service under systemd 255: 9 restarts in 12 s and still restarting with
+# StartLimitIntervalSec=0, failed after 5 with the old start limit.)
+# scripts/check-packages.py (check 11) keeps these three settings.
+OOMPolicy=stop
 # Probes are detached on SIGTERM; give the daemon time to do it cleanly.
 TimeoutStopSec=30s
 
@@ -68,8 +85,10 @@ TimeoutStopSec=30s
 # runaway daemon (event storm, leak, a probe flooding its perf buffers) would
 # push the kernel's OOM killer onto the motion stack instead (sales-readiness
 # T76). With the caps below it hits its own cgroup limit first: only
-# robodr-pulsard is killed, Restart=on-failure brings it back, and the gap
-# is visible (journal, missing heartbeats).
+# robodr-pulsard is killed (OOMPolicy=stop), Restart=on-failure brings it
+# back after RestartSec= however often it happens (no start limit, see
+# [Unit]), and the gap is visible (journal, NRestarts in robodr-metrics,
+# missing heartbeats).
 #   * MemoryMax= is the whole cgroup, including the BPF maps and perf ring
 #     buffers Pulsar locks (LimitMEMLOCK=infinity: kernels >= 5.11 charge
 #     them to the memory cgroup, not to RLIMIT_MEMLOCK). MemoryHigh=

@@ -13,8 +13,8 @@
 //!   before it is written (fail closed).
 //! * [`metrics`]: `robodr-metrics`, a Prometheus textfile exporter of
 //!   `robodr-agentd`'s `status.json` and `robodr-uplink`'s
-//!   `uplink-status.json` (no listening socket; node_exporter's textfile
-//!   collector serves it).
+//!   `uplink-status.json`, and of the systemd state of RoboDR's units (no
+//!   listening socket; node_exporter's textfile collector serves it).
 //!
 //! Commands are run through [`exec`]: absolute search path, cleared
 //! environment, no stdin, bounded output and a timeout.

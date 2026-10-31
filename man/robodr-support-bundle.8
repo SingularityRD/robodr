@@ -87,7 +87,14 @@ list (it is also in the manifest as
 .SS Redaction
 A value whose name reads like a secret
 .RB ( secret ", " password ", " passphrase ", " token ", " private ,
-.BR psk ", " api_key ", " bearer ", " authorization ", " cookie ", " sasl )
+.BR psk ", " api_key ", " hmac ", " bearer ", " authorization ", " cookie ,
+.BR sasl ,
+or a name that is or ends in
+.B key
+such as
+.BR hmac_key ,
+except
+.BR public_key " and " pub_key )
 is replaced by
 .BR <redacted> ,
 unless the name says it is a reference
@@ -97,6 +104,11 @@ structurally, other text line by line
 .RB ( NAME=value ", " "NAME = value" ", " \(dqname\(dq: " value ,
 .BR Environment=NAME=value );
 PEM private-key blocks are dropped whole.
+Whatever the name, the user information of every URL
+.RB ( scheme://user:password@host )
+is replaced by
+.BR <redacted> ,
+in JSON strings and in text.
 .SS Fail closed
 Before the bundle is packed, every file is scanned for key material (PEM
 and OpenSSH private keys, minisign secret keys, RoboDR secret key files).

@@ -173,7 +173,11 @@ pub struct KeyOutcome {
 }
 
 /// Generate the `kinds` keys in `keys_dir` (absolute, under `root`).
-/// Existing keys are kept and reported.
+/// Existing keys are kept and reported. An existing black-box key bound to
+/// another unit (`device_id` other than `unit_id`: the box was
+/// re-provisioned under a new id) is refused before anything is written:
+/// robodr-agentd would refuse to start with it, and replacing it is a
+/// decision for the operator (the SOC trusts the old key).
 pub fn generate_keys(
     root: &Path,
     keys_dir: &str,
@@ -193,6 +197,24 @@ pub fn generate_keys(
              refusing to write secret keys into it",
             md.mode() & 0o7777
         ));
+    }
+    for &kind in kinds.iter().filter(|k| k.bound()) {
+        let path = dir.join(kind.file());
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        let shown = format!("{}/{}", keys_dir.trim_end_matches('/'), kind.file());
+        let k = KeyFile::load(&path).map_err(|e| format!("{shown}: exists but {e}"))?;
+        if k.device_id.as_deref() != Some(unit_id) {
+            return Err(format!(
+                "{shown}: exists and is bound to unit {:?}, not {unit_id:?}; robodr-agentd \
+                 would refuse it (its binding must equal robot.id). Use --unit-id {:?}, or \
+                 retire the old key (move {shown} and its .pub away, revoke it at the SOC) \
+                 and run again",
+                k.device_id.as_deref().unwrap_or("(none)"),
+                k.device_id.as_deref().unwrap_or("(none)"),
+            ));
+        }
     }
     let mut out = Vec::new();
     for &kind in kinds {

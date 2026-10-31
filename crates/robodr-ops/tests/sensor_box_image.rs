@@ -66,6 +66,12 @@ impl BoxRoot {
         );
         stub(&stubs, "systemctl", &format!("echo \"systemctl $*\" >>{l}"));
         stub(&stubs, "findmnt", "echo /dev/vda3");
+        // nft refuses a ruleset that contains BROKEN.
+        stub(
+            &stubs,
+            "nft",
+            &format!("echo \"nft $*\" >>{l}\n! grep -q BROKEN \"$2\""),
+        );
         BoxRoot { t, stubs, log }
     }
 
@@ -162,6 +168,94 @@ fn early_provisions_from_the_command_line_and_renders_runtime_config() {
     assert!(b
         .read("/run/systemd/network/50-site-uplink.network")
         .contains("10.0.0.5"));
+}
+
+/// robodr.ntp must be an IP address: the strict default firewall lets no
+/// DNS out, so a host name would never resolve.
+#[test]
+fn early_accepts_only_an_ip_address_for_ntp() {
+    let b = BoxRoot::new(
+        "img-ntp-name",
+        "robodr.unit_id=sb-07 robodr.ntp=pool.ntp.example\n",
+        0,
+    );
+    let o = b.run("robodr-image-early");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!b.read("/etc/robodr/provision.env").contains("NTP"));
+    assert!(err(&o).contains("not an IP address"), "{}", err(&o));
+    assert!(!b
+        .t
+        .path("/run/systemd/timesyncd.conf.d/50-robodr.conf")
+        .exists());
+    // From provision.env too.
+    b.t.put("/etc/robodr/provision.env", "ROBODR_NTP=ntp.site.example\n");
+    let o = b.run("robodr-image-early");
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("not an IP address"), "{}", err(&o));
+    // IPv6 is an address.
+    let b = BoxRoot::new("img-ntp-v6", "robodr.ntp=2001:db8::123\n", 0);
+    assert!(b.run("robodr-image-early").status.success());
+    assert!(b
+        .read("/run/systemd/timesyncd.conf.d/50-robodr.conf")
+        .contains("NTP=2001:db8::123"));
+}
+
+/// The firewall goes in before anything else can fail; and whatever
+/// happens to robodr-image-early, nftables.service (robodr-nft-load) loads
+/// a ruleset: the site's, or the strict default (fail closed).
+#[test]
+fn the_host_firewall_never_depends_on_early_succeeding() {
+    let b = BoxRoot::new("img-fw-first", "robodr.unit_id=sb-07\n", 0);
+    // Provisioning cannot be written (here: its temporary name is taken).
+    std::fs::create_dir_all(b.t.path("/etc/robodr/provision.env.tmp")).unwrap();
+    let o = b.run("robodr-image-early");
+    assert!(!o.status.success());
+    assert!(
+        b.read("/etc/robodr/nftables.conf").contains("policy drop"),
+        "firewall not installed before the failure: {}",
+        err(&o)
+    );
+
+    let unit = std::fs::read_to_string(
+        recipe().join("mkosi.extra/usr/lib/systemd/system/nftables.service.d/50-robodr-image.conf"),
+    )
+    .unwrap();
+    assert!(unit.contains("ExecStart=\nExecStart=/usr/lib/robodr-image/robodr-nft-load"));
+    assert!(unit.contains("After=robodr-image-early.service"));
+
+    // The site's ruleset loads: only it.
+    let b = BoxRoot::new("img-nft-site", "\n", 0);
+    b.t.put("/etc/robodr/nftables.conf", "site rules\n");
+    let o = b.run("robodr-nft-load");
+    assert!(o.status.success(), "{}", err(&o));
+    let root = b.t.0.display().to_string();
+    assert_eq!(
+        b.calls(),
+        format!("nft -f {root}/etc/robodr/nftables.conf\n")
+    );
+    // Refused by nft: the default instead, and the unit fails visibly.
+    b.t.put("/etc/robodr/nftables.conf", "BROKEN\n");
+    std::fs::remove_file(&b.log).unwrap();
+    let o = b.run("robodr-nft-load");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        b.calls().ends_with(&format!(
+            "nft -f {root}/usr/lib/robodr-image/nftables.default.conf\n"
+        )),
+        "{}",
+        b.calls()
+    );
+    assert!(err(&o).contains("did not load"), "{}", err(&o));
+    // Missing (overlay or early failed): the default.
+    std::fs::remove_file(b.t.path("/etc/robodr/nftables.conf")).unwrap();
+    std::fs::remove_file(&b.log).unwrap();
+    let o = b.run("robodr-nft-load");
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        b.calls(),
+        format!("nft -f {root}/usr/lib/robodr-image/nftables.default.conf\n")
+    );
+    assert!(err(&o).contains("missing"), "{}", err(&o));
 }
 
 #[test]
@@ -262,8 +356,15 @@ fn have(tool: &str) -> bool {
     robodr_ops::exec::which(tool).is_some()
 }
 
-/// A fake offline bundle signed with a fresh minisign key.
+/// A fake offline bundle signed with a fresh minisign key (minisign's
+/// default trusted comment).
 fn signed_bundle(t: &Tmp, tamper: bool) -> (PathBuf, PathBuf) {
+    signed_bundle_tc(t, tamper, "0.1", None)
+}
+
+/// A fake offline bundle of `version`, signed with trusted comment `tc`
+/// (`None`: minisign's default, `timestamp:... file:<name> hashed`).
+fn signed_bundle_tc(t: &Tmp, tamper: bool, version: &str, tc: Option<&str>) -> (PathBuf, PathBuf) {
     let keys = t.path("/keys");
     std::fs::create_dir_all(&keys).unwrap();
     let o = Command::new("minisign")
@@ -274,7 +375,7 @@ fn signed_bundle(t: &Tmp, tamper: bool) -> (PathBuf, PathBuf) {
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", err(&o));
-    let stage = t.path("/stage/robodr-0.1-amd64");
+    let stage = t.path(&format!("/stage/robodr-{version}-amd64"));
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::write(stage.join("robodr_0.1-1_amd64.deb"), b"not really a deb").unwrap();
     let o = Command::new("sh")
@@ -289,28 +390,34 @@ fn signed_bundle(t: &Tmp, tamper: bool) -> (PathBuf, PathBuf) {
     }
     let dl = t.path("/download");
     std::fs::create_dir_all(&dl).unwrap();
-    let bundle = dl.join("robodr-0.1-amd64-offline.tar.gz");
+    let bundle = dl.join(format!("robodr-{version}-amd64-offline.tar.gz"));
     let o = Command::new("tar")
         .arg("-czf")
         .arg(&bundle)
         .arg("-C")
         .arg(t.path("/stage"))
-        .arg("robodr-0.1-amd64")
+        .arg(format!("robodr-{version}-amd64"))
         .output()
         .unwrap();
     assert!(o.status.success());
-    let o = Command::new("minisign")
-        .args(["-S", "-s"])
+    let mut sign = Command::new("minisign");
+    sign.args(["-S", "-s"])
         .arg(keys.join("release.key"))
         .arg("-m")
-        .arg(&bundle)
-        .output()
-        .unwrap();
+        .arg(&bundle);
+    if let Some(tc) = tc {
+        sign.arg("-t").arg(tc);
+    }
+    let o = sign.output().unwrap();
     assert!(o.status.success(), "{}", err(&o));
     (bundle, keys.join("release.pub"))
 }
 
 fn build(t: &Tmp, bundle: &Path, pubkey: &Path) -> (Output, String) {
+    build_with(t, bundle, pubkey, &[])
+}
+
+fn build_with(t: &Tmp, bundle: &Path, pubkey: &Path, extra: &[&str]) -> (Output, String) {
     let stubs = t.path("/mkosi-stub");
     std::fs::create_dir_all(&stubs).unwrap();
     let log = t.path("/mkosi.log");
@@ -332,6 +439,7 @@ fn build(t: &Tmp, bundle: &Path, pubkey: &Path) -> (Output, String) {
         .arg(t.path("/out"))
         .arg("--mkosi")
         .arg(stubs.join("mkosi"))
+        .args(extra)
         .output()
         .unwrap();
     (o, std::fs::read_to_string(&log).unwrap_or_default())
@@ -395,4 +503,61 @@ fn build_image_verifies_the_signed_bundle_before_mkosi() {
     let (o, _) = build(&t4, &bundle4, &next_to);
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains("out of band"), "{}", err(&o));
+}
+
+/// The signed trusted comment binds the signature to the bundle's name and,
+/// with --expect-version, to the release: an older, correctly signed bundle
+/// (renamed or not) is not built by mistake.
+#[test]
+fn build_image_checks_the_trusted_comment() {
+    if !have("minisign") {
+        assert!(std::env::var("ROBODR_REQUIRE_MINISIGN_TEST").as_deref() != Ok("1"));
+        eprintln!("SKIPPED build_image trusted comment: needs minisign");
+        return;
+    }
+    // Signed as release.yml signs: "robodr <version> <file>".
+    let t = Tmp::new("img-tc");
+    let (bundle, pubkey) = signed_bundle_tc(
+        &t,
+        false,
+        "0.1",
+        Some("robodr 0.1 robodr-0.1-amd64-offline.tar.gz"),
+    );
+    let (o, log) = build_with(&t, &bundle, &pubkey, &["--expect-version", "0.1"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout)
+            .contains("trusted comment: robodr 0.1 robodr-0.1-amd64-offline.tar.gz"),
+        "{o:?}"
+    );
+    assert!(!log.is_empty());
+    std::fs::remove_file(t.path("/mkosi.log")).unwrap();
+    // The older release when 0.2 was meant: refused, mkosi never runs.
+    let (o, log) = build_with(&t, &bundle, &pubkey, &["--expect-version", "0.2"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("another release"), "{}", err(&o));
+    assert!(log.is_empty(), "{log}");
+    // The older bundle renamed to pass for 0.2 (signature still valid).
+    let renamed = bundle.with_file_name("robodr-0.2-amd64-offline.tar.gz");
+    std::fs::copy(&bundle, &renamed).unwrap();
+    std::fs::copy(
+        bundle.with_extension("gz.minisig"),
+        renamed.with_extension("gz.minisig"),
+    )
+    .unwrap();
+    let (o, log) = build(&t, &renamed, &pubkey);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("names another file"), "{}", err(&o));
+    assert!(log.is_empty(), "{log}");
+    // minisign's default comment names the file but no version: fine
+    // without --expect-version, refused with it.
+    let t2 = Tmp::new("img-tc-default");
+    let (b2, k2) = signed_bundle(&t2, false);
+    let (o, _) = build(&t2, &b2, &k2);
+    assert!(o.status.success(), "{}", err(&o));
+    let (o, _) = build_with(&t2, &b2, &k2, &["--expect-version", "0.1"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    // A version with shell or path characters is a usage error.
+    let (o, _) = build_with(&t2, &b2, &k2, &["--expect-version", "0.1;x"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
 }
