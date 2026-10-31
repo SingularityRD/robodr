@@ -1,0 +1,67 @@
+# Dependency update pull requests (T57 of docs/SALES-READINESS.md;
+# docs/BUILD.md "Dependency updates"). Every update goes through the full CI:
+# cargo-deny (advisories, licences against deny.toml, sources), the
+# Cargo.lock policy, the reproducible build and the extended jobs. Security
+# advisories are also raised by the weekly `deny` run of ci.yml.
+version: 2
+updates:
+  # The workspace (Cargo.lock is committed and audited).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:17"
+    open-pull-requests-limit: 10
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "deps"
+    groups:
+      # One PR for compatible updates; each semver-major update stays alone,
+      # it needs a review of its own (API, MSRV, licence).
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  # The fuzz workspace (its own manifest, never shipped).
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    labels: [dependencies, fuzz]
+    commit-message:
+      prefix: "deps(fuzz)"
+    groups:
+      fuzz-all:
+        patterns: ["*"]
+
+  # Actions are pinned by full commit SHA with the tag in a comment;
+  # Dependabot keeps both in step.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:17"
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # vendor/pulsar (eBPF probes, rules engine). A bump changes what is loaded
+  # into the robot's kernel: CI's rule validation, the eBPF load job and the
+  # GPL source offer must pass, and the PR needs the owners of vendor/
+  # (.github/CODEOWNERS).
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:17"
+    open-pull-requests-limit: 1
+    labels: [dependencies, pulsar]
+    commit-message:
+      prefix: "deps(pulsar)"
