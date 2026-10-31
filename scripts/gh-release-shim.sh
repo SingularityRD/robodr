@@ -116,6 +116,12 @@ view)
     ;;
 edit)
     [[ -f "$rel/meta" ]] || die 1 "release $tag not found"
+    # GitHub does not make a pre-release "Latest"; the shim refuses the
+    # whole edit so a dry run catches a workflow asking for it (what the real
+    # API answers, an error or silently ignoring it, is not emulated).
+    if [[ "$latest" == 1 ]] && grep -qx 'prerelease=1' "$rel/meta"; then
+        die 1 "edit: --latest=true on a pre-release"
+    fi
     [[ -z "$notes" ]] || { [[ -s "$notes" ]] || die 1 "notes file $notes empty"; cp "$notes" "$rel/notes.md"; }
     if [[ "$draft" == 0 ]]; then
         sed -i 's/^draft=.*/draft=0/' "$rel/meta"

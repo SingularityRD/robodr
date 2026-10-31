@@ -25,7 +25,9 @@
 #
 # Gates before anything is built (`prepare`) and again right before signing
 # (`publish`), scripts/release-gate.py:
-#  * line: the tagged commit is on main (the release becomes "Latest") or
+#  * line: the tagged commit is on main (the release becomes "Latest",
+#    unless the version is a pre-release, which GitHub never makes
+#    "Latest") or
 #    on release/X.Y for version X.Y.* (a long-term-support line; never
 #    "Latest"). Protect release/* like main (required reviews and checks).
 #  * ci: ci.yml has a completed, successful push / workflow_dispatch /
@@ -274,7 +276,8 @@ jobs:
         run: |
           if [ "$DRY_RUN" = true ]; then echo "dry run: no release created"; exit 0; fi
           pre=""
-          case "$VERSION" in *-*) pre="--prerelease" ;; esac
+          # Same rule as release-gate.py (latest=false): a '-' before any '+build'.
+          case "${VERSION%%+*}" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --draft --verify-tag $pre \
             --title "RoboDR $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
@@ -936,8 +939,14 @@ jobs:
           fetch-depth: 0
       - name: Release line and CI (again, right before signing)
         id: line
+        # No pipe: the default `bash -e` shell has no pipefail, so
+        # `gate | tee` would hide a refusal. The output reaches
+        # $GITHUB_OUTPUT only when the gate accepted.
         run: |
-          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" | tee -a "$GITHUB_OUTPUT"
+          python3 scripts/release-gate.py line --commit "$GITHUB_SHA" --version "$VERSION" > "$RUNNER_TEMP/line"
+          cat "$RUNNER_TEMP/line"
+          grep -qxE 'latest=(true|false)' "$RUNNER_TEMP/line" || { echo "::error::release line output missing"; exit 1; }
+          cat "$RUNNER_TEMP/line" >> "$GITHUB_OUTPUT"
           python3 scripts/release-gate.py ci --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
       - name: Install minisign, rpm2archive (rebuild comparison) and cyclonedx-cli (SBOM schema)
         run: |
@@ -1004,7 +1013,8 @@ jobs:
             echo '```'
           } >> "$RUNNER_TEMP/notes.md"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
-          # An older release line (release/X.Y) never becomes "Latest".
+          # An older release line (release/X.Y) or a pre-release never
+          # becomes "Latest" (release-gate.py line).
           case "$LATEST" in true|false) ;; *) echo "::error::release line output missing"; exit 1 ;; esac
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$LATEST"
 

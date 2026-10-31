@@ -53,7 +53,8 @@
 #  6. Acceptance beyond the workflow: the published set is complete and
 #     signed (minisign -V with the public key FILE, SHA256SUMS covers every
 #     asset), the SLSA provenance verifies against the published assets
-#     (scripts/slsa-provenance.py verify), the release is marked Latest,
+#     (scripts/slsa-provenance.py verify), the release is marked Latest
+#     (explicitly not Latest for a pre-release version such as the default),
 #     every offline bundle passes `install-bundle.sh verify --pubkey
 #     --tarball` (trusted copy from the release commit) and is refused when
 #     tampered with or checked with another key, and every .deb passes
@@ -100,6 +101,10 @@ while [[ $# -gt 0 ]]; do
 done
 case "$tag" in v[0-9]*) ;; *) echo "release-dry-run: --tag must look like v<version>" >&2; exit 2 ;; esac
 version="${tag#v}"
+# A pre-release (a '-' before any '+build') is never "Latest"
+# (scripts/release-gate.py line).
+want_latest=true
+case "${version%%+*}" in *-*) want_latest=false ;; esac
 workflow_rel=.github/workflows/release.yml
 
 # ---------------------------------------------------------------- preflight
@@ -312,7 +317,7 @@ for j in $jobs; do
     fi
     args=(--job "$job" --sha "$sha" --ref-name "$tag")
     [[ -n "$arch" ]] && args+=(--matrix "arch=$arch")
-    [[ -n "$vout" ]] && args+=(--needs "prepare.version=$vout" --needs "prepare.latest=true" --needs "prepare.dry_run=false")
+    [[ -n "$vout" ]] && args+=(--needs "prepare.version=$vout" --needs "prepare.latest=$want_latest" --needs "prepare.dry_run=false")
     [[ "$job" == prepare ]] && args+=(--outputs-file "$outputs")
     # The build jobs run with ROBODR_RELEASE=1, which refuses a placeholder
     # maintainer; the dry run's own (reserved .test domain) stands in for
@@ -351,7 +356,7 @@ for j in $jobs; do
         vout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$outputs")"
         [[ "$vout" == "$version" ]] || { result FAIL "prepare output version '$vout' != $version"; break; }
         lout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["latest"])' "$outputs")"
-        [[ "$lout" == true ]] || { result FAIL "prepare: a commit on main must become Latest (latest=$lout)"; break; }
+        [[ "$lout" == "$want_latest" ]] || { result FAIL "prepare: latest=$lout, want $want_latest (a commit on main becomes Latest unless $version is a pre-release)"; break; }
     fi
 done
 grep -h '^\[dry-run\] .*adaptation' "$out"/logs/*.log 2>/dev/null | sort | uniq -c |
@@ -366,10 +371,16 @@ if [[ $rc_all == 0 && $publish_ran == 1 ]]; then
     else
         result FAIL "release still a draft"
     fi
-    if grep -qx 'latest=1' "$rel/meta"; then
-        result PASS "marked Latest (a release from main)"
+    if [[ "$want_latest" == true ]]; then
+        if grep -qx 'latest=1' "$rel/meta"; then
+            result PASS "marked Latest (a final release from main)"
+        else
+            result FAIL "a final release from main is not marked Latest"
+        fi
+    elif grep -qx 'latest=0' "$rel/meta"; then
+        result PASS "not marked Latest (pre-release $version)"
     else
-        result FAIL "a release from main is not marked Latest"
+        result FAIL "pre-release $version: --latest=false was not requested"
     fi
     case "$version" in
     *-*)
