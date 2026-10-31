@@ -1,0 +1,40 @@
+[package]
+name = "robodr-ops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "RoboDR operator tools: robodr-setup (host preflight, key generation, role configuration, key fingerprints), robodr-support-bundle (redacted diagnostics with a SHA-256 manifest; never keys or evidence) and robodr-metrics (Prometheus textfile exporter of the daemons' status files)."
+
+# std + RoboDR crates + serde only (no async runtime, no Pulsar, no new
+# crates.io dependency), so the tools build static for robodr-focal.
+[dependencies]
+# Key generation and the key file format (robodr-blackbox keygen's code).
+robodr-blackbox = { workspace = true }
+# The daemon's own status freshness rule (daemon::effective_state,
+# notify::monotonic_ms) and configuration parser (config::parse), so the
+# exporter and the role configuration can never drift from agentd.
+robodr-agentd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[[bin]]
+name = "robodr-setup"
+path = "src/bin/robodr-setup.rs"
+
+[[bin]]
+name = "robodr-support-bundle"
+path = "src/bin/robodr-support-bundle.rs"
+
+[[bin]]
+name = "robodr-metrics"
+path = "src/bin/robodr-metrics.rs"
+
+[dev-dependencies]
+# The key fingerprint definition robodr-setup must match (revocation lists).
+robodr-commission = { workspace = true }

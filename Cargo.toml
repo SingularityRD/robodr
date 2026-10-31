@@ -19,6 +19,7 @@ members = [
     "crates/robodr-fleet",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
+    "crates/robodr-ops",
     "crates/robodr-pkg",
     "crates/robodr-release",
     "crates/robodr-responder",

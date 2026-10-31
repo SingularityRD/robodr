@@ -1,0 +1,61 @@
+# robodr-metrics: Prometheus textfile exporter of RoboDR's status files.
+# Example unit (installed as /usr/share/doc/robodr/examples/metrics/; not
+# active). Enable with:
+#
+#   install -m 0644 robodr-metrics.service.example /etc/systemd/system/robodr-metrics.service
+#   install -m 0644 robodr-metrics.timer.example   /etc/systemd/system/robodr-metrics.timer
+#   systemctl daemon-reload && systemctl enable --now robodr-metrics.timer
+#
+# and let node_exporter's textfile collector read /run/robodr-metrics:
+#   --collector.textfile.directory=/run/robodr-metrics
+# (or a symlink to /run/robodr-metrics/robodr.prom in the directory it
+# already reads, e.g. /var/lib/prometheus/node-exporter/).
+#
+# No listening socket: RoboDR adds no network service for monitoring. The
+# file holds counters and states only (no finding content, no free text).
+#
+# Privileges: it reads robodr-agentd's status.json (group robodr) and
+# robodr-uplink's uplink-status.json (0600 robodr-uplink), so it runs as
+# root with CAP_DAC_READ_SEARCH only (read any file, write nothing it does
+# not own), no network, a read-only OS, and the key and evidence trees
+# hidden. It writes only its RuntimeDirectory.
+
+[Unit]
+Description=RoboDR metrics (Prometheus textfile)
+Documentation=man:robodr-metrics(1)
+After=robodr-agentd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/robodr-metrics --out /run/robodr-metrics/robodr.prom
+RuntimeDirectory=robodr-metrics
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+InaccessiblePaths=-/etc/robodr/keys -/run/credentials -/var/lib/robodr/blackbox -/var/lib/robodr/control-plane -/var/lib/robodr/export/diode
+MemoryMax=64M
+CPUQuota=20%
+TimeoutStartSec=30s
