@@ -574,8 +574,8 @@ def augment(
                 }
             )
     for rel, data in sorted(ebpf or []):
-        if not ebpf_version:
-            raise ValueError("eBPF objects given without an eBPF (Pulsar) version")
+        if not isinstance(ebpf_version, str) or not re.fullmatch(r"[0-9A-Za-z.+-]{1,64}", ebpf_version):
+            raise ValueError(f"eBPF objects need an eBPF (Pulsar) version, got {ebpf_version!r}")
         if not re.fullmatch(r"[A-Za-z0-9_./+-]{1,256}", rel) or ".." in rel.split("/") or rel.startswith("/"):
             raise ValueError(f"bad eBPF object path {rel!r}")
         added.append(
