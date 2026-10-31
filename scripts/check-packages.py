@@ -41,6 +41,14 @@ Static checks (no package needed; CI job `scripts`):
      needs, and `publish` runs scripts/compare-rebuild.py before it writes
      SHA256SUMS and signs.
 
+  11. Resource caps (sales-readiness T76): every long-running service
+     (regular and focal; Type= other than oneshot) sets MemoryMax=, so a
+     runaway RoboDR daemon hits its own cgroup limit before it can push the
+     OOM killer onto the robot's motion stack; the units in CPU_CAPPED
+     (event-driven detectors that an event storm could make spin) also set
+     CPUQuota=. (The inline gateway is deliberately not CPU-capped: it is a
+     real-time process in the motion path, where throttling is latency.)
+
   5a. Every unit (regular and focal) and every unit with each of its
      drop-in examples applied: with SecureBits=noroot / noroot-locked, a
      process of uid 0 gets capabilities on execve only through the ambient
@@ -142,6 +150,8 @@ OWN_USER = {
     "robodr-uplink.service": "robodr-uplink",
     "robodr-firewall-gw.service": "robodr-gw",
 }
+# Units that must also cap their CPU time (check 11).
+CPU_CAPPED = {"robodr-pulsard.service"}
 # The only capabilities the firewall ruleset's commands need.
 RULES_CAPS = {"CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SYS_MODULE"}
 
@@ -396,6 +406,26 @@ def check_units_caps(root: Path) -> list[str]:
     return errs
 
 
+def check_unit_resources_text(name: str, text: str) -> list[str]:
+    if (unit_values(text, "Type") or ["simple"])[-1] == "oneshot":
+        return []
+    errs = []
+    if not unit_values(text, "MemoryMax"):
+        errs.append(f"{name}: long-running service without MemoryMax= (a runaway daemon is not capped by its own cgroup)")
+    if Path(name).name in CPU_CAPPED and not unit_values(text, "CPUQuota"):
+        errs.append(f"{name}: without CPUQuota= (an event storm must not take the robot's CPU)")
+    return errs
+
+
+def check_unit_resources(root: Path) -> list[str]:
+    errs = []
+    sysd = root / "packaging" / "systemd"
+    for d in (sysd, sysd / "focal"):
+        for unit in sorted(d.glob("*.service")):
+            errs += check_unit_resources_text(str(unit.relative_to(sysd)), unit.read_text())
+    return errs
+
+
 def unit_values(text: str, key: str) -> list[str]:
     """Every value of KEY= in a unit (in order; an empty one resets)."""
     out: list[str] = []
@@ -589,6 +619,7 @@ def static_checks(root: Path) -> list[str]:
         + check_build_deb(root)
         + check_scripts(root)
         + check_units_caps(root)
+        + check_unit_resources(root)
         + check_identities(root)
         + check_rules_unit(root)
         + check_release_workflow(root)
@@ -969,6 +1000,13 @@ def self_test() -> int:
     expect("rules full caps", check_rules_unit_text("r", rules.replace(
         "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE", "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN")), False)
     expect("rules no ProtectSystem", check_rules_unit_text("r", rules.replace("ProtectSystem=strict", "")), False)
+    # 11. Resource caps: the real units pass; pulsard without its caps fails.
+    expect("unit resources ok", check_unit_resources(ROOT), True)
+    pulsard = (pk / "systemd" / "robodr-pulsard.service").read_text()
+    expect("pulsard without MemoryMax", check_unit_resources_text("p", pulsard.replace("MemoryMax=512M\n", "")), False)
+    expect("pulsard without CPUQuota", check_unit_resources_text(
+        "robodr-pulsard.service", pulsard.replace("CPUQuota=100%\n", "")), False)
+    expect("oneshot needs no cap", check_unit_resources_text("o", "[Service]\nType=oneshot\nExecStart=/bin/true\n"), True)
     # 10. The release workflow.
     rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
     expect("release workflow ok", check_release_workflow_text(rel), True)
@@ -978,7 +1016,7 @@ def self_test() -> int:
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
     expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 53
+    total = 57
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

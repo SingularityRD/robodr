@@ -120,6 +120,20 @@ with `WatchdogSec=` set, systemd would kill a healthy daemon. For it,
 `Restart=on-failure` with a start limit (5 starts in 300 s) covers crashes.
 Neither watchdog has been exercised under a real systemd yet.
 
+Every long-running unit caps its own cgroup with `MemoryMax=` (and most with
+`MemoryHigh=`), so a runaway RoboDR daemon is killed inside its own limit and
+restarted, instead of pushing the kernel's OOM killer onto the robot's motion
+stack. `robodr-pulsard` keeps `OOMScoreAdjust=-500` (detection outlives
+ordinary services) but is now bounded: `MemoryHigh=384M`, `MemoryMax=512M`
+(BPF maps and perf buffers are charged to this cgroup on kernels >= 5.11),
+`MemorySwapMax=0`, `CPUQuota=100%` (one CPU for the user-space side; the eBPF
+programs run in the kernel) and `TasksMax=128`. These values are provisional,
+estimated on a development VM; size them on the target from the commissioning
+run (`systemctl show -p MemoryPeak,CPUUsageNSec robodr-pulsard`) and override
+them with a drop-in, never by removing them. `scripts/check-packages.py`
+(check 11) fails a long-running unit without `MemoryMax=` and
+`robodr-pulsard.service` without `CPUQuota=`.
+
 ## Filesystem layout
 
 ```
