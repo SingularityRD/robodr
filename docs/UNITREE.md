@@ -138,15 +138,21 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
 2. **Install the bundle** ([OPERATIONS.md section 3](OPERATIONS.md#3-install-on-an-air-gapped-host)):
 
    ```sh
-   minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
-   sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+   sudo install -d -m 0700 -o root -g root /root/robodr-$V
+   sudo cp -- robodr-$V-$A-offline.tar.gz robodr-$V-$A-offline.tar.gz.minisig /root/robodr-$V/
+   sudo minisign -V -p /etc/robodr-trust/robodr-release.pub -m /root/robodr-$V/robodr-$V-$A-offline.tar.gz
+   #   the "Trusted comment" printed must name robodr-$V-$A-offline.tar.gz
+   sudo tar -xzf /root/robodr-$V/robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
    sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
        --pubkey /etc/robodr-trust/robodr-release.pub \
-       --tarball robodr-$V-$A-offline.tar.gz
+       --tarball /root/robodr-$V/robodr-$V-$A-offline.tar.gz
    ```
 
-   Verify before extracting; upgrades run `/usr/lib/robodr/install-bundle.sh`
-   (OPERATIONS.md section 3).
+   Copy once into a root-owned directory, then verify, extract and install
+   that copy only: a tarball on the media can be swapped between the check
+   and the extraction. Upgrades run `/usr/lib/robodr/install-bundle.sh`
+   (OPERATIONS.md section 3). On Ubuntu 20.04 the bundle is
+   `robodr-focal-$V-$A`: replace `robodr-$V-$A` with it in every command.
 
    The units are installed disabled. `robodr-pulsard` is not needed for the
    robot (it watches the host it runs on); enabling it on the box to watch

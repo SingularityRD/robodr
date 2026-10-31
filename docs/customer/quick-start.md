@@ -43,19 +43,48 @@ site ([OPERATIONS section 2](../OPERATIONS.md)).
 
 ## 2. Robot or sensor box: install
 
-Verify the tarball **before** extracting it, then run the installer from
-the verified extraction (upgrades: from `/usr/lib/robodr/install-bundle.sh`,
-installed by the previous release). It installs from its own private copy
-of the signed tarball and refuses an extracted directory that was modified
-([OPERATIONS section 3](../OPERATIONS.md)).
+Verify the tarball **before** extracting it, and verify, extract and
+install the **same copy**. A file on removable media, or in a directory
+another user can write, can be swapped between the check and the
+extraction; the package's scripts then run as root from something that was
+never verified. So copy the tarball and its signature once into a
+root-owned 0700 directory and use only that copy
+([OPERATIONS section 3](../OPERATIONS.md#3-install-on-an-air-gapped-host);
+this block is the same as there):
 
 ```sh
-minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
-sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+sudo install -d -m 0700 -o root -g root /root/robodr-$V
+sudo cp -- robodr-$V-$A-offline.tar.gz robodr-$V-$A-offline.tar.gz.minisig /root/robodr-$V/
+sudo minisign -V -p /etc/robodr-trust/robodr-release.pub -m /root/robodr-$V/robodr-$V-$A-offline.tar.gz
+#   the "Trusted comment" printed must name robodr-$V-$A-offline.tar.gz
+sudo tar -xzf /root/robodr-$V/robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
 sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
+    --pubkey /etc/robodr-trust/robodr-release.pub \
+    --tarball /root/robodr-$V/robodr-$V-$A-offline.tar.gz
+```
+
+The installer makes its own private copy of the tarball, checks the
+signature again against the pinned key and refuses an extracted directory
+that differs from the signed content. Upgrades run the installer that the
+previous, verified release installed, so the tarball may stay on the
+media:
+
+```sh
+sudo sh /usr/lib/robodr/install-bundle.sh install \
     --pubkey /etc/robodr-trust/robodr-release.pub \
     --tarball robodr-$V-$A-offline.tar.gz
 ```
+
+The bundle name differs per package. The commands above are for
+`robodr` (`.deb`). For the other two, replace `robodr-$V-$A` with the
+name below in every command; the tarball is that name plus
+`-offline.tar.gz` and it extracts to a directory of that name:
+
+| Package | Bundle name | Tarball |
+|---|---|---|
+| `robodr` (`.deb`) | `robodr-$V-$A` | `robodr-$V-$A-offline.tar.gz` |
+| `robodr-focal` (Ubuntu 20.04 / JetPack 5) | `robodr-focal-$V-$A` | `robodr-focal-$V-$A-offline.tar.gz` |
+| `robodr` RPM (RHEL / Rocky / Alma 9) | `robodr-$V-$A-rpm` | `robodr-$V-$A-rpm-offline.tar.gz` |
 
 Units are installed **disabled**. The installer ends with the host
 preflight (`robodr-setup preflight`: BTF, bpffs, nf_tables, systemd, glibc,
@@ -65,8 +94,7 @@ service. The install itself succeeds either way. Before installing, check the
 `robodr` package glibc 2.35+ and systemd 247+ (`robodr-focal`: systemd
 245+), a kernel with BTF for `robodr-pulsard`, and `minisign` where the
 signature is checked. RHEL / Rocky / Alma 9 use the RPM offline bundle
-(`robodr-$V-$A-rpm-offline.tar.gz`) with the same commands. On a sensor
-box, also follow the hardening checklist in
+(table above). On a sensor box, also follow the hardening checklist in
 [UNITREE.md section 3.1](../UNITREE.md).
 
 ## 3. Keys
