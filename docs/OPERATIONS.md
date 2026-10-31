@@ -2095,7 +2095,11 @@ set: SNI and the verified name are the same); `server_spki_sha256`
 for a receiver with `client_ca`. All paths absolute; the key file needs
 no access for others and no group write; give it to agentd through a
 `LoadCredential=anchor-tls.key:/etc/robodr/anchor/ugv-07.key` drop-in
-(section 6.4 explains drop-ins). A TLS failure is an anchor failure (the
+(section 6.4 explains drop-ins). agentd's unit denies every IP address
+(`IPAddressDeny=any`), so the same drop-in must also allow the receiver
+(`IPAddressAllow=10.20.0.1/32` for the example above); without it every
+delivery fails and is counted as an anchor failure. This outbound
+connection is the only one agentd opens. A TLS failure is an anchor failure (the
 robot keeps recording, `anchor_failures` counts it); there is no fallback
 to plain TCP. Each exchange is bounded as a whole (connect within
 `timeout_ms`, then handshake, request and answer within three times it),
@@ -3285,6 +3289,35 @@ wrong user or password, or the mechanism is not enabled for that user. `UNKNOWN_
 (it is never auto-created). `TOPIC_AUTHORIZATION_FAILED`: grant WRITE and
 DESCRIBE on the findings topic (default `robodr.findings`) to the
 publisher's principal.
+
+**Delivered findings stay on the unit.** Every exporter (spool-export,
+kafka-publish, uplink) acknowledges a delivered record by moving it from
+`<spool>/ready/` to `<spool>/acked/`; nothing deletes it on delivery.
+agentd deletes `acked/` records, oldest first, only when a new record would
+exceed the spool bound (`spool.max_bytes` / `spool.max_files` in
+`agentd.json`, default 64 MiB / 10,000 files for `ready/` and `acked/`
+together); undelivered records in `ready/` are never deleted. On a unit
+that reports a few findings a day, delivered findings (which can carry
+personal data: operator names, addresses, process names) can therefore stay
+for months. `rejected/` records are kept unless the exporter's
+`--rejected-max-*` bounds are set (above). There is no age-based retention
+for `acked/` yet. To purge by age, delete old `acked/` records, but keep the
+newest one: agentd numbers new records after the highest one in `ready/`
+and `acked/` when it starts, and an emptied spool would reuse numbers the
+exporters have already seen:
+
+```sh
+A=/var/lib/robodr/spool/agentd/acked
+keep=$(sudo ls "$A" | sort | tail -n 1)
+sudo find "$A" -maxdepth 1 -name '*.json' ! -name "$keep" -mtime +30 -delete
+```
+
+(`-mtime +30`: written more than 30 days ago; a move into `acked/` keeps
+the file's time.) Run it from a timer or cron job to keep a fixed
+retention (agentd tolerates records removed under it: it rescans the
+spool before it prunes or refuses a record). Lowering
+`spool.max_files` / `spool.max_bytes` also shortens it, at the cost of
+headroom for an exporter that falls behind.
 
 ### 8.4 Journal
 

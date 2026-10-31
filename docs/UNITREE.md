@@ -369,8 +369,8 @@ every process in `/proc`; on Ubuntu 20.04's default hybrid cgroup layout
 `MemoryHigh=` has no effect and `MemoryMax=` becomes the v1 memory limit;
 `IPAddressDeny=` needs the kernel's cgroup BPF support: if the journal
 says "Proceeding WITHOUT firewalling in effect!" after the first start, it
-is not enforced on that kernel (agentd still opens no IP connection itself,
-and `robodr-spool-export` uses `PrivateNetwork=yes`, which does not depend
+is not enforced on that kernel (agentd still opens no IP connection itself
+unless the control plane or a remote head anchor is configured, and `robodr-spool-export` uses `PrivateNetwork=yes`, which does not depend
 on it). These units have been checked with `systemd-analyze verify` on
 systemd 255 and their start sequence simulated without systemd; they have
 **not** run under a real systemd 245 or on a Jetson yet.
