@@ -228,6 +228,47 @@ fn keys_are_generated_once_bound_and_never_overwritten() {
     assert!(setup::generate_keys(&t.0, "/etc/robodr/keys", &[KeyKind::Blackbox], "../x").is_err());
 }
 
+/// Re-provisioned under a new unit id: the kept black-box key would still
+/// be bound to the old one and robodr-agentd would refuse to start, so the
+/// setup refuses, before it creates any other key.
+#[test]
+fn a_kept_blackbox_key_bound_to_another_unit_is_refused() {
+    let t = Tmp::new("keys-rebind");
+    mkdir_mode(&t.path("/etc/robodr/keys"), 0o700);
+    setup::generate_keys(&t.0, "/etc/robodr/keys", &[KeyKind::Blackbox], "ugv-007").unwrap();
+    let e = setup::generate_keys(
+        &t.0,
+        "/etc/robodr/keys",
+        &[KeyKind::Finding, KeyKind::Blackbox],
+        "ugv-008",
+    )
+    .unwrap_err();
+    assert!(e.contains("\"ugv-007\"") && e.contains("ugv-008"), "{e}");
+    assert!(!t.path("/etc/robodr/keys/agentd-finding.key").exists());
+    // The same id: kept. Unbound keys (uplink) are not affected.
+    let ok = setup::generate_keys(
+        &t.0,
+        "/etc/robodr/keys",
+        &[KeyKind::Blackbox, KeyKind::Uplink],
+        "ugv-007",
+    )
+    .unwrap();
+    assert_eq!(ok[0].action, "kept");
+    // The CLI says so and exits 1.
+    let o = run(&[
+        "keys",
+        "--root",
+        t.0.to_str().unwrap(),
+        "--unit-id",
+        "ugv-009",
+    ]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("bound to unit"),
+        "{o:?}"
+    );
+}
+
 #[test]
 fn fingerprints_match_the_commission_definition() {
     let t = Tmp::new("fp");

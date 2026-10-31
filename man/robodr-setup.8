@@ -195,6 +195,11 @@ reach is refused.
 .BR LoadCredential= ),
 bound to the unit id (agentd requires the binding to equal
 .BR robot.id ).
+An existing one bound to another unit id (a box re-provisioned under a new
+id) is refused with exit 1 before any key is written: retire the old key
+(move it and its
+.I .pub
+away, revoke it at the SOC) or use the old id.
 The default for every role but
 .BR soc\-relay .
 .TP
