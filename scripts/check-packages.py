@@ -150,6 +150,8 @@ NEVER_PACKAGED = {
     "robodr-safety-replay": "test tool of robodr-deliverd",
     "robodr-release": "SOC / build-side delivery artifact tool",
     "robodr-signer": "key-ceremony check tool, used next to robodr-release (the PKCS#11 adapter script is packaged)",
+    "robodr-attack-sim": "PoC attack simulator (lab and demo use, never on a robot)",
+    "robodr-demo-soc": "PoC demo SOC receiver (lab and demo use)",
 }
 # build-deb.sh requires these whatever ROBODR_DEB_REQUIRE says.
 ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch",
@@ -357,7 +359,7 @@ def check_build_deb(root: Path) -> list[str]:
     return [f"packaging/build-deb.sh: never installs {p}" for p in sorted(PROGRAMS) if not re.search(rf"\b{re.escape(p)}\b", text)]
 
 
-FOR_RE = re.compile(r"for u in (.*?); do\n(.*?)\n", re.S)
+FOR_RE = re.compile(r"for u in (.*?); do\n(.*?)\n\s*done\b", re.S)
 
 
 def unit_loops(text: str) -> dict[str, set[str]]:
@@ -694,7 +696,9 @@ def check_release_workflow_text(text: str) -> list[str]:
     errs = []
     jobs = job_blocks(text)
     for j in ("prepare", "publish"):
-        if "merge-base --is-ancestor" not in jobs.get(j, "") or "origin/main" not in jobs.get(j, ""):
+        # scripts/release-gate.py line: on origin/main, or on the version's
+        # release/X.Y line (merge-base --is-ancestor; refused otherwise).
+        if "scripts/release-gate.py line" not in jobs.get(j, ""):
             errs.append(f"release.yml: job {j} does not check that the tagged commit is on main")
     pub = jobs.get("publish", "")
     m = re.search(r"needs:\s*\[([^\]]*)\]", pub)
@@ -710,14 +714,25 @@ def check_release_workflow_text(text: str) -> list[str]:
             errs.append(f"release.yml: {rebuild} does not run scripts/ci-rebuild.sh")
         if rebuild not in needs:
             errs.append(f"release.yml: publish does not need {rebuild}")
-    cmp_at, sums_at, sign_at = pub.find("python3 scripts/compare-rebuild.py"), pub.find("> SHA256SUMS"), pub.find("minisign -S")
-    if cmp_at < 0 or not (0 <= cmp_at < sums_at < sign_at):
-        errs.append("release.yml: publish must run scripts/compare-rebuild.py before writing SHA256SUMS and signing")
+    fin_at, sign_at = pub.find("scripts/release-finalize.sh"), pub.find("scripts/release-sign.sh")
+    if not (0 <= fin_at < sign_at):
+        errs.append("release.yml: publish must run scripts/release-finalize.sh before scripts/release-sign.sh")
     return errs
 
 
+def check_release_finalize_text(text: str) -> list[str]:
+    """scripts/release-finalize.sh compares the rebuild before it writes
+    SHA256SUMS (release-sign.sh signs only what SHA256SUMS lists)."""
+    cmp_at = text.find("compare-rebuild.py")
+    sums_at = text.find(">\"$work/SHA256SUMS\"")
+    if not (0 <= cmp_at < sums_at):
+        return ["scripts/release-finalize.sh: must run compare-rebuild.py before writing SHA256SUMS"]
+    return []
+
+
 def check_release_workflow(root: Path) -> list[str]:
-    return check_release_workflow_text((root / ".github" / "workflows" / "release.yml").read_text())
+    return check_release_workflow_text((root / ".github" / "workflows" / "release.yml").read_text()) + \
+        check_release_finalize_text((root / "scripts" / "release-finalize.sh").read_text())
 
 
 def static_checks(root: Path) -> list[str]:
@@ -1156,13 +1171,17 @@ def self_test() -> int:
     # 10. The release workflow.
     rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
     expect("release workflow ok", check_release_workflow_text(rel), True)
-    expect("no main check", check_release_workflow_text(rel.replace("merge-base --is-ancestor", "true")), False)
+    expect("no main check", check_release_workflow_text(rel.replace("scripts/release-gate.py line", "true")), False)
     expect("publish without rebuild", check_release_workflow_text(
-        rel.replace(", rebuild-deb, rebuild-rpm, rebuild-static]", "]")), False)
+        rel.replace(", rebuild-deb, rebuild-rpm, rebuild-static, delivery]", ", delivery]")), False)
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
-    expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 67
+    expect("sign before finalize", check_release_workflow_text(
+        rel.replace("scripts/release-finalize.sh", "true")), False)
+    fin = (ROOT / "scripts" / "release-finalize.sh").read_text()
+    expect("finalize ok", check_release_finalize_text(fin), True)
+    expect("no comparison", check_release_finalize_text(fin.replace("compare-rebuild.py", "true")), False)
+    total = 69
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

@@ -11,24 +11,24 @@ This is the full generated reference. How to read a finding, what each detection
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
 * **Since** is the contract version that added the entry. A consumer validating an older message applies that message's catalog; an id without an entry is reported with a generic title ("RoboDR model-profile deviation").
 
-162 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
+165 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
 
 ## By data source
 
 | Data source | Rule ids |
 |---|---|
 | `host_runtime` | 1 |
-| `robodr_agent` | 26 |
+| `robodr_agent` | 27 |
 | `robodr_correlation` | 10 |
 | `robodr_delivery` | 17 |
 | `robot_safety_state` | 4 |
-| `ros2_dds_discovery` | 32 |
+| `ros2_dds_discovery` | 34 |
 | `ros2_motion_commands` | 72 |
 
 ## Families
 
-* [`robot.agent.*`](#robotagent) (24)
-* [`robot.capture.*`](#robotcapture) (9)
+* [`robot.agent.*`](#robotagent) (25)
+* [`robot.capture.*`](#robotcapture) (10)
 * [`robot.correlate.*`](#robotcorrelate) (10)
 * [`robot.dds.*`](#robotdds) (1)
 * [`robot.deliver.*`](#robotdeliver) (7)
@@ -38,7 +38,7 @@ This is the full generated reference. How to read a finding, what each detection
 * [`robot.host.*`](#robothost) (1)
 * [`robot.motion.*`](#robotmotion) (20)
 * [`robot.profile.*`](#robotprofile) (1)
-* [`robot.ros2.*`](#robotros2) (16)
+* [`robot.ros2.*`](#robotros2) (17)
 * [`robot.rtps.*`](#robotrtps) (7)
 * [`robot.safety_state.*`](#robotsafety_state) (4)
 * [`robot.seal.*`](#robotseal) (5)
@@ -52,6 +52,7 @@ This is the full generated reference. How to read a finding, what each detection
 |---|---|---|---|---|---|
 | `robot.agent.clock_jump` | Robot wall clock jumped | The robot's wall clock moved away from what its monotonic clock says elapsed (a time step, an RTC reset or a spoofed time source). Durations are unaffected; finding and evidence times around the jump may be wrong. | `robodr_agent` | - | 2.5 |
 | `robot.agent.clock_unsynced` | Robot clock not synchronised | The robot's kernel reports its wall clock unsynchronised (no NTP, NTS or PTP lock) or with a large error estimate: finding and evidence times may be wrong. | `robodr_agent` | - | 2.5 |
+| `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | A safety configuration file the robot's agent loaded (response policy, Motion Firewall joint configuration) claims more than the signed commissioning attested: it is not bound to the trusted locked profile, so the agent treats it as not validated and stays observe-only for what it governs. The detail names the file and why the binding failed. | `robodr_agent` | - | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | The robot's control-plane API refused authenticated requests for an action, parameter, time limit or authority it never allows; each was recorded in the black box and nothing was executed. | `robodr_agent` | - | 1.3 |
 | `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it. | `robodr_agent` | - | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | At start the control plane's sealed request journal or replay store was damaged, edited, sealed under another key, or older than the head the black box recorded for it. The robot failed safe: the damaged copy was quarantined, requests were reconciled with the black box and the replay store was fenced; nothing was reset silently. | `robodr_agent` | - | 2.4 |
@@ -88,6 +89,7 @@ This is the full generated reference. How to read a finding, what each detection
 | `robot.capture.malformed_frames` | Malformed or truncated captured frames | The capture saw malformed or truncated frames; they were not inspected. | `ros2_dds_discovery` | - | 1.3 |
 | `robot.capture.not_udp` | Non-UDP packets reached the sensor | IP packets that were not UDP passed the kernel capture filter; they were not inspected. | `ros2_dds_discovery` | - | 1.3 |
 | `robot.capture.unsupported_middleware` | Robot middleware not inspected (Zenoh) | The capture sees Zenoh (rmw_zenoh) traffic, which RoboDR does not decode: participants, publishers and motion commands on it are not inspected; with no RTPS at all the sensor is blind to the robot's bus. | `ros2_dds_discovery` | - | 1.3 |
+| `robot.capture.unsupported_transport` | DDS transport not inspected (shared memory, TCP) | Participants on a host advertise a DDS transport the capture cannot inspect (shared memory such as Fast DDS SHM or Cyclone Iceoryx, TCP, or an unknown locator kind): traffic between same-host processes over it never reaches a network interface, so motion commands there may be invisible. Commission the robot with UDP-only transports. | `ros2_dds_discovery` | - | 2.5 |
 
 ## robot.correlate.*
 
@@ -240,6 +242,7 @@ This is the full generated reference. How to read a finding, what each detection
 | `robot.ros2.unknown_reader_topic` | Subscriber on a topic outside the reader allowlist | A reader was announced on a topic, service or action outside the profile's reader allowlist; it cannot command but may collect data. | `ros2_dds_discovery` | T0801 Monitor Process State | 1.3 |
 | `robot.ros2.unknown_service` | Writer on a service outside the model profile | A writer was announced on a ROS 2 service request or reply the locked model profile does not allow. | `ros2_dds_discovery` | T0855 Unauthorized Command Message (revoked in ATT&CK for ICS 20.0; now T1692.001 Command Message) | 1.3 |
 | `robot.ros2.unknown_writer_topic` | Writer on a topic outside the model profile | A writer was announced on a topic the locked model profile does not allow anyone to publish to. | `ros2_dds_discovery` | T0855 Unauthorized Command Message (revoked in ATT&CK for ICS 20.0; now T1692.001 Command Message) | 1 |
+| `robot.ros2.untrusted_security_identity` | Participant outside the robot's SROS 2 keystore | A DDS participant's security identity does not fit the robot's SROS 2 keystore: it is unauthenticated while the governance requires authentication, or its certificate subject is named by no grant of the keystore (a participant from another keystore or CA). | `ros2_dds_discovery` | - | 2.5 |
 
 ## robot.rtps.*
 

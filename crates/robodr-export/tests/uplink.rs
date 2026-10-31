@@ -1527,7 +1527,7 @@ fn rejected_and_reinject_payloads_are_pruned_on_request_and_measured() {
 
 /// Run the service loop `runs` times with `cfg`; `between` runs after each
 /// sleep. Returns the log lines.
-fn run_service_with(
+fn run_service_between(
     r: &Rig,
     cfg: UplinkConfig,
     runs: usize,
@@ -1551,6 +1551,7 @@ fn run_service_with(
             left -= 1;
             left == 0
         }),
+        credentials: Box::new(|_| Vec::new()),
     };
     let l2 = logs.clone();
     let open = || {
@@ -1577,7 +1578,7 @@ fn service_measures_state_usage_at_most_once_per_interval() {
         cfg.usage_interval = interval;
         let done = r.state.join("done");
         // A file appears in done/ after each of the first runs.
-        run_service_with(&r, cfg, 4, |n| {
+        run_service_between(&r, cfg, 4, |n| {
             if n < 4 {
                 fs::write(done.join(format!("x{n}")), b"").unwrap();
             }
@@ -1653,7 +1654,7 @@ fn out_pruning_that_fails_does_not_block_the_uplink() {
         max_count: Some(0),
         ..Default::default()
     };
-    let logs = run_service_with(&r, cfg, 3, |_| {});
+    let logs = run_service_between(&r, cfg, 3, |_| {});
     let st = status_of(&r);
     assert_eq!(st.state, "ok", "{:?}", st.last_error);
     assert_eq!(st.snapshot.accepted_total, 2, "the new batch is delivered");
