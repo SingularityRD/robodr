@@ -2206,7 +2206,7 @@ records it. Bridged traffic is isolated only with `br_netfilter` loaded
 * `journalctl -u robodr-executor`.
 
 A failed revert is retried every 500 ms until it verifies. agentd raises
-`robot.agent.executor_revert_failed` (High, findings contract 2.4) once
+`robot.agent.executor_revert_failed` (High, added in findings contract 2.4) once
 per request until a revert of it succeeds, naming the action, request,
 TTL and error: the rules may still be in force. Treat it, and
 `revert_failures > 0`, as urgent.

@@ -33,7 +33,7 @@ Contents: [Toolchain](#toolchain) · [Developer build](#developer-build) ·
 with. A fixed compiler is also a precondition for reproducible builds.
 
 Every workspace crate inherits the MSRV with `rust-version.workspace = true`
-(all 13 members; the separate `fuzz/` workspace does not, it needs nightly).
+(all 33 members; the separate `fuzz/` workspace does not, it needs nightly).
 Why 1.87: `u*::is_multiple_of` is used in library code of `robodr-capture`,
 `-rtps`, `-blackbox` and `-commission` (and in tests/examples of
 `-firewall`, `-motion`, `-ros2-pipeline`). Because the crates declare it,

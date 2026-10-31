@@ -117,7 +117,7 @@ crates/
                           used for profile signing. Binary: robodr-blackbox
                           (keygen, export-pub, verify, inspect).
   robodr-ocsf/            Deviation -> OCSF Detection Finding in the vendor-neutral
-                          robodr.findings contract (2.4; configurable data source
+                          robodr.findings contract (2.5; configurable data source
                           and topic; 1.x parse-only); Kafka key/partition helpers
                           (no Kafka client); optional detached Ed25519 per-finding
                           signatures (header robodr-finding-sig); rule catalog
@@ -206,6 +206,29 @@ crates/
                           erase epoch (tpm2-tools), the LUKS2 runtime
                           volume and the Clevis/Tang fallback. Binary:
                           robodr-seal. Sprint 13c; tested against swtpm.
+  robodr-signer/          Key providers: one Ed25519 signer for commissioning
+                          and release keys (a robodr-blackbox key file, or an
+                          external signer command such as the shipped PKCS#11
+                          adapter in adapters/), and the classification of
+                          systemd encrypted credentials (TPM2-sealed or not).
+                          Binary: robodr-signer (check, credential).
+  robodr-ops/             Operator tools. Binaries: robodr-setup (host
+                          preflight, key generation, role configuration, key
+                          fingerprints), robodr-support-bundle (redacted
+                          diagnostics with a SHA-256 manifest; never keys or
+                          evidence), robodr-metrics (Prometheus textfile
+                          exporter of the daemons' status files).
+  robodr-buildinfo/       Build identity (commit, SOURCE_DATE_EPOCH, target
+                          triple) for every binary's --version line.
+  robodr-attack-sim/      Attack simulator for POCs and demos: the red-team
+                          network scenarios as an offline pcap generator, a
+                          guarded live sender (allow-listed target, public
+                          addresses refused) and a scorer of the findings
+                          they must produce. Binary: robodr-attack-sim.
+  robodr-demo-soc/        Demo SOC for POCs: the reference robodr.ingest v1
+                          consumer behind a minimal HTTP server, a finding
+                          store and a browser viewer with time-to-SOC. Demo
+                          only, not a production SOC. Binary: robodr-demo-soc.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's
@@ -218,6 +241,10 @@ crates/
                           Pulsar-dependent; built and tested in the `pulsar`
                           job; run as root with eBPF probes loaded in WSL2,
                           never on a robot (PULSAR-INTEGRATION §7b).
+benches/                Throughput benchmarks for sizing a sensor box
+                        (robodr-agentd end to end, robodr-correlate) with a
+                        regression gate against a recorded baseline
+                        (benches/README.md). Binary: robodr-bench.
 rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
                         (validate: scripts/validate_rules.py; see rules/README.md).
 config/                 Profile, response-policy and daemon config examples.
@@ -262,7 +289,7 @@ qemu. No release has been cut or signed. GitHub CI has run once in full
   signed and hash-chained black box. Unitree SDK2 topics and Go1 legacy
   UDP decode end to end on synthetic traffic and IDL-derived vectors
   ([`docs/UNITREE.md`](docs/UNITREE.md)).
-- **Findings to a SOC**: `robodr.findings` 2.4 over `robodr-uplink`
+- **Findings to a SOC**: `robodr.findings` 2.5 over `robodr-uplink`
   (signed NDJSON batches, TLS, contract
   [`robodr.ingest-api`](docs/contracts/robodr.ingest-api.md)), the diode,
   or Kafka (TLS, mutual TLS, SASL/SCRAM).

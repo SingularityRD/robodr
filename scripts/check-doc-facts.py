@@ -339,10 +339,17 @@ def check_workspace_members(root: Path) -> list[str]:
     names = sorted(Path(m).name for m in members)
     errs: list[str] = []
     readme = read(root, "README.md")
+    # crates/<name> is listed indented under `crates/`; a member elsewhere
+    # (`benches`) by its own path at the start of a line.
     listed = set(re.findall(r"^ {2,}(robodr-[a-z0-9-]+)/(?:\s|$)", readme, re.MULTILINE))
-    for n in names:
-        if n not in listed:
-            errs.append(f"README.md: repository layout does not list crates/{n}/ (a workspace member)")
+    for m in sorted(members):
+        mp = Path(m)
+        if mp.parent == Path("crates"):
+            found = mp.name in listed
+        else:
+            found = re.search(rf"^{re.escape(m)}/(?:\s|$)", readme, re.MULTILINE) is not None
+        if not found:
+            errs.append(f"README.md: repository layout does not list {m}/ (a workspace member)")
     for n in sorted(listed - set(names)):
         errs.append(f"README.md: repository layout lists {n}/, which is not a workspace member")
     pats = (
@@ -614,7 +621,7 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
 GOOD_TREE: dict[str, str] = {
     "Cargo.toml": (
         '[workspace]\nmembers = [\n    "crates/robodr-a",\n    # comment "crates/robodr-x"\n'
-        '    "crates/robodr-b",\n]\n\n[workspace.package]\nversion = "0"\n'
+        '    "crates/robodr-b",\n    "benches",\n]\n\n[workspace.package]\nversion = "0"\n'
     ),
     MODEL_RS: 'pub const CONTRACT_VERSION: &str = "2.4.0";\n',
     CONTRACT_MD: "# Contract\n\n| Contract | `robodr.findings`, version **2.4.0** (x) |\n",
@@ -624,9 +631,9 @@ GOOD_TREE: dict[str, str] = {
     ),
     EXAMPLE_JSON: '{\n  "contract_version": "2.4.0"\n}\n',
     "README.md": (
-        "Layout:\n```\ncrates/\n  robodr-a/   first\n  robodr-b/   second\n```\n"
+        "Layout:\n```\ncrates/\n  robodr-a/   first\n  robodr-b/   second\nbenches/      bench\n```\n"
         "Findings: `robodr.findings` 2.4 over uplink; since `robodr.findings` 2.2 the deliverd.\n"
-        "All 2 members inherit it. 3 fuzz targets.\n"
+        "All 3 members inherit it. 3 fuzz targets.\n"
     ),
     "docs/compliance/a.md": (
         "> Verified at commit `STAMP` (date).\n\nfindings contract 2.4.0\n"
@@ -706,7 +713,8 @@ MUTATIONS = (
      "does not list crates/robodr-c/"),
     ("workspace-members", "README.md", "  robodr-b/   second\n", "  robodr-b/   second\n  robodr-z/   gone\n",
      "lists robodr-z/, which is not a workspace member"),
-    ("workspace-members", "README.md", "All 2 members", "all 13 members", "says 'all 13 members'"),
+    ("workspace-members", "README.md", "All 3 members", "all 13 members", "says 'all 13 members'"),
+    ("workspace-members", "README.md", "benches/      bench\n", "", "does not list benches/ (a workspace member)"),
     ("fuzz-targets", "fuzz/README.md", "| `t_three` | c |\n", "", "no table row for target t_three"),
     ("fuzz-targets", "README.md", "3 fuzz targets", "23 fuzz targets", "says '23 fuzz targets'"),
     ("fuzz-targets", "fuzz/Cargo.toml", 'name = "t_two"', 'name = "t_2"', "no [[bin]] for fuzz_targets/t_two.rs"),
