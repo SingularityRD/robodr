@@ -495,7 +495,10 @@ def check_action_catalog(root: Path) -> list[str]:
         named: set[str] = set()
         for cells in rows:
             if len(cells) > 1:
-                named.update(re.findall(r"`([a-z0-9_]+)`", cells[1]))
+                # Parentheses qualify an adapter (policy values, modes);
+                # only the backticked names outside them are adapters.
+                cell = re.sub(r"\([^()]*\)", "", cells[1])
+                named.update(re.findall(r"`([a-z0-9_]+)`", cell))
         for a in adapters:
             if a not in named:
                 errs.append(f"{EXECUTOR_README}: Motion adapters table does not name adapter `{a}`")
@@ -697,7 +700,8 @@ GOOD_TREE: dict[str, str] = {
     ),
     EXECUTOR_README: (
         "# x\n\n## Motion adapters (Sprint 8)\n\n| Action | Adapter | Apply | Revert |\n"
-        "|---|---|---|---|\n| `move_less` | `gateway` | a | b |\n| `pause` | `nav2` | a | b |\n\n## Next\n"
+        "|---|---|---|---|\n| `move_less` | `gateway` | a | b |\n"
+        "| `pause` | `nav2` (hold, or `rtl` when the policy's `safe_state` says so) | a | b |\n\n## Next\n"
     ),
 }
 
@@ -731,6 +735,8 @@ MUTATIONS = (
     ("action-catalog", MOTION_RS, '            AdapterKind::Nav2 => "nav2",\n',
      '            AdapterKind::Nav2 => "nav2",\n            AdapterKind::Px4 => "px4",\n',
      "does not name adapter `px4`"),
+    ("action-catalog", EXECUTOR_README, "| `nav2` (hold, or", "| x (`nav2` hold, or",
+     "does not name adapter `nav2`"),
     ("evidence-links", "docs/compliance/a.md", "`robodr-a/tests/t.rs`", "`robodr-a/tests/gone.rs`",
      "path robodr-a/tests/gone.rs does not exist"),
     ("evidence-links", "docs/compliance/a.md", "(../../README.md#layout)", "(../../READ.md)",
