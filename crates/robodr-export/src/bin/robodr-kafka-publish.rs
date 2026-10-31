@@ -47,12 +47,17 @@ deletion is logged with its entry count). done/ markers older than --done-max-ag
 2592000 = 30 days, 0 = keep) or beyond --done-max-count are deleted once their batch has left \
 the importer's out/. --out-max-age-s / --out-max-count / --out-max-bytes (diode source, \
 default keep; only when this publisher is the sole consumer of out/) delete the records of out/ \
-batches it has finished (aged by their done/ marker; a tombstone with the manifest stays); \
+batches it has finished (aged by their done/ marker; a tombstone with the manifest stays; \
+--out-max-count / --out-max-bytes rank every batch that still has records, unfinished ones \
+included, and do not count tombstones). A batch it may not delete (no write permission on \
+out/<batch>/) is reported as out_prune_error and warned about once; publishing goes on. \
 --rejected-max-age-s / \
 --rejected-max-count / --rejected-max-bytes (spool source, default keep) delete the oldest \
-<spool>/rejected/ records. Nothing still needed for deduplication is deleted. The JSON report \
-carries state_usage (entries and bytes of done/, dead letters, out/ or rejected/, measured at \
-most once a minute). A spool file that \
+<spool>/rejected/ records. Nothing still needed for deduplication is deleted. A JSON report \
+line is printed after a run that published, dead-lettered or pruned something, or that measured \
+state_usage (entries and bytes of done/, dead letters, out/ or rejected/; at most once a \
+minute, so at least once a minute while idle); a failed measurement is state_usage_error and \
+never fails the run. A spool file that \
 cannot be read (I/O error after 3 attempts) is dead-lettered with the error and moved to \
 <spool>/rejected/; the run goes on.";
 
@@ -320,6 +325,8 @@ fn run(o: &Opts) -> Result<(), String> {
             || r.pruned_dead_letters.removed > 0
             || r.pruned_out.removed > 0
             || r.pruned_rejected.removed > 0
+            || r.state_usage.is_some()
+            || r.state_usage_error.is_some()
         {
             println!("{}", serde_json::to_string(&r).unwrap_or_default());
         }

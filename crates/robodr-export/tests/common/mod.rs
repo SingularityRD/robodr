@@ -5,6 +5,55 @@
 //! duplicates of the last five batches).
 #![allow(dead_code)]
 
+/// `file` in `dir` cannot be unlinked by this process until this is
+/// dropped: `dir` read-only when not root, `file` immutable
+/// (`chattr +i`) as root.
+pub struct Undeletable {
+    dir: PathBuf,
+    file: PathBuf,
+    immutable: bool,
+}
+
+/// `None` when neither works here (no `chattr`, or a file system or
+/// container without the immutable flag): the caller skips.
+pub fn undeletable(dir: &Path, file: &Path) -> Option<Undeletable> {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    if !root {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).ok()?;
+    } else {
+        let ok = std::process::Command::new("chattr")
+            .arg("+i")
+            .arg(file)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return None;
+        }
+    }
+    Some(Undeletable {
+        dir: dir.to_path_buf(),
+        file: file.to_path_buf(),
+        immutable: root,
+    })
+}
+
+impl Drop for Undeletable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        if self.immutable {
+            let _ = std::process::Command::new("chattr")
+                .arg("-i")
+                .arg(&self.file)
+                .status();
+        } else {
+            let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
 use robodr_events::graph::Endpoint;
 use robodr_events::{Deviation, RobotEvent, Severity};
 use robodr_export::kafka::batch::{decode_batches, DecodedRecord};

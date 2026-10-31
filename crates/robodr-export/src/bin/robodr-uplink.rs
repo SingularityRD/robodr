@@ -53,11 +53,13 @@ and done/ markers older than --done-max-age-s (default 2592000 = 30 days, 0 = ke
 --done-max-count, are deleted once nothing in them is needed any more (records that may still be \
 processed again; batches still in out/). Opt-in, default keep: --out-max-* (diode source; only \
 when this uplink is the sole consumer of out/) delete the records of out/ batches it has finished \
-(a tombstone with the manifest stays), \
+(a tombstone with the manifest stays; count and byte bounds rank every batch that still has \
+records, unfinished ones included, not tombstones; a batch it may not delete is reported as \
+out_prune_error in uplink-status.json, logged once, and delivery goes on), \
 --rejected-max-* (spool source) the oldest <spool>/rejected/ records, --reinject-max-* the \
 records.jsonl of finished re-injection generations (their origin.jsonl ledger stays). \
 uplink-status.json carries state_usage (entries and bytes of each, measured at most once a \
-minute).\n\
+minute; a failed measurement is state_usage_error and never fails a run).\n\
 Exit: 0 done (--once, reinject), 1 runtime or configuration error, 2 usage, \
 3 failing longer than --exit-when-stuck-s.";
 

@@ -282,34 +282,81 @@ fn out_payload(dir: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
 /// finished batch with less payload, never a half-readable records file
 /// under a name that is not finished; the next pass completes it.
 ///
+/// The count and byte bounds rank every batch directory that still has
+/// a payload, finished or not, from the newest: an unfinished batch
+/// counts against the bounds (and so pushes older finished ones over
+/// them) but is itself held. Tombstones are not ranked: `max_count`
+/// bounds the batches that still have a payload, not the entries of
+/// `out/`.
+///
 /// Only for a tool that is the **sole consumer** of `out/`: a second
 /// consumer (another publisher or uplink on the same `out/`) would lose the
 /// batches this one has finished.
+///
+/// A batch whose payload cannot be removed (typically: this tool may not
+/// write the importer's `out/<batch>/`) does not stop the others: the
+/// pass goes on and returns the first error, with its path, beside what it
+/// did. The callers report it ([`out_prune_failure`]) and go on
+/// delivering: pruning `out/` is housekeeping, never a reason to stop
+/// delivering findings.
 pub fn prune_diode_out(
     out: &Path,
     done_dir: &Path,
     r: &Retention,
     now: SystemTime,
-) -> io::Result<PruneReport> {
+) -> (PruneReport, Option<io::Error>) {
     let mut rep = PruneReport::default();
     if r.is_unbounded() {
-        return Ok(rep);
+        return (rep, None);
     }
+    let cands = match out_candidates(out, done_dir) {
+        Ok(c) => c,
+        Err(e) => return (rep, Some(e)),
+    };
+    let mut first_err = None;
+    let items: Vec<(SystemTime, u64)> = cands.iter().map(|c| (c.modified, c.bytes)).collect();
+    for (c, over) in cands.iter().zip(r.over(&items, now)) {
+        if !over {
+            continue;
+        }
+        match prune_out_batch(out, done_dir, c) {
+            Ok(true) => {
+                rep.removed += 1;
+                rep.removed_bytes += c.bytes;
+            }
+            Ok(false) => rep.held += 1,
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    (rep, first_err)
+}
+
+/// `e` with the path it concerns.
+fn at(p: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", p.display()))
+}
+
+/// The batch directories of `out/` that still have a payload.
+fn out_candidates(out: &Path, done_dir: &Path) -> io::Result<Vec<Candidate>> {
     let rd = match fs::read_dir(out) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(rep),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(at(out, e)),
     };
     let mut cands = Vec::new();
     for e in rd {
-        let e = e?;
+        let e = e.map_err(|x| at(out, x))?;
         let Some(name) = e.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !crate::publish::valid_batch_name(&name) || !e.file_type()?.is_dir() {
+        let path = e.path();
+        let is_dir = e.file_type().map_err(|x| at(&path, x))?.is_dir();
+        if !crate::publish::valid_batch_name(&name) || !is_dir {
             continue;
         }
-        let payload = out_payload(&e.path())?;
+        let payload = out_payload(&path).map_err(|x| at(&path, x))?;
         if payload.is_empty() {
             // A tombstone already.
             continue;
@@ -317,14 +364,18 @@ pub fn prune_diode_out(
         let mut bytes = 0u64;
         for (p, is_dir) in &payload {
             bytes = bytes.saturating_add(if *is_dir {
-                tree_bytes(p, 3)?
+                tree_bytes(p, 3).map_err(|x| at(p, x))?
             } else {
-                file_meta(p)?.map_or(0, |m| m.1)
+                file_meta(p).map_err(|x| at(p, x))?.map_or(0, |m| m.1)
             });
         }
-        let modified = match file_meta(&done_dir.join(&name))? {
+        let marker = done_dir.join(&name);
+        let modified = match file_meta(&marker).map_err(|x| at(&marker, x))? {
             Some((t, _)) => t,
-            None => e.metadata()?.modified()?,
+            None => e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map_err(|x| at(&path, x))?,
         };
         cands.push(Candidate {
             name,
@@ -333,32 +384,108 @@ pub fn prune_diode_out(
             bytes,
         });
     }
-    let items: Vec<(SystemTime, u64)> = cands.iter().map(|c| (c.modified, c.bytes)).collect();
-    for (c, over) in cands.iter().zip(r.over(&items, now)) {
-        if !over {
-            continue;
+    Ok(cands)
+}
+
+/// Remove one batch's payload if it is finished (`Ok(false)`: held).
+fn prune_out_batch(out: &Path, done_dir: &Path, c: &Candidate) -> io::Result<bool> {
+    let marker = done_dir.join(&c.name);
+    if file_meta(&marker).map_err(|e| at(&marker, e))?.is_none() {
+        return Ok(false);
+    }
+    for p in &c.paths {
+        let res = match fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+            Ok(_) => fs::remove_file(p),
+            Err(e) => Err(e),
+        };
+        match res {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(at(p, e)),
         }
-        if file_meta(&done_dir.join(&c.name))?.is_none() {
-            rep.held += 1;
-            continue;
+    }
+    let dir = out.join(&c.name);
+    fsutil::fsync_dir(&dir).map_err(|e| at(&dir, e))?;
+    Ok(true)
+}
+
+/// What the publisher and the uplink report (and log, once while it
+/// lasts) when pruning `out/` failed ([`prune_diode_out`]).
+pub fn out_prune_failure(e: &io::Error) -> String {
+    let hint = if e.kind() == io::ErrorKind::PermissionDenied {
+        " (this tool needs write permission on the importer's out/<batch>/ \
+         directories: run it as the importer's user or give its group write \
+         access there, or drop --out-max-*)"
+    } else {
+        ""
+    };
+    format!(
+        "cannot prune the importer's out/ for --out-max-*: {e}{hint}; \
+         delivery goes on, that payload stays"
+    )
+}
+
+/// Measures [`state_usage`] at most once per interval, across runs (and,
+/// in `robodr-uplink`'s service loop, across re-opens of the uplink).
+/// Measuring is monitoring: a failed measurement is reported (and the
+/// last good one kept), never a reason to fail a run. A failed attempt
+/// also waits for the interval before the next one.
+#[derive(Debug, Clone, Default)]
+pub struct UsageMeter {
+    at: Option<std::time::Instant>,
+    last: Option<StateUsage>,
+    error: Option<String>,
+}
+
+/// What [`UsageMeter::measure_if_due`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Measured {
+    /// Within the interval: nothing measured.
+    NotDue,
+    Fresh(StateUsage),
+    /// The measurement failed; `new` when the previous attempt did not
+    /// fail with the same message (log it then).
+    Failed {
+        error: String,
+        new: bool,
+    },
+}
+
+impl UsageMeter {
+    pub fn measure_if_due(
+        &mut self,
+        interval: Duration,
+        measure: impl FnOnce() -> io::Result<StateUsage>,
+    ) -> Measured {
+        if self.at.is_some_and(|t| t.elapsed() < interval) {
+            return Measured::NotDue;
         }
-        for p in &c.paths {
-            let res = match fs::symlink_metadata(p) {
-                Ok(m) if m.is_dir() => fs::remove_dir_all(p),
-                Ok(_) => fs::remove_file(p),
-                Err(e) => Err(e),
-            };
-            match res {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+        self.at = Some(std::time::Instant::now());
+        match measure() {
+            Ok(u) => {
+                self.error = None;
+                self.last = Some(u.clone());
+                Measured::Fresh(u)
+            }
+            Err(e) => {
+                let error = format!("cannot measure the state usage: {e}");
+                let new = self.error.as_deref() != Some(error.as_str());
+                self.error = Some(error.clone());
+                Measured::Failed { error, new }
             }
         }
-        fsutil::fsync_dir(&out.join(&c.name))?;
-        rep.removed += 1;
-        rep.removed_bytes += c.bytes;
     }
-    Ok(rep)
+
+    /// The last successful measurement.
+    pub fn last(&self) -> Option<&StateUsage> {
+        self.last.as_ref()
+    }
+
+    /// The last attempt's error, while it lasts.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
 }
 
 /// Prune the payload of finished re-injection generations
@@ -480,24 +607,25 @@ pub fn state_usage(
     reinject: bool,
 ) -> io::Result<StateUsage> {
     use crate::publish::Source;
+    let usage = |d: &Path, depth: u32| dir_usage(d, depth).map_err(|e| at(d, e));
     let mut dead = Usage::default();
-    for p in crate::deadletter::files(state_dir, dead_letter)? {
-        if let Some((_, n)) = file_meta(&p)? {
+    for p in crate::deadletter::files(state_dir, dead_letter).map_err(|e| at(state_dir, e))? {
+        if let Some((_, n)) = file_meta(&p).map_err(|e| at(&p, e))? {
             dead.entries += 1;
             dead.bytes = dead.bytes.saturating_add(n);
         }
     }
     let (diode_out, spool_rejected) = match source {
-        Source::DiodeOut(out) => (Some(dir_usage(out, 4)?), None),
-        Source::Spool(root) => (None, Some(dir_usage(&root.join("rejected"), 0)?)),
+        Source::DiodeOut(out) => (Some(usage(out, 4)?), None),
+        Source::Spool(root) => (None, Some(usage(&root.join("rejected"), 0)?)),
     };
     Ok(StateUsage {
-        done_markers: dir_usage(&state_dir.join("done"), 0)?,
+        done_markers: usage(&state_dir.join("done"), 0)?,
         dead_letters: dead,
         diode_out,
         spool_rejected,
         reinject: if reinject {
-            Some(dir_usage(&state_dir.join(crate::uplink::REINJECT_DIR), 1)?)
+            Some(usage(&state_dir.join(crate::uplink::REINJECT_DIR), 1)?)
         } else {
             None
         },
@@ -547,6 +675,11 @@ mod tests {
     use super::*;
 
     const DAY: Duration = Duration::from_secs(86_400);
+
+    fn ok((rep, e): (PruneReport, Option<io::Error>)) -> PruneReport {
+        assert!(e.is_none(), "{e:?}");
+        rep
+    }
 
     fn at(days_ago: u64, now: SystemTime) -> SystemTime {
         now - DAY * days_ago as u32
@@ -657,12 +790,12 @@ mod tests {
         let later = SystemTime::now() + DAY * 40;
         let r = Retention::max_age(DAY * 30);
         assert_eq!(
-            prune_diode_out(&out, &done, &Retention::UNBOUNDED, later).unwrap(),
+            ok(prune_diode_out(&out, &done, &Retention::UNBOUNDED, later)),
             PruneReport::default()
         );
-        let rep = prune_diode_out(&out, &done, &r, SystemTime::now()).unwrap();
+        let rep = ok(prune_diode_out(&out, &done, &r, SystemTime::now()));
         assert_eq!((rep.removed, rep.held), (0, 0), "not old yet");
-        let rep = prune_diode_out(&out, &done, &r, later).unwrap();
+        let rep = ok(prune_diode_out(&out, &done, &r, later));
         assert_eq!((rep.removed, rep.held, rep.removed_bytes), (1, 1, 110));
         // Finished: only the tombstone (the manifest copy) is left.
         let left: Vec<_> = fs::read_dir(out.join("rdd_a_1"))
@@ -675,12 +808,12 @@ mod tests {
         assert!(out.join(".tmp-import").join("records.jsonl").exists());
         assert!(done.join("rdd_a_1").exists(), "the marker is not ours");
         // A tombstone is not pruned again.
-        let rep = prune_diode_out(&out, &done, &r, later).unwrap();
+        let rep = ok(prune_diode_out(&out, &done, &r, later));
         assert_eq!((rep.removed, rep.held), (0, 1));
         // A crash after the records went: the next pass finishes it.
         fs::write(done.join("rdd_a_2"), b"").unwrap();
         fs::remove_file(out.join("rdd_a_2").join("records.jsonl")).unwrap();
-        let rep = prune_diode_out(&out, &done, &r, later).unwrap();
+        let rep = ok(prune_diode_out(&out, &done, &r, later));
         assert_eq!((rep.removed, rep.removed_bytes), (1, 10));
         let u = dir_usage(&out, 4).unwrap();
         assert_eq!((u.entries, u.bytes), (3, 14), "two tombstones, one file");

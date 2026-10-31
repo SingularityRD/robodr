@@ -121,9 +121,18 @@ pub struct Snapshot {
     pub dead_lettered_total: u64,
     /// What the state occupies on disk (`done/`, dead letters, `out/` or
     /// `rejected/`, re-injection generations), measured at most every
-    /// [`super::UplinkConfig::usage_interval`].
+    /// [`super::UplinkConfig::usage_interval`] (the last good
+    /// measurement; `measured_at_ms` says when).
     #[serde(default)]
     pub state_usage: Option<crate::retention::StateUsage>,
+    /// The last measurement failed (monitoring only; retried after the
+    /// interval).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_usage_error: Option<String>,
+    /// The last pruning of `out/` (`--out-max-*`) failed, with the path and
+    /// what to do; delivery goes on, that payload stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_prune_error: Option<String>,
 }
 
 /// `<state>/uplink-status.json`.
@@ -307,11 +316,20 @@ pub fn run<T: Transport>(
     let mut failures: u32 = 0;
     let mut streak_start: Option<u64> = None;
     let mut warned = false;
+    // Carried from one run's Uplink to the next (usage measured at most
+    // once per interval, a lasting pruning error logged once).
+    let mut upkeep = super::Upkeep::default();
     loop {
         let (result, snap) = match open() {
-            Ok(mut u) => {
+            Ok(u) => {
+                let mut u = u.with_upkeep(std::mem::take(&mut upkeep));
                 let r = u.run_once();
-                (r, u.snapshot().ok())
+                let snap = u.snapshot();
+                upkeep = u.take_upkeep();
+                if let Err(e) = &snap {
+                    (env.log)(&format!("cannot update the status snapshot: {e}"));
+                }
+                (r, snap.ok())
             }
             Err(e) => (Err(e), None),
         };

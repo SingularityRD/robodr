@@ -1033,8 +1033,7 @@ fn fencing_of_an_older_epochs_batch_resets_the_producer_id() {
         assert!(
             appended(&c)
                 .iter()
-                .filter(|a| a.0 == 0)
-                .last()
+                .rfind(|a| a.0 == 0)
                 .is_some_and(|a| a.1 != 1000),
             "{:?}",
             appended(&c)

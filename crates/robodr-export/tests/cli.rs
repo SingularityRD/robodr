@@ -157,6 +157,38 @@ fn export_then_publish_spool_once() {
     assert_eq!(fs::read_dir(spool.join("ready")).unwrap().count(), 1);
 }
 
+/// Review finding (WP16): an idle publisher still prints its report when
+/// the run measured the state's usage (`state_usage`, at most once per
+/// minute), so the sizes reach the operator without a delivery.
+#[test]
+fn idle_publisher_prints_state_usage() {
+    let t = TempDir::new("cli-idle");
+    let spool = t.path().join("spool");
+    for d in ["ready", "acked"] {
+        fs::create_dir_all(spool.join(d)).unwrap();
+    }
+    let c = Cluster::start(1, 2);
+    let o = Command::new(PUBLISH)
+        .args([
+            "--bootstrap",
+            &c.bootstrap()[0],
+            "--allow-plaintext",
+            "--once",
+        ])
+        .args(["--spool".as_ref(), spool.as_os_str()])
+        .args(["--state-dir".as_ref(), t.path().join("soc").as_os_str()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let line = o.stdout.split(|b| *b == b'\n').next().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(line).unwrap_or_else(|e| {
+        panic!("{e}: {:?}", String::from_utf8_lossy(&o.stdout));
+    });
+    assert_eq!(report["published"], 0);
+    assert_eq!(report["state_usage"]["done_markers"]["entries"], 0);
+    assert_eq!(c.total(), 0);
+}
+
 /// `--version` prints `<name> <version>` and `--help` the usage, both on
 /// stdout with exit 0 (the release .deb smoke test runs both on every
 /// shipped binary); misuse of either stays a usage error (exit 2).
