@@ -161,7 +161,13 @@ Loop interval, > 0 (default 2000).
 One pass, then exit.
 .TP
 .B \-\-check
-Site acceptance: the state and input directories exist, the cluster
+Site acceptance: the state and input directories exist, the client
+certificate and the CRLs in use have not expired (one line each with the
+days left,
+.B WARN
+within 14 days,
+.B FAIL
+once expired), the cluster
 answers with this TLS (CA, client certificate, pins, CRLs) and SASL
 configuration, and the topic's metadata (partitions) is readable. Nothing
 is produced and nothing written; bounded to 30 s. Exit 0 passed, 1 failed.
@@ -204,7 +210,10 @@ system roots).
 .TP
 .BI \-\-tls\-cert " FILE" " \-\-tls\-key " FILE
 Client certificate chain and key (mutual TLS). The key file must not be
-readable by others or writable by the group.
+readable by others or writable by the group. Within 14 days of the first
+certificate's notAfter, and after it, a line on stderr says so once per
+day count (as for each CRL's nextUpdate with
+.BR \-\-tls\-crl\-file ).
 .TP
 .BI \-\-tls\-server\-name " NAME"
 Name sent as SNI and verified in every broker certificate instead of the

@@ -8,7 +8,10 @@ use robodr_diode::cli::{argv, is_version_request, parse_args_with_switches, Args
 use robodr_export::deadletter::{DEFAULT_ROTATION, MIN_ROTATION_BYTES};
 use robodr_export::kafka::{Producer, ProducerConfig};
 use robodr_export::retention;
+use robodr_export::uplink::service;
 use robodr_export::{PublishConfig, Publisher, Source};
+use robodr_ocsf::CredentialExpiry;
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -31,9 +34,12 @@ host name, or --tls-server-name); --tls-cert/--tls-key add a client certificate 
 --tls-crl-file (PEM or DER CRLs of the broker CAs) refuses a revoked broker certificate (an issuer \
 without a CRL, an expired or unusable CRL refuse every broker; reloaded when the files change). \
 Plain TCP only with an explicit --allow-plaintext (isolated network or a local TLS proxy).\n\
---check (site acceptance): the directories exist, the cluster answers with this TLS and SASL \
+--check (site acceptance): the directories exist, the --tls-cert certificate and the CRLs have \
+not expired (WARN within 14 days), the cluster answers with this TLS and SASL \
 configuration and the topic exists (metadata, partitions); nothing is produced, \
 no state written (at most 30 s); exit 0 passed, 1 failed.\n\
+The --tls-cert certificate and each CRL in use within 14 days of expiry are logged to stderr \
+once per day count.\n\
 The producer is idempotent (InitProducerId, sequence numbers; a re-sent batch is dropped by the \
 broker); --no-idempotence for brokers that refuse it (Kafka < 3.0 without the IDEMPOTENT_WRITE \
 cluster ACL): at-least-once.\n\
@@ -89,6 +95,38 @@ struct Opts {
     publish: PublishConfig,
     interval: Duration,
     once: bool,
+    /// `notAfter` (Unix seconds) of the `--tls-cert` leaf, if one is given.
+    client_cert_not_after: Option<i64>,
+}
+
+/// The credentials this publisher depends on and when they expire at
+/// `now_ms`: the client certificate (`tls-cert`) and each CRL in use
+/// (`crl:<issuer>`, its `nextUpdate`).
+fn credentials(o: &Opts, now_ms: u64) -> Vec<CredentialExpiry> {
+    let mut v = Vec::new();
+    if let Some(na) = o.client_cert_not_after {
+        v.push(CredentialExpiry::at("tls-cert", na, now_ms));
+    }
+    if let Some(s) = o.producer.tls.as_ref().and_then(|t| t.crl.as_ref()) {
+        v.extend(service::crl_credentials(&s.status(), now_ms));
+    }
+    v
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// `notAfter` of the first certificate in the `--tls-cert` file.
+fn leaf_not_after(path: &std::path::Path) -> Result<Option<i64>, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let pem = robodr_blackbox::tls::read_pem("--tls-cert", path, false)?;
+    Ok(CertificateDer::pem_slice_iter(&pem)
+        .next()
+        .and_then(Result::ok)
+        .and_then(|c| robodr_blackbox::crl::cert_not_after(c.as_ref())))
 }
 
 fn opts(a: &Args) -> Result<Opts, String> {
@@ -117,6 +155,10 @@ fn opts(a: &Args) -> Result<Opts, String> {
     }
     p.idempotence = !a.flag("no-idempotence");
     security(a, &mut p)?;
+    let client_cert_not_after = match (&p.tls, a.one("tls-cert")?) {
+        (Some(_), Some(c)) => leaf_not_after(std::path::Path::new(c))?,
+        _ => None,
+    };
     // Configuration errors (plain TCP not allowed, SASL without TLS, bad
     // bounds) are usage errors (exit 2), not retried at run time.
     Producer::new(p.clone()).map_err(|e| e.to_string())?;
@@ -185,6 +227,7 @@ fn opts(a: &Args) -> Result<Opts, String> {
         publish: c,
         interval: Duration::from_millis(interval),
         once: a.flag("once"),
+        client_cert_not_after,
     })
 }
 
@@ -273,6 +316,21 @@ fn check(o: &Opts) -> ExitCode {
         }
         println!("ok   {what} {}", p.display());
     }
+    // Credentials: an expired one fails the check, one within
+    // CREDENTIAL_WARN_DAYS is a warning (the check still passes).
+    for c in credentials(o, wall_ms()) {
+        let d = c.days_to_expiry;
+        if d < 0 {
+            println!("FAIL {} expired {} day(s) ago", c.name, d.unsigned_abs());
+            return ExitCode::from(1);
+        }
+        let tag = if d <= service::CREDENTIAL_WARN_DAYS {
+            "WARN"
+        } else {
+            "ok  "
+        };
+        println!("{tag} {} expires in {d} day(s)", c.name);
+    }
     let security = match (&o.producer.tls, &o.producer.sasl) {
         (Some(_), Some(_)) => "TLS + SASL",
         (Some(_), None) => "TLS",
@@ -313,10 +371,18 @@ fn check(o: &Opts) -> ExitCode {
     }
 }
 
-fn run(o: &Opts) -> Result<(), String> {
+/// Log each credential close to expiry, once per day count (`logged`).
+fn warn_expiring(o: &Opts, logged: &mut BTreeMap<String, i64>) {
+    service::warn_expiring(&credentials(o, wall_ms()), logged, &mut |m| {
+        eprintln!("robodr-kafka-publish: {m}");
+    });
+}
+
+fn run(o: &Opts, logged: &mut BTreeMap<String, i64>) -> Result<(), String> {
     let producer = Producer::new(o.producer.clone()).map_err(|e| e.to_string())?;
     let mut p = Publisher::open(o.publish.clone(), producer).map_err(|e| e.to_string())?;
     loop {
+        warn_expiring(o, logged);
         let r = p.run_once().map_err(|e| e.to_string())?;
         if r.published > 0
             || r.dead_lettered > 0
@@ -415,8 +481,10 @@ fn main() -> ExitCode {
     if check_mode {
         return check(&o);
     }
+    let mut logged = BTreeMap::new();
     loop {
-        match run(&o) {
+        warn_expiring(&o, &mut logged);
+        match run(&o, &mut logged) {
             Ok(()) => return ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("robodr-kafka-publish: {e}");

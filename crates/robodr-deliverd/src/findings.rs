@@ -245,6 +245,7 @@ impl Findings {
         let mut ctx = RobotContext::new(self.robot.clone(), profile, Mode::Enforce);
         ctx.data_source = self.cfg.data_source.clone();
         ctx.topic = self.cfg.topic.clone();
+        ctx.max_contract_minor = self.cfg.max_contract_minor;
         let dev = Deviation::new(f.rule, f.severity, f.detail.clone());
         let mut b = FindingBuilder::from_deviation(&dev, &ctx)
             .safety_state(ocsf_safety(f.safety))
@@ -570,6 +571,39 @@ mod tests {
             "{}"
         )
         .is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// T38: `findings.max_contract_minor` caps deliverd's findings like
+    /// agentd's (they share the spool and the SOC's validators).
+    #[test]
+    fn producer_cap_labels_the_older_contract() {
+        let d = std::env::temp_dir().join(format!("deliverd-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        for s in ["ready", "acked"] {
+            fs::create_dir_all(d.join(s)).unwrap();
+        }
+        let emit = |cap: Option<u64>| {
+            let cfg = FindingsCfg {
+                spool: d.clone(),
+                max_contract_minor: cap,
+                ..FindingsCfg::default()
+            };
+            let mut f = Findings::new(&cfg, "ugv-007", "test", "lab", None);
+            let p = f
+                .emit(
+                    &finding(rules::ROLLBACK_BLOCKED_FLOOR, Severity::High),
+                    None,
+                    1_790_000_000_000,
+                )
+                .unwrap();
+            let rec: SpoolRecord = serde_json::from_slice(&fs::read(p).unwrap()).unwrap();
+            robodr_ocsf::parse_and_validate(&rec.value).unwrap()
+        };
+        assert_eq!(emit(None).contract_version, robodr_ocsf::CONTRACT_VERSION);
+        let capped = emit(Some(3));
+        assert_eq!(capped.contract_version, "2.3.0");
+        assert_eq!(capped.entity_context.rule_id, rules::ROLLBACK_BLOCKED_FLOOR);
         fs::remove_dir_all(&d).unwrap();
     }
 

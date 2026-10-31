@@ -382,7 +382,9 @@ pub struct FindingsSection {
     /// `2.<max_contract_minor>.0` so a SOC whose validators are older than
     /// this build accepts them (0 ..= [`robodr_ocsf::CONTRACT_MINOR`];
     /// absent: the current contract). What a lower minor changes:
-    /// `robodr_ocsf::RobotContext::contract_minor`.
+    /// `robodr_ocsf::RobotContext::contract_minor`. Below 5 the
+    /// `robot.agent.health` record (a contract 2.5 finding) is off, as if
+    /// `daemon.self_health.health_record_ms` were 0.
     #[serde(default)]
     pub max_contract_minor: Option<u64>,
 }

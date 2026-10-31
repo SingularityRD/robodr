@@ -423,6 +423,9 @@ fn file_checks() {
     assert!(tls::load_server(&files("server.key")).is_err());
     std::fs::set_permissions(pki.p("server.key"), std::fs::Permissions::from_mode(0o640)).unwrap();
     assert!(tls::load_server(&files("server.key")).is_ok());
+    // T6: the server certificate's notAfter (2125-01-01) is kept.
+    let t = tls::load_server_tls_with_crl_state(&files("server.key"), None).unwrap();
+    assert_eq!(t.not_after, Some(4_891_363_200));
     // A certificate where the key belongs, a key that does not match.
     std::fs::set_permissions(pki.p("server.pem"), std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(tls::load_server(&files("server.pem")).is_err());

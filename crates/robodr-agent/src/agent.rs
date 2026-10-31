@@ -673,6 +673,13 @@ impl Agent {
         self.faults.drain(..).collect()
     }
 
+    /// `contract_version` of the findings this agent builds: this build's
+    /// contract, or the older one `max_contract_minor` caps it to
+    /// ([`RobotContext::contract_version`]).
+    pub fn contract_version(&self) -> String {
+        self.ocsf.contract_version()
+    }
+
     /// `true` while the black box is failing (appends are being lost).
     pub fn evidence_degraded(&self) -> bool {
         self.blackbox_down_since.is_some()

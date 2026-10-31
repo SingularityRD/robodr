@@ -36,6 +36,8 @@ pub trait SocTransport {
 pub struct Https {
     inner: HttpsTransport,
     base: String,
+    /// The CRLs in use (with `crl_files`).
+    crl: Option<std::sync::Arc<robodr_blackbox::crl::CrlStats>>,
 }
 
 impl Https {
@@ -58,18 +60,32 @@ impl Https {
             .iter()
             .map(|p| http::parse_pin(p))
             .collect::<Result<Vec<_>, _>>()?;
-        let tls = if ep.tls {
+        let (tls, crl) = if ep.tls {
             let ca = ca_bundle.ok_or("an https:// SOC URL needs a CA bundle (--ca-bundle)")?;
-            Some(http::client_config_with_crls(http::load_ca_bundle(ca)?, &pins, crl_files)?.0)
+            let (c, crl) =
+                http::client_config_with_crls(http::load_ca_bundle(ca)?, &pins, crl_files)?;
+            (Some(c), crl)
         } else if !crl_files.is_empty() {
             return Err("CRL files are meaningless for plain http:// (loopback only)".into());
         } else {
-            None
+            (None, None)
         };
         let base = ep.path.clone();
         let mut inner = HttpsTransport::new(ep, tls, Timeouts::default())?;
         inner.set_user_agent(&format!("robodr-enroll/{}", env!("CARGO_PKG_VERSION")))?;
-        Ok(Self { inner, base })
+        Ok(Self { inner, base, crl })
+    }
+
+    /// Each CRL in use (`crl:<issuer>`) with its `nextUpdate`, Unix
+    /// seconds; empty without `crl_files`.
+    pub fn crl_next_updates(&self) -> Vec<(String, i64)> {
+        self.crl
+            .as_ref()
+            .map(|c| c.status().in_use)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|u| u.next_update.map(|nu| (format!("crl:{}", u.issuer), nu)))
+            .collect()
     }
 }
 

@@ -49,8 +49,9 @@ usage:
                              [--receipt-out FILE]
   robodr-enroll decommission [--answer FILE] [--receipt-out FILE]   (resume / show the receipt)
   robodr-enroll decommission --abort
-check: SOC keys, TLS (CA bundle, pins, CRLs), the fleet API and, once enrolled, request
-authentication with the uplink key; read-only (site acceptance, docs/SITE-ACCEPTANCE.md).
+check: SOC keys, TLS (CA bundle, pins, CRLs; each CRL's days left, warn within 14 days),
+the fleet API and, once enrolled, request authentication with the uplink key; read-only
+(site acceptance, docs/SITE-ACCEPTANCE.md).
 decommission: retires every key of the unit at the SOC (request signed by its uplink,
 finding and blackbox keys), then shreds the uplink and finding keys; procedure:
 docs/DECOMMISSION.md.
@@ -495,6 +496,19 @@ fn run(a: &Args) -> Result<(), Fail> {
             a.allow(&[])?;
             let ctx = context(a)?;
             let mut t = transport(&ctx)?;
+            // The CRLs in use: days left (warn within 14 days).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            for (name, next) in t.crl_next_updates() {
+                let d = next.saturating_sub(now).div_euclid(86_400);
+                if d < 0 {
+                    println!("FAIL {name} expired {} day(s) ago", d.unsigned_abs());
+                    return Err(Fail::Refused(format!("{name} expired")));
+                }
+                let tag = if d <= 14 { "warn" } else { "ok  " };
+                println!("{tag} {name} expires in {d} day(s)");
+            }
             let r = check::run(&ctx, &mut t);
             for line in &r.lines {
                 println!("{line}");

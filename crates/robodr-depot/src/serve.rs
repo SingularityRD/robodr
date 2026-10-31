@@ -129,6 +129,38 @@ pub fn server_config(cfg: &Config) -> Result<Arc<rustls::ServerConfig>, DepotErr
     .map_err(err)
 }
 
+/// A server certificate this close to expiry (whole days) is logged once
+/// per day count (agentd's default `credential_warn_days`).
+pub const CERT_WARN_DAYS: i64 = 14;
+
+/// The log line for a server certificate expiring at `not_after` (Unix
+/// seconds) seen at `now` (Unix seconds), once per day count (`last`: the
+/// count last logged); `None` outside [`CERT_WARN_DAYS`] or already said.
+pub fn cert_expiry_warning(not_after: i64, now: u64, last: &mut Option<i64>) -> Option<String> {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let d = not_after.saturating_sub(now).div_euclid(86_400);
+    if d > CERT_WARN_DAYS {
+        *last = None;
+        return None;
+    }
+    if *last == Some(d) {
+        return None;
+    }
+    *last = Some(d);
+    Some(if d < 0 {
+        format!(
+            "robodr-depot: the server certificate (tls/server.pem) expired {} day(s) ago: \
+             units refuse the depot; issue a fresh one",
+            d.unsigned_abs()
+        )
+    } else {
+        format!(
+            "robodr-depot: the server certificate (tls/server.pem) expires in {d} day(s): \
+             issue a fresh one before then"
+        )
+    })
+}
+
 /// Serve until `stop` is set (checked between connections). Each request
 /// opens the depot under its lock ([`crate::lock`]) and closes it again,
 /// so operators' commands run between requests.
@@ -143,6 +175,17 @@ pub fn serve(
         .clone()
         .ok_or_else(|| err("no serve configuration"))?;
     let tls = server_config(&cfg)?;
+    // T6: the server certificate's expiry, logged once per day count.
+    let not_after = std::fs::read(cfg.state_dir.join("tls/server.pem"))
+        .ok()
+        .and_then(|pem| {
+            use rustls::pki_types::{pem::PemObject, CertificateDer};
+            CertificateDer::pem_slice_iter(&pem)
+                .next()
+                .and_then(Result::ok)
+        })
+        .and_then(|c| robodr_blackbox::crl::cert_not_after(c.as_ref()));
+    let mut warned = None;
     let deadline = Duration::from_secs(s.deadline_s);
     listener
         .set_nonblocking(true)
@@ -150,6 +193,9 @@ pub fn serve(
     let slots = Slots::new(s.max_connections, s.max_connections_per_source);
     let cfg = Arc::new(cfg);
     while !stop.load(Ordering::SeqCst) {
+        if let Some(line) = not_after.and_then(|na| cert_expiry_warning(na, clock(), &mut warned)) {
+            eprintln!("{line}");
+        }
         match listener.accept() {
             Ok((sock, peer)) => {
                 let Some(slot) = slots.take(peer.ip()) else {
@@ -345,6 +391,30 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    /// T6: within 14 days of the server certificate's notAfter, and after
+    /// it, one line per day count; nothing before.
+    #[test]
+    fn server_certificate_expiry_is_logged_once_per_day_count() {
+        const DAY: u64 = 86_400;
+        let na = 1_000 * DAY;
+        let mut last = None;
+        let at = |days_before: u64| na - days_before * DAY;
+        assert_eq!(cert_expiry_warning(na as i64, at(30), &mut last), None);
+        let l = cert_expiry_warning(na as i64, at(14), &mut last).unwrap();
+        assert!(l.contains("expires in 14 day(s)"), "{l}");
+        assert_eq!(cert_expiry_warning(na as i64, at(14) - 60, &mut last), None);
+        let l = cert_expiry_warning(na as i64, at(3), &mut last).unwrap();
+        assert!(l.contains("expires in 3 day(s)"), "{l}");
+        let l = cert_expiry_warning(na as i64, na + 2 * DAY, &mut last).unwrap();
+        assert!(l.contains("expired 2 day(s) ago"), "{l}");
+        // A renewed certificate: quiet again.
+        assert_eq!(
+            cert_expiry_warning((na + 400 * DAY) as i64, na, &mut last),
+            None
+        );
+        assert_eq!(last, None);
+    }
 
     fn idle(port: u16) -> TcpStream {
         let c = TcpStream::connect(("127.0.0.1", port)).unwrap();

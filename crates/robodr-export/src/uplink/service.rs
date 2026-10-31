@@ -301,8 +301,9 @@ pub fn crl_credentials(
 pub const CREDENTIAL_WARN_DAYS: i64 = 14;
 
 /// Log each credential within [`CREDENTIAL_WARN_DAYS`] once per day count
-/// (`logged`: the day count last logged per name).
-fn warn_expiring(
+/// (`logged`: the day count last logged per name). Also used by
+/// `robodr-kafka-publish`.
+pub fn warn_expiring(
     creds: &[robodr_ocsf::CredentialExpiry],
     logged: &mut std::collections::BTreeMap<String, i64>,
     log: &mut dyn FnMut(&str),

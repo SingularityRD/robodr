@@ -408,6 +408,13 @@ pub struct FindingsCfg {
     /// Optional finding signing key (`robodr-finding-sig`), as agentd's.
     #[serde(default)]
     pub finding_key: Option<PathBuf>,
+    /// Producer cap, as agentd's `findings.max_contract_minor` (findings
+    /// contract §5): build every finding for contract
+    /// `2.<max_contract_minor>.0` (0 ..= this build's minor; absent: the
+    /// current contract). Set it to the same value as agentd's, since both
+    /// write into the same spool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_contract_minor: Option<u64>,
 }
 
 impl Default for FindingsCfg {
@@ -420,6 +427,7 @@ impl Default for FindingsCfg {
             stale_grace_s: d_grace(),
             deferral_medium_after: d_deferral_medium(),
             finding_key: None,
+            max_contract_minor: None,
         }
     }
 }
@@ -941,6 +949,15 @@ impl Config {
         if !robodr_ocsf::validate::is_valid_topic(&f.topic) {
             return Err("findings.topic: not a valid topic".into());
         }
+        if let Some(m) = f
+            .max_contract_minor
+            .filter(|m| *m > robodr_ocsf::CONTRACT_MINOR)
+        {
+            return Err(format!(
+                "findings.max_contract_minor {m} is above this build's contract {}",
+                robodr_ocsf::CONTRACT_VERSION
+            ));
+        }
         if f.max_ready_files == 0 || f.deferral_medium_after == 0 {
             return Err("findings: max_ready_files and deferral_medium_after must be >= 1".into());
         }
@@ -1002,6 +1019,19 @@ mod tests {
         assert!(c.is_denied_user("root"));
         assert!(c.is_denied_user("robodr"));
         assert!(!c.is_denied_user("probe"));
+        assert_eq!(c.findings.max_contract_minor, None);
+    }
+
+    /// T38: the producer cap is parsed; one above this build's contract
+    /// is refused.
+    #[test]
+    fn producer_cap_is_bounded_by_this_build() {
+        let mut v = minimal();
+        v["findings"] = serde_json::json!({"max_contract_minor": 3});
+        assert_eq!(parse(&v).unwrap().findings.max_contract_minor, Some(3));
+        v["findings"]["max_contract_minor"] = (robodr_ocsf::CONTRACT_MINOR + 1).into();
+        let e = parse(&v).unwrap_err();
+        assert!(e.contains("findings.max_contract_minor"), "{e}");
     }
 
     /// Review H2: a unit without a TPM is erased by wiping its runtime

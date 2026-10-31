@@ -1172,6 +1172,30 @@ loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and
 keep-alives), so a hung, still-alive pulsard is not restarted automatically.
 Monitor the findings and heartbeat flow on the fleet side.
 
+#### Health record and early warnings (`daemon.self_health`)
+
+Every `health_record_ms` (default 60 s; 0 switches it off, only for replay
+and tests) agentd sends one Low, observe-only `robot.agent.health`
+finding (findings contract 2.5, §3g), an Update of the same finding each
+time, carrying `entity_context.agent_health`: state and reasons,
+component and contract versions, per-input freshness and counters, spool
+and black-box counters, executor / gateway / pulsard reachability,
+credential expiry, clock and free disk space. A SOC rule "no health
+record from robot X for N periods" tells a silent robot from a quiet one.
+`status.json` `self_health` shows the same probes between records. Under
+a producer cap below 2.5 (`findings.max_contract_minor`, contract §5) the
+record is off.
+
+The early warnings, all observe-only (they never trigger a response):
+
+| Finding | Severity | When (setting, default) |
+|---|---|---|
+| `robot.agent.credential_expiring` | Medium; High | the control plane's server certificate or a CRL within `credential_warn_days` (14); within `credential_critical_days` (3) or expired |
+| `robot.agent.clock_unsynced` | Medium | the kernel reports the clock unsynchronised for `clock_unsynced_grace_ms` (5 min); never where `adjtimex(2)` is refused, as under the shipped unit (`docs/TIME-SYNC.md`) |
+| `robot.agent.clock_jump` | High | the wall clock jumped against the monotonic clock (> 1 s) |
+| `robot.agent.disk_low` | Medium; High | the black-box or spool filesystem below `disk_warn_percent` (10 %) free; below `disk_critical_percent` (3 %) |
+| `robot.agent.executor_unreachable` | High | the executor has not answered for `executor_unreachable_ms` (30 s) |
+
 #### Crashes and restarts (`panic = "abort"`)
 
 Release binaries are built with `panic = "abort"` (`Cargo.toml`,
@@ -1671,6 +1695,39 @@ an OCSP responder; a soft-fail OCSP check would protect nothing and a
 hard-fail one would cut the robot off. A CRL is a signed file that travels
 over the same configuration channel as the CA bundle, so it is the only
 revocation mechanism.
+
+**Renewing CRLs on an air-gapped site.** A CRL past its `nextUpdate`
+refuses every peer of its CA (fail closed), so a renewed CRL must reach
+every host that lists it before then:
+
+1. On the (offline) CA, issue the CRL with a `nextUpdate` longer than the
+   time it takes to carry a file to every host, plus a margin
+   (`openssl ca -gencrl -crldays N -out new.crl.pem`; the CRL number must
+   go up, `crlnumber` in the `openssl ca` configuration).
+2. Carry it in on the same channel as the CA bundle (media, the site's
+   configuration channel) and check it before installing:
+   `openssl crl -in new.crl.pem -CAfile ca.pem -noout -crlnumber -nextupdate`
+   (the signature must verify under the CA, the number must be higher than
+   the one in use).
+3. On each host, write it next to the old file and `mv` it over the
+   configured path (`tls.crl_files`, `--crl-file`, `--tls-crl-file`,
+   `soc.crl_files`). The file is re-read on its next use, no restart.
+4. Confirm: agentd `status.json` `control_plane.tls.crl.in_use` shows the
+   new CRL number; `<state>/uplink-status.json` `credentials` shows the new
+   `days_to_expiry`; `robodr-kafka-publish ... --check`,
+   `robodr-anchor-receiver check` and `robodr-enroll check` print the days
+   left on each CRL in use.
+
+What warns before a CRL or certificate lapses: agentd raises
+`robot.agent.credential_expiring` for the control plane's server
+certificate and CRLs (Medium within `daemon.self_health.credential_warn_days`,
+default 14; High within `credential_critical_days`, default 3, or once
+expired). `robodr-uplink` (its CRLs), `robodr-kafka-publish` (its client
+certificate and CRLs) and `robodr-anchor-receiver serve` (its server
+certificate and unit CRLs) log a line on stderr within 14 days of expiry,
+once per day count; `robodr-depot serve` does the same for its server
+certificate. Do not remove a lapsed CRL from the configuration to get
+peers through: that switches revocation off for that path.
 
 **Evidence export (`control_plane.evidence`).** The SOC lists the retained
 evidence (`GET .../evidence`), asks for an export of a finding's evidence

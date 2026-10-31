@@ -645,6 +645,33 @@ impl ReplayTimeline {
     }
 }
 
+/// `daemon.self_health` as the daemon runs it. Under a producer cap below
+/// contract 2.5 (`findings.max_contract_minor` < 5) the `robot.agent.health`
+/// record is switched off (`health_record_ms` 0): a producer of that minor
+/// never sent it, and its SOC would get a Low finding every period under
+/// the generic "model-profile deviation" entry that reports no deviation.
+/// Returns the section and, when the record was switched off, why.
+pub(crate) fn effective_self_health(
+    cfg: &crate::config::DaemonConfig,
+) -> (crate::selfcheck::SelfHealthSection, Option<String>) {
+    let mut sh = cfg.daemon.self_health.clone();
+    match cfg.findings.max_contract_minor {
+        Some(m) if m < robodr_ocsf::builder::CATALOG_2_5_MINOR && sh.health_record_ms != 0 => {
+            sh.health_record_ms = 0;
+            (
+                sh,
+                Some(format!(
+                    "findings.max_contract_minor {m}: the robot.agent.health record \
+                     is off (it is a contract 2.{} finding); \
+                     the early warnings stay on",
+                    robodr_ocsf::builder::CATALOG_2_5_MINOR
+                )),
+            )
+        }
+        _ => (sh, None),
+    }
+}
+
 fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
@@ -684,6 +711,10 @@ impl<'a> Daemon<'a> {
         let cfg = &r.config;
         for w in &r.warnings {
             let _ = writeln!(log, "robodr-agentd: warning: {}", sanitize(w));
+        }
+        let (self_health, capped) = effective_self_health(cfg);
+        if let Some(w) = capped {
+            let _ = writeln!(log, "robodr-agentd: warning: {w}");
         }
         // Create the black-box and spool directories (0700, as the recorder
         // and the spool would) and re-check that they are apart on their
@@ -1350,10 +1381,7 @@ impl<'a> Daemon<'a> {
             executor_head_recorded: None,
             revert_failed_reported: std::collections::BTreeSet::new(),
             executor,
-            warnings: crate::selfcheck::Warnings::new(
-                cfg.daemon.self_health.clone(),
-                cfg.daemon.health_report_ms,
-            ),
+            warnings: crate::selfcheck::Warnings::new(self_health, cfg.daemon.health_report_ms),
             self_view: SelfView::default(),
             health_records: 0,
             health_record_at_ms: 0,
@@ -2844,7 +2872,8 @@ impl<'a> Daemon<'a> {
                 },
                 ComponentVersion {
                     component: robodr_ocsf::CONTRACT_NAME.into(),
-                    version: robodr_ocsf::CONTRACT_VERSION.into(),
+                    // The version the envelope carries (producer cap).
+                    version: self.agent.contract_version(),
                 },
             ],
             inputs,

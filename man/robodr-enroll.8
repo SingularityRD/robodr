@@ -243,7 +243,10 @@ the active uplink key file is the registered one and the SOC accepts a
 request it authenticates (a read-only
 .BR "GET .../ring" ;
 a published ring document is verified against the SOC fleet keys but not
-recorded). Exit 0 when every step passes, 1 when one fails, 3 when the SOC
+recorded). With
+.BR soc.crl_files ,
+it first prints the days left on each CRL in use (warn within 14 days).
+Exit 0 when every step passes, 1 when one fails, 3 when the SOC
 is not reached.
 .SS Decommissioning
 .B decommission \-\-reason

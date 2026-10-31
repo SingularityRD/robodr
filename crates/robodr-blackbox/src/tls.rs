@@ -146,6 +146,9 @@ pub struct ServerTls {
     pub config: Arc<ServerConfig>,
     /// Revocation counters (with `crl_files`).
     pub crl: Option<Arc<crate::crl::CrlStats>>,
+    /// `notAfter` (Unix seconds) of the server certificate (the first one
+    /// of `cert_chain`), for expiry warnings; `None` if it cannot be read.
+    pub not_after: Option<i64>,
 }
 
 impl fmt::Debug for ServerTls {
@@ -493,6 +496,9 @@ pub fn load_server_tls_with_crl_state(
     crl_state: Option<&Path>,
 ) -> Result<ServerTls, String> {
     let chain = certs("cert_chain", &f.cert_chain)?;
+    let not_after = chain
+        .first()
+        .and_then(|c| crate::crl::cert_not_after(c.as_ref()));
     let key = private_key("key_file", &f.key_file)?;
     let provider = provider();
     let b = ServerConfig::builder_with_provider(provider.clone())
@@ -524,6 +530,7 @@ pub fn load_server_tls_with_crl_state(
     Ok(ServerTls {
         config: Arc::new(cfg),
         crl,
+        not_after,
     })
 }
 
