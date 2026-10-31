@@ -176,6 +176,14 @@ Enable **exactly one** spool consumer. The units conflict.
    public key and imports them. Then `robodr-uplink --diode-out ...`
    sends them to the ingest API under a `relay` key.
 
+**Acceptance** ([`SITE-ACCEPTANCE.md`](../SITE-ACCEPTANCE.md)): with
+agentd and the exporter running, run the read-only checks there, then
+`sudo robodr-agentd selftest --config /etc/robodr/agentd.json`. It has
+agentd spool one Low `robot.agent.selftest` finding with a printed nonce
+and exits 0 once the exporter acknowledged it (`robodr-uplink`: the SOC
+accepted it; `robodr-spool-export`: it is in the diode outbox, so look for
+the nonce at the SOC).
+
 ## 7. SOC side
 
 - **AutoSecOps** receives findings at `POST /api/robot-edr/v2/ingest`

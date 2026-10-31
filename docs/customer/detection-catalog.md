@@ -8,9 +8,11 @@
 > `scripts/check-detection-catalog.py`, which fails when this page and the
 > code disagree. Verification levels (V0–V3) are those of
 > [`support-matrix.md`](support-matrix.md). Nothing here has been verified
-> on a customer robot. Two ids are catalogued in 2.5 for features
-> that do not emit them yet: `robot.agent.control_plane_request_fenced`
-> and `robot.agent.selftest`.
+> on a customer robot. One id is catalogued in 2.5 for a feature that
+> does not emit it yet: `robot.agent.control_plane_request_fenced`.
+> `robot.gateway.overload` comes from `robodr-firewall-gw`;
+> `robot.agent.selftest` only on an operator's request
+> (`robodr-agentd selftest`, site acceptance).
 
 ## How to read a finding
 

@@ -21,11 +21,28 @@ uses std threads and `std::sync::mpsc` only: no async runtime, no Pulsar.
 
 ```
 robodr-agentd --config /etc/robodr/agentd.json [--check-config]
+robodr-agentd selftest --config /etc/robodr/agentd.json [--timeout SECS]
 ```
 
 Exit codes: `0` clean stop (SIGTERM/SIGINT, or every input ended when
 `exit_when_inputs_end` is set); `1` runtime failure; `2` usage or
 configuration error (nothing started).
+
+`selftest` (field acceptance, `src/selftest.rs`) asks the daemon already
+running with that configuration to prove the path to the SOC: it writes
+`<spool>/selftest.request` (a fresh 128-bit nonce); the daemon takes it on
+its next tick (at most one per second), spools a Low, observe-only
+`robot.agent.selftest` finding with the nonce in its detail (ordinary spool
+share, not fed to the correlator) and answers in `<spool>/selftest.answer`
+with the record's name. The command then waits for the exporter to move the
+record into `acked/` (exit 0) or `rejected/` (exit 1); a request not taken,
+a finding not spooled, or a record still in `ready/` at the deadline
+(`--timeout`, default 120 s) is exit 1. Only `spool.dir` is read from the
+configuration (strict parse; no key or profile is opened). `acked/` means
+what the exporter means by it: `robodr-uplink` after the SOC accepted the
+line, `robodr-kafka-publish` after the broker acknowledged it,
+`robodr-spool-export` after the record was committed into the diode outbox
+(across a diode, the SOC confirms receipt by the printed nonce).
 
 ## Configuration
 

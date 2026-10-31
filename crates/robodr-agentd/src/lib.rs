@@ -132,6 +132,8 @@ pub mod safety_feed;
 /// Health record and early warnings (credential expiry, clock, disk,
 /// executor reachability).
 pub mod selfcheck;
+/// Field acceptance self-test (`robodr-agentd selftest`, T13).
+pub mod selftest;
 pub mod signal;
 pub mod spool;
 
