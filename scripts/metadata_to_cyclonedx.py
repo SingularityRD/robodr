@@ -9,6 +9,25 @@ hosts, the dev sandbox). Python 3.11+ standard library only.
     python3 scripts/metadata_to_cyclonedx.py --check robodr.cdx.json
     python3 scripts/metadata_to_cyclonedx.py --self-test
 
+Release SBOMs (.github/workflows/release.yml) also go through --augment, which
+adds what cargo's view misses, to any CycloneDX >= 1.5 JSON (cargo-cyclonedx's
+too), in place:
+
+    python3 scripts/metadata_to_cyclonedx.py --augment dist/sbom/*.cdx.json \
+        --rustc-vv rustc-vV.txt --target aarch64-unknown-linux-musl \
+        --self-contained-dir "$(rustc --print sysroot)/lib/rustlib/<triple>/lib/self-contained" \
+        [--ebpf-dir target/release/build --ebpf-version 0.11.0] --tool clang=18.1.3 ...
+    python3 scripts/metadata_to_cyclonedx.py --check X.cdx.json --require-complete
+
+  * Rust's std, core and alloc (the pinned toolchain's release and commit),
+    statically linked into every binary;
+  * musl targets: musl (version read from rust-std's libc.a) and LLVM's
+    libunwind, with the SHA-256 of the archives that were linked;
+  * eBPF objects embedded in robodr-pulsard (*.bpf.o under --ebpf-dir), with
+    SHA-256 and GPL-2.0-only;
+  * `formulation`: rustc (release, commit, host, LLVM) and every --tool.
+--require-complete makes --check refuse a BOM without them (the publish gate).
+
 What it records, per resolved package: name, version, purl, SPDX license
 expression (or the raw string as a named license when the string is not a
 syntactically valid SPDX expression), the crates.io SHA-256 checksum from
@@ -381,6 +400,8 @@ def check_against_lock(bom, lock: dict) -> list[str]:
         for c in cs or []:
             if not isinstance(c, dict):
                 continue
+            if any(p.get("name") == "robodr:sbom:augmented" for p in c.get("properties", []) or []):
+                continue  # not a crate: Rust std, musl, eBPF objects (augment)
             key = (str(c.get("name")), str(c.get("version")))
             if key not in by_nv:
                 errs.append(f"component {key[0]}@{key[1]} is not in Cargo.lock")
@@ -397,6 +418,310 @@ def check_against_lock(bom, lock: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Augmenting a BOM with what cargo does not see (release SBOMs).
+# --------------------------------------------------------------------------
+RUST_STD_LIBS = ("std", "core", "alloc")
+RUST_LICENSE = "MIT OR Apache-2.0"
+# vendor/pulsar/LICENSE: "Pulsar eBPF probes are provided under the GPL-2.0 license".
+EBPF_LICENSE = "GPL-2.0-only"
+MUSL_LICENSE = "MIT"
+LIBUNWIND_LICENSE = "Apache-2.0 WITH LLVM-exception"
+ROLE_PROP = "robodr:sbom:augmented"
+MAX_AR_MEMBER = 1 << 20
+
+
+def parse_rustc_vv(text: str) -> dict[str, str]:
+    """`rustc -vV` output -> {release, commit-hash, host, LLVM version, ...}."""
+    out: dict[str, str] = {}
+    for ln in text.splitlines():
+        if ": " in ln:
+            k, v = ln.split(": ", 1)
+            out[k.strip()] = v.strip()
+    for k in ("release", "commit-hash", "host"):
+        if not out.get(k):
+            raise ValueError(f"rustc -vV output has no '{k}:' line")
+    return out
+
+
+def ar_member(data: bytes, name: str) -> bytes | None:
+    """One member of a System V / GNU `ar` archive (short names only)."""
+    if not data.startswith(b"!<arch>\n"):
+        raise ValueError("not an ar archive")
+    pos = 8
+    while pos + 60 <= len(data):
+        hdr = data[pos : pos + 60]
+        try:
+            size = int(hdr[48:58].decode("ascii").strip())
+        except ValueError:
+            raise ValueError("ar archive: bad member header") from None
+        if size < 0 or pos + 60 + size > len(data):
+            raise ValueError("ar archive: truncated member")
+        member = hdr[:16].decode("ascii", "replace").strip().rstrip("/")
+        if member == name:
+            return data[pos + 60 : pos + 60 + min(size, MAX_AR_MEMBER)]
+        pos += 60 + size + (size & 1)
+    return None
+
+
+def musl_version(libc_a: bytes) -> str:
+    """musl's version string, from the version.lo member of its libc.a."""
+    m = ar_member(libc_a, "version.lo")
+    found = sorted(set(re.findall(rb"(?<![0-9.])1\.[0-9]{1,2}\.[0-9]{1,2}(?![0-9.])", m or b"")))
+    if len(found) != 1:
+        raise ValueError(f"cannot tell musl's version from libc.a (version.lo: {found})")
+    return found[0].decode()
+
+
+def _prop(name: str, value: str) -> dict:
+    return {"name": name, "value": value}
+
+
+def _sha(b: bytes) -> list[dict]:
+    return [{"alg": "SHA-256", "content": hashlib.sha256(b).hexdigest()}]
+
+
+def augment(
+    bom: dict,
+    rustc: dict[str, str],
+    target: str,
+    self_contained: dict[str, bytes] | None = None,
+    ebpf: list[tuple[str, bytes]] | None = None,
+    ebpf_version: str | None = None,
+    tools: list[tuple[str, str]] | None = None,
+) -> dict:
+    """Add the components a cargo-based SBOM misses, and the toolchain.
+
+    * Rust's standard library (std, core, alloc) of the pinned toolchain,
+      statically linked into every binary.
+    * For a musl target: musl's libc.a and LLVM's libunwind.a from rust-std's
+      self-contained directory (`self_contained`: file name -> bytes), with
+      their SHA-256 and versions (musl's read from libc.a itself, libunwind's
+      = rustc's LLVM).
+    * eBPF objects (`ebpf`: (relative path, bytes)) embedded in
+      robodr-pulsard: GPL-2.0-only, with their SHA-256.
+    * `formulation`: rustc (release, commit, host, LLVM) and every `tools`
+      entry (name, version): how the artefact was built.
+    Every added component becomes a dependency of the BOM's root component.
+    Refuses (ValueError) a BOM below CycloneDX 1.5 (no formulation) or one
+    that is already augmented.
+    """
+    if not isinstance(bom, dict) or bom.get("bomFormat") != "CycloneDX":
+        raise ValueError("not a CycloneDX BOM")
+    try:
+        major, minor = (int(x) for x in str(bom.get("specVersion", "")).split("."))
+    except ValueError:
+        raise ValueError(f"bad specVersion {bom.get('specVersion')!r}") from None
+    if (major, minor) < (1, 5):
+        raise ValueError(
+            f"specVersion {major}.{minor} < 1.5 (no formulation): generate 1.5 (cargo cyclonedx --spec-version 1.5)"
+        )
+    if bom.get("formulation") or any(
+        isinstance(c, dict) and any(p.get("name") == ROLE_PROP for p in c.get("properties", []) or [])
+        for c in bom.get("components", []) or []
+    ):
+        raise ValueError("BOM is already augmented")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", target):
+        raise ValueError(f"bad target triple {target!r}")
+    ver = rustc["release"]
+    added: list[dict] = []
+    for lib in RUST_STD_LIBS:
+        added.append(
+            {
+                "type": "library",
+                "bom-ref": f"pkg:generic/rust-lang/{lib}@{ver}?target={target}",
+                "supplier": {"name": "The Rust Project"},
+                "name": lib,
+                "version": ver,
+                "scope": "required",
+                "purl": f"pkg:generic/rust-lang/{lib}@{ver}",
+                "licenses": [{"expression": RUST_LICENSE}],
+                "properties": [
+                    _prop(ROLE_PROP, "rust-std"),
+                    _prop("robodr:rust:commit-hash", rustc["commit-hash"]),
+                    _prop("robodr:rust:target", target),
+                    _prop("robodr:linkage", "static"),
+                ],
+            }
+        )
+    if target.endswith("-musl"):
+        sc = self_contained or {}
+        for f in ("libc.a", "libunwind.a"):
+            if f not in sc:
+                raise ValueError(f"musl target {target}: rust-std self-contained {f} not given")
+        llvm = rustc.get("LLVM version")
+        if not llvm:
+            raise ValueError("rustc -vV has no 'LLVM version:' line (libunwind's version)")
+        for name, version, lic, f, sup in (
+            ("musl", musl_version(sc["libc.a"]), MUSL_LICENSE, "libc.a", "musl libc"),
+            ("libunwind", llvm, LIBUNWIND_LICENSE, "libunwind.a", "LLVM Project"),
+        ):
+            added.append(
+                {
+                    "type": "library",
+                    "bom-ref": f"pkg:generic/{name}@{version}?target={target}",
+                    "supplier": {"name": sup},
+                    "name": name,
+                    "version": version,
+                    "scope": "required",
+                    "purl": f"pkg:generic/{name}@{version}",
+                    "hashes": _sha(sc[f]),
+                    "licenses": [{"expression": lic}],
+                    "properties": [
+                        _prop(ROLE_PROP, "rust-std-self-contained"),
+                        _prop("robodr:file", f"lib/rustlib/{target}/lib/self-contained/{f}"),
+                        _prop("robodr:linkage", "static"),
+                    ],
+                }
+            )
+    for rel, data in sorted(ebpf or []):
+        if not ebpf_version:
+            raise ValueError("eBPF objects given without an eBPF (Pulsar) version")
+        if not re.fullmatch(r"[A-Za-z0-9_./+-]{1,256}", rel) or ".." in rel.split("/") or rel.startswith("/"):
+            raise ValueError(f"bad eBPF object path {rel!r}")
+        added.append(
+            {
+                "type": "file",
+                "bom-ref": f"file:ebpf/{rel}",
+                "name": rel.rsplit("/", 1)[-1],
+                "version": ebpf_version,
+                "scope": "required",
+                "hashes": _sha(data),
+                "licenses": [{"expression": EBPF_LICENSE}],
+                "properties": [
+                    _prop(ROLE_PROP, "ebpf-object"),
+                    _prop("robodr:ebpf:path", rel),
+                    _prop("robodr:linkage", "embedded in robodr-pulsard (include_bytes)"),
+                ],
+            }
+        )
+    tool_comps = [
+        {
+            "type": "application",
+            "bom-ref": f"formulation:tool:rustc@{ver}",
+            "name": "rustc",
+            "version": ver,
+            "properties": [
+                _prop("robodr:rust:commit-hash", rustc["commit-hash"]),
+                _prop("robodr:rust:host", rustc["host"]),
+                _prop("robodr:rust:llvm", rustc.get("LLVM version", "")),
+            ],
+        }
+    ]
+    for name, version in sorted(tools or []):
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", name or "") or not version or len(version) > 200:
+            raise ValueError(f"bad tool {name!r}={version!r}")
+        tool_comps.append(
+            {"type": "application", "bom-ref": f"formulation:tool:{name}", "name": name, "version": version}
+        )
+    out = json.loads(json.dumps(bom))
+    out.setdefault("components", []).extend(added)
+    out["formulation"] = [
+        {
+            "bom-ref": "formulation:robodr-release-build",
+            "components": tool_comps,
+            "properties": [_prop("robodr:build:target", target)],
+        }
+    ]
+    root = ((out.get("metadata") or {}).get("component") or {}).get("bom-ref")
+    if root:
+        deps = out.setdefault("dependencies", [])
+        entry = next((d for d in deps if isinstance(d, dict) and d.get("ref") == root), None)
+        if entry is None:
+            entry = {"ref": root, "dependsOn": []}
+            deps.insert(0, entry)
+        entry["dependsOn"] = sorted(set(entry.get("dependsOn", []) or []) | {c["bom-ref"] for c in added})
+    return out
+
+
+def check_complete(bom) -> list[str]:
+    """What a release SBOM must contain beyond cargo's view (see augment)."""
+    errs: list[str] = []
+    if not isinstance(bom, dict):
+        return ["BOM is not a JSON object"]
+    try:
+        if tuple(int(x) for x in str(bom.get("specVersion", "")).split(".")) < (1, 5):
+            errs.append(f"specVersion {bom.get('specVersion')} < 1.5")
+    except ValueError:
+        errs.append(f"bad specVersion {bom.get('specVersion')!r}")
+    roles: dict[str, list[dict]] = {}
+    for c in bom.get("components", []) or []:
+        if not isinstance(c, dict):
+            continue
+        for p in c.get("properties", []) or []:
+            if p.get("name") == ROLE_PROP:
+                roles.setdefault(p.get("value"), []).append(c)
+    if sorted(str(c.get("name")) for c in roles.get("rust-std", [])) != sorted(RUST_STD_LIBS):
+        errs.append("Rust std/core/alloc components missing (not augmented)")
+    targets = {
+        p.get("value")
+        for c in roles.get("rust-std", [])
+        for p in c.get("properties", []) or []
+        if p.get("name") == "robodr:rust:target"
+    }
+    if any(str(t).endswith("-musl") for t in targets) and sorted(
+        str(c.get("name")) for c in roles.get("rust-std-self-contained", [])
+    ) != ["libunwind", "musl"]:
+        errs.append("musl target without musl and libunwind components")
+    for c in roles.get("rust-std-self-contained", []) + roles.get("ebpf-object", []):
+        if not any(h.get("alg") == "SHA-256" for h in c.get("hashes", []) or []):
+            errs.append(f"{c.get('name')}: no SHA-256")
+    form = bom.get("formulation")
+    if not (
+        isinstance(form, list)
+        and any(
+            isinstance(f, dict) and any(c.get("name") == "rustc" for c in f.get("components", []) or [])
+            for f in form
+        )
+    ):
+        errs.append("formulation (toolchain) missing")
+    return errs
+
+
+def augment_main(a) -> int:
+    """--augment: rewrite BOM files in place (each one: read, augment, write)."""
+    try:
+        rustc = parse_rustc_vv(open(a.rustc_vv, encoding="utf-8").read())
+        sc: dict[str, bytes] = {}
+        if a.target.endswith("-musl"):
+            d = a.self_contained_dir
+            if not d:
+                raise ValueError("musl target: --self-contained-dir is required")
+            for f in ("libc.a", "libunwind.a"):
+                with open(os.path.join(d, f), "rb") as fh:
+                    sc[f] = fh.read()
+        ebpf: list[tuple[str, bytes]] = []
+        for d in a.ebpf_dir or []:
+            for dirpath, _dirs, files in os.walk(d):
+                for f in files:
+                    if f.endswith(".bpf.o"):
+                        p = os.path.join(dirpath, f)
+                        with open(p, "rb") as fh:
+                            ebpf.append((os.path.relpath(p, d).replace(os.sep, "/"), fh.read()))
+        if a.ebpf_dir and not ebpf:
+            raise ValueError(f"no *.bpf.o under {a.ebpf_dir}")
+        tools = []
+        for t in a.tool or []:
+            name, sep, version = t.partition("=")
+            if not sep:
+                raise ValueError(f"--tool {t!r}: want NAME=VERSION")
+            tools.append((name, version))
+        for path in a.augment:
+            with open(path, encoding="utf-8") as fh:
+                bom = json.load(fh)
+            out = augment(bom, rustc, a.target, sc, ebpf, a.ebpf_version, tools)
+            errs = check_bom(out) + check_complete(out)
+            if errs:
+                raise ValueError(f"{path}: augmented BOM fails its own check: {errs}")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(out, indent=2) + "\n")
+            print(f"{path}: augmented (+{len(out['components']) - len(bom.get('components', []) or [])} components, formulation)")
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("metadata", nargs="?", default="-", help="cargo metadata JSON file, or - for stdin")
@@ -410,11 +735,32 @@ def main(argv: list[str]) -> int:
         metavar="BOM",
         help="check a CycloneDX JSON file (with --lockfile: cross-check it against Cargo.lock) and exit",
     )
+    ap.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="with --check: also require what --augment adds (release SBOMs)",
+    )
+    ap.add_argument(
+        "--augment",
+        nargs="+",
+        metavar="BOM",
+        help="add Rust std, musl/libunwind, eBPF objects and the toolchain to these BOM files (in place)",
+    )
+    ap.add_argument("--rustc-vv", help="--augment: file with `rustc -vV` of the build")
+    ap.add_argument("--target", help="--augment: the Rust target triple of the build")
+    ap.add_argument("--self-contained-dir", help="--augment, musl: rust-std's lib/rustlib/<triple>/lib/self-contained")
+    ap.add_argument("--ebpf-dir", action="append", help="--augment: directory searched for *.bpf.o (repeatable)")
+    ap.add_argument("--ebpf-version", help="--augment: version of the eBPF objects (Pulsar's)")
+    ap.add_argument("--tool", action="append", help="--augment: NAME=VERSION of a build tool (repeatable)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
 
     if a.self_test:
         return _self_test()
+    if a.augment:
+        if not (a.rustc_vv and a.target):
+            ap.error("--augment needs --rustc-vv and --target")
+        return augment_main(a)
     if a.check:
         try:
             with open(a.check, encoding="utf-8") as f:
@@ -423,6 +769,8 @@ def main(argv: list[str]) -> int:
             print(f"error: {a.check}: {e}", file=sys.stderr)
             return 1
         errs = check_bom(bom)
+        if a.require_complete:
+            errs += check_complete(bom)
         if a.lockfile:
             try:
                 with open(a.lockfile, "rb") as f:
@@ -739,8 +1087,147 @@ def _self_test() -> int:
             b["components"][0]["hashes"] = [{"alg": "SHA-256", "content": "xyz"}]
             self.assertEqual(len(check_bom(b)), 2)
 
+    RUSTC_VV = (
+        "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\n"
+        "commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\n"
+        "host: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\n"
+    )
+
+    def ar(members: dict[str, bytes]) -> bytes:
+        out = b"!<arch>\n"
+        for n, d in members.items():
+            hdr = f"{n + '/':<16}{0:<12}{0:<6}{0:<6}{644:<8}{len(d):<10}`\n".encode()
+            assert len(hdr) == 60
+            out += hdr + d + (b"\n" if len(d) & 1 else b"")
+        return out
+
+    LIBC = ar({"abs.lo": b"\x7fELF...", "version.lo": b"\x00\x00musl 1.2.5\x00x"})
+    UNWIND = b"!<arch>\nlibunwind"
+
+    class Augment(unittest.TestCase):
+        def bom(self):
+            return convert(_fixture(), lock=lock)
+
+        def aug(self, target="aarch64-unknown-linux-musl", **kw):
+            args = dict(
+                self_contained={"libc.a": LIBC, "libunwind.a": UNWIND},
+                ebpf=[("bpf-filtering-x/out/probes.acl.bpf.o", b"BPF1"), ("p/out/net.none.bpf.o", b"BPF2")],
+                ebpf_version="0.11.0",
+                tools=[("cargo-cyclonedx", "0.5.9"), ("clang", "18.1.3")],
+            )
+            args.update(kw)
+            return augment(self.bom(), parse_rustc_vv(RUSTC_VV), target, **args)
+
+        def names(self, b):
+            return {c["name"] for c in b["components"]}
+
+        def test_plain_bom_is_not_complete(self):
+            # The release gate: a cargo-only SBOM is refused.
+            errs = check_complete(self.bom())
+            self.assertTrue(any("std" in e for e in errs), errs)
+            self.assertTrue(any("formulation" in e for e in errs), errs)
+
+        def test_musl_complete(self):
+            b = self.aug()
+            self.assertEqual(check_bom(b), [])
+            self.assertEqual(check_complete(b), [])
+            self.assertTrue({"std", "core", "alloc", "musl", "libunwind"} <= self.names(b))
+            musl = next(c for c in b["components"] if c["name"] == "musl")
+            self.assertEqual(musl["version"], "1.2.5")
+            self.assertEqual(musl["hashes"][0]["content"], hashlib.sha256(LIBC).hexdigest())
+            unw = next(c for c in b["components"] if c["name"] == "libunwind")
+            self.assertEqual(unw["version"], "22.1.8")
+            self.assertEqual(unw["licenses"], [{"expression": "Apache-2.0 WITH LLVM-exception"}])
+            tools = {c["name"]: c["version"] for c in b["formulation"][0]["components"]}
+            self.assertEqual(tools, {"rustc": "1.98.1", "cargo-cyclonedx": "0.5.9", "clang": "18.1.3"})
+            root = b["dependencies"][0]
+            self.assertEqual(root["ref"], b["metadata"]["component"]["bom-ref"])
+            for c in b["components"]:
+                if any(p["name"] == ROLE_PROP for p in c.get("properties", [])):
+                    self.assertIn(c["bom-ref"], root["dependsOn"])
+
+        def test_ebpf_objects(self):
+            b = self.aug()
+            e = [c for c in b["components"] if c["type"] == "file"]
+            self.assertEqual(len(e), 2)
+            self.assertEqual({c["licenses"][0]["expression"] for c in e}, {"GPL-2.0-only"})
+            self.assertIn(hashlib.sha256(b"BPF1").hexdigest(), json.dumps(e))
+            with self.assertRaises(ValueError):
+                self.aug(ebpf=[("../x.bpf.o", b"x")])
+            with self.assertRaises(ValueError):
+                self.aug(ebpf_version=None)
+
+        def test_gnu_target_needs_no_musl(self):
+            b = self.aug(target="x86_64-unknown-linux-gnu", self_contained=None, ebpf=None)
+            self.assertEqual(check_complete(b), [])
+            self.assertNotIn("musl", self.names(b))
+
+        def test_refusals(self):
+            with self.assertRaises(ValueError):
+                self.aug(self_contained={"libc.a": LIBC})  # no libunwind.a
+            with self.assertRaises(ValueError):
+                self.aug(self_contained={"libc.a": ar({"version.lo": b"1.2.4 1.2.5"}), "libunwind.a": UNWIND})
+            old = self.bom()
+            old["specVersion"] = "1.3"
+            with self.assertRaises(ValueError):
+                augment(old, parse_rustc_vv(RUSTC_VV), "x86_64-unknown-linux-gnu")
+            twice = self.aug()
+            with self.assertRaises(ValueError):
+                augment(twice, parse_rustc_vv(RUSTC_VV), "aarch64-unknown-linux-musl")
+            with self.assertRaises(ValueError):
+                parse_rustc_vv("rustc 1.0\n")
+            with self.assertRaises(ValueError):
+                ar_member(b"not ar", "x")
+            with self.assertRaises(ValueError):
+                ar_member(b"!<arch>\n" + b"x" * 48 + b"9999999999" + b"`\n", "x")
+
+        def test_musl_check_needs_libs(self):
+            b = self.aug()
+            b["components"] = [c for c in b["components"] if c["name"] != "musl"]
+            self.assertTrue(check_complete(b))
+
+        def test_lock_check_skips_augmented(self):
+            b = self.aug()
+            full = tomllib.loads(
+                "".join(
+                    f'[[package]]\nname = "{c["name"]}"\nversion = "{c["version"]}"\n'
+                    for c in convert(_fixture(), lock=lock)["components"]
+                    if c["name"] != "serde"
+                )
+            )
+            full["package"] += lock["package"]
+            self.assertEqual(check_against_lock(b, full), [])
+
+        def test_cli(self):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as d:
+                bp = os.path.join(d, "x.cdx.json")
+                with open(bp, "w") as f:
+                    json.dump(self.bom(), f)
+                rv = os.path.join(d, "rustc-vV")
+                with open(rv, "w") as f:
+                    f.write(RUSTC_VV)
+                sc = os.path.join(d, "sc")
+                os.makedirs(os.path.join(d, "bpf", "out"))
+                os.makedirs(sc)
+                with open(os.path.join(sc, "libc.a"), "wb") as f:
+                    f.write(LIBC)
+                with open(os.path.join(sc, "libunwind.a"), "wb") as f:
+                    f.write(UNWIND)
+                with open(os.path.join(d, "bpf", "out", "a.none.bpf.o"), "wb") as f:
+                    f.write(b"BPF")
+                self.assertEqual(main(["--check", bp, "--require-complete"]), 1)
+                base = ["--augment", bp, "--rustc-vv", rv, "--target", "aarch64-unknown-linux-musl"]
+                self.assertEqual(main(base), 1)  # musl without --self-contained-dir
+                ok = base + ["--self-contained-dir", sc, "--ebpf-dir", os.path.join(d, "bpf"),
+                             "--ebpf-version", "0.11.0", "--tool", "clang=18.1.3"]
+                self.assertEqual(main(ok), 0)
+                self.assertEqual(main(["--check", bp, "--require-complete"]), 0)
+                self.assertEqual(main(ok), 1)  # already augmented
+
     suite = unittest.TestSuite()
-    for cls in (Spdx, Convert, Check):
+    for cls in (Spdx, Convert, Check, Augment):
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(cls))
     r = unittest.TextTestRunner(verbosity=1).run(suite)
     return 0 if r.wasSuccessful() else 1
