@@ -112,7 +112,7 @@ pub enum Status {
     Refused,
     /// The apply failed and was rolled back (or could not be committed).
     Failed,
-    /// Recorded only (v1 `restrict_motion`).
+    /// Recorded only (`restrict_motion` without a `motion` section).
     Advisory,
     /// A non-reversible motion action took effect (`request_safe_state`,
     /// `rollback_config`); there is nothing to revert.

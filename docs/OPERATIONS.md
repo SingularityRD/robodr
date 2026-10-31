@@ -2080,10 +2080,13 @@ its own table `inet robodr`, plus an evidence mark:
 | `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix; by the source addresses agentd saw it sending from, cut whole on the robot's DDS ports whatever the source port; and by its SPDP locators on those addresses; all outside the motion control path, which is never cut, even by traffic carrying the quarantined prefix). Cutting an address cuts every DDS participant on that host. The SOC's answer says how far it reaches: `containment` `full` (every observed address and announced locator cut whole), `partial` or `guid_only` (GUID-prefix drop only, evadable), with `state.quarantine` listing what was cut and left out (contract §6a) | on revert or TTL |
 | `record_evidence` | a signed black-box mark | never: evidence is not reverted |
 
-`restrict_motion` is recorded as advisory: the executor does not drive the
-inline gateway (section 6.6), which enforces its own locked profile. The
-executor never sends `safe_pause`, `request_safe_state` or
-`rollback_config`.
+Without a `motion` section in `executor.json`, `restrict_motion` is
+recorded as advisory and the executor never sends `safe_pause`,
+`request_safe_state` or `rollback_config`. With one, they run through the
+platform adapters (`gateway`: a restriction file read by the inline
+gateway, section 6.6; `unitree_sport`, `nav2`, `ros2_control`, `px4`,
+`rollback`), each refused until the site sets its `oem_validated: true`
+(`crates/robodr-executor/README.md`, "Motion adapters").
 
 **Capability model.**
 
