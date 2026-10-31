@@ -299,12 +299,15 @@ fn wp8a_units_left_on_previous_binaries_reach_the_soc() {
             "restart_pending_file": file}}),
     );
     let (stop, h) = spawn(s.resolve(&cfg));
-    let st = wait_for(15, "restart_pending spooled", || {
+    // The finding is spooled before the next status.json write: wait for
+    // both, so the status read is not the one written at start.
+    let st = wait_for(15, "restart_pending spooled and in status.json", || {
         rules(&spooled(&s.spool))
             .iter()
             .any(|r| r == "robot.agent.restart_pending")
             .then(|| status(&s.spool))
             .flatten()
+            .filter(|st| !st["self_health"]["pending_restart"].is_null())
     });
     let log = finish(stop, h);
     let found = spooled(&s.spool);
