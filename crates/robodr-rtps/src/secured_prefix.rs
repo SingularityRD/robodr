@@ -31,7 +31,7 @@
 //! Subjects that cannot be rebuilt never match, so a legitimate secured
 //! participant with such a subject is not resolved to a learned identity
 //! (`robodr-commission learn --pcap` warns about it:
-//! `secured_prefix_unverified`):
+//! `identity_prefix_unverified`):
 //!
 //! - in the one-line form, a multi-valued RDN (the form does not show the
 //!   grouping) and a value containing `/x=` (read as a new attribute);

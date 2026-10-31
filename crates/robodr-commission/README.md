@@ -126,7 +126,13 @@ always printed to stdout. The report contains:
   `reader_only_name`, `raw_dds_topic`, `reader_topics_not_learned`, and, for
   captures, `fragmented_discovery_unreassembled` (DATA_FRAG seen but not all
   rebuilt, so endpoints are missing), `fragmented_discovery_reassembled`,
-  `ip_reassembly_failed`, `truncated_frames` and `protected_discovery`;
+  `ip_reassembly_failed`, `truncated_frames`, `protected_discovery`,
+  `unsupported_transport` (per source host: its SPDP advertises
+  shared-memory, TCP or unknown-kind locators, so traffic over them is not
+  in the capture and was not learned) and `identity_prefix_unverified` (an
+  accepted participant whose identity the sensor will not resolve: its
+  vendor id is missing or not the GUID prefix's first two bytes, and no
+  claimed PKI-DH certificate subject rebuilds to the prefix);
   `endpoint_sender_mismatch`, `discovery_relay_attributed` (info),
   `discovery_relay_participants_ignored` (info), `envelope_outlier`,
   `envelope_dimension_unobserved` (info) and `presence_measured_by_position`

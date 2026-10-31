@@ -33,12 +33,18 @@ that and none of its commands is on the wire.
 - `robodr-ros2-watch --check-config /etc/robodr/pulsar.toml` warns when
   `/dev/shm` of the host it runs on holds DDS segments (`fastrtps_port<N>`,
   `fastrtps_<hex>`, `fast_datasharing_*`, `iceoryx_mgmt`, `iox_*`): run it
-  on the robot. With the passive capture enabled it also prints a `note:`
-  summary line that shared-memory transports are invisible (not a warning,
-  so `--strict` can pass).
-- The running daemon does not list `/dev/shm`, and `robodr-commission
-  learn` does not yet warn about shared-memory locators: only the SPDP
-  finding above and the check-config warning exist today.
+  on the robot. Nothing in the configuration tells it which host is the
+  robot: on a developer workstation running ROS the same warning appears
+  (and fails `--strict`). When none are found, or `/dev/shm` cannot be
+  listed, it prints a `note:` summary line instead. With the passive
+  capture enabled it also prints a `note:` summary line that shared-memory
+  transports are invisible (not a warning, so `--strict` can pass).
+- `robodr-commission learn --pcap` warns `unsupported_transport` once per
+  source host whose SPDP advertises such locators: what went over them is
+  not in the capture, so it is not in the profile either. Learning from
+  sensor events (JSON lines) has no locator kinds, so no such warning.
+- The running daemon does not list `/dev/shm`: on the robot only the SPDP
+  finding above reports shared memory.
 
 ### Commissioning prerequisite: UDP only
 
@@ -97,6 +103,13 @@ nothing else (warning `protected_discovery`), and the writer and
 motion-envelope checks have nothing to work on: topic access control is the
 DDS stack's own (the permissions). RoboDR still sees who is on the domain.
 
+`robodr-ros2-watch --check-config` with `sros2_keystore` set states this
+(and the other rows of the table) as `note:` summary lines, **not as
+warnings**: it is what a correctly secured deployment looks like, so
+`--strict` passes on it. Read the notes: under discovery protection the
+writer and motion-envelope checks inspect nothing, and `--strict` does not
+flag that loss of coverage.
+
 ### Policy input: `sros2_keystore`
 
 Point the sensor at the robot's keystore `enclaves/` directory (only
@@ -154,6 +167,23 @@ the profile: update the files (or `sros2_keystore`), run
   claims: a crafted announcement can claim the subject and use its prefix,
   as it can claim any vendor id; it still has to come from one of the
   identity's addresses and find a free `max_instances` slot.
+- Subject forms the sensor can rebuild (`robodr_rtps::secured_prefix`):
+  the OpenSSL one-line form (`/CN=\/lab\/x`, what Fast DDS 2.6 sends) and
+  the RFC 4514 form (`CN=/lab/x`), with attribute types by name (`CN`,
+  `O`, `OU`, `C`, `L`, `ST`, `street`, `serialNumber`, `title`, `SN`,
+  `GN`, `initials`, `postalCode`, `dnQualifier`, `pseudonym`,
+  `emailAddress`, `DC`, `UID`) or as numeric OIDs, values as UTF8String or
+  PrintableString (the type is not in the text, both are tried), and in
+  the RFC 4514 form also multi-valued RDNs (`CN=a+UID=b`), `#hex` values
+  of any string type and escaped spaces. Not rebuilt: multi-valued RDNs
+  and values containing `/x=` in the one-line form, T61String / BMPString
+  values not given as `#hex`, other attribute names. A secured participant
+  whose subject is not rebuilt never resolves to its learned identity and
+  is reported as an unknown participant (a false positive, not a missed
+  detection); `robodr-commission learn --pcap` warns
+  `identity_prefix_unverified` for it at commissioning. The default SROS 2
+  subjects (`CN=<enclave>`) are rebuilt; Cyclone DDS's `dds.cert.sn` format
+  has not been captured.
 - Validated on Fast DDS 2.6 (Humble) only; Cyclone DDS with DDS-Security
   has not been captured.
 
