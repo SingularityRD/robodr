@@ -24,6 +24,12 @@
 //!   harness key's (deterministic Ed25519) over exactly its fields for this
 //!   robot: nothing unsigned, re-encoded or signed for another robot is
 //!   accepted;
+//! * an accepted order is the order the SOC signed (review finding F3):
+//!   its id, action, `ttl_s`, target, origin key id and `requested_by`
+//!   equal the signed body's `request_id`, `action`, `ttl_seconds`,
+//!   parameters, the request's `key_id` and `requested_by`
+//!   ([`signed_body_matches`], an oracle written independently of
+//!   `verify`'s own comparison);
 //! * the same approval is never accepted twice (`soc_nonce_replayed`), and
 //!   never by an executor of another robot (`soc_signature_invalid`);
 //! * a planner order never carries an approval (`approval_missing`);
@@ -157,12 +163,93 @@ fn approval(order: &Order) {
         "accepted a request the key did not sign"
     );
     assert_eq!(soc.method, "POST");
+    if let Err(why) = signed_body_matches(order) {
+        panic!("accepted an order that is not the one the SOC signed: {why}");
+    }
     let again = verify(order, &cx(&keys, ROBOT), &mut replay).expect_err("approval replayed");
     assert_eq!(again.code, codes::SOC_NONCE_REPLAYED);
     let mut other = store("b");
     let e = verify(order, &cx(&keys, OTHER_ROBOT), &mut other)
         .expect_err("approval accepted by another robot");
     assert_eq!(e.code, codes::SOC_SIGNATURE_INVALID);
+}
+
+/// Whether `order` is the order its SOC request's body describes, checked
+/// field by field against the body as JSON (not through `verify`'s own
+/// types): the binding that makes the signature an approval of *this*
+/// order. `Err` names the first field that differs.
+pub fn signed_body_matches(order: &Order) -> Result<(), String> {
+    use robodr_executor::net::GuidPrefix;
+    use robodr_executor::order::Target;
+    use serde_json::Value;
+    let soc = order.soc.as_deref().ok_or("no signed request")?;
+    let body: Value = serde_json::from_str(&soc.body).map_err(|e| format!("signed body: {e}"))?;
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    let Origin::ControlPlane {
+        key_id,
+        requested_by,
+    } = &order.origin
+    else {
+        return Err("not a control-plane order".into());
+    };
+    if &soc.key_id != key_id {
+        return Err("key_id".into());
+    }
+    if str_of(&body, "request_id").as_deref() != Some(order.id.as_str()) {
+        return Err("request_id".into());
+    }
+    if str_of(&body, "action").as_deref() != Some(order.action.as_str()) {
+        return Err("action".into());
+    }
+    if str_of(&body, "requested_by").as_deref() != Some(requested_by.as_str()) {
+        return Err("requested_by".into());
+    }
+    let ttl = match body.get("ttl_seconds") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().ok_or("ttl_seconds is not a u64")?),
+    };
+    if ttl != order.ttl_s {
+        return Err("ttl_seconds".into());
+    }
+    let none = Value::Null;
+    let params = body.get("parameters").unwrap_or(&none);
+    let p_str = |k: &str| str_of(params, k);
+    let p_f64 = |k: &str| params.get(k).and_then(Value::as_f64);
+    let target_ok = match (&order.target, order.action.as_str()) {
+        (Target::None, "restrict_motion" | "rollback_config") => true,
+        (Target::Motion(m), "restrict_motion") => {
+            m.factor.is_none()
+                && m.config.is_none()
+                && m.to_version.is_none()
+                && m.max_linear_speed == p_f64("max_linear_speed")
+                && m.max_joint_speed == p_f64("max_joint_speed")
+                && m.workspace_zone == p_str("workspace_zone")
+        }
+        (Target::Motion(m), "rollback_config") => {
+            m.factor.is_none()
+                && m.max_linear_speed.is_none()
+                && m.max_joint_speed.is_none()
+                && m.workspace_zone.is_none()
+                && m.config.as_deref() == Some(p_str("config").as_deref().unwrap_or("profile"))
+                && m.to_version == p_str("to_version")
+        }
+        (Target::Participant { guid_prefix, .. }, "quarantine_node") => p_str("participant_guid")
+            .and_then(|g| g.parse::<GuidPrefix>().ok())
+            .is_some_and(|g| g == *guid_prefix),
+        (Target::Node { name }, "quarantine_node") => match p_str("participant_guid") {
+            Some(g) => g.parse::<GuidPrefix>().is_err() && &g == name,
+            None => p_str("node").as_deref() == Some(name.as_str()),
+        },
+        (Target::None, "quarantine_node") => {
+            p_str("participant_guid").is_none() && p_str("node").is_none()
+        }
+        (Target::None, _) => true,
+        _ => false,
+    };
+    if !target_ok {
+        return Err("target".into());
+    }
+    Ok(())
 }
 
 fn revert(req: &SocRequest) {
