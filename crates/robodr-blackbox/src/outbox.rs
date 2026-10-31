@@ -20,10 +20,14 @@
 //!    time (a segment wholly before the cursor, judged by the first record
 //!    of the next one, is not read), and collect the frames of the current
 //!    chain (the chain of the newest record) after the cursor. Memory is
-//!    the bundle (`max_bytes`) plus one frame (at most 16 MiB), whatever
-//!    the segment size; only bytes that are not a frame (damage) make the
-//!    rest of that segment be read whole to resynchronise past them. Each
-//!    record's hash is recomputed, its
+//!    the bundle (its buffer never grows past `max_bytes`, or one frame
+//!    for a first record larger than that; while it grows the old and the
+//!    new buffer briefly coexist, so about 1.5 x `max_bytes` at the last
+//!    step) plus one frame (at most 16 MiB) plus a 64 KiB search buffer,
+//!    whatever the segment size, damaged or not: bytes that are not a
+//!    frame (damage) are resynchronised past while streaming, as
+//!    [`scan_frames`] does (the next `RBF1` magic that starts a complete,
+//!    decodable frame). Each record's hash is recomputed, its
 //!    signature checked with the caller's keys, and it must link to the
 //!    one before (`seq + 1`, `prev_hash`). The bundle stops at the first
 //!    break (a quarantined or dropped segment, a record half written right
@@ -52,9 +56,11 @@
 
 use crate::crypto::to_hex;
 use crate::export::{cursor_signing_message, Anchor, Bundle, SignedCursor};
+#[cfg(doc)]
+use crate::record::scan_frames;
 use crate::record::{
-    scan_frames, signing_message, ChainIdentity, FrameRead, FrameReader, GenesisPayload, Hash,
-    Record, RecordKind, ScanItem, SegmentStartPayload,
+    signing_message, ChainIdentity, FrameRead, FrameReader, GenesisPayload, Hash, Record,
+    RecordKind, SegmentStartPayload, FRAME_MAGIC,
 };
 use crate::sign::Signer;
 use crate::store::{atomic_write_owned, list_segments, lock_file, read_state, Error, CURSOR_FILE};
@@ -68,8 +74,8 @@ pub const EXPORT_LOCK_FILE: &str = "export.lock";
 pub const BUNDLE_PREFIX: &str = "rbbx-";
 /// File name suffix of the bundles written to the outbox.
 pub const BUNDLE_SUFFIX: &str = ".rbbx";
-/// Largest segment file read.
-const MAX_SEGMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Read size of the search for the next frame magic after damage.
+const RESYNC_CHUNK: usize = 64 * 1024;
 
 /// Size bounds of one bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,55 +153,78 @@ enum Step {
 /// each frame. Streams one frame at a time ([`FrameReader`]): memory does
 /// not grow with the segment. Bytes that are not a complete frame (a
 /// record being written right now, or damage) are resynchronised past as
-/// [`scan_frames`] does, reading only the rest of the segment from that
-/// point (damage is rare; a torn tail is a few bytes). Returns `false` if
-/// the segment no longer exists.
+/// [`scan_frames`] does, without reading the segment whole: the next
+/// offset after them holding the frame magic is tried, and so on, until a
+/// complete, decodable frame starts there or the segment ends. Returns
+/// `false` if the segment no longer exists.
 fn for_each_record(p: &Path, visit: &mut RecordVisitor<'_>) -> Result<bool, Error> {
     let Some(file) = open_segment(p)? else {
         return Ok(false);
     };
-    let mut fr = FrameReader::new(io::BufReader::new(&file));
     let mut frame = Vec::new();
-    let irregular_at = loop {
-        match fr.next_frame()? {
-            FrameRead::Record(sr) => {
-                frame.clear();
-                fr.append_last_frame(&mut frame);
-                if let Step::Stop = visit(&frame, sr.record)? {
-                    return Ok(true);
+    // Offset the current reader started at.
+    let mut base = 0u64;
+    loop {
+        let mut f = &file;
+        f.seek(SeekFrom::Start(base))?;
+        let mut fr = FrameReader::new(io::BufReader::new(&file));
+        let irregular_at = loop {
+            match fr.next_frame()? {
+                FrameRead::Record(sr) => {
+                    frame.clear();
+                    fr.append_last_frame(&mut frame);
+                    if let Step::Stop = visit(&frame, sr.record)? {
+                        return Ok(true);
+                    }
                 }
+                FrameRead::End => return Ok(true),
+                FrameRead::Irregular { offset } => break base.saturating_add(offset),
             }
-            FrameRead::End => return Ok(true),
-            FrameRead::Irregular { offset } => break offset,
-        }
-    };
-    drop(fr);
-    let mut f = &file;
-    f.seek(SeekFrom::Start(irregular_at))?;
-    let mut rest = Vec::new();
-    f.take(MAX_SEGMENT_FILE_BYTES + 1).read_to_end(&mut rest)?;
-    if rest.len() as u64 > MAX_SEGMENT_FILE_BYTES {
-        return Err(Error::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} is larger than {MAX_SEGMENT_FILE_BYTES} bytes",
-                p.display()
-            ),
-        )));
-    }
-    for item in scan_frames(&rest).items {
-        let ScanItem::Record(r) = item else {
-            continue;
         };
-        let (off, len) = (r.offset as usize, r.frame_len as usize);
-        let Some(bytes) = rest.get(off..off.saturating_add(len)) else {
-            break;
-        };
-        if let Step::Stop = visit(bytes, r.record)? {
-            break;
+        drop(fr);
+        match next_magic(&file, irregular_at.saturating_add(1))? {
+            Some(next) => base = next,
+            None => return Ok(true),
         }
     }
-    Ok(true)
+}
+
+/// Offset of the next frame magic in `file` at or after `from`, read in
+/// [`RESYNC_CHUNK`]s (`None`: none before the end).
+fn next_magic(file: &File, from: u64) -> io::Result<Option<u64>> {
+    let mut f = file;
+    f.seek(SeekFrom::Start(from))?;
+    let keep = FRAME_MAGIC.len() - 1;
+    let mut buf = vec![0u8; RESYNC_CHUNK + keep];
+    // Bytes carried over from the previous chunk, and the file offset of
+    // `buf[0]`.
+    let (mut have, mut at) = (0usize, from);
+    loop {
+        let Some(dst) = buf.get_mut(have..) else {
+            return Ok(None);
+        };
+        let n = match f.read(dst) {
+            Ok(0) => return Ok(None),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let filled = have + n;
+        let Some(window) = buf.get(..filled) else {
+            return Ok(None);
+        };
+        if let Some(i) = window
+            .windows(FRAME_MAGIC.len())
+            .position(|w| w == FRAME_MAGIC)
+        {
+            return Ok(Some(at + i as u64));
+        }
+        // Keep the last `keep` bytes: a magic may straddle two reads.
+        let tail = filled.saturating_sub(keep);
+        buf.copy_within(tail..filled, 0);
+        at += tail as u64;
+        have = filled - tail;
+    }
 }
 
 /// The first record of segment `p`, if it has a decodable one.
@@ -338,6 +367,15 @@ pub fn collect_pending(
                 more = true;
                 done = true;
                 return Ok(Step::Stop);
+            }
+            // Grow the buffer by doubling, but never past `max_bytes` (a
+            // single first record larger than that excepted): a plain
+            // `Vec` would reach up to 2 x `max_bytes` of capacity.
+            let need = frames.len().saturating_add(frame.len());
+            if need > frames.capacity() {
+                let cap = usize::try_from(opts.max_bytes).unwrap_or(usize::MAX);
+                let target = frames.capacity().saturating_mul(2).min(cap).max(need);
+                frames.reserve_exact(target - frames.len());
             }
             frames.extend_from_slice(frame);
             if first.is_none() {

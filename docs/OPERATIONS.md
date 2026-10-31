@@ -2840,9 +2840,11 @@ robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd \
 Each record's hash, signature and link are checked before it is
 exported; each bundle is written durably before the cursor moves (a crash
 in between re-exports the same records; the far side reports the replay).
-It streams the segments one frame at a time, so its memory is about
-`--max-bytes` (64 MiB) plus one frame (at most 16 MiB) whatever the
-segment size. After a key rotation (4.3) `--key` must be the new key and
+It streams the segments one frame at a time (also past damage, which it
+resynchronises over without reading the segment whole), so its memory is
+the bundle buffer (never more than `--max-bytes`, 64 MiB, but briefly
+about 1.5 times that while it grows) plus a few copies of one frame (at
+most 16 MiB), whatever the segment size. After a key rotation (4.3) `--key` must be the new key and
 the retired public keys go in `--previous-keys`: a run with the retired
 key is refused (exit 2) before it writes anything, because the newest
 record is not signed by it. `robodr-blackbox rotate` holds `export.lock`

@@ -1085,7 +1085,27 @@ fn export_pending_gap_writes_the_bundle_and_exits_1() {
         "--device",
         "ugv-01",
     ]);
-    assert!(v.status.code().is_some(), "{}", text(&v));
+    // A gap-start bundle carries no anchor: it verifies intact on its own
+    // and starts right after the records reported lost.
+    let lost_end: u64 = text(&o)
+        .split("EVIDENCE LOST BEFORE EXPORT: records 0..=")
+        .nth(1)
+        .and_then(|t| {
+            t.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or_else(|| panic!("{}", text(&o)));
+    assert_eq!(v.status.code(), Some(0), "{}", text(&v));
+    assert!(text(&v).contains("RESULT: INTACT, CLEAN"), "{}", text(&v));
+    assert!(
+        text(&v).contains(&format!(
+            "head starts at {}; earlier records dropped",
+            lost_end + 1
+        )),
+        "{}",
+        text(&v)
+    );
     assert!(dir.join(robodr_blackbox::store::CURSOR_FILE).exists());
 }
 

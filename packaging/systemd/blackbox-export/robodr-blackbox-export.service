@@ -6,10 +6,11 @@
 #
 # Checked against crates/robodr-blackbox (robodr-blackbox export-pending):
 #   * It reads the black box while agentd records (read only, streaming one
-#     frame at a time: memory is about --max-bytes (64 MiB) plus one frame
-#     of at most 16 MiB whatever blackbox.retention.segment_bytes is; only a
-#     damaged segment is read whole from the damage on; its own
-#     export.lock, never agentd's lock), checks
+#     frame at a time, damaged segments included: memory is the bundle
+#     buffer, never more than --max-bytes (64 MiB) but briefly about 1.5 x
+#     that while it grows, plus a few copies of one frame of at most
+#     16 MiB, whatever blackbox.retention.segment_bytes is; raise MemoryMax
+#     with --max-bytes; its own export.lock, never agentd's lock), checks
 #     every record's hash, signature and link, writes each bundle durably,
 #     then advances the signed export cursor (export-cursor.json). agentd
 #     re-reads the cursor before cyclic retention would drop a segment
