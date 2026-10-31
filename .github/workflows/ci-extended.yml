@@ -32,6 +32,7 @@ env:
   KAFKA_IT_IMAGE: docker.io/apache/kafka:3.9.1@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
   # The broker distribution scripts/kafka-tls-it.sh runs (TLS, mTLS, SCRAM),
   # checked against Apache's published SHA-512.
+  KAFKA_DIST_CDN_URL: https://dlcdn.apache.org/kafka/3.9.1/kafka_2.13-3.9.1.tgz
   KAFKA_DIST_URL: https://archive.apache.org/dist/kafka/3.9.1/kafka_2.13-3.9.1.tgz
   KAFKA_DIST_SHA512: 1ea204ba73411737a275429ca976d440f007ff0957b90b19be41dc5a4bae52617267769be9f0b5791714d0b3c4c760605bd426faea39edd90763585523fa2cfe
 
@@ -136,7 +137,10 @@ jobs:
         run: scripts/kafka-it.sh
       - name: Kafka distribution (SHA-512 checked)
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/kafka.tgz" "$KAFKA_DIST_URL"
+          # Apache's CDN first (fast; it keeps current releases only), then
+          # the archive (every release, slow). Same file, same checksum.
+          curl -fsSL --retry 3 --max-time 600 -o "$RUNNER_TEMP/kafka.tgz" "$KAFKA_DIST_CDN_URL" ||
+            curl -fsSL --retry 3 --max-time 1800 -o "$RUNNER_TEMP/kafka.tgz" "$KAFKA_DIST_URL"
           echo "$KAFKA_DIST_SHA512  $RUNNER_TEMP/kafka.tgz" | sha512sum -c -
           mkdir -p "$RUNNER_TEMP/kafka"
           tar -xzf "$RUNNER_TEMP/kafka.tgz" -C "$RUNNER_TEMP/kafka" --strip-components=1

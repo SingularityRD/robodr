@@ -35,6 +35,7 @@ cd "$root"
 
 # package | test target | extra arguments to the test binary
 SPECS=(
+    "robodr-seal|swtpm_harness|"
     "robodr-seal|adversarial|"
     "robodr-seal|cli|"
     "robodr-seal|exit_criteria|"
