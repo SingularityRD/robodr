@@ -4,8 +4,8 @@
 //! then what a loader decides for the bound files (`trust::bound`).
 
 use robodr_commission::trust::bound::{
-    bytes_digest, digest_for_role, verify_bindings, BindingRefusal, ROLE_EXECUTOR_MOTION,
-    ROLE_MOTION_FIREWALL, ROLE_RESPONSE_POLICY,
+    bytes_digest, digest_for_role, verify_bindings, verify_bindings_report, BindingRefusal,
+    ROLE_EXECUTOR_MOTION, ROLE_MOTION_FIREWALL, ROLE_RESPONSE_POLICY,
 };
 use robodr_commission::trust::TrustInputs;
 use std::path::{Path, PathBuf};
@@ -213,6 +213,10 @@ fn bound_policy_and_executor_motion_are_honoured_only_as_signed() {
     );
     assert!(r.iter().all(Result::is_ok), "{r:?}");
     assert_eq!(r[0].as_ref().unwrap().locked_by, "alice [LAB-ONLY]");
+    // Review (WP6): a loader without the trust evaluation (the executor)
+    // learns the chain is lab-only, to print the banner.
+    let rep = verify_bindings_report(&locked, &ti, &[(ROLE_RESPONSE_POLICY, &pol_d)]);
+    assert!(rep.lab_only && rep.results[0].is_ok(), "{rep:?}");
 
     // A flipped flag (or any edit) under the same profile: mismatch.
     let edited = bytes_digest(policy_text(false).as_bytes());

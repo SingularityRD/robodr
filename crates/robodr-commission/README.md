@@ -455,6 +455,19 @@ What the unit does (fail closed):
   may change without a re-lock. Without the section the flags are
   unsigned: kept for compatibility, with a loud warning at start and in
   `--check-config` (agentd, which every order passes, still gates them).
+  The section itself lives in `executor.json`, which is not bound. A
+  running executor therefore keeps the section it read: if the file's
+  section is later removed or re-pointed (other profile, other trust
+  anchors), the re-read before each order still verifies against the
+  section the process had, with a warning. The change takes effect only
+  at a restart, which prints the UNSIGNED warning again when the section
+  is gone. Someone who can edit `executor.json` *and* restart the
+  executor can still drop to unsigned flags; making the section mandatory
+  is an open product decision. When a re-read's notes differ from the
+  previous ones (a binding lost or regained, the section changed), the
+  executor logs them and journals a `reconciled` event that agentd
+  receives. A profile accepted under a lab-only trust file (`poc-init`)
+  makes the executor print the LAB-ONLY banner at start too.
 * **gateway** (`motion_firewall`): `trust::bound::verify_bindings` is the
   call; refusing `enforce` on an unbound file belongs to the gateway work
   package (WP11) and is not in this change.

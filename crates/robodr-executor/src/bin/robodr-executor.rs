@@ -119,12 +119,16 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
-fn load(path: &std::path::Path) -> Result<(Resolved, robodr_responder::ResponsePolicy), String> {
+/// Load and log the commissioning notes (returned too: the engine logs a
+/// later re-read only when its notes differ).
+fn load(
+    path: &std::path::Path,
+) -> Result<(Resolved, robodr_responder::ResponsePolicy, Vec<String>), String> {
     let (cfg, policy, notes) = config::load_commissioned(path)?;
-    for n in notes {
+    for n in &notes {
         eprintln!("robodr-executor: {n}");
     }
-    Ok((cfg, policy))
+    Ok((cfg, policy, notes))
 }
 
 /// Minimal `sd_notify` (std only; no-op without `NOTIFY_SOCKET`).
@@ -224,7 +228,7 @@ fn main() -> ExitCode {
         return stop_cleanup(cfg_path);
     }
     let serving = a.cmd == "run" && !a.check;
-    let (cfg, policy) = match load(cfg_path) {
+    let (cfg, policy, notes) = match load(cfg_path) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("robodr-executor: {e}");
@@ -363,7 +367,9 @@ fn main() -> ExitCode {
     };
     let mut engine = match Engine::open_sealed(cfg, policy, nft, &boot, Now::system(), seal) {
         // Policy and configuration are re-read before every order.
-        Ok(e) if a.cmd == "run" => e.with_reload(cfg_path.clone()),
+        Ok(e) if a.cmd == "run" => e
+            .with_reload(cfg_path.clone())
+            .with_commissioning_notes(notes),
         Ok(e) => e,
         Err(e) => {
             // Engine::open deleted the table already.

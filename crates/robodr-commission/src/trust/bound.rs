@@ -160,11 +160,33 @@ pub fn verify_bindings(
     inputs: &TrustInputs<'_>,
     bindings: &[(&str, &str)],
 ) -> Vec<Result<Bound, BindingRefusal>> {
-    let refuse_all = |why: String| {
-        bindings
+    verify_bindings_report(profile_path, inputs, bindings).results
+}
+
+/// What [`verify_bindings_report`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingsReport {
+    /// One result per binding, in order (as [`verify_bindings`]).
+    pub results: Vec<Result<Bound, BindingRefusal>>,
+    /// The profile was accepted under a lab-only trust file
+    /// (`VerifiedProfile::lab_only`, `poc-init`): the caller must say so
+    /// loudly. `false` when the profile was not accepted at all.
+    pub lab_only: bool,
+}
+
+/// [`verify_bindings`], also reporting whether the accepted profile came
+/// from a lab-only trust chain.
+pub fn verify_bindings_report(
+    profile_path: &Path,
+    inputs: &TrustInputs<'_>,
+    bindings: &[(&str, &str)],
+) -> BindingsReport {
+    let refuse_all = |why: String| BindingsReport {
+        results: bindings
             .iter()
             .map(|_| Err(BindingRefusal::NoTrustedProfile { why: why.clone() }))
-            .collect()
+            .collect(),
+        lab_only: false,
     };
     let raw = match read_regular_file(profile_path, MAX_PROFILE_BYTES) {
         Ok(t) => t,
@@ -176,10 +198,13 @@ pub fn verify_bindings(
         Ok(acc) if !acc.verified.profile.locked => {
             refuse_all(format!("{}: a draft profile", profile_path.display()))
         }
-        Ok(acc) => bindings
-            .iter()
-            .map(|(role, digest)| check_binding(&acc.verified.profile, role, digest))
-            .collect(),
+        Ok(acc) => BindingsReport {
+            results: bindings
+                .iter()
+                .map(|(role, digest)| check_binding(&acc.verified.profile, role, digest))
+                .collect(),
+            lab_only: acc.verified.lab_only,
+        },
     }
 }
 

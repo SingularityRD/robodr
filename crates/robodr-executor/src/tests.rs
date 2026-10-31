@@ -1867,6 +1867,91 @@ fn l7_policy_is_reread_per_order() {
     );
 }
 
+/// Review (WP6): the `commissioning` section lives in executor.json, which
+/// is not bound. Deleting it (or re-pointing its trust anchors) while the
+/// executor runs must not bring back unsigned `oem_validated` flags on the
+/// next re-read, and the changed commissioning notes are logged and
+/// journalled instead of dropped.
+#[test]
+fn wp6_commissioning_section_is_sticky_and_its_notes_are_journalled() {
+    let d = tmpdir("sticky-commissioning");
+    let pol_path = d.join("policy.json");
+    let cfg_path = d.join("executor.json");
+    let p = policy(Morphology::WheeledMobile, true, &[]);
+    std::fs::write(&pol_path, serde_json::to_string(&p).unwrap()).unwrap();
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["policy_path"] = json!(pol_path);
+    // No profile at that path: nothing is bound, the policy's flag is not
+    // honoured.
+    v["commissioning"] = json!({"profile_path": d.join("profile.json"),
+                                "trusted_keys": d.join("trust.json")});
+    std::fs::write(&cfg_path, v.to_string()).unwrap();
+    let (c, p, notes) = crate::config::load_commissioned(&cfg_path).unwrap();
+    assert!(!p.oem_validated, "{notes:?}");
+    let nft = FakeNft::default();
+    let mut e = Engine::open(c, p, Box::new(nft.clone()), "b1", 1_000)
+        .unwrap()
+        .with_reload(cfg_path.clone())
+        .with_commissioning_notes(notes.clone());
+    let commissioning_events = |e: &Engine| {
+        e.events_since(0, 10_000)
+            .into_iter()
+            .filter(|ev| ev.kind == EventKind::Reconciled && ev.detail.contains("commissioning"))
+            .count()
+    };
+    let isolate = |id: &str| {
+        order(
+            id,
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        )
+    };
+    assert_eq!(
+        e.submit(&isolate("i1"), &mut idle(), 1_100)
+            .refusal
+            .unwrap()
+            .code,
+        codes::OBSERVE_MODE
+    );
+    // Same notes as at start: nothing new is logged.
+    assert_eq!(commissioning_events(&e), 0);
+
+    // The section is deleted at runtime: still verified against it.
+    v.as_object_mut().unwrap().remove("commissioning");
+    std::fs::write(&cfg_path, v.to_string()).unwrap();
+    assert_eq!(
+        e.submit(&isolate("i2"), &mut idle(), 1_200)
+            .refusal
+            .unwrap()
+            .code,
+        codes::OBSERVE_MODE
+    );
+    assert!(
+        e.commissioning_notes()
+            .first()
+            .is_some_and(|n| n.contains("removed")),
+        "{:?}",
+        e.commissioning_notes()
+    );
+    assert_eq!(commissioning_events(&e), 1);
+
+    // Re-pointed at other trust anchors: the same.
+    v["commissioning"] = json!({"profile_path": "/elsewhere/profile.json",
+                                "trusted_keys": "/elsewhere/trust.json"});
+    std::fs::write(&cfg_path, v.to_string()).unwrap();
+    assert_eq!(
+        e.submit(&isolate("i3"), &mut idle(), 1_300)
+            .refusal
+            .unwrap()
+            .code,
+        codes::OBSERVE_MODE
+    );
+    assert!(e.commissioning_notes()[0].contains("changed"));
+    assert_eq!(commissioning_events(&e), 2);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// M5 (model): a revert whose journal write fails is reported `reverting`
 /// (never `reverted`) until the journal records it.
 #[test]

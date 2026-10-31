@@ -9,7 +9,7 @@ use robodr_blackbox::Ed25519SigningKey;
 use robodr_commission::trust::bound::{bytes_digest, digest_for_role};
 use robodr_commission::trust::{sig_path_for, trust_keys_text, ProfileSignature};
 use robodr_events::profile::{Envelope, Profile, ProfileMetadata, PROFILE_SCHEMA_VERSION};
-use robodr_executor::config::load_commissioned;
+use robodr_executor::config::{load_commissioned, load_commissioned_pinned};
 use serde_json::Value;
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -186,6 +186,45 @@ fn edited_or_unbound_files_lose_their_flags() {
     std::fs::write(&pp, t).unwrap();
     let (r, p, notes) = load_commissioned(&cfg).unwrap();
     assert!(!p.oem_validated && !validated_adapters(&r), "{notes:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Review (WP6): a running executor keeps the `commissioning` section it
+/// read; removing it from executor.json does not unsign the flags until a
+/// restart (a fresh `load_commissioned`, which warns UNSIGNED).
+#[test]
+fn a_pinned_commissioning_survives_its_removal_from_the_file() {
+    let (d, cfg) = setup("pinned", true);
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    write_profile(
+        &d,
+        &[("response_policy", bytes_digest(policy_text().as_bytes()))],
+    );
+    let (r, p, _) = load_commissioned(&cfg).unwrap();
+    assert!(p.oem_validated);
+    let pin = r.config.commissioning.clone().unwrap();
+    // The section removed and the policy edited: under the pin the edit
+    // is caught.
+    let mut v: Value = serde_json::from_str(&text).unwrap();
+    v.as_object_mut().unwrap().remove("commissioning");
+    std::fs::write(&cfg, serde_json::to_string(&v).unwrap()).unwrap();
+    std::fs::write(d.join("policy.json"), format!("{} ", policy_text())).unwrap();
+    let (r, p, notes) = load_commissioned_pinned(&cfg, Some(&pin)).unwrap();
+    assert!(!p.oem_validated, "{notes:?}");
+    assert_eq!(r.config.commissioning.as_ref(), Some(&pin));
+    assert!(notes[0].contains("removed"), "{notes:?}");
+    // The same section in the file: no note about it.
+    std::fs::write(&cfg, &text).unwrap();
+    let (_, _, notes) = load_commissioned_pinned(&cfg, Some(&pin)).unwrap();
+    assert!(
+        !notes.iter().any(|n| n.contains("since this executor read")),
+        "{notes:?}"
+    );
+    // A restart without the section: unsigned, warned.
+    std::fs::write(&cfg, serde_json::to_string(&v).unwrap()).unwrap();
+    let (_, p, notes) = load_commissioned(&cfg).unwrap();
+    assert!(p.oem_validated);
+    assert!(notes.iter().any(|n| n.contains("UNSIGNED")), "{notes:?}");
     let _ = std::fs::remove_dir_all(&d);
 }
 
