@@ -79,7 +79,7 @@ migrate_exporter_users() {
 }
 # <<< migrate_exporter_users
 
-# >>> gated_restart (packaging/rpm/post carries the same block)
+# >>> gated_restart (the same block in packaging/deb/postinst and packaging/rpm/post)
 # T9: robodr-firewall-gw and robodr-executor are never restarted by a
 # package upgrade: restarting the gateway drops the motion commands
 # queued in it (fail_closed: the bridge refuses motion while it is down),
