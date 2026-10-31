@@ -242,6 +242,10 @@ short:
 | Uplink key (Ed25519 secret) | `/etc/robodr/keys/uplink.key` (`0600 root:root`) | ingest batches and fleet API requests (8.5, 8.6) |
 | SOC fleet key (Ed25519, public) | `/etc/robodr/fleet-soc.pub` (`0644`), from the SOC on vetted media | verifying enrollment tokens and answers, rotation answers, profile approvals, ring information (8.6) |
 
+On a new unit, `robodr-setup init --role ROLE --unit-id ID` runs the host
+preflight and then generates the role's keys (`robodr-setup keys` generates
+them alone); neither overwrites an existing key. `robodr-setup fingerprints`
+prints the key ids to register (`man robodr-setup`).
 `robodr-enroll` (8.6) generates the uplink, finding and black-box keys on
 the unit at enrollment and rotates the uplink and finding keys with the
 SOC; the black-box key is rotated in place with `robodr-blackbox rotate`
@@ -3462,6 +3466,13 @@ The package never deletes evidence or keys, not even on `apt purge`.
    unverifiable on the robot side.
 
 ## 10. Troubleshooting
+
+`robodr-setup preflight` re-checks the host (BTF, bpffs, nf_tables,
+systemd, glibc, clock, disk, key directory). For RoboDR support, `sudo
+robodr-support-bundle` writes a redacted diagnostics archive (versions,
+unit state and journal, status files, the nftables ruleset, configuration
+from `/etc/robodr`; never keys, credentials, evidence or findings; mode
+0600, to `/var/tmp`).
 
 | Symptom | Likely cause | Action |
 |---|---|---|
