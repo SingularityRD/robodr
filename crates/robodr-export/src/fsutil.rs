@@ -345,11 +345,30 @@ mod tests {
     }
 
     /// T60: the symlink guard is never compiled out (the hand-written
-    /// table it replaced was 0 on unlisted architectures).
+    /// table it replaced was 0 on unlisted architectures), and the kernel
+    /// of the architecture the tests run on refuses a symlink with it
+    /// (`ELOOP`). This exercises the build's own architecture only; the
+    /// value for others comes from the `libc` crate.
     #[test]
-    fn o_nofollow_is_the_platform_value() {
+    fn o_nofollow_refuses_a_symlink() {
+        use std::os::unix::fs::OpenOptionsExt;
         assert_ne!(libc_o_nofollow(), 0);
-        assert_eq!(libc_o_nofollow(), libc::O_NOFOLLOW);
+        let d = std::env::temp_dir().join(format!("robodr-export-nofollow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        mkdir(&d).unwrap();
+        let target = d.join("target");
+        fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, d.join("link")).unwrap();
+        let open = |p: &Path| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc_o_nofollow())
+                .open(p)
+        };
+        assert!(open(&target).is_ok());
+        let e = open(&d.join("link")).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
