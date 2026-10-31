@@ -2,7 +2,7 @@ id: 8acc7450-2203-5750-a19b-55b1976635c9
 name: RoboDR - Unauthorised motion source
 description: |
   Something that is not the robot's operator is commanding it: an unauthorised motion writer, a firewall rejection of an unknown source, an unlisted Unitree legacy-UDP sender or an unknown WebRTC controller. Observe-only: alerts, never responds.
-  RoboDR rule ids (docs/customer/detection-catalog.md):
+  RoboDR rule ids (docs/customer/detection-rules.md):
     - robot.ros2.unauthorized_motion_writer
     - robot.firewall.rejected_unknown_source
     - robot.unitree.legacy_unknown_sender

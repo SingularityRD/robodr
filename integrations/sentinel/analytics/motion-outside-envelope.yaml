@@ -2,7 +2,7 @@ id: c42bfc47-d262-5bbb-a281-0b71ebf638ae
 name: RoboDR - Motion outside the envelope
 description: |
   Commanded motion beyond the robot's locked profile (linear, angular or joint speed, joint torque). Observe-only: alerts, never responds.
-  RoboDR rule ids (docs/customer/detection-catalog.md):
+  RoboDR rule ids (docs/customer/detection-rules.md):
     - robot.motion.linear_over_envelope
     - robot.motion.angular_over_envelope
     - robot.motion.joint_over_envelope

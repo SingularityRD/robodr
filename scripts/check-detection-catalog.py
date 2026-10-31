@@ -44,6 +44,7 @@ SINCE = {
     "catalog_2_3_gateway": "2.3",
     "catalog_2_3_unitree": "2.3",
     "catalog_2_4": "2.4",
+    "catalog_2_5": "2.5",
 }
 
 STR = r'"((?:[^"\\]|\\.)*)"'
@@ -60,6 +61,11 @@ ARM2 = re.compile(r'"(robot\.[a-z0-9_.]+)"\s*=>\s*e\(\s*' + STR + r",\s*" + STR 
 E2 = re.compile(
     r"const fn e\(title: &'static str, desc: &'static str\) -> RuleInfo \{\s*RuleInfo \{"
     r"\s*title,\s*desc,\s*data_source: ([A-Z_0-9]+),\s*techniques: &\[\],"
+)
+# `e(title, desc, SOURCE)`: a block whose helper takes the data source and
+# no technique (contract 2.5).
+ARM3 = re.compile(
+    r'"(robot\.[a-z0-9_.]+)"\s*=>\s*e\(\s*' + STR + r",\s*" + STR + r",\s*([A-Z_0-9]+),?\s*\)"
 )
 ANY_ARM = re.compile(r'"(robot\.[a-z0-9_.]+)"\s*=>')
 CONST = re.compile(r"const ([A-Z_0-9]+): &str = " + STR + ";")
@@ -116,6 +122,22 @@ def parse(src: str) -> list[dict[str, str]]:
             ds = consts.get(helper.group(1), "")
             if not ds:
                 problems.append(f"{m.group(1)}: data source {helper.group(1)} not resolved")
+            out.append(
+                {
+                    "id": m.group(1),
+                    "title": m.group(2).replace('\\"', '"'),
+                    "data_source": ds,
+                    "attack": "",
+                    "since": SINCE[name],
+                }
+            )
+            parsed.add(m.start())
+        for m in ARM3.finditer(body):
+            if m.start() in parsed:
+                continue
+            ds = consts.get(m.group(4), "")
+            if not ds:
+                problems.append(f"{m.group(1)}: data source {m.group(4)} not resolved")
             out.append(
                 {
                     "id": m.group(1),

@@ -92,6 +92,8 @@ const NOT_SIGNALS: &[&str] = &[
     "robot.rtps.x",
     "robot.motion.envelope_exceeded",
     "robot.hostile.x",
+    "robot.x.y",
+    "robot.x.z",
 ];
 
 #[test]

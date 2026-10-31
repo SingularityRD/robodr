@@ -7,6 +7,20 @@ use robodr_ocsf::*;
 
 pub mod health;
 
+/// Adds what a rule's finding must carry beyond the deviation: the
+/// `robot.agent.health` record carries `entity_context.agent_health`
+/// (contract 2.5). Tests that build one finding per catalog id use it.
+pub fn with_required<'a>(
+    b: robodr_ocsf::FindingBuilder<'a>,
+    rule: &str,
+) -> robodr_ocsf::FindingBuilder<'a> {
+    if rule == robodr_ocsf::AGENT_HEALTH_RULE {
+        b.agent_health(health::sample())
+    } else {
+        b
+    }
+}
+
 pub const T0: u64 = 1_790_000_000_000; // 2026-09-21T14:13:20Z
 
 pub fn ctx() -> RobotContext {
