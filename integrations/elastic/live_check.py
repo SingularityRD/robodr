@@ -3,6 +3,8 @@
 
     live_check.py --es URL --findings FINDINGS.ndjson
 
+URL may carry basic-auth credentials (http://user:password@host:9200).
+
 Installs both ingest pipelines and the index template from this directory
 (PUT, overwriting objects of the same name: use a scratch cluster), then:
 
@@ -27,11 +29,13 @@ The data stream is deleted before and after. Exit 0 when everything holds,
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,12 +49,17 @@ def problem(msg):
     problems.append(msg)
 
 
-def call(es, method, path, body=None, ndjson=False):
+def call(es, method, path, body=None, ndjson=False, extra_headers=None):
     data = None
-    headers = {}
+    headers = dict(extra_headers or {})
     if body is not None:
         data = body.encode() if ndjson else json.dumps(body).encode()
         headers["Content-Type"] = "application/x-ndjson" if ndjson else "application/json"
+    u = urllib.parse.urlsplit(es)
+    if u.username is not None:  # http://user:password@host:port
+        cred = f"{urllib.parse.unquote(u.username)}:{urllib.parse.unquote(u.password or '')}"
+        headers["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
+        es = urllib.parse.urlunsplit((u.scheme, u.hostname + (f":{u.port}" if u.port else ""), u.path, "", ""))
     req = urllib.request.Request(es.rstrip("/") + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -97,6 +106,18 @@ def simulate(es, pipeline, docs):
     return [d.get("doc", {}).get("_source", {"error": d.get("error")}) for d in r["docs"]]
 
 
+def install(es):
+    """PUT both ingest pipelines and the index template."""
+    for name, file in (("robodr-findings", "ingest-pipeline-robodr-findings.json"),
+                       ("robodr-findings-verified", "ingest-pipeline-robodr-findings-verified.json")):
+        code, r = call(es, "PUT", f"/_ingest/pipeline/{name}", load(file))
+        if code != 200:
+            raise SystemExit(f"PUT pipeline {name}: HTTP {code}: {r}")
+    code, r = call(es, "PUT", "/_index_template/robodr-findings", load("index-template-robodr-findings.json"))
+    if code != 200:
+        raise SystemExit(f"PUT index template: HTTP {code}: {r}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--es", required=True)
@@ -111,14 +132,7 @@ def main(argv=None):
     if code != 200:
         raise SystemExit(f"{es}: HTTP {code}")
     version = info.get("version", {}).get("number", "?")
-    for name, file in (("robodr-findings", "ingest-pipeline-robodr-findings.json"),
-                       ("robodr-findings-verified", "ingest-pipeline-robodr-findings-verified.json")):
-        code, r = call(es, "PUT", f"/_ingest/pipeline/{name}", load(file))
-        if code != 200:
-            raise SystemExit(f"PUT pipeline {name}: HTTP {code}: {r}")
-    code, r = call(es, "PUT", "/_index_template/robodr-findings", load("index-template-robodr-findings.json"))
-    if code != 200:
-        raise SystemExit(f"PUT index template: HTTP {code}: {r}")
+    install(es)
 
     # 1. Every finding through both pipelines.
     plain = simulate(es, "robodr-findings", findings)

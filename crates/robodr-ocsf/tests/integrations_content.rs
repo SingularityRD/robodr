@@ -143,6 +143,24 @@ fn siem_content_matches_the_contract_and_maps_real_findings() {
         let stderr = String::from_utf8_lossy(&o.stderr);
         assert!(o.status.success(), "{stdout}\n{stderr}");
         eprintln!("{stderr}");
+        // And the detection rules, previewed in a real Kibana.
+        if let Some(kb) = std::env::var_os("ROBODR_KIBANA_URL") {
+            let o = Command::new("python3")
+                .arg("-I")
+                .arg(root().join("integrations/elastic/live_check_rules.py"))
+                .arg("--es")
+                .arg(&es)
+                .arg("--kibana")
+                .arg(&kb)
+                .arg("--findings")
+                .arg(&f)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{stdout}\n{stderr}");
+            eprintln!("{stderr}");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -64,6 +64,17 @@ cluster), `_simulate`s every finding through both pipelines, checks a forged
 status is dropped, indexes into `logs-robodr.findings-check`, counts the
 verified documents and checks a raw tainted value is not searchable while
 its `display` is. It passed with the 166 findings of the cargo test on
-Elasticsearch 8.15.3 (Docker image `elasticsearch:8.15.3`, single node,
-security off) on 2026-10-31. Not run in CI. The detection rules are
-Kibana objects and have not been loaded into Kibana.
+Elasticsearch 8.15.3 (Docker image `elasticsearch:8.15.3`, single node)
+on 2026-10-31. Not run in CI.
+
+`live_check_rules.py --es URL --kibana URL --findings findings.ndjson`
+(or `ROBODR_KIBANA_URL` next to `ROBODR_ES_URL` in the cargo test above;
+URLs may carry `user:password@`) creates the six rules through
+`POST /api/detection_engine/rules` as above, indexes four copies of a
+matching finding per shared detection (verified, unsigned, no verifier, and
+a forged status through `robodr-findings`) and previews each rule
+(`/api/detection_engine/rules/preview`): each shared rule alerts on exactly
+its verified, unverified and forged copies, "Unverified findings" on every
+copy that is not verified. Passed on Kibana 8.15.3 with Elasticsearch
+8.15.3 (security on, HTTP without TLS) on 2026-10-31. The rules were
+previewed, not enabled and scheduled.

@@ -28,12 +28,15 @@ Elastic pipelines), and the Sentinel DCR's columns match its table. `crates/robo
 The Elastic check there evaluates the pipelines with an in-repo evaluator of
 the processors they use. `elastic/live_check.py` runs the same findings
 through a real Elasticsearch (both ingest pipelines, the index template,
-indexing and search); the test runs it when `ROBODR_ES_URL` names a scratch
-cluster, and it passed on Elasticsearch 8.15.3 (single node, Docker image
-`elasticsearch:8.15.3`) on 2026-10-31. It does not run in CI. The Elastic
-detection rules (Kibana), the Splunk add-on and the Sentinel content have
-not been loaded into a running instance yet; doing that with a design
-partner's SIEM is the remaining step (no licence or tenant was available).
+indexing and search) and `elastic/live_check_rules.py` creates the six
+detection rules in a real Kibana and previews them on verified, unsigned,
+unverified and forged-status documents. The test runs them when
+`ROBODR_ES_URL` (and `ROBODR_KIBANA_URL`) name a scratch deployment; both
+passed on Elasticsearch and Kibana 8.15.3 (single node, Docker images
+`elasticsearch:8.15.3` and `kibana:8.15.3`) on 2026-10-31. They do not run
+in CI. The Splunk add-on and the Sentinel content have not been loaded into
+a running instance yet; doing that with a design partner's SIEM is the
+remaining step (no licence or tenant was available).
 
 ## How findings reach a SIEM
 
