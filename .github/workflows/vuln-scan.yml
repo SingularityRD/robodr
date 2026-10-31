@@ -1,8 +1,9 @@
 # Vulnerability monitoring of PUBLISHED releases (ci.yml's cargo-deny job
 # only sees the default branch). Daily, and by hand.
 #
-# For the newest release of every release line (vX.Y.*, so LTS lines stay
-# covered) and the newest release overall:
+# For every release line (vX.Y.*, so LTS lines stay covered): its newest
+# final release, plus its newest pre-release when that is newer
+# (scripts/vuln-scan-tags.py, semantic-version precedence):
 #   * cargo-deny (advisories, with an EMPTY config: no waiver of the tag's
 #     deny.toml can hide an advisory) and osv-scanner (pinned by SHA-256)
 #     against the tag's committed Cargo.lock;
@@ -45,17 +46,13 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Newest tag per release line
+      - name: Newest final release (and any newer pre-release) per release line
         id: pick
+        # Semantic-version precedence (scripts/vuln-scan-tags.py), not
+        # `sort -V`, which ranks v0.2.0-rc.1 above v0.2.0.
         run: |
-          tags="$(git tag -l 'v[0-9]*' | sort -V | python3 -c '
-          import json, re, sys
-          newest = {}
-          for t in sys.stdin.read().split():
-              m = re.match(r"^v([0-9]+)\.([0-9]+)\.[0-9]+(-[0-9A-Za-z.]+)?$", t)
-              if m:
-                  newest[(m.group(1), m.group(2))] = t   # input is version-sorted
-          print(json.dumps(sorted(set(newest.values()))))')"
+          python3 scripts/vuln-scan-tags.py --self-test
+          tags="$(git tag -l 'v[0-9]*' | python3 scripts/vuln-scan-tags.py)"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           echo "scanning: $tags"
 

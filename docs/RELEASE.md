@@ -303,8 +303,8 @@ released from a protected branch `release/0.1`:
 4. The release is published with `--latest=false`: the repository's
    "Latest" stays the newest `main` release.
 
-The scheduled vulnerability scan (section 10) covers the newest release of
-every `X.Y` line automatically.
+The scheduled vulnerability scan (section 10) covers every `X.Y` line
+automatically.
 
 ## 7. Secure delivery: RPKs and the 2-of-N signing ceremony
 
@@ -425,10 +425,12 @@ justifications and an impact statement; `affected` with an action;
 `fixed`; `under_investigation`). Each release publishes
 `robodr-<ver>.openvex.json` generated from it.
 
-`.github/workflows/vuln-scan.yml` runs daily on the newest release of every
-`X.Y` line: cargo-deny with an **empty** configuration (no waiver of the
-tag's `deny.toml` can hide an advisory) and osv-scanner (pinned by SHA-256)
-on the tag's `Cargo.lock`. Every advisory found must have an applicable
+`.github/workflows/vuln-scan.yml` runs daily, for every `X.Y` line, on its
+newest final release and, when one is newer, its newest pre-release
+(`scripts/vuln-scan-tags.py`: semantic-version precedence, so `v0.2.0`
+ranks above `v0.2.0-rc.1`; `sort -V` would not): cargo-deny with an
+**empty** configuration (no waiver of the tag's `deny.toml` can hide an
+advisory) and osv-scanner (pinned by SHA-256) on the tag's `Cargo.lock`. Every advisory found must have an applicable
 statement in the current `statements.json` (`scripts/vex.py coverage`), or
 the workflow fails: assess the advisory, add the statement on `main`, and
 if the release is affected, patch it (section 6 for an older line). Each run
