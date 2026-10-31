@@ -253,7 +253,12 @@ pack
 .RB ( "GET /v1/pack" )
 and may post its own reports
 .RB ( "POST /v1/report" ,
-answered with its lease). No request names a unit.
+answered with its lease). No request names a unit. Within 14 days of the
+server certificate's notAfter
+.RI ( state_dir /tls/server.pem,
+issued for five years at
+.BR init ),
+and after it, one line on stderr per day count.
 .TP
 .B reanchor
 Operator quorum: accept a database the anchor check locked
