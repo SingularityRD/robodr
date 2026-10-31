@@ -17,3 +17,7 @@
 # cargo-cyclonedx writes SBOMs next to each manifest; scripts/sbom.sh collects them.
 *.cdx.json
 *.cdx.xml
+
+# Python bytecode caches (integrations/, tools/e2e/, scripts/)
+__pycache__/
+*.pyc
