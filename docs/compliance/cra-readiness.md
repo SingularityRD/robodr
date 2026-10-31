@@ -9,6 +9,8 @@
 > Regulation text and its implementing acts. This page records what the
 > RoboDR repository does today against the obligations engineering can
 > act on.
+>
+> *Corrected at `a28163b` (2026-10-31) without re-verifying the rest of the document:* the fuzz target count (41).
 
 ## 1. Applicability: questions for legal
 
@@ -43,7 +45,7 @@
 |---|---|---|
 | Identify and document components, including an SBOM | 🟡 | CycloneDX generator and verification ([`docs/BUILD.md`](../BUILD.md) "SBOM"); the CI `SBOM` job passed in run 41136491301. `THIRD_PARTY_NOTICES` and the GPL-2.0 source offer ship in the packages. **No SBOM has shipped**, because no release has been cut. The SBOM does not yet cover the eBPF objects, the Rust standard library, musl or the clang toolchain. Pulsar due diligence: [`third-party-due-diligence.md`](third-party-due-diligence.md). |
 | Address and remediate vulnerabilities without delay, with separate security updates where feasible | 🟡 | `SECURITY.md` timelines. Untested. No release branches yet. |
-| Regular security testing and review | 🟡 | Tests, 37 fuzz targets (std-only smoke runs in the crates' tests; libFuzzer runs of 630 s for 10 of them), AI-agent review rounds, and a 2 h soak with an end-to-end red team ([`iec-62443-4-1-sdl-evidence.md`](iec-62443-4-1-sdl-evidence.md)). CI ran on GitHub for the first time on 2026-10-30 (run 41136491301) and is **red** (pure-crate tests, Rocky 9 RPM builds, cargo-deny, fuzz smoke). No external pentest; no human security review. |
+| Regular security testing and review | 🟡 | Tests, 41 fuzz targets (std-only smoke runs in the crates' tests; libFuzzer runs of 630 s for 10 of them), AI-agent review rounds, and a 2 h soak with an end-to-end red team ([`iec-62443-4-1-sdl-evidence.md`](iec-62443-4-1-sdl-evidence.md)). CI ran on GitHub for the first time on 2026-10-30 (run 41136491301) and is **red** (pure-crate tests, Rocky 9 RPM builds, cargo-deny, fuzz smoke). No external pentest; no human security review. |
 | Publicly disclose fixed vulnerabilities (advisories) | ❌ | Process drafted ([`docs/customer/psirt-process.md`](../customer/psirt-process.md)). Never exercised. The repository is **public** (verified 2026-10-30), so GitHub security advisories could carry them; whether the source stays public is an open owner decision. |
 | Coordinated vulnerability disclosure policy | ✅ | [`SECURITY.md`](../../SECURITY.md) |
 | Contact address for reporting | ❌ | [`SECURITY.md`](../../SECURITY.md) points to GitHub private vulnerability reporting, but that feature is **disabled** on the repository (GitHub API, 2026-10-30): the documented channel does not accept reports. Enable it, and add a security mailbox and `security.txt`. |

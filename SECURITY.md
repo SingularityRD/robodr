@@ -160,8 +160,9 @@ claims are:
   `motion` section with an adapter the site marked `oem_validated`, and
   then only through the platform's own interface (gateway restriction,
   Unitree speed level, Nav2, ros2_control, PX4, the site's rollback
-  program); the last three need two approvers named in the signed request
-  and are refused where the morphology forbids them. Without a `motion`
+  program); `safe_pause`, `request_safe_state` and `rollback_config` need
+  two approvers named in the signed request and are refused where the
+  morphology forbids them. Without a `motion`
   section they are never executed.
 - **No channel without the SOC's certificate.** Off loopback the API is
   served only over mutual TLS (rustls): the peer must present a client
