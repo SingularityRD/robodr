@@ -182,7 +182,9 @@ pub struct Config {
     /// The robot's SROS 2 keystore `enclaves/` directory (absolute; only
     /// `governance.xml` and the `permissions.xml` files are read). SPDP
     /// DDS-Security identities are judged against it
-    /// ([`crate::sros2`]). Unset (default) = not checked.
+    /// ([`crate::sros2`]), with the governance rule for `domain_id`.
+    /// Unset (default) = not checked. Unreadable, malformed or without a
+    /// grant: a validation error, so the whole module does not start.
     pub sros2_keystore: Option<PathBuf>,
 }
 
@@ -992,7 +994,7 @@ impl Config {
                 ))
             }
             Some(dir) => {
-                let policy = crate::sros2::Sros2Policy::load(dir)
+                let policy = crate::sros2::Sros2Policy::load(dir, self.domain_id)
                     .map_err(|e| format!("sros2_keystore: {e}"))?;
                 warnings.extend(
                     policy
