@@ -121,10 +121,10 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
 
 ### 3.1 Sensor box
 
-1. **Prepare the box.** Ubuntu 24.04 for the regular `robodr` package: as
-   released it is built on Ubuntu 24.04 and needs glibc 2.39 (the libc6
-   floor in its `Depends:`, read from the binaries) and systemd 247 or
-   newer. On Ubuntu 20.04 or 22.04 use the static `robodr-focal` package
+1. **Prepare the box.** Ubuntu 22.04 or 24.04 for the regular `robodr`
+   package: as released it is built in an Ubuntu 22.04 container and needs
+   glibc 2.35 (the libc6 floor in its `Depends:`, read from the binaries)
+   and systemd 247 or newer. On Ubuntu 20.04 use the static `robodr-focal` package
    (section 3.2): no glibc dependency, systemd 245 or newer. `Promiscuous=`
    in systemd-networkd needs 248 (22.04 and later); on 20.04 set promiscuous
    mode with the oneshot alternative named in the networkd example. Install

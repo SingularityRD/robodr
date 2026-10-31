@@ -459,7 +459,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   static:
-    # Static (musl) build of the pure binaries for hosts below glibc 2.39 /
+    # Static (musl) build of the pure binaries for hosts below glibc 2.35 /
     # systemd 247, e.g. Unitree EDU computers on JetPack 5 (Ubuntu 20.04,
     # glibc 2.31, systemd 245): docs/BUILD.md "Static (musl) build". Both
     # targets are cross-linked with rust-lld on the x86-64 runner (the only C

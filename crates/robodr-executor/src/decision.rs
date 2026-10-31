@@ -28,9 +28,9 @@
 //! 7. the safety system was not engaged when judged
 //!    (`safety_system_engaged`), and the state was known
 //!    (`safety_state_unavailable` for `unknown`);
-//! 8. `restrict_motion` is advisory in v1 (the executor does not drive the
-//!    motion firewall gateway, a separate unit): recorded,
-//!    nothing applied (outcome `advisory`);
+//! 8. without a `motion` section in `executor.json`, `restrict_motion` is
+//!    advisory (no platform adapter is configured): recorded, nothing
+//!    applied (outcome `advisory`); with one it goes to [`crate::motion`];
 //! 9. the target is one executor v1 can act on: a participant by GUID
 //!    prefix for `quarantine_node` (`unsupported_target` for a node name or
 //!    a process);
@@ -378,8 +378,8 @@ pub enum Effect {
     Quarantine(QuarantineSpec),
     /// Black-box mark and bundle (done by agentd, which owns the black box).
     Evidence,
-    /// Recorded only (v1 `restrict_motion`: the executor does not drive the
-    /// motion firewall gateway).
+    /// Recorded only (`restrict_motion` without a `motion` section in
+    /// `executor.json`: no platform adapter is configured).
     Advisory {
         note: String,
     },
@@ -656,10 +656,9 @@ pub fn precheck(
     if order.action == ActionId::RestrictMotion {
         return Ok(Planned {
             effect: Effect::Advisory {
-                note: "restrict_motion is advisory in executor v1: the executor does not drive \
-                       the motion firewall gateway (robodr-firewall-gw, a separate unit with its \
-                       own static envelope), so the request is recorded and nothing is changed \
-                       on the robot"
+                note: "restrict_motion is advisory: executor.json has no motion section, so no \
+                       platform adapter (gateway, unitree_sport) is configured; the request is \
+                       recorded and nothing is changed on the robot"
                     .into(),
             },
             ttl_s: None,

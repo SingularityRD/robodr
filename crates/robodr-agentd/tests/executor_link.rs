@@ -596,7 +596,7 @@ fn accepted_requests_are_executed_verified_and_reverted_through_the_executor() {
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0]["bundle"][0], req_evidence.as_str());
 
-    // restrict_motion: advisory only (the executor does not drive the gateway).
+    // restrict_motion: advisory only (no `motion` section in this executor config).
     submit(
         ux,
         "m-1",

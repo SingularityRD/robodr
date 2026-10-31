@@ -196,7 +196,7 @@ pub enum Final {
     Failed,
     /// Refused before anything was applied.
     Refused,
-    /// Recorded only (v1 `restrict_motion`).
+    /// Recorded only (`restrict_motion` without a `motion` section).
     Advisory,
     /// The table was removed from outside (operator emergency disable).
     RemovedExternally,

@@ -86,6 +86,14 @@ Checks (``--only`` takes these names):
       file written as ``robodr-<crate>/tests/<f>.rs`` relative to crates/)
       must exist.
 
+  glibc-floor
+      Source: ``DEB_FLOOR`` in scripts/check-glibc-floor.sh, the libc6
+      floor the release enforces on the ``robodr`` package. In the
+      install documents (GLIBC_DOCS below), no "glibc X", "GLIBC_X" or
+      "libc6 (>= X)" names a version above it (the stale "needs glibc
+      2.39" of a 24.04 build); a mention right after a history marker (see
+      contract-version) is not checked.
+
   pulsar-pin
       Source: the gitlink of vendor/pulsar in HEAD. The Pulsar
       due-diligence record names that commit in full, and
@@ -122,6 +130,21 @@ CURRENT_DOCS = (
     "fuzz/README.md",
 )
 
+# Documents that tell an installer which glibc the packages need. Not
+# docs/BUILD.md: its run logs record what earlier builds needed.
+GLIBC_DOCS = (
+    "README.md",
+    "docs/OPERATIONS.md",
+    "docs/UNITREE.md",
+    "docs/RELEASE.md",
+    "docs/GA-ROADMAP.md",
+    "docs/customer/*.md",
+    "docs/compliance/*.md",
+    "packaging/README.md",
+)
+GLIBC_FLOOR_SH = "scripts/check-glibc-floor.sh"
+GLIBC_RE = re.compile(r"\b(?:glibc|GLIBC_|libc6\s*\()\s*(?:>=|≥)?\s*\**\s*(\d+)\.(\d+)\b")
+
 # Documents that must carry a "Verified at commit" stamp.
 STAMPED_DOCS = (
     "docs/compliance/*.md",
@@ -154,6 +177,7 @@ CHECKS = (
     "stamps",
     "evidence-links",
     "pulsar-pin",
+    "glibc-floor",
 )
 
 LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
@@ -711,6 +735,23 @@ def check_evidence_links(root: Path) -> list[str]:
     return errs
 
 
+def check_glibc_floor(root: Path) -> list[str]:
+    m = re.search(r"^DEB_FLOOR=(\d+)\.(\d+)$", read(root, GLIBC_FLOOR_SH), re.MULTILINE)
+    if not m:
+        raise SourceError(f"{GLIBC_FLOOR_SH}: no DEB_FLOOR=<major>.<minor> line")
+    floor = (int(m.group(1)), int(m.group(2)))
+    errs: list[str] = []
+    for rel in expand(root, GLIBC_DOCS):
+        text = read(root, rel)
+        for g in GLIBC_RE.finditer(text):
+            if (int(g.group(1)), int(g.group(2))) > floor and not is_history(text, g.start()):
+                errs.append(
+                    f"{rel}:{line_of(text, g.start())}: names glibc {g.group(1)}.{g.group(2)}; "
+                    f"the robodr package needs {floor[0]}.{floor[1]} ({GLIBC_FLOOR_SH} DEB_FLOOR)"
+                )
+    return errs
+
+
 def check_pulsar_pin(root: Path) -> list[str]:
     r = git(root, "ls-tree", "HEAD", "vendor/pulsar")
     m = re.match(r"160000 commit ([0-9a-f]{40})\t", r.stdout)
@@ -757,6 +798,8 @@ def run(root: Path, only: list[str], max_age: int | None, skip_git: bool) -> tup
                     errs += check_stamps(root, max_age, notes)
             elif name == "evidence-links":
                 errs += check_evidence_links(root)
+            elif name == "glibc-floor":
+                errs += check_glibc_floor(root)
             elif name == "pulsar-pin":
                 if skip_git:
                     notes.append("pulsar-pin: SKIPPED (--skip-git); the Pulsar pin was not checked")
@@ -811,6 +854,11 @@ GOOD_TREE: dict[str, str] = {
     DUE_DILIGENCE_MD: "> Verified at commit `STAMP`.\n\n| Pinned commit | `PULSAR` (date) |\n",
     PULSAR_INTEGRATION_MD: "**Verified against Pulsar commit PULSHORT by reading its source**\n",
     "docs/customer/data-handling.md": "> Verified at commit `STAMP`.\n",
+    "scripts/check-glibc-floor.sh": "#!/usr/bin/env bash\nDEB_FLOOR=2.35\nRPM_FLOOR=2.34\n",
+    "docs/customer/reqs.md": (
+        "The `robodr` package needs glibc 2.35 or newer (`libc6 (>= 2.35)`); "
+        "Ubuntu 20.04 has glibc 2.31. The static focal build is unchanged since glibc 2.39.\n"
+    ),
     "fuzz/Cargo.toml": "".join(
         f'[[bin]]\nname = "{t}"\npath = "fuzz_targets/{t}.rs"\n\n' for t in ("t_one", "t_two", "t_three")
     ),
@@ -920,6 +968,12 @@ MUTATIONS = (
     ("evidence-links", "docs/compliance/a.md", "(../../README.md#layout)", "(../../READ.md)",
      "link target ../../READ.md does not exist"),
     ("evidence-links", "SECURITY.md", "(#reporting)", "(docs/none.md)", "link target docs/none.md does not exist"),
+    ("glibc-floor", "docs/customer/reqs.md", "needs glibc 2.35", "needs glibc **2.39**",
+     "reqs.md:1: names glibc 2.39"),
+    ("glibc-floor", "docs/customer/reqs.md", "(`libc6 (>= 2.35)`)", "(`libc6 (>= 2.36)`)",
+     "names glibc 2.36"),
+    ("glibc-floor", "scripts/check-glibc-floor.sh", "DEB_FLOOR=2.35", "DEB_FLOOR=2.31",
+     "names glibc 2.35; the robodr package needs 2.31"),
     ("pulsar-pin", DUE_DILIGENCE_MD, "`PULSAR`", "`" + "a" * 40 + "`", "review the bump"),
     ("pulsar-pin", PULSAR_INTEGRATION_MD, "PULSHORT", "abcdef1", "verified against abcdef1"),
     ("stamps", "docs/customer/data-handling.md", "> Verified at commit `STAMP`.\n", "> Reviewed.\n",

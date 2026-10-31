@@ -7,8 +7,13 @@
 //! | `isolate_network` | [`nft`] | drops all traffic except loopback, the management / uplink allow-list, the control buses (configurable), the motion control path, the robot's DDS discovery, DHCP, path MTU and IPv6 neighbour discovery | exact inverse (re-render without it) | always (default `ttl.default_s`) |
 //! | `quarantine_node` | [`nft`] | drops RTPS from the participant's GUID prefix (raw payload match), UDP to / from the source addresses it was seen sending from on the robot's DDS ports (any source port, review R3-1) and to / from its SPDP locators (addresses or locators required, provably outside the motion control path; that path is accepted before any drop) | exact inverse | always |
 //! | `record_evidence` | [`evidence`] (in agentd) | signed black-box mark naming the evidence bundle | not applicable | none |
-//! | `restrict_motion` | none in v1 | recorded as advisory (the executor does not drive the separate `robodr-firewall-gw` unit) | — | — |
-//! | `safe_pause`, `request_safe_state`, `rollback_config` | none | refused (`not_executor_action`) | — | — |
+//! | `restrict_motion` | none without a `motion` section in `executor.json` | recorded as advisory | — | — |
+//! | `safe_pause`, `request_safe_state`, `rollback_config` | none without a `motion` section | refused (`not_executor_action`) | — | — |
+//!
+//! With a `motion` section these four go through the OEM-validated platform
+//! adapters of [`motion`] (`gateway`, `unitree_sport`, `nav2`,
+//! `ros2_control`, `px4`, `rollback`), each refused until the site sets its
+//! `oem_validated: true`.
 //!
 //! Every adapter follows precheck ([`decision::precheck`], against the
 //! executor's **own** response policy and configuration) → safety re-check

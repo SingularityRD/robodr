@@ -2,7 +2,7 @@
 # Static (musl) release build of the pure binaries, for robots whose OS is
 # older than the glibc the regular package needs: Unitree EDU computers on
 # JetPack 5 (Ubuntu 20.04, glibc 2.31, systemd 245) and any other host below
-# glibc 2.39 (docs/BUILD.md "Static (musl) build", docs/UNITREE.md 3.2).
+# glibc 2.35 (docs/BUILD.md "Static (musl) build", docs/UNITREE.md 3.2).
 #
 #   scripts/build-static.sh <x86_64-unknown-linux-musl|aarch64-unknown-linux-musl> [--out DIR]
 #   scripts/build-static.sh <triple> --check-dir DIR

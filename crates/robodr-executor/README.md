@@ -13,8 +13,12 @@ default**: agentd hands it nothing unless `executor.enabled` is `true` in
 | `isolate_network` | nftables | drops all traffic in, out and forwarded, except loopback, the management and uplink allow-list, the robot's control buses (configurable), the motion control path, the robot's DDS discovery (SPDP multicast, IGMP), and what any host needs: DHCP / DHCPv6 client, path MTU discovery (ICMP "fragmentation needed", ICMPv6 "packet too big"), IPv6 neighbour / router discovery and MLD | exact inverse | always (`ttl.default_s` if the request names none) |
 | `quarantine_node` | nftables | drops RTPS whose header carries the participant's GUID prefix (raw payload match), all UDP from and to the source addresses it was seen sending from on the robot's DDS ports (any source port; review R3-1), and UDP from and to its SPDP unicast locators (IP and port); never inside the motion control path it may not cut (accepted before any drop). Needs addresses or locators, each provably outside that path | exact inverse | always |
 | `record_evidence` | black box (runs inside agentd) | a signed, fsynced `robodr.evidence_mark` note naming the evidence bundle (the request's black-box reference) | not applicable: evidence is never reverted | none |
-| `restrict_motion` | none in v1 | recorded as advisory: the in-path Motion Firewall gateway (`robodr-firewall-gw`) is a separate unit with its own static configuration, and the executor does not drive it, so nothing changes on the robot (request state `recorded_not_executed`) | — | — |
-| `safe_pause`, `request_safe_state`, `rollback_config` | none | refused (`not_executor_action`): these may de-energise the robot or are plan-only | — | — |
+| `restrict_motion` | none without a `motion` section in `executor.json` | recorded as advisory: nothing changes on the robot (request state `recorded_not_executed`) | — | — |
+| `safe_pause`, `request_safe_state`, `rollback_config` | none without a `motion` section | refused (`not_executor_action`): these may de-energise the robot or are plan-only | — | — |
+
+With a `motion` section these four actions go through platform adapters,
+each refused until the site sets its `oem_validated: true`: see
+[Motion adapters](#motion-adapters-sprint-8).
 
 ## Life of an action
 
@@ -447,10 +451,14 @@ crash at any point, is recovered at the next start.
 
 ## Safety argument
 
-* **Never de-energises, never actuates.** The executor has no code path to
-  the platform, actuators, e-stop or power. Actions that may de-energise
-  (`safe_pause`, `request_safe_state`, `rollback_config`) are refused by
-  the catalog check. `restrict_motion` is recorded only.
+* **Never de-energises, never actuates directly.** The executor has no
+  code path to actuators, the e-stop or power. Without a `motion` section
+  the actions that may de-energise (`safe_pause`, `request_safe_state`,
+  `rollback_config`) are refused by the catalog check and
+  `restrict_motion` is recorded only; with one, the motion actions go only
+  through the platform's own pause, hold, mode and speed-level interfaces
+  ([Motion adapters](#motion-adapters-sprint-8)), each adapter refused
+  until the site sets its `oem_validated: true`.
 * **Can only remove traffic.** In nftables an `accept` ends only the chain
   it is in, while a `drop` is final at its hook. A table that adds
   `accept` and `drop` rules therefore cannot open anything another table
@@ -953,10 +961,10 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   prefix. A GUID-narrowed protected entry keeps only RTPS **sent by**
   that participant (in either direction); traffic to it is kept by
   address / port entries.
-* **`restrict_motion`** is advisory: the in-path Motion Firewall gateway
-  (`robodr-firewall-gw`) exists as a separate unit, but it enforces its own
-  static envelope and the executor does not drive it (no interface to
-  tighten its limits at run time).
+* **`restrict_motion`** is advisory without a `motion` section. With the
+  `gateway` adapter it is a restriction file the gateway reads; only that
+  adapter has run against the real component (lab soak), the others only
+  against in-process simulated peers.
 * **No High finding for a failed revert yet.** A failed revert is reported
   through:
   * the request state;

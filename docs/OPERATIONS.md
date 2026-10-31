@@ -29,7 +29,7 @@ Status labels used below:
 | bpffs | mounted at `/sys/fs/bpf` (systemd does this at boot) |
 | systemd | 247 or newer (`LoadCredential=`) for the `robodr` package. |
 | Arch | amd64 or arm64, Debian or Ubuntu (`dpkg`) |
-| Runtime libs | glibc, libgcc-s1, libsqlite3-0 (the `.deb` declares them). The libc6 floor is read from the binaries: a release built on Ubuntu 24.04 needs **glibc 2.39**, i.e. Ubuntu 24.04 or newer. |
+| Runtime libs | glibc, libgcc-s1, libsqlite3-0 (the `.deb` declares them). The libc6 floor is read from the binaries; the release builds the `.deb` in an Ubuntu 22.04 container, so it needs **glibc 2.35** or newer (Ubuntu 22.04 / 24.04, JetPack 6, Debian 12 / 13; [support-matrix.md](customer/support-matrix.md#platform-requirements)). |
 | Older hosts | Ubuntu 20.04 / 22.04 (glibc 2.31 / 2.35, systemd 245 / 249), e.g. NVIDIA JetPack 5 / 6: the **`robodr-focal`** package, static musl binaries with systemd 245 units, **without `robodr-pulsard`** (agentd and the tools only). See [UNITREE.md section 3.2](UNITREE.md#32-edu-agent-development-computer). |
 | Tools on the robot | `sha256sum` (coreutils), `dpkg`; `minisign` if signatures are checked on the robot itself |
 
@@ -209,11 +209,12 @@ short:
   a sensor box, never on a robot. Hardening checklist: UNITREE.md section
   3.1.
 * **EDU agent.** On the EDU development computer (Jetson, arm64). Current
-  Unitree images (JetPack 5, Ubuntu 20.04, kernel without BTF; JetPack 6 is
-  Ubuntu 22.04) cannot install the regular package (glibc 2.39, systemd
-  247): they take `robodr-focal`, agentd only, no host rules.
-  `robodr-pulsard` with the host rules needs a BTF kernel and a `robodr`
-  build for the image's glibc (UNITREE.md section 3.2).
+  Unitree images (JetPack 5, Ubuntu 20.04, kernel without BTF) cannot
+  install the regular package (glibc 2.35, systemd 247): they take
+  `robodr-focal`, agentd only, no host rules. JetPack 6 (Ubuntu 22.04)
+  takes the regular package; its `robodr-pulsard` and host rules need a
+  kernel with BTF or an external BTF file for the running kernel
+  (UNITREE.md section 3.2).
 
 ## 4. Keys
 
@@ -2152,10 +2153,13 @@ its own table `inet robodr`, plus an evidence mark:
 | `quarantine_node` | one DDS participant dropped (by RTPS GUID prefix; by the source addresses agentd saw it sending from, cut whole on the robot's DDS ports whatever the source port; and by its SPDP locators on those addresses; all outside the motion control path, which is never cut, even by traffic carrying the quarantined prefix). Cutting an address cuts every DDS participant on that host. The SOC's answer says how far it reaches: `containment` `full` (every observed address and announced locator cut whole), `partial` or `guid_only` (GUID-prefix drop only, evadable), with `state.quarantine` listing what was cut and left out (contract §6a) | on revert or TTL |
 | `record_evidence` | a signed black-box mark | never: evidence is not reverted |
 
-`restrict_motion` is recorded as advisory: the executor does not drive the
-inline gateway (section 6.6), which enforces its own locked profile. The
-executor never sends `safe_pause`, `request_safe_state` or
-`rollback_config`.
+Without a `motion` section in `executor.json`, `restrict_motion` is
+recorded as advisory and the executor never sends `safe_pause`,
+`request_safe_state` or `rollback_config`. With one, they run through the
+platform adapters (`gateway`: a restriction file read by the inline
+gateway, section 6.6; `unitree_sport`, `nav2`, `ros2_control`, `px4`,
+`rollback`), each refused until the site sets its `oem_validated: true`
+(`crates/robodr-executor/README.md`, "Motion adapters").
 
 **Capability model.**
 

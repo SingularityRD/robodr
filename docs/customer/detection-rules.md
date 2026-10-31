@@ -2,7 +2,7 @@
      Regenerate: ROBODR_BLESS=1 cargo test -p robodr-ocsf --test detection_catalog -->
 # RoboDR detection catalog
 
-Every detection RoboDR can report, as the robot sends it in the `robodr.findings` contract 2.5.0 (`docs/contracts/robodr.findings.md`). Generated from the trusted rule catalog the sensor uses to write each finding's `title`, `description`, `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, so this page and the findings cannot disagree: a test fails when they do.
+Every rule id the trusted catalog of the `robodr.findings` contract 2.5.0 (`docs/contracts/robodr.findings.md`) defines, as the robot sends it. A few ids are catalogued before a sensor emits them; the customer guide names them. Generated from the trusted rule catalog the sensor uses to write each finding's `title`, `description`, `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, so this page and the findings cannot disagree: a test fails when they do.
 
 This is the full generated reference. How to read a finding, what each detection needs and what is not detected are in the customer guide, [`detection-catalog.md`](detection-catalog.md).
 
@@ -11,13 +11,13 @@ This is the full generated reference. How to read a finding, what each detection
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
 * **Since** is the contract version that added the entry. A consumer validating an older message applies that message's catalog; an id without an entry is reported with a generic title ("RoboDR model-profile deviation").
 
-169 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
+255 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
 
 ## By data source
 
 | Data source | Rule ids |
 |---|---|
-| `host_runtime` | 1 |
+| `host_runtime` | 87 |
 | `robodr_agent` | 31 |
 | `robodr_correlation` | 10 |
 | `robodr_delivery` | 17 |
@@ -35,7 +35,7 @@ This is the full generated reference. How to read a finding, what each detection
 * [`robot.depot.*`](#robotdepot) (5)
 * [`robot.firewall.*`](#robotfirewall) (30)
 * [`robot.gateway.*`](#robotgateway) (10)
-* [`robot.host.*`](#robothost) (1)
+* [`robot.host.*`](#robothost) (87)
 * [`robot.motion.*`](#robotmotion) (20)
 * [`robot.profile.*`](#robotprofile) (1)
 * [`robot.ros2.*`](#robotros2) (17)
@@ -193,7 +193,93 @@ This is the full generated reference. How to read a finding, what each detection
 
 | Rule id | Title | Description | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|---|
+| `robot.host.autostart_moved` | Service or autostart entry moved into place outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.autostart_written` | Service or autostart entry written outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.bluetooth_keys_modified` | Bluetooth pairing keys or configuration modified outside bluetoothd | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.bluetooth_keys_moved` | Bluetooth pairing keys or configuration moved into place outside bluetoothd | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.bluetooth_tooling_executed` | Bluetooth tooling executed on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.boot_hook_linked` | Boot, network or udev hook linked outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.boot_hook_moved` | Boot, network or udev hook moved into place outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.boot_hook_written` | Boot, network or udev hook written outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.deb_database_changed` | Debian package database changed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.deb_installed` | Debian package installed on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.deb_maintainer_script` | Debian package maintainer script executed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.debugger_started` | Debugger or tracer started on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.elf_from_writable_dir` | ELF opened from a world-writable or user cache directory | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.exec_from_fd` | Program executed from a file descriptor or /proc path | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.exec_from_tmp` | Program executed from a temporary directory | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.exec_noncanonical_path` | Program executed through a non-canonical path | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.interactive_python` | Interactive or stdin-fed Python interpreter started | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.interactive_shell` | Interactive shell started on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.interpreter_one_liner` | Interpreter one-liner executed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.kernel_module_autoload_changed` | Kernel module autoload configuration changed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.kernel_module_linked` | Kernel module file or autoload configuration linked into place outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.kernel_module_moved` | Kernel module file or autoload configuration moved into place outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.kernel_module_written` | Kernel module file written outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.library_from_tmp` | Shared library opened from a temporary directory | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.linker_path_changed` | Dynamic linker search path changed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.login_shell` | Login shell started on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.node_package_installed` | Node.js package installed with npm, npx, pnpm or yarn | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.overlay_vpn` | Remote-access overlay VPN started on robot | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.package_manager_foreign_elf` | Package manager mapped an ELF from outside the system paths | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.package_manager_foreign_library` | Package manager loaded a library from outside the system library paths | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.pip_installed` | Python package installed on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.proc_memory_written` | Process memory written through /proc | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_dir_deleted` | RoboDR or Pulsar protected directory deleted | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_file_deleted` | RoboDR or Pulsar protected file deleted | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_file_renamed` | RoboDR or Pulsar protected file or directory renamed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_file_written` | RoboDR or Pulsar protected file written | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_path_dir_created` | Directory created in a RoboDR or Pulsar protected path | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_path_file_created` | File or device node created in a RoboDR or Pulsar protected path | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.protected_path_linked` | Link created in or to a RoboDR or Pulsar protected path | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.provisioning_ip_connection` | Bluetooth daemon or Wi-Fi provisioning script opened an IP connection | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.pty_wrapper` | Pseudo-terminal wrapper executed on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
 | `robot.host.pulsar_threat` | Host runtime-security detection (Pulsar rule) | A Pulsar runtime-security rule fired on the robot controller (process, file or network activity of the host operating system); the detail names the Pulsar rule and the process. | `host_runtime` | - | 1.3 |
+| `robot.host.python_env_file_created` | File created in the system or ROS Python environment outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.python_env_file_moved` | File moved into the system or ROS Python environment outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.python_env_linked` | Link created in the system or ROS Python environment outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.python_tool_installed` | Python package installed with uv, pipx, poetry or conda/mamba | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.reverse_tunnel_client` | Reverse tunnel client executed on robot | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_external_connection` | ROS 2 process connects outside the robot's networks | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_foreign_elf_mapped` | ROS 2 process mapped an ELF from outside the allowlisted paths | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_foreign_library` | ROS 2 process loaded a library from outside the allowlisted library paths | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_foreign_python` | ROS 2 process imported Python code from outside the allowlisted paths | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_install_tree_file_placed` | File created or moved into the ROS 2 install tree outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_install_tree_linked` | Link created inside the ROS 2 install tree outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_install_tree_written` | ROS 2 install tree written outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ros2_ld_preload` | ROS 2 process loaded /etc/ld.so.preload | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.service_enabled` | Service enabled, masked or linked outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.service_stop_attempt` | Attempt to stop the Pulsar or RoboDR service | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.shell_network_connection` | Shell or netcat-style tool opened a network connection | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.shell_startup_linked` | Shell startup or login environment file linked | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.shell_startup_modified` | Shell startup or login environment file modified | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.shell_startup_moved` | Shell startup or login environment file moved into place | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_ca_key_accessed` | SROS 2 CA private key accessed on robot | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_enclave_linked` | Link created inside an SROS 2 enclave directory | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_foreign_security_files` | SROS 2 security files loaded from outside the commissioned keystore | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_key_linked` | Link created to an SROS 2 private key | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_key_read` | SROS 2 enclave private key read by a process outside the ROS stack | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_keystore_replaced` | SROS 2 keystore file renamed or replaced | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.sros2_keystore_written` | SROS 2 keystore file written | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.ssh_tunnel` | SSH reverse or dynamic tunnel with bundled options | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.system_library_linked` | Link created in a system library path or linker configuration outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.system_library_moved` | File moved into a system library path or linker configuration outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.system_library_opened_for_write` | Existing file in a system library path opened for writing outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.system_library_written` | Shared library written into a system library path outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unexpected_rmw_library` | Unexpected ROS 2 middleware (RMW) library loaded | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_dds_config_modified` | Unitree DDS configuration modified | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_dds_config_moved` | Unitree DDS configuration moved into place | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_external_connection` | Unitree robot process connects outside the allowlisted destinations | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_sdk_linked` | Unitree SDK or Cyclone DDS library linked outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_sdk_modified` | Unitree SDK or Cyclone DDS library modified outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_sdk_moved` | Unitree SDK or Cyclone DDS library moved into place outside the package manager | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_wifi_script_executed` | Unitree Wi-Fi provisioning script executed | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.unitree_wifi_script_opened` | Unitree Wi-Fi provisioning script opened | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.wifi_tooling_executed` | Wi-Fi configuration tooling executed on robot controller | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.wireless_config_linked` | Link created in a wireless network configuration directory | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.wireless_config_modified` | Wireless network configuration modified | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.wireless_config_moved` | Wireless network configuration moved into or out of place | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
+| `robot.host.writable_dir_public_connection` | Program in a user-writable directory connects to a public address | A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process. | `host_runtime` | - | 2.5 |
 
 ## robot.motion.*
 
@@ -303,132 +389,132 @@ This is the full generated reference. How to read a finding, what each detection
 
 ## Host rules (Pulsar)
 
-Runtime-security rules RoboDR ships for the Pulsar engine on the robot controller (`rules/robodr/*.toml`). Each match is reported as `robot.host.pulsar_threat` with the rule name in the finding's detail.
+Runtime-security rules RoboDR ships for the Pulsar engine on the robot controller (`rules/robodr/*.toml`). Since contract 2.5 each shipped rule is reported under its own rule id (the **Rule id** column; the `robot.host.*` family above), with the process in the finding's detail. A Pulsar rule RoboDR does not ship (a deployment's own rule, for example) is reported as `robot.host.pulsar_threat` with the rule name in the detail.
 
 ### kernel_modules.toml (4)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: Kernel module file written outside the package manager | `FileCreated` | persistence | high |
-| RoboDR: Kernel module autoload configuration changed | `FileOpened` | persistence | medium |
-| RoboDR: Kernel module file or autoload configuration moved into place outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Kernel module file or autoload configuration linked into place outside the package manager | `FileLink` | persistence | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: Kernel module file written outside the package manager | `robot.host.kernel_module_written` | `FileCreated` | persistence | high |
+| RoboDR: Kernel module autoload configuration changed | `robot.host.kernel_module_autoload_changed` | `FileOpened` | persistence | medium |
+| RoboDR: Kernel module file or autoload configuration moved into place outside the package manager | `robot.host.kernel_module_moved` | `FileRename` | persistence | high |
+| RoboDR: Kernel module file or autoload configuration linked into place outside the package manager | `robot.host.kernel_module_linked` | `FileLink` | persistence | high |
 
 ### radio_provisioning.toml (5)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: Bluetooth tooling executed on robot controller | `Exec` | lateral_movement | high |
-| RoboDR: Wi-Fi configuration tooling executed on robot controller | `Exec` | command_and_control | medium |
-| RoboDR: Wireless network configuration modified | `FileOpened` | command_and_control | high |
-| RoboDR: Wireless network configuration moved into or out of place | `FileRename` | command_and_control | high |
-| RoboDR: Link created in a wireless network configuration directory | `FileLink` | command_and_control | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: Bluetooth tooling executed on robot controller | `robot.host.bluetooth_tooling_executed` | `Exec` | lateral_movement | high |
+| RoboDR: Wi-Fi configuration tooling executed on robot controller | `robot.host.wifi_tooling_executed` | `Exec` | command_and_control | medium |
+| RoboDR: Wireless network configuration modified | `robot.host.wireless_config_modified` | `FileOpened` | command_and_control | high |
+| RoboDR: Wireless network configuration moved into or out of place | `robot.host.wireless_config_moved` | `FileRename` | command_and_control | high |
+| RoboDR: Link created in a wireless network configuration directory | `robot.host.wireless_config_linked` | `FileLink` | command_and_control | high |
 
 ### ros2_stack.toml (7)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: Interactive shell started on robot controller | `Exec` | execution | medium |
-| RoboDR: Login shell started on robot controller | `Exec` | execution | medium |
-| RoboDR: ROS 2 process connects outside the robot's networks | `Connect` | command_and_control | high |
-| RoboDR: ROS 2 install tree written outside the package manager | `FileOpened` | persistence | high |
-| RoboDR: File created or moved into the ROS 2 install tree outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Link created inside the ROS 2 install tree outside the package manager | `FileLink` | persistence | high |
-| RoboDR: Shell or netcat-style tool opened a network connection | `Connect` | command_and_control | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: Interactive shell started on robot controller | `robot.host.interactive_shell` | `Exec` | execution | medium |
+| RoboDR: Login shell started on robot controller | `robot.host.login_shell` | `Exec` | execution | medium |
+| RoboDR: ROS 2 process connects outside the robot's networks | `robot.host.ros2_external_connection` | `Connect` | command_and_control | high |
+| RoboDR: ROS 2 install tree written outside the package manager | `robot.host.ros2_install_tree_written` | `FileOpened` | persistence | high |
+| RoboDR: File created or moved into the ROS 2 install tree outside the package manager | `robot.host.ros2_install_tree_file_placed` | `FileRename` | persistence | high |
+| RoboDR: Link created inside the ROS 2 install tree outside the package manager | `robot.host.ros2_install_tree_linked` | `FileLink` | persistence | high |
+| RoboDR: Shell or netcat-style tool opened a network connection | `robot.host.shell_network_connection` | `Connect` | command_and_control | high |
 
 ### runtime_hooking.toml (22)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths | `FileOpened` | defense_evasion | high |
-| RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths | `ElfOpened` | defense_evasion | high |
-| RoboDR: ELF opened from a world-writable or user cache directory | `ElfOpened` | defense_evasion | high |
-| RoboDR: ROS 2 process loaded /etc/ld.so.preload | `FileOpened` | defense_evasion | high |
-| RoboDR: Unexpected ROS 2 middleware (RMW) library loaded | `FileOpened` | defense_evasion | high |
-| RoboDR: Shared library opened from a temporary directory | `FileOpened` | defense_evasion | high |
-| RoboDR: Program executed from a temporary directory | `Exec` | execution | high |
-| RoboDR: Shared library written into a system library path outside the package manager | `FileCreated` | persistence | high |
-| RoboDR: File moved into a system library path or linker configuration outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Link created in a system library path or linker configuration outside the package manager | `FileLink` | persistence | high |
-| RoboDR: Existing file in a system library path opened for writing outside the package manager | `FileOpened` | persistence | high |
-| RoboDR: Dynamic linker search path changed | `FileOpened` | persistence | high |
-| RoboDR: Process memory written through /proc | `FileOpened` | defense_evasion | high |
-| RoboDR: Debugger or tracer started on robot controller | `Exec` | credential_access | medium |
-| RoboDR: Program executed from a file descriptor or /proc path | `Exec` | defense_evasion | high |
-| RoboDR: Program executed through a non-canonical path | `Exec` | defense_evasion | medium |
-| RoboDR: ROS 2 process imported Python code from outside the allowlisted paths | `FileOpened` | defense_evasion | high |
-| RoboDR: Interpreter one-liner executed | `Exec` | execution | medium |
-| RoboDR: Interactive or stdin-fed Python interpreter started | `Exec` | execution | medium |
-| RoboDR: Pseudo-terminal wrapper executed on robot controller | `Exec` | execution | medium |
-| RoboDR: Package manager loaded a library from outside the system library paths | `FileOpened` | defense_evasion | high |
-| RoboDR: Package manager mapped an ELF from outside the system paths | `ElfOpened` | defense_evasion | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: ROS 2 process loaded a library from outside the allowlisted library paths | `robot.host.ros2_foreign_library` | `FileOpened` | defense_evasion | high |
+| RoboDR: ROS 2 process mapped an ELF from outside the allowlisted paths | `robot.host.ros2_foreign_elf_mapped` | `ElfOpened` | defense_evasion | high |
+| RoboDR: ELF opened from a world-writable or user cache directory | `robot.host.elf_from_writable_dir` | `ElfOpened` | defense_evasion | high |
+| RoboDR: ROS 2 process loaded /etc/ld.so.preload | `robot.host.ros2_ld_preload` | `FileOpened` | defense_evasion | high |
+| RoboDR: Unexpected ROS 2 middleware (RMW) library loaded | `robot.host.unexpected_rmw_library` | `FileOpened` | defense_evasion | high |
+| RoboDR: Shared library opened from a temporary directory | `robot.host.library_from_tmp` | `FileOpened` | defense_evasion | high |
+| RoboDR: Program executed from a temporary directory | `robot.host.exec_from_tmp` | `Exec` | execution | high |
+| RoboDR: Shared library written into a system library path outside the package manager | `robot.host.system_library_written` | `FileCreated` | persistence | high |
+| RoboDR: File moved into a system library path or linker configuration outside the package manager | `robot.host.system_library_moved` | `FileRename` | persistence | high |
+| RoboDR: Link created in a system library path or linker configuration outside the package manager | `robot.host.system_library_linked` | `FileLink` | persistence | high |
+| RoboDR: Existing file in a system library path opened for writing outside the package manager | `robot.host.system_library_opened_for_write` | `FileOpened` | persistence | high |
+| RoboDR: Dynamic linker search path changed | `robot.host.linker_path_changed` | `FileOpened` | persistence | high |
+| RoboDR: Process memory written through /proc | `robot.host.proc_memory_written` | `FileOpened` | defense_evasion | high |
+| RoboDR: Debugger or tracer started on robot controller | `robot.host.debugger_started` | `Exec` | credential_access | medium |
+| RoboDR: Program executed from a file descriptor or /proc path | `robot.host.exec_from_fd` | `Exec` | defense_evasion | high |
+| RoboDR: Program executed through a non-canonical path | `robot.host.exec_noncanonical_path` | `Exec` | defense_evasion | medium |
+| RoboDR: ROS 2 process imported Python code from outside the allowlisted paths | `robot.host.ros2_foreign_python` | `FileOpened` | defense_evasion | high |
+| RoboDR: Interpreter one-liner executed | `robot.host.interpreter_one_liner` | `Exec` | execution | medium |
+| RoboDR: Interactive or stdin-fed Python interpreter started | `robot.host.interactive_python` | `Exec` | execution | medium |
+| RoboDR: Pseudo-terminal wrapper executed on robot controller | `robot.host.pty_wrapper` | `Exec` | execution | medium |
+| RoboDR: Package manager loaded a library from outside the system library paths | `robot.host.package_manager_foreign_library` | `FileOpened` | defense_evasion | high |
+| RoboDR: Package manager mapped an ELF from outside the system paths | `robot.host.package_manager_foreign_elf` | `ElfOpened` | defense_evasion | high |
 
 ### self_protection.toml (8)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: RoboDR or Pulsar protected file written | `FileOpened` | defense_evasion | high |
-| RoboDR: RoboDR or Pulsar protected file deleted | `FileDeleted` | defense_evasion | high |
-| RoboDR: RoboDR or Pulsar protected file or directory renamed | `FileRename` | defense_evasion | high |
-| RoboDR: File or device node created in a RoboDR or Pulsar protected path | `FileCreated` | defense_evasion | high |
-| RoboDR: Link created in or to a RoboDR or Pulsar protected path | `FileLink` | defense_evasion | high |
-| RoboDR: Directory created in a RoboDR or Pulsar protected path | `DirCreated` | defense_evasion | high |
-| RoboDR: RoboDR or Pulsar protected directory deleted | `DirDeleted` | defense_evasion | high |
-| RoboDR: Attempt to stop the Pulsar or RoboDR service | `Exec` | defense_evasion | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: RoboDR or Pulsar protected file written | `robot.host.protected_file_written` | `FileOpened` | defense_evasion | high |
+| RoboDR: RoboDR or Pulsar protected file deleted | `robot.host.protected_file_deleted` | `FileDeleted` | defense_evasion | high |
+| RoboDR: RoboDR or Pulsar protected file or directory renamed | `robot.host.protected_file_renamed` | `FileRename` | defense_evasion | high |
+| RoboDR: File or device node created in a RoboDR or Pulsar protected path | `robot.host.protected_path_file_created` | `FileCreated` | defense_evasion | high |
+| RoboDR: Link created in or to a RoboDR or Pulsar protected path | `robot.host.protected_path_linked` | `FileLink` | defense_evasion | high |
+| RoboDR: Directory created in a RoboDR or Pulsar protected path | `robot.host.protected_path_dir_created` | `DirCreated` | defense_evasion | high |
+| RoboDR: RoboDR or Pulsar protected directory deleted | `robot.host.protected_dir_deleted` | `DirDeleted` | defense_evasion | high |
+| RoboDR: Attempt to stop the Pulsar or RoboDR service | `robot.host.service_stop_attempt` | `Exec` | defense_evasion | high |
 
 ### sros2_keystore.toml (7)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: SROS 2 enclave private key read by a process outside the ROS stack | `FileOpened` | credential_access | high |
-| RoboDR: SROS 2 CA private key accessed on robot | `FileOpened` | credential_access | critical |
-| RoboDR: SROS 2 keystore file written | `FileOpened` | persistence | high |
-| RoboDR: SROS 2 keystore file renamed or replaced | `FileRename` | persistence | high |
-| RoboDR: Link created to an SROS 2 private key | `FileLink` | credential_access | high |
-| RoboDR: Link created inside an SROS 2 enclave directory | `FileLink` | persistence | high |
-| RoboDR: SROS 2 security files loaded from outside the commissioned keystore | `FileOpened` | defense_evasion | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: SROS 2 enclave private key read by a process outside the ROS stack | `robot.host.sros2_key_read` | `FileOpened` | credential_access | high |
+| RoboDR: SROS 2 CA private key accessed on robot | `robot.host.sros2_ca_key_accessed` | `FileOpened` | credential_access | critical |
+| RoboDR: SROS 2 keystore file written | `robot.host.sros2_keystore_written` | `FileOpened` | persistence | high |
+| RoboDR: SROS 2 keystore file renamed or replaced | `robot.host.sros2_keystore_replaced` | `FileRename` | persistence | high |
+| RoboDR: Link created to an SROS 2 private key | `robot.host.sros2_key_linked` | `FileLink` | credential_access | high |
+| RoboDR: Link created inside an SROS 2 enclave directory | `robot.host.sros2_enclave_linked` | `FileLink` | persistence | high |
+| RoboDR: SROS 2 security files loaded from outside the commissioned keystore | `robot.host.sros2_foreign_security_files` | `FileOpened` | defense_evasion | high |
 
 ### supply_chain.toml (9)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: Debian package installed on robot controller | `Exec` | initial_access | high |
-| RoboDR: Debian package maintainer script executed | `Exec` | execution | high |
-| RoboDR: Debian package database changed | `FileRename` | persistence | medium |
-| RoboDR: Python package installed on robot controller | `Exec` | initial_access | high |
-| RoboDR: Python package installed with uv, pipx, poetry or conda/mamba | `Exec` | initial_access | high |
-| RoboDR: Node.js package installed with npm, npx, pnpm or yarn | `Exec` | initial_access | high |
-| RoboDR: File created in the system or ROS Python environment outside the package manager | `FileCreated` | persistence | high |
-| RoboDR: File moved into the system or ROS Python environment outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Link created in the system or ROS Python environment outside the package manager | `FileLink` | persistence | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: Debian package installed on robot controller | `robot.host.deb_installed` | `Exec` | initial_access | high |
+| RoboDR: Debian package maintainer script executed | `robot.host.deb_maintainer_script` | `Exec` | execution | high |
+| RoboDR: Debian package database changed | `robot.host.deb_database_changed` | `FileRename` | persistence | medium |
+| RoboDR: Python package installed on robot controller | `robot.host.pip_installed` | `Exec` | initial_access | high |
+| RoboDR: Python package installed with uv, pipx, poetry or conda/mamba | `robot.host.python_tool_installed` | `Exec` | initial_access | high |
+| RoboDR: Node.js package installed with npm, npx, pnpm or yarn | `robot.host.node_package_installed` | `Exec` | initial_access | high |
+| RoboDR: File created in the system or ROS Python environment outside the package manager | `robot.host.python_env_file_created` | `FileCreated` | persistence | high |
+| RoboDR: File moved into the system or ROS Python environment outside the package manager | `robot.host.python_env_file_moved` | `FileRename` | persistence | high |
+| RoboDR: Link created in the system or ROS Python environment outside the package manager | `robot.host.python_env_linked` | `FileLink` | persistence | high |
 
 ### unitree.toml (24)
 
-| Rule | Event | Category | Severity |
-|---|---|---|---|
-| RoboDR: Unitree Wi-Fi provisioning script executed | `Exec` | initial_access | medium |
-| RoboDR: Unitree Wi-Fi provisioning script opened | `FileOpened` | initial_access | medium |
-| RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection | `Connect` | command_and_control | critical |
-| RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd | `FileOpened` | persistence | high |
-| RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd | `FileRename` | persistence | high |
-| RoboDR: Service or autostart entry written outside the package manager | `FileOpened` | persistence | high |
-| RoboDR: Service or autostart entry moved into place outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Service enabled, masked or linked outside the package manager | `FileLink` | persistence | medium |
-| RoboDR: Boot, network or udev hook written outside the package manager | `FileOpened` | persistence | high |
-| RoboDR: Boot, network or udev hook moved into place outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Boot, network or udev hook linked outside the package manager | `FileLink` | persistence | high |
-| RoboDR: Shell startup or login environment file modified | `FileOpened` | persistence | medium |
-| RoboDR: Shell startup or login environment file moved into place | `FileRename` | persistence | medium |
-| RoboDR: Shell startup or login environment file linked | `FileLink` | persistence | medium |
-| RoboDR: Unitree robot process connects outside the allowlisted destinations | `Connect` | exfiltration | high |
-| RoboDR: Program in a user-writable directory connects to a public address | `Connect` | command_and_control | high |
-| RoboDR: Reverse tunnel client executed on robot | `Exec` | command_and_control | high |
-| RoboDR: SSH reverse or dynamic tunnel with bundled options | `Exec` | command_and_control | high |
-| RoboDR: Remote-access overlay VPN started on robot | `Exec` | command_and_control | medium |
-| RoboDR: Unitree DDS configuration modified | `FileOpened` | defense_evasion | high |
-| RoboDR: Unitree DDS configuration moved into place | `FileRename` | defense_evasion | high |
-| RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager | `FileOpened` | persistence | high |
-| RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager | `FileRename` | persistence | high |
-| RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager | `FileLink` | persistence | high |
+| Rule | Rule id | Event | Category | Severity |
+|---|---|---|---|---|
+| RoboDR: Unitree Wi-Fi provisioning script executed | `robot.host.unitree_wifi_script_executed` | `Exec` | initial_access | medium |
+| RoboDR: Unitree Wi-Fi provisioning script opened | `robot.host.unitree_wifi_script_opened` | `FileOpened` | initial_access | medium |
+| RoboDR: Bluetooth daemon or Wi-Fi provisioning script opened an IP connection | `robot.host.provisioning_ip_connection` | `Connect` | command_and_control | critical |
+| RoboDR: Bluetooth pairing keys or configuration modified outside bluetoothd | `robot.host.bluetooth_keys_modified` | `FileOpened` | persistence | high |
+| RoboDR: Bluetooth pairing keys or configuration moved into place outside bluetoothd | `robot.host.bluetooth_keys_moved` | `FileRename` | persistence | high |
+| RoboDR: Service or autostart entry written outside the package manager | `robot.host.autostart_written` | `FileOpened` | persistence | high |
+| RoboDR: Service or autostart entry moved into place outside the package manager | `robot.host.autostart_moved` | `FileRename` | persistence | high |
+| RoboDR: Service enabled, masked or linked outside the package manager | `robot.host.service_enabled` | `FileLink` | persistence | medium |
+| RoboDR: Boot, network or udev hook written outside the package manager | `robot.host.boot_hook_written` | `FileOpened` | persistence | high |
+| RoboDR: Boot, network or udev hook moved into place outside the package manager | `robot.host.boot_hook_moved` | `FileRename` | persistence | high |
+| RoboDR: Boot, network or udev hook linked outside the package manager | `robot.host.boot_hook_linked` | `FileLink` | persistence | high |
+| RoboDR: Shell startup or login environment file modified | `robot.host.shell_startup_modified` | `FileOpened` | persistence | medium |
+| RoboDR: Shell startup or login environment file moved into place | `robot.host.shell_startup_moved` | `FileRename` | persistence | medium |
+| RoboDR: Shell startup or login environment file linked | `robot.host.shell_startup_linked` | `FileLink` | persistence | medium |
+| RoboDR: Unitree robot process connects outside the allowlisted destinations | `robot.host.unitree_external_connection` | `Connect` | exfiltration | high |
+| RoboDR: Program in a user-writable directory connects to a public address | `robot.host.writable_dir_public_connection` | `Connect` | command_and_control | high |
+| RoboDR: Reverse tunnel client executed on robot | `robot.host.reverse_tunnel_client` | `Exec` | command_and_control | high |
+| RoboDR: SSH reverse or dynamic tunnel with bundled options | `robot.host.ssh_tunnel` | `Exec` | command_and_control | high |
+| RoboDR: Remote-access overlay VPN started on robot | `robot.host.overlay_vpn` | `Exec` | command_and_control | medium |
+| RoboDR: Unitree DDS configuration modified | `robot.host.unitree_dds_config_modified` | `FileOpened` | defense_evasion | high |
+| RoboDR: Unitree DDS configuration moved into place | `robot.host.unitree_dds_config_moved` | `FileRename` | defense_evasion | high |
+| RoboDR: Unitree SDK or Cyclone DDS library modified outside the package manager | `robot.host.unitree_sdk_modified` | `FileOpened` | persistence | high |
+| RoboDR: Unitree SDK or Cyclone DDS library moved into place outside the package manager | `robot.host.unitree_sdk_moved` | `FileRename` | persistence | high |
+| RoboDR: Unitree SDK or Cyclone DDS library linked outside the package manager | `robot.host.unitree_sdk_linked` | `FileLink` | persistence | high |
 
 86 host rules in 8 files.
