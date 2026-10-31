@@ -2797,6 +2797,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodr-demo-soc"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "robodr-blackbox",
+ "robodr-events",
+ "robodr-export",
+ "robodr-ocsf",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "robodr-depot"
 version = "0.1.0-alpha.1"
 dependencies = [

@@ -9,6 +9,7 @@ members = [
     "crates/robodr-cdr",
     "crates/robodr-commission",
     "crates/robodr-correlate",
+    "crates/robodr-demo-soc",
     "crates/robodr-deliverd",
     "crates/robodr-depot",
     "crates/robodr-diode",
