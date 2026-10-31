@@ -203,9 +203,13 @@ jobs:
         # minisign: the signed-install tests (signature, private extraction,
         # a tampered extracted directory refused). rpm (rpm, rpmbuild,
         # rpm2archive): the RPM bundle tests, in a separate rpm root.
+        # The sensor box image tests skip their minisign cases (build-image.sh
+        # signature gate, trusted comment) without minisign; with it installed
+        # here, ROBODR_REQUIRE_MINISIGN_TEST=1 turns a skip into a failure.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends minisign rpm
+          ROBODR_REQUIRE_MINISIGN_TEST=1 cargo test -p robodr-ops --test sensor_box_image $CARGO_LOCKED
           bin=$(cargo test -p robodr-fleet --test packaging $CARGO_LOCKED --no-run 2>&1 |
             sed -n 's/.*Executable tests\/packaging.rs (\(.*\))$/\1/p')
           test -x "$bin"
