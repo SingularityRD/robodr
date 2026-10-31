@@ -625,8 +625,15 @@ comment; container images by multi-arch index digest (resolved with
 
 ## Local CI verification
 
-GitHub Actions has not run for this repository yet (the organisation's
-Actions are blocked by billing). On **2026-10-17** every job of `ci.yml`, and
+*2026-10-30: GitHub Actions has since run on the repository (run
+41136491301, the first complete run of the current `ci.yml`). It finished
+**red**: Pure crates, both Rocky Linux RPM jobs, cargo-deny and Fuzz smoke
+failed, and the package install smoke was skipped; the fixes are in
+progress. Until a run is green, the local records below are the only
+evidence that a job passes.*
+
+At the time of the records below GitHub Actions had not run for this
+repository (the organisation's Actions were blocked by billing). On **2026-10-17** every job of `ci.yml`, and
 the build/package part of `release.yml`, was run locally, step by step with
 the workflow's own commands and environment (`CARGO_INCREMENTAL=0`,
 `scripts/ci-setup.sh` exports applied as `$GITHUB_ENV` would), on the commit
@@ -722,7 +729,7 @@ target/aarch64-unknown-linux-gnu/release` for `build-deb.sh`.
 | released pure binaries == reproduced | pass | `sha256sum --strict -c` in `target/aarch64-unknown-linux-gnu/release` |
 | Cargo.lock unchanged | pass | |
 | SBOM (`SBOM_TOOL=cyclonedx`) | pass | 19 SBOMs, all pass `--check` |
-| `.deb` (`ROBODR_DEB_REQUIRE` as in the workflow) | pass after fix | `Architecture: arm64`; every binary ELF AArch64; `Depends: libc6 (>= 2.39), ...` (was 2.35, wrong: see fixes) |
+| `.deb` (`ROBODR_DEB_REQUIRE` as in the workflow) | pass after fix | `Architecture: arm64`; every binary ELF AArch64; `Depends: libc6 (>= 2.39), ...` (was 2.35, wrong: see fixes). *Superseded 2026-10-30: the release builds the `.deb` in an Ubuntu 22.04 container, `libc6 (>= 2.35)` ([Release build userlands](#release-build-userlands)).* |
 | offline bundle, SBOM tarball, `SHA256SUMS-arm64` | pass | `install-bundle.sh verify` on the extracted bundle: checksums OK |
 | `file` on the 11 binaries | pass | `ELF 64-bit LSB pie executable, ARM aarch64`, interpreter `/lib/ld-linux-aarch64.so.1`, stripped |
 | qemu smoke runs | pass | `robodr-pulsard --version`: `robodr-pulsard 0.1.0-alpha.1` / `pulsar: 0.11.0-alpha.1 (commit 4796504...)`; `robodr-agentd --version` and `robodr-commission --version` print `0.1.0-alpha.1` |
@@ -823,7 +830,9 @@ Not checked on arm64:
 - The native `ubuntu-24.04-arm` runner: clang-20 from its apt sources, the
   native build and its hashes.
 - That ld.so really refuses the binaries on glibc < 2.39. This follows from
-  the `readelf -V` output above and was not run on an old system.
+  the `readelf -V` output above and was not run on an old system. *(Historical:
+  it applies to binaries linked on a glibc 2.39 host, which the release no
+  longer ships; the current floor is 2.35, [Package matrix](#package-matrix).)*
 
 ### Release dry run (2026-10-26)
 
@@ -837,7 +846,7 @@ with a throwaway, test-only minisign key. Result: **PASS**.
 |---|---|---|
 | guard: wrong tag, `Cargo.toml` version != `VERSION` | refused | the second guard failed before `6e69f91` (fix below) |
 | `prepare` | pass | draft prerelease, notes from the CHANGELOG section |
-| `build` amd64 | pass (22 min) | clang-20 installed from noble-updates for eBPF (not the fallback); 14 pure binaries reproducible; `robodr-pulsard` built `--locked`; 22 SBOMs (cargo-cyclonedx 0.5.9); `libc6 (>= 2.39)` |
+| `build` amd64 | pass (22 min) | clang-20 installed from noble-updates for eBPF (not the fallback); 14 pure binaries reproducible; `robodr-pulsard` built `--locked`; 22 SBOMs (cargo-cyclonedx 0.5.9); `libc6 (>= 2.39)` (built on ubuntu-24.04 at the time; superseded by the Ubuntu 22.04 container build, `libc6 (>= 2.35)`) |
 | `build` arm64 | pass (21 min) | **cross-compiled** (adaptations below); 14 reproducible; `robodr-pulsard` cross-built against multiarch `libssl-dev:arm64`/`libsqlite3-dev:arm64` |
 | `build-static` amd64 / arm64 | pass (12 / 15 min) | 14 static binaries each, reproducible, built == reproduced, smoke run (arm64 under qemu-aarch64-static 8.2) |
 | `publish` | pass | per-arch hashes, `SHA256SUMS`, 15 signatures with a password-protected key through the secret path, self-verify with the `RW...` string |
@@ -905,8 +914,9 @@ script, unit or workflow.
 
 ### Package userlands, local run (2026-10-30)
 
-Run on a 4-core amd64 host with Docker, not on GitHub (Actions are
-blocked by billing; **none of the new CI or release jobs has run**).
+Run on a 4-core amd64 host with Docker, not on GitHub (Actions were
+blocked by billing at the time; **none of the new CI or release jobs had
+run**; see the 2026-10-30 note under [Local CI verification](#local-ci-verification)).
 Source: the commit that introduced the jobs, plus this record.
 
 Verified locally, **amd64 only**:
@@ -1000,7 +1010,9 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
 
 **Not verified** (needs network, the pinned toolchain or a kernel):
 
-- No GitHub Actions run has happened yet. Since 2026-10-17 every job has
+- No GitHub Actions run had passed when this was written; the first
+  complete run (2026-10-30) was red ([Local CI verification](#local-ci-verification)).
+  Since 2026-10-17 every job has
   passed locally ([Local CI verification](#local-ci-verification)): the
   Pulsar-bound build, cargo-cyclonedx 0.5.9, the cargo-deny 0.20.2 config,
   the full graph's licenses, `nightly-2026-09-01` + cargo-fuzz 0.13.1,
