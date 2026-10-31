@@ -356,7 +356,11 @@ rotation.
    # records of keys retired before; add --allow-hmac when the old key is HMAC
    ```
 
-   It refuses a log that is open (agentd still running), the wrong old key,
+   It refuses a log that is open (agentd still running), a log being
+   exported right now (`export.lock` held by `export-pending`: retry; with
+   the export timer, a run that starts between this step and step 4 holds
+   the retired key and is refused, exit 2, without touching the cursor),
+   the wrong old key,
    an HMAC new key, a reused key id, and a log holding records no given key
    authenticates. `--previous-keys` gets the same checks as agentd's
    `blackbox.previous_keys` (below). Re-running it after success prints
@@ -2737,7 +2741,14 @@ robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd \
 Each record's hash, signature and link are checked before it is
 exported; each bundle is written durably before the cursor moves (a crash
 in between re-exports the same records; the far side reports the replay).
-After a key rotation add the retired public keys with `--previous-keys`.
+It streams the segments one frame at a time, so its memory is about
+`--max-bytes` (64 MiB) plus one frame (at most 16 MiB) whatever the
+segment size. After a key rotation (4.3) `--key` must be the new key and
+the retired public keys go in `--previous-keys`: a run with the retired
+key is refused (exit 2) before it writes anything, because the newest
+record is not signed by it. `robodr-blackbox rotate` holds `export.lock`
+(it fails while an export runs: retry) and re-signs the newest cursor on
+disk under the new key.
 Records lost before they were exported (a gap after the cursor) are named
 on stderr and the run exits 1 after writing what is there; the far side
 reports them too. On the far side, verify each bundle in order with

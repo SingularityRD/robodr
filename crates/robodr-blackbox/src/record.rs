@@ -492,6 +492,15 @@ impl<R: std::io::Read> FrameReader<R> {
         self.offset
     }
 
+    /// Append the exact bytes of the frame [`FrameReader::next_frame`] just
+    /// returned as [`FrameRead::Record`] (header and body, as stored) to
+    /// `out`. Meaningful only right after a `Record`.
+    pub fn append_last_frame(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&FRAME_MAGIC);
+        out.extend_from_slice(&(self.buf.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.buf);
+    }
+
     /// Fill `n` bytes; `Ok(read)` < `n` only at end of input.
     fn fill(&mut self, n: usize) -> std::io::Result<usize> {
         self.buf.clear();

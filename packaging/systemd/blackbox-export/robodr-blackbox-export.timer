@@ -3,7 +3,8 @@
 # black-box sizing table (OPERATIONS 6.4): the export must run well inside
 # the time the pending-export reserve covers at the unit's write rate.
 #
-# Installed disabled:
+# Not installed by the package yet (OPERATIONS 8.2): copy it and the service
+# to /etc/systemd/system/, then:
 #   systemctl enable --now robodr-blackbox-export.timer
 
 [Unit]

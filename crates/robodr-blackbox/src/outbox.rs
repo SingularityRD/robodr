@@ -12,9 +12,18 @@
 //!    if it verifies under the recorder's **current** key, as the recorder
 //!    itself requires; a cursor that does not verify is ignored and the
 //!    export starts at the oldest retained record (re-exporting is safe).
-//! 3. Walk the retained segments oldest first, one in memory at a time,
-//!    and collect the frames of the current chain (the chain of the newest
-//!    record) after the cursor: each record's hash is recomputed, its
+//!    The newest record must be signed by that key too: an exporter that
+//!    still holds the key a rotation retired is refused before it writes
+//!    anything (it would re-export everything and overwrite the cursor the
+//!    rotation re-signed with one the recorder ignores).
+//! 3. Walk the retained segments oldest first, streaming one frame at a
+//!    time (a segment wholly before the cursor, judged by the first record
+//!    of the next one, is not read), and collect the frames of the current
+//!    chain (the chain of the newest record) after the cursor. Memory is
+//!    the bundle (`max_bytes`) plus one frame (at most 16 MiB), whatever
+//!    the segment size; only bytes that are not a frame (damage) make the
+//!    rest of that segment be read whole to resynchronise past them. Each
+//!    record's hash is recomputed, its
 //!    signature checked with the caller's keys, and it must link to the
 //!    one before (`seq + 1`, `prev_hash`). The bundle stops at the first
 //!    break (a quarantined or dropped segment, a record half written right
@@ -44,13 +53,13 @@
 use crate::crypto::to_hex;
 use crate::export::{cursor_signing_message, Anchor, Bundle, SignedCursor};
 use crate::record::{
-    scan_frames, signing_message, ChainIdentity, GenesisPayload, Hash, Record, RecordKind,
-    ScanItem, SegmentStartPayload,
+    scan_frames, signing_message, ChainIdentity, FrameRead, FrameReader, GenesisPayload, Hash,
+    Record, RecordKind, ScanItem, SegmentStartPayload,
 };
 use crate::sign::Signer;
 use crate::store::{atomic_write_owned, list_segments, lock_file, read_state, Error, CURSOR_FILE};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Lock file serialising exporters of one directory.
@@ -102,7 +111,8 @@ pub struct PendingExport {
 /// recorder's current key and, after rotations, its previous keys)?
 pub type Authentic<'a> = &'a dyn Fn(&[u8], &[u8]) -> bool;
 
-fn read_segment(p: &Path) -> io::Result<Option<Vec<u8>>> {
+/// Open a segment for streaming (`None`: dropped since it was listed).
+fn open_segment(p: &Path) -> io::Result<Option<File>> {
     let mut o = OpenOptions::new();
     o.read(true);
     #[cfg(unix)]
@@ -121,34 +131,104 @@ fn read_segment(p: &Path) -> io::Result<Option<Vec<u8>>> {
             format!("{} is not a regular file", p.display()),
         ));
     }
-    let mut b = Vec::new();
-    f.take(MAX_SEGMENT_FILE_BYTES + 1).read_to_end(&mut b)?;
-    if b.len() as u64 > MAX_SEGMENT_FILE_BYTES {
-        return Err(io::Error::new(
+    Ok(Some(f))
+}
+
+/// Gets each frame's bytes and record; says whether to go on.
+type RecordVisitor<'a> = dyn FnMut(&[u8], Record) -> Result<Step, Error> + 'a;
+
+/// What a record visitor wants next.
+enum Step {
+    Next,
+    Stop,
+}
+
+/// Visit the records of segment `p` in file order with the exact bytes of
+/// each frame. Streams one frame at a time ([`FrameReader`]): memory does
+/// not grow with the segment. Bytes that are not a complete frame (a
+/// record being written right now, or damage) are resynchronised past as
+/// [`scan_frames`] does, reading only the rest of the segment from that
+/// point (damage is rare; a torn tail is a few bytes). Returns `false` if
+/// the segment no longer exists.
+fn for_each_record(p: &Path, visit: &mut RecordVisitor<'_>) -> Result<bool, Error> {
+    let Some(file) = open_segment(p)? else {
+        return Ok(false);
+    };
+    let mut fr = FrameReader::new(io::BufReader::new(&file));
+    let mut frame = Vec::new();
+    let irregular_at = loop {
+        match fr.next_frame()? {
+            FrameRead::Record(sr) => {
+                frame.clear();
+                fr.append_last_frame(&mut frame);
+                if let Step::Stop = visit(&frame, sr.record)? {
+                    return Ok(true);
+                }
+            }
+            FrameRead::End => return Ok(true),
+            FrameRead::Irregular { offset } => break offset,
+        }
+    };
+    drop(fr);
+    let mut f = &file;
+    f.seek(SeekFrom::Start(irregular_at))?;
+    let mut rest = Vec::new();
+    f.take(MAX_SEGMENT_FILE_BYTES + 1).read_to_end(&mut rest)?;
+    if rest.len() as u64 > MAX_SEGMENT_FILE_BYTES {
+        return Err(Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "{} is larger than {MAX_SEGMENT_FILE_BYTES} bytes",
                 p.display()
             ),
-        ));
+        )));
     }
-    Ok(Some(b))
+    for item in scan_frames(&rest).items {
+        let ScanItem::Record(r) = item else {
+            continue;
+        };
+        let (off, len) = (r.offset as usize, r.frame_len as usize);
+        let Some(bytes) = rest.get(off..off.saturating_add(len)) else {
+            break;
+        };
+        if let Step::Stop = visit(bytes, r.record)? {
+            break;
+        }
+    }
+    Ok(true)
 }
 
-fn records_of(bytes: &[u8]) -> impl Iterator<Item = (usize, usize, Record)> + '_ {
-    scan_frames(bytes)
-        .items
-        .into_iter()
-        .filter_map(|i| match i {
-            ScanItem::Record(r) => Some((r.offset as usize, r.frame_len as usize, r.record)),
-            ScanItem::Malformed { .. } => None,
-        })
+/// The first record of segment `p`, if it has a decodable one.
+fn first_record(p: &Path) -> Result<Option<Record>, Error> {
+    let Some(file) = open_segment(p)? else {
+        return Ok(None);
+    };
+    let mut fr = FrameReader::new(io::BufReader::new(&file));
+    Ok(match fr.next_frame()? {
+        FrameRead::Record(sr) => Some(sr.record),
+        _ => None,
+    })
+}
+
+/// The chain identity a Genesis or SegmentStart record states.
+fn stated_identity(r: &Record) -> Option<ChainIdentity> {
+    match r.kind {
+        RecordKind::Genesis => r.payload_json::<GenesisPayload>().map(|g| g.identity),
+        RecordKind::SegmentStart => r.payload_json::<SegmentStartPayload>().map(|s| s.identity),
+        _ => None,
+    }
 }
 
 /// Collect the records after the export cursor (see the module docs).
 /// `None`: nothing is pending. `cursor_key` checks the cursor's signature
 /// (the recorder's current key only); `authentic` checks record
 /// signatures.
+///
+/// The newest record must be signed by `cursor_key`'s key: if it is not,
+/// the recorder signs with another key now (`robodr-blackbox rotate` ran
+/// and this exporter still holds the old key), and exporting would only
+/// overwrite the cursor the rotation re-signed with one the recorder
+/// ignores. That is refused ([`Error::Config`]) before anything is written.
 pub fn collect_pending(
     dir: &Path,
     cursor_key: Authentic<'_>,
@@ -157,18 +237,31 @@ pub fn collect_pending(
 ) -> Result<Option<PendingExport>, Error> {
     let segs = list_segments(dir)?;
     // The current chain: the newest record's.
-    let mut chain: Option<Hash> = None;
+    let mut newest: Option<Record> = None;
     for (_, p) in segs.iter().rev() {
-        if let Some(b) = read_segment(p)? {
-            if let Some((_, _, r)) = records_of(&b).last() {
-                chain = Some(r.chain_id);
-                break;
-            }
+        for_each_record(p, &mut |_, r| {
+            newest = Some(r);
+            Ok(Step::Next)
+        })?;
+        if newest.is_some() {
+            break;
         }
     }
-    let Some(chain) = chain else {
+    let Some(newest) = newest else {
         return Ok(None);
     };
+    let chain = newest.chain_id;
+    if newest.compute_hash() == newest.hash
+        && !cursor_key(&signing_message(&newest.hash), &newest.sig)
+    {
+        return Err(Error::Config(format!(
+            "the newest record (seq {}) is not signed by --key: the recorder signs with \
+             another key now (rotated with `robodr-blackbox rotate`?). Export with the \
+             recorder's current key (and the retired public keys as --previous-keys); \
+             nothing was written and the export cursor is unchanged",
+            newest.seq
+        )));
+    }
     let mut cursor_rejected = None;
     let cursor = match read_state(dir, CURSOR_FILE)? {
         None => None,
@@ -196,61 +289,68 @@ pub fn collect_pending(
     let mut first: Option<(u64, Hash)> = None;
     let mut count = 0usize;
     let mut more = false;
-    'segments: for (_, p) in &segs {
-        let Some(bytes) = read_segment(p)? else {
-            // Dropped by retention since the listing: a break, unless
-            // nothing was collected yet.
-            if prev.is_some() {
-                break;
+    let mut done = false;
+    for (i, (_, p)) in segs.iter().enumerate() {
+        // A segment wholly before the cursor is skipped without reading it:
+        // the next segment of this chain starts at or before `from`. Its
+        // first record (a SegmentStart) states the identity too.
+        if prev.is_none() {
+            if let Some((_, next)) = segs.get(i + 1) {
+                if let Some(r) = first_record(next)? {
+                    if r.chain_id == chain && r.seq <= from {
+                        if identity.is_none() {
+                            identity = stated_identity(&r).filter(|i| i.chain_id() == chain);
+                        }
+                        continue;
+                    }
+                }
             }
-            continue;
-        };
-        for (off, len, r) in records_of(&bytes) {
+        }
+        let present = for_each_record(p, &mut |frame, r| {
             if r.chain_id != chain {
-                continue;
+                return Ok(Step::Next);
             }
             // The chain identity (needed for the bundle) from any
             // retained statement of it, wherever it is.
             if identity.is_none() {
-                let stated = match r.kind {
-                    RecordKind::Genesis => r.payload_json::<GenesisPayload>().map(|g| g.identity),
-                    RecordKind::SegmentStart => {
-                        r.payload_json::<SegmentStartPayload>().map(|s| s.identity)
-                    }
-                    _ => None,
-                };
-                identity = stated.filter(|i| i.chain_id() == chain);
+                identity = stated_identity(&r).filter(|i| i.chain_id() == chain);
             }
             if r.seq < from {
-                continue;
+                return Ok(Step::Next);
             }
             // Authentic, and linked to what came before.
             if r.compute_hash() != r.hash || !authentic(&signing_message(&r.hash), &r.sig) {
                 if prev.is_some() {
-                    break 'segments;
+                    done = true;
+                    return Ok(Step::Stop);
                 }
-                continue;
+                return Ok(Step::Next);
             }
             if let Some((ps, ph)) = prev {
                 if r.seq != ps.saturating_add(1) || r.prev_hash != ph {
-                    break 'segments;
+                    done = true;
+                    return Ok(Step::Stop);
                 }
             }
             if count == opts.max_records
-                || (count > 0 && frames.len() as u64 + len as u64 > opts.max_bytes)
+                || (count > 0 && frames.len() as u64 + frame.len() as u64 > opts.max_bytes)
             {
                 more = true;
-                break 'segments;
+                done = true;
+                return Ok(Step::Stop);
             }
-            let Some(frame) = bytes.get(off..off.saturating_add(len)) else {
-                break 'segments;
-            };
             frames.extend_from_slice(frame);
             if first.is_none() {
                 first = Some((r.seq, r.prev_hash));
             }
             prev = Some((r.seq, r.hash));
             count += 1;
+            Ok(Step::Next)
+        })?;
+        // Dropped by retention since the listing: a break, unless nothing
+        // was collected yet.
+        if done || (!present && prev.is_some()) {
+            break;
         }
     }
     let (Some((first_seq, first_prev)), Some((last_seq, last_hash))) = (first, prev) else {
@@ -351,8 +451,9 @@ pub fn write_bundle(out_dir: &Path, p: &PendingExport) -> io::Result<PathBuf> {
         Err(_) => {}
     }
     let res = (|| {
-        let mut f = o.open(&tmp)?;
-        f.write_all(&p.bundle.to_bytes())?;
+        let mut f = io::BufWriter::new(o.open(&tmp)?);
+        p.bundle.write_to(&mut f)?;
+        let f = f.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
         if fs::symlink_metadata(&path).is_ok() {
             return Err(io::Error::new(

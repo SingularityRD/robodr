@@ -110,15 +110,20 @@
 //!   `rbbx-<device>-<chain>-<first>-<last>.rbbx`), each written durably
 //!   before the cursor is advanced (signed with `--key`, the recorder's
 //!   current secret key; records signed by keys retired by a rotation need
-//!   `--previous-keys`). Each record's hash, signature and link are checked
+//!   `--previous-keys`; a `--key` that did not sign the newest record, a
+//!   key retired by `rotate`, is refused before anything is written).
+//!   Segments are streamed one frame at a time (memory follows
+//!   `--max-bytes`, not the segment size). Each record's hash, signature
+//!   and link are checked
 //!   first; a bundle stops at a break. With
 //!   `blackbox.retention.unexported_reserve_segments` the recorder keeps
 //!   segments this has not exported. Up to `--max-bundles` (default 64)
 //!   bundles of at most `--max-records` (100000) records / `--max-bytes`
 //!   (64 MiB) per run. It prints one line per bundle; records lost before
 //!   they were exported (a gap after the cursor) are reported and make the
-//!   run exit 1 after writing what is there. Packaged as
-//!   `robodr-blackbox-export.timer` (OPERATIONS 8.2).
+//!   run exit 1 after writing what is there. Example units (not installed
+//!   by the package): `packaging/systemd/blackbox-export/`
+//!   (OPERATIONS 8.2).
 //! - `backup` backs a unit up and restores it as OPERATIONS §14 says
 //!   (`robodr_blackbox::backup`): `create` archives the §14.1 "back up"
 //!   paths under `--root` (default `/`) into an `RBKUP001` archive

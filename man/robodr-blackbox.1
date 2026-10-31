@@ -263,8 +263,16 @@ At most
 .B \-\-max\-records
 (100000) records or
 .B \-\-max\-bytes
-(64 MiB) per run. Records lost before they were exported are reported and
-make the run exit 1 after writing what is there.
+(64 MiB) per run; segments are streamed one frame at a time, so memory
+follows
+.BR \-\-max\-bytes ,
+not the segment size. A
+.B \-\-key
+that did not sign the newest record (a key retired by
+.BR rotate )
+is refused (exit 2) before anything is written. Records lost before they
+were exported are reported and make the run exit 1 after writing what is
+there.
 .TP
 .B backup create
 Archive a unit's configuration, drop\-ins, anchor\-receiver state and a

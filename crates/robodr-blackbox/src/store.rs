@@ -3760,6 +3760,14 @@ impl Recorder {
     /// signed are retained. Verify across the rotation with a keyring that
     /// holds both keys.
     ///
+    /// The export cursor is re-signed under the new key. The rotation holds
+    /// the directory's `export.lock` (fails if an `outbox` exporter is
+    /// running) and first re-reads the cursor from disk, so a cursor an
+    /// exporter advanced since this recorder read it is the one re-signed
+    /// (never an older copy held in memory). Exporters must use the new key
+    /// afterwards: `outbox` refuses a key that did not sign the newest
+    /// record.
+    ///
     /// `new_verifier` is required when `new_signer` cannot verify its own
     /// signatures; it must match the signer and pass a self-test.
     pub fn rotate_key(
@@ -3818,6 +3826,13 @@ impl Recorder {
             Some(v) => v.key_fingerprint(v.key_id()),
             None => new_signer.public_fingerprint(),
         };
+        // An exporter beside the recorder (`outbox`, its own lock) may have
+        // advanced the cursor since this recorder read it: hold the export
+        // lock for the rotation (no exporter in between) and pick that
+        // cursor up while it still verifies under the old key, so the
+        // re-signed cursor below never moves back.
+        let _export_lock = lock_file(self.cfg.dir.join(crate::outbox::EXPORT_LOCK_FILE))?;
+        self.refresh_export_state();
         let from = ChainKey {
             key: KeyRef {
                 key_id: self.signer.key_id().to_string(),
