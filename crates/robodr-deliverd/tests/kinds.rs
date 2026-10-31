@@ -491,27 +491,29 @@ fn postinst_leaves_the_deliverd_restart_to_the_agent_under_its_marker() {
 fn a_deb_on_a_unit_without_dpkg_is_refused_as_deb_only() {
     let u = Unit::new("deb-on-rpm-host");
     // No dpkg_root(&u): <dpkg_root>/var/lib/dpkg/status does not exist.
+    // The staging directory exists (empty), so "nothing staged" below
+    // checks something.
+    let debs = u.cfg.state_dir.join("debs");
+    std::fs::create_dir_all(&debs).unwrap();
+    std::fs::set_permissions(&debs, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     let r = deb_rpk(&u, 1, b"!<arch>\nnot really a deb\n", false);
     let b = u.bundle(1, None, std::slice::from_ref(&r));
     u.pack("p1", 1, &[r], &[b]);
     let mut e = u.open();
     let reps = u.run(&mut e, 4);
     assert!(
-        reps.iter().any(|r| r
-            .refused
-            .iter()
-            .any(|x| x.contains("kind deb needs a Debian / Ubuntu unit")
-                && x.contains("RoboDR delivers no RPM packages"))),
+        reps.iter().any(|r| r.refused.iter().any(
+            |x| x.contains("kind deb needs a Debian / Ubuntu unit")
+                && x.contains("RoboDR delivers no RPM packages")
+                // A Debian unit with a wrong dpkg_root gets the same
+                // refusal: the reason names that possibility too.
+                && x.contains("install.dpkg_root")
+        )),
         "{reps:?}"
     );
     assert!(u.notes_of("robodr.deliver.activating").is_empty());
     // Nothing staged.
-    assert!(!u
-        .cfg
-        .state_dir
-        .join("debs")
-        .read_dir()
-        .is_ok_and(|mut d| d.next().is_some()));
+    assert_eq!(debs.read_dir().unwrap().count(), 0);
 }
 
 const RULES_OK: &str = r#"[[rules]]
