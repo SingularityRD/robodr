@@ -8,6 +8,8 @@
 >
 > *Corrected at `a28163b` (2026-10-31) without re-verifying the rest of the document:* the fuzz target counts (41) and the SI row on unsafe-code lints, now checked by `scripts/check-doc-facts.py`.
 >
+> *Corrected after `380c482` (2026-10-31), again without re-verifying the rest:* the SI row on unsafe-code lints (27 of 27 binary roots forbid it; where the local allows sit).
+>
 > | Practice | Name |
 > |---|---|
 > | SM | security management |
@@ -94,7 +96,7 @@ now an item of the release checklist ([`docs/RELEASE.md`](../RELEASE.md)
 | Evidence | Where |
 |---|---|
 | `cargo clippy -D warnings`, `cargo fmt --check` in CI (pure and Pulsar jobs) | [`docs/BUILD.md`](../BUILD.md) "CI jobs" |
-| `#![forbid(unsafe_code)]` on 21 library crates; `deny(unsafe_code)` on 11 library crates (`robodr-agentd`, `robodr-blackbox`, `robodr-capture`, `robodr-deliverd`, `robodr-depot`, `robodr-diode`, `robodr-executor`, `robodr-export`, `robodr-firewall-gw`, `robodr-fleet`, `robodr-ros2-pipeline`), where each `unsafe` block (FFI calls, plus one call of the `unsafe fn` `zeroize::zeroize_flat_type`) carries a local `#[allow(unsafe_code)]` and a `SAFETY` comment, and all of them but the executor also deny `unsafe_op_in_unsafe_fn`. `#![forbid(unsafe_code)]` on 25 of 27 binary roots: `robodr-deliverd`'s binary denies it, `robodr-seal`'s has no lint of its own (both `main`s only call their library). `scripts/check-doc-facts.py` (check `unsafe-lints`) checks these counts against the code | `c2800c8`, `2b8ab65`, `a4e0b4b`, `1de502d`; the crate roots |
+| `#![forbid(unsafe_code)]` on 21 library crates; `deny(unsafe_code)` on 11 library crates (`robodr-agentd`, `robodr-blackbox`, `robodr-capture`, `robodr-deliverd`, `robodr-depot`, `robodr-diode`, `robodr-executor`, `robodr-export`, `robodr-firewall-gw`, `robodr-fleet`, `robodr-ros2-pipeline`), where each function or module that holds `unsafe` code (FFI calls, plus one call of the `unsafe fn` `zeroize::zeroize_flat_type`) carries a local `#[allow(unsafe_code)]` (the allow sits on the item, so one allow can cover several blocks, as in the netlink `socket` modules of `robodr-firewall-gw`), each `unsafe` block has a `SAFETY` comment, and all of them but the executor also deny `unsafe_op_in_unsafe_fn`. `#![forbid(unsafe_code)]` on 27 of 27 binary roots. `scripts/check-doc-facts.py` (check `unsafe-lints`) checks these counts against the code; it reads only the crate-level lint lines of library and binary roots (a root that also allows `unsafe_code` crate-wide counts as neither) and does not check examples, tests or benches | `c2800c8`, `2b8ab65`, `a4e0b4b`, `1de502d`; the crate roots |
 | Panic-family calls (`unwrap`, `expect`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`) denied by clippy in non-test code of the daemon crates, executor, gateway and fleet | `7637f9d`, `2b8ab65`, `a4e0b4b`, `1de502d` |
 | `clippy::indexing_slicing` denied in non-test code of `robodr-agentd`, `-executor`, `-export`, `-firewall-gw`, `-deliverd` and the parsers they run on untrusted input (`-rtps`, `-capture`, `-cdr`, `-pkg`, `-ros2-pipeline`); about 530 sites rewritten to checked access | merge `20ad170` |
 | Audited crypto: `ed25519-dalek` (strict), rustls + ring, `sha2` (HMAC as RFC 2104 over it) with `subtle` and `zeroize`, proven byte-identical to the replaced code by differential tests | [ADR-0007](../adr/0007-audited-libraries.md); `86e70e7`; `crates/robodr-blackbox/tests/crypto_differential.rs` |

@@ -2,7 +2,7 @@
 //! `robodr_deliverd::cli::USAGE`). Exit codes: 0 ok, 1 refused or error,
 //! 2 usage.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 

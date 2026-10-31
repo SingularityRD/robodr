@@ -130,7 +130,8 @@ jobs:
         run: python3 scripts/check-detection-catalog.py
       - name: Document facts in step with the code
         # Contract version, workspace members, fuzz targets, action catalog,
-        # "Verified at commit" stamps, evidence links, Pulsar pin.
+        # unsafe-code lints, "Verified at commit" stamps, evidence links,
+        # Pulsar pin.
         run: python3 scripts/check-doc-facts.py
       - name: Package variants consistent (programs, workflows, maintainer scripts)
         # Every robodr-* program classified per package variant, every

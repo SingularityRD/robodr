@@ -14,6 +14,8 @@
 >
 > *Corrected at `a28163b` (2026-10-31) without re-verifying the rest of the document:* the fuzz target count (41) and GRC-05 (now Partial).
 >
+> *Corrected after `380c482` (2026-10-31), again without re-verifying the rest:* GRC-05 (the script now runs in CI and reports no drift).
+>
 > **Before sending to a customer:** re-run the check script, restamp, have
 > the product owner confirm every "Organisation" answer, and remove
 > anything the customer's NDA does not cover. This file is not legal
@@ -48,7 +50,7 @@
 | GRC-02 | Is the organisation certified (ISO/IEC 27001, SOC 2, IEC 62443-4-1)? | No | No certification. IEC 62443-4-1 / 4-2 self-assessments exist; certification is a post-GA goal. | [4-1 evidence](iec-62443-4-1-sdl-evidence.md), [4-2 gap analysis](iec-62443-4-2-gap-analysis.md) |
 | GRC-03 | Is there a product risk assessment / threat model, reviewed regularly? | Partial | Consolidated threat model with STRIDE per trust boundary, residual risks and SL-C targets; reviewed per release (checklist). Not yet reviewed by an independent human. | [threat-model.md](threat-model.md) |
 | GRC-04 | How do you track regulatory obligations (EU CRA, NIS2 customers)? | Partial | CRA readiness check with open actions; product category and conformity route await legal (CRA-1). | [cra-readiness.md](cra-readiness.md) |
-| GRC-05 | Are security documents kept current? | Partial | Compliance documents carry a "Verified at commit" stamp; a script checks stamps, counts, the action catalog, the unsafe-code lints and evidence links against the code. The script still reports drift in other documents (README, BUILD, fuzz and executor READMEs) and does not run in CI yet, so nothing stops a merge that makes a document stale; a stamp is a manual re-verification, not a guarantee. | `scripts/check-doc-facts.py` |
+| GRC-05 | Are security documents kept current? | Partial | Compliance documents carry a "Verified at commit" stamp; a script checks stamps, counts, the action catalog, the unsafe-code lints and evidence links against the code. The script runs in the CI `scripts` job and reports no drift at the time of writing; whether a red job blocks a merge depends on the repository's branch protection, which is set on GitHub, not in the repository. It checks only those facts: the stamps themselves are manual re-verifications, not a guarantee, and are well over 100 code commits old. | `scripts/check-doc-facts.py` |
 | GRC-06 | Is there a functional-safety position? | Yes | RoboDR is a cybersecurity component, not safety-rated; integrator obligations listed. | [safety-positioning.md](safety-positioning.md) |
 
 ## 3. Human resources and awareness (organisation)
