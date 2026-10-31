@@ -22,7 +22,9 @@ use robodr_ocsf::builder::{
     CATALOG_1_3_MINOR, CATALOG_2_1_MINOR, CATALOG_2_2_MINOR, CATALOG_2_3_MINOR, CATALOG_2_4_MINOR,
     CATALOG_2_5_MINOR,
 };
-use robodr_ocsf::{rule_info, rule_info_for_contract, RuleInfo, CONTRACT_VERSION};
+use robodr_ocsf::{
+    rule_info, rule_info_for_contract, RuleInfo, CONTRACT_VERSION, HOST_THREAT_FALLBACK,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -153,8 +155,26 @@ fn host_rules(text: &str) -> Vec<HostRule> {
     out
 }
 
+/// Every rule id with a catalog entry: the literal match arms and, since
+/// contract 2.5, one id per shipped Pulsar rule (`HOST_RULES`, which the
+/// catalog reads through `host_rule_title` rather than a match arm).
+fn page_rule_ids() -> Vec<String> {
+    let mut ids = catalog_ids::catalog_rule_ids();
+    for (_, id) in robodr_ocsf::HOST_RULES {
+        assert_ne!(
+            rule_info(id),
+            generic(),
+            "{id} is in HOST_RULES but has no catalog entry"
+        );
+        ids.push((*id).to_string());
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 fn render() -> String {
-    let ids = catalog_ids::catalog_rule_ids();
+    let ids = page_rule_ids();
     let table = attack_table();
     let prefixes = catalog_ids::catalog_prefix_arms();
     let mut families: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -174,8 +194,10 @@ fn render() -> String {
     );
     o.push_str("# RoboDR detection catalog\n\n");
     o.push_str(&format!(
-        "Every detection RoboDR can report, as the robot sends it in the `robodr.findings` \
-         contract {CONTRACT_VERSION} (`docs/contracts/robodr.findings.md`). Generated from the \
+        "Every rule id the trusted catalog of the `robodr.findings` contract \
+         {CONTRACT_VERSION} (`docs/contracts/robodr.findings.md`) defines, as the robot sends \
+         it. A few ids are catalogued before a sensor emits them; the customer guide names \
+         them. Generated from the \
          trusted rule catalog the sensor uses to write each finding's `title`, `description`, \
          `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, \
          so this page and the findings cannot disagree: a test fails when they do.\n\n\
@@ -258,8 +280,11 @@ fn render() -> String {
     o.push_str(
         "\n## Host rules (Pulsar)\n\n\
          Runtime-security rules RoboDR ships for the Pulsar engine on the robot controller \
-         (`rules/robodr/*.toml`). Each match is reported as `robot.host.pulsar_threat` with \
-         the rule name in the finding's detail.\n",
+         (`rules/robodr/*.toml`). Since contract 2.5 each shipped rule is reported under its \
+         own rule id (the **Rule id** column; the `robot.host.*` family above), with the \
+         process in the finding's detail. A Pulsar rule RoboDR does not ship (a deployment's \
+         own rule, for example) is reported as `robot.host.pulsar_threat` with the rule name \
+         in the detail.\n",
     );
     let dir = root().join("rules/robodr");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -274,12 +299,14 @@ fn render() -> String {
         total += rules.len();
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         o.push_str(&format!(
-            "\n### {name} ({})\n\n| Rule | Event | Category | Severity |\n|---|---|---|---|\n",
+            "\n### {name} ({})\n\n| Rule | Rule id | Event | Category | Severity |\n\
+             |---|---|---|---|---|\n",
             rules.len()
         ));
         for r in rules {
+            let id = robodr_ocsf::host_rule_id(&r.name).unwrap_or(HOST_THREAT_FALLBACK);
             o.push_str(&format!(
-                "| {} | `{}` | {} | {} |\n",
+                "| {} | `{id}` | `{}` | {} | {} |\n",
                 cell(&r.name),
                 r.event,
                 cell(&r.category),
@@ -364,4 +391,23 @@ fn host_rule_reader_parses_fields() {
     assert_eq!(rules[0].name, "A \"q\"");
     assert_eq!(rules[1].event, "FileOpened");
     assert_eq!(rules[1].severity, "low");
+}
+
+#[test]
+fn host_rule_ids_are_in_the_catalog_page() {
+    // Since contract 2.5 every shipped Pulsar rule has its own rule id
+    // (HOST_RULES); the page must list each one and must not say that every
+    // host match is reported as the fallback id.
+    let page = render();
+    for (name, id) in robodr_ocsf::HOST_RULES {
+        assert!(
+            page.contains(&format!("| `{id}` | ")),
+            "{id} has no row in the catalog page"
+        );
+        assert!(
+            page.contains(&format!("| {} | `{id}` |", cell(name))),
+            "host rule {name:?} is not shown with its id {id}"
+        );
+    }
+    assert!(!page.contains("Each match is reported as `robot.host.pulsar_threat`"));
 }
