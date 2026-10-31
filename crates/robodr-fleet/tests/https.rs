@@ -510,6 +510,34 @@ fn crl_files_refuse_a_revoked_soc_server() {
     .is_err());
 }
 
+/// T6: `robodr-enroll check` prints the days left on each CRL in use
+/// (`soc.crl_files`).
+#[test]
+fn cli_check_reports_crl_expiry() {
+    let good = serve_as(live_soc(), "fx/crl-server");
+    let u = Unit::new("cli-check-crl");
+    let crl = u.root.join("crl-ca.crl.pem");
+    for (from, to) in [
+        ("fx/crl-ca.pem", &u.cfg.ca_bundle),
+        ("fx/crl-ca.crl.pem", &crl),
+    ] {
+        std::fs::copy(tls_data(from), to).unwrap();
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let cfgf = u.config_file(Some(&good.url()));
+    let mut j: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfgf).unwrap()).unwrap();
+    j["soc"]["crl_files"] = serde_json::json!([crl]);
+    std::fs::write(&cfgf, j.to_string()).unwrap();
+    let o = run(&["check", "--config", cfgf.to_str().unwrap()]);
+    assert_eq!(code(&o), 0, "{}", txt(&o));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("ok   crl:") && l.contains(" expires in ")),
+        "{out}"
+    );
+}
+
 /// `robodr-enroll check` (site acceptance): read-only, exit 0 when TLS,
 /// the fleet API and request authentication work; exit 3 for a SOC that
 /// TLS refuses; exit 1 for a SOC key that does not verify. Then
