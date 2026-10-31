@@ -324,6 +324,41 @@ fn fragmented_runs_replay_clean_with_one_low_finding_per_host() {
     }
 }
 
+/// Review 2, H1: the reassembler marks a sample whose fragment copies
+/// disagreed as contested (an enforcement point then refuses to relax
+/// anything for it). Honest stacks never send disagreeing copies: both
+/// vendors' fragmented runs, Cyclone's resends of a fragment to one reader
+/// included, complete with no conflict and nothing contested.
+#[test]
+fn honest_fragmented_discovery_is_never_contested() {
+    for v in VENDORS {
+        for run in ["run1", "run2"] {
+            let file = format!("{v}_frag_{run}.pcap");
+            let bytes = std::fs::read(fixture(&file)).unwrap();
+            let mut src = CaptureDatagramSource::new(
+                CaptureFile::new(&bytes[..]).unwrap(),
+                robodr_ros2_pipeline::source::rtps_filter(RtpsPortMap::ros2_default()),
+            );
+            let mut reasm = robodr_rtps::FragmentReassembler::new(ReassemblyLimits::default());
+            let (mut fragmented, mut contested) = (0usize, 0usize);
+            while let Some(d) = src.recv().unwrap() {
+                let Some(r) = reasm.parse_datagram_detailed(&d.payload) else {
+                    continue;
+                };
+                fragmented += r.endpoints.iter().filter(|e| e.from_fragments).count();
+                contested += r.endpoints.iter().filter(|e| e.contested).count()
+                    + r.removed_endpoints.iter().filter(|e| e.contested).count()
+                    + r.removed_participants
+                        .iter()
+                        .filter(|e| e.contested)
+                        .count();
+            }
+            assert!(fragmented > 50, "{file}: {fragmented}");
+            assert_eq!((contested, reasm.conflicts()), (0, 0), "{file}");
+        }
+    }
+}
+
 #[test]
 fn the_old_reassembly_quota_lost_cyclone_sedp_bursts() {
     // Evidence for the raised defaults: with the previous caps (16 pending,

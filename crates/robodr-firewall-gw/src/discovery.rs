@@ -18,11 +18,26 @@
 //!   been idle for at least `rtps.enforced_idle_evict_s` (`enforced_evicted`;
 //!   DDS writer GUIDs change with every controller restart, so stale ones
 //!   pile up). Otherwise the new writer is refused (`enforced_refused`, a
-//!   gateway finding) and stays unknown, so its samples are probed. A full
-//!   table stays full, so an evicted writer's next samples are probed too
-//!   (also with `unknown_writers: pass`), never passed unchecked.
-//!   Other writers live in a least-recently-used table (`rtps.max_writers`):
-//!   evicting one only makes it unknown again.
+//!   gateway finding) and stays unknown, so its samples are probed. An
+//!   evicted writer is **remembered as a suspect** (gateway review 2, H2):
+//!   a later announcement of its GUID on another topic (which anyone can
+//!   send, under any header prefix) is ignored (`suspect_kept`), so it
+//!   stays unknown and its samples are probed, whatever
+//!   `rtps.unknown_writers` says (an unprobeable one is suppressed); only an
+//!   announcement on an enforced topic takes it back into the enforced
+//!   table. The suspect memory holds four times the enforced table; while
+//!   it is full no enforced writer is evicted (fail closed: the new
+//!   enforced writer is refused instead). Other writers live in a
+//!   least-recently-used table (`rtps.max_writers`): evicting one only
+//!   makes it unknown again.
+//! - **Contested announcements** (gateway review 2, H1): an announcement
+//!   or removal reassembled from DATA_FRAG copies that disagreed
+//!   (`EndpointInfo::contested`) may not be what the robot completed (it
+//!   drops a copy addressed elsewhere and may keep another one). Its
+//!   enforced readings are enforced (whatever its INFO_DST); its other
+//!   writers are never learned as not enforced: they are forgotten if
+//!   known and remembered as suspects (`contested`). A contested removal
+//!   is ignored.
 //! - **INFO_DST is obeyed**: a robot drops a submessage addressed (INFO_DST)
 //!   to another participant, so an announcement or removal addressed to
 //!   anyone but the robot's participants (learned from the robot's own
@@ -125,6 +140,12 @@ pub struct Discovery {
     types: Vec<&'static str>,
     /// The robot's participant prefixes (most recent last).
     robot_prefixes: VecDeque<GuidPrefix>,
+    /// Suspect writers (module docs): evicted enforced writers and writers
+    /// of contested announcements, with their insertion order. Never
+    /// learned as not enforced; their samples are always probed. Bounded
+    /// by [`SUSPECTS_PER_ENFORCED`] times the enforced table.
+    suspects: HashMap<Guid, u64>,
+    suspect_seq: u64,
     reasm: FragmentReassembler,
     identities: IdentityResolver,
     /// Bumped whenever identities change, so cached source resolutions are
@@ -183,8 +204,15 @@ pub struct DiscoveryStats {
     /// Removals, or announcements on another topic, of a writer ever
     /// classified as enforced: the classification was kept.
     pub enforced_kept: u64,
-    /// New enforced writers refused because the enforced table was full.
+    /// New enforced writers refused because the enforced table was full
+    /// (and no writer in it idle long enough, or the suspect memory full).
     pub enforced_refused: u64,
+    /// Not-enforced announcements of a suspect writer (evicted from the
+    /// enforced table, or contested) ignored: it stays unknown and probed.
+    pub suspect_kept: u64,
+    /// Announcements and removals reassembled from disagreeing DATA_FRAG
+    /// copies: enforced readings applied, nothing else learned or removed.
+    pub contested: u64,
     /// Enforced writers idle for `rtps.enforced_idle_evict_s` or more that
     /// a new enforced writer replaced in the full table.
     pub enforced_evicted: u64,
@@ -203,11 +231,19 @@ struct StateFile {
     /// v2: not-enforced writers announced under an unverified INFO_DST.
     #[serde(default)]
     unverified: Vec<String>,
+    /// v3: suspect writers (evicted from the enforced table, or announced
+    /// in a contested sample), oldest first.
+    #[serde(default)]
+    suspects: Vec<String>,
 }
 
-const STATE_FORMAT: &str = "robodr-firewall-gw-writers/v2";
+const STATE_FORMAT: &str = "robodr-firewall-gw-writers/v3";
+/// Still read (no `suspects` list).
+const STATE_FORMAT_V2: &str = "robodr-firewall-gw-writers/v2";
 /// Still read (it has no `same_type` / `unverified` lists).
 const STATE_FORMAT_V1: &str = "robodr-firewall-gw-writers/v1";
+/// Suspect writers remembered per enforced-table entry.
+pub const SUSPECTS_PER_ENFORCED: usize = 4;
 /// Largest state file read.
 const MAX_STATE_BYTES: u64 = 4 << 20;
 /// `O_NOFOLLOW` (Linux; differs between architectures).
@@ -284,6 +320,8 @@ impl Discovery {
             topics,
             types: Vec::new(),
             robot_prefixes: VecDeque::new(),
+            suspects: HashMap::new(),
+            suspect_seq: 0,
             reasm: FragmentReassembler::new(ReassemblyLimits::default()),
             identities,
             epoch: 0,
@@ -476,16 +514,22 @@ impl Discovery {
             return false;
         }
         self.enforced.insert(guid, (channel, now));
+        self.suspects.remove(&guid);
         self.dirty = true;
         true
     }
 
     /// Remove the enforced writer seen longest ago if it has been idle for
-    /// `enforced_idle_evict` or more. `false`: none qualifies.
+    /// `enforced_idle_evict` or more, remembering it as a suspect. `false`:
+    /// none qualifies, or the suspect memory is full (fail closed: the
+    /// evicted writer could not be remembered).
     fn evict_idle_enforced(&mut self) -> bool {
         let Some(idle) = self.enforced_idle_evict else {
             return false;
         };
+        if self.suspects_full() {
+            return false;
+        }
         let Some((&oldest, &(_, seen))) = self
             .enforced
             .iter()
@@ -497,9 +541,36 @@ impl Discovery {
             return false;
         }
         self.enforced.remove(&oldest);
+        self.add_suspect(oldest);
         self.stats.enforced_evicted += 1;
         self.dirty = true;
         true
+    }
+
+    fn suspects_full(&self) -> bool {
+        self.suspects.len() >= self.max_enforced.saturating_mul(SUSPECTS_PER_ENFORCED)
+    }
+
+    /// Remember `guid` as a suspect (module docs); nothing when the memory
+    /// is full (it is then simply unknown).
+    fn add_suspect(&mut self, guid: Guid) {
+        if self.suspects.contains_key(&guid) || self.suspects_full() {
+            return;
+        }
+        self.suspect_seq += 1;
+        self.suspects.insert(guid, self.suspect_seq);
+        self.dirty = true;
+    }
+
+    /// `guid` is a suspect writer (module docs): never learned as not
+    /// enforced, and its samples are always probed while it is unknown.
+    pub fn is_suspect(&self, guid: &Guid) -> bool {
+        self.suspects.contains_key(guid)
+    }
+
+    /// Suspect writers remembered.
+    pub fn suspects_len(&self) -> usize {
+        self.suspects.len()
     }
 
     /// The enforced table is full: a new enforced writer is admitted only
@@ -510,9 +581,15 @@ impl Discovery {
     }
 
     /// Record a not-enforced writer or a probe result (least recently used
-    /// table). An enforced writer is never downgraded by it.
+    /// table). An enforced writer is never downgraded by it, and a suspect
+    /// is never recorded as not enforced (a probe result naming a channel
+    /// is recorded).
     pub fn insert(&mut self, guid: Guid, info: WriterInfo) {
         if self.enforced.contains_key(&guid) {
+            return;
+        }
+        if info.channel.is_none() && self.suspects.contains_key(&guid) {
+            self.stats.suspect_kept += 1;
             return;
         }
         self.clock += 1;
@@ -653,7 +730,11 @@ impl Discovery {
         }
         for r in &report.removed_participants {
             // Only a removal the robot acts on, sent by the participant
-            // itself, forgets anything.
+            // itself, forgets anything; never a contested one.
+            if r.contested {
+                self.stats.contested += 1;
+                continue;
+            }
             if self.addressed(r.destination) != Addressed::Robot {
                 self.stats.misaddressed += 1;
                 continue;
@@ -693,7 +774,12 @@ impl Discovery {
                 continue;
             }
             let addressed = self.addressed(e.destination);
-            if addressed == Addressed::Elsewhere {
+            // A contested announcement may have reached the robot in
+            // another copy whatever the kept copy's INFO_DST: its enforced
+            // readings are applied, nothing else is learned (below).
+            if e.contested {
+                self.stats.contested += 1;
+            } else if addressed == Addressed::Elsewhere {
                 self.stats.misaddressed += 1;
                 continue;
             }
@@ -742,6 +828,19 @@ impl Discovery {
                         // Never downgraded (module docs).
                         self.stats.enforced_kept += 1;
                     }
+                    None if e.contested => {
+                        // The robot may have matched it on a motion topic:
+                        // unknown (probed), never not enforced.
+                        if self.forget_other(&guid) {
+                            self.stats.writers_removed += 1;
+                        }
+                        self.add_suspect(guid);
+                    }
+                    None if self.suspects.contains_key(&guid) => {
+                        // Once enforced (or contested): never downgraded
+                        // by an announcement anyone can send.
+                        self.stats.suspect_kept += 1;
+                    }
                     None if !own => self.stats.relayed_ignored += 1,
                     None => self.insert(
                         guid,
@@ -762,6 +861,10 @@ impl Discovery {
             let Some(g) = r.guid else {
                 continue;
             };
+            if r.contested {
+                self.stats.contested += 1;
+                continue;
+            }
             if self.addressed(r.destination) != Addressed::Robot {
                 self.stats.misaddressed += 1;
                 continue;
@@ -822,11 +925,15 @@ impl Discovery {
         writers.sort_unstable();
         same_type.sort_unstable();
         unverified.sort_unstable();
+        let mut suspects: Vec<(u64, String)> =
+            self.suspects.iter().map(|(g, n)| (*n, hex(g))).collect();
+        suspects.sort_unstable();
         let s = StateFile {
             format: STATE_FORMAT.to_string(),
             writers,
             same_type,
             unverified,
+            suspects: suspects.into_iter().map(|(_, g)| g).collect(),
         };
         let text = serde_json::to_string(&s).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("tmp");
@@ -902,11 +1009,17 @@ impl Discovery {
         }
         let s: StateFile =
             serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        if s.format != STATE_FORMAT && s.format != STATE_FORMAT_V1 {
+        if ![STATE_FORMAT, STATE_FORMAT_V2, STATE_FORMAT_V1].contains(&s.format.as_str()) {
             return Err(format!("{}: unknown format {:?}", path.display(), s.format));
         }
         let same_type: std::collections::HashSet<String> = s.same_type.into_iter().collect();
         let unverified: std::collections::HashSet<String> = s.unverified.into_iter().collect();
+        // Suspects first, so a not-enforced entry cannot shadow one.
+        for g in &s.suspects {
+            if let Some(guid) = unhex16(g) {
+                self.add_suspect(guid);
+            }
+        }
         let mut n = 0;
         for (g, topic) in s.writers {
             let Some(guid) = unhex16(&g) else {

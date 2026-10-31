@@ -2615,7 +2615,8 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `suppressed` growing while the controller runs normally | frames refused with nothing to emit: wrong `allowed_src_ips` / sources, a rate window that does not match the controller's loop, or an attack |
 | `rewrite_failed` > 0 | a limited / substitute frame could not be written and verified (suppressed instead): report it |
 | `late` > 0 | packets read more than `max_queue_delay_ns` after arrival: the box is overloaded or not running the unit's real-time priority (reported as `robot.gateway.overload`, at most once per `overload_interval_ms`) |
-| `overload.shed_total` > 0 | packets the kernel queued for the gateway but never delivered (gaps in the NFQUEUE packet ids): the gateway reads too slowly; dropped, or forwarded unchecked with `on_gateway_down: bypass` (also in `robot.gateway.overload`) |
+| `overload.shed_total` > 0 | packets the kernel queued for the gateway but never delivered (gaps in the NFQUEUE packet ids, plus the kernel's own queue-full drop counter, `overload.kernel_queue_dropped`): the gateway reads too slowly; dropped, or forwarded unchecked with `on_gateway_down: bypass` (also in `robot.gateway.overload`) |
+| `overload.kernel_queue_full_seen` > 0 | the kernel queue held `queue.max_len` packets at a housekeeping tick. With `on_gateway_down: bypass` the kernel forwards further packets **unchecked and counts them nowhere**; with `fail_closed` they are dropped and counted in `kernel_queue_dropped`. Raise `queue.max_len` or fix the overload. `overload.kernel_counters: false` means the kernel's counters could not be read: only id gaps are counted |
 | `undecidable`, `rtps_malformed`, `unsupported_sample` | malformed or fragmented motion traffic: misconfiguration or an attack |
 | `binding_conflicts` > 0 | the motion writer's GUID arrived from another source IP / MAC than the controller's stream: a spoofer on the controller segment (or a second NIC sending the controller's traffic) |
 | `sn_jumps` > 0 | a sequence-number jump past `rtps.max_sn_jump` was held back: lost frames between controller and gateway, or a spoofed far-future number |
@@ -2625,6 +2626,9 @@ lines, size-capped by `events_max_bytes`). Watch in particular:
 | `velocity_expired` | a loco `SetVelocity` ended (the robot stopped on its own): informational |
 | `observe_unavailable`, `observe_overruns` | robot-side observation is off (no `rt/lowstate`, no robot-side locator check) / copies lost under load |
 | `unknown_undecidable` > 0 | a fragmented / key-only / non-standard sample from a writer the gateway never saw announced was removed: a discovery path around the bridge, a missing `rtps.state_file`, or an attack |
+| `unenforced_undecidable` > 0 | the same from a writer SEDP announced on a topic no channel enforces (`rtps.unenforced_unprobeable: suppress`, default): a controller-side writer of large non-motion samples (decide whether that topic must reach the robot; `pass` forwards such samples unchecked), or a motion writer hidden behind another topic |
+| discovery `contested` > 0 | an SEDP / SPDP sample whose DATA_FRAG copies disagreed (one copy addressed to another participant, another to everyone): honest DDS stacks do not send that; its writers stay enforced or unknown (probed). Investigate the sender |
+| discovery `suspect_kept` > 0 | an announcement on another topic of a writer once enforced (evicted from the full table) or contested was ignored: a GUID re-labelled by anyone on the segment. A legitimate writer re-announced like that stays probed until announced on its enforced topic again |
 | `non_motor_rejected` > 0 | a `LowCmd_` asked to turn the battery off (`bms_cmd.off`) and was replaced by the substitute: investigate the sender |
 | firewall `joint_holds_exceeded` | a humanoid has been held past `max_hold_ns`: escalate (the gateway keeps holding) |
 

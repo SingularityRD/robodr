@@ -124,7 +124,13 @@
   overloaded host a frame decided late gets the fail-safe verdict (seen
   on a shared VM in the lab soak); the gateway reports such frames as
   `robot.gateway.overload` (Medium, High from `overload_high_late` late or
-  shed frames in one interval), at most once per `overload_interval_ms`. It
+  shed frames in one interval), at most once per `overload_interval_ms`.
+  Shed frames are those the kernel dropped before the gateway saw them
+  (counted from packet-id gaps and the kernel's queue-full counter). With
+  `on_gateway_down: bypass`, frames the kernel forwards because the queue
+  is full are **not counted**: the kernel keeps no counter for them, and
+  the gateway only notes that it found the queue full
+  (`overload.kernel_queue_full_seen`). It
   has not run on a robot, a real Cyclone DDS stack or a
   real sensor box. Start in `mode: observe`.
 - **Humanoids and other balancing robots:** RoboDR never executes a pause

@@ -296,3 +296,61 @@ fn info_dst_destination_is_reported_on_announcements_and_removals() {
     assert_eq!(r.removed_endpoints[1].destination, GUIDPREFIX_UNKNOWN);
     assert_eq!(r.endpoints[1].destination, GUIDPREFIX_UNKNOWN);
 }
+
+/// Review 2, H1: fragment 1 of an SEDP announcement addressed (INFO_DST)
+/// to another participant naming a harmless topic, then fragment 1 to
+/// everyone naming the motion topic, then fragment 2. A robot drops the
+/// first copy and completes the sample from the second; the reassembler
+/// keeps the first. The decoded announcement must not claim to be
+/// everyone's and must say it is contested; a later conflicting copy of
+/// a completed sample re-reports it contested.
+#[test]
+fn contested_fragmented_announcement_is_not_everyones() {
+    const ELSEWHERE: [u8; 12] = [0x5e; 12];
+    let g = guid_of(ATT, ROGUE_ENT);
+    let harmless = sedp_payload(true, g, "rt/fooxyz", "T");
+    let motion = sedp_payload(true, g, "rt/lowcmd", "T");
+    assert_eq!(harmless.len(), motion.len());
+    let last_diff = (0..harmless.len())
+        .rev()
+        .find(|&i| harmless[i] != motion[i])
+        .unwrap();
+    let fs = (last_diff + 1).div_ceil(4) * 4;
+    assert!(fs < harmless.len(), "the topic sits in fragment 1");
+    let n = harmless.len() as u32;
+    let f1 = |p: &[u8]| data_frag(true, PUB, 1, 1, 1, fs as u16, n, None, &p[..fs]);
+    let f2 = data_frag(true, PUB, 1, 2, 1, fs as u16, n, None, &harmless[fs..]);
+
+    let mut reasm = FragmentReassembler::new(ReassemblyLimits::default());
+    let r1 = reasm
+        .parse_datagram_detailed(&dg(ATT, &[info_dst(true, ELSEWHERE), f1(&harmless)]))
+        .unwrap();
+    assert!(r1.endpoints.is_empty());
+    reasm
+        .parse_datagram_detailed(&dg(ATT, &[f1(&motion)]))
+        .unwrap();
+    let r3 = reasm
+        .parse_datagram_detailed(&dg(ATT, std::slice::from_ref(&f2)))
+        .unwrap();
+    assert_eq!(r3.endpoints.len(), 1);
+    let e = &r3.endpoints[0];
+    assert_eq!(e.topic, "rt/fooxyz", "the first copy is kept");
+    assert_eq!(e.destination, ELSEWHERE, "kept bytes reached only it");
+    assert!(e.contested);
+
+    // An uncontested sample, then a conflicting late copy of fragment 1:
+    // the completed sample is reported again, contested.
+    let mut reasm = FragmentReassembler::new(ReassemblyLimits::default());
+    reasm
+        .parse_datagram_detailed(&dg(ATT, &[f1(&harmless)]))
+        .unwrap();
+    let done = reasm.parse_datagram_detailed(&dg(ATT, &[f2])).unwrap();
+    assert_eq!(done.endpoints.len(), 1);
+    assert!(!done.endpoints[0].contested);
+    let late = reasm
+        .parse_datagram_detailed(&dg(ATT, &[f1(&motion)]))
+        .unwrap();
+    assert_eq!(late.endpoints.len(), 1);
+    assert_eq!(late.endpoints[0].topic, "rt/fooxyz");
+    assert!(late.endpoints[0].contested);
+}

@@ -2415,6 +2415,7 @@ mod tests {
             type_names: vec!["t".into()],
             alternates: Vec::new(),
             from_fragments: false,
+            contested: false,
             unicast_locators: Vec::new(),
             multicast_locators: Vec::new(),
         }
@@ -2431,6 +2432,7 @@ mod tests {
             source,
             destination: [0; 12],
             status: robodr_rtps::StatusInfo { raw: [0, 0, 0, 3] },
+            contested: false,
         }
     }
 

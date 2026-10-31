@@ -92,6 +92,20 @@
 //! whose `sampleSize` / `fragmentSize` / key flag disagrees with the pending
 //! sample is refused on its own; the pending sample is left untouched.
 //!
+//! The completed sample is then **contested** ([`FragOutcome::Complete`]),
+//! and so is a sample a conflicting late copy arrives for
+//! ([`FragOutcome::LateConflict`]); the decoded announcements and removals
+//! carry it ([`crate::EndpointInfo::contested`]). Which copy a receiver
+//! keeps depends on which copies reached it: one addressed (INFO_DST) to
+//! another participant is dropped, so a receiver may complete the sample
+//! from the other copy (gateway review 2, H1: fragment 1 addressed
+//! elsewhere naming a harmless topic, then fragment 1 to everyone naming
+//! `rt/lowcmd`). What was decoded from the kept bytes is therefore not
+//! necessarily what every receiver saw; an enforcement point must not
+//! relax anything because of it. A copy that repeats the kept bytes
+//! exactly contests nothing: every receiver that took either copy holds
+//! the same bytes, so the destination of the completed sample counts it.
+//!
 //! # Copies of a completed sample
 //!
 //! A DDS writer sends one copy of a sample **per matched remote reader
@@ -301,13 +315,24 @@ pub(crate) enum FragOutcome {
     /// reached every receiver, the one receiver's prefix when the
     /// fragments missing from that were all addressed to it, otherwise
     /// [`DESTINATION_NO_SINGLE_RECEIVER`] (conservative: a fragment resent
-    /// to two readers makes the sample no single receiver's).
-    Complete(Vec<u8>, InlineQos, bool, [u8; 12]),
+    /// to two readers makes the sample no single receiver's); and whether
+    /// it is **contested**: two copies of one of its fragments carried
+    /// different bytes or inline QoS, so a receiver that dropped the copy
+    /// kept here (addressed elsewhere, or lost) may have completed the
+    /// sample with other content (module docs, "Overlaps").
+    Complete(Vec<u8>, InlineQos, bool, [u8; 12], bool),
     /// Refused (see the [`FragmentEvent`] pushed alongside).
     Rejected,
-    /// A fragment of a sample completed earlier (another reader's copy):
-    /// nothing new; any difference was reported as a conflict event.
+    /// A fragment of a sample completed earlier (another reader's copy)
+    /// that repeats what was completed: nothing new.
     LateCopy,
+    /// A fragment of a sample completed earlier whose bytes, geometry or
+    /// inline QoS differ from what was completed (reported as a conflict
+    /// event too). The completed sample is returned again, as
+    /// [`FragOutcome::Complete`] would (always contested): a receiver that
+    /// never got the copy kept here completes the sample with this
+    /// fragment's content, so what was learned from it is in doubt.
+    LateConflict(Vec<u8>, InlineQos, bool, [u8; 12]),
 }
 
 /// A completed multi-fragment sample, kept to judge late copies.
@@ -318,6 +343,10 @@ struct Done {
     key_only: bool,
     inline: InlineQos,
     payload: Vec<u8>,
+    /// What [`FragOutcome::Complete`] reported (inline QoS readings and
+    /// destination), to report it again on a conflicting late copy.
+    reported_inline: InlineQos,
+    destination: [u8; 12],
 }
 
 struct Pending {
@@ -348,6 +377,8 @@ struct Pending {
     /// they went to more than one.
     to_one: Option<[u8; 12]>,
     to_several: bool,
+    /// Two copies of a fragment disagreed (bytes or inline QoS).
+    contested: bool,
 }
 
 impl Pending {
@@ -537,6 +568,9 @@ impl FragmentReassembler {
                 crate::wire::PID_KEY_HASH,
             ));
         }
+        if kinds.is_empty() {
+            return FragOutcome::LateCopy;
+        }
         for kind in kinds {
             self.conflicts += 1;
             events.push(FragmentEvent {
@@ -549,7 +583,12 @@ impl FragmentReassembler {
                 total_fragments: nfrags,
             });
         }
-        FragOutcome::LateCopy
+        FragOutcome::LateConflict(
+            d.payload.clone(),
+            d.reported_inline,
+            d.key_only,
+            d.destination,
+        )
     }
 
     fn remove(&mut self, i: usize) -> Pending {
@@ -698,7 +737,13 @@ impl FragmentReassembler {
                 // The whole sample in one submessage: complete it without
                 // touching the table, so it can neither evict nor be evicted.
                 self.completed += 1;
-                return FragOutcome::Complete(data.to_vec(), f.inline, f.key_only, f.destination);
+                return FragOutcome::Complete(
+                    data.to_vec(),
+                    f.inline,
+                    f.key_only,
+                    f.destination,
+                    false,
+                );
             }
             None => {
                 if self.limits.max_pending_samples == 0 || self.limits.max_pending_per_source == 0 {
@@ -731,6 +776,7 @@ impl FragmentReassembler {
                     to_every: vec![0; words],
                     to_one: None,
                     to_several: false,
+                    contested: false,
                 });
                 self.total += cost;
                 self.pending.len() - 1
@@ -747,19 +793,12 @@ impl FragmentReassembler {
         let mut progressed = false;
         let delivers_head = first == 0 && !p.has(0);
         let to_every = f.destination == crate::parse::GUIDPREFIX_UNKNOWN;
-        if !to_every {
-            match p.to_one {
-                None => p.to_one = Some(f.destination),
-                Some(d) if d != f.destination => p.to_several = true,
-                Some(_) => {}
-            }
-        }
+        // Destination bookkeeping counts only copies whose bytes are the
+        // kept ones (the copy that wrote them, or an exact repeat): a copy
+        // that disagrees says nothing about who holds the kept bytes, it
+        // contests the sample instead (gateway review 2, H1).
+        let mut agreed = false;
         for n in first..last {
-            if to_every {
-                if let Some(word) = p.to_every.get_mut(n / 64) {
-                    *word |= 1 << (n % 64);
-                }
-            }
             let lo = n * frag_size - offset;
             let hi = ((n + 1) * frag_size).min(sample_size) - offset;
             let have = p.has(n);
@@ -771,17 +810,33 @@ impl FragmentReassembler {
                 continue;
             };
             if have {
-                conflict |= src != &*dst;
-                continue;
+                if src != &*dst {
+                    conflict = true;
+                    continue;
+                }
+            } else {
+                let Some(word) = p.received.get_mut(n / 64) else {
+                    continue;
+                };
+                dst.copy_from_slice(src);
+                *word |= 1 << (n % 64);
+                p.got += 1;
+                p.got_bytes += hi - lo;
+                progressed = true;
             }
-            let Some(word) = p.received.get_mut(n / 64) else {
-                continue;
-            };
-            dst.copy_from_slice(src);
-            *word |= 1 << (n % 64);
-            p.got += 1;
-            p.got_bytes += hi - lo;
-            progressed = true;
+            agreed = true;
+            if to_every {
+                if let Some(word) = p.to_every.get_mut(n / 64) {
+                    *word |= 1 << (n % 64);
+                }
+            }
+        }
+        if agreed && !to_every {
+            match p.to_one {
+                None => p.to_one = Some(f.destination),
+                Some(d) if d != f.destination => p.to_several = true,
+                Some(_) => {}
+            }
         }
         if progressed {
             p.last_progress = clock;
@@ -821,6 +876,12 @@ impl FragmentReassembler {
         if delivers_head {
             p.head_inline = Some(f.inline);
         }
+        // A copy that disagrees with the kept one contests the sample: a
+        // receiver that dropped the kept copy (addressed elsewhere, or
+        // lost on its link) may complete the sample with this one.
+        if conflict || !qos_conflicts.is_empty() {
+            p.contested = true;
+        }
         let overlap = conflict.then(|| Self::event_for(p, FragmentEventKind::ConflictingOverlap));
         let qos = qos_conflicts
             .into_iter()
@@ -836,14 +897,6 @@ impl FragmentReassembler {
                 Some(h) => p.inline.with_reading(&h),
                 None => p.inline,
             };
-            self.remember(Done {
-                key: p.key,
-                sample_size: p.sample_size,
-                frag_size: p.frag_size,
-                key_only: p.key_only,
-                inline: p.inline,
-                payload: p.buf.clone(),
-            });
             let every = (0..p.nfrags as usize).all(|n| {
                 p.to_every
                     .get(n / 64)
@@ -854,7 +907,17 @@ impl FragmentReassembler {
                 (false, Some(d), false) => d,
                 (false, Some(_), true) => DESTINATION_NO_SINGLE_RECEIVER,
             };
-            return FragOutcome::Complete(p.buf, inline, p.key_only, destination);
+            self.remember(Done {
+                key: p.key,
+                sample_size: p.sample_size,
+                frag_size: p.frag_size,
+                key_only: p.key_only,
+                inline: p.inline,
+                payload: p.buf.clone(),
+                reported_inline: inline,
+                destination,
+            });
+            return FragOutcome::Complete(p.buf, inline, p.key_only, destination, p.contested);
         }
         FragOutcome::Pending
     }
@@ -919,11 +982,15 @@ mod tests {
                 let hi = (lo + 100).min(250);
                 match add(&mut r, frag(1, i as u32 + 1, 1, 100, 250, &s[lo..hi])) {
                     FragOutcome::Pending => assert!(k < 2),
-                    FragOutcome::Complete(b, _, ko, _) => {
+                    FragOutcome::Complete(b, _, ko, _, _) => {
                         assert!(!ko);
                         done = Some(b)
                     }
-                    FragOutcome::Rejected | FragOutcome::LateCopy => panic!("rejected"),
+                    FragOutcome::Rejected
+                    | FragOutcome::LateCopy
+                    | FragOutcome::LateConflict(..) => {
+                        panic!("rejected")
+                    }
                 }
             }
             assert_eq!(done.as_deref(), Some(&s[..]));
@@ -945,7 +1012,7 @@ mod tests {
         d = s[8..].to_vec();
         d.extend_from_slice(&[0, 0]); // submessage padding past the sample end
         match add(&mut r, frag(1, 3, 1, 4, 10, &d)) {
-            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s),
+            FragOutcome::Complete(b, _, _, _, _) => assert_eq!(b, s),
             other => panic!("{other:?}"),
         }
     }
@@ -997,7 +1064,10 @@ mod tests {
         let mut both = b"EVIL".to_vec();
         both.extend_from_slice(&s[4..]);
         match r.add(frag(1, 1, 2, 4, 8, &both), &mut ev) {
-            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s, "first copy of fragment 1 kept"),
+            FragOutcome::Complete(b, _, _, _, contested) => {
+                assert_eq!(b, s, "first copy of fragment 1 kept");
+                assert!(contested, "a receiver may have kept the other copy");
+            }
             other => panic!("{other:?}"),
         }
         assert_eq!(r.conflicts(), 2);
@@ -1129,16 +1199,20 @@ mod tests {
         assert!(ev.is_empty(), "{ev:?}");
         assert_eq!(r.pending_samples(), 0, "the late fragment starts nothing");
         assert_eq!((r.completed(), r.late_copies(), r.conflicts()), (1, 1, 0));
-        // A late copy with other bytes, geometry or status is a conflict.
-        assert!(matches!(
-            r.add(frag(1, 1, 1, 4, 8, &[9; 4]), &mut ev),
-            FragOutcome::LateCopy
-        ));
+        // A late copy with other bytes, geometry or status is a conflict:
+        // the completed sample comes back, contested.
+        match r.add(frag(1, 1, 1, 4, 8, &[9; 4]), &mut ev) {
+            FragOutcome::LateConflict(b, _, _, d) => {
+                assert_eq!(b, s, "the completed bytes, not the late copy's");
+                assert_eq!(d, [0; 12]);
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, FragmentEventKind::ConflictingOverlap);
         assert!(matches!(
             r.add(frag(1, 1, 1, 2, 8, &s[..2]), &mut ev),
-            FragOutcome::LateCopy
+            FragOutcome::LateConflict(..)
         ));
         assert_eq!(ev.len(), 2, "different fragment size");
         let mut alive = frag(2, 1, 1, 4, 8, &s[..4]);
@@ -1150,7 +1224,10 @@ mod tests {
         let mut late = frag(2, 2, 1, 4, 8, &s[4..]);
         late.inline.status = Some(crate::parse::StatusInfo { raw: [0, 0, 0, 3] });
         let n = ev.len();
-        r.add(late, &mut ev);
+        assert!(matches!(
+            r.add(late, &mut ev),
+            FragOutcome::LateConflict(..)
+        ));
         assert_eq!(
             ev[n..].iter().map(|e| e.kind).collect::<Vec<_>>(),
             [FragmentEventKind::ConflictingInlineQos(
@@ -1368,14 +1445,14 @@ mod tests {
         });
         let mut ev = Vec::new();
         match r.add(frag(1, 1, 1, 10, 10, &s), &mut ev) {
-            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s),
+            FragOutcome::Complete(b, _, _, _, _) => assert_eq!(b, s),
             other => panic!("{other:?}"),
         }
         // Several fragments of one sample in one submessage, plus padding.
         let mut padded = s.clone();
         padded.extend_from_slice(&[0; 3]);
         match r.add(frag(2, 1, 3, 4, 10, &padded), &mut ev) {
-            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s),
+            FragOutcome::Complete(b, _, _, _, _) => assert_eq!(b, s),
             other => panic!("{other:?}"),
         }
         let mut r = FragmentReassembler::new(ReassemblyLimits::default());
@@ -1425,7 +1502,7 @@ mod tests {
         let mut resent = frag(1, 2, 1, 100, 300, &s[100..200]);
         resent.destination = READER;
         match add(&mut r, resent) {
-            FragOutcome::Complete(b, _, _, d) => {
+            FragOutcome::Complete(b, _, _, d, _) => {
                 assert_eq!(b, s);
                 assert_eq!(d, READER);
             }
@@ -1448,7 +1525,7 @@ mod tests {
             FragOutcome::Pending
         ));
         match add(&mut r, frag(1, 2, 1, 100, 200, &s[100..])) {
-            FragOutcome::Complete(_, _, _, d) => assert_eq!(d, [0; 12]),
+            FragOutcome::Complete(_, _, _, d, _) => assert_eq!(d, [0; 12]),
             other => panic!("{other:?}"),
         }
         let mut a = frag(2, 1, 1, 100, 200, &s[..100]);
@@ -1457,8 +1534,79 @@ mod tests {
         b.destination = [0x43; 12];
         assert!(matches!(add(&mut r, a), FragOutcome::Pending));
         match add(&mut r, b) {
-            FragOutcome::Complete(_, _, _, d) => assert_eq!(d, DESTINATION_NO_SINGLE_RECEIVER),
+            FragOutcome::Complete(_, _, _, d, _) => assert_eq!(d, DESTINATION_NO_SINGLE_RECEIVER),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Gateway review 2, H1: fragment 1 addressed to another participant
+    /// (kept), then a different fragment 1 to everyone, then fragment 2.
+    /// A receiver that drops the first copy completes the sample from the
+    /// second; the reassembler keeps the first. The disagreeing copy does
+    /// not make the kept bytes everyone's: the sample is the other
+    /// participant's, and contested.
+    #[test]
+    fn a_disagreeing_copy_to_everyone_does_not_make_kept_bytes_everyones() {
+        const ELSEWHERE: [u8; 12] = [0x42; 12];
+        let s = sample(200);
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let mut ev = Vec::new();
+        let mut first = frag(1, 1, 1, 100, 200, &s[..100]);
+        first.destination = ELSEWHERE;
+        assert!(matches!(r.add(first, &mut ev), FragOutcome::Pending));
+        let other = [7u8; 100];
+        assert!(matches!(
+            r.add(frag(1, 1, 1, 100, 200, &other), &mut ev),
+            FragOutcome::Pending
+        ));
+        match r.add(frag(1, 2, 1, 100, 200, &s[100..]), &mut ev) {
+            FragOutcome::Complete(b, _, _, d, contested) => {
+                assert_eq!(b, s, "first copy kept");
+                assert_eq!(d, ELSEWHERE, "the kept fragment 1 reached only it");
+                assert!(contested);
+            }
+            other => panic!("{other:?}"),
+        }
+        // An exact repeat to everyone does make it everyone's, uncontested.
+        let mut first = frag(2, 1, 1, 100, 200, &s[..100]);
+        first.destination = ELSEWHERE;
+        assert!(matches!(r.add(first, &mut ev), FragOutcome::Pending));
+        assert!(matches!(
+            r.add(frag(2, 1, 1, 100, 200, &s[..100]), &mut ev),
+            FragOutcome::Pending
+        ));
+        match r.add(frag(2, 2, 1, 100, 200, &s[100..]), &mut ev) {
+            FragOutcome::Complete(_, _, _, d, contested) => {
+                assert_eq!(d, [0; 12]);
+                assert!(!contested);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A fragment resent to one reader that repeats the multicast bytes
+    /// (Cyclone answering a NACK_FRAG) contests nothing.
+    #[test]
+    fn an_identical_resend_to_one_reader_is_not_contested() {
+        const READER: [u8; 12] = [0x42; 12];
+        let s = sample(200);
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        assert!(matches!(
+            add(&mut r, frag(1, 1, 1, 100, 200, &s[..100])),
+            FragOutcome::Pending
+        ));
+        let mut resent = frag(1, 1, 1, 100, 200, &s[..100]);
+        resent.destination = READER;
+        assert!(matches!(add(&mut r, resent), FragOutcome::Pending));
+        match add(&mut r, frag(1, 2, 1, 100, 200, &s[100..])) {
+            FragOutcome::Complete(_, _, _, d, contested) => {
+                assert_eq!(d, [0; 12]);
+                assert!(!contested);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut late = frag(1, 2, 1, 100, 200, &s[100..]);
+        late.destination = READER;
+        assert!(matches!(add(&mut r, late), FragOutcome::LateCopy));
     }
 }
