@@ -1575,17 +1575,28 @@ sudo systemctl restart robodr-agentd
   workers behind one NAT address at their per-source share cut their own.
   With `soc_sources` nothing is cut by age unless you set
   `pre_auth_evict_after_ms`; `0` turns it off without `soc_sources` too.
-  Keep the `IPAddressAllow=` drop-in (§6.4) as well: it stops unlisted
-  peers before agentd sees them.
+  The trade-off for clients **outside** `soc_sources` (another SOC
+  worker, a monitoring probe): with nothing cut by age, a slowloris holds
+  every general slot for the full 5 s handshake deadline and reopens, so
+  every unlisted client is refused for as long as the attack lasts; list
+  every legitimate client network in `soc_sources`, or set
+  `pre_auth_evict_after_ms` to let some of them through at the cost
+  above. Keep the `IPAddressAllow=` drop-in (§6.4) as well: it stops
+  unlisted peers before agentd sees them.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
   `last_auth_failure`, `connections_rejected`, `connections_evicted`,
-  `recorded_not_executed`,
+  `fenced`, `recorded_not_executed`,
   `refused`, `busy`, `rate_limited`, `journal_errors`, `replay_fence`,
   `state.refusing_new_request_ids`, `evidence`) and the
   findings `robot.agent.control_plane_unauthenticated` (High: someone
-  without the certificate or the key is trying) and
+  without the certificate or the key is trying),
   `robot.agent.control_plane_invalid` (Medium: the SOC sent something the
-  API never allows). Each decision is a `robodr.control_plane_request` note
+  API never allows), `robot.agent.control_plane_saturated` (Medium:
+  connections refused or cut before they authenticated: a handshake flood
+  or slowloris, which a cut handshake does not count as an authentication
+  failure, or more clients than `max_connections`) and
+  `robot.agent.control_plane_request_fenced` (Low: correctly signed
+  requests refused by the replay fence after a restart; the SOC re-signs). Each decision is a `robodr.control_plane_request` note
   in the black box with the SOC's signature, which re-verifies offline.
 
 **Rotation (no downtime for the SOC).**
@@ -3472,6 +3483,8 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | SOC gets 401 `stale_timestamp` / `bad_signature` from the control plane | clocks apart, or the request was signed for another robot id / rewritten by a proxy | section 6.4 "Control-plane API": NTP on both sides; the SOC must sign the exact target and body it sends (mutual TLS ends at agentd: no proxy may rewrite them) |
 | every control-plane request `refused` `observe_mode` | profile not enforced or policy not OEM-validated | section 5; the API never acts beyond what the policy allows |
 | High `robot.agent.control_plane_unauthenticated` | requests without a valid SOC signature | check `status.json` `control_plane.last_auth_failure`; treat repeated ones as an attempt to reach the robot |
+| Medium `robot.agent.control_plane_saturated` | the control plane's TCP slots were full: connections refused (`connections_rejected`) or handshakes cut (`connections_evicted`) | sustained: a handshake flood or slowloris (check the source addresses at the firewall; `soc_sources` keeps the SOC's slot); otherwise more SOC clients than `max_connections` |
+| Low `robot.agent.control_plane_request_fenced` | requests signed before the replay fence set at start (the replay store was created, damaged or the clock went back) | expected right after such a start; the SOC signs again |
 | every finding `[observe-only]` | profile unlocked, missing or invalid | section 5 |
 | executor: request `failed` "executor unreachable" | `robodr-executor` not running, wrong `executor.socket`, or the two keys differ | section 6.5: `systemctl status robodr-executor`; the same `/etc/robodr/keys/executor.key` must reach both units |
 | executor: `refused` `safety_state_stale` / `safety_state_changed` | agentd's safety state was older than `max_safety_age_ms`, or changed between judgment and apply | expected during transitions; re-judge (submit a new request); check the safety feed if persistent |
