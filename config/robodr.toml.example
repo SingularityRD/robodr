@@ -48,10 +48,12 @@ rate_limit_burst = 20
 rate_limit_interval_ms = 6000
 # SROS 2 robots: the keystore's enclaves/ directory (only governance.xml and
 # the permissions.xml files are read, never keys). A participant announcing
-# no DDS-Security identity on a domain that requires one, or a certificate
-# subject no grant names, is reported (robot.ros2.untrusted_security_identity).
-# Check with: robodr-ros2-watch --check-config (it also says what the
-# governance leaves visible). See docs/DDS-TRANSPORTS.md.
+# no complete DDS-Security identity on a domain that requires one, or a
+# certificate subject no grant names, is reported
+# (robot.ros2.untrusted_security_identity). An unreadable keystore stops the
+# whole module (all DDS monitoring). Check with: robodr-ros2-watch
+# --check-config (it also says what the governance leaves visible). See
+# docs/DDS-TRANSPORTS.md.
 # sros2_keystore = "/etc/robodr/sros2/enclaves"
 
 # Passive capture: sees the unicast SEDP announcements (who writes which

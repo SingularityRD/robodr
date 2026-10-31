@@ -30,10 +30,15 @@ that and none of its commands is on the wire.
   kind 16, Connext `0x01000000`), or TCP / unknown locator kinds (RTPS over
   TCP is not decoded either). The detail names the host and the transports.
   Every Fast DDS participant with default transports raises it.
-- `robodr-ros2-watch --check-config /etc/robodr/pulsar.toml` (on the robot)
-  warns when `/dev/shm` holds DDS segments (`fastrtps_port<N>`,
-  `fastrtps_<hex>`, `fast_datasharing_*`, `iceoryx_mgmt`, `iox_*`) and when
-  the passive capture is enabled at all.
+- `robodr-ros2-watch --check-config /etc/robodr/pulsar.toml` warns when
+  `/dev/shm` of the host it runs on holds DDS segments (`fastrtps_port<N>`,
+  `fastrtps_<hex>`, `fast_datasharing_*`, `iceoryx_mgmt`, `iox_*`): run it
+  on the robot. With the passive capture enabled it also prints a `note:`
+  summary line that shared-memory transports are invisible (not a warning,
+  so `--strict` can pass).
+- The running daemon does not list `/dev/shm`, and `robodr-commission
+  learn` does not yet warn about shared-memory locators: only the SPDP
+  finding above and the check-config warning exist today.
 
 ### Commissioning prerequisite: UDP only
 
@@ -103,21 +108,33 @@ copy of those files is enough):
 sros2_keystore = "/etc/robodr/sros2/enclaves"
 ```
 
+The governance rule used is the first `domain_rule` whose `<domains>`
+covers the sensor's `domain_id`, as the DDS stack chooses it. If none covers
+it, all rules are combined (most protective) and check-config warns.
+
 Then:
 
-- a participant that announces **no DDS-Security identity** on a domain
-  whose governance refuses unauthenticated participants is
-  `robot.ros2.untrusted_security_identity` (Medium): the robot will not talk
-  to it, but it is on the robot's network;
 - a participant whose **certificate subject no grant names** is
   `robot.ros2.untrusted_security_identity` (High): a participant from
   another keystore or CA;
+- a participant without a **complete identity token** (class
+  `DDS:Auth:PKI-DH` with a certificate subject) on a domain whose governance
+  refuses unauthenticated participants is
+  `robot.ros2.untrusted_security_identity` (Medium): the robot will not talk
+  to it, but it is on the robot's network. This covers no DDS-Security
+  parameter at all and partial claims (only `PID_PARTICIPANT_SECURITY_INFO`,
+  only a permissions token, an identity token without a subject), which any
+  sender can add to its announcement;
 - `robodr-ros2-watch --check-config` lists the grants with the `rt/` topics
-  each may publish (profile input for the operator) and states what the
-  governance leaves visible.
+  each may publish (profile input for the operator) and prints what the
+  governance leaves visible as `note:` summary lines.
 
-A missing or unreadable keystore is a configuration error (the module does
-not start), like any other invalid value.
+A missing or unreadable keystore, or one without any grant, is a
+configuration error like any other invalid value: the **whole sensor
+module** does not start, so all DDS monitoring stops, not only the SROS 2
+check. Moving or rotating the keystore therefore needs the same care as
+the profile: update the files (or `sros2_keystore`), run
+`robodr-ros2-watch --check-config`, then restart.
 
 ### Limits
 
@@ -130,7 +147,13 @@ not start), like any other invalid value.
   in the handshake against the keystore is planned.
 - Identities of secured participants are bound by address and by the
   subject hash in their GUID prefix (`robodr-ros2-pipeline::identity`), not
-  by node names (those are in the encrypted discovery).
+  by node names (those are in the encrypted discovery). The hash is used
+  only when the SPDP's PKI-DH identity token claims the subject the prefix
+  is derived from (DDS-Security §9.3.3: SHA-256 of the subject's DER, which
+  the sensor rebuilds from the claimed text). Subject and prefix are both
+  claims: a crafted announcement can claim the subject and use its prefix,
+  as it can claim any vendor id; it still has to come from one of the
+  identity's addresses and find a free `max_instances` slot.
 - Validated on Fast DDS 2.6 (Humble) only; Cyclone DDS with DDS-Security
   has not been captured.
 
