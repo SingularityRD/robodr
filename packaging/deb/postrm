@@ -23,7 +23,7 @@ purge)
     for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
         robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
         robodr-executor.service robodr-firewall-gw.service robodr-firewall-gw-rules.service \
-        robodr-deliverd.service robodr-depot.service; do
+        robodr-deliverd.service robodr-depot.service robodr-metrics.timer robodr-metrics.service; do
         find -P /etc/systemd/system -mindepth 2 -maxdepth 2 -type l \
             \( -path "*.wants/$u" -o -path "*.requires/$u" \) -exec rm -f -- {} + 2>/dev/null || true
     done

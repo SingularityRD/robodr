@@ -48,9 +48,16 @@ Wants=network.target
 # RestartSec= for as long as it fails; each restart is a detection gap and
 # is counted (NRestarts), which robodr-metrics exports
 # (robodr_unit_restarts, robodr_unit_failed; example alerts
-# RoboDRUnitRestartLoop, RoboDRUnitFailed). A configuration that never
-# starts (no BTF, a stale external BTF) costs one failed start attempt per
-# RestartSec=, visible in the journal.
+# RoboDRUnitRestartLoop, RoboDRUnitFailed).
+# A configuration that never starts behaves in one of two ways:
+#  * A failed Assert...= above (no BTF at all, no bpffs, no pulsar.toml)
+#    fails the start job before any process runs: no restart, and the unit
+#    is left inactive, not failed (example alert RoboDRUnitDown, which
+#    needs the unit enabled).
+#  * A daemon that runs and exits non-zero (ExecStartPre= refusing a stale
+#    external BTF, a probe that does not load) is restarted every
+#    RestartSec= without end, one failed attempt each time in the journal.
+# (Both checked with stand-in units under systemd 255.)
 StartLimitIntervalSec=0
 
 [Service]
@@ -71,8 +78,9 @@ RestartSec=10s
 # The kernel's OOM killer acting inside this cgroup (MemoryMax=) stops the
 # whole unit instead of letting it run on in whatever state the kill left
 # it; Restart=on-failure then starts it again. (Shown with a stand-in
-# service under systemd 255: 9 restarts in 12 s and still restarting with
-# StartLimitIntervalSec=0, failed after 5 with the old start limit.)
+# service under systemd 255 that hits a 32M MemoryMax= right after every
+# start: with RestartSec=10s as here, 4 restarts in 45 s and still
+# restarting; with the old start limit it was left failed after 5.)
 # scripts/check-packages.py (check 11) keeps these three settings.
 OOMPolicy=stop
 # Probes are detached on SIGTERM; give the daemon time to do it cleanly.

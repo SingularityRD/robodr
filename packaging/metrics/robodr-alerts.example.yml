@@ -127,7 +127,9 @@ groups:
           description: "systemctl show failed (systemd not answering, or the exporter's sandbox blocks it)."
 
       # A unit crashed and was not restarted, or systemd gave up restarting
-      # it (start limit): that detector or exporter is off.
+      # it (start limit): that detector or exporter is off. robodr-pulsard
+      # has no start limit: while it crash-loops it is `activating`, not
+      # failed (RoboDRUnitRestartLoop, RoboDRUnitDown).
       - alert: RoboDRUnitFailed
         expr: robodr_unit_failed == 1
         for: 1m
@@ -147,3 +149,21 @@ groups:
         annotations:
           summary: "{{ $labels.unit }} restarted 3+ times in 30 minutes on {{ $labels.instance }}"
           description: "journalctl -u {{ $labels.unit }}; \"killed by the OOM killer\" there means it hit its MemoryMax= (systemctl show -p MemoryPeak {{ $labels.unit }})."
+
+      # Enabled (the site expects it to run) but not running, and not
+      # failed either: a start job that failed an Assert...= (robodr-pulsard
+      # without BTF or bpffs: systemd leaves the unit inactive and does not
+      # restart it), a clean or SIGTERM exit that Restart=on-failure does
+      # not restart, a manual stop, or a crash loop between restarts.
+      # Units that are started without being enabled (the sensor box image
+      # starts robodr-agentd and its exporter from robodr-image-late) are
+      # not covered: name them instead, e.g.
+      #   robodr_unit_active{unit=~"robodr-agentd.service|robodr-uplink.service"} == 0
+      - alert: RoboDRUnitDown
+        expr: robodr_unit_enabled == 1 and robodr_unit_active == 0 and robodr_unit_failed == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.unit }} is enabled but not running on {{ $labels.instance }}"
+          description: "systemctl status {{ $labels.unit }}; journalctl -u {{ $labels.unit }} (\"Assertion failed\" means a precondition such as BTF is missing)."

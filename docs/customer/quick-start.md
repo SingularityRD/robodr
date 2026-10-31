@@ -57,7 +57,10 @@ sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
     --tarball robodr-$V-$A-offline.tar.gz
 ```
 
-Units are installed **disabled**. Before installing, check the
+Units are installed **disabled**. The installer ends with the host
+preflight (`robodr-setup preflight`: BTF, bpffs, nf_tables, systemd, glibc,
+clock, disk, key directory); fix every `FAIL` line before you start a
+service. The install itself succeeds either way. Before installing, check the
 [platform requirements](support-matrix.md#platform-requirements): for the
 `robodr` package glibc 2.35+ and systemd 247+ (`robodr-focal`: systemd
 245+), a kernel with BTF for `robodr-pulsard`, and `minisign` where the
@@ -74,6 +77,13 @@ finding key and the uplink or diode key:
 ```sh
 sudo robodr-blackbox keygen --out /etc/robodr/keys/agentd-blackbox.key --key-id <robot>-bb-<date>
 ```
+
+Or let `robodr-setup init --role <robot|unitree-edu|unitree-sensor-box|soc-relay>
+--unit-id <robot>` do this and the configuration file of step 5 in one go:
+the host preflight (it stops on a `FAIL`), the keys for the role,
+`/etc/robodr/agentd.json` from the role's shipped example (not for
+`soc-relay`), and the key fingerprints to register with the SOC. It never
+overwrites an existing file (`man robodr-setup`).
 
 Copy only the **`.pub`** files to the SOC and the evidence verifiers, on
 vetted media. Secret keys never leave the robot. The profile-signing and
@@ -231,6 +241,15 @@ It is not validated on a robot. Before you install it:
 - Run observe-only for the first field period (executor disabled,
   gateway in `mode: observe`), and review false positives with your
   RoboDR contact.
+- Monitor it: `sudo systemctl enable --now robodr-metrics.timer` writes a
+  Prometheus textfile for node_exporter (no listening port), and
+  `/usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml` has
+  alert rules for a stale, blind or failed agent and for failed or
+  restarting units (`man robodr-metrics`).
+- For support, `sudo robodr-support-bundle` writes a redacted diagnostics
+  archive (versions, unit state and journal, status files, configuration;
+  never keys, credentials, evidence or findings) to `/var/tmp`
+  (`man robodr-support-bundle`).
 - Read [`known-limitations.md`](known-limitations.md) and the
   [`security-whitepaper.md`](security-whitepaper.md).
 - Report vulnerabilities as described in [`SECURITY.md`](../../SECURITY.md)

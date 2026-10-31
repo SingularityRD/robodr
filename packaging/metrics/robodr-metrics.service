@@ -1,10 +1,8 @@
 # robodr-metrics: Prometheus textfile exporter of RoboDR's status files.
-# Example unit (installed as /usr/share/doc/robodr/examples/metrics/; not
-# active). Enable with:
+# Installed disabled (/usr/lib/systemd/system/, with robodr-metrics.timer),
+# like every RoboDR unit. Enable with:
 #
-#   install -m 0644 robodr-metrics.service.example /etc/systemd/system/robodr-metrics.service
-#   install -m 0644 robodr-metrics.timer.example   /etc/systemd/system/robodr-metrics.timer
-#   systemctl daemon-reload && systemctl enable --now robodr-metrics.timer
+#   systemctl enable --now robodr-metrics.timer
 #
 # and let node_exporter's textfile collector read /run/robodr-metrics:
 #   --collector.textfile.directory=/run/robodr-metrics

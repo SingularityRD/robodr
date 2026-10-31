@@ -130,7 +130,11 @@ Verify the release at the entry station first ([OPERATIONS.md section 2](OPERATI
    mode with the oneshot alternative named in the networkd example. Install
    with full-disk encryption. Work
    through the [hardening checklist](#sensor-box-hardening-checklist) before
-   connecting it to the robot.
+   connecting it to the robot. An image recipe that implements the
+   checklist as far as an image can (read-only root, signed bundle, keys
+   generated at first boot, strict default firewall) is in
+   `packaging/sensor-box/image/` of the source tree; it has not yet been
+   built and booted on reference hardware.
 2. **Install the bundle** ([OPERATIONS.md section 3](OPERATIONS.md#3-install-on-an-air-gapped-host)):
 
    ```sh

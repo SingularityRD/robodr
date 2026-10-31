@@ -163,7 +163,11 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    again, agentd's heartbeat is fresh) and **rolls back automatically** to
    the previous kept release if it is not healthy (section 7);
 8. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
-   rollback (`--keep N` keeps only the N newest).
+   rollback (`--keep N` keeps only the N newest);
+9. runs the installed release's **host preflight** (`robodr-setup
+   preflight`: BTF, bpffs, nf_tables, systemd, glibc, clock, disk, key
+   directory) and prints it. Advisory: a `FAIL` line is a warning, the
+   install still succeeds; fix it before enabling RoboDR's services.
 
 Every default above and its only override are listed in
 `docs/SECURE-DEFAULTS.md`.
@@ -239,6 +243,10 @@ short:
 | Uplink key (Ed25519 secret) | `/etc/robodr/keys/uplink.key` (`0600 root:root`) | ingest batches and fleet API requests (8.5, 8.6) |
 | SOC fleet key (Ed25519, public) | `/etc/robodr/fleet-soc.pub` (`0644`), from the SOC on vetted media | verifying enrollment tokens and answers, rotation answers, profile approvals, ring information (8.6) |
 
+On a new unit, `robodr-setup init --role ROLE --unit-id ID` runs the host
+preflight and then generates the role's keys (`robodr-setup keys` generates
+them alone); neither overwrites an existing key. `robodr-setup fingerprints`
+prints the key ids to register (`man robodr-setup`).
 `robodr-enroll` (8.6) generates the uplink, finding and black-box keys on
 the unit at enrollment and rotates the uplink and finding keys with the
 SOC; the black-box key is rotated in place with `robodr-blackbox rotate`
@@ -1157,14 +1165,19 @@ systemd-analyze security robodr-pulsard robodr-agentd   # exposure report
 ```
 
 Both units restart on failure. `robodr-agentd` restarts up to 5 times in
-300 s, then stays failed. `robodr-pulsard` has no start limit: it is
+300 s, then stays failed (kept on purpose; the reasons are in its unit
+file). `robodr-pulsard` has no start limit: a daemon that exits non-zero is
 restarted every 10 s for as long as it fails (an event storm can kill it at
 its `MemoryMax=` again and again; giving up would leave host detection
-off), and each restart is counted in its `NRestarts`. A failed or
+off), and each restart is counted in its `NRestarts`. A failed
+`AssertPathExists=` (no BTF, no bpffs) is different: systemd runs nothing,
+does not restart, and leaves the unit inactive, not failed. A failed or
 restarting unit does not affect the robot's operation; it does mean the
-robot is not (fully) being watched. Alert on both: `robodr-metrics`
-exports `robodr_unit_failed` and `robodr_unit_restarts` per unit
-(example alerts `RoboDRUnitFailed`, `RoboDRUnitRestartLoop`).
+robot is not (fully) being watched. Alert on all of these: `robodr-metrics`
+exports `robodr_unit_failed`, `robodr_unit_restarts`, `robodr_unit_active`
+and `robodr_unit_enabled` per unit (example alerts `RoboDRUnitFailed`,
+`RoboDRUnitRestartLoop`, and `RoboDRUnitDown` for an enabled unit that is
+not running).
 
 `robodr-agentd` runs as `Type=notify` with `WatchdogSec=60s`; a hung main
 loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and
@@ -3574,6 +3587,13 @@ The package never deletes evidence or keys, not even on `apt purge`.
    unverifiable on the robot side.
 
 ## 10. Troubleshooting
+
+`robodr-setup preflight` re-checks the host (BTF, bpffs, nf_tables,
+systemd, glibc, clock, disk, key directory). For RoboDR support, `sudo
+robodr-support-bundle` writes a redacted diagnostics archive (versions,
+unit state and journal, status files, the nftables ruleset, configuration
+from `/etc/robodr`; never keys, credentials, evidence or findings; mode
+0600, to `/var/tmp`).
 
 | Symptom | Likely cause | Action |
 |---|---|---|
