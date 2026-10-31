@@ -2266,6 +2266,15 @@ records it. Bridged traffic is isolated only with `br_netfilter` loaded
   Find the cause and acknowledge it with `rearm`: until then every order
   is refused (`journal_reset`; the flag `journal_reset_ms` stays in
   `robodr-executor status`).
+* `commissioning` events: one per note of the executor's signed
+  commissioning check, journalled at start and whenever a re-read's notes
+  change. agentd raises `robot.agent.config_unattested` (High) for a flag
+  the executor does not honour and for a `commissioning` section removed
+  or changed while it runs, and for the UNSIGNED-flags note when agentd's
+  trusted profile binds `response_policy` or `executor_motion` (a unit
+  commissioned with signed flags whose executor started without the
+  section). A lab-only note and the note that the notes cleared raise
+  nothing.
 * `robodr-executor status --config /etc/robodr/executor.json`: the journal
   of active actions, their deadlines, history and events (it needs the
   link key to check the journal's seal).

@@ -17,8 +17,10 @@
 //!   nothing.
 //! * **`firewall.joint_config`**: must be the bound `joint_firewall` file.
 //!   agentd's firewall verdicts are recording-only, so nothing is
-//!   disabled; the mismatch is a warning and the same finding (the gateway,
-//!   which enforces, refuses `enforce` on an unbound file: WP11).
+//!   disabled; the mismatch is a warning and the same finding. (The
+//!   gateway, which enforces, needs its own file signed for the profile and,
+//!   when the profile binds a `motion_firewall` file, that very file:
+//!   `robodr_firewall_gw::runtime`.)
 //! * A **lab-only** trust chain (`robodr-commission poc-init`) is accepted
 //!   and warned about at every start.
 //!
@@ -29,7 +31,8 @@
 use std::path::Path;
 
 use robodr_commission::trust::bound::{
-    bytes_digest, check_binding, BindingRefusal, ROLE_JOINT_FIREWALL, ROLE_RESPONSE_POLICY,
+    bytes_digest, check_binding, BindingRefusal, ROLE_EXECUTOR_MOTION, ROLE_JOINT_FIREWALL,
+    ROLE_RESPONSE_POLICY,
 };
 use robodr_events::profile::Profile;
 use robodr_responder::ResponsePolicy;
@@ -46,6 +49,11 @@ pub struct Commissioned {
     pub findings: Vec<String>,
     /// Warnings to log.
     pub warnings: Vec<String>,
+    /// The trusted locked profile binds a file of robodr-executor
+    /// (`response_policy` or `executor_motion`): the unit was commissioned
+    /// with signed executor flags, so an executor reporting UNSIGNED flags
+    /// is a `robot.agent.config_unattested` finding (review WP6).
+    pub executor_bound: bool,
 }
 
 /// Apply the decision (see the module docs). `trusted` is `Some(profile)`
@@ -58,7 +66,13 @@ pub fn apply(
     policy: &mut ResponsePolicy,
     joint: Option<(&Path, &str)>,
 ) -> Commissioned {
-    let mut out = Commissioned::default();
+    let mut out = Commissioned {
+        executor_bound: trusted.is_some_and(|p| {
+            p.bound_config.contains_key(ROLE_RESPONSE_POLICY)
+                || p.bound_config.contains_key(ROLE_EXECUTOR_MOTION)
+        }),
+        ..Commissioned::default()
+    };
     let check = |role: &str, text: &str| -> Result<(), BindingRefusal> {
         let digest = bytes_digest(text.as_bytes());
         match trusted {
@@ -151,7 +165,8 @@ mod tests {
         let prof = locked(&[(ROLE_RESPONSE_POLICY, &text)]);
         let c = apply(Some(&prof), Path::new("/p.json"), &text, &mut pol, None);
         assert!(pol.oem_validated);
-        assert_eq!(c, Commissioned::default());
+        assert!(c.findings.is_empty() && c.warnings.is_empty(), "{c:?}");
+        assert!(c.executor_bound);
         // One byte more: not the commissioned file.
         let edited = format!("{text} ");
         let mut pol = ResponsePolicy::from_json(&edited).unwrap();
@@ -180,6 +195,25 @@ mod tests {
             None,
         );
         assert_eq!(c, Commissioned::default());
+    }
+
+    /// Review WP6: whether the trusted profile binds an executor file
+    /// (an executor reporting UNSIGNED flags is then a finding).
+    #[test]
+    fn executor_bound_follows_the_trusted_profile() {
+        let (mut pol, text) = policy(false);
+        let p = Path::new("/p.json");
+        for (bind, want) in [
+            (vec![], false),
+            (vec![(ROLE_JOINT_FIREWALL, "{}")], false),
+            (vec![(ROLE_RESPONSE_POLICY, "x")], true),
+            (vec![(ROLE_EXECUTOR_MOTION, "{}")], true),
+        ] {
+            let c = apply(Some(&locked(&bind)), p, &text, &mut pol, None);
+            assert_eq!(c.executor_bound, want, "{bind:?}");
+        }
+        // Not trusted: never bound.
+        assert!(!apply(None, p, &text, &mut pol, None).executor_bound);
     }
 
     #[test]

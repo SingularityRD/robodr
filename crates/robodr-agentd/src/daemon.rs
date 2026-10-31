@@ -3637,6 +3637,12 @@ impl Daemon<'_> {
                 Some(d) => d,
                 None => return,
             },
+            EventKind::Commissioning => {
+                match executor_commissioning_finding(ev, self.r.executor_bound) {
+                    Some(d) => d,
+                    None => return,
+                }
+            }
             EventKind::JournalReset => robodr_events::Deviation::new(
                 health_rules::EXECUTOR_JOURNAL_RESET,
                 robodr_events::Severity::High,
@@ -3671,6 +3677,95 @@ fn pause_overridden(ev: &robodr_executor::journal::Event) -> Option<robodr_event
             sanitize(&ev.detail)
         ),
     ))
+}
+
+/// Review WP6: the executor's signed-commissioning notes (`commissioning`
+/// events). A flag it does not honour, or its `commissioning` section
+/// removed or changed at runtime (a tamper indicator), is a High
+/// `robot.agent.config_unattested` finding; UNSIGNED flags are one too when
+/// agentd's trusted locked profile binds an executor file
+/// (`executor_bound`: the unit was commissioned with signed flags, so an
+/// executor started without its section is a downgrade). A lab-only
+/// chain (agentd warns about it itself) and notes that cleared raise
+/// nothing.
+fn executor_commissioning_finding(
+    ev: &robodr_executor::journal::Event,
+    executor_bound: bool,
+) -> Option<robodr_events::Deviation> {
+    use robodr_executor::config::{note_class, NoteClass};
+    if ev.kind != robodr_executor::journal::EventKind::Commissioning {
+        return None;
+    }
+    let why = match note_class(&ev.detail) {
+        NoteClass::Unattested => "robodr-executor does not honour a commissioning claim",
+        NoteClass::Unsigned if executor_bound => {
+            "robodr-executor runs with UNSIGNED oem_validated flags (no `commissioning` \
+             section) on a unit whose trusted profile binds its files"
+        }
+        NoteClass::Unsigned | NoteClass::LabOnly | NoteClass::Cleared => return None,
+    };
+    Some(robodr_events::Deviation::new(
+        crate::commissioned::CONFIG_UNATTESTED,
+        robodr_events::Severity::High,
+        format!("{why}: {}", sanitize(&ev.detail)),
+    ))
+}
+
+#[cfg(test)]
+mod executor_commissioning_tests {
+    use robodr_executor::journal::{Event, EventKind};
+
+    fn ev(kind: EventKind, detail: &str) -> Event {
+        Event {
+            seq: 1,
+            at_ms: 1,
+            kind,
+            id: None,
+            action: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// Review WP6: before, a commissioning change was a `reconciled` event
+    /// and executor start notes were not journalled; neither reached the
+    /// SOC as a finding.
+    #[test]
+    fn executor_commissioning_notes_are_findings() {
+        use super::executor_commissioning_finding as f;
+        let removed = ev(
+            EventKind::Commissioning,
+            "WARNING: the `commissioning` section of /etc/robodr/executor.json was removed \
+             since this executor read it; still verifying against the section it had",
+        );
+        let d = f(&removed, false).unwrap();
+        assert_eq!(d.rule, "robot.agent.config_unattested");
+        assert_eq!(d.severity, robodr_events::Severity::High);
+        assert!(d.detail.contains("removed"), "{}", d.detail);
+
+        let unsigned = ev(
+            EventKind::Commissioning,
+            robodr_executor::config::UNSIGNED_NOTE,
+        );
+        assert!(f(&unsigned, false).is_none());
+        let d = f(&unsigned, true).unwrap();
+        assert!(d.detail.contains("UNSIGNED"), "{}", d.detail);
+
+        let lab = ev(
+            EventKind::Commissioning,
+            &format!(
+                "WARNING: /etc/robodr/profile.json: {}",
+                robodr_commission::poc::LAB_ONLY_BANNER
+            ),
+        );
+        assert!(f(&lab, true).is_none());
+        let cleared = ev(
+            EventKind::Commissioning,
+            robodr_executor::config::NOTES_CLEARED,
+        );
+        assert!(f(&cleared, true).is_none());
+        // Another kind with the same text is not this finding.
+        assert!(f(&ev(EventKind::Reconciled, "nothing to do"), true).is_none());
+    }
 }
 
 #[cfg(test)]

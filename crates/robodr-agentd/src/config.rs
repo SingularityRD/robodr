@@ -933,6 +933,11 @@ pub struct Resolved {
     /// signed (`crate::commissioned`): one `robot.agent.config_unattested`
     /// finding each at start.
     pub config_unattested: Vec<String>,
+    /// The trusted locked profile binds a robodr-executor file
+    /// ([`crate::commissioned::Commissioned::executor_bound`]): an executor
+    /// that reports UNSIGNED flags is a `robot.agent.config_unattested`
+    /// finding.
+    pub executor_bound: bool,
 }
 
 impl std::fmt::Debug for KeyBytes {
@@ -1824,6 +1829,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         warnings,
         key_protection,
         config_unattested: commissioned.findings,
+        executor_bound: commissioned.executor_bound,
     })
 }
 

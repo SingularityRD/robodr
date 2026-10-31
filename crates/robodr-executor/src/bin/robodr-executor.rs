@@ -385,11 +385,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut engine = match Engine::open_sealed(cfg, policy, nft, &boot, Now::system(), seal) {
+    let now = Now::system();
+    let mut engine = match Engine::open_sealed(cfg, policy, nft, &boot, now, seal) {
         // Policy and configuration are re-read before every order.
         Ok(e) if a.cmd == "run" => e
             .with_reload(cfg_path.clone())
-            .with_commissioning_notes(notes),
+            .with_commissioning_notes(notes, now.wall_ms),
         Ok(e) => e,
         Err(e) => {
             // Engine::open deleted the table already.

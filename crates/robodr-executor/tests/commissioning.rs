@@ -236,3 +236,45 @@ fn without_commissioning_the_flags_are_reported_unsigned() {
     assert!(notes.iter().any(|n| n.contains("UNSIGNED")), "{notes:?}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Review WP6 (Phase 2 not_done): a profile accepted under a lab-only trust
+/// file (`poc-init`) keeps its bound flags but the executor says so: the
+/// LAB-ONLY banner is a note (journalled as a `commissioning` event, which
+/// agentd does not turn into a finding).
+#[test]
+fn a_lab_only_chain_is_announced() {
+    use robodr_commission::trust::{trust_file_text_with, TrustFileOptions};
+    use robodr_executor::config::{note_class, NoteClass};
+    let (d, cfg) = setup("lab-only", true);
+    std::fs::write(
+        d.join("trust.json"),
+        trust_file_text_with(
+            &[key().verifying_key()],
+            &TrustFileOptions {
+                lab_only: true,
+                ..Default::default()
+            },
+        ),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    write_profile(
+        &d,
+        &[
+            ("response_policy", bytes_digest(policy_text().as_bytes())),
+            (
+                "executor_motion",
+                digest_for_role("executor_motion", &text).unwrap(),
+            ),
+        ],
+    );
+    let (r, p, notes) = load_commissioned(&cfg).unwrap();
+    assert!(p.oem_validated && validated_adapters(&r), "{notes:?}");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(robodr_commission::poc::LAB_ONLY_BANNER),
+        "{notes:?}"
+    );
+    assert_eq!(note_class(&notes[0]), NoteClass::LabOnly);
+    let _ = std::fs::remove_dir_all(&d);
+}
