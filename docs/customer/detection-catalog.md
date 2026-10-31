@@ -96,9 +96,9 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-254 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+255 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (28)
+### `robot.agent.*` (29)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -128,6 +128,7 @@ correlation entry.
 | `robot.agent.input_silent` | Agent input silent | `robodr_agent` | — | 1.3 |
 | `robot.agent.pipeline_lag` | Agent pipeline lagging | `robodr_agent` | — | 1.3 |
 | `robot.agent.queue_overflow` | Agent input queue overflowed | `robodr_agent` | — | 1.3 |
+| `robot.agent.restart_pending` | Upgraded components still on the previous binaries | `robodr_agent` | — | 2.5 |
 | `robot.agent.selftest` | Agent field acceptance self-test | `robodr_agent` | — | 2.5 |
 | `robot.agent.spool_full` | Finding spool full or failing | `robodr_agent` | — | 1.3 |
 

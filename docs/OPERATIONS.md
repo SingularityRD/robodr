@@ -2695,10 +2695,19 @@ therefore never restarts these two unguarded:
   restarts them later, again only while the state allows it (exit 1 and
   nothing restarted otherwise), then runs the health check below (exit 1
   when unhealthy; no automatic rollback). A reboot also starts the new
-  binaries. Until then `install-bundle.sh list` shows the units waiting
-  (`pending restart`). Nothing reports this to the SOC: the package
-  database and the security floor show the new version while the two
-  still run the previous binaries;
+  binaries. Until then the package database and the security floor show
+  the new version while the two still run the previous binaries;
+  `install-bundle.sh list` shows the units waiting (`pending restart`),
+  `robodr-agentd`'s `status.json` shows them under
+  `self_health.pending_restart`, and once the file is
+  `daemon.self_health.restart_pending_grace_ms` old (default 15 min)
+  agentd sends the SOC a Medium `robot.agent.restart_pending` naming them,
+  again when the units change and then daily until they are restarted
+  (also after a plain `dpkg`/`rpm` upgrade, which writes the same file;
+  a file agentd cannot read is reported with its units unknown). agentd
+  reads the file, not the processes: a gated unit restarted by hand
+  (`systemctl restart`) while the file stays is still reported until
+  `restart-pending` removes it;
 - `--allow-gateway-restart` restarts them whatever the state says. It is
   a deliberate operator decision: motion through the gateway is
   interrupted. Use it only with the robot stopped by other means (e.g.
@@ -2712,17 +2721,26 @@ through the gate; for an `.rpm`, install the release again with
 `install-bundle.sh` once the robot is idle). When the installed
 `robodr-deliverd` has **no `safety-state` command** (0.1.0-alpha.1),
 `install` reads the state with the `robodr-deliverd` of the package being
-installed (after its signature and checksum checks, from a copy in the
-private staging directory); if that copy cannot run there (e.g. a
-`noexec` `TMPDIR`), the gate stays closed: stop the gateway at a safe
-moment or pass `--allow-gateway-restart`.
+installed, run as root from a copy in the private staging directory. It
+runs after the bundle's checksum check and, with `--pubkey`/`--tarball`,
+its signature check, but before the security floor and the format gate;
+with `ROBODR_ALLOW_UNSIGNED=1` (lab only) nothing was signature-checked, so
+an unsigned package's binary runs as root at that point (installing it
+would run its maintainer scripts as root anyway). If that copy cannot run
+there (e.g. a `noexec` `TMPDIR`), or the installed `robodr-agentd` does not
+serve the status socket and live safety feed this reader needs (not
+verified against a real 0.1.0-alpha.1 agentd), the state reads `unknown`
+and the gate stays closed: stop the gateway at a safe moment or pass
+`--allow-gateway-restart`.
 
 **Releases from before the gate.** The maintainer scripts of
 0.1.0-alpha.1 restart the gateway and the executor unconditionally. A
 `rollback` (or `install --allow-downgrade`) to such a release therefore
 cannot be deferred: with the gateway or the executor running and the
 state closed it is **refused**, `--defer-restart` included, unless
-`--allow-gateway-restart`. The automatic rollback after a failed health
+`--allow-gateway-restart`. With the state open, it is read once more
+right before `dpkg`/`rpm` runs; if it closed meanwhile, nothing is
+installed (exit 1). The automatic rollback after a failed health
 check goes to such a release only while the state allows it at that
 moment; otherwise the unhealthy release stays installed (exit 1) and you
 roll back by hand once the robot is idle. `install-bundle.sh` recognises
@@ -2827,7 +2845,9 @@ goes below the unit's **security floor**
 `min_version` ever seen in an installed bundle's `security-floor` file
 (covered by the release signature) or in the SOC's signed ring information
 (`robodr-enroll ring`, 8.6). The floor only rises and has no override:
-releases below it are known to be vulnerable.
+releases below it are known to be vulnerable. A release below the floor it
+would end at is refused before the safety state is read, so the refusal
+names the floor, not the safety state.
 
 **Black-box format gate** (install and rollback). Every package states the
 black-box formats it writes and reads (`/usr/share/robodr/formats`, e.g.

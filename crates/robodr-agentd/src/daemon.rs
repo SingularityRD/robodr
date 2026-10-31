@@ -495,6 +495,10 @@ struct SelfView {
     /// Certificate `notAfter` / CRL `nextUpdate`, with `days_to_expiry`.
     credentials: Vec<robodr_ocsf::CredentialExpiry>,
     reachability: Vec<robodr_ocsf::Reachability>,
+    /// The gated units a package upgrade left on the previous binaries
+    /// (`None`: nothing pending).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_restart: Option<crate::selfcheck::PendingRestart>,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -2815,6 +2819,15 @@ impl<'a> Daemon<'a> {
             exec.as_ref().and_then(|r| r.unreachable_for_ms),
             exec.as_ref().and_then(|r| r.last_error.as_deref()),
         ));
+        // Gated units an upgrade left on the previous binaries (T9).
+        let pending_restart = crate::selfcheck::pending_restart(
+            &self.warnings.config().restart_pending_file,
+            wall_ms,
+        );
+        found.extend(
+            self.warnings
+                .restart_pending(now_ms, pending_restart.as_ref()),
+        );
         self.self_view = SelfView {
             health_records: self.health_records,
             health_record_ms: self.warnings.config().health_record_ms,
@@ -2822,6 +2835,7 @@ impl<'a> Daemon<'a> {
             disks,
             credentials: creds,
             reachability,
+            pending_restart,
         };
         for w in found {
             self.self_health("agentd:self_health", w.deviation());

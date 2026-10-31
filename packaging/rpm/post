@@ -96,7 +96,8 @@ migrate_exporter_users() {
 # package upgrade: restarting the gateway drops the motion commands
 # queued in it (fail_closed: the bridge refuses motion while it is down),
 # restarting the executor drops its pending actions. They keep running
-# the previous binaries and are recorded in /var/lib/robodr/pending-restart;
+# the previous binaries and are recorded in /var/lib/robodr/pending-restart
+# (robodr-agentd reports it as robot.agent.restart_pending while it stays);
 # install-bundle.sh restarts them only while the live safety state is
 # idle or safe_state_active (or with --allow-gateway-restart), at once or
 # later with `install-bundle.sh restart-pending` (OPERATIONS.md 7).
@@ -107,6 +108,10 @@ mark_pending_restart() { # unit
     mkdir -p /var/lib/robodr
     grep -qx "$1" /var/lib/robodr/pending-restart 2>/dev/null ||
         echo "$1" >>/var/lib/robodr/pending-restart
+    # robodr-agentd (group robodr) reads it and reports
+    # robot.agent.restart_pending to the SOC while it stays.
+    chgrp robodr /var/lib/robodr/pending-restart 2>/dev/null || true
+    chmod 0640 /var/lib/robodr/pending-restart 2>/dev/null || true
     echo "robodr: $1 keeps running the previous binaries until a safety-gated restart:"
     echo "robodr:   /usr/lib/robodr/install-bundle.sh restart-pending (OPERATIONS.md 7)"
 }

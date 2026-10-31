@@ -133,13 +133,16 @@ esac
 const LEGACY_POSTINST: &str = "#!/bin/sh\nfor u in robodr-executor.service robodr-firewall-gw.service; do\n    systemctl try-restart \"$u\" || true\ndone\n";
 
 /// A fake `robodr-deliverd` with `safety-state` only: the state from
-/// `<sd>/safety`, the heartbeat stale when `<sd>/stale` exists.
+/// `<sd>/safety`, the heartbeat stale when `<sd>/stale` exists. When
+/// `<sd>/safety-then` exists, it becomes `<sd>/safety` after this read
+/// (the state changes between two reads).
 const FAKE_DELIVERD: &str = r#"#!/bin/sh
 d=$FAKE_SD
 case "$1" in
 --help) echo "usage: robodr-deliverd safety-state" ;;
 safety-state)
     st=$(cat "$d/safety" 2>/dev/null || echo unknown)
+    if [ -e "$d/safety-then" ]; then mv "$d/safety-then" "$d/safety"; fi
     fr=true
     [ ! -e "$d/stale" ] || fr=false
     printf '{\n  "safety_state": "%s",\n  "agentd_fresh": %s\n}\n' "$st" "$fr"
@@ -1025,4 +1028,133 @@ fn an_upgrade_from_alpha1_reads_the_gate_with_the_new_package() {
         u.log()
     );
     assert_eq!(u.pending(), "");
+}
+
+/// Phase 3 review (low): for a release whose post-install script predates
+/// the gate, the gate is read again right before dpkg runs; if it closed
+/// since it was decided open, nothing is installed and nothing restarted.
+#[test]
+fn a_pre_gate_release_is_refused_when_the_gate_closes_before_dpkg() {
+    if !available("legacy_recheck", &[]) {
+        return;
+    }
+    let u = Unit::new("legacyrecheck", true);
+    u.migrated();
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", LEGACY_POSTINST), "b1");
+    let pi = upgrade_postinst();
+    let b2 = bundle(&u.dir, &stub_deb(&u.dir, "0.2.0-1", &pi), "b2");
+    ok(&u.run(&b1, &["install"], true));
+    ok(&u.run(&b2, &["install"], true));
+    for s in [GW, EX] {
+        u.active(s);
+    }
+    // Open when decided, moving by the time dpkg would run.
+    u.safety("idle");
+    std::fs::write(u.sd.join("safety-then"), "moving_fast").unwrap();
+    u.clear_log();
+    let o = u.run(&b2, &["rollback", "0.1.0-1", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("REFUSED")
+            && out(&o).contains("no longer allows")
+            && out(&o).contains("moving_fast"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.2.0-1");
+    assert!(!u.log().contains("try-restart"), "{}", u.log());
+}
+
+/// Phase 3 review (low): a gate-aware package whose post-install script
+/// cannot be read (a failing `dpkg-deb --ctrl-tarfile`) keeps its
+/// pending-restart record: the gated units are still restarted through
+/// the gate, and nothing is lost when the gate is closed.
+#[test]
+fn an_unreadable_post_install_script_keeps_the_pending_restart_record() {
+    if !available("unreadable_postinst", &[]) {
+        return;
+    }
+    let u = Unit::new("unreadpi", true);
+    u.migrated();
+    let pi = upgrade_postinst();
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", &pi), "b1");
+    let b2 = bundle(&u.dir, &stub_deb(&u.dir, "0.2.0-1", &pi), "b2");
+    ok(&u.run(&b1, &["install"], true));
+    for s in [GW, EX] {
+        u.active(s);
+    }
+    // dpkg-deb that cannot read control archives (dpkg itself does not
+    // use --ctrl-tarfile).
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v dpkg-deb"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let wrap = u.dir.join("wrap");
+    write_exec(
+        &wrap.join("dpkg-deb"),
+        &format!(
+            "#!/bin/sh\n[ \"$1\" != --ctrl-tarfile ] || exit 2\nexec {} \"$@\"\n",
+            real.trim()
+        ),
+    );
+    let path = format!("{}:{}", wrap.display(), u.path);
+    u.safety("idle");
+    u.clear_log();
+    ok(&u.run_env(
+        &b2,
+        &[
+            "install",
+            "--allow-gateway-restart",
+            "--health-timeout",
+            "3",
+        ],
+        true,
+        &[("PATH", &path)],
+    ));
+    assert_eq!(u.installed(), "0.2.0-1");
+    for s in [GW, EX] {
+        assert!(
+            u.log().contains(&format!("try-restart {s}")),
+            "{s} must be restarted: {}",
+            u.log()
+        );
+    }
+    assert_eq!(u.pending(), "");
+}
+
+/// Phase 3 review (low): a rollback below the security floor is refused
+/// for the floor, also while the safety state is closed (not first for
+/// the safety state, then again for the floor).
+#[test]
+fn a_rollback_below_the_floor_is_refused_for_the_floor_first() {
+    if !available("floor_first", &[]) {
+        return;
+    }
+    let u = Unit::new("floorfirst", true);
+    u.migrated();
+    let pi = upgrade_postinst();
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", &pi), "b1");
+    let b2 = bundle_floor(
+        &u.dir,
+        &stub_deb(&u.dir, "0.2.0-1", &pi),
+        "b2",
+        Some("0.2.0-1"),
+    );
+    ok(&u.run(&b1, &["install"], true));
+    ok(&u.run(&b2, &["install"], true));
+    u.active(GW);
+    u.safety("moving_fast");
+    let o = u.run(&b2, &["rollback", "0.1.0-1", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("below this unit's security floor 0.2.0-1")
+            && !out(&o).contains("live safety state"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.2.0-1");
 }

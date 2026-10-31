@@ -112,10 +112,16 @@
 # and installing or rolling back to a package whose post-install script
 # predates the gate (no gated_restart block: 0.1.0-alpha.1), which
 # try-restarts the two itself; with the gate closed both are REFUSED
-# unless --allow-gateway-restart. When the installed robodr-deliverd has no
-# safety-state command (0.1.0-alpha.1), install reads the state with the
-# robodr-deliverd of the package being installed (after its verification,
-# from a copy in the private staging directory).
+# unless --allow-gateway-restart, and with it open the state is read once
+# more right before dpkg / rpm (refused if it closed meanwhile). A release
+# below the security floor is refused before the gate is read. When the
+# installed robodr-deliverd has no safety-state command (0.1.0-alpha.1),
+# install reads the state with the robodr-deliverd of the package being
+# installed, run as root from a copy in the private staging directory,
+# after the checksum check and (with --pubkey) the signature check but
+# before the floor and format gates; under ROBODR_ALLOW_UNSIGNED nothing
+# was signature-checked. While the units wait, robodr-agentd reports
+# robot.agent.restart_pending to the SOC from the pending-restart file.
 #
 # Health check and automatic rollback (T50). After install and rollback,
 # every RoboDR unit that was active before must be active again (on two
@@ -547,15 +553,43 @@ pkg_formats() { # file
     pkg_cat "$1" /usr/share/robodr/formats || true
 }
 
+# A package's post-install script (rpm: all its scriptlets) on stdout;
+# fails when it cannot be read (an unreadable control archive, a failing
+# dpkg-deb / rpm, no post-install script).
+pkg_postinst() { # file
+    case "$(format_of "$1")" in
+    deb)
+        pp_t=$(mktemp) || return 1
+        if ! dpkg-deb --ctrl-tarfile "$1" >"$pp_t" 2>/dev/null; then
+            rm -f "$pp_t"
+            return 1
+        fi
+        pp_rc=0
+        tar -xOf "$pp_t" ./postinst 2>/dev/null || pp_rc=$?
+        rm -f "$pp_t"
+        return "$pp_rc"
+        ;;
+    rpm) rpm -qp --nosignature --scripts "$1" 2>/dev/null ;;
+    *) return 1 ;;
+    esac
+}
+
 # Whether a package's post-install script leaves the gateway and the
 # executor to the safety-state gate (its gated_restart block defines
 # mark_pending_restart). The post-install script of a release from before
-# the gate (0.1.0-alpha.1) try-restarts both unconditionally.
+# the gate (0.1.0-alpha.1) try-restarts both unconditionally. A script that
+# cannot be read counts as from before the gate (the safe side for every
+# gating decision).
 pkg_gate_aware() { # file
-    case "$(format_of "$1")" in
-    deb) dpkg-deb --ctrl-tarfile "$1" | tar -xOf - ./postinst 2>/dev/null | grep -q '^mark_pending_restart()' ;;
-    rpm) rpm -qp --nosignature --scripts "$1" 2>/dev/null | grep -q '^mark_pending_restart()' ;;
-    esac
+    pg_s=$(pkg_postinst "$1") || return 1
+    printf '%s\n' "$pg_s" | grep -q '^mark_pending_restart()'
+}
+
+# Whether a package's post-install script was read and has no
+# gated_restart block (a release from before the gate, for certain).
+pkg_pre_gate() { # file
+    pg_s=$(pkg_postinst "$1") || return 1
+    ! printf '%s\n' "$pg_s" | grep -q '^mark_pending_restart()'
 }
 
 # Install a package file (policy already checked).
@@ -867,8 +901,43 @@ pkg_install_gated() { # file
         pkg_install "$1"
     fi
     # A package from before the gate has just try-restarted the running
-    # gated units itself: nothing is pending any more.
-    if ! pkg_gate_aware "$1"; then rm -f "$pending_file"; fi
+    # gated units itself: nothing is pending any more. Only when its
+    # post-install script was read: a package whose script could not be
+    # read may well have left them pending (and the file is then the
+    # record agentd reports to the SOC).
+    if pkg_pre_gate "$1"; then rm -f "$pending_file"; fi
+}
+
+# Right before installing a package whose post-install script predates
+# the gate (it restarts the running gated units unconditionally), with the
+# gate decided open: the state must still allow it now (the security
+# floor, the format gate and the package reads took time).
+recheck_pre_gate() { # what package-file
+    [ "$gate" = open ] || return 0
+    ! pkg_gate_aware "$2" || return 0
+    if ! gate_open; then
+        die 1 "REFUSED: $1: that release's maintainer scripts predate the safety-state gate and restart$gated_active unconditionally, and the live safety state no longer allows it ($gate_why). Nothing was installed. Run it again when the robot is idle or in its safe state, or with --allow-gateway-restart."
+    fi
+}
+
+# The security floor this install or rollback would end at (the recorded
+# floor, the ring information's minimum and, for an install, the bundle's
+# own), checked without recording anything: a release below it is refused
+# before the safety-state gate is asked (the floor has no override, so
+# waiting for the robot to be idle would not help).
+precheck_floor() { # version [bundle-floor]
+    pf=$(floor_now)
+    if [ -r "$ring_env" ]; then
+        pm=$(sed -n 's/^min_version=//p' "$ring_env")
+        if [ -n "$pm" ]; then
+            pm=$(deb_of "$pm")
+            if [ -z "$pf" ] || ver_lt "$pf" "$pm"; then pf=$pm; fi
+        fi
+    fi
+    if [ -n "${2:-}" ] && { [ -z "$pf" ] || ver_lt "$pf" "$2"; }; then pf=$2; fi
+    if [ -n "$pf" ] && ver_lt "$1" "$pf"; then
+        die 1 "REFUSED: $1 is below this unit's security floor $pf (recorded floor, SOC ring information or the bundle's security-floor): releases below it are known to be vulnerable. There is no override."
+    fi
 }
 
 # Restart what the maintainer scripts left in the pending-restart file,
@@ -1125,6 +1194,11 @@ EOF
         fi
         echo "install-bundle: WARNING: downgrading from $prev_ver to $ver (--allow-downgrade)"
     fi
+    bf=""
+    if [ -f "$bundle/security-floor" ]; then
+        bf=$(sed -n 's/^min_version=//p' "$bundle/security-floor" | head -n1)
+    fi
+    precheck_floor "$ver" "$bf"
     # The safety-state gate, before anything on the unit changes.
     before=$(active_units)
     pick_bundle_reader "$pkgfile"
@@ -1140,6 +1214,7 @@ EOF
     pkg_formats "$pkgfile" >"$fmt"
     check_formats "$fmt" "$ver" || { rm -f "$fmt"; exit 1; }
     new_pkg=$pkg
+    recheck_pre_gate "installing $ver" "$pkgfile"
     pkg_install_gated "$pkgfile"
     restart_pending "$gate" || true
     if ! health_check "$before"; then
@@ -1291,6 +1366,7 @@ rollback)
         die 1 "the kept package in $dir is not version $version_arg"
     check_other_format "$pkgfmt"
     check_variant "$pkg" "$(installed_pkgs "$pkgfmt")"
+    precheck_floor "$version_arg"
     # The safety-state gate, before anything on the unit changes.
     before=$(active_units)
     decide_gate "$before" "rolling back to $version_arg" "$pkgfile"
@@ -1301,6 +1377,7 @@ rollback)
     check_formats "$fmt" "$version_arg" || { rm -f "$fmt"; exit 1; }
     rm -f "$fmt"
     echo "install-bundle: rolling back to $pkg $version_arg ($pkgfmt)"
+    recheck_pre_gate "rolling back to $version_arg" "$pkgfile"
     pkg_install_gated "$pkgfile"
     restart_pending "$gate" || true
     health_check "$before" || die 1 "rolled back to $version_arg, but the unit is not healthy: check the units"

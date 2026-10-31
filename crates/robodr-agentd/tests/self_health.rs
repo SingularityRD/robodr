@@ -275,6 +275,88 @@ fn t38_producer_cap_emits_the_older_contract() {
     }
 }
 
+/// WP8a (Phase 2 review, medium): gated units a package upgrade left on
+/// the previous binaries (`--defer-restart`, a raw dpkg / rpm upgrade)
+/// reach the SOC as a Medium, observe-only `robot.agent.restart_pending`
+/// naming them; `status.json` shows the file's units. The finding is not
+/// raised while the file is younger than the grace.
+#[test]
+fn wp8a_units_left_on_previous_binaries_reach_the_soc() {
+    let s = setup("restart-pending", &robot_profile(true));
+    let file = s.dir.join("pending-restart");
+    std::fs::write(
+        &file,
+        "robodr-firewall-gw.service\nrobodr-executor.service\n",
+    )
+    .unwrap();
+    let cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        json!({"self_health": {"health_record_ms": 0,
+            "disk_warn_percent": 1, "disk_critical_percent": 0,
+            "clock_unsynced_grace_ms": 86_400_000,
+            "restart_pending_grace_ms": 0,
+            "restart_pending_file": file}}),
+    );
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let st = wait_for(15, "restart_pending spooled", || {
+        rules(&spooled(&s.spool))
+            .iter()
+            .any(|r| r == "robot.agent.restart_pending")
+            .then(|| status(&s.spool))
+            .flatten()
+    });
+    let log = finish(stop, h);
+    let found = spooled(&s.spool);
+    let f: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.restart_pending")
+        .map(|(_, e)| e)
+        .collect();
+    assert_eq!(f.len(), 1, "once while unchanged: {log}");
+    assert_eq!(f[0].severity, robodr_events::Severity::Medium);
+    assert_eq!(f[0].entity_context.mode, robodr_ocsf::Mode::Observe);
+    let d = &f[0].entity_context.detail.value;
+    assert!(
+        d.contains("robodr-executor.service and robodr-firewall-gw.service")
+            && d.contains("restart-pending"),
+        "{d}"
+    );
+    assert_eq!(
+        st["self_health"]["pending_restart"]["units"],
+        json!(["robodr-executor.service", "robodr-firewall-gw.service"]),
+        "{st}"
+    );
+
+    // A fresh file (an install restarting them right now) stays quiet
+    // within the default grace.
+    let s = setup("restart-pending-grace", &robot_profile(true));
+    let file = s.dir.join("pending-restart");
+    std::fs::write(&file, "robodr-firewall-gw.service\n").unwrap();
+    let cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        json!({"self_health": {"health_record_ms": 0,
+            "disk_warn_percent": 1, "disk_critical_percent": 0,
+            "clock_unsynced_grace_ms": 86_400_000,
+            "restart_pending_file": file}}),
+    );
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let st = wait_for(10, "ticks", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["ticks"].as_u64()? >= 5).then_some(st)
+    });
+    finish(stop, h);
+    assert_eq!(
+        st["self_health"]["pending_restart"]["units"],
+        json!(["robodr-firewall-gw.service"]),
+        "{st}"
+    );
+    assert!(!rules(&spooled(&s.spool))
+        .iter()
+        .any(|r| r == "robot.agent.restart_pending"));
+}
+
 /// The record can be switched off (replay, tests); the early warnings stay.
 #[test]
 fn t5_health_record_off_emits_none() {

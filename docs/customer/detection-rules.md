@@ -11,14 +11,14 @@ This is the full generated reference. How to read a finding, what each detection
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
 * **Since** is the contract version that added the entry. A consumer validating an older message applies that message's catalog; an id without an entry is reported with a generic title ("RoboDR model-profile deviation").
 
-168 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
+169 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
 
 ## By data source
 
 | Data source | Rule ids |
 |---|---|
 | `host_runtime` | 1 |
-| `robodr_agent` | 30 |
+| `robodr_agent` | 31 |
 | `robodr_correlation` | 10 |
 | `robodr_delivery` | 17 |
 | `robot_safety_state` | 4 |
@@ -27,7 +27,7 @@ This is the full generated reference. How to read a finding, what each detection
 
 ## Families
 
-* [`robot.agent.*`](#robotagent) (28)
+* [`robot.agent.*`](#robotagent) (29)
 * [`robot.capture.*`](#robotcapture) (10)
 * [`robot.correlate.*`](#robotcorrelate) (10)
 * [`robot.dds.*`](#robotdds) (1)
@@ -76,6 +76,7 @@ This is the full generated reference. How to read a finding, what each detection
 | `robot.agent.input_silent` | Agent input silent | An agent input delivered no valid data within the silence window; the robot state reads unknown while the agent is blind. | `robodr_agent` | - | 1.3 |
 | `robot.agent.pipeline_lag` | Agent pipeline lagging | Queue latency or tick delay in the agent exceeded the configured lag bound; detections are late. | `robodr_agent` | - | 1.3 |
 | `robot.agent.queue_overflow` | Agent input queue overflowed | The agent's input queue was full and items were dropped without inspection. | `robodr_agent` | - | 1.3 |
+| `robot.agent.restart_pending` | Upgraded components still on the previous binaries | A package upgrade left the robot's in-path motion gateway or response executor running the binaries of the release before it (their restart waits for the safety-state gate): the installed release and its security floor are not what runs until they are restarted. The detail names the units and how long they have been pending. | `robodr_agent` | - | 2.5 |
 | `robot.agent.selftest` | Agent field acceptance self-test | A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection. | `robodr_agent` | - | 2.5 |
 | `robot.agent.spool_full` | Finding spool full or failing | The agent could not write findings to its outbound spool (full or write errors); findings may be lost before export. | `robodr_agent` | - | 1.3 |
 
