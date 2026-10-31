@@ -392,9 +392,7 @@ pub fn open_secret_file(path: &Path) -> Result<(File, Metadata), SecretFileError
     }
     let f = match o.open(path) {
         Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(40) || e.raw_os_error() == Some(62) => {
-            return Err(SecretFileError::NotRegular)
-        }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(SecretFileError::NotRegular),
         Err(e) => return Err(SecretFileError::Io(e.to_string())),
     };
     let md = f
