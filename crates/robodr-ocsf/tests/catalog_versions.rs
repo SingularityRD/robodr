@@ -484,6 +484,7 @@ const IDS_2_5_AGENT: &[&str] = &[
     "robot.agent.clock_jump",
     "robot.agent.disk_low",
     "robot.agent.executor_unreachable",
+    "robot.agent.restart_pending",
     "robot.agent.executor_pause_overridden",
     "robot.agent.config_unattested",
     "robot.agent.control_plane_request_fenced",

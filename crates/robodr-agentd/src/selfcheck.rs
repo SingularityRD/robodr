@@ -9,6 +9,7 @@
 //! | wall clock jumped against monotonic | [`rules::CLOCK_JUMP`] | High | on a new jump, at most every `health_report_ms` |
 //! | filesystem nearly full | [`rules::DISK_LOW`] | Medium (< `disk_warn_percent` free), High (< `disk_critical_percent`) | per filesystem on each escalation |
 //! | executor does not answer | [`rules::EXECUTOR_UNREACHABLE`] | High | once per outage, after `executor_unreachable_ms` |
+//! | gateway / executor still on the binaries from before an upgrade | [`rules::RESTART_PENDING`] | Medium | once the pending-restart file is `restart_pending_grace_ms` old, again when its units change, then at most once a day |
 //!
 //! Every evaluator here is a pure function of its inputs (times are
 //! milliseconds: daemon time for durations, Unix time for expiry), so it is
@@ -39,7 +40,22 @@ pub mod rules {
     pub const CLOCK_JUMP: &str = "robot.agent.clock_jump";
     pub const DISK_LOW: &str = "robot.agent.disk_low";
     pub const EXECUTOR_UNREACHABLE: &str = "robot.agent.executor_unreachable";
+    pub const RESTART_PENDING: &str = "robot.agent.restart_pending";
 }
+
+/// The file the package's maintainer scripts write the gated units into
+/// when an upgrade leaves them on the previous binaries
+/// (`packaging/deb/postinst`, `packaging/rpm/post`: `mark_pending_restart`);
+/// `install-bundle.sh` removes it once they are restarted.
+pub const PENDING_RESTART_FILE: &str = "/var/lib/robodr/pending-restart";
+
+/// The units a package upgrade never restarts by itself (T9): only these
+/// names in [`PENDING_RESTART_FILE`] count (`install-bundle.sh` ignores
+/// any other line too).
+pub const GATED_UNITS: &[&str] = &["robodr-executor.service", "robodr-firewall-gw.service"];
+
+/// At most this much of the pending-restart file is read.
+const PENDING_RESTART_MAX_BYTES: u64 = 4096;
 
 const DAY_MS: u64 = 86_400_000;
 
@@ -50,7 +66,8 @@ const DAY_MS: u64 = 86_400_000;
 /// "daemon": { "self_health": { "health_record_ms": 60000,
 ///   "credential_warn_days": 14, "credential_critical_days": 3,
 ///   "clock_unsynced_grace_ms": 300000, "disk_warn_percent": 10,
-///   "disk_critical_percent": 3, "executor_unreachable_ms": 30000 } }
+///   "disk_critical_percent": 3, "executor_unreachable_ms": 30000,
+///   "restart_pending_grace_ms": 900000 } }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -77,6 +94,15 @@ pub struct SelfHealthSection {
     /// `robot.agent.executor_unreachable` (1 000 ..= 3 600 000 ms, default
     /// 30 000).
     pub executor_unreachable_ms: u64,
+    /// The pending-restart file must be this old before
+    /// `robot.agent.restart_pending` (0 ..= 86 400 000 ms, default 900 000:
+    /// an install whose safety gate is open restarts the two within
+    /// seconds and removes the file).
+    pub restart_pending_grace_ms: u64,
+    /// Where the maintainer scripts record the units left on the previous
+    /// binaries (default [`PENDING_RESTART_FILE`]; another path only for
+    /// tests or a relocated install root).
+    pub restart_pending_file: std::path::PathBuf,
 }
 
 impl Default for SelfHealthSection {
@@ -89,6 +115,8 @@ impl Default for SelfHealthSection {
             disk_warn_percent: 10,
             disk_critical_percent: 3,
             executor_unreachable_ms: 30_000,
+            restart_pending_grace_ms: 900_000,
+            restart_pending_file: PENDING_RESTART_FILE.into(),
         }
     }
 }
@@ -140,6 +168,20 @@ impl SelfHealthSection {
                 3_600_000,
                 self.executor_unreachable_ms,
             );
+        }
+        if self.restart_pending_grace_ms > 86_400_000 {
+            return bad(
+                "restart_pending_grace_ms",
+                0,
+                86_400_000,
+                self.restart_pending_grace_ms,
+            );
+        }
+        if !self.restart_pending_file.is_absolute() {
+            return Err(format!(
+                "daemon.self_health.restart_pending_file must be an absolute path, got {}",
+                self.restart_pending_file.display()
+            ));
         }
         Ok(())
     }
@@ -283,6 +325,73 @@ pub fn file_age_ms(path: &Path, wall_ms: u64) -> Option<u64> {
     Some(wall_ms.saturating_sub(at_ms))
 }
 
+/// What the pending-restart file says (`status.json`
+/// `self_health.pending_restart`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingRestart {
+    /// The gated units it names, sorted, each once; empty when the file
+    /// could not be read (`read_error`).
+    pub units: Vec<String>,
+    /// Milliseconds since the file was last written (`None`: unknown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// Why the file exists but could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+}
+
+/// The pending-restart file at `path` at Unix time `wall_ms`: `None` when
+/// there is none, or it names no gated unit (nothing to restart). A file
+/// that exists but cannot be read still counts (its units unknown): the
+/// gated units may well run the previous binaries.
+pub fn pending_restart(path: &Path, wall_ms: u64) -> Option<PendingRestart> {
+    use std::io::Read;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(PendingRestart {
+                units: Vec::new(),
+                age_ms: None,
+                read_error: Some(e.to_string()),
+            })
+        }
+    };
+    let age_ms = file_age_ms(path, wall_ms);
+    if !meta.is_file() {
+        return Some(PendingRestart {
+            units: Vec::new(),
+            age_ms,
+            read_error: Some("not a regular file".into()),
+        });
+    }
+    let mut text = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| {
+        f.take(PENDING_RESTART_MAX_BYTES)
+            .read_to_end(&mut text)
+            .map(|_| ())
+    });
+    if let Err(e) = read {
+        return Some(PendingRestart {
+            units: Vec::new(),
+            age_ms,
+            read_error: Some(e.to_string()),
+        });
+    }
+    let text = String::from_utf8_lossy(&text);
+    let mut units: Vec<String> = GATED_UNITS
+        .iter()
+        .filter(|u| text.lines().any(|l| l.trim() == **u))
+        .map(|u| (*u).to_string())
+        .collect();
+    units.sort();
+    (!units.is_empty()).then_some(PendingRestart {
+        units,
+        age_ms,
+        read_error: None,
+    })
+}
+
 /// A problem worth a finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Warning {
@@ -309,6 +418,7 @@ pub enum Warning {
         for_ms: u64,
         error: Option<String>,
     },
+    RestartPending(PendingRestart),
 }
 
 impl Warning {
@@ -378,6 +488,28 @@ impl Warning {
                         .unwrap_or_default()
                 ),
             ),
+            Warning::RestartPending(p) => Deviation::new(
+                rules::RESTART_PENDING,
+                Severity::Medium,
+                format!(
+                    "{} still run the binaries from before the last package upgrade{}{}: \
+                     the installed release and its security floor are not what runs. Restart \
+                     them through the safety gate when the robot is idle or in its safe state: \
+                     install-bundle.sh restart-pending (OPERATIONS.md 7)",
+                    if p.units.is_empty() {
+                        "the gated units (robodr-firewall-gw, robodr-executor) may".to_string()
+                    } else {
+                        p.units.join(" and ")
+                    },
+                    p.age_ms
+                        .map(|a| format!(" (pending for {} s)", a / 1000))
+                        .unwrap_or_default(),
+                    p.read_error
+                        .as_deref()
+                        .map(|e| format!(" ({PENDING_RESTART_FILE} unreadable: {e})"))
+                        .unwrap_or_default()
+                ),
+            ),
         }
     }
 }
@@ -418,6 +550,8 @@ pub struct Warnings {
     jumps_reported: u64,
     jump_reported_at: Option<u64>,
     executor_reported: bool,
+    /// The units last reported pending and when (daemon ms).
+    restart_reported: Option<(Vec<String>, u64)>,
 }
 
 impl Warnings {
@@ -433,6 +567,7 @@ impl Warnings {
             jumps_reported: 0,
             jump_reported_at: None,
             executor_reported: false,
+            restart_reported: None,
         }
     }
 
@@ -568,6 +703,38 @@ impl Warnings {
     }
 }
 
+impl Warnings {
+    /// The pending-restart file at daemon time `now_ms` (`None`: none):
+    /// a finding once it is `restart_pending_grace_ms` old (its age
+    /// unknown counts as old), again when the units it names change, then
+    /// once a day while it stays. Its removal re-arms.
+    pub fn restart_pending(
+        &mut self,
+        now_ms: u64,
+        pending: Option<&PendingRestart>,
+    ) -> Vec<Warning> {
+        let Some(p) = pending else {
+            self.restart_reported = None;
+            return Vec::new();
+        };
+        if p.age_ms
+            .is_some_and(|a| a < self.cfg.restart_pending_grace_ms)
+        {
+            return Vec::new();
+        }
+        let due = match &self.restart_reported {
+            None => true,
+            Some((units, _)) if *units != p.units => true,
+            Some((_, at)) => now_ms.saturating_sub(*at) >= DAY_MS,
+        };
+        if !due {
+            return Vec::new();
+        }
+        self.restart_reported = Some((p.units.clone(), now_ms));
+        vec![Warning::RestartPending(p.clone())]
+    }
+}
+
 /// Free and total bytes (for an unprivileged writer) of the filesystem
 /// holding `dir` (`statvfs(3)`; `None` where unavailable).
 #[allow(unsafe_code)]
@@ -697,6 +864,111 @@ mod tests {
             ..Default::default()
         };
         assert!(off.validate().is_ok());
+        for bad in [
+            SelfHealthSection {
+                restart_pending_grace_ms: 86_400_001,
+                ..Default::default()
+            },
+            SelfHealthSection {
+                restart_pending_file: "pending-restart".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    fn pending(units: &[&str], age_ms: Option<u64>) -> PendingRestart {
+        PendingRestart {
+            units: units.iter().map(|u| (*u).to_string()).collect(),
+            age_ms,
+            read_error: None,
+        }
+    }
+
+    /// WP8a (Phase 2 review, medium): units left on the previous binaries
+    /// by an upgrade reach the SOC, after the grace, again when the set
+    /// changes, daily while they stay; the file's removal re-arms.
+    #[test]
+    fn restart_pending_is_reported_after_the_grace_and_rearms() {
+        let mut w = w();
+        let gw = "robodr-firewall-gw.service";
+        let ex = "robodr-executor.service";
+        assert!(w.restart_pending(0, None).is_empty());
+        // Younger than the grace (an install restarting them right now).
+        assert!(w
+            .restart_pending(1_000, Some(&pending(&[gw], Some(60_000))))
+            .is_empty());
+        let f = w.restart_pending(2_000, Some(&pending(&[gw], Some(900_000))));
+        assert_eq!(f.len(), 1);
+        let d = f[0].deviation();
+        assert_eq!(d.rule_str(), rules::RESTART_PENDING);
+        assert_eq!(d.severity, Severity::Medium);
+        assert!(d.detail.contains(gw) && d.detail.contains("restart-pending"));
+        // Not again while unchanged, within a day.
+        assert!(w
+            .restart_pending(60_000, Some(&pending(&[gw], Some(960_000))))
+            .is_empty());
+        // The set grew: again.
+        assert_eq!(
+            w.restart_pending(61_000, Some(&pending(&[ex, gw], Some(1_000_000))))
+                .len(),
+            1
+        );
+        // A day later: again.
+        assert_eq!(
+            w.restart_pending(61_000 + DAY_MS, Some(&pending(&[ex, gw], None)))
+                .len(),
+            1
+        );
+        // Restarted (file gone), then a new upgrade: reported anew.
+        assert!(w.restart_pending(DAY_MS * 2, None).is_empty());
+        assert_eq!(
+            w.restart_pending(DAY_MS * 2 + 1, Some(&pending(&[ex], None)))
+                .len(),
+            1
+        );
+        // Unreadable: the units are unknown, still reported.
+        let mut w2 = super::Warnings::new(SelfHealthSection::default(), 10_000);
+        let p = PendingRestart {
+            units: Vec::new(),
+            age_ms: None,
+            read_error: Some("Permission denied".into()),
+        };
+        let f = w2.restart_pending(0, Some(&p));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].deviation().detail.contains("unreadable"));
+    }
+
+    #[test]
+    fn pending_restart_file_reads_only_gated_units() {
+        let d = std::env::temp_dir().join(format!("robodr-pr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("pending-restart");
+        assert_eq!(pending_restart(&f, 0), None);
+        std::fs::write(&f, "robodr-agentd.service\n").unwrap();
+        assert_eq!(
+            pending_restart(&f, 0),
+            None,
+            "no gated unit: nothing pending"
+        );
+        std::fs::write(
+            &f,
+            "robodr-firewall-gw.service\nrobodr-executor.service\nrobodr-firewall-gw.service\n",
+        )
+        .unwrap();
+        let p = pending_restart(&f, u64::MAX).unwrap();
+        assert_eq!(
+            p.units,
+            ["robodr-executor.service", "robodr-firewall-gw.service"]
+        );
+        assert!(p.age_ms.is_some() && p.read_error.is_none());
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir(&f).unwrap();
+        let p = pending_restart(&f, 0).unwrap();
+        assert!(p.units.is_empty() && p.read_error.is_some());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -863,6 +1135,7 @@ mod tests {
             rules::CLOCK_JUMP,
             rules::DISK_LOW,
             rules::EXECUTOR_UNREACHABLE,
+            rules::RESTART_PENDING,
         ] {
             assert!(robodr_ocsf::builder::rule_known(r), "{r}");
             assert_eq!(robodr_ocsf::rule_info(r).data_source, "robodr_agent");

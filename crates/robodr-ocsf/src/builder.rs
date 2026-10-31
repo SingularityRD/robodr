@@ -1220,6 +1220,11 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "The robot's agent cannot reach its response executor: containment actions cannot be applied, verified or reverted, and actions in force are not watched, until it answers again.",
             AGENT,
         ),
+        "robot.agent.restart_pending" => e(
+            "Upgraded components still on the previous binaries",
+            "A package upgrade left the robot's in-path motion gateway or response executor running the binaries of the release before it (their restart waits for the safety-state gate): the installed release and its security floor are not what runs until they are restarted. The detail names the units and how long they have been pending.",
+            AGENT,
+        ),
         "robot.agent.executor_pause_overridden" => e(
             "Robot set moving while paused",
             "While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found.",
