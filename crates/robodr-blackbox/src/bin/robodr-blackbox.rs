@@ -23,6 +23,10 @@
 //! robodr-blackbox export-pending DIR --key FILE --device ID --out-dir DIR
 //!                            [--previous-keys FILE]... [--max-records N] [--max-bytes N]
 //!                            [--max-bundles N] [--allow-hmac]
+//! robodr-blackbox backup create  --out FILE|- [--root DIR] [--include-keys]
+//! robodr-blackbox backup verify  FILE
+//! robodr-blackbox backup restore FILE [--root DIR] [--spool-ready]
+//!                            [--evidence-to DIR] [--dry-run]
 //! ```
 //!
 //! **Legacy HMAC keys are refused by default** (symmetric: whoever can
@@ -115,6 +119,19 @@
 //!   they were exported (a gap after the cursor) are reported and make the
 //!   run exit 1 after writing what is there. Packaged as
 //!   `robodr-blackbox-export.timer` (OPERATIONS 8.2).
+//! - `backup` backs a unit up and restores it as OPERATIONS §14 says
+//!   (`robodr_blackbox::backup`): `create` archives the §14.1 "back up"
+//!   paths under `--root` (default `/`) into an `RBKUP001` archive
+//!   (`--out`, created new, 0600; `-` = stdout, to pipe into the site's
+//!   encryption); the keys (`etc/robodr/keys`) only with `--include-keys`.
+//!   `verify` checks an archive end to end. `restore` verifies the whole
+//!   archive first, then writes configuration (and the anchor receiver's
+//!   state) under `--root`, never anything the §14.1 table says must not
+//!   be restored (anti-rollback floors, replay stores, security floor,
+//!   TPM-bound material, exporter sequence state: each is listed with the
+//!   reason), evidence only under `--evidence-to` (never into the unit),
+//!   and the spools' `ready/` findings only with `--spool-ready` and only
+//!   into an empty `ready/`. `--dry-run` reports without writing.
 //!
 //! Exit codes: 0 = verified intact (warnings allowed unless `--strict`),
 //! 1 = verification failed, 2 = usage, I/O or key error.
@@ -162,6 +179,10 @@ const USAGE: &str = "usage:
   robodr-blackbox export-pending DIR --key FILE --device ID --out-dir DIR
                              [--previous-keys FILE]... [--max-records N] [--max-bytes N]
                              [--max-bundles N] [--allow-hmac]
+  robodr-blackbox backup create  --out FILE|- [--root DIR] [--include-keys]
+  robodr-blackbox backup verify  FILE
+  robodr-blackbox backup restore FILE [--root DIR] [--spool-ready]
+                             [--evidence-to DIR] [--dry-run]
   robodr-blackbox --version
 keygen defaults to ed25519 (secret FILE, 0600; public FILE.pub, safe to share).
 --keyring accepts secret key files (0600, own user or root) and public key
@@ -278,6 +299,7 @@ fn main() -> ExitCode {
         Some("tpm-anchor-check") => tpm_anchor_check(&argv[1..]),
         Some("anchor-mark") => anchor_mark(&argv[1..]),
         Some("export-pending") => export_pending(&argv[1..]),
+        Some("backup") => backup(&argv[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
@@ -948,6 +970,138 @@ fn export_pending(raw: &[String]) -> Result<(), Fail> {
         return Err(Fail::Verify);
     }
     Ok(())
+}
+
+fn backup(raw: &[String]) -> Result<(), Fail> {
+    use robodr_blackbox::backup;
+    let (sub, rest) = raw
+        .split_first()
+        .ok_or_else(|| "backup needs create, verify or restore".to_string())?;
+    match sub.as_str() {
+        "create" => {
+            let a = Args::parse(rest, &["out", "root"], &["include-keys"])?;
+            if !a.positional.is_empty() {
+                return Err("backup create takes no positional argument"
+                    .to_string()
+                    .into());
+            }
+            let out = a
+                .one("out")?
+                .ok_or_else(|| "--out FILE (or -) is required".to_string())?;
+            let root = PathBuf::from(a.one("root")?.unwrap_or("/"));
+            let include_keys = a.flag("include-keys");
+            let rep = if out == "-" {
+                let stdout = std::io::stdout();
+                let mut w = std::io::BufWriter::new(stdout.lock());
+                backup::create(&root, &mut w, include_keys).map_err(|e| format!("backup: {e}"))?
+            } else {
+                let mut o = std::fs::OpenOptions::new();
+                o.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    o.mode(0o600);
+                }
+                let f = o.open(out).map_err(|e| format!("{out}: {e}"))?;
+                let mut w = std::io::BufWriter::new(f);
+                let rep = backup::create(&root, &mut w, include_keys)
+                    .map_err(|e| format!("backup: {e}"))?;
+                let f = w.into_inner().map_err(|e| format!("{out}: {e}"))?;
+                f.sync_all().map_err(|e| format!("{out}: {e}"))?;
+                rep
+            };
+            for (p, why) in &rep.skipped {
+                eprintln!("robodr-blackbox: not archived: {p}: {why}");
+            }
+            eprintln!(
+                "robodr-blackbox: backup: {} files, {} directories, {} bytes{}",
+                rep.files,
+                rep.dirs,
+                rep.bytes,
+                if include_keys {
+                    " (holds private keys: encrypt it before it leaves the unit, OPERATIONS 14.2)"
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        "verify" => {
+            let a = Args::parse(rest, &[], &[])?;
+            let p = a.single_positional("archive")?;
+            let f = std::fs::File::open(p).map_err(|e| format!("{p}: {e}"))?;
+            match backup::verify(&mut std::io::BufReader::new(f)) {
+                Ok(entries) => {
+                    println!("{p}: intact, {} entries", entries.len());
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("robodr-blackbox: {p}: {e}");
+                    Err(Fail::Verify)
+                }
+            }
+        }
+        "restore" => {
+            let a = Args::parse(rest, &["root", "evidence-to"], &["spool-ready", "dry-run"])?;
+            let p = PathBuf::from(a.single_positional("archive")?);
+            let root = PathBuf::from(a.one("root")?.unwrap_or("/"));
+            let opts = backup::RestoreOptions {
+                spool_ready: a.flag("spool-ready"),
+                evidence_to: a.one("evidence-to")?.map(PathBuf::from),
+                dry_run: a.flag("dry-run"),
+            };
+            if let Some(d) = &opts.evidence_to {
+                // Evidence never goes back into the unit's live state.
+                if ["var/lib/robodr", "etc"]
+                    .iter()
+                    .any(|live| d.starts_with(root.join(live)))
+                {
+                    return Err(format!(
+                        "--evidence-to {}: inside the unit's live state under --root (evidence \
+                         goes to an archive directory, OPERATIONS 14.1)",
+                        d.display()
+                    )
+                    .into());
+                }
+            }
+            let rep = match backup::restore(&p, &root, &opts) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    eprintln!(
+                        "robodr-blackbox: {}: {e}; nothing was restored",
+                        p.display()
+                    );
+                    return Err(Fail::Verify);
+                }
+                Err(e) => return Err(format!("restore: {e}").into()),
+            };
+            let verb = if opts.dry_run {
+                "would restore"
+            } else {
+                "restored"
+            };
+            for x in &rep.restored {
+                println!("{verb}: {x}");
+            }
+            for x in &rep.evidence {
+                println!("evidence: {x}");
+            }
+            for (x, why) in &rep.refused {
+                println!("not restored: {x}: {why}");
+            }
+            eprintln!(
+                "robodr-blackbox: {verb} {} entries, {} evidence entries, {} not restored. Next \
+                 (OPERATIONS 14.3): systemd-tmpfiles --create; re-create, never copy, the \
+                 monotonic state (seal provisioning, enrolment, delivery anchor, depot); \
+                 re-install the current signed profile; then start the services",
+                rep.restored.len(),
+                rep.evidence.len(),
+                rep.refused.len()
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown backup subcommand {other:?}").into()),
+    }
 }
 
 fn read_bytes_bounded(p: &Path, max: u64) -> Result<Vec<u8>, String> {

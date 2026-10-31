@@ -84,6 +84,7 @@
     )
 )]
 
+pub mod backup;
 pub mod crl;
 pub mod crypto;
 pub mod export;
