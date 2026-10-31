@@ -228,10 +228,13 @@ SHIPPED_DOCS = (
     "/usr/share/doc/robodr/examples/metrics/robodr-metrics.timer.example",
     "/usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
 )
+# A key is its header followed by its base64 body. The header alone is not
+# key material: programs that detect keys (robodr-support-bundle's final
+# scan, minisign parsing) carry it as a string literal, and string literals
+# sit back to back in a binary's read-only data.
 SECRET_MARKERS = (
-    re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(rb"minisign encrypted secret key"),
-    re.compile(rb"untrusted comment: [^\n]*secret key"),
+    re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----\r?\n[A-Za-z0-9+/=\r\n]{40,}"),
+    re.compile(rb"untrusted comment: [ -~]{0,120}secret key\r?\n[A-Za-z0-9+/=]{100,}"),
 )
 
 
@@ -1076,7 +1079,11 @@ def self_test() -> int:
     expect("setuid", check_package("t", STD, {**base, "/usr/bin/robodr-replay": ent(mode=0o4755)}, {}, ROOT), False)
     expect("not root", check_package("t", STD, {**base, "/usr/share/x": ent(owner="robodr")}, {}, ROOT), False)
     expect("state in payload", check_package("t", STD, {**base, "/var/lib/robodr/x": ent()}, {}, ROOT), False)
-    expect("secret", check_package("t", STD, base, {"/usr/share/x": b"-----BEGIN PRIVATE KEY-----\n"}, ROOT), False)
+    expect("secret", check_package("t", STD, base, {"/usr/share/x": b"-----BEGIN PRIVATE KEY-----\n" + b"MIIEv" * 20 + b"\n"}, ROOT), False)
+    expect("minisign secret", check_package("t", STD, base, {
+        "/usr/share/x": b"untrusted comment: minisign encrypted secret key\n" + b"RWRTY0Iy" * 20 + b"\n"}, ROOT), False)
+    expect("detector literals", check_package("t", STD, base, {
+        "/usr/sbin/robodr-x": b"-----BEGINPRIVATE KEY-----minisign encrypted secret keyuntrusted comment: secret key"}, ROOT), True)
     no_seal = {k: v for k, v in base.items() if not k.endswith("/robodr-seal")}
     expect("program missing", check_package("t", STD, no_seal, {}, ROOT), False)
     no_unit = {k: v for k, v in base.items() if not k.endswith("robodr-deliverd.service")}
@@ -1181,7 +1188,7 @@ def self_test() -> int:
     fin = (ROOT / "scripts" / "release-finalize.sh").read_text()
     expect("finalize ok", check_release_finalize_text(fin), True)
     expect("no comparison", check_release_finalize_text(fin.replace("compare-rebuild.py", "true")), False)
-    total = 69
+    total = 71
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
