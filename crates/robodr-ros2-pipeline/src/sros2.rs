@@ -8,7 +8,10 @@
 //! create_keystore` / `create_enclave` / `generate_artifacts`), or a copy of
 //! its public parts:
 //!
-//! - `governance.xml`: the domain rules. RoboDR reads, per domain rule,
+//! - `governance.xml`: the domain rules. RoboDR takes the first rule whose
+//!   `<domains>` covers the configured `domain_id` (as the DDS stack does;
+//!   if none does, all rules combined, most protective, with a warning)
+//!   and reads its
 //!   `allow_unauthenticated_participants`, `discovery_protection_kind`,
 //!   `rtps_protection_kind` and the topic rules' `enable_discovery_protection`
 //!   / `metadata_protection_kind` / `data_protection_kind`.
@@ -28,9 +31,9 @@
 //!
 //! | announcement | finding |
 //! |---|---|
-//! | no DDS-Security identity, while governance has `allow_unauthenticated_participants` false | [`rules::UNTRUSTED_SECURITY_IDENTITY`], Medium: the secured robot will not talk to it, but something unauthenticated is on the robot's DDS domain |
-//! | an identity whose certificate subject no grant of the keystore names | [`rules::UNTRUSTED_SECURITY_IDENTITY`], High: a participant from another keystore / CA |
-//! | an identity whose subject is granted | nothing |
+//! | a certificate subject no grant of the keystore names | [`rules::UNTRUSTED_SECURITY_IDENTITY`], High: a participant from another keystore / CA |
+//! | an identity token of class `DDS:Auth:PKI-DH:*` whose subject is granted | nothing |
+//! | anything else (no DDS-Security parameter, or only part of one: security info, a permissions token, an identity token without subject or of another class), while the governance rule for `domain_id` has `allow_unauthenticated_participants` false | [`rules::UNTRUSTED_SECURITY_IDENTITY`], Medium: the secured robot will not talk to it, but something unauthenticated is on the robot's DDS domain |
 //!
 //! The subject is a claim in clear text (see `robodr_rtps::security`): a
 //! participant can claim a granted subject without holding its key. The
@@ -75,7 +78,8 @@ pub const MAX_PERMISSION_FILES: usize = 1024;
 /// Directory depth searched for `permissions.xml`.
 pub const MAX_DEPTH: usize = 16;
 
-/// What the governance protects (the most protective domain rule wins).
+/// What the governance rule for the robot's domain protects (all rules
+/// combined, most protective, when none covers the domain).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Governance {
     pub allow_unauthenticated_participants: bool,
@@ -137,14 +141,17 @@ pub struct Sros2Policy {
 
 impl Sros2Policy {
     /// Read `governance.xml` and every `permissions.xml` under `enclaves`
-    /// (an SROS 2 keystore's `enclaves/` directory). Errors: the directory
-    /// cannot be read, `governance.xml` is unreadable or malformed, or no
-    /// grant was found.
-    pub fn load(enclaves: &Path) -> Result<Self, String> {
+    /// (an SROS 2 keystore's `enclaves/` directory), with the governance
+    /// rule that applies to `domain_id` ([`parse_governance`]). Errors: the
+    /// directory cannot be read, `governance.xml` is unreadable or
+    /// malformed, or no grant was found.
+    pub fn load(enclaves: &Path, domain_id: u32) -> Result<Self, String> {
         let gov_path = enclaves.join("governance.xml");
         let gov = read_xml(&gov_path)?;
+        let (governance, gov_warning) = parse_governance(&gov, domain_id)?;
         let mut p = Self {
-            governance: Some(parse_governance(&gov)?),
+            governance: Some(governance),
+            warnings: gov_warning.into_iter().collect(),
             ..Self::default()
         };
         let mut files = Vec::new();
@@ -184,37 +191,51 @@ impl Sros2Policy {
     pub fn judge_spdp(&self, spdp: &SpdpInfo, src_ip: &str) -> Option<Deviation> {
         let sec = &spdp.security;
         let guid = robodr_rtps::hex12(&spdp.guid_prefix);
-        match sec.cert_subject.as_deref() {
-            None if sec.is_secured() => None, // secured, subject not announced
-            None => {
-                let gov = self.governance.as_ref()?;
-                if gov.allow_unauthenticated_participants {
-                    return None;
-                }
-                Some(Deviation::new(
+        // Any claimed subject no grant names: High, whatever the token
+        // class (a subject is never less alarming for a malformed token).
+        if let Some(subject) = sec.cert_subject.as_deref() {
+            if self.grant_for(subject).is_none() {
+                return Some(Deviation::new(
                     rules::UNTRUSTED_SECURITY_IDENTITY,
-                    Severity::Medium,
+                    Severity::High,
                     format!(
-                        "participant {guid} from {src_ip} announces no DDS-Security identity on a \
-                         domain whose SROS 2 governance requires authentication: the secured \
-                         robot ignores it, but an unauthenticated DDS participant is on the \
-                         robot's network"
+                        "participant {guid} from {src_ip} claims certificate subject {:?} (CA \
+                         {:?}), which no grant of the robot's SROS 2 keystore names: a \
+                         participant from another keystore or CA",
+                        sanitize(subject),
+                        sanitize(sec.ca_subject.as_deref().unwrap_or("?"))
                     ),
-                ))
+                ));
             }
-            Some(subject) if self.grant_for(subject).is_some() => None,
-            Some(subject) => Some(Deviation::new(
-                rules::UNTRUSTED_SECURITY_IDENTITY,
-                Severity::High,
-                format!(
-                    "participant {guid} from {src_ip} claims certificate subject {:?} (CA {:?}), \
-                     which no grant of the robot's SROS 2 keystore names: a participant from \
-                     another keystore or CA",
-                    sanitize(subject),
-                    sanitize(sec.ca_subject.as_deref().unwrap_or("?"))
-                ),
-            )),
         }
+        // A complete identity token (PKI-DH class and a subject) whose
+        // subject is granted: nothing.
+        if sec.pki_identity_subject().is_some() {
+            return None;
+        }
+        // Anything else cannot authenticate: no security parameter at all,
+        // or only part of one (security info, permissions token, an
+        // identity token without subject or of another class), which any
+        // sender can add to its SPDP.
+        let gov = self.governance.as_ref()?;
+        if gov.allow_unauthenticated_participants {
+            return None;
+        }
+        let what = if sec.is_secured() {
+            "announces DDS-Security parameters but no complete identity token (class \
+             DDS:Auth:PKI-DH with a certificate subject)"
+        } else {
+            "announces no DDS-Security identity"
+        };
+        Some(Deviation::new(
+            rules::UNTRUSTED_SECURITY_IDENTITY,
+            Severity::Medium,
+            format!(
+                "participant {guid} from {src_ip} {what} on a domain whose SROS 2 governance \
+                 requires authentication: the secured robot ignores it, but an \
+                 unauthenticated DDS participant is on the robot's network"
+            ),
+        ))
     }
 
     /// One-line statements of what the sensor can and cannot see under this
@@ -422,20 +443,65 @@ fn is_true(v: Option<String>) -> bool {
     v.is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
 }
 
-/// Parse `governance.xml`.
-pub fn parse_governance(xml: &str) -> Result<Governance, String> {
+/// Whether a `domain_rule`'s `<domains>` covers `domain_id` (`<id>`
+/// entries and `<id_range>` with `<min>` and an optional `<max>`;
+/// DDS-Security §9.4.1.2.3). Unparsable entries cover nothing.
+fn rule_covers(rule: &str, domain_id: u32) -> bool {
+    let num = |s: &str, tag: &str| text(s, tag).and_then(|v| v.parse::<u32>().ok());
+    elements(rule, "domains").into_iter().any(|d| {
+        elements(d, "id")
+            .into_iter()
+            .any(|id| unescape(id).parse::<u32>().ok() == Some(domain_id))
+            || elements(d, "id_range").into_iter().any(|r| {
+                let Some(min) = num(r, "min") else {
+                    return false;
+                };
+                let max = if elements(r, "max").is_empty() {
+                    Some(u32::MAX)
+                } else {
+                    num(r, "max")
+                };
+                max.is_some_and(|max| (min..=max).contains(&domain_id))
+            })
+    })
+}
+
+/// Parse `governance.xml` for the robot's `domain_id`: the first
+/// `domain_rule` whose `<domains>` covers it applies (DDS-Security
+/// §9.4.1.2.4). If none covers it (the robot's secured participants could
+/// not be created on that domain with this governance: a wrong keystore or
+/// `domain_id`), every rule is combined, most protective first
+/// (`allow_unauthenticated_participants` only if all rules allow it), and
+/// the second value says so.
+pub fn parse_governance(xml: &str, domain_id: u32) -> Result<(Governance, Option<String>), String> {
     let xml = strip_comments(xml);
-    let rules = elements(&xml, "domain_rule");
-    if rules.is_empty() {
+    let all = elements(&xml, "domain_rule");
+    if all.is_empty() {
         return Err("governance.xml: no domain_rule".into());
     }
-    // Most protective over all domain rules; allow_unauthenticated only if
-    // every rule allows it.
+    let (rules, warning) = match all.iter().find(|r| rule_covers(r, domain_id)) {
+        Some(r) => (vec![*r], None),
+        None => (
+            all,
+            Some(format!(
+                "governance.xml: no domain_rule covers domain_id {domain_id} (the robot's \
+                 secured participants could not join it with this governance; wrong keystore \
+                 or domain_id?): judging by all rules combined, most protective"
+            )),
+        ),
+    };
+    let g = combine_rules(&rules);
+    Ok((g, warning))
+}
+
+fn combine_rules(rules: &[&str]) -> Governance {
+    // Most protective over the rules; allow_unauthenticated only if every
+    // rule allows it.
     let mut g = Governance {
         allow_unauthenticated_participants: true,
         ..Governance::default()
     };
-    for r in rules {
+    for r in rules.iter().copied() {
         g.allow_unauthenticated_participants &=
             is_true(text(r, "allow_unauthenticated_participants"));
         g.discovery_protected |= not_none(text(r, "discovery_protection_kind"));
@@ -446,7 +512,7 @@ pub fn parse_governance(xml: &str) -> Result<Governance, String> {
             g.data_protected |= not_none(text(t, "data_protection_kind"));
         }
     }
-    Ok(g)
+    g
 }
 
 fn topics(rule: &str, list: &str) -> Vec<String> {
@@ -597,7 +663,8 @@ mod tests {
 
     #[test]
     fn sros2_default_governance() {
-        let g = parse_governance(GOV).unwrap();
+        let (g, w) = parse_governance(GOV, 0).unwrap();
+        assert_eq!(w, None);
         assert_eq!(
             g,
             Governance {
@@ -608,7 +675,64 @@ mod tests {
                 rtps_protected: true,
             }
         );
-        assert!(parse_governance("<dds/>").is_err());
+        assert!(parse_governance("<dds/>", 0).is_err());
+    }
+
+    /// Review finding (WP7, low): the `<domains>` of each domain_rule were
+    /// ignored and every rule combined, so a rule for another domain
+    /// changed the verdict on the robot's domain.
+    #[test]
+    fn governance_rule_is_chosen_by_domain() {
+        let xml = r#"<dds><domain_access_rules>
+            <domain_rule>
+              <domains><id>7</id><id_range><min>20</min><max>29</max></id_range></domains>
+              <allow_unauthenticated_participants>false</allow_unauthenticated_participants>
+              <discovery_protection_kind>ENCRYPT</discovery_protection_kind>
+              <rtps_protection_kind>SIGN</rtps_protection_kind>
+              <topic_access_rules><topic_rule><topic_expression>*</topic_expression>
+                <data_protection_kind>ENCRYPT</data_protection_kind></topic_rule></topic_access_rules>
+            </domain_rule>
+            <domain_rule>
+              <domains><id_range><min>0</min><max>6</max></id_range></domains>
+              <allow_unauthenticated_participants>true</allow_unauthenticated_participants>
+              <discovery_protection_kind>NONE</discovery_protection_kind>
+              <rtps_protection_kind>NONE</rtps_protection_kind>
+              <topic_access_rules><topic_rule><topic_expression>*</topic_expression>
+                <data_protection_kind>NONE</data_protection_kind></topic_rule></topic_access_rules>
+            </domain_rule>
+            <domain_rule>
+              <domains><id_range><min>100</min></id_range></domains>
+              <allow_unauthenticated_participants>false</allow_unauthenticated_participants>
+            </domain_rule>
+            <domain_rule>
+              <domains><id>0</id></domains>
+              <allow_unauthenticated_participants>false</allow_unauthenticated_participants>
+            </domain_rule>
+          </domain_access_rules></dds>"#;
+        // Domain 0: the second rule (the first that covers it) applies, the
+        // later one for id 0 does not.
+        let (g, w) = parse_governance(xml, 0).unwrap();
+        assert_eq!(w, None);
+        assert_eq!(
+            g,
+            Governance {
+                allow_unauthenticated_participants: true,
+                ..Governance::default()
+            }
+        );
+        for d in [7, 20, 29] {
+            let (g, w) = parse_governance(xml, d).unwrap();
+            assert_eq!(w, None);
+            assert!(!g.allow_unauthenticated_participants && g.discovery_protected);
+            assert!(g.rtps_protected && g.data_protected);
+        }
+        // Open-ended range.
+        let (g, _) = parse_governance(xml, 232).unwrap();
+        assert!(!g.allow_unauthenticated_participants && !g.discovery_protected);
+        // No rule for domain 50: all rules combined, and said so.
+        let (g, w) = parse_governance(xml, 50).unwrap();
+        assert!(w.is_some_and(|w| w.contains("domain_id 50")));
+        assert!(!g.allow_unauthenticated_participants && g.discovery_protected);
     }
 
     #[test]
@@ -682,22 +806,119 @@ mod tests {
             "<dds><grant/>",
         ] {
             let _ = parse_permissions(x);
-            let _ = parse_governance(x);
+            let _ = parse_governance(x, 0);
         }
         let r = parse_permissions("<grant name='a'><default>ALLOW</default></grant>");
         assert!(r.is_err(), "a grant without subject is refused");
+    }
+
+    fn spdp_with(security: robodr_rtps::SpdpSecurity) -> SpdpInfo {
+        SpdpInfo {
+            guid_prefix: [0xaf; 12],
+            attribution: robodr_rtps::Attribution::ParticipantGuid,
+            source: [0xaf; 12],
+            participant_entity: None,
+            protocol_version: None,
+            vendor_id: Some([0x01, 0x0f]),
+            domain_id: None,
+            domain_tag: None,
+            entity_name: None,
+            user_data: None,
+            lease_duration: None,
+            metatraffic_unicast: Vec::new(),
+            metatraffic_multicast: Vec::new(),
+            default_unicast: Vec::new(),
+            default_multicast: Vec::new(),
+            alternate_guid_prefixes: Vec::new(),
+            from_fragments: false,
+            security,
+        }
+    }
+
+    fn fixture_policy() -> Sros2Policy {
+        Sros2Policy {
+            governance: Some(parse_governance(GOV, 0).unwrap().0),
+            grants: parse_permissions(PERM).unwrap(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Review finding (WP7, medium): any one DDS-Security parameter made an
+    /// announcement "secured", and a secured announcement without a
+    /// certificate subject produced no finding. An unauthenticated sender
+    /// adding the 8-byte PID_PARTICIPANT_SECURITY_INFO (or an empty
+    /// identity token) escaped the Medium finding.
+    #[test]
+    fn partial_security_claims_are_unauthenticated() {
+        use robodr_rtps::SpdpSecurity;
+        let p = fixture_policy();
+        let partial = [
+            SpdpSecurity {
+                security_info: Some((0, 0)),
+                ..SpdpSecurity::default()
+            },
+            SpdpSecurity {
+                identity_class: Some("DDS:Auth:PKI-DH:1.0".into()),
+                ..SpdpSecurity::default()
+            },
+            SpdpSecurity {
+                permissions_ca_subject: Some("CN=sros2CA".into()),
+                ..SpdpSecurity::default()
+            },
+            // A granted subject, but not in a PKI-DH identity token.
+            SpdpSecurity {
+                identity_class: Some("Vendor:Other:1.0".into()),
+                cert_subject: Some("CN=/lab/teleop_twist".into()),
+                ..SpdpSecurity::default()
+            },
+            SpdpSecurity::default(),
+        ];
+        for sec in partial {
+            let d = p
+                .judge_spdp(&spdp_with(sec.clone()), "10.0.0.66")
+                .unwrap_or_else(|| panic!("no finding for {sec:?}"));
+            assert_eq!(d.rule, rules::UNTRUSTED_SECURITY_IDENTITY);
+            assert_eq!(d.severity, Severity::Medium, "{sec:?}");
+        }
+        // A complete, granted identity: nothing. An ungranted one: High.
+        let ok = SpdpSecurity {
+            identity_class: Some("DDS:Auth:PKI-DH:1.0".into()),
+            cert_subject: Some(r"/CN=\/lab\/teleop_twist".into()),
+            ..SpdpSecurity::default()
+        };
+        assert!(p.judge_spdp(&spdp_with(ok.clone()), "10.0.0.11").is_none());
+        let foreign = SpdpSecurity {
+            cert_subject: Some("CN=/other".into()),
+            ..ok
+        };
+        let d = p.judge_spdp(&spdp_with(foreign), "10.0.0.66").unwrap();
+        assert_eq!(d.severity, Severity::High);
+        // Where the governance allows unauthenticated participants, a
+        // partial claim is not reported.
+        let mut open = fixture_policy();
+        if let Some(g) = open.governance.as_mut() {
+            g.allow_unauthenticated_participants = true;
+        }
+        let only_info = SpdpSecurity {
+            security_info: Some((0, 0)),
+            ..SpdpSecurity::default()
+        };
+        assert!(open
+            .judge_spdp(&spdp_with(only_info), "10.0.0.66")
+            .is_none());
     }
 
     #[test]
     fn load_keystore_copy() {
         let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/captures/ros2-humble/sros2");
-        let p = Sros2Policy::load(&d).unwrap();
+        let p = Sros2Policy::load(&d, 0).unwrap();
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         let names: Vec<&str> = p.grants.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["/lab/base_controller", "/lab/teleop_twist"]);
         assert!(p.grant_for(r"/CN=\/lab\/base_controller").is_some());
         assert!(p.visibility()[0].contains("no topic"));
         assert!(p.publish_summary()[1].contains("rt/*"));
-        assert!(Sros2Policy::load(Path::new("/nonexistent/robodr")).is_err());
+        assert!(Sros2Policy::load(Path::new("/nonexistent/robodr"), 0).is_err());
     }
 }

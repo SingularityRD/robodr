@@ -273,7 +273,9 @@ fn humble_default_shared_memory_transport_is_reported_per_host() {
 const FOREIGN_CA_IP: &str = "10.77.10.67";
 
 fn keystore() -> std::sync::Arc<robodr_ros2_pipeline::sros2::Sros2Policy> {
-    std::sync::Arc::new(robodr_ros2_pipeline::sros2::Sros2Policy::load(&fixture("sros2")).unwrap())
+    std::sync::Arc::new(
+        robodr_ros2_pipeline::sros2::Sros2Policy::load(&fixture("sros2"), 0).unwrap(),
+    )
 }
 
 fn replay_opts(profile: Profile, file: &str, opts: PipelineOptions) -> Replay {
@@ -413,9 +415,13 @@ fn sros2_restarted_robot_resolves_and_rogues_are_reported() {
     // restarted robot and teleop were unknown participants here: `learn`
     // takes the identity's `vendor` from the prefix.)
 
-    // The subject hash only stands in for the vendor of a participant that
-    // announces a DDS-Security identity: the unsecured rogue cannot borrow
-    // it even from a robot address.
+    // The subject hash only stands in for the vendor of an SPDP whose
+    // PKI-DH identity token claims the subject the prefix is derived from:
+    // this unmodified, unsecured rogue does not borrow it even from a robot
+    // address. (A crafted SPDP can still claim the subject and use its
+    // prefix: identity.rs unit test
+    // `copied_secured_prefix_head_without_its_subject_does_not_resolve`
+    // shows what it must at least do.)
     let mut pinned = profile;
     for id in pinned.participant_identities.values_mut() {
         id.ips.insert(ROGUE_IP.into());
@@ -444,7 +450,7 @@ fn sros2_participant_from_another_keystore_is_high() {
         dir.join("lab/base_controller/permissions.xml"),
     )
     .unwrap();
-    let policy = robodr_ros2_pipeline::sros2::Sros2Policy::load(&dir).unwrap();
+    let policy = robodr_ros2_pipeline::sros2::Sros2Policy::load(&dir, 0).unwrap();
     let opts = PipelineOptions {
         sros2: Some(std::sync::Arc::new(policy)),
         ..PipelineOptions::default()

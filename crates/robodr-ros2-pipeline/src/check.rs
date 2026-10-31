@@ -12,9 +12,11 @@
 //!    pass), so a key the daemon would ignore with a log warning (a typo such
 //!    as `bindng`, `hold_msec`) is reported here as a warning too;
 //! 3. runs [`Config::validate`] (ranges, absolute paths, port overlap, ...);
-//! 4. lists `/dev/shm` for DDS shared-memory segments (Fast DDS SHM,
-//!    data sharing, iceoryx): their traffic is invisible to the capture
-//!    (warning; see `robodr_capture::shm`);
+//! 4. lists `/dev/shm` **of the host running the check** for DDS
+//!    shared-memory segments (Fast DDS SHM, data sharing, iceoryx): their
+//!    traffic is invisible to the capture (a warning when segments are
+//!    found, a summary line otherwise; see `robodr_capture::shm`). Run the
+//!    check on the robot for this to mean anything;
 //! 5. reads the profile and evaluates its trust (signature, metadata,
 //!    revocation, anti-rollback decision against the current state file)
 //!    with [`load_profile_deferred`], **without writing** the state file,
@@ -26,7 +28,10 @@
 //! interfaces explicitly).
 //!
 //! Outcome: errors make the configuration invalid (exit 1); warnings do not,
-//! unless `--strict` is given. A profile the daemon would refuse to enforce
+//! unless `--strict` is given. Limits that hold for every deployment (the
+//! capture cannot see shared-memory transports; what an SROS 2 governance
+//! leaves visible) are summary lines starting with `note:`, not warnings,
+//! so a correct configuration can pass `--strict`. A profile the daemon would refuse to enforce
 //! (it then runs observe-only and raises `robot.ros2.profile_refused`) is a
 //! warning, as in `robodr-agentd --check-config`, and an error under
 //! `--strict`.
@@ -79,10 +84,19 @@ pub fn check_config_file(path: &Path) -> CheckReport {
     match read_bounded(path) {
         Ok(text) => {
             let mut r = check_config_text(&text, crate::config::system_default_route_interface);
+            // The host running the check, which is the robot only when the
+            // check runs there: a warning only when segments are found.
             match robodr_capture::shm::scan_dir(Path::new(robodr_capture::shm::DEV_SHM)) {
-                Ok(scan) => r.warnings.extend(shm_warning(&scan)),
-                Err(e) => r.warnings.push(format!(
-                    "cannot list {}: {} (DDS shared-memory use on this host not checked)",
+                Ok(scan) => match shm_warning(&scan) {
+                    Some(w) => r.warnings.push(w),
+                    None => r.summary.push(format!(
+                        "no DDS shared-memory segment in {} of the host running this check",
+                        robodr_capture::shm::DEV_SHM
+                    )),
+                },
+                Err(e) => r.summary.push(format!(
+                    "note: cannot list {}: {} (DDS shared-memory use on the host running this \
+                     check not checked)",
                     robodr_capture::shm::DEV_SHM,
                     sanitize(&e.to_string())
                 )),
@@ -100,15 +114,16 @@ pub fn check_config_file(path: &Path) -> CheckReport {
     }
 }
 
-/// The warning for DDS shared-memory segments found on this host
-/// (`/dev/shm`), if any: DDS traffic between this host's participants over
-/// them is never captured.
+/// The warning for DDS shared-memory segments found in `/dev/shm` of the
+/// host running the check, if any: DDS traffic between that host's
+/// participants over them is never captured.
 pub fn shm_warning(scan: &robodr_capture::shm::ShmScan) -> Option<String> {
     (!scan.is_empty()).then(|| {
         format!(
-            "{} holds DDS shared-memory segments ({}{}): DDS traffic between processes on this \
-             host goes over shared memory and is invisible to the capture; commission the \
-             robot with UDP-only transports (docs/DDS-TRANSPORTS.md)",
+            "{} of the host running this check holds DDS shared-memory segments ({}{}): if \
+             this is the robot, DDS traffic between its processes goes over shared memory and \
+             is invisible to the capture; commission the robot with UDP-only transports \
+             (docs/DDS-TRANSPORTS.md)",
             robodr_capture::shm::DEV_SHM,
             scan.summary(),
             if scan.truncated {
@@ -121,7 +136,13 @@ pub fn shm_warning(scan: &robodr_capture::shm::ShmScan) -> Option<String> {
 }
 
 fn read_bounded(path: &Path) -> Result<String, String> {
+    // Stat before opening: opening a FIFO blocks until a writer appears.
+    let meta = std::fs::metadata(path).map_err(|e| format!("cannot open: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
     let f = std::fs::File::open(path).map_err(|e| format!("cannot open: {e}"))?;
+    // Again on the opened file (the path may have changed in between).
     let meta = f.metadata().map_err(|e| format!("cannot stat: {e}"))?;
     if !meta.is_file() {
         return Err("not a regular file".into());
@@ -265,18 +286,33 @@ pub fn check_config_text(
                          is NOT watched by the capture",
                         sanitize(&path.display().to_string())
                     ));
-                    if let Err(e) = std::fs::File::open(path) {
-                        r.errors.push(format!(
-                            "capture.pcap_replay {}: cannot open: {}",
-                            sanitize(&path.display().to_string()),
+                    let shown = sanitize(&path.display().to_string());
+                    // Stat first: opening a FIFO would block the check.
+                    match std::fs::metadata(path) {
+                        Err(e) => r.errors.push(format!(
+                            "capture.pcap_replay {shown}: cannot open: {}",
                             sanitize(&e.to_string())
-                        ));
+                        )),
+                        Ok(m) if !m.is_file() => r.warnings.push(format!(
+                            "capture.pcap_replay {shown} is not a regular file: not opened by \
+                             the check"
+                        )),
+                        Ok(_) => {
+                            if let Err(e) = std::fs::File::open(path) {
+                                r.errors.push(format!(
+                                    "capture.pcap_replay {shown}: cannot open: {}",
+                                    sanitize(&e.to_string())
+                                ));
+                            }
+                        }
                     }
                 }
             }
-            r.warnings.push(
-                "shared-memory DDS transports (Fast DDS SHM, Cyclone iceoryx, Connext SHM) \
-                 are invisible to the capture: commission the robot with them off \
+            // A fact about every capture, not about this configuration:
+            // a summary note, so `--strict` can pass.
+            r.summary.push(
+                "note: shared-memory DDS transports (Fast DDS SHM, Cyclone iceoryx, Connext \
+                 SHM) are invisible to the capture: commission the robot with them off \
                  (docs/DDS-TRANSPORTS.md)"
                     .into(),
             );
@@ -295,8 +331,14 @@ pub fn check_config_text(
             policy.grants.len()
         ));
         r.summary.extend(policy.publish_summary());
-        r.warnings
-            .extend(policy.visibility().into_iter().map(|v| sanitize(&v)));
+        // What the governance leaves visible follows from a correct
+        // (secured) deployment: summary notes, not warnings.
+        r.summary.extend(
+            policy
+                .visibility()
+                .into_iter()
+                .map(|v| format!("note: {}", sanitize(&v))),
+        );
     }
 
     // Profile + trust, without writing the anti-rollback state.
@@ -491,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_on_warns_about_shared_memory_and_replay_is_checked() {
+    fn capture_on_notes_shared_memory_and_replay_is_checked() {
         let d = tmpdir("cap");
         let p = unlocked_profile(&d);
         let r = check_config_text(
@@ -500,7 +542,7 @@ mod tests {
         );
         assert!(r.errors.is_empty(), "{r:?}");
         assert!(
-            r.warnings.iter().any(|w| w.contains("shared-memory")),
+            r.summary.iter().any(|s| s.contains("shared-memory")),
             "{r:?}"
         );
         assert!(r.summary.iter().any(|s| s.contains("lo,eth0")), "{r:?}");
@@ -539,7 +581,7 @@ mod tests {
         );
         assert!(r.errors.is_empty(), "{r:?}");
         assert!(r.summary.iter().any(|s| s.contains("2 grant(s)")), "{r:?}");
-        assert!(r.warnings.iter().any(|w| w.contains("no topic")), "{r:?}");
+        assert!(r.summary.iter().any(|s| s.contains("no topic")), "{r:?}");
         let r = check_config_text(
             &section(&p, "sros2_keystore = \"relative/enclaves\"\n"),
             eth0,
@@ -551,6 +593,94 @@ mod tests {
         );
         assert!(
             r.errors.iter().any(|e| e.contains("sros2_keystore")),
+            "{r:?}"
+        );
+    }
+
+    /// Review finding (WP7, medium): with the capture enabled, a static
+    /// shared-memory note was a warning, so `--strict` failed on every
+    /// configuration with passive capture, whatever the operator did; the
+    /// SROS 2 visibility statements did the same for every keystore.
+    #[test]
+    fn static_notes_do_not_fail_strict() {
+        let d = tmpdir("strictnotes");
+        let p = unlocked_profile(&d);
+        let ks = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/captures/ros2-humble/sros2");
+        let r = check_config_text(
+            &section(
+                &p,
+                &format!(
+                    "sros2_keystore = {:?}\n[module.robodr-sensor-ros2.capture]\nenabled = true\n",
+                    ks.display().to_string()
+                ),
+            ),
+            eth0,
+        );
+        assert!(r.errors.is_empty(), "{r:?}");
+        let static_notes: Vec<&String> = r
+            .warnings
+            .iter()
+            .filter(|w| w.contains("shared-memory") || w.contains("SROS 2 governance"))
+            .collect();
+        assert!(static_notes.is_empty(), "{static_notes:?}");
+        assert!(
+            r.summary.iter().any(|s| s.contains("shared-memory")),
+            "{r:?}"
+        );
+        assert!(r.summary.iter().any(|s| s.contains("no topic")), "{r:?}");
+    }
+
+    /// Review finding (WP7, low): the file was opened before the regular
+    /// file check, so a FIFO made `--check-config` block for ever.
+    #[test]
+    fn fifo_is_refused_without_blocking() {
+        let d = tmpdir("fifo");
+        let f = d.join("pulsar.toml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&f)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            eprintln!("mkfifo unavailable: skipped");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = f.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_config_file(&path));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("check_config_file blocked on a FIFO");
+        assert!(
+            r.errors.iter().any(|e| e.contains("not a regular file")),
+            "{r:?}"
+        );
+        // pcap_replay pointing at a FIFO: not opened by the check either.
+        let p = unlocked_profile(&d);
+        let cfg = d.join("replay.toml");
+        std::fs::write(
+            &cfg,
+            section(
+                &p,
+                &format!(
+                    "[module.robodr-sensor-ros2.capture]\nenabled = true\npcap_replay = {:?}\n",
+                    f.display().to_string()
+                ),
+            ),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_config_file(&cfg));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("check_config_file blocked on a pcap_replay FIFO");
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("not a regular file")),
             "{r:?}"
         );
     }

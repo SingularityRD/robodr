@@ -853,6 +853,13 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    `robot.profile_version` in `agentd.json` was removed: the version in
    findings is the signed `metadata.profile_version`; delete the key.
 
+   With `sros2_keystore` set (SROS 2 robots, `docs/DDS-TRANSPORTS.md`
+   section 3), a missing or unreadable keystore, or one without a grant, is
+   a configuration error: the whole `robodr-sensor-ros2` module does not
+   start and **all DDS monitoring stops**, not only the SROS 2 check. After
+   moving or rotating the keystore, update `sros2_keystore` and run
+   `robodr-ros2-watch --check-config` before restarting `robodr-pulsard`.
+
    The anti-rollback state file must be writable by the daemon. The package
    creates `/var/lib/robodr/profile-state` (`robodr-agentd:robodr`, agentd's
    `agentd.json`) and `/var/lib/robodr/profile-state-pulsard` (`root:robodr`,

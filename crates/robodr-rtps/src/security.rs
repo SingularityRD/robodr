@@ -41,6 +41,9 @@ pub const PID_PARTICIPANT_SECURITY_INFO: u16 = 0x1005;
 pub const MAX_PROPERTIES: usize = 16;
 /// Longest class id / property name / value kept (longer ones are skipped).
 pub const MAX_TOKEN_STRING: usize = 512;
+/// Class id prefix of the builtin authentication plugin's identity token
+/// (`DDS:Auth:PKI-DH:1.0`, §9.3.2.1).
+pub const PKI_DH_CLASS_PREFIX: &str = "DDS:Auth:PKI-DH:";
 
 /// What an SPDP announcement says about the participant's DDS-Security.
 /// `Default` = nothing was announced (an unsecured participant).
@@ -60,12 +63,28 @@ pub struct SpdpSecurity {
 }
 
 impl SpdpSecurity {
-    /// The participant announced any DDS-Security parameter.
+    /// The participant announced any DDS-Security parameter. Any one of
+    /// them is enough, so this is only a hint: an unauthenticated sender
+    /// can add an 8-byte `PID_PARTICIPANT_SECURITY_INFO` to its SPDP. Use
+    /// [`Self::pki_identity_subject`] for "announces a complete identity".
     pub fn is_secured(&self) -> bool {
         self.identity_class.is_some()
             || self.cert_subject.is_some()
             || self.security_info.is_some()
             || self.permissions_ca_subject.is_some()
+    }
+
+    /// The certificate subject (`dds.cert.sn`) of a complete identity
+    /// token: class `DDS:Auth:PKI-DH:*` and a non-empty subject. `None` for
+    /// an unsecured participant and for any partial or other-class security
+    /// claim. Still a claim, not a proof (see the module docs).
+    pub fn pki_identity_subject(&self) -> Option<&str> {
+        self.identity_class
+            .as_deref()
+            .filter(|c| c.starts_with(PKI_DH_CLASS_PREFIX))?;
+        self.cert_subject
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -238,7 +257,35 @@ mod tests {
             assert_eq!(s.ca_subject.as_deref(), Some("CN=sros2CA"));
             assert_eq!(s.identity_class.as_deref(), Some("DDS:Auth:PKI-DH:1.0"));
             assert!(s.is_secured());
+            assert_eq!(s.pki_identity_subject(), Some("CN=/lab/teleop_twist"));
         }
+    }
+
+    #[test]
+    fn partial_or_other_class_identity_is_not_a_pki_identity() {
+        // Security info only (8 bytes anyone can add): secured, no identity.
+        let mut s = SpdpSecurity::default();
+        assert!(apply_param(
+            &mut s,
+            PID_PARTICIPANT_SECURITY_INFO,
+            &[0; 8],
+            true
+        ));
+        assert!(s.is_secured());
+        assert_eq!(s.pki_identity_subject(), None);
+        // PKI-DH class without a subject, or with a blank one.
+        for props in [&[][..], &[("dds.cert.sn", " ")][..]] {
+            let mut s = SpdpSecurity::default();
+            let v = holder("DDS:Auth:PKI-DH:1.0", props, true);
+            assert!(apply_param(&mut s, PID_IDENTITY_TOKEN, &v, true));
+            assert!(s.is_secured());
+            assert_eq!(s.pki_identity_subject(), None);
+        }
+        // A subject under another class.
+        let mut s = SpdpSecurity::default();
+        let v = holder("Vendor:Custom:1.0", &[("dds.cert.sn", "CN=x")], true);
+        assert!(apply_param(&mut s, PID_IDENTITY_TOKEN, &v, true));
+        assert_eq!(s.pki_identity_subject(), None);
     }
 
     #[test]
