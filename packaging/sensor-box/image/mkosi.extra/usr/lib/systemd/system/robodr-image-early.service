@@ -1,0 +1,18 @@
+# RoboDR sensor box image: provisioning, strict default firewall, runtime
+# network and time configuration (every boot, before networking).
+[Unit]
+Description=RoboDR sensor box: provisioning and runtime network configuration
+Documentation=file:/usr/share/doc/robodr/sensor-box-image/README.md
+DefaultDependencies=no
+After=robodr-etc-overlay.service local-fs.target
+Requires=robodr-etc-overlay.service
+Before=network-pre.target systemd-networkd.service systemd-timesyncd.service nftables.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/robodr-image/robodr-image-early
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,90 @@
+#!/bin/sh
+# robodr-image-early: every boot, before networking
+# (robodr-image-early.service). Never fails the boot.
+#
+#  1. First boot: writes /etc/robodr/provision.env (the writable overlay,
+#     robodr-etc-overlay.service) from the kernel command line
+#     (robodr.unit_id= robodr.capture_if= robodr.uplink_if= robodr.site=
+#     robodr.ntp= robodr.role= robodr.exporter=), each value validated; an
+#     existing file is never changed.
+#  2. Host firewall: installs the strict default ruleset as
+#     /etc/robodr/nftables.conf (/etc/nftables.conf points there) when there
+#     is none: only loopback and replies, nothing on the capture NIC.
+#  3. Runtime network and time configuration under /run (the root file
+#     system is read-only): the capture NIC silent and promiscuous
+#     (networkd example, Name= from provisioning), the uplink by DHCP unless
+#     the site put its own *.network files in /etc/robodr/network/, NTP.
+set -eu
+. "${ROBODR_IMAGE_ROOT:-}/usr/lib/robodr-image/common.sh"
+
+install -d -m 0700 "$STATE"
+
+# 1. Provisioning from the kernel command line, first boot only.
+if [ ! -f "$PROVISION" ]; then
+    tmp="$PROVISION.tmp"
+    : >"$tmp"
+    chmod 0640 "$tmp"
+    for arg in $(cat "$R/proc/cmdline" 2>/dev/null || true); do
+        key=""
+        case "$arg" in
+        robodr.unit_id=*) key=ROBODR_UNIT_ID kind=unit_id ;;
+        robodr.site=*) key=ROBODR_SITE kind=site ;;
+        robodr.capture_if=*) key=ROBODR_CAPTURE_IF kind=iface ;;
+        robodr.uplink_if=*) key=ROBODR_UPLINK_IF kind=iface ;;
+        robodr.ntp=*) key=ROBODR_NTP kind=ntp ;;
+        robodr.role=*) key=ROBODR_ROLE kind=role ;;
+        robodr.exporter=*) key=ROBODR_EXPORTER kind=exporter ;;
+        esac
+        [ -n "$key" ] || continue
+        val="${arg#*=}"
+        if valid "$kind" "$val"; then
+            echo "$key=$val" >>"$tmp"
+        else
+            log "ignoring invalid ${arg%%=*} on the kernel command line"
+        fi
+    done
+    if [ -s "$tmp" ]; then
+        mv "$tmp" "$PROVISION"
+        log "provisioning written to /etc/robodr/provision.env from the kernel command line"
+    else
+        rm -f "$tmp"
+        log "not provisioned: no /etc/robodr/provision.env and no robodr.* kernel parameters (README.md, Provisioning)"
+    fi
+fi
+
+# 2. Host firewall: strict default until the site installs its own.
+if [ ! -e "$R/etc/robodr/nftables.conf" ]; then
+    install -m 0640 "$R/usr/lib/robodr-image/nftables.default.conf" "$R/etc/robodr/nftables.conf"
+    log "installed the strict default host firewall (/etc/robodr/nftables.conf)"
+fi
+
+# 3. Runtime network and time configuration.
+net="$R/run/systemd/network"
+install -d -m 0755 "$net"
+capture="$(get ROBODR_CAPTURE_IF)"
+uplink="$(get ROBODR_UPLINK_IF)"
+ntp="$(get ROBODR_NTP)"
+if [ -n "$capture" ] && valid iface "$capture"; then
+    sed "s/^Name=.*/Name=$capture/" \
+        "$R/usr/share/doc/robodr/examples/sensor-box/10-robodr-capture.network.example" \
+        >"$net/10-robodr-capture.network"
+    chmod 0644 "$net/10-robodr-capture.network"
+elif [ -n "$capture" ]; then
+    log "ROBODR_CAPTURE_IF in provision.env is invalid; capture NIC not configured"
+fi
+site_net="$R/etc/robodr/network"
+if [ -d "$site_net" ] && ls "$site_net"/*.network >/dev/null 2>&1; then
+    for f in "$site_net"/*.network; do
+        install -m 0644 "$f" "$net/50-site-$(basename "$f")"
+    done
+elif [ -n "$uplink" ] && valid iface "$uplink"; then
+    printf '[Match]\nName=%s\n\n[Network]\nDHCP=yes\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nLLDP=no\nEmitLLDP=no\n' \
+        "$uplink" >"$net/20-robodr-uplink.network"
+    chmod 0644 "$net/20-robodr-uplink.network"
+fi
+if [ -n "$ntp" ] && valid ntp "$ntp"; then
+    install -d -m 0755 "$R/run/systemd/timesyncd.conf.d"
+    printf '[Time]\nNTP=%s\n' "$ntp" >"$R/run/systemd/timesyncd.conf.d/50-robodr.conf"
+    chmod 0644 "$R/run/systemd/timesyncd.conf.d/50-robodr.conf"
+fi
+exit 0

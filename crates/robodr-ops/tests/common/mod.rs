@@ -9,11 +9,13 @@ pub struct Tmp(pub PathBuf);
 
 impl Tmp {
     pub fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!(
-            "robodr-ops-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        // Only [A-Za-z0-9-] in the name: the paths end up in shell stubs.
+        let thread: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        let d =
+            std::env::temp_dir().join(format!("robodr-ops-{tag}-{}-{thread}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         Tmp(d)

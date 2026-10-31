@@ -49,6 +49,14 @@ Static checks (no package needed; CI job `scripts`):
      CPUQuota=. (The inline gateway is deliberately not CPU-capped: it is a
      real-time process in the motion path, where throttling is latency.)
 
+  12. The sensor box image recipe (packaging/sensor-box/image, T77): the
+     root partition is read-only (ReadOnly=yes), build-image.sh verifies
+     the bundle's minisign signature before it extracts anything and then
+     its SHA256SUMS, has no unsigned switch, the post-install script checks
+     the package digest and refuses an image with keys, the first-boot
+     script generates the keys with robodr-setup init, and no file of the
+     recipe holds key material.
+
   5a. Every unit (regular and focal) and every unit with each of its
      drop-in examples applied: with SecureBits=noroot / noroot-locked, a
      process of uid 0 gets capabilities on execve only through the ambient
@@ -449,6 +457,45 @@ def check_unit_resources(root: Path) -> list[str]:
     return errs
 
 
+def check_image_recipe_texts(files: dict[str, bytes]) -> list[str]:
+    """files: path relative to packaging/sensor-box/image -> content."""
+    errs = []
+    t = {k: v.decode("utf-8", "replace") for k, v in files.items()}
+    where = "packaging/sensor-box/image"
+    root = t.get("mkosi.repart/10-root.conf", "")
+    if unit_values(root, "Type") != ["root"] or unit_values(root, "ReadOnly") != ["yes"]:
+        errs.append(f"{where}/mkosi.repart/10-root.conf: the root partition must be Type=root, ReadOnly=yes")
+    code = "\n".join(ln for ln in t.get("build-image.sh", "").splitlines() if not ln.lstrip().startswith("#"))
+    v, x = code.find("minisign -V"), code.find("tar ")
+    if v < 0 or x < 0 or v > x:
+        errs.append(f"{where}/build-image.sh: must verify the minisign signature before extracting the bundle")
+    if x < 0 or "sha256sum -c" not in code[x:]:
+        errs.append(f"{where}/build-image.sh: must check the bundle's SHA256SUMS after extracting it")
+    if re.search(r"unsigned|minisign -V[^\n]*\|\|\s*true", code, re.I):
+        errs.append(f"{where}/build-image.sh: has a way around the signature check")
+    post = t.get("mkosi.postinst.chroot", "")
+    if "sha256sum -c" not in post or "/etc/robodr/keys" not in post:
+        errs.append(f"{where}/mkosi.postinst.chroot: must check the package digest and refuse an image with keys")
+    late = t.get("mkosi.extra/usr/lib/robodr-image/robodr-image-late", "")
+    if 'robodr-setup "$@"' not in late or "set -- init" not in late:
+        errs.append(f"{where}/robodr-image-late: first boot must generate the keys with robodr-setup init")
+    for name, body in sorted(files.items()):
+        if name.endswith((".key", ".pem")):
+            errs.append(f"{where}/{name}: key file in the image recipe")
+        for m in SECRET_MARKERS:
+            if m.search(body):
+                errs.append(f"{where}/{name}: contains private key material")
+    return errs
+
+
+def check_image_recipe(root: Path) -> list[str]:
+    d = root / "packaging" / "sensor-box" / "image"
+    if not d.is_dir():
+        return ["packaging/sensor-box/image: missing"]
+    files = {str(f.relative_to(d)): f.read_bytes() for f in sorted(d.rglob("*")) if f.is_file()}
+    return check_image_recipe_texts(files)
+
+
 def unit_values(text: str, key: str) -> list[str]:
     """Every value of KEY= in a unit (in order; an empty one resets)."""
     out: list[str] = []
@@ -643,6 +690,7 @@ def static_checks(root: Path) -> list[str]:
         + check_scripts(root)
         + check_units_caps(root)
         + check_unit_resources(root)
+        + check_image_recipe(root)
         + check_identities(root)
         + check_rules_unit(root)
         + check_release_workflow(root)
@@ -1040,6 +1088,19 @@ def self_test() -> int:
     expect("pulsard without CPUQuota", check_unit_resources_text(
         "robodr-pulsard.service", pulsard.replace("CPUQuota=100%\n", "")), False)
     expect("oneshot needs no cap", check_unit_resources_text("o", "[Service]\nType=oneshot\nExecStart=/bin/true\n"), True)
+    # 12. The sensor box image recipe.
+    img = pk / "sensor-box" / "image"
+    real_img = {str(f.relative_to(img)): f.read_bytes() for f in img.rglob("*") if f.is_file()}
+    expect("image recipe ok", check_image_recipe_texts(real_img), True)
+    rootconf = real_img["mkosi.repart/10-root.conf"].replace(b"ReadOnly=yes", b"")
+    expect("writable root", check_image_recipe_texts({**real_img, "mkosi.repart/10-root.conf": rootconf}), False)
+    bi = real_img["build-image.sh"].decode()
+    moved = bi.replace("minisign -Vq -p", "true -p").replace(
+        "(cd \"$top\" && sha256sum", "minisign -Vq -p \"$pubkey\" -m \"$bundle\"\n(cd \"$top\" && sha256sum")
+    expect("extract before verify", check_image_recipe_texts({**real_img, "build-image.sh": moved.encode()}), False)
+    bypass = bi + "\n[ -n \"${ROBODR_ALLOW_UNSIGNED:-}\" ] && exit 0\n"
+    expect("unsigned switch", check_image_recipe_texts({**real_img, "build-image.sh": bypass.encode()}), False)
+    expect("key in recipe", check_image_recipe_texts({**real_img, "mkosi.extra/etc/robodr/keys/a.key": b"x"}), False)
     # 10. The release workflow.
     rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
     expect("release workflow ok", check_release_workflow_text(rel), True)
@@ -1049,7 +1110,7 @@ def self_test() -> int:
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
     expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 59
+    total = 64
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
