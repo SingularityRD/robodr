@@ -429,11 +429,17 @@ robodr-commission bind --in draft.json --out bound.json \
 robodr-commission lock --in bound.json --signoff bound.json.signoff.json ...
 ```
 
-`bind` validates each file as its loader will (the policy parses, a
-firewall file compiles against the draft), writes its digest into the
-draft's `bound_config` (profile *content*), and writes a new sign-off list:
-the learner's items plus one `bound_config:<role> <digest>` item per file,
-all unconfirmed again, and the manifest. A `bound_config` item is a motion
+`bind` validates the policy and firewall files as their loaders will (the
+policy parses, a firewall file compiles against the draft). For
+`--executor-config` it checks only the shape (the `robodr-executor-config/v1`
+schema and a `motion` object): `robodr-executor` depends on this crate, so
+its parser is not available here. Run `robodr-executor --config FILE
+--check-config` on the same file before binding it. `bind` then writes each
+digest into the draft's `bound_config` (profile *content*), and writes a new
+sign-off list: the learner's items plus one `bound_config:<role> <digest>`
+item per file, all unconfirmed again, and the manifest. Binding in steps
+works: given the previous run's list (`--signoff`), `bind` keeps the items
+of the bindings it does not replace. A `bound_config` item is a motion
 item, so `motion_quorum` distinct operators must sign; the floor
 (`required_items`) requires a confirmed item for every binding, so a forged
 list cannot drop it. The profile signature, the attestation and the

@@ -433,6 +433,31 @@ fn bind_refuses_invalid_files_and_locked_input() {
     // Nothing to bind.
     let o = run(&["bind", "--in", s(&c.draft), "--out", s(&c.d.join("b.json"))]);
     assert_eq!(code(&o), 2);
+    // Not an executor configuration, or a `motion` that is not an object
+    // (review WP6: only a digest was computed before).
+    for bad_exe in [
+        r#"{"motion": {"nav2": {"oem_validated": true}}}"#,
+        r#"{"schema": "robodr-executor-config/v1", "motion": [1]}"#,
+        r#"{"schema": "robodr-executor-config/v1", "motion": "x"}"#,
+    ] {
+        let exe = c.d.join("bad-executor.json");
+        std::fs::write(&exe, bad_exe).unwrap();
+        let o = run(&[
+            "bind",
+            "--in",
+            s(&c.draft),
+            "--out",
+            s(&c.d.join("b.json")),
+            "--executor-config",
+            s(&exe),
+        ]);
+        assert_eq!(code(&o), 2, "{bad_exe}: {}", err(&o));
+        assert!(
+            err(&o).contains("not a valid executor_motion file"),
+            "{}",
+            err(&o)
+        );
+    }
     // A firewall file that does not compile against the draft.
     let fw = c.d.join("fw.json");
     std::fs::write(&fw, "{\"channels\": {}}").unwrap();

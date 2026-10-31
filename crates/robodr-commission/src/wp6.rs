@@ -28,7 +28,8 @@ const MAX_BOUND_FILE_BYTES: u64 = 1 << 20;
 const MAX_REPORT_BYTES: u64 = robodr_commission::ops::MAX_REPORT_BYTES;
 
 /// Check `text` is a valid file of `role` for `draft` (what the unit will
-/// load), before its digest is bound.
+/// load; for the executor configuration only its shape, see below),
+/// before its digest is bound.
 fn validate_role(
     role: &str,
     path: &str,
@@ -58,6 +59,24 @@ fn validate_role(
                     "agentd's joint_config defines joint_channels (and platform) only".into(),
                 ));
             }
+        }
+        ROLE_EXECUTOR_MOTION => {
+            // robodr-executor depends on this crate, so its parser is not
+            // available here: only the shape is checked (review WP6). The
+            // executor's own `--check-config` is the full check.
+            let v: serde_json::Value =
+                serde_json::from_str(text).map_err(|e| bad(e.to_string()))?;
+            if v.get("schema").and_then(serde_json::Value::as_str)
+                != Some("robodr-executor-config/v1")
+            {
+                return Err(bad(
+                    "not an executor configuration (schema robodr-executor-config/v1)".into(),
+                ));
+            }
+            if !v.get("motion").is_some_and(serde_json::Value::is_object) {
+                return Err(bad("`motion` must be an object".into()));
+            }
+            digest_for_role(role, text).map_err(bad)?;
         }
         _ => {
             digest_for_role(role, text).map_err(bad)?;
