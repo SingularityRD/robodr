@@ -232,7 +232,7 @@ segment, `allowed_src_macs`) on every channel.
 | `unitree_hg_lowcmd` | RTPS DATA `unitree_hg::msg::dds_::LowCmd_` on `rt/lowcmd` (G1, H1-2) | joint, 35 slots | `mode_pr` / `mode_machine` passed through (pinnable) |
 | `unitree_go_lowcmd` | RTPS DATA `unitree_go::msg::dds_::LowCmd_` (Go2, B2, H1) | joint, 20 slots | |
 | `unitree_sport_request` | RTPS DATA `unitree_api::msg::dds_::Request_` on `rt/api/sport/request` | twist | `Move` (1008) decided as `(vx, vy, 0)/(0, 0, vyaw)`; a malformed `Move` as non-finite; `StopMove` always allowed, queries pass; other calls only if listed in `allowed_api_ids` (**required**; `[]` = velocity, stop and queries only), then a zero-velocity check (source, rate); an api id outside `i32` (aliasing) is suppressed |
-| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes only if listed in `allowed_high_modes` (**required**; `[0]` = idle only), then a zero-velocity check; `bms.off` non-zero refused |
+| `go1_high_cmd` | UDP `HighCmd` (129 octets), default port 8082 | twist | mode 2 decided on `velocity` / `yawSpeed`; other modes only if listed in `allowed_high_modes` (**required**; `[0]` = idle only), then a zero-velocity check; under a `restrict_motion` restriction only mode 2 (velocity capped) and mode 0 (if listed) pass, every other listed mode is refused; `bms.off` non-zero refused |
 | `go1_low_cmd` | UDP uncompressed `LowCmd` (734 octets), default port 8007 | joint, 20 slots | `bms.off` non-zero refused (integrity failure); any other length is undecidable (dropped) |
 | `go1_low_cmd_compressed` | UDP compressed `LowCmd` (614 octets, `LOW_CMD_LENGTH` of `unitree_legged_sdk` v3.8.6: what a real Go1 client sends), default port 8007 | joint, 20 slots | layout from the library's `refineCmd` (below, "Go1 compressed `LowCmd`"); `tau` / `Kp` / `Kd` are `i16` fixed point (÷256 / ÷32 / ÷16), a limited value is written as the step on the safe side of the bound and one beyond `i16` is refused (suppressed); holds ride on the last accepted 614-octet frame; any other length is dropped. Cannot share its port with `go1_low_cmd` |
 | `unitree_a2_lowcmd` | RTPS DATA on an A2 / AS2 `rt/lowcmd`, **inferred** `unitree_go::msg::dds_::LowCmd_` | joint, 20 slots | decided exactly as `unitree_go_lowcmd`; refused at start unless the firewall channel has `require_crc`, the profile records the channel's type (learned from the robot's SEDP; any other type than the go `LowCmd_` is refused), and `on_gateway_down` is not `bypass`; `allow_battery_off` refused (below, "A2 / AS2") |
@@ -650,8 +650,12 @@ the decision counters since the previous line (`packets`, `accepted`,
 `modified`, `dropped`, `samples`, `passed`, `limited`, `substituted`,
 `suppressed`, `late`, `undecidable`), the firewall's fault verdicts and the
 id of the restriction in force. agentd appends each as a black-box note
-(signed and chained; start and stop critical), so what the gateway
-enforced and how it decided is in the signed record; the individual
+(signed and chained; start and stop critical), so what agentd received as
+the gateway's summary is in the signed record. The signature proves
+receipt, not authorship: the feed socket checks the peer's uid (root
+and `allowed_uids`) but the lines carry no signature of the gateway, so any
+process allowed on the socket can write a summary claiming enforce mode
+and the expected digests. The individual
 verdicts stay in the status and events files. A stop that is not clean (a
 crash, SIGKILL) writes no stop line; the next start line shows the
 restart. Lines that wait while agentd is away share the feed's bounded
@@ -664,8 +668,10 @@ responder, correlation). The socket is connected, and written with a
 thread only hands lines over a bounded channel (256, non-blocking; a full
 channel drops the line, counted), so agentd being slow or away never
 delays a decision. While agentd is away up to 1024 lines wait on the feed
-thread (oldest dropped, counted: status `findings_feed`). The events file
-keeps everything either way.
+thread (oldest dropped, counted: status `findings_feed`). At stop the
+feed thread writes what waits for 500 ms at most (a slow agentd cannot
+hold the shutdown); the rest is lost to the feed. The events file keeps
+everything either way.
 
 ## `restrict_motion` (restriction file)
 

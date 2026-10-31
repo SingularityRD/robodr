@@ -473,7 +473,11 @@ aggregate, whose detail says how many were not recorded. The gateway's decision 
 (`robodr-gateway-summary/v1`: mode, fail behaviour, file digests and
 decision counters at start, every minute and at stop; T19) are parsed as
 strictly and appended to the black box as notes (`gateway summary`, start
-and stop critical), never findings. Status: `daemon.gateway_findings`,
+and stop critical), never findings. A note proves what agentd received,
+not that the gateway wrote it: the socket checks the peer's uid
+(root and `allowed_uids`), the lines carry no gateway signature, so a process
+allowed on the socket can write a summary of its choosing. Status:
+`daemon.gateway_findings`,
 `daemon.gateway_folded`, `daemon.gateway_unrecorded`,
 `daemon.gateway_aggregates`,
 `daemon.gateway_summaries`, `daemon.gateway_summary_errors`,
