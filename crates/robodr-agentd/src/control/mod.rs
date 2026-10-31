@@ -56,8 +56,10 @@
 //!   valid signature does not widen this: an authenticated but invalid
 //!   body is refused (400) and recorded. A scoped key ([`SocKeyEntry`],
 //!   [`auth::KeyScope`]) may request and revert only its
-//!   `allowed_actions`, with at most its `max_ttl_seconds`; outside them
-//!   it is refused (403) and recorded the same way. Evidence: read-only exports of
+//!   `allowed_actions`, with at most its `max_ttl_seconds` (which bounds
+//!   only the actions that take a TTL); outside them it is refused (403)
+//!   and recorded the same way. A key without an installed scope may ask
+//!   for nothing. Evidence: read-only exports of
 //!   black-box frames, never key material.
 //! * **What happens.** Nothing reaches the robot: the request is judged and
 //!   recorded. A refusal is final (never retried here).
@@ -137,9 +139,9 @@ fn default_connections() -> usize {
 fn default_connections_per_source() -> usize {
     2
 }
-fn default_evict_after_ms() -> u64 {
-    100
-}
+/// `pre_auth_evict_after_ms` when it is not set and `soc_sources` is not
+/// either (with `soc_sources` the default is 0: no cut by age).
+pub const DEFAULT_EVICT_AFTER_MS: u64 = 100;
 fn default_requests() -> usize {
     1024
 }
@@ -220,13 +222,15 @@ pub struct ControlPlaneSection {
     pub reserved_connections: Option<usize>,
     /// When every pre-authentication slot is busy, a new connection cuts
     /// the oldest one that has spent this long in its handshake / request
-    /// read, 100..=5000 ms (default 100; raise it for SOC links with long
-    /// round trips; 5000: in effect never, the read deadline cuts first).
-    /// A connection from `soc_sources` is never cut for an unlisted one.
-    /// Cutting alone does not hold against a peer that reopens faster
-    /// than this; `soc_sources` does.
-    #[serde(default = "default_evict_after_ms")]
-    pub pre_auth_evict_after_ms: u64,
+    /// read: 0 (never cut by age) or 100..=5000 ms. Default: 100 without
+    /// `soc_sources`, 0 with them (the SOC's reserved slot and its right to
+    /// cut unlisted handshakes at once already keep it in; cutting by age
+    /// would only let legitimate clients cut each other's slow handshakes
+    /// under load). A connection from `soc_sources` is never cut for an
+    /// unlisted one. Cutting alone does not hold against a peer that
+    /// reopens faster than this; `soc_sources` does.
+    #[serde(default)]
+    pub pre_auth_evict_after_ms: Option<u64>,
     /// Requests kept for GET / revert / idempotency, 16..=65536.
     #[serde(default = "default_requests")]
     pub max_requests: usize,
@@ -366,10 +370,32 @@ pub struct ControlPlaneSpec {
     /// [`ControlPlaneSection::soc_sources`], parsed.
     pub soc_sources: Vec<IpNet>,
     pub reserved_connections: usize,
-    pub pre_auth_evict_after: Duration,
+    /// `None`: a pre-authentication connection is never cut by age.
+    pub pre_auth_evict_after: Option<Duration>,
     pub max_requests: usize,
     pub answer_timeout: Duration,
     pub evidence: Option<evidence::EvidenceSection>,
+}
+
+impl ControlPlaneSpec {
+    /// Every configured key has exactly its scope, and no scope names a key
+    /// that is not configured ([`ControlPlane::start`] refuses otherwise;
+    /// the engine also fails closed for a key without one).
+    pub fn check_scopes(&self) -> Result<(), String> {
+        let keys: std::collections::BTreeSet<&str> =
+            self.keys.iter().map(|k| k.key_id.as_str()).collect();
+        let scoped: std::collections::BTreeSet<&str> =
+            self.scopes.keys().map(String::as_str).collect();
+        if keys == scoped {
+            Ok(())
+        } else {
+            Err(
+                "control plane: the SOC key scopes do not match the configured keys \
+                 (internal error)"
+                    .into(),
+            )
+        }
+    }
 }
 
 fn range(what: &str, v: u64, lo: u64, hi: u64) -> Result<(), String> {
@@ -461,12 +487,9 @@ impl ControlPlaneSection {
             1,
             16,
         )?;
-        range(
-            "pre_auth_evict_after_ms",
-            self.pre_auth_evict_after_ms,
-            100,
-            5000,
-        )?;
+        if let Some(ms) = self.pre_auth_evict_after_ms.filter(|ms| *ms != 0) {
+            range("pre_auth_evict_after_ms", ms, 100, 5000)?;
+        }
         if self.soc_sources.len() > MAX_SOC_SOURCES {
             return Err(format!(
                 "control_plane.soc_sources: at most {MAX_SOC_SOURCES} networks"
@@ -494,6 +517,12 @@ impl ControlPlaneSection {
                 range("reserved_connections", n as u64, 1, 4)?;
                 n
             }
+        };
+        let pre_auth_evict_after = match self.pre_auth_evict_after_ms {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None if soc_sources.is_empty() => Some(Duration::from_millis(DEFAULT_EVICT_AFTER_MS)),
+            None => None,
         };
         range("max_requests", self.max_requests as u64, 16, 65_536)?;
         range("answer_timeout_ms", self.answer_timeout_ms, 100, 30_000)?;
@@ -559,7 +588,7 @@ impl ControlPlaneSection {
             max_connections_per_source: self.max_connections_per_source.min(self.max_connections),
             soc_sources,
             reserved_connections,
-            pre_auth_evict_after: Duration::from_millis(self.pre_auth_evict_after_ms),
+            pre_auth_evict_after,
             max_requests: self.max_requests,
             answer_timeout: Duration::from_millis(self.answer_timeout_ms),
             evidence: self.evidence.clone(),
@@ -865,6 +894,7 @@ impl ControlPlane {
         anchors: &anchor::Found,
         blackbox_signer: &dyn robodr_blackbox::Signer,
     ) -> Result<Self, String> {
+        spec.check_scopes()?;
         let now_s = wall_s().ok_or("control plane: the wall clock is unavailable")?;
         let euid = crate::config::effective_uid();
         let dir = &spec.state_dir;
@@ -1338,6 +1368,10 @@ fn run_tcp(l: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, sh: Arc<Share
                                     sh,
                                     slot,
                                 ),
+                                // Cut by a newcomer: the handshake failed
+                                // because the robot closed it, not the peer
+                                // (counted in `connections_evicted`).
+                                Err(_) if slot.evicted() => {}
                                 Err(why) => {
                                     sh.counters.tls_failures.fetch_add(1, Ordering::Relaxed);
                                     sh.counters.note_auth_failure(format!(
@@ -1409,8 +1443,9 @@ pub struct IpNet {
 }
 
 impl IpNet {
-    /// `a.b.c.d`, `a.b.c.d/n` (0..=32), `v6` or `v6/n` (0..=128). Host
-    /// bits must be zero (`10.0.0.1/24` is refused: a typo, not a network).
+    /// `a.b.c.d`, `a.b.c.d/n` (1..=32), `v6` or `v6/n` (1..=128). Host
+    /// bits must be zero (`10.0.0.1/24` is refused: a typo, not a network);
+    /// a /0 is refused (it lists every address).
     pub fn parse(s: &str) -> Result<Self, String> {
         let shown = || robodr_ros2_pipeline::sanitize(s);
         let (a, p) = match s.split_once('/') {
@@ -1433,6 +1468,15 @@ impl IpNet {
                     .map_err(|_| format!("{:?}: bad prefix length", shown()))?;
                 if n > max {
                     return Err(format!("{:?}: prefix length above {max}", shown()));
+                }
+                if n == 0 {
+                    // Every peer would be the SOC's: the reservation and
+                    // the right to cut unlisted handshakes would mean
+                    // nothing.
+                    return Err(format!(
+                        "{:?}: prefix length 0 lists every address",
+                        shown()
+                    ));
                 }
                 n
             }
@@ -1487,21 +1531,28 @@ impl std::fmt::Display for IpNet {
 /// the SOC's networks (`soc_sources`).
 ///
 /// When every slot a newcomer may use is busy, it **cuts the oldest
-/// pre-authentication connection** (the socket is shut down, its thread
-/// ends at once) instead of being refused: a slowloris peer that trickles
-/// a handshake cannot hold a slot against fresh connections for more than
-/// `evict_after`, and a SOC address cuts any unlisted peer's handshake at
-/// once. An unlisted newcomer never cuts a listed connection. A source
-/// that already holds its share only makes room by cutting one of its own
-/// stale handshakes. Authenticated connections are never cut. The unix
-/// socket never uses these.
+/// pre-authentication connection it may cut** (the socket is shut down,
+/// its thread ends at once) instead of being refused: a SOC address cuts
+/// any unlisted peer's handshake at once, and with `evict_after` set any
+/// newcomer cuts a handshake that has had that long, so a slowloris peer
+/// cannot hold a slot against fresh connections for longer. An unlisted
+/// newcomer never cuts a listed connection. A source that already holds
+/// its share only makes room by cutting one of its own handshakes that
+/// has had `evict_after`. With `evict_after` unset nothing is cut by age:
+/// a full listener refuses newcomers (only a SOC address still cuts an
+/// unlisted handshake). Cutting by age is a trade: under legitimate
+/// overload (more clients than slots, round trips longer than
+/// `evict_after`) clients cut each other's handshakes and few finish.
+/// Authenticated connections are never cut. The unix socket never uses
+/// these.
 #[derive(Debug)]
 pub struct TcpSlots {
     max: usize,
     max_per_source: usize,
     reserved: usize,
     allow: Vec<IpNet>,
-    evict_after: Duration,
+    /// `None`: never cut by age.
+    evict_after: Option<Duration>,
     inner: Arc<Mutex<SlotCounts>>,
 }
 
@@ -1572,7 +1623,13 @@ fn lock_counts(m: &Mutex<SlotCounts>) -> std::sync::MutexGuard<'_, SlotCounts> {
 impl TcpSlots {
     /// No reserved slots, no SOC networks, cut after one second.
     pub fn new(max: usize, max_per_source: usize) -> Self {
-        Self::with_sources(max, max_per_source, Vec::new(), 0, Duration::from_secs(1))
+        Self::with_sources(
+            max,
+            max_per_source,
+            Vec::new(),
+            0,
+            Some(Duration::from_secs(1)),
+        )
     }
 
     pub fn with_sources(
@@ -1580,7 +1637,7 @@ impl TcpSlots {
         max_per_source: usize,
         allow: Vec<IpNet>,
         reserved: usize,
-        evict_after: Duration,
+        evict_after: Option<Duration>,
     ) -> Self {
         Self {
             max,
@@ -1619,7 +1676,10 @@ impl TcpSlots {
         let from_ip = g.per_source.get(&ip).copied().unwrap_or(0);
         let reserved_used = g.pre_auth.values().filter(|p| p.reserved).count();
         let general_used = g.pre_auth.len().saturating_sub(reserved_used);
-        let aged = |p: &PreAuth| now.saturating_duration_since(p.since) >= self.evict_after;
+        let aged = |p: &PreAuth| {
+            self.evict_after
+                .is_some_and(|d| now.saturating_duration_since(p.since) >= d)
+        };
         let victim = if from_ip >= self.max_per_source {
             // The source holds its share: only one of its own stale
             // handshakes makes room (a NAT shared with a slowloris peer).
@@ -1635,7 +1695,7 @@ impl TcpSlots {
             // Every slot this newcomer may use is busy: cut the oldest one
             // it may cut. A listed newcomer cuts any unlisted handshake at
             // once, else (like everyone) only one that has had
-            // `evict_after`; an unlisted newcomer never cuts a listed
+            // `evict_after` (if set); an unlisted newcomer never cuts a listed
             // connection (reserved slots hold listed ones only).
             let v = g
                 .pre_auth
@@ -1694,6 +1754,12 @@ impl TcpSlots {
 }
 
 impl TcpSlot {
+    /// Whether a newcomer cut this connection before it authenticated
+    /// (its socket was shut down: what fails next is not the peer's doing).
+    pub fn evicted(&self) -> bool {
+        !self.authed && !lock_counts(&self.inner).pre_auth.contains_key(&self.id)
+    }
+
     /// Move to an authenticated slot; `false` when they are all taken or
     /// this connection was cut (evicted) meanwhile.
     pub fn authenticate(&mut self) -> bool {
@@ -1731,6 +1797,13 @@ enum Slot {
 }
 
 impl Slot {
+    fn evicted(&self) -> bool {
+        match self {
+            Slot::Unix(_) => false,
+            Slot::Tcp(t) => t.evicted(),
+        }
+    }
+
     fn authenticate(&mut self) -> bool {
         match self {
             Slot::Unix(_) => true,
@@ -1964,6 +2037,8 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared, slot: &mut Slot) 
     let c = &sh.counters;
     let req = match http::read_request(&mut s, Instant::now() + READ_DEADLINE) {
         Ok(r) => r,
+        // Cut by a newcomer (`connections_evicted`): not a malformed request.
+        Err(_) if slot.evicted() => return,
         Err(e) => {
             c.malformed.fetch_add(1, Ordering::Relaxed);
             send(&mut s, e.status, &api::error_body(e.code, &e.message), &[]);
@@ -2551,7 +2626,7 @@ mod tests {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let net = IpNet::parse("192.168.7.0/24").unwrap();
-        let slots = TcpSlots::with_sources(2, 1, vec![net], 1, Duration::from_millis(1000));
+        let slots = TcpSlots::with_sources(2, 1, vec![net], 1, Some(Duration::from_millis(1000)));
         let _a = slots.enter_at(ip(1), ms(0), None).unwrap().into_slot();
         let _b = slots.enter_at(ip(2), ms(0), None).unwrap().into_slot();
         // General slots full; the reserved one is the SOC's only.
@@ -2608,7 +2683,7 @@ mod tests {
         assert!(v4.contains("10.20.255.1".parse().unwrap()));
         assert!(!v4.contains("10.21.0.1".parse().unwrap()));
         assert!(!v4.contains("::1".parse().unwrap()));
-        assert!(n("0.0.0.0/0").unwrap().contains("8.8.8.8".parse().unwrap()));
+        assert!(n("0.0.0.0/1").unwrap().contains("8.8.8.8".parse().unwrap()));
         let one = n("192.0.2.7").unwrap();
         assert!(one.contains("192.0.2.7".parse().unwrap()));
         assert!(!one.contains("192.0.2.8".parse().unwrap()));
@@ -2625,6 +2700,9 @@ mod tests {
             "host.example",
             "10.0.0.0/8/8",
             "",
+            // Every address: the reservation would mean nothing.
+            "0.0.0.0/0",
+            "::/0",
         ] {
             assert!(n(bad).is_err(), "{bad:?} accepted");
         }
@@ -2907,6 +2985,9 @@ mod tests {
             .contains("pre_auth_evict_after_ms"));
         assert!(s(serde_json::json!({"pre_auth_evict_after_ms": 5001}))
             .contains("pre_auth_evict_after_ms"));
+        // A /0 would make every peer the SOC's.
+        assert!(s(serde_json::json!({"soc_sources": ["0.0.0.0/0"]})).contains("every address"));
+        assert!(s(serde_json::json!({"soc_sources": ["::/0"]})).contains("every address"));
         // Unix socket only: nothing to reserve.
         let v = serde_json::json!({
             "unix_socket": "/run/x/c.sock", "state_dir": "/var/lib/x", "soc_keys": [],
@@ -2917,6 +2998,111 @@ mod tests {
             .resolve("r", &[])
             .unwrap_err()
             .contains("applies to listen_tcp"));
+    }
+
+    /// Review of T39: cutting by age let legitimate clients cut each
+    /// other's handshakes under load. With `soc_sources` (which already
+    /// keep the SOC in) it is off unless set; 0 turns it off explicitly.
+    #[test]
+    fn pre_auth_eviction_by_age_defaults_off_with_soc_sources() {
+        let d = tmp("evict");
+        let k = robodr_blackbox::KeyFile::ed25519_from_seed(&[7; 32], Some("soc-e")).unwrap();
+        let p = d.join("e.pub");
+        k.to_public().unwrap().write_new(&p).unwrap();
+        let evict = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "listen_tcp": "127.0.0.1:1", "state_dir": "/var/lib/x", "soc_keys": [p]
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            section(v)
+                .unwrap()
+                .resolve("ugv-007", &[])
+                .unwrap()
+                .pre_auth_evict_after
+        };
+        let ms = |n| Some(Duration::from_millis(n));
+        assert_eq!(evict(serde_json::json!({})), ms(DEFAULT_EVICT_AFTER_MS));
+        assert_eq!(
+            evict(serde_json::json!({"soc_sources": ["10.0.0.0/8"]})),
+            None
+        );
+        assert_eq!(
+            evict(
+                serde_json::json!({"soc_sources": ["10.0.0.0/8"], "pre_auth_evict_after_ms": 250})
+            ),
+            ms(250)
+        );
+        assert_eq!(
+            evict(serde_json::json!({"pre_auth_evict_after_ms": 0})),
+            None
+        );
+        assert_eq!(
+            evict(serde_json::json!({"pre_auth_evict_after_ms": 5000})),
+            ms(5000)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review of T39: without cutting by age a full listener refuses
+    /// newcomers (the old behaviour: the older handshakes finish), however
+    /// old the busy ones are; only a SOC newcomer still cuts an unlisted
+    /// handshake, and SOC connections never cut each other.
+    #[test]
+    fn without_age_eviction_a_full_listener_refuses_and_only_the_soc_cuts() {
+        let ip = |n: u8| IpAddr::from([10, 0, 0, n]);
+        let soc = |n: u8| IpAddr::from([192, 168, 7, n]);
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let net = IpNet::parse("192.168.7.0/24").unwrap();
+        let slots = TcpSlots::with_sources(2, 2, vec![net], 1, None);
+        let _a = slots.enter_at(ip(1), ms(0), None).unwrap().into_slot();
+        let _a2 = slots.enter_at(ip(1), ms(0), None).unwrap().into_slot();
+        // An hour later: still refused, nobody cut (no age eviction), and
+        // a source at its share does not cut its own handshakes either.
+        assert!(slots.enter_at(ip(2), ms(3_600_000), None).is_none());
+        assert!(slots.enter_at(ip(1), ms(3_600_000), None).is_none());
+        // SOC workers: the reserved slot, then they cut unlisted ones.
+        let s1 = slots.enter_at(soc(1), ms(10), None).unwrap();
+        assert!(matches!(s1, Entered::Slot(_)), "{s1:?}");
+        let s2 = slots.enter_at(soc(2), ms(20), None).unwrap();
+        assert!(matches!(s2, Entered::Evicted(_, v) if v == ip(1)), "{s2:?}");
+        let s3 = slots.enter_at(soc(3), ms(30), None).unwrap();
+        assert!(matches!(s3, Entered::Evicted(_, v) if v == ip(1)), "{s3:?}");
+        // Only SOC handshakes left: a fourth SOC worker is refused, it
+        // does not cut another worker's handshake however old.
+        assert!(slots.enter_at(soc(4), ms(3_600_000), None).is_none());
+        // The SOC's own NAT address at its share: refused, not self-cut.
+        let slots = TcpSlots::with_sources(4, 1, vec![net], 1, None);
+        let _w = slots.enter_at(soc(1), ms(0), None).unwrap().into_slot();
+        assert!(slots.enter_at(soc(1), ms(3_600_000), None).is_none());
+        drop((s1, s2, s3));
+    }
+
+    /// Review of T39: a connection cut by a newcomer knows it was cut, so
+    /// its failed handshake is not counted as an authentication failure.
+    #[test]
+    fn an_evicted_slot_knows_it_was_cut() {
+        let slots = TcpSlots::new(1, 1);
+        let t0 = Instant::now();
+        let old = slots
+            .enter_at(IpAddr::from([10, 0, 0, 1]), t0, None)
+            .unwrap()
+            .into_slot();
+        assert!(!old.evicted());
+        let mut new = slots
+            .enter_at(
+                IpAddr::from([10, 0, 0, 2]),
+                t0 + Duration::from_secs(2),
+                None,
+            )
+            .unwrap()
+            .into_slot();
+        assert!(old.evicted());
+        assert!(!new.evicted());
+        assert!(new.authenticate());
+        assert!(!new.evicted(), "authenticated is not evicted");
     }
 
     /// T67: `soc_keys` entries may scope a key.
@@ -2947,6 +3133,16 @@ mod tests {
         assert_eq!(t1.actions(), ["isolate_network", "record_evidence"]);
         assert_eq!(t1.max_ttl_seconds, 900);
         assert_eq!(spec.scopes["soc-all"], auth::KeyScope::unrestricted());
+        // Review of T67: the scopes are tied to the key list.
+        assert_eq!(spec.check_scopes(), Ok(()));
+        let mut missing = spec.clone();
+        missing.scopes.remove("soc-all");
+        assert!(missing.check_scopes().is_err());
+        let mut extra = spec.clone();
+        extra
+            .scopes
+            .insert("soc-ghost".into(), auth::KeyScope::unrestricted());
+        assert!(extra.check_scopes().is_err());
         // Only max_ttl_seconds: every action, the shorter TTL.
         let spec = resolve(serde_json::json!([{"path": p, "max_ttl_seconds": 60}])).unwrap();
         assert_eq!(spec.scopes["soc-t1"].actions().len(), 7);

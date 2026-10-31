@@ -1513,29 +1513,22 @@ fn request_journal_tail_damage_is_rebuilt_from_the_black_box() {
 // W2-4 / T39: TLS slowloris against the control plane's pre-auth slots.
 // ---------------------------------------------------------------------
 
-/// A local IPv4 address that is not loopback (the SOC's source address in
-/// the slowloris test: the attacker uses 127.0.0.1). A UDP `connect` sends
-/// nothing; it only picks the route's source address.
-fn second_local_ipv4() -> Option<std::net::Ipv4Addr> {
-    [
-        "192.0.2.1:9",
-        "10.255.255.1:9",
-        "198.51.100.1:9",
-        "8.8.8.8:9",
-    ]
-    .into_iter()
-    .find_map(|dst| {
-        let u = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-        u.connect(dst).ok()?;
-        match u.local_addr().ok()?.ip() {
-            std::net::IpAddr::V4(v) if !v.is_loopback() && !v.is_unspecified() => Some(v),
-            _ => None,
-        }
-    })
+/// The SOC's source address in the slowloris tests (the attackers use
+/// 127.0.0.10 and up). All of 127.0.0.0/8 is local on Linux: a client
+/// bound to one of them before it connects is seen with that address, so
+/// the test needs no second interface and never skips.
+const SOC_SRC: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
+
+/// A TCP connection to 127.0.0.1:`port` from source address `src`.
+fn connect_from(src: std::net::Ipv4Addr, port: u16) -> std::io::Result<TcpStream> {
+    let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    s.bind(&std::net::SocketAddr::from((src, 0)).into())?;
+    s.connect(&std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)).into())?;
+    Ok(s.into())
 }
 
-fn mtls_at(ip: std::net::Ipv4Addr, port: u16, client: &str, r: &Req) -> Result<Resp, String> {
-    let tcp = TcpStream::connect((ip, port)).map_err(|e| e.to_string())?;
+fn mtls_from(src: std::net::Ipv4Addr, port: u16, client: &str, r: &Req) -> Result<Resp, String> {
+    let tcp = connect_from(src, port).map_err(|e| e.to_string())?;
     tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .unwrap();
     let conn = rustls::ClientConnection::new(
@@ -1546,45 +1539,47 @@ fn mtls_at(ip: std::net::Ipv4Addr, port: u16, client: &str, r: &Req) -> Result<R
     exchange_raw(rustls::StreamOwned::new(conn, tcp), &request_bytes(r))
 }
 
-/// RESULTS.md S2 (W2-4): an unauthenticated peer that keeps reopening TLS
-/// handshakes and trickles their bytes kept every pre-authentication slot
-/// busy, and the SOC got 3/20 and 1/20 requests through during the attack.
-/// With `soc_sources`, the SOC's address has a reserved slot and cuts an
-/// attacker's handshake when it needs one: 20/20 while the attack runs.
-#[test]
-fn slowloris_cannot_lock_the_listed_soc_out() {
-    let Some(soc_ip) = second_local_ipv4() else {
-        eprintln!("skipped: this host has no non-loopback IPv4 address for the SOC");
-        return;
-    };
-    let s = setup("cp-slowloris", &robot_profile(true));
+/// What one slowloris run measured.
+struct Slowloris {
+    /// SOC requests answered 200 (of 20) while the attack ran.
+    ok: usize,
+    failures: Vec<String>,
+    /// `status.json` `control_plane` at the end of the attack.
+    cp: Value,
+}
+
+/// RESULTS.md S2 (W2-4) in process: 4 attacker addresses (127.0.0.10 to
+/// .13) with 2 connections each (the default per-source share) keep
+/// reopening TLS handshakes and trickle a ClientHello's first bytes, one
+/// every 100 ms, against 4 pre-authentication slots; meanwhile the SOC
+/// (from [`SOC_SRC`]) sends 20 signed GETs over mutual TLS. `extra` is
+/// merged into `control_plane`.
+fn slowloris(name: &str, extra: Value) -> Slowloris {
+    let s = setup(name, &robot_profile(true));
     let events = s.dir.join("ev.sock");
     let soc_pub = write_soc_pub(&s.dir);
     let port = free_port();
     let mut cfg = base_config(&s, &events);
     cfg["control_plane"] = json!({
-        "listen_tcp": format!("0.0.0.0:{port}"),
+        "listen_tcp": format!("127.0.0.1:{port}"),
         "tls": tls_section(&s.dir, &[&spki_pin("soc")]),
         "state_dir": state_dir(&s),
         "soc_keys": [soc_pub],
         "rate_per_minute": 600,
         "burst": 100,
-        // One attacker address may fill every general slot (the same as
-        // S2's many addresses holding two each).
         "max_connections": 4,
-        "max_connections_per_source": 4,
-        "soc_sources": [soc_ip.to_string()],
     });
+    for (k, v) in extra.as_object().unwrap() {
+        cfg["control_plane"][k] = v.clone();
+    }
     let (stop, h) = spawn(s.resolve(&cfg));
     let base = format!("/api/v2/robots/{ROBOT}");
     let req = signed("GET", &base, b"");
     let r = wait_for(5, "mTLS listener", || {
-        mtls_at(soc_ip, port, "soc", &req).ok()
+        mtls_from(SOC_SRC, port, "soc", &req).ok()
     });
     assert_eq!(r.status, 200, "{}", r.body);
 
-    // The attacker: 8 connections from 127.0.0.1, each sending a TLS
-    // ClientHello's first bytes one every 100 ms, reopened when cut.
     let attack = Arc::new(AtomicBool::new(true));
     let opened = Arc::new(AtomicU64::new(0));
     let hello: Vec<u8> = [
@@ -1593,12 +1588,14 @@ fn slowloris_cannot_lock_the_listed_soc_out() {
     .into_iter()
     .chain(std::iter::repeat_n(0x42, 32))
     .collect();
-    let attackers: Vec<_> = (0..8)
-        .map(|_| {
+    let attackers: Vec<_> = (0..4u8)
+        .flat_map(|i| [i, i])
+        .map(|i| {
             let (attack, opened, hello) = (attack.clone(), opened.clone(), hello.clone());
+            let src = std::net::Ipv4Addr::new(127, 0, 0, 10 + i);
             std::thread::spawn(move || {
                 while attack.load(Ordering::Relaxed) {
-                    let Ok(mut c) = TcpStream::connect(("127.0.0.1", port)) else {
+                    let Ok(mut c) = connect_from(src, port) else {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         continue;
                     };
@@ -1626,7 +1623,7 @@ fn slowloris_cannot_lock_the_listed_soc_out() {
     let mut failures = Vec::new();
     for _ in 0..20 {
         let req = signed("GET", &base, b"");
-        match mtls_at(soc_ip, port, "soc", &req) {
+        match mtls_from(SOC_SRC, port, "soc", &req) {
             Ok(r) if r.status == 200 => {
                 check_answer(&req, &r);
                 ok += 1;
@@ -1641,12 +1638,98 @@ fn slowloris_cannot_lock_the_listed_soc_out() {
     }
     let st = status(&s.spool).unwrap();
     finish(stop, h);
-    assert_eq!(ok, 20, "SOC requests during the attack: {failures:?}");
-    let cp = &st["control_plane"];
-    assert!(
-        cp["connections_evicted"].as_u64().unwrap() > 0,
-        "the attacker's stale handshakes were cut: {cp}"
+    Slowloris {
+        ok,
+        failures,
+        cp: st["control_plane"].clone(),
+    }
+}
+
+/// RESULTS.md S2 (W2-4): an unauthenticated peer with several addresses
+/// that keeps reopening TLS handshakes and trickles their bytes kept every
+/// pre-authentication slot busy, and the SOC got 3/20 and 1/20 requests
+/// through during the attack. With `soc_sources`, the SOC's address has a
+/// reserved slot (and would cut an attacker's handshake if it needed
+/// another): 20/20 while the attack runs.
+#[test]
+fn slowloris_cannot_lock_the_listed_soc_out() {
+    let r = slowloris(
+        "cp-slowloris",
+        json!({"soc_sources": [SOC_SRC.to_string()]}),
     );
+    assert_eq!(r.ok, 20, "SOC requests during the attack: {:?}", r.failures);
+    assert!(
+        r.cp["connections_rejected"].as_u64().unwrap() > 0,
+        "the attack filled every general slot: {}",
+        r.cp
+    );
+}
+
+/// The control of the test above, so it is shown to catch the regression:
+/// the same attack against the listener as it was before W2-4 (no
+/// `soc_sources`, nothing cut by age) locks the SOC out, and the assertion
+/// above fails.
+#[test]
+fn without_soc_sources_the_same_slowloris_locks_the_soc_out() {
+    let r = slowloris("cp-slowloris-ctl", json!({"pre_auth_evict_after_ms": 0}));
+    eprintln!("SOC requests through without soc_sources: {}/20", r.ok);
+    assert!(r.ok < 20, "the attack did not hold the slots: {}", r.cp);
+    assert_eq!(r.cp["connections_evicted"], 0, "{}", r.cp);
+}
+
+/// Review of T39: a handshake cut to make room for a newcomer was counted
+/// as a TLS failure and an authentication failure, which raise
+/// `robot.agent.control_plane_unauthenticated` (High): a legitimate client
+/// cut under load looked like an attacker. Only `connections_evicted`
+/// counts it now; a handshake the peer itself abandons still counts.
+#[test]
+fn an_evicted_handshake_is_not_an_authentication_failure() {
+    let s = setup("cp-evicted", &robot_profile(true));
+    let events = s.dir.join("ev.sock");
+    let soc_pub = write_soc_pub(&s.dir);
+    let port = free_port();
+    let mut cfg = base_config(&s, &events);
+    cfg["control_plane"] = json!({
+        "listen_tcp": format!("127.0.0.1:{port}"),
+        "tls": tls_section(&s.dir, &[&spki_pin("soc")]),
+        "state_dir": state_dir(&s),
+        "soc_keys": [soc_pub],
+        "max_connections": 1,
+        "pre_auth_evict_after_ms": 100,
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let base = format!("/api/v2/robots/{ROBOT}");
+    let req = signed("GET", &base, b"");
+    let r = wait_for(5, "mTLS listener", || {
+        mtls_from(SOC_SRC, port, "soc", &req).ok()
+    });
+    assert_eq!(r.status, 200, "{}", r.body);
+    // A client whose handshake is slow (it sends nothing yet) ...
+    let mut cut = connect_from(std::net::Ipv4Addr::new(127, 0, 0, 20), port).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // ... is cut by the next one once it has had 100 ms.
+    let next = connect_from(std::net::Ipv4Addr::new(127, 0, 0, 21), port).unwrap();
+    cut.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut b = [0u8; 1];
+    assert!(
+        matches!(cut.read(&mut b), Ok(0) | Err(_)),
+        "closed by the robot"
+    );
+    // The next one gives up on its own: that is a failed handshake.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(next);
+    let cp = wait_for(10, "both handshakes counted", || {
+        let cp = status(&s.spool)?["control_plane"].clone();
+        (cp["connections_evicted"].as_u64()? >= 1 && cp["tls_failures"].as_u64()? >= 1)
+            .then_some(cp)
+    });
+    finish(stop, h);
+    assert_eq!(cp["connections_evicted"], 1, "{cp}");
+    assert_eq!(cp["tls_failures"], 1, "only the abandoned one: {cp}");
+    assert_eq!(cp["unauthenticated"], 1, "{cp}");
+    let last = cp["last_auth_failure"].as_str().unwrap();
+    assert!(last.contains("127.0.0.21"), "{last}");
 }
 
 // ---------------------------------------------------------------------
