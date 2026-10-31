@@ -1,5 +1,7 @@
 #!/bin/sh
 # usage: capture_multi.sh <rmw> <order: a|b> <out.pcap>
+# Distribution: DISTRO (default jazzy) and IMG (default robodr-cap:$DISTRO,
+# built from Dockerfile with --build-arg DISTRO=...).
 # Robot host runs three processes (base_controller, add_two_ints_server,
 # fibonacci action server); order b starts them in reverse.
 set -e
@@ -13,9 +15,9 @@ if [ "$ORD" = a ]; then
 else
   START="ros2 run action_tutorials_cpp fibonacci_action_server & sleep 1; ros2 run demo_nodes_cpp add_two_ints_server & sleep 1; python3 /cap/robot.py & wait"
 fi
-docker run -d --rm --name robot --network $NET --ip 10.77.10.10 $E -v "$D:/cap" robodr-cap:jazzy bash -c "source /opt/ros/jazzy/setup.bash && sleep 1 && $START" >/dev/null
-docker run -d --rm --name tcpd --network container:robot -v "$D:/cap" robodr-cap:jazzy tcpdump -i eth0 -U -s 0 -w /cap/$OUT udp >/dev/null
-docker run -d --rm --name teleop --network $NET --ip 10.77.10.21 $E -v "$D:/cap" robodr-cap:jazzy bash -c "source /opt/ros/jazzy/setup.bash && sleep 2 && python3 /cap/teleop.py teleop_twist 0.3 0.1" >/dev/null
+docker run -d --rm --name robot --network $NET --ip 10.77.10.10 $E -v "$D:/cap" ${IMG:-robodr-cap:${DISTRO:-jazzy}} bash -c "source /opt/ros/${DISTRO:-jazzy}/setup.bash && sleep 1 && $START" >/dev/null
+docker run -d --rm --name tcpd --network container:robot -v "$D:/cap" ${IMG:-robodr-cap:${DISTRO:-jazzy}} tcpdump -i eth0 -U -s 0 -w /cap/$OUT udp >/dev/null
+docker run -d --rm --name teleop --network $NET --ip 10.77.10.21 $E -v "$D:/cap" ${IMG:-robodr-cap:${DISTRO:-jazzy}} bash -c "source /opt/ros/${DISTRO:-jazzy}/setup.bash && sleep 2 && python3 /cap/teleop.py teleop_twist 0.3 0.1" >/dev/null
 sleep 16
 docker stop -t 1 teleop >/dev/null 2>&1 || true
 sleep 1; docker stop -t 2 tcpd robot >/dev/null 2>&1 || true
