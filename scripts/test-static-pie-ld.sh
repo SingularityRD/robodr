@@ -99,7 +99,14 @@ EOF
         a="$($qemu "$work/p" || echo FAILED)"
         b="$($qemu "$work/p" || echo FAILED)"
         case "$a" in "static-pie 42 0x"*) ok "runs: $a" ;; *) bad "run: $a" ;; esac
-        [ "$a" != "$b" ] && ok "image address differs between runs (ASLR)" || bad "same address twice: $a"
+        # qemu-user takes the load address from the host's mmap, which can
+        # repeat for two runs in a row: up to 8 runs must show two addresses.
+        n=0
+        while [ "$a" = "$b" ] && [ "$n" -lt 8 ]; do
+            b="$($qemu "$work/p" || echo FAILED)"
+            n=$((n + 1))
+        done
+        [ "$a" != "$b" ] && ok "image address differs between runs (ASLR)" || bad "same address in 9 runs: $a"
         c="$($qemu "$work/p" x 2>/dev/null | tail -1 || true)"
         [ "$c" = "caught=true" ] && ok "panic unwinds" || bad "unwind: $c"
         # build-static.sh's release check: static-pie passes, the default

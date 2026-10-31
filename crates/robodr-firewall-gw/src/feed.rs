@@ -247,6 +247,17 @@ pub struct FeedThread {
     handoff_dropped: u64,
 }
 
+/// Copy the feed's counters into the status the packet thread reads.
+fn publish(st: &std::sync::Mutex<FeedStatus>, f: &Feed) {
+    if let Ok(mut s) = st.lock() {
+        s.connected = f.connected();
+        s.sent = f.sent;
+        s.pending = f.pending();
+        s.dropped = f.dropped;
+        s.last_error = f.last_error.clone();
+    }
+}
+
 impl FeedThread {
     pub fn spawn(path: PathBuf) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(HANDOFF);
@@ -272,14 +283,12 @@ impl FeedThread {
                         f.push(l);
                     }
                     f.heartbeat_if_idle(Instant::now());
+                    // Published before the flush too: a connect or write
+                    // can block up to WRITE_TIMEOUT, and the lines taken
+                    // off the hand-off are pending meanwhile, not lost.
+                    publish(&st, &f);
                     f.flush(Instant::now());
-                    if let Ok(mut s) = st.lock() {
-                        s.connected = f.connected();
-                        s.sent = f.sent;
-                        s.pending = f.pending();
-                        s.dropped = f.dropped;
-                        s.last_error = f.last_error.clone();
-                    }
+                    publish(&st, &f);
                 }
             })?;
         Ok(Self {
