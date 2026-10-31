@@ -131,6 +131,19 @@ fn preflight_finds_each_problem() {
     let c = preflight::run(&p, &opts());
     assert_eq!(level(&c, "nf_tables"), Level::Ok);
     assert_eq!(level(&c, "kernel.btf"), Level::Ok);
+    // No module tree at all, but the kernel answers nft: usable.
+    std::fs::remove_dir_all(t.path("/lib/modules")).unwrap();
+    assert_eq!(
+        level(&preflight::run(&p, &opts()), "nf_tables"),
+        Level::Warn
+    );
+    let r2 = Fake::default().with("nft list tables", 0, "table ip filter\n");
+    let p2 = Probe {
+        root: t.0.clone(),
+        runner: &r2,
+        now: now(),
+    };
+    assert_eq!(level(&preflight::run(&p2, &opts()), "nf_tables"), Level::Ok);
     // No BTF at all: a warning (agentd still runs), not a failure.
     std::fs::remove_dir_all(t.path("/etc/robodr/btf")).unwrap();
     assert_eq!(

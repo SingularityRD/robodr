@@ -386,7 +386,13 @@ pub fn collect(opts: &Options, runner: &dyn Runner) -> Result<Written, String> {
 
 fn fill(b: &mut Builder<'_>, host: &str, now: u64) -> Result<(), String> {
     // System.
-    b.file("system/os-release", "/etc/os-release", Redact::None)?;
+    // /etc/os-release is usually a symlink (never followed) to this one.
+    let os_release = if rooted(&b.opts.root, "/usr/lib/os-release").is_file() {
+        "/usr/lib/os-release"
+    } else {
+        "/etc/os-release"
+    };
+    b.file("system/os-release", os_release, Redact::None)?;
     b.file("system/kernel-version", "/proc/version", Redact::None)?;
     b.file("system/uptime", "/proc/uptime", Redact::None)?;
     b.file("system/meminfo", "/proc/meminfo", Redact::None)?;

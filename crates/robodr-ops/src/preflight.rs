@@ -13,7 +13,7 @@
 //! |---|---|---|---|
 //! | `kernel.btf` | `/sys/kernel/btf/vmlinux`, or an external BTF stamped for the running kernel | no BTF (no `robodr-pulsard`) | external BTF stamped for another kernel |
 //! | `bpffs` | `/sys/fs/bpf` is a `bpf` mount | not mounted (`robodr-pulsard` refuses to start) | |
-//! | `nf_tables` | loaded, built in, or a module of the running kernel | none (executor / gateway cannot enforce) | |
+//! | `nf_tables` | loaded, built in, a module of the running kernel, or `nft list tables` works | none (executor / gateway cannot enforce) | |
 //! | `systemd` | PID 1 is systemd >= 247 (245 for `robodr-focal`) | | older, or not PID 1 |
 //! | `glibc` | >= the package's `libc6` floor | | older |
 //! | `clock` | after the build date and NTP-synchronised | not synchronised / unknown | before the build date |
@@ -243,6 +243,15 @@ fn nf_tables(p: &Probe<'_>) -> Check {
     if p.path("/sys/module/nf_tables").is_dir() {
         return check(ID, Level::Ok, "nf_tables loaded");
     }
+    // Built in without a /sys/module entry, and no module tree (a minimal
+    // or container kernel): ask the kernel (needs CAP_NET_ADMIN; changes
+    // nothing).
+    if p.runner
+        .run("nft", &["list", "tables"])
+        .is_ok_and(|o| o.ok())
+    {
+        return check(ID, Level::Ok, "nf_tables usable (nft list tables)");
+    }
     let Some(rel) = p.kernel_release() else {
         return check(
             ID,
@@ -427,13 +436,13 @@ fn clock(p: &Probe<'_>, o: &Options) -> Check {
         Some("yes") => check(
             ID,
             Level::Ok,
-            format!("{} UTC, NTP-synchronised", crate::time::rfc3339(now)),
+            format!("{}, NTP-synchronised", crate::time::rfc3339(now)),
         ),
         Some(_) => check(
             ID,
             Level::Warn,
             format!(
-                "{} UTC, not NTP-synchronised: evidence timestamps drift (air-gapped site: \
+                "{}, not NTP-synchronised: evidence timestamps drift (air-gapped site: \
                  provide a site NTP source, or record the offset at commissioning)",
                 crate::time::rfc3339(now)
             ),
@@ -442,7 +451,7 @@ fn clock(p: &Probe<'_>, o: &Options) -> Check {
             ID,
             Level::Warn,
             format!(
-                "{} UTC; synchronisation unknown (timedatectl unavailable)",
+                "{}; synchronisation unknown (timedatectl unavailable)",
                 crate::time::rfc3339(now)
             ),
         ),
