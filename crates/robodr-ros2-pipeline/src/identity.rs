@@ -22,7 +22,7 @@
 //! |---|---|
 //! | the SPDP was sent by the participant itself (not relayed) and carries one `PID_PARTICIPANT_GUID` | a relayed or ambiguous announcement says nothing about where the participant runs |
 //! | its source IP is one of the identity's `ips`, and the binding check does not reject it (not contested, not outside an existing binding, not a forged loopback source) | the identity is a place on the robot's network |
-//! | `PID_VENDORID` equals `vendor`; for an SPDP with a PKI-DH identity token whose claimed certificate subject hashes to the GUID prefix (DDS-Security §9.3.3, [`crate::secured_prefix`]) the first two prefix bytes may match instead | a Cyclone process cannot take a Fast DDS node's place; a secured prefix is derived from the certificate subject, and `learn` takes `vendor` from the prefix. Both are claims in the SPDP (as `PID_VENDORID` is): a crafted SPDP can claim the subject and use its prefix; the address and `max_instances` conditions still apply |
+//! | `PID_VENDORID` equals `vendor`; for an SPDP with a PKI-DH identity token whose claimed certificate subject hashes to the GUID prefix (DDS-Security §9.3.3, [`robodr_rtps::secured_prefix`]) the first two prefix bytes may match instead | a Cyclone process cannot take a Fast DDS node's place; a secured prefix is derived from the certificate subject, and `learn` takes `vendor` from the prefix. Both are claims in the SPDP (as `PID_VENDORID` is): a crafted SPDP can claim the subject and use its prefix; the address and `max_instances` conditions still apply |
 //! | the SPDP user-data enclave equals `enclave`, when set | the SROS 2 enclave is stable per node set |
 //! | fewer than `max_instances` live prefixes hold the identity | a rogue started next to the live controller stays unknown |
 //!
@@ -347,7 +347,7 @@ impl IdentityResolver {
         let secured_hash = spdp
             .security
             .pki_identity_subject()
-            .is_some_and(|s| crate::secured_prefix::prefix_matches_subject(&p, s))
+            .is_some_and(|s| robodr_rtps::secured_prefix::prefix_matches_subject(&p, s))
             .then_some([p[0], p[1]]);
         let mut full: Option<Resolution> = None;
         for (idx, m) in self.ids.iter().enumerate() {

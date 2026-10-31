@@ -12,6 +12,9 @@ description = "Read-only RTPS discovery (SPDP/SEDP) parser for RoboDR. Pure, no 
 
 [dependencies]
 robodr-events = { workspace = true }
+# SHA-256 of a claimed certificate subject (DDS-Security GUID prefix check,
+# `secured_prefix`); already in the workspace lock.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
