@@ -118,10 +118,27 @@ EOF
         else
             ok "build-static.sh --check-dir refuses a non-PIE (ET_EXEC) binary"
         fi
-        if env -u ROBODR_REQUIRE_STATIC_PIE "$here/build-static.sh" aarch64-unknown-linux-musl --check-dir "$work/nopie" 2>/dev/null; then
+        if env -u ROBODR_REQUIRE_STATIC_PIE -u ROBODR_ALLOW_NON_PIE "$here/build-static.sh" aarch64-unknown-linux-musl --check-dir "$work/nopie" 2>/dev/null; then
             bad "build-static.sh --check-dir accepted a non-PIE binary with the default linker"
         else
             ok "build-static.sh --check-dir refuses non-PIE with the default linker"
+        fi
+        # A caller-set linker does not make non-PIE acceptable.
+        if env -u ROBODR_REQUIRE_STATIC_PIE -u ROBODR_ALLOW_NON_PIE CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+            "$here/build-static.sh" aarch64-unknown-linux-musl --check-dir "$work/nopie" 2>/dev/null; then
+            bad "build-static.sh --check-dir accepted a non-PIE binary with a caller-set linker"
+        else
+            ok "build-static.sh --check-dir refuses non-PIE with a caller-set linker"
+        fi
+        if env -u ROBODR_REQUIRE_STATIC_PIE ROBODR_ALLOW_NON_PIE=1 "$here/build-static.sh" aarch64-unknown-linux-musl --check-dir "$work/nopie" 2>/dev/null; then
+            ok "build-static.sh --check-dir accepts non-PIE only with ROBODR_ALLOW_NON_PIE=1"
+        else
+            bad "build-static.sh --check-dir refused non-PIE despite ROBODR_ALLOW_NON_PIE=1"
+        fi
+        if ROBODR_REQUIRE_STATIC_PIE=1 ROBODR_ALLOW_NON_PIE=1 "$here/build-static.sh" aarch64-unknown-linux-musl --check-dir "$work/nopie" 2>/dev/null; then
+            bad "ROBODR_ALLOW_NON_PIE=1 overrode ROBODR_REQUIRE_STATIC_PIE=1"
+        else
+            ok "ROBODR_REQUIRE_STATIC_PIE=1 wins over ROBODR_ALLOW_NON_PIE=1"
         fi
     else
         bad "rustc link failed: $(tail -5 "$work/rustc.log")"

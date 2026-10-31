@@ -10,7 +10,9 @@
         v0.2.0 is newer than v0.2.0-rc.1, and rc.10 newer than rc.9.
         `sort -V` gets the first wrong (it puts v0.2.0-rc.1 after v0.2.0),
         which would scan a release candidate instead of the shipped final
-        release. Tags that are not vX.Y.Z[-pre] are ignored.
+        release. Tags that are not vX.Y.Z[-pre] are ignored, as is a
+        pre-release that is not valid semver (an empty identifier, or a
+        numeric one with a leading zero such as rc.01).
 
     vuln-scan-tags.py --self-test
 """
@@ -21,7 +23,13 @@ import json
 import re
 import sys
 
-TAG = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z.-]+))?$")
+# A pre-release identifier (semver.org item 9): numeric without a leading
+# zero, or alphanumeric (with at least one letter or hyphen); none empty.
+_PRE_ID = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+TAG = re.compile(
+    r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    rf"(?:-({_PRE_ID}(?:\.{_PRE_ID})*))?$"
+)
 
 
 def _pre_key(pre: str) -> tuple:
@@ -83,6 +91,11 @@ def self_test() -> int:
 
         def test_ignored(self):
             self.assertEqual(pick(["v1", "v1.2", "vx.1.2", "v01.2.3", "v1.2.3+meta", "1.2.3"]), [])
+            # semver: no leading zero in a numeric identifier, no empty identifier.
+            self.assertEqual(pick(["v0.1.0-rc.01", "v0.1.0-rc..1", "v0.1.0-rc.", "v0.1.0-.rc"]), [])
+            self.assertEqual(pick(["v0.1.0-rc.1", "v0.1.0-rc.02"]), ["v0.1.0-rc.1"])
+            # Leading zeros are allowed in an alphanumeric identifier.
+            self.assertEqual(pick(["v0.1.0-0a"]), ["v0.1.0-0a"])
 
     r = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(Pick))
     return 0 if r.wasSuccessful() else 1

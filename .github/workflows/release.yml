@@ -178,6 +178,8 @@ jobs:
           python3 scripts/release-gate.py --self-test
           python3 scripts/vuln-scan-tags.py --self-test
           python3 scripts/metadata_to_cyclonedx.py --self-test
+          python3 scripts/sbom-select.py --self-test
+          scripts/test-release-sbom-gate.sh
           python3 scripts/release-rpk.py --self-test
           python3 scripts/vex.py --self-test
           python3 scripts/slsa-provenance.py --self-test
@@ -361,7 +363,7 @@ jobs:
         run: |
           epoch="$(git log -1 --format=%ct)"
           triple="$(rustc -vV | sed -n 's/^host: //p')"
-          for b in robodr-agentd robodr-executor robodr-uplink robodr-seal; do
+          for b in robodr-agentd robodr-executor robodr-uplink robodr-seal robodr-firewall-gw; do
             o="$(target/release/$b --version)"
             echo "$o"
             case "$o" in *"$VERSION (commit $GITHUB_SHA, source-date-epoch $epoch, target $triple)"*) ;; *) exit 1 ;; esac
@@ -370,11 +372,6 @@ jobs:
         run: git diff --exit-code -- Cargo.lock
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
-      - name: SBOM (CycloneDX 1.5; + Rust std, eBPF objects, toolchain)
-        run: |
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
-          scripts/release-sbom-augment.sh dist/sbom target/release/build
       - name: Debian package (Depends from dpkg-shlibdeps, libc6 floor checked)
         env:
           # A release must never ship without the daemons and their tools.
@@ -387,6 +384,13 @@ jobs:
           deb=$(packaging/build-deb.sh --bin-dir target/release --arch "$ARCH" --out dist/release)
           scripts/check-glibc-floor.sh "$deb"
           python3 scripts/check-packages.py --deb "$deb"
+      - name: SBOM (CycloneDX 1.5; + Rust std, eBPF objects, toolchain)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          # Only the crates the package ships (scripts/ci-rebuild.sh selects alike).
+          python3 scripts/sbom-select.py dist/sbom --package "$(ls dist/release/robodr_*_"$ARCH".deb)"
+          scripts/release-sbom-augment.sh dist/sbom target/release/build
       - name: Offline install bundle and SBOM archive
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
@@ -476,11 +480,6 @@ jobs:
         run: git diff --exit-code -- Cargo.lock
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
-      - name: SBOM (CycloneDX 1.5; + Rust std, eBPF objects, toolchain)
-        run: |
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
-          scripts/release-sbom-augment.sh dist/sbom target/release/build
       - name: RPM package (generated GLIBC requirement checked)
         env:
           ROBODR_DEB_REQUIRE: robodr-pulsard robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-anchor-receiver robodr-deliverd robodr-seal robodr-depot
@@ -492,6 +491,17 @@ jobs:
           rpm=$(packaging/build-rpm.sh --bin-dir target/release --arch "$ARCH" --out dist/release)
           scripts/check-glibc-floor.sh "$rpm"
           python3 scripts/check-packages.py --rpm "$rpm"
+      - name: SBOM (CycloneDX 1.5; + Rust std, eBPF objects, toolchain)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          # Only the crates the package ships.
+          python3 scripts/sbom-select.py dist/sbom --package "$(ls dist/release/robodr-*.rpm)"
+          scripts/release-sbom-augment.sh dist/sbom target/release/build
+      - name: Offline install bundle and SBOM archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          rpm=$(ls dist/release/robodr-*.rpm)
           # Offline bundle for RPM hosts (install-bundle.sh drives rpm -U).
           packaging/make-bundle.sh --rpm "$rpm" --out dist/release
           tar --sort=name --owner=0 --group=0 --numeric-owner --mode=go-w \
@@ -587,27 +597,16 @@ jobs:
           run=""
           [ "$ARCH" = arm64 ] && run=qemu-aarch64-static
           epoch="$(git log -1 --format=%ct)"
-          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-deliverd robodr-seal robodr-depot; do
+          for b in robodr-agentd robodr-commission robodr-ros2-watch robodr-uplink robodr-kafka-publish robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot; do
             o="$($run "dist/static/$TARGET/$b" --version)"
             echo "$o"
             case "$o" in *"$VERSION (commit $GITHUB_SHA, source-date-epoch $epoch, target $TARGET)"*) ;; *) exit 1 ;; esac
           done
-          # robodr-firewall-gw prints its version only (until the gateway merge).
-          $run "dist/static/$TARGET/robodr-firewall-gw" --version
       - name: Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
-      - name: SBOM (CycloneDX 1.5; + Rust std, musl, libunwind, toolchain)
-        run: |
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
-          # robodr-focal does not ship robodr-pulsard (not built here), so
-          # its SBOM (cargo-cyclonedx writes one per workspace crate) is not
-          # part of this package's SBOM set.
-          rm -f dist/sbom/*robodr-pulsard*.cdx.json
-          scripts/release-sbom-augment.sh dist/sbom
-      - name: robodr-focal package, offline bundle and SBOM archive
+      - name: robodr-focal package
         env:
           ROBODR_DEB_REQUIRE: robodr-agentd robodr-blackbox robodr-diode-pack robodr-diode-unpack robodr-spool-export robodr-kafka-publish robodr-uplink robodr-enroll robodr-executor robodr-firewall-gw robodr-deliverd robodr-seal robodr-depot
           ROBODR_RELEASE: "1"
@@ -621,6 +620,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/focal-bins"
           cp "$RUNNER_TEMP"/focal-root/usr/bin/robodr-* "$RUNNER_TEMP"/focal-root/usr/sbin/robodr-* "$RUNNER_TEMP/focal-bins/"
           scripts/build-static.sh "$TARGET" --check-dir "$RUNNER_TEMP/focal-bins"
+      - name: SBOM (CycloneDX 1.5; + Rust std, musl, libunwind, toolchain)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+          # Only the crates the package ships: cargo-cyclonedx writes one SBOM
+          # per workspace crate; robodr-focal has no robodr-pulsard (and so no
+          # eBPF objects). scripts/ci-rebuild.sh selects alike.
+          python3 scripts/sbom-select.py dist/sbom --package "$(ls dist/release/robodr-focal_*_"$ARCH".deb)"
+          scripts/release-sbom-augment.sh dist/sbom
+      - name: robodr-focal offline bundle and SBOM archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          deb=$(ls dist/release/robodr-focal_*_"$ARCH".deb)
           packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out dist/release
           tar --sort=name --owner=0 --group=0 --numeric-owner --mode=go-w \
               --mtime="@$SOURCE_DATE_EPOCH" \

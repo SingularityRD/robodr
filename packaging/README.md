@@ -304,6 +304,10 @@ packaging/build-rpm.sh --bin-dir target/release --arch amd64 --out dist
 rustup target add aarch64-unknown-linux-musl
 scripts/build-static.sh aarch64-unknown-linux-musl          # -> dist/static/<triple>
 packaging/build-deb.sh --variant focal --bin-dir dist/static/aarch64-unknown-linux-musl --arch arm64 --out dist
+# Per-crate (cargo-cyclonedx) SBOMs: keep those of the crates this package
+# ships, as release.yml does (no robodr-pulsard for robodr-focal); use a
+# separate SBOM directory per package.
+python3 scripts/sbom-select.py dist/sbom --package dist/robodr-focal_*_arm64.deb
 packaging/make-bundle.sh --deb dist/robodr-focal_*_arm64.deb --sbom-dir dist/sbom --out dist
 ```
 

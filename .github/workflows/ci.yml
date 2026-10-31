@@ -12,7 +12,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/X.Y: an LTS release commit needs a CI run of its own
+    # (scripts/release-gate.py ci; docs/RELEASE.md section 6).
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -116,6 +118,8 @@ jobs:
           python3 scripts/check-packages.py --self-test
           python3 scripts/third_party_notices.py --self-test
           python3 scripts/compare-rebuild.py --self-test
+          python3 scripts/sbom-select.py --self-test
+          scripts/test-release-sbom-gate.sh
           python3 scripts/check-detection-catalog.py --self-test
           python3 scripts/check-doc-facts.py --self-test
           scripts/ci-install-ebpf-toolchain.sh --self-test
@@ -471,9 +475,10 @@ jobs:
     # Static (musl) build of the pure binaries for hosts below glibc 2.35 /
     # systemd 247, e.g. Unitree EDU computers on JetPack 5 (Ubuntu 20.04,
     # glibc 2.31, systemd 245): docs/BUILD.md "Static (musl) build". Both
-    # targets are cross-linked with rust-lld on the x86-64 runner (the only C
-    # is ring's, robodr-uplink's TLS crypto, built with clang); the arm64
-    # binaries are smoke-run under
+    # targets are cross-linked with rust-lld on the x86-64 runner, arm64
+    # through scripts/static-pie-ld, so both are static-pie (build-static.sh
+    # fails on a non-PIE binary; the only C is ring's, robodr-uplink's TLS
+    # crypto, built with clang); the arm64 binaries are smoke-run under
     # qemu-user. Then the robodr-focal .deb is assembled and checked.
     name: Static musl build (${{ matrix.target }})
     runs-on: ubuntu-24.04
@@ -500,8 +505,19 @@ jobs:
           rustup target add "$TARGET"
       - name: Setup (mirror, --locked, Pulsar-bound excludes)
         run: scripts/ci-setup.sh
-      - name: Linker (rust-lld, self-contained musl)
-        run: echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=rust-lld" >> "$GITHUB_ENV"
+      - name: Linker (rust-lld; arm64 through scripts/static-pie-ld, as release.yml), tested
+        env:
+          ROBODR_REQUIRE_STATIC_PIE_TEST: "1"
+        run: |
+          if [ "$TARGET" = aarch64-unknown-linux-musl ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends qemu-user-static
+            linker="$GITHUB_WORKSPACE/scripts/static-pie-ld"
+            scripts/test-static-pie-ld.sh
+          else
+            linker=rust-lld
+          fi
+          echo "CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=$linker" >> "$GITHUB_ENV"
       - name: Pinned C compiler (clang 18.1.3, ring's C/assembly; scripts/c-toolchain.sh)
         # ci-repro.sh / build-static.sh set CC_<triple> to it and fail on
         # any other compiler (no fallback to cc).
@@ -511,7 +527,7 @@ jobs:
           REPRO_REQUIRE_BINARIES: "1"
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: scripts/ci-repro.sh dist/repro-static
-      - name: Static build, checked (no interpreter, no shared library)
+      - name: Static build, checked (static-pie, no interpreter, no shared library)
         run: scripts/build-static.sh "$TARGET" --out "dist/static/$TARGET"
       - name: Built binaries == reproduced binaries
         run: (cd "dist/static/$TARGET" && sha256sum --strict -c "$GITHUB_WORKSPACE/dist/repro-static/SHA256SUMS")

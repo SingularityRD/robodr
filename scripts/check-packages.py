@@ -79,6 +79,7 @@ Package checks (`--deb FILE ... --rpm FILE ...`; CI jobs `package-*`):
      group/other-writable, no device/FIFO, paths only under /usr and
      /etc/robodr, no private key material (PEM private keys, minisign
      secret keys) anywhere in the payload; exactly the variant's programs,
+     each program an ELF of type ET_DYN (PIE, static-pie for robodr-focal),
      each unit together with its program, and a man page for every
      shipped program that has one in man/; the customer documentation
      (no drafts), the demo captures and the operator examples
@@ -871,6 +872,17 @@ def read_rpm(path: Path) -> tuple[dict[str, Entry], dict[str, bytes], str, str]:
     return entries, contents, name, deb_arch
 
 
+def elf_pie_problems(body: bytes) -> list[str]:
+    """[] when body is an ELF with e_type ET_DYN (position-independent: a PIE,
+    or static-pie for robodr-focal), so the kernel randomises the image."""
+    if len(body) < 18 or body[:4] != b"\x7fELF" or body[5] not in (1, 2):
+        return ["not an ELF program"]
+    e_type = int.from_bytes(body[16:18], "little" if body[5] == 1 else "big")
+    if e_type != 3:
+        return [f"not position-independent (e_type {e_type}, want 3 ET_DYN)"]
+    return []
+
+
 def is_program(p: str) -> bool:
     return bool(re.fullmatch(r"/usr/s?bin/robodr-[a-z0-9-]+", p))
 
@@ -892,6 +904,9 @@ def check_package(label: str, variant: str, entries: dict[str, Entry], contents:
         for m in SECRET_MARKERS:
             if m.search(body):
                 errs.append(f"{label}: {p} contains private key material ({m.pattern!r})")
+    for p, body in sorted(contents.items()):
+        if is_program(p):
+            errs += [f"{label}: {p}: {e}" for e in elf_pie_problems(body)]
     progs = {p.rsplit("/", 1)[1] for p in entries if is_program(p)}
     want = variant_programs(variant)
     for p in sorted(want - progs):
@@ -995,6 +1010,12 @@ def package_checks(debs: list[Path], rpms: list[Path], root: Path) -> list[str]:
 # -------------------------------------------------------------- self-test --
 
 
+def _elf(e_type: int, be: bool = False) -> bytes:
+    """A 64-bit ELF header prefix with the given e_type."""
+    ident = b"\x7fELF\x02" + (b"\x02" if be else b"\x01") + b"\x01" + b"\x00" * 9
+    return ident + e_type.to_bytes(2, "big" if be else "little") + b"\x00" * 46
+
+
 def _tar_with(name: str) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
@@ -1083,7 +1104,12 @@ def self_test() -> int:
     expect("minisign secret", check_package("t", STD, base, {
         "/usr/share/x": b"untrusted comment: minisign encrypted secret key\n" + b"RWRTY0Iy" * 20 + b"\n"}, ROOT), False)
     expect("detector literals", check_package("t", STD, base, {
-        "/usr/sbin/robodr-x": b"-----BEGINPRIVATE KEY-----minisign encrypted secret keyuntrusted comment: secret key"}, ROOT), True)
+        "/usr/sbin/robodr-x": _elf(3) + b"-----BEGINPRIVATE KEY-----minisign encrypted secret keyuntrusted comment: secret key"}, ROOT), True)
+    expect("program PIE", check_package("t", STD, base, {"/usr/sbin/robodr-agentd": _elf(3)}, ROOT), True)
+    expect("program PIE, big-endian", check_package("t", STD, base, {"/usr/sbin/robodr-agentd": _elf(3, be=True)}, ROOT), True)
+    expect("program not PIE", check_package("t", STD, base, {"/usr/sbin/robodr-agentd": _elf(2)}, ROOT), False)
+    expect("program not ELF", check_package("t", STD, base, {"/usr/sbin/robodr-agentd": b"#!/bin/sh\n"}, ROOT), False)
+    expect("program truncated ELF", check_package("t", STD, base, {"/usr/sbin/robodr-agentd": _elf(3)[:17]}, ROOT), False)
     no_seal = {k: v for k, v in base.items() if not k.endswith("/robodr-seal")}
     expect("program missing", check_package("t", STD, no_seal, {}, ROOT), False)
     no_unit = {k: v for k, v in base.items() if not k.endswith("robodr-deliverd.service")}
