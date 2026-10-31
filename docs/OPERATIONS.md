@@ -4363,7 +4363,11 @@ state re-created by its own procedure, never copied.
    extracts evidence only under `--evidence-to` (a directory that, after
    resolving `..`, relative paths and symlinks, is the root or lies in
    `/etc`, `/var/lib/robodr`, `/var/lib/robodr-anchor-receiver`,
-   `/var/lib/robodr-seal` or `/opt/robodr-delivered` is refused, exit 2),
+   `/var/lib/robodr-seal` or `/opt/robodr-delivered` is refused, exit 2;
+   it is created before the verification pass and must still resolve to
+   itself before each evidence file is written, else the restore stops,
+   exit 2; the check is not atomic with each write, so put it where only
+   the operator can write),
    restores the spools' `ready/` findings only with `--spool-ready` and only
    into an empty `ready/`, and **never** restores a "no" row of 14.1, even
    from an archive that holds one: each refused path is printed with its

@@ -139,7 +139,8 @@
 //!   (anti-rollback floors, replay stores, security floor, TPM-bound
 //!   material, exporter sequence state: each is listed with the reason),
 //!   evidence only under `--evidence-to` (never into the unit: a directory
-//!   that resolves to the root or into its live trees is refused, exit 2),
+//!   that resolves to the root or into its live trees is refused, exit 2,
+//!   and so is one that no longer resolves to itself mid-restore),
 //!   and the spools' `ready/` findings only with `--spool-ready` and only
 //!   into an empty `ready/`. `--dry-run` reports without writing.
 //!
