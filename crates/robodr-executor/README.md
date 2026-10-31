@@ -260,15 +260,19 @@ default 2; counted from the end of the previous run):
   a later switch by someone else is not detected).
 
 Every run cancels / sets hold again, but the `overridden` events are
-rate-limited per pause: a kind of override (`nav2:goals`,
-`px4:manual:<mode>`, `px4:mode:<mode>`) is reported once, and the same
-kind found again within 5 minutes is counted, not reported; the count
-(and the last one's detail) is reported in the next event for that pause,
-at the latest 5 minutes after the previous one. A different kind is
-reported at once. A pilot holding a manual mode, or a script re-sending a
-goal, is therefore at most one High finding per 5 minutes per pause, and
-cannot push older evidence (approvals, applies, refusals) out of the
-journal's ring of events.
+rate-limited per pause in 5-minute windows. In a window the first 3
+distinct kinds of override (`nav2:goals`, `px4:manual:<mode>`,
+`px4:mode:<mode>`, or a combination of them for a spec with several
+adapters) are reported at once; every further override, whether the same
+kind again or a kind beyond those 3 (someone alternating flight modes),
+is counted, not reported. The count, the kinds (up to 8 named) and the
+last one's detail go into the next event for that pause, at the latest
+when the window has passed. A pilot holding a manual mode, or a script
+re-sending a goal, is therefore one High finding per 5 minutes per pause,
+and any mix of overrides at most 4 per 5 minutes per pause. This slows,
+but does not stop, a persistent override pushing older evidence
+(approvals, applies, refusals) out of the journal's ring of 512 events:
+one pause at that maximum fills the ring in about 10 hours.
 
 The latch's adapter calls are synchronous: while one run lasts, the
 engine handles nothing else (reverts, new orders and TTL expiries wait).

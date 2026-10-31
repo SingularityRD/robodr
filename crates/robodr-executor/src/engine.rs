@@ -321,33 +321,83 @@ pub struct Engine {
     last_latch_boot_ms: u64,
     /// The last latch error per pause (one event per change).
     latch_errors: BTreeMap<String, String>,
-    /// The last override reported per pause (one event per kind of
-    /// override, repeats summarised at most every
-    /// [`LATCH_REPEAT_REPORT_MS`]).
+    /// The overrides found per pause in its current report window (at
+    /// most [`LATCH_KINDS_PER_WINDOW`] kinds reported at once, the rest
+    /// counted and summarised once the [`LATCH_REPEAT_REPORT_MS`] window
+    /// has passed).
     latch_overrides: BTreeMap<String, OverrideSeen>,
 }
 
-/// How often the safe_pause latch reports the **same** kind of override
-/// again while it persists or repeats (a pilot holding a manual mode, a
-/// script re-sending a Nav2 goal): 5 minutes, with the number of repeats
-/// found meanwhile. Every latch run still cancels the goals / sets hold
-/// again; only the `overridden` events (each a High finding in agentd and
-/// a journal write) are rate-limited, so they cannot flood the SOC or push
-/// older evidence out of the journal's ring of events. A different kind
-/// is reported at once.
+/// The safe_pause latch's report window per pause: 5 minutes. Every latch
+/// run still cancels the goals / sets hold again; only the `overridden`
+/// events (each a High finding in agentd and a journal write) are
+/// rate-limited. Within one window the first [`LATCH_KINDS_PER_WINDOW`]
+/// distinct kinds of override are reported at once; any further override
+/// (the same kind again, or a kind beyond that budget, such as a pilot or
+/// an attacker alternating flight modes) is counted and summarised with
+/// its count once the window has passed. One pause therefore writes at
+/// most `LATCH_KINDS_PER_WINDOW + 1` `overridden` events per window,
+/// whatever kinds the overrides have. This bounds, but does not stop, how
+/// fast a persistent override adds events to the journal's ring.
 pub const LATCH_REPEAT_REPORT_MS: u64 = 300_000;
 
-/// The last override the latch reported for one pause.
-#[derive(Debug, Clone)]
+/// How many distinct kinds of override one pause reports at once per
+/// [`LATCH_REPEAT_REPORT_MS`] window (review of T42: with one remembered
+/// kind, alternating two kinds was one event per latch run).
+pub const LATCH_KINDS_PER_WINDOW: usize = 3;
+
+/// How many distinct kinds a summary names (further ones are "and
+/// others"); bounds the state kept per pause.
+pub(crate) const LATCH_SUMMARY_KINDS: usize = 8;
+
+/// The overrides the latch found for one pause in its report window.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct OverrideSeen {
-    /// [`crate::motion::Latch::Overridden`]'s `kind`.
-    pub(crate) kind: String,
-    /// When it was last reported (monotonic ms).
-    pub(crate) reported_ms: u64,
-    /// Overrides of this kind found since, not reported yet.
+    /// When the current report window started (monotonic ms).
+    pub(crate) window_ms: u64,
+    /// The kinds ([`crate::motion::Latch::Overridden`]'s `kind`) reported
+    /// in this window, at most [`LATCH_KINDS_PER_WINDOW`].
+    pub(crate) reported: Vec<String>,
+    /// Overrides found in this window and not reported yet.
     pub(crate) unreported: u64,
+    /// Their distinct kinds, at most [`LATCH_SUMMARY_KINDS`].
+    pub(crate) unreported_kinds: Vec<String>,
+    /// More distinct kinds than [`LATCH_SUMMARY_KINDS`] went unreported.
+    pub(crate) more_kinds: bool,
     /// The last unreported one's note.
     pub(crate) last_note: String,
+}
+
+impl OverrideSeen {
+    /// Counts an override that is not reported now.
+    pub(crate) fn count(&mut self, kind: String, note: String) {
+        self.unreported = self.unreported.saturating_add(1);
+        self.last_note = note;
+        if !self.unreported_kinds.contains(&kind) {
+            if self.unreported_kinds.len() < LATCH_SUMMARY_KINDS {
+                self.unreported_kinds.push(kind);
+            } else {
+                self.more_kinds = true;
+            }
+        }
+    }
+
+    /// The unreported overrides (count, their kinds, the last one's note)
+    /// for an event's text, and forgets them; `None` when there are none.
+    pub(crate) fn take_unreported(&mut self) -> Option<(u64, String, String)> {
+        if self.unreported == 0 {
+            return None;
+        }
+        let mut kinds = self.unreported_kinds.join(", ");
+        if self.more_kinds {
+            kinds.push_str(" and others");
+        }
+        let out = (self.unreported, kinds, std::mem::take(&mut self.last_note));
+        self.unreported = 0;
+        self.unreported_kinds.clear();
+        self.more_kinds = false;
+        Some(out)
+    }
 }
 
 impl std::fmt::Debug for Engine {

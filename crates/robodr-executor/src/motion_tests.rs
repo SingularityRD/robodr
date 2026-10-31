@@ -2305,6 +2305,84 @@ fn t42_review_a_held_manual_mode_is_reported_once_per_kind_not_per_run() {
     assert_eq!(e.status("ld1").status, Status::Verified);
 }
 
+/// Phase-3 review of T42: only the last kind was remembered per pause, so
+/// alternating two kinds (a pilot or attacker toggling ALTCTL and POSCTL,
+/// or OFFBOARD and AUTO.MISSION) was again one HIGH event and one journal
+/// save per latch run. Now each pause reports at most
+/// `LATCH_KINDS_PER_WINDOW` distinct kinds per window, whatever the kinds,
+/// and summarises the rest with their count and kinds.
+#[test]
+fn t42_review_alternating_kinds_do_not_bypass_the_report_budget() {
+    let (_sim, addr, mode) = sim_px4(true);
+    let d = tmpdir("t42-px4-alternate");
+    let motion = json!({"safe_pause": "px4",
+        "px4": {"oem_validated": true, "address": addr.to_string(), "bind": "127.0.0.1:0",
+                "timeout_ms": 3000}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Drone, Morphology::Aerial),
+        t0,
+    );
+    let o = signed(
+        "la1",
+        ActionId::SafePause,
+        Morphology::Aerial,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::MovingSlow,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::MovingSlow), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let budget = crate::engine::LATCH_KINDS_PER_WINDOW;
+    // Two manual modes on alternate runs: two events, not twenty.
+    let modes = [mav::px4_custom_mode(2, 0), mav::px4_custom_mode(3, 0)];
+    for i in 1..=20u64 {
+        *mode.lock().unwrap() = modes[(i % 2) as usize];
+        e.tick(late(i * 2_100));
+    }
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 2, "one event per run: {ov:?}");
+    // Five kinds in turn (manual ones left to the pilot, commanded ones
+    // set back to hold): the budget, not one per kind or run.
+    let five = [
+        mav::px4_custom_mode(1, 0),
+        mav::px4_custom_mode(2, 0),
+        mav::px4_custom_mode(3, 0),
+        mav::px4_custom_mode(6, 0),
+        mav::px4_custom_mode(mav::PX4_MAIN_AUTO, 4),
+    ];
+    for i in 21..=60u64 {
+        *mode.lock().unwrap() = five[(i % 5) as usize];
+        e.tick(late(i * 2_100));
+    }
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), budget, "kinds beyond the budget reported: {ov:?}");
+    let hold = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, mav::PX4_SUB_AUTO_LOITER);
+    *mode.lock().unwrap() = hold;
+    // The window passes with no override: one summary, with the count and
+    // the kinds not reported.
+    let t = crate::engine::LATCH_REPEAT_REPORT_MS;
+    e.tick(late(t + 10_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), budget + 1, "{ov:?}");
+    let last = &ov[budget];
+    assert!(
+        last.starts_with("HIGH:")
+            && last.contains("further override(s) of kind(s)")
+            && last.contains("OFFBOARD")
+            && last.contains("px4:manual:ALTCTL"),
+        "{last}"
+    );
+    assert_eq!(e.status("la1").status, Status::Verified);
+}
+
 /// Review of T42: a script re-sending a Nav2 goal every few seconds was
 /// one HIGH event per latch run. Each goal is still cancelled (and zero
 /// twists follow); the reports are rate-limited with a count.
