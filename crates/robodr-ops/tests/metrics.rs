@@ -225,7 +225,10 @@ fn uplink_status() -> Value {
                 measured_at_ms: 1_793_408_000_000,
                 ..Default::default()
             }),
+            state_usage_error: None,
+            out_prune_error: None,
         },
+        credentials: Vec::new(),
     };
     serde_json::to_value(s).unwrap()
 }
