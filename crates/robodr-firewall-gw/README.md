@@ -884,7 +884,8 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `rtps.malformed_datagram` | `drop` | whole-datagram policy |
 | `rtps.unknown_writers` | `probe` | `probe` or `pass` |
 | `rtps.max_writers`, `rtps.max_writers_per_channel` | 4096, 16 | not-enforced writers remembered (least recently used evicted: it is then unknown and probed again); per-channel sequence state |
-| `rtps.max_enforced_writers` | 1024 | writers ever classified as enforced (`1..=65536`); **never evicted or removed** (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer is refused (finding `fragmented_command`, reason `enforced_writer_table_full`) and probed, also with `unknown_writers: pass` |
+| `rtps.max_enforced_writers` | 1024 | writers classified as enforced (`1..=65536`); **never downgraded or removed** by discovery (a dispose, an unregister or an announcement on another topic keeps them enforced); when full, a new enforced writer replaces the one seen longest ago (by a sample or an announcement) if that one has been idle for `rtps.enforced_idle_evict_s` (`discovery.enforced_evicted`), else it is refused (finding `fragmented_command`, reason `enforced_writer_table_full`; `discovery.enforced_refused`) and probed. A full table stays full, so unknown writers (an evicted one included) are probed, also with `unknown_writers: pass` |
+| `rtps.enforced_idle_evict_s` | 3600 | how long an enforced writer must have sent no sample and had no announcement before a new enforced writer may take its place in a full table; `0` = never (`60..=31536000` otherwise). An active writer is never evicted; a flood of fresh forged announcements on an enforced topic can still hold the table, and a new writer is then refused and probed |
 | `rtps.state_file` | none | persisted writer → channel map (format `robodr-firewall-gw-writers/v2`, v1 still read): the enforced table and the not-enforced writers. Read only if a regular file (symlinks refused), owned by root or the directory's owner and not group / world writable; written through an `O_EXCL` 0600 temporary file |
 | `rtps.max_sn_jump` | 64 | largest sequence-number step decided at once (larger: held until confirmed) |
 | `rtps.binding_takeover_ns` | 1 s | silence after which another (IP, MAC) may continue an authorised GUID's stream |
@@ -1091,8 +1092,10 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   SPDP / SEDP; `discovery.misaddressed`) is ignored, as the robot ignores
   it; a not-enforced announcement or a removal sent by another participant
   than the writer's own is ignored (`discovery.relayed_ignored`); a writer
-  ever classified as enforced stays enforced (own table, never evicted,
-  persisted; `discovery.enforced_kept`); the not-enforced table evicts the
+  ever classified as enforced stays enforced (own table, persisted;
+  `discovery.enforced_kept`; evicted only from a full table, idle for
+  `rtps.enforced_idle_evict_s`, to make room for a new enforced writer,
+  after which it is probed); the not-enforced table evicts the
   least recently used; only the standard builtin entity ids are discovery
   (a user writer with builtin kind bits is decided). Until the robot's
   participants are known (observation off, or its SPDP not seen yet) an

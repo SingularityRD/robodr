@@ -2519,6 +2519,17 @@ while the chain is flushed.
   (set `rtps.state_file`) and `unknown_writers: pass`; or the controller's
   participant changed and its identity / GUID is not in the firewall's
   `allowed_sources`.
+* `enforced_writer_table_full` findings (`discovery.enforced_refused`
+  rising): the enforced writer table (`rtps.max_enforced_writers`) is full
+  of writers that were all seen within `rtps.enforced_idle_evict_s`.
+  Stale GUIDs from controller restarts age out on their own; a table held
+  by fresh entries means many enforced writers or forged SEDP
+  announcements on the controller segment (investigate the sender). New
+  writers are probed meanwhile (a fragmented or key-only sample of theirs
+  is removed). To reset the table: stop the gateway (the kernel applies
+  `on_gateway_down`), delete `rtps.state_file`, start the gateway, then
+  restart the controller-side ROS 2 graph so its SEDP crosses the bridge
+  again.
 * Large IP datagrams from the controller side disappear: defragmentation
   did not run (another ruleset flushed the `raw` table); re-run the rules
   unit.

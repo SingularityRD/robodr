@@ -488,6 +488,102 @@ fn f2_full_enforced_table_refuses_and_probes() {
     assert_not_forwarded_as_sent(&out, "table full");
 }
 
+/// Verifier finding (GW+WP11): the enforced table never aged, so stale
+/// GUIDs from controller restarts (or a flood of forged enforced
+/// announcements) filled it for good and every new legitimate writer was
+/// refused. A writer idle for `rtps.enforced_idle_evict_s` now makes room;
+/// an active one never does, and an evicted writer is probed (the table
+/// stays full), never passed, also with `unknown_writers: pass`.
+#[test]
+fn f2_full_enforced_table_evicts_an_idle_writer_only() {
+    let mut cfg = gateway_config(Fixture::G1);
+    cfg.rtps.max_enforced_writers = 1;
+    cfg.rtps.enforced_idle_evict_s = 60;
+    cfg.rtps.unknown_writers = robodr_firewall_gw::config::UnknownWriters::Pass;
+    let mut gw = Gateway::new(&cfg, &profile(Fixture::G1), &firewall(Fixture::G1)).unwrap();
+    let base = Instant::now();
+    let at = |s: u64, now: u64| PacketMeta {
+        now_ns: now,
+        queue_delay_ns: None,
+        instant: base + std::time::Duration::from_secs(s),
+        src_mac: None,
+    };
+    let send = |gw: &mut Gateway, pkt: &[u8], m: PacketMeta| {
+        let mut p = pkt.to_vec();
+        gw.process(&mut p, m);
+        p
+    };
+    // A stale (forged or pre-restart) enforced writer fills the table.
+    let stale = sedp_datagram(
+        FOREIGN,
+        [0, 0, 9, 3],
+        "rt/lowcmd",
+        "unitree_hg::msg::dds_::LowCmd_",
+    );
+    send(&mut gw, &packet(ATTACKER_IP, SEDP_PORT, &stale), at(0, T0));
+    let sedp = sedp_datagram(
+        PREFIX,
+        WRITER,
+        "rt/lowcmd",
+        "unitree_hg::msg::dds_::LowCmd_",
+    );
+    // Not idle long enough yet: refused.
+    send(
+        &mut gw,
+        &packet(CONTROLLER_IP, SEDP_PORT, &sedp),
+        at(30, T0 + MS),
+    );
+    assert_eq!(gw.discovery().stats.enforced_refused, 1);
+    assert_eq!(gw.discovery().stats.enforced_evicted, 0);
+    // Idle for 61 s: the controller's writer takes its place.
+    send(
+        &mut gw,
+        &packet(CONTROLLER_IP, SEDP_PORT, &sedp),
+        at(61, T0 + 2 * MS),
+    );
+    assert_eq!(gw.discovery().stats.enforced_refused, 1);
+    assert_eq!(gw.discovery().stats.enforced_evicted, 1);
+    let w = guid(PREFIX, WRITER);
+    assert_eq!(gw.discovery().writer(&w).and_then(|i| i.channel), Some(0));
+    // The controller's writer stays active (a sample at 100 s); the
+    // stale one re-announced at 130 s cannot evict it.
+    let out = send(
+        &mut gw,
+        &lowcmd_pkt(CONTROLLER_IP, 1, &frame(0.0)),
+        at(100, T0 + 3 * MS),
+    );
+    assert!(
+        out_payload(&out).is_some(),
+        "an enforced writer's valid frame passes"
+    );
+    send(
+        &mut gw,
+        &packet(ATTACKER_IP, SEDP_PORT, &stale),
+        at(130, T0 + 4 * MS),
+    );
+    assert_eq!(gw.discovery().stats.enforced_evicted, 1);
+    assert_eq!(gw.discovery().stats.enforced_refused, 2);
+    assert_eq!(gw.discovery().writer(&w).and_then(|i| i.channel), Some(0));
+    // An evicted writer's motion sample is probed and decided, not passed.
+    let foreign = guid(FOREIGN, [0, 0, 9, 3]);
+    assert!(gw.discovery().writer(&foreign).is_none());
+    let d = lowcmd_datagram(
+        FOREIGN,
+        [0, 0, 9, 3],
+        1,
+        &evil_frame(),
+        Representation::CdrLe,
+    );
+    let samples = gw.stats.samples;
+    let out = send(
+        &mut gw,
+        &packet(ATTACKER_IP, DDS_PORT, &d),
+        at(140, T0 + 5 * MS),
+    );
+    assert_eq!(gw.stats.samples, samples + 1, "probed and decided");
+    assert_not_forwarded_as_sent(&out, "evicted writer");
+}
+
 // ------------------------------------------------------------ finding 7
 
 /// A user writer whose entity id has the builtin kind (`0xc3`) but is no

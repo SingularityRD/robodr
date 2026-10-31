@@ -8,13 +8,19 @@
 //!   writer GUID to that channel: where DDS stacks would disagree on which
 //!   topic a writer writes, the gateway enforces. Other writers are
 //!   remembered as "not enforced" so their samples are not probed.
-//! - **Enforced is forever** (gateway review, findings 1 and 2): a writer
-//!   once classified as enforced is kept in its own table, never evicted
-//!   and never removed. A dispose / unregister, a participant removal or an
+//! - **Enforced is never downgraded** (gateway review, findings 1 and 2):
+//!   a writer once classified as enforced is kept in its own table and
+//!   never removed. A dispose / unregister, a participant removal or an
 //!   announcement of the same GUID on another topic leaves it enforced
-//!   (`enforced_kept`). The table is bounded (`rtps.max_enforced_writers`);
-//!   when it is full a new enforced writer is refused (`enforced_refused`,
-//!   a gateway finding) and stays unknown, so its samples are probed.
+//!   (`enforced_kept`). The table is bounded (`rtps.max_enforced_writers`).
+//!   When it is full, a new enforced writer takes the place of the writer
+//!   seen longest ago (by a sample or an announcement), if that one has
+//!   been idle for at least `rtps.enforced_idle_evict_s` (`enforced_evicted`;
+//!   DDS writer GUIDs change with every controller restart, so stale ones
+//!   pile up). Otherwise the new writer is refused (`enforced_refused`, a
+//!   gateway finding) and stays unknown, so its samples are probed. A full
+//!   table stays full, so an evicted writer's next samples are probed too
+//!   (also with `unknown_writers: pass`), never passed unchecked.
 //!   Other writers live in a least-recently-used table (`rtps.max_writers`):
 //!   evicting one only makes it unknown again.
 //! - **INFO_DST is obeyed**: a robot drops a submessage addressed (INFO_DST)
@@ -96,10 +102,17 @@ pub const MAX_ROBOT_PREFIXES: usize = 64;
 
 /// Discovery state.
 pub struct Discovery {
-    /// Writers ever classified as enforced (SEDP or the state file):
-    /// writer -> channel. Never evicted, never removed (module docs).
-    enforced: HashMap<Guid, usize>,
+    /// Writers classified as enforced (SEDP or the state file): writer ->
+    /// (channel, last seen). Never removed or downgraded; evicted only for
+    /// a new enforced writer when full and idle long enough (module docs).
+    enforced: HashMap<Guid, (usize, Instant)>,
     max_enforced: usize,
+    /// How long an enforced writer must have been idle before a new one
+    /// may take its place in a full table (`None`: never).
+    enforced_idle_evict: Option<std::time::Duration>,
+    /// The clock enforced writers' last-seen times are kept on (the last
+    /// [`Discovery::learn`] or [`Discovery::set_now`]).
+    now: Instant,
     /// Every other writer (SEDP on another topic, probe results), with its
     /// last use; `lru` orders them (least recently used first).
     others: HashMap<Guid, (WriterInfo, u64)>,
@@ -172,6 +185,9 @@ pub struct DiscoveryStats {
     pub enforced_kept: u64,
     /// New enforced writers refused because the enforced table was full.
     pub enforced_refused: u64,
+    /// Enforced writers idle for `rtps.enforced_idle_evict_s` or more that
+    /// a new enforced writer replaced in the full table.
+    pub enforced_evicted: u64,
 }
 
 /// Persisted form.
@@ -222,9 +238,7 @@ fn unhex16(s: &str) -> Option<Guid> {
 }
 
 fn prefix_of(g: &Guid) -> GuidPrefix {
-    let mut p = [0u8; 12];
-    p.copy_from_slice(&g[..12]);
-    p
+    crate::rtps::guid_prefix(g)
 }
 
 /// How an INFO_DST destination relates to the robot.
@@ -261,6 +275,8 @@ impl Discovery {
         Self {
             enforced: HashMap::new(),
             max_enforced: max_writers.max(1),
+            enforced_idle_evict: None,
+            now: Instant::now(),
             others: HashMap::new(),
             lru: BTreeMap::new(),
             clock: 0,
@@ -280,10 +296,23 @@ impl Discovery {
         }
     }
 
-    /// The size of the never-evicted enforced table.
+    /// The size of the enforced table.
     pub fn with_max_enforced(mut self, n: usize) -> Self {
         self.max_enforced = n.max(1);
         self
+    }
+
+    /// How long an enforced writer must have been idle before a new
+    /// enforced writer may replace it in a full table (`None`: never).
+    pub fn with_enforced_idle_evict(mut self, idle: Option<std::time::Duration>) -> Self {
+        self.enforced_idle_evict = idle;
+        self
+    }
+
+    /// Advance the clock enforced writers' last-seen times are kept on
+    /// (the gateway calls it per datagram; never moves backwards).
+    pub fn set_now(&mut self, now: Instant) {
+        self.now = self.now.max(now);
     }
 
     /// The enforced channels' DDS type names (a not-enforced writer
@@ -427,34 +456,55 @@ impl Discovery {
         })
     }
 
-    /// Classify `guid` as enforced on `channel` (module docs: never
-    /// evicted). `false`: the enforced table is full, the writer was
-    /// refused (and forgotten, so it is unknown and probed).
+    /// Classify `guid` as enforced on `channel` (module docs). `false`:
+    /// the enforced table is full and no writer in it has been idle long
+    /// enough to make room; the writer was refused (and forgotten, so it is
+    /// unknown and probed).
     fn set_enforced(&mut self, guid: Guid, channel: usize) -> bool {
         self.forget_other(&guid);
-        let full = self.enforced.len() >= self.max_enforced;
-        match self.enforced.get_mut(&guid) {
-            Some(c) => {
-                if *c != channel {
-                    *c = channel;
-                    self.dirty = true;
-                }
-                true
-            }
-            None if full => {
-                self.stats.enforced_refused += 1;
-                false
-            }
-            None => {
-                self.enforced.insert(guid, channel);
+        let now = self.now;
+        if let Some((c, seen)) = self.enforced.get_mut(&guid) {
+            *seen = now;
+            if *c != channel {
+                *c = channel;
                 self.dirty = true;
-                true
             }
+            return true;
         }
+        if self.enforced.len() >= self.max_enforced && !self.evict_idle_enforced() {
+            self.stats.enforced_refused += 1;
+            return false;
+        }
+        self.enforced.insert(guid, (channel, now));
+        self.dirty = true;
+        true
     }
 
-    /// The enforced table is full: new enforced writers are refused (and
-    /// must then be probed whatever `rtps.unknown_writers` says).
+    /// Remove the enforced writer seen longest ago if it has been idle for
+    /// `enforced_idle_evict` or more. `false`: none qualifies.
+    fn evict_idle_enforced(&mut self) -> bool {
+        let Some(idle) = self.enforced_idle_evict else {
+            return false;
+        };
+        let Some((&oldest, &(_, seen))) = self
+            .enforced
+            .iter()
+            .min_by_key(|(g, (_, seen))| (*seen, **g))
+        else {
+            return false;
+        };
+        if self.now.saturating_duration_since(seen) < idle {
+            return false;
+        }
+        self.enforced.remove(&oldest);
+        self.stats.enforced_evicted += 1;
+        self.dirty = true;
+        true
+    }
+
+    /// The enforced table is full: a new enforced writer is admitted only
+    /// in place of an idle one, and unknown writers (an evicted one among
+    /// them) must be probed whatever `rtps.unknown_writers` says.
     pub fn enforced_full(&self) -> bool {
         self.enforced.len() >= self.max_enforced
     }
@@ -498,7 +548,7 @@ impl Discovery {
 
     /// What is known about `guid`, without marking it used.
     pub fn writer(&self, guid: &Guid) -> Option<WriterInfo> {
-        if let Some(&ch) = self.enforced.get(guid) {
+        if let Some(&(ch, _)) = self.enforced.get(guid) {
             return Some(WriterInfo {
                 channel: Some(ch),
                 ..WriterInfo::default()
@@ -510,7 +560,9 @@ impl Discovery {
     /// What is known about `guid`, marking a not-enforced entry used (the
     /// decision path).
     pub fn lookup(&mut self, guid: &Guid) -> Option<WriterInfo> {
-        if let Some(&ch) = self.enforced.get(guid) {
+        if let Some((ch, seen)) = self.enforced.get_mut(guid) {
+            *seen = self.now;
+            let ch = *ch;
             return Some(WriterInfo {
                 channel: Some(ch),
                 ..WriterInfo::default()
@@ -547,6 +599,7 @@ impl Discovery {
 
     /// Learn from one RTPS datagram (UDP payload) from `src`.
     pub fn learn(&mut self, datagram: &[u8], src: Ipv4Addr, now: Instant) {
+        self.set_now(now);
         self.stats.datagrams += 1;
         self.announced.clear();
         let Some(report) = self.reasm.parse_datagram_detailed(datagram) else {
@@ -610,8 +663,7 @@ impl Discovery {
                 continue;
             }
             self.stats.participants_removed += 1;
-            let mut guid = [0u8; 16];
-            guid[..12].copy_from_slice(&r.guid_prefix);
+            let guid = crate::rtps::guid_of(&r.guid_prefix, &[0; 4]);
             self.announced.push(Announced {
                 guid,
                 whole_participant: true,
@@ -622,12 +674,12 @@ impl Discovery {
             self.stats.enforced_kept += self
                 .enforced
                 .keys()
-                .filter(|g| g[..12] == r.guid_prefix)
+                .filter(|g| prefix_of(g) == r.guid_prefix)
                 .count() as u64;
             let gone: Vec<Guid> = self
                 .others
                 .keys()
-                .filter(|g| g[..12] == r.guid_prefix)
+                .filter(|g| prefix_of(g) == r.guid_prefix)
                 .copied()
                 .collect();
             for g in gone {
@@ -751,7 +803,7 @@ impl Discovery {
         let mut writers: Vec<(String, String)> = self
             .enforced
             .iter()
-            .filter_map(|(g, ch)| Some((hex(g), self.topics.get(*ch)?.clone()?)))
+            .filter_map(|(g, (ch, _))| Some((hex(g), self.topics.get(*ch)?.clone()?)))
             .collect();
         let mut same_type = Vec::new();
         let mut unverified = Vec::new();

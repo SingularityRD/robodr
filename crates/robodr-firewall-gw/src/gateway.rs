@@ -770,6 +770,10 @@ impl Gateway {
             binding_takeover_ns: cfg.rtps.binding_takeover_ns,
             discovery: Discovery::new(topics, cfg.rtps.max_writers, IdentityResolver::new(profile))
                 .with_max_enforced(cfg.rtps.max_enforced_writers)
+                .with_enforced_idle_evict(
+                    (cfg.rtps.enforced_idle_evict_s > 0)
+                        .then(|| std::time::Duration::from_secs(cfg.rtps.enforced_idle_evict_s)),
+                )
                 .with_channel_types(
                     cfg.channels
                         .iter()
@@ -1101,6 +1105,7 @@ impl Gateway {
     /// or a suppression could not be applied.
     fn rtps(&mut self, d: &mut [u8], src: Ipv4Addr, meta: PacketMeta) -> Result<bool, RtpsError> {
         let mut samples = std::mem::take(&mut self.samples);
+        self.discovery.set_now(meta.instant);
         let r = rtps::walk(d, WalkOptions::default(), &mut samples);
         let out = match r {
             Err(_) => Err(RtpsError::Malformed),
@@ -1161,7 +1166,7 @@ impl Gateway {
             for (g, w) in ch.writers.iter_mut() {
                 let hit = hints.iter().any(|h| {
                     if h.whole_participant {
-                        h.guid[..12] == g[..12]
+                        crate::rtps::guid_prefix(&h.guid) == crate::rtps::guid_prefix(g)
                     } else {
                         h.guid == *g
                     }
@@ -1400,8 +1405,7 @@ impl Gateway {
         }
         let full = hex(writer);
         let prefix = full.get(..24).unwrap_or("");
-        let mut prefix_arr = [0u8; 12];
-        prefix_arr.copy_from_slice(&writer[..12]);
+        let prefix_arr = crate::rtps::guid_prefix(writer);
         let s = self
             .fw
             .source_id(&full)
