@@ -17,10 +17,11 @@
 //!   every agentd start says so).
 //!
 //! Loaders accept such a chain (it is cryptographically complete), and
-//! report it loudly: `verify-profile` prints [`LAB_ONLY_BANNER`], agentd
-//! warns at every start. Moving to production means a new chain (`keygen
-//! --roots`, `keygen`, `operators` with two or more people, `trust-keys
-//! --sign-key`): nothing of a lab chain is reusable, by design.
+//! report it loudly: `verify-profile` prints [`LAB_ONLY_BANNER`], agentd and
+//! the executor (with `commissioning`) warn at every start. Moving to
+//! production means a new chain (`keygen --roots`, `keygen`, `operators`
+//! with two or more people, `trust-keys --sign-key`): nothing of a lab
+//! chain is reusable, by design.
 
 use crate::signoff::OperatorTrust;
 use crate::trust::{

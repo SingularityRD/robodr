@@ -533,8 +533,9 @@ with the step-by-step path (learn, report-html, firewall-draft, bind,
 sign-off, lock, verify-profile). The POC therefore runs the production
 path, not observe-only shortcuts. The marking is loud and sticky: key ids
 start with `lab-only-`, the operator is `NAME [LAB-ONLY]` (so `locked_by`
-of every profile says it), `verify-profile` and agentd print the LAB-ONLY
-banner at every start, and removing `lab_only` breaks the root signature.
+of every profile says it), `verify-profile`, agentd and (with
+`commissioning`) the executor print the LAB-ONLY banner at every start,
+and removing `lab_only` breaks the root signature.
 Never deploy it: production needs an offline root and two or more
 operators; nothing of a lab chain is reusable.
 
