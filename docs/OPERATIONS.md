@@ -4184,6 +4184,13 @@ robodr-blackbox backup create --include-keys --out - | age -r <custodian key> \
 
 `create` archives only the "back up: yes" rows (never symlinks or special
 files), each file with its SHA-256; the "no" rows are not archived. The
+SHA-256 sums and the archive's end record are **not keyed**: `verify`
+catches corruption and truncation, not tampering. Anyone who can write an
+archive can build a consistent one with other contents, and a restore
+writes trust files (profile trust, control-plane and SOC trust, CA
+certificates) from it. The archive's authenticity rests entirely on how it
+was kept: encrypted (`age`) and on offline media under the site's custody.
+Restore only from such a copy. The
 same with `tar` and `age` by hand:
 
 ```sh
@@ -4213,19 +4220,32 @@ state re-created by its own procedure, never copied.
    the security floor the fleet runs; this creates the directories and
    `/var/lib/robodr/releases/security-floor` from the bundle.
 2. Restore `/etc/robodr` (and the drop-ins) from the configuration
-   backup, then the keys; `systemd-tmpfiles --create` resets owners and
-   modes. With an archive of 14.2:
+   backup, then the keys; `systemd-tmpfiles --create` resets the owners
+   and modes of the packaged directories. With an archive of 14.2:
    `robodr-blackbox backup restore FILE [--evidence-to /srv/archive/<unit>]
    [--spool-ready] [--dry-run]` (decrypt the keys archive first:
    `age -d ... > keys.rbkup`). It verifies the whole archive before writing
-   anything, restores configuration (keys 0600 in a 0700 directory, no
-   set-id bits) and the anchor receiver's state, extracts evidence only
-   under `--evidence-to` (never into the unit), restores the spools'
-   `ready/` findings only with `--spool-ready` and only into an empty
-   `ready/`, and **never** restores a "no" row of 14.1, even from an
-   archive that holds one: each refused path is printed with its reason.
-   It refuses paths that escape the root and targets behind a symlink. A replaced unit with a new TPM keeps the old keys only if the
-   site decides so; otherwise rotate (4.3).
+   anything, then reads it again to write it, checking every entry and
+   every file's bytes against the verified pass before the file replaces
+   anything (an archive that changed in between stops the restore with
+   exit 1; what was written before is what was verified). It restores
+   configuration and the anchor receiver's state (never set-id, sticky,
+   group- or world-writable; key material — `/etc/robodr/keys`,
+   `/etc/robodr-depot/keys`, any `*.key` file — 0600 in 0700 directories),
+   extracts evidence only under `--evidence-to` (a directory that, after
+   resolving `..`, relative paths and symlinks, is the root or lies in
+   `/etc`, `/var/lib/robodr`, `/var/lib/robodr-anchor-receiver`,
+   `/var/lib/robodr-seal` or `/opt/robodr-delivered` is refused, exit 2),
+   restores the spools' `ready/` findings only with `--spool-ready` and only
+   into an empty `ready/`, and **never** restores a "no" row of 14.1, even
+   from an archive that holds one: each refused path is printed with its
+   reason. It refuses paths that escape the root and targets behind a
+   symlink. Restored files are owned by the user who runs it (root):
+   `systemd-tmpfiles --create` resets the packaged directories, not the
+   files in them, so give the depot's keys back to its user
+   (`chown -R robodr-depot:robodr-depot /etc/robodr-depot/keys`) and check
+   any file a service reads as its own user. A replaced unit with a new TPM
+   keeps the old keys only if the site decides so; otherwise rotate (4.3).
 3. Do **not** copy any "no" row of 14.1. Re-create instead: seal
    provisioning and enrolment (12.1-12.3) and the anchor sidecar (6.4),
    fleet enrollment (8.6), delivery anchor (11.3), depot enrolment (13.3).

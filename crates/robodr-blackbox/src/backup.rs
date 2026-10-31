@@ -20,23 +20,44 @@
 //! `--include-keys`, and such an archive goes through the site's encryption
 //! (`age`) to offline media (§14.2).
 //!
+//! **No authenticity.** The SHA-256 sums and the end record are unkeyed:
+//! they catch corruption and truncation, not tampering. Anyone who can
+//! write the archive can build a consistent one with other contents, and a
+//! restore writes trust files (profile trust, control-plane and SOC trust,
+//! CA certificates) from it. What vouches for an archive is where it was
+//! kept: the site's encryption (`age`) and the custody of the offline
+//! media, not this format.
+//!
 //! # Restore
 //!
 //! The whole archive is verified first (framing, every path, every file's
-//! SHA-256, the end record); nothing is written unless it all checks. Then
-//! each entry is classified by [`classify`]:
+//! SHA-256, the end record); nothing is written unless it all checks. The
+//! archive is then read a second time to write it: every entry must be the
+//! one the first pass verified (same position, path, kind, mode, size and
+//! SHA-256), and every file's bytes are hashed while they are written and
+//! compared before the file replaces anything. An archive that changes
+//! between the passes (removable media, a directory someone else can
+//! write) stops the restore with [`ArchiveChanged`]; what was written
+//! before that point is exactly what the first pass verified. Then each
+//! entry is classified by [`classify`]:
 //!
 //! * **config** (`etc/robodr/**`, `etc/systemd/system/robodr-*.service.d/**`,
 //!   `etc/robodr-depot/**`, `etc/robodr-anchor-receiver/**`) and the anchor
 //!   receiver's state (`var/lib/robodr-anchor-receiver/**`): restored under
-//!   the target root (files replaced atomically; key files 0600, key
-//!   directories 0700; set-id bits never restored);
+//!   the target root (files replaced atomically; never set-id, sticky,
+//!   group- or world-writable; key material — `etc/robodr/keys/**`,
+//!   `etc/robodr-depot/keys/**`, any `*.key` file — 0600 in 0700
+//!   directories; owned by the user running the restore, an existing
+//!   directory keeps its mode and owner);
 //! * **spool** `ready/` findings (`var/lib/robodr/spool/{agentd,pulsard}/ready/*`):
 //!   only with `--spool-ready`, and only into an empty `ready/` (§14.1: only
 //!   on a unit that never exported them);
 //! * **evidence** (black boxes, fleet journal, archive, outboxes, evidence
 //!   exports, gateway events, depot database): never into the live tree;
-//!   with `--evidence-to DIR` extracted under `DIR` for the archive host;
+//!   with `--evidence-to DIR` extracted under `DIR` for the archive host.
+//!   `DIR` is resolved first (relative paths, `..`, symlinks) and refused
+//!   if it is the root or inside one of [`LIVE_TREES`] under the root or
+//!   under `/` ([`evidence_dir`]);
 //! * **never restored** (§14.1 "no" rows, [`NEVER_RESTORE`]) and anything
 //!   unknown: refused and listed with the reason.
 //!
@@ -47,7 +68,7 @@
 use crate::crypto::{sha256, to_hex, Sha256};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 /// Archive magic.
@@ -533,7 +554,7 @@ fn walk(
             let want = to_hex(&headers.finalize());
             if h.entries != Some(count) || h.headers_sha256.as_deref() != Some(want.as_str()) {
                 return Err(bad(
-                    "end record does not match the entries (edited archive?)",
+                    "end record does not match the entries (corrupted or altered archive)",
                 ));
             }
             let mut extra = [0u8; 1];
@@ -630,6 +651,19 @@ pub struct RestoreOptions {
     pub dry_run: bool,
 }
 
+/// The archive changed between the verification pass and the write pass
+/// of [`restore`]: the restore stopped.
+#[derive(Debug)]
+pub struct ArchiveChanged(pub String);
+
+impl std::fmt::Display for ArchiveChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ArchiveChanged {}
+
 /// What [`restore`] did (or would do).
 #[derive(Debug, Default, Clone)]
 pub struct RestoreReport {
@@ -667,19 +701,115 @@ fn safe_target(base: &Path, rel_path: &str, dir: bool) -> Result<PathBuf, String
     Ok(p)
 }
 
+/// Key directories: restored 0700, everything in them 0600.
+const KEY_DIRS: &[&str] = &["etc/robodr/keys", "etc/robodr-depot/keys"];
+
+/// Is `path` key material (restored 0600 / 0700)? The key directories, and
+/// any `*.key` file of a restored configuration tree (the anchor
+/// receiver's `receiver.key`, `tls/receiver.key`).
+fn is_key(path: &str, dir: bool) -> bool {
+    KEY_DIRS.iter().any(|k| under(path, k)) || (!dir && path.ends_with(".key"))
+}
+
+/// The mode a restored entry gets: never set-id / sticky, never group or
+/// world writable (an archive is not trusted to widen access), key
+/// material 0600 in 0700 directories.
 fn restored_mode(path: &str, e: &Entry) -> u32 {
-    let m = e.mode & 0o777; // never set-id / sticky
-    if under(path, "etc/robodr/keys") {
-        if e.dir {
-            0o700
-        } else {
-            0o600
-        }
-    } else if e.dir {
-        m | 0o700
-    } else {
-        m
+    let m = e.mode & 0o755;
+    match (is_key(path, e.dir), e.dir) {
+        (true, true) => 0o700,
+        (true, false) => 0o600,
+        (false, true) => m | 0o700,
+        (false, false) => m,
     }
+}
+
+/// Trees of a unit's live state: evidence is never extracted into them
+/// (nor into the root itself, where it would land in `var/lib/robodr`).
+pub const LIVE_TREES: &[&str] = &[
+    "etc",
+    "var/lib/robodr",
+    "var/lib/robodr-anchor-receiver",
+    "var/lib/robodr-seal",
+    "opt/robodr-delivered",
+];
+
+/// Resolve `p` (absolute or relative to the working directory) through
+/// every symlink and `..` of its existing part; the part that does not
+/// exist yet must be plain names.
+fn resolve(p: &Path) -> io::Result<PathBuf> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(p)
+    };
+    let mut existing = abs.as_path();
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(mut c) => {
+                for part in rest.iter().rev() {
+                    c.push(part);
+                }
+                return Ok(c);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match (existing.parent(), existing.components().next_back()) {
+                    (Some(parent), Some(Component::Normal(name))) => {
+                        rest.push(name);
+                        existing = parent;
+                    }
+                    (Some(parent), Some(Component::CurDir)) => existing = parent,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "{}: `..` below a directory that does not exist",
+                                p.display()
+                            ),
+                        ))
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Check `--evidence-to` against the unit's live state under `root` and
+/// under `/` (after resolving `..`, relative paths and symlinks) and
+/// return the resolved directory evidence is written under. Refused
+/// ([`io::ErrorKind::InvalidInput`]): inside a [`LIVE_TREES`] tree, or the
+/// root itself.
+pub fn evidence_dir(root: &Path, to: &Path) -> io::Result<PathBuf> {
+    let refuse = |why: String| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--evidence-to {}: {why} (evidence goes to an archive directory, never back \
+                 into the unit, OPERATIONS 14.1)",
+                to.display()
+            ),
+        ))
+    };
+    let dest = resolve(to)?;
+    let mut bases = vec![resolve(root)?];
+    let sys = resolve(Path::new("/"))?;
+    if !bases.contains(&sys) {
+        bases.push(sys);
+    }
+    for base in &bases {
+        if dest == *base {
+            return refuse(format!("is the root {}", base.display()));
+        }
+        for live in LIVE_TREES {
+            let l = resolve(&base.join(live))?;
+            if dest.starts_with(&l) {
+                return refuse(format!("is inside the live tree {}", l.display()));
+            }
+        }
+    }
+    Ok(dest)
 }
 
 fn write_entry(target: &Path, e: &Entry, mode: u32, data: &mut dyn Read) -> io::Result<()> {
@@ -717,7 +847,16 @@ fn write_entry(target: &Path, e: &Entry, mode: u32, data: &mut dyn Read) -> io::
     }
     let res = (|| {
         let mut f = o.open(&tmp)?;
-        io::copy(data, &mut f)?;
+        // The bytes are checked against the verified entry before they
+        // replace anything: the archive may have changed since pass 1.
+        let mut h = Sha256::new();
+        let n = copy_hashing(&mut data.take(e.size), &mut f, &mut h)?;
+        if n != e.size || h.finalize() != e.sha256 {
+            return Err(changed(format!(
+                "{}: the archive changed after it was verified; restore stopped",
+                e.path
+            )));
+        }
         f.sync_all()?;
         drop(f);
         set_mode(&tmp, mode)?;
@@ -742,8 +881,22 @@ fn set_mode(_: &Path, _: u32) -> io::Result<()> {
 /// Restore `archive` (read twice: verified first, then written) under
 /// `root` following the module docs.
 pub fn restore(archive: &Path, root: &Path, opts: &RestoreOptions) -> io::Result<RestoreReport> {
+    restore_from(&mut File::open(archive)?, root, opts)
+}
+
+/// [`restore`] from an open archive.
+pub fn restore_from<R: Read + Seek>(
+    archive: &mut R,
+    root: &Path,
+    opts: &RestoreOptions,
+) -> io::Result<RestoreReport> {
+    let evidence_base = match &opts.evidence_to {
+        Some(d) => Some(evidence_dir(root, d)?),
+        None => None,
+    };
     // Pass 1: verify everything before writing anything.
-    verify(&mut io::BufReader::new(File::open(archive)?))?;
+    archive.seek(SeekFrom::Start(0))?;
+    let verified = verify(&mut io::BufReader::new(&mut *archive))?;
     let mut rep = RestoreReport::default();
     // `ready/` dirs that were non-empty before this restore.
     let mut busy_ready: Vec<String> = Vec::new();
@@ -755,8 +908,21 @@ pub fn restore(archive: &Path, root: &Path, opts: &RestoreOptions) -> io::Result
             busy_ready.push(s.to_string());
         }
     }
-    let mut r = io::BufReader::new(File::open(archive)?);
+    archive.seek(SeekFrom::Start(0))?;
+    let mut r = io::BufReader::new(&mut *archive);
+    let mut next = 0usize;
     walk(&mut r, &mut |e, data| {
+        // Pass 2 must read exactly what pass 1 verified (an archive on
+        // removable media or in a directory someone else can write may be
+        // replaced in between); file bytes are checked again as they are
+        // written ([`write_entry`]).
+        if verified.get(next) != Some(e) {
+            return Err(changed(format!(
+                "{}: the archive changed after it was verified; restore stopped",
+                e.path
+            )));
+        }
+        next += 1;
         let (base, kind) = match classify(&e.path) {
             Class::Restore => (root.to_path_buf(), "restore"),
             Class::SpoolReady if !opts.spool_ready => {
@@ -776,7 +942,7 @@ pub fn restore(archive: &Path, root: &Path, opts: &RestoreOptions) -> io::Result
                 }
                 (root.to_path_buf(), "restore")
             }
-            Class::Evidence => match &opts.evidence_to {
+            Class::Evidence => match &evidence_base {
                 Some(d) => (d.clone(), "evidence"),
                 None => {
                     rep.refused.push((
@@ -823,13 +989,130 @@ pub fn restore(archive: &Path, root: &Path, opts: &RestoreOptions) -> io::Result
             rep.restored.push(e.path.clone());
         }
         Ok(())
+    })
+    .map_err(|e| {
+        // Pass 1 accepted these bytes: any data error now is a change.
+        if e.kind() == io::ErrorKind::InvalidData
+            && e.get_ref().is_none_or(|x| !x.is::<ArchiveChanged>())
+        {
+            changed(format!(
+                "the archive changed after it was verified ({e}); restore stopped"
+            ))
+        } else {
+            e
+        }
     })?;
+    if next != verified.len() {
+        return Err(changed(
+            "the archive changed after it was verified (fewer entries); restore stopped".into(),
+        ));
+    }
     Ok(rep)
+}
+
+fn changed(m: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, ArchiveChanged(m))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "rbkup-unit-{tag}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+            ));
+            fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn archive_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let t = Tmp::new("src");
+        for (p, d) in files {
+            let p = t.0.join(p);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, d).unwrap();
+        }
+        let mut out = Vec::new();
+        create(&t.0, &mut out, false).unwrap();
+        out
+    }
+
+    /// Serves `first` until it is rewound a second time, then `second`:
+    /// an archive replaced between the verification pass and the write
+    /// pass (removable media, a directory someone else can write).
+    struct Swapped {
+        first: Cursor<Vec<u8>>,
+        second: Cursor<Vec<u8>>,
+        rewinds: u32,
+    }
+    impl Read for Swapped {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            if self.rewinds > 1 {
+                self.second.read(b)
+            } else {
+                self.first.read(b)
+            }
+        }
+    }
+    impl Seek for Swapped {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            if to == SeekFrom::Start(0) {
+                self.rewinds += 1;
+            }
+            self.first.seek(to)?;
+            self.second.seek(to)
+        }
+    }
+
+    /// Review (WP4, high): the write pass must write only what the
+    /// verification pass checked, even if the archive changes in between.
+    #[test]
+    fn an_archive_changed_after_verification_writes_nothing_unverified() {
+        let good = archive_of(&[("etc/robodr/agentd.json", "good")]);
+        // Same headers, other bytes of the same length.
+        let pos = good.windows(4).position(|w| w == b"good").unwrap();
+        let mut evil = good.clone();
+        evil[pos..pos + 4].copy_from_slice(b"evil");
+        // A whole other archive (consistent on its own).
+        let other = archive_of(&[
+            ("etc/robodr/agentd.json", "good"),
+            ("etc/robodr/control-plane/soc-trust.json", "attacker trust"),
+        ]);
+        for (tag, second) in [("same headers", evil), ("other archive", other)] {
+            let dst = Tmp::new("dst");
+            let mut a = Swapped {
+                first: Cursor::new(good.clone()),
+                second: Cursor::new(second),
+                rewinds: 0,
+            };
+            let e = restore_from(&mut a, &dst.0, &RestoreOptions::default()).unwrap_err();
+            assert!(
+                e.get_ref().is_some_and(|x| x.is::<ArchiveChanged>()),
+                "{tag}: {e}"
+            );
+            let cfg = dst.0.join("etc/robodr/agentd.json");
+            assert!(
+                !cfg.exists() || fs::read_to_string(&cfg).unwrap() == "good",
+                "{tag}: unverified data written"
+            );
+            assert!(
+                !dst.0.join("etc/robodr/control-plane").exists(),
+                "{tag}: unverified entry written"
+            );
+        }
+    }
 
     #[test]
     fn paths_are_strictly_relative() {

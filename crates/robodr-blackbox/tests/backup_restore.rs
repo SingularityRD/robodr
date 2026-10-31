@@ -366,3 +366,176 @@ fn cli_round_trip() {
         .unwrap();
     assert_eq!(o.status.code(), Some(1));
 }
+
+/// Like [`crafted`], with a kind and mode per entry.
+fn crafted_with(entries: &[(&str, &str, u32, &[u8])]) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    let mut h = Sha256::new();
+    for (p, kind, mode, data) in entries {
+        let hd = serde_json::to_vec(&serde_json::json!({
+            "kind": kind, "path": p, "mode": mode, "size": data.len(),
+            "sha256": to_hex(&sha256(data)),
+        }))
+        .unwrap();
+        let lp = (hd.len() as u32).to_be_bytes();
+        h.update(&lp);
+        h.update(&hd);
+        out.extend_from_slice(&lp);
+        out.extend_from_slice(&hd);
+        out.extend_from_slice(data);
+    }
+    let end = serde_json::to_vec(&serde_json::json!({
+        "kind": "end", "entries": entries.len(), "headers_sha256": to_hex(&h.finalize()),
+    }))
+    .unwrap();
+    out.extend_from_slice(&(end.len() as u32).to_be_bytes());
+    out.extend_from_slice(&end);
+    out
+}
+
+/// Review (WP4): group / world write bits from the archive are never
+/// restored, and every key file (the unit's, the depot's, the anchor
+/// receiver's) comes back 0600 in a 0700 key directory.
+#[cfg(unix)]
+#[test]
+fn restored_modes_drop_group_world_write_and_force_key_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TestDir::new("t85-modes");
+    let dst = d.sub("unit");
+    std::fs::create_dir_all(&dst).unwrap();
+    let a = d.sub("modes.rbkup");
+    std::fs::write(
+        &a,
+        crafted_with(&[
+            ("etc", "dir", 0o755, b""),
+            ("etc/robodr", "dir", 0o777, b""),
+            ("etc/robodr/agentd.json", "file", 0o666, b"{}"),
+            ("etc/robodr/soc", "dir", 0o777, b""),
+            ("etc/robodr-depot", "dir", 0o777, b""),
+            ("etc/robodr-depot/depot.json", "file", 0o646, b"{}"),
+            ("etc/robodr-depot/keys", "dir", 0o755, b""),
+            ("etc/robodr-depot/keys/signing.key", "file", 0o644, b"k"),
+            ("etc/robodr-depot/keys/unit-ca.pem", "file", 0o644, b"k"),
+            ("etc/robodr-anchor-receiver", "dir", 0o755, b""),
+            (
+                "etc/robodr-anchor-receiver/receiver.key",
+                "file",
+                0o644,
+                b"k",
+            ),
+            ("etc/robodr-anchor-receiver/tls", "dir", 0o755, b""),
+            (
+                "etc/robodr-anchor-receiver/tls/receiver.key",
+                "file",
+                0o664,
+                b"k",
+            ),
+            (
+                "etc/robodr-anchor-receiver/tls/receiver.crt",
+                "file",
+                0o644,
+                b"c",
+            ),
+        ]),
+    )
+    .unwrap();
+    backup::restore(&a, &dst, &RestoreOptions::default()).unwrap();
+    let mode = |p: &str| std::fs::metadata(dst.join(p)).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode("etc/robodr"), 0o755);
+    assert_eq!(mode("etc/robodr/agentd.json"), 0o644);
+    assert_eq!(mode("etc/robodr/soc"), 0o755);
+    assert_eq!(mode("etc/robodr-depot"), 0o755);
+    assert_eq!(mode("etc/robodr-depot/depot.json"), 0o644);
+    assert_eq!(mode("etc/robodr-depot/keys"), 0o700);
+    assert_eq!(mode("etc/robodr-depot/keys/signing.key"), 0o600);
+    assert_eq!(mode("etc/robodr-depot/keys/unit-ca.pem"), 0o600);
+    assert_eq!(mode("etc/robodr-anchor-receiver/receiver.key"), 0o600);
+    assert_eq!(mode("etc/robodr-anchor-receiver/tls/receiver.key"), 0o600);
+    assert_eq!(mode("etc/robodr-anchor-receiver/tls/receiver.crt"), 0o644);
+}
+
+/// Review (WP4): `--evidence-to` inside the unit's live state is refused
+/// by the library whatever the spelling: a `..` path, a relative path, a
+/// symlinked directory, the root itself, and every live tree (not only
+/// `etc` and `var/lib/robodr`). Nothing is written.
+#[cfg(unix)]
+#[test]
+fn evidence_into_live_state_is_refused_however_it_is_spelled() {
+    let d = TestDir::new("t85-evidence-to");
+    let src = d.sub("unit");
+    unit(&src);
+    let a = d.sub("b.rbkup");
+    archive(&src, &a, false);
+    let dst = d.sub("rebuilt");
+    for live in [
+        "var/lib/robodr",
+        "var/lib/robodr-anchor-receiver",
+        "var/lib/robodr-seal",
+        "opt/robodr-delivered",
+        "etc",
+    ] {
+        std::fs::create_dir_all(dst.join(live)).unwrap();
+    }
+    let link = d.sub("innocent-looking");
+    std::os::unix::fs::symlink(dst.join("var/lib/robodr"), &link).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let rel = relative_to(&dst.join("var/lib/robodr/new"), &cwd);
+    assert!(rel.is_relative());
+    let attempts = [
+        dst.join("var/lib/../lib/robodr/x"),
+        dst.join("var/lib/robodr-anchor-receiver/ev"),
+        dst.join("var/lib/robodr-seal"),
+        dst.join("opt/robodr-delivered/ev"),
+        link.join("ev"),
+        link.clone(),
+        dst.clone(),
+        rel,
+    ];
+    for to in attempts {
+        let opts = RestoreOptions {
+            evidence_to: Some(to.clone()),
+            ..RestoreOptions::default()
+        };
+        let e = backup::restore(&a, &dst, &opts).unwrap_err();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{}: {e}",
+            to.display()
+        );
+        assert!(
+            !dst.join("etc/robodr/agentd.json").exists(),
+            "{}",
+            to.display()
+        );
+        assert!(
+            !dst.join("var/lib/robodr/blackbox").exists(),
+            "{}",
+            to.display()
+        );
+    }
+    // A real archive directory, not existing yet, is fine.
+    let ok = d.sub("archive-host/ugv-07");
+    let opts = RestoreOptions {
+        evidence_to: Some(ok.clone()),
+        ..RestoreOptions::default()
+    };
+    let rep = backup::restore(&a, &dst, &opts).unwrap();
+    assert!(!rep.evidence.is_empty());
+    assert!(ok.join(EVIDENCE[0]).exists());
+}
+
+/// `to` relative to `from` (both absolute), with `..` components.
+fn relative_to(to: &Path, from: &Path) -> std::path::PathBuf {
+    let to: Vec<_> = to.components().collect();
+    let from: Vec<_> = from.components().collect();
+    let common = to.iter().zip(&from).take_while(|(a, b)| a == b).count();
+    let mut p = std::path::PathBuf::new();
+    for _ in common..from.len() {
+        p.push("..");
+    }
+    for c in &to[common..] {
+        p.push(c.as_os_str());
+    }
+    p
+}
