@@ -66,6 +66,12 @@ pub fn is_secret_name(name: &str) -> bool {
 
 /// `text` with the user information of every URL (`scheme://user:pw@`)
 /// replaced by [`REDACTED`]; `None` when there is none.
+///
+/// The authority normally ends at the first `/`, `?` or `#`. A password
+/// written into a URL without percent-encoding may contain one of those
+/// (`https://u:pa#ss@host`), which would cut the authority inside the
+/// password and leave `u:pa` behind; [`raw_userinfo_end`] catches that
+/// case and redacts up to the `@` that starts the host instead.
 pub fn scrub_url_userinfo(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -73,26 +79,59 @@ pub fn scrub_url_userinfo(text: &str) -> Option<String> {
     while let Some(i) = rest.find("://") {
         let (head, tail) = rest.split_at(i + 3);
         out.push_str(head);
-        // The authority ends at the path, query, fragment or anything that
-        // cannot be part of a URL in a log line or a setting.
-        let end = tail
-            .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>' | '`') || c.is_whitespace()
-            })
+        // The URL ends at anything that cannot be part of one in a log
+        // line or a setting; its authority at the path, query or fragment.
+        let token_end = tail
+            .find(|c: char| matches!(c, '"' | '\'' | '<' | '>' | '`') || c.is_whitespace())
             .unwrap_or(tail.len());
+        let token = tail.get(..token_end).unwrap_or_default();
+        let end = token.find(['/', '?', '#']).unwrap_or(token.len());
         let (authority, after) = tail.split_at(end);
-        match authority.rfind('@') {
+        let at = authority
+            .rfind('@')
+            .or_else(|| raw_userinfo_end(token, end));
+        match at {
             Some(at) if at > 0 => {
                 out.push_str(REDACTED);
-                out.push_str(authority.get(at..).unwrap_or_default());
+                rest = tail.get(at..).unwrap_or_default();
                 changed = true;
             }
-            _ => out.push_str(authority),
+            _ => {
+                out.push_str(authority);
+                rest = after;
+            }
         }
-        rest = after;
     }
     out.push_str(rest);
     changed.then_some(out)
+}
+
+/// The position of the `@` ending a userinfo that contains a raw `/`, `?`
+/// or `#` (so the authority, `token[..end]`, holds no `@`), or `None`.
+///
+/// It is taken to be one when the authority reads `user:x` where `x` is not
+/// a port (not all digits) and an `@` follows later in the URL: `host:8443/
+/// p?mail=a@b` and `[::1]:80/a@b` are left alone. Of several `@`, the one
+/// that starts the host is the last before the next `/`, `?` or `#`
+/// (`u:p#a@s@host/x` redacts `u:p#a@s`).
+fn raw_userinfo_end(token: &str, end: usize) -> Option<usize> {
+    let authority = token.get(..end)?;
+    if authority.starts_with('[') {
+        return None;
+    }
+    let (_, port) = authority.split_once(':')?;
+    if port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut at = end + token.get(end..)?.find('@')?;
+    loop {
+        let seg = token.get(at + 1..)?;
+        let seg = seg.get(..seg.find(['/', '?', '#']).unwrap_or(seg.len()))?;
+        match seg.find('@') {
+            Some(i) => at += 1 + i,
+            None => return Some(at),
+        }
+    }
 }
 
 /// Redact a JSON document; `None` when it is not JSON.
@@ -328,6 +367,39 @@ mod tests {
             "{j}"
         );
         assert!(scrub_url_userinfo("nothing here").is_none());
+    }
+
+    #[test]
+    fn url_userinfo_with_raw_delimiters_is_scrubbed() {
+        // A password with an un-encoded `#`, `?` or `/` (a malformed URL,
+        // but written that way into settings and logs).
+        for (url, want) in [
+            ("https://u:pa#ss@host/x", "https://<redacted>@host/x"),
+            ("https://u:pa?ss@host", "https://<redacted>@host"),
+            (
+                "https://u:pa/ss@host:9093/x?y=1",
+                "https://<redacted>@host:9093/x?y=1",
+            ),
+            (
+                "kafka://u:p#a@s@broker/x?e=a@b",
+                "kafka://<redacted>@broker/x?e=a@b",
+            ),
+        ] {
+            let r = scrub_url_userinfo(&format!("url={url} next")).unwrap();
+            assert_eq!(r, format!("url={want} next"), "{url}");
+            assert!(!r.contains("pa") && !r.contains("ss@"), "{r}");
+        }
+        // A port, an IPv6 literal or a plain host followed by an @ in the
+        // path or query is not userinfo.
+        for url in [
+            "https://soc.example:8443/p?mail=a@b",
+            "https://soc.example:/a@b",
+            "http://[::1]:80/a@b",
+            "https://soc.example/a@b",
+            "https://u:x",
+        ] {
+            assert!(scrub_url_userinfo(url).is_none(), "{url}");
+        }
     }
 
     #[test]
