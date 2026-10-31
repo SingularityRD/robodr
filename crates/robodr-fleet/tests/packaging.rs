@@ -1466,6 +1466,56 @@ fn a_half_configured_package_counts_as_installed() {
     assert_eq!(dpkg_state(&root, "robodr").0, "0.2.0-1");
 }
 
+/// `install` ends with the installed release's host preflight
+/// (`robodr-setup preflight`, sales-readiness T68), run on the same root.
+/// It is advisory: a FAIL is a warning, the install still succeeds; a
+/// release without robodr-setup is installed without it.
+#[test]
+fn install_runs_the_host_preflight_advisory_only() {
+    if !dpkg_available("host_preflight") {
+        return;
+    }
+    let dir = TempDir::new("preflight");
+    let root = dpkg_root(&dir);
+    let f = Some(("RBF1:1", "RBF1:1"));
+    // 0.1.0: no robodr-setup.
+    let b1 = bundle(&dir, &stub_deb(&dir, "0.1.0-1", f));
+    let t = ok(&run_bundle(&root, &b1, &["install"]));
+    assert!(t.contains("host preflight skipped"), "{t}");
+    // 0.2.0: a robodr-setup whose preflight records its arguments and
+    // reports a FAIL.
+    let deb = stub_deb(&dir, "0.2.0-1", f);
+    let st = dir.join("stage-robodr-0.2.0-1");
+    let log = dir.join("preflight.args");
+    let setup = st.join("usr/sbin/robodr-setup");
+    std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
+    std::fs::write(
+        &setup,
+        format!(
+            "#!/bin/sh\necho \"$*\" >{}\necho '[FAIL] btf        no BTF'\necho 'preflight: FAIL'\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&setup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    ok(&sh(Command::new("dpkg-deb")
+        .args(["--root-owner-group", "-Zxz", "--build"])
+        .arg(&st)
+        .arg(&deb)));
+    let b2 = bundle_named(&dir, &deb, "b2", None);
+    let t = ok(&run_bundle(&root, &b2, &["install"]));
+    assert_eq!(installed(&root), "0.2.0-1");
+    assert!(t.contains("[FAIL] btf"), "{t}");
+    assert!(
+        t.contains("WARNING: the host preflight reports FAIL"),
+        "{t}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().trim(),
+        format!("preflight --root {}", root.display())
+    );
+}
+
 // ------------------------------------------------------- RPM bundles ---
 //
 // The same install-bundle.sh drives `rpm -U` for an RPM bundle (RHEL /

@@ -163,7 +163,11 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    again, agentd's heartbeat is fresh) and **rolls back automatically** to
    the previous kept release if it is not healthy (section 7);
 8. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
-   rollback (`--keep N` keeps only the N newest).
+   rollback (`--keep N` keeps only the N newest);
+9. runs the installed release's **host preflight** (`robodr-setup
+   preflight`: BTF, bpffs, nf_tables, systemd, glibc, clock, disk, key
+   directory) and prints it. Advisory: a `FAIL` line is a warning, the
+   install still succeeds; fix it before enabling RoboDR's services.
 
 Every default above and its only override are listed in
 `docs/SECURE-DEFAULTS.md`.

@@ -75,7 +75,12 @@
 #          warning says the signature was not checked).
 # install  verify, then `dpkg -i` the .deb (`rpm -U` the .rpm), check the
 #          unit's health and keep a copy of the package under
-#          /var/lib/robodr/releases/<version>/ for rollback.
+#          /var/lib/robodr/releases/<version>/ for rollback. Then runs
+#          the installed release's host preflight (robodr-setup preflight:
+#          BTF, bpffs, nf_tables, systemd, clock, disk, key directory) and
+#          prints it. Advisory: a FAIL there is a warning, never a failed
+#          install (the package is installed and healthy either way; the
+#          host lacks something RoboDR's daemons need before they run).
 #          Services are not enabled; on upgrade the running ones are restarted
 #          by the package's maintainer scripts / scriptlets, except the
 #          gateway and the executor (see "Safety-state gate").
@@ -958,6 +963,22 @@ health_check() { # active-units
     return 1
 }
 
+# The host preflight of the release just installed (robodr-setup, T68).
+# Advisory only: it reads the host and writes nothing.
+host_preflight() {
+    setup_bin=$root/usr/sbin/robodr-setup
+    if [ ! -x "$setup_bin" ]; then
+        echo "install-bundle: host preflight skipped: this release has no robodr-setup"
+        return 0
+    fi
+    echo "install-bundle: host preflight (robodr-setup preflight):"
+    if [ -n "$root" ]; then set -- --root "$root"; else set --; fi
+    if ! "$setup_bin" preflight "$@"; then
+        echo "install-bundle: WARNING: the host preflight reports FAIL lines (above): fix them before enabling RoboDR's services; a new unit is set up with 'robodr-setup init' (OPERATIONS.md)" >&2
+    fi
+    return 0
+}
+
 # Keep the N newest kept releases and the installed one; archive the
 # formats file of every pruned release (the format gate's record).
 prune_releases() { # n installed-version
@@ -1202,6 +1223,7 @@ EOF
     rm -f "$fmt"
     echo "install-bundle: kept $releases/$ver for rollback"
     if [ -n "$keep" ]; then prune_releases "$keep" "$ver"; fi
+    host_preflight
     ;;
 restart-pending)
     [ "$have_version" -eq 0 ] || die 2 "restart-pending takes no version"
