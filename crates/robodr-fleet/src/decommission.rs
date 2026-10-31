@@ -34,6 +34,14 @@
 //!   the final `decommissioned` note still carries the request digest),
 //!   and a crash right after the final note is sealed writes that note a
 //!   second time on the re-run.
+//! * **A black-box key rotated in place** (`robodr-blackbox rotate`,
+//!   `docs/OPERATIONS.md` 4.3) is not known to the SOC: the fleet API does
+//!   not rotate the black-box role, so the SOC still has the enrollment
+//!   black-box key registered. The request is then signed with that
+//!   registered key, found by its fingerprint among the retired keys in
+//!   `<key directory>/retired/` (where the rotation procedure keeps it on
+//!   an enrolled unit); without it the request is refused here, before
+//!   anything is sent, with the way out.
 //! * **What is destroyed here, and what is not**: the uplink and finding
 //!   secret keys (retired at the SOC: they authenticate nothing any more)
 //!   are shredded. The black-box key is **kept**: it signs the final journal
@@ -181,6 +189,33 @@ pub fn prepare(ctx: &Ctx, reason: &str) -> Result<Decommission, String> {
         let registered = en
             .key(role)
             .ok_or_else(|| format!("enrollment has no {role} key"))?;
+        if registered.fingerprint != k.fingerprint() && role == "blackbox" {
+            // Rotated in place (OPERATIONS 4.3): sign with the registered,
+            // retired key if the unit kept it.
+            match keys::find_retired(role, path, &registered.fingerprint)? {
+                Some(old) => {
+                    role_keys.push(old);
+                    continue;
+                }
+                None => {
+                    return Err(format!(
+                        "{} holds black-box key {} but the SOC has {} registered as this \
+                         unit's black-box key (the key was rotated in place with \
+                         robodr-blackbox rotate; the fleet API does not rotate it). The \
+                         decommission request must be signed by the registered key: put \
+                         the retired secret key file back in {}/retired/ (0600 root) and \
+                         run this again (docs/OPERATIONS.md 4.3, docs/DECOMMISSION.md \
+                         step 4). If it was destroyed, the SOC operator has to retire this \
+                         unit's registration on the SOC side; the SOC would refuse this \
+                         request (409 stale_key)",
+                        path.display(),
+                        k.key_id(),
+                        registered.key_id,
+                        path.parent().unwrap_or(std::path::Path::new("/")).display()
+                    ));
+                }
+            }
+        }
         if registered.fingerprint != k.fingerprint() {
             return Err(format!(
                 "{} holds key {} but the SOC has {} registered as this unit's {role} key; \

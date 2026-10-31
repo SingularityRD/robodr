@@ -35,8 +35,11 @@
 //! validated beyond the members used): `robot.id`, `robot.site`,
 //! `sensor.profile_path` and `sensor.profile_trust` (`trusted_keys`,
 //! `trust_roots`, `revocation_list`, `revocation_policy`, `state_file`,
-//! `expect_platform`, `expect_unit_id`). The fleet tool verifies profiles
-//! and revocation lists with exactly the trust inputs agentd will use.
+//! `expect_platform`, `expect_unit_id`) and `blackbox.previous_keys` (the
+//! retired black-box keys' public files: the fleet journal is signed by the
+//! same key and opens with the same retired keys after a rotation,
+//! `docs/OPERATIONS.md` 4.3). The fleet tool verifies profiles and
+//! revocation lists with exactly the trust inputs agentd will use.
 
 use robodr_commission::trust::RevocationPolicy;
 use serde::Deserialize;
@@ -254,7 +257,13 @@ pub struct AgentdFacts {
     pub state_file: Option<PathBuf>,
     pub expect_platform: Option<String>,
     pub expect_unit_id: Option<String>,
+    /// `blackbox.previous_keys`: absolute paths (at most
+    /// [`MAX_PREVIOUS_KEYS`]).
+    pub blackbox_previous_keys: Vec<PathBuf>,
 }
+
+/// Most `blackbox.previous_keys` entries read (agentd's own limit).
+pub const MAX_PREVIOUS_KEYS: usize = 16;
 
 impl AgentdFacts {
     /// Extract the facts from agentd's JSON configuration text.
@@ -287,6 +296,24 @@ impl AgentdFacts {
             Some("required") => RevocationPolicy::Required,
             Some(o) => return Err(format!("revocation_policy {o:?}")),
         };
+        let mut previous = Vec::new();
+        match v.get("blackbox").and_then(|b| b.get("previous_keys")) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(a)) => {
+                if a.len() > MAX_PREVIOUS_KEYS {
+                    return Err(format!(
+                        "blackbox.previous_keys: at most {MAX_PREVIOUS_KEYS} files"
+                    ));
+                }
+                for x in a {
+                    match x.as_str() {
+                        Some(p) if Path::new(p).is_absolute() => previous.push(PathBuf::from(p)),
+                        _ => return Err("blackbox.previous_keys[] must be absolute paths".into()),
+                    }
+                }
+            }
+            Some(_) => return Err("blackbox.previous_keys must be an array".into()),
+        }
         Ok(Self {
             robot_id: s(&["robot", "id"])?,
             site: s(&["robot", "site"])?,
@@ -298,6 +325,7 @@ impl AgentdFacts {
             state_file: path(&[pt[0], pt[1], "state_file"])?,
             expect_platform: s(&[pt[0], pt[1], "expect_platform"])?,
             expect_unit_id: s(&[pt[0], pt[1], "expect_unit_id"])?,
+            blackbox_previous_keys: previous,
         })
     }
 
@@ -360,5 +388,14 @@ mod tests {
         assert_eq!(f.robot_id.as_deref(), Some("ugv-1"));
         assert_eq!(f.revocation_policy, RevocationPolicy::Required);
         assert!(AgentdFacts::parse(r#"{"sensor":{"profile_path":"rel"}}"#).is_err());
+        assert!(f.blackbox_previous_keys.is_empty());
+        let f = AgentdFacts::parse(r#"{"blackbox":{"previous_keys":["/etc/robodr/old.pub"]}}"#)
+            .unwrap();
+        assert_eq!(
+            f.blackbox_previous_keys,
+            [PathBuf::from("/etc/robodr/old.pub")]
+        );
+        assert!(AgentdFacts::parse(r#"{"blackbox":{"previous_keys":["rel.pub"]}}"#).is_err());
+        assert!(AgentdFacts::parse(r#"{"blackbox":{"previous_keys":"/x.pub"}}"#).is_err());
     }
 }

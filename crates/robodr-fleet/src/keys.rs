@@ -75,6 +75,43 @@ pub fn load(role: &str, path: &Path) -> Result<RoleKey, String> {
     })
 }
 
+/// Most entries of a `retired/` directory [`find_retired`] looks at.
+const MAX_RETIRED_SCAN: usize = 256;
+
+/// The retired secret key of `role` whose fingerprint is `fingerprint`, in
+/// `<directory of active>/retired/` (where `docs/OPERATIONS.md` 4.3 step 4
+/// moves a rotated black-box key, `agentd-blackbox-<old id>.key`). Only
+/// regular `*.key` files are considered, each loaded with [`load`]'s checks;
+/// a file that does not load is skipped. `Ok(None)` when there is no such
+/// directory or no matching key.
+pub fn find_retired(
+    role: &str,
+    active: &Path,
+    fingerprint: &str,
+) -> Result<Option<RoleKey>, String> {
+    let dir = active.parent().unwrap_or(Path::new("/")).join("retired");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    for e in entries.take(MAX_RETIRED_SCAN) {
+        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let p = e.path();
+        let is_key = p.extension().is_some_and(|x| x == "key");
+        let regular = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file());
+        if !is_key || !regular {
+            continue;
+        }
+        if let Ok(k) = load(role, &p) {
+            if k.fingerprint() == fingerprint {
+                return Ok(Some(k));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Generate a fresh key into `path` (exclusive create, 0600) and its
 /// `.pub` (replaced atomically). The directory must exist and be private.
 pub fn generate(role: &str, path: &Path) -> Result<RoleKey, String> {
