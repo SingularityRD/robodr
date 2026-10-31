@@ -223,6 +223,7 @@ use crate::health::{
 use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
 use crate::notify::{monotonic_ms, Notifier};
 use crate::safety::{FeedFinding, FeedStatus, SafetyFeed, Transition};
+use crate::safety_feed::context::LiveContext;
 use crate::spool::{Spool, SpoolClass, SpoolError, SpoolStats};
 
 /// Most queued items handled between two clock checks.
@@ -1798,7 +1799,65 @@ impl<'a> Daemon<'a> {
         if let Some(t) = transition {
             self.transition_note(&t);
         }
+        // Every plan is graded by the context of the same moment.
+        self.live_context();
         state
+    }
+
+    /// The configured `context.*` (control, phase, connectivity).
+    fn configured_context(&self) -> LiveContext {
+        let c = &self.r.config.context;
+        LiveContext {
+            control: c.control,
+            phase: c.phase,
+            connectivity: c.connectivity,
+        }
+    }
+
+    /// The live operational context (`crate::safety_feed::context`):
+    /// re-evaluated, a change recorded in the black box and handed to the
+    /// agent for every later plan. The configured one without context
+    /// sources.
+    fn live_context(&mut self) -> LiveContext {
+        let fallback = self.configured_context();
+        let now_ms = self.now_ms();
+        let wall_ms = self.clock.now().wall_ns / 1_000_000;
+        let Some((live, transition)) = self
+            .feed
+            .as_mut()
+            .and_then(|f| f.evaluate_context(now_ms, wall_ms, fallback))
+        else {
+            return fallback;
+        };
+        if let Some(t) = transition {
+            self.agent
+                .set_operational(live.control, live.phase, live.connectivity);
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: operational context control {:?} -> {:?}, phase {:?} -> {:?}, \
+                 connectivity {:?} -> {:?}{}",
+                t.from.control,
+                t.to.control,
+                t.from.phase,
+                t.to.phase,
+                t.from.connectivity,
+                t.to.connectivity,
+                if t.conflict {
+                    " (sources disagree: most conservative taken)"
+                } else {
+                    ""
+                }
+            );
+            let now = self.clock.now();
+            if self
+                .agent
+                .record_note(now, "context transition", &t, false)
+                .is_err()
+            {
+                self.stats.note_errors += 1;
+            }
+        }
+        live
     }
 
     fn transition_note(&mut self, t: &Transition) {
@@ -2901,12 +2960,23 @@ impl cp_api::Host for Daemon<'_> {
 
     fn context(&self) -> OperationalContext {
         let c = &self.r.config.context;
+        // The live context as last evaluated (`safety_feed` context
+        // sources), else the configured one.
+        let live = self
+            .feed
+            .as_ref()
+            .and_then(SafetyFeed::live_context)
+            .unwrap_or(LiveContext {
+                control: c.control,
+                phase: c.phase,
+                connectivity: c.connectivity,
+            });
         OperationalContext {
             platform: self.r.policy.platform,
             morphology: self.r.policy.morphology,
-            phase: c.phase,
-            connectivity: c.connectivity,
-            control: c.control,
+            phase: live.phase,
+            connectivity: live.connectivity,
+            control: live.control,
             operator_present: c.operator_present,
             // Locked in the agent *and* enforced by the pipeline.
             profile_locked: self.agent.profile().locked

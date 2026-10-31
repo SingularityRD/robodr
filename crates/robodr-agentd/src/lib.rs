@@ -119,6 +119,8 @@ pub mod input;
 pub mod notify;
 pub mod profile_chain;
 pub mod safety;
+/// Unitree safety-state sources and the live operational context.
+pub mod safety_feed;
 pub mod signal;
 pub mod spool;
 

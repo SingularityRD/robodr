@@ -735,6 +735,28 @@ impl Agent {
         }
     }
 
+    /// Replace the live part of the operational context (control mode,
+    /// mission phase, connectivity) that every later plan is made with, as
+    /// read from live sources by the caller (`robodr-agentd`'s context
+    /// feed). The platform, morphology, operator presence and profile lock
+    /// stay as configured.
+    pub fn set_operational(
+        &mut self,
+        control: robodr_responder::ControlMode,
+        phase: robodr_responder::MissionPhase,
+        connectivity: robodr_responder::Connectivity,
+    ) {
+        self.context.control = control;
+        self.context.phase = phase;
+        self.context.connectivity = connectivity;
+    }
+
+    /// The operational context plans are made with (before the per-plan
+    /// observe-mode downgrade).
+    pub fn context(&self) -> OperationalContext {
+        self.context
+    }
+
     pub fn stats(&self) -> AgentStats {
         self.stats
     }

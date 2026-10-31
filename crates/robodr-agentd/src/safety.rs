@@ -173,6 +173,14 @@ use robodr_rtps::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::safety_feed::context::{
+    self as ctx, ContextSourceView, ContextStatus, ContextTransition, Contributions, CtxReading,
+    CtxRole, LifecycleSection, LifecycleSpec, LiveContext, OnStaleSection, UplinkSection,
+    UplinkSource, UplinkSpec, WirelessSection, WirelessSpec,
+};
+use crate::safety_feed::unitree::{self, LowSection, SportSection, SportSpec};
+use robodr_cdr::unitree::{decode_unitree, UnitreeKind, UnitreeMessage};
+
 /// Rule ids raised by the feed.
 pub mod rules {
     /// A sample on a safety-state topic from a writer the profile does not
@@ -305,6 +313,10 @@ pub struct SafetyFeedSection {
     pub topics: Vec<TopicSourceSection>,
     #[serde(default)]
     pub socket: Option<SocketSourceSection>,
+    /// The `robodr-uplink` status file: live connectivity
+    /// ([`crate::safety_feed::context`]).
+    #[serde(default)]
+    pub uplink_status: Option<UplinkSection>,
 }
 
 fn default_stale() -> u64 {
@@ -333,6 +345,25 @@ pub struct TopicSourceSection {
     pub writers: Vec<String>,
     #[serde(default)]
     pub stale_after_ms: Option<u64>,
+    /// `unitree_go::msg::dds_::SportModeState_`: mode / speed -> claim,
+    /// optionally mode -> phase / control
+    /// ([`crate::safety_feed::unitree`]).
+    #[serde(default)]
+    pub unitree_sport: Option<SportSection>,
+    /// `unitree_go` / `unitree_hg` `LowState_`: joint speed -> claim.
+    #[serde(default)]
+    pub unitree_low: Option<LowSection>,
+    /// `unitree_go::msg::dds_::WirelessController_`: control mode only
+    /// ([`crate::safety_feed::context`]).
+    #[serde(default)]
+    pub wireless_controller: Option<WirelessSection>,
+    /// `lifecycle_msgs/msg/TransitionEvent`: control mode / phase only.
+    #[serde(default)]
+    pub lifecycle: Option<LifecycleSection>,
+    /// Context values while this source is stale, unmapped or undecodable
+    /// (only for the context fields it reports).
+    #[serde(default)]
+    pub on_stale: Option<OnStaleSection>,
 }
 
 /// Odometry -> idle / moving_slow / moving_fast.
@@ -409,10 +440,21 @@ pub const MAX_SOCKET_PEERS: usize = 16;
 /// How a topic source turns a sample into a claim.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decoder {
-    Bool { on_true: Claim, on_false: Claim },
+    Bool {
+        on_true: Claim,
+        on_false: Claim,
+    },
     UInt8(BTreeMap<u8, Claim>),
     Text(BTreeMap<Vec<u8>, Claim>),
     Odometry(MotionThresholds),
+    /// Unitree `SportModeState_` (safety, optionally context).
+    UnitreeSport(Box<SportSpec>),
+    /// Unitree go / hg `LowState_` (safety): joint-speed thresholds.
+    UnitreeLow(UnitreeKind, MotionThresholds),
+    /// Unitree `WirelessController_` (context only).
+    Wireless(WirelessSpec),
+    /// `lifecycle_msgs/msg/TransitionEvent` (context only, latched).
+    Lifecycle(Box<LifecycleSpec>),
 }
 
 impl Decoder {
@@ -422,7 +464,23 @@ impl Decoder {
             Decoder::UInt8(_) => StdKind::UInt8.ros_type_name(),
             Decoder::Text(_) => StdKind::String.ros_type_name(),
             Decoder::Odometry(_) => MessageKind::Odometry.ros_type_name(),
+            Decoder::UnitreeSport(_) => UnitreeKind::GoSportModeState.dds_type_name(),
+            Decoder::UnitreeLow(k, _) => k.dds_type_name(),
+            Decoder::Wireless(_) => UnitreeKind::GoWirelessController.dds_type_name(),
+            Decoder::Lifecycle(_) => robodr_cdr::lifecycle::TRANSITION_EVENT_DDS,
         }
+    }
+
+    /// Does this source take part in the safety state? (Context-only
+    /// sources do not: their silence must not make the robot `unknown`.)
+    pub fn is_safety(&self) -> bool {
+        !matches!(self, Decoder::Wireless(_) | Decoder::Lifecycle(_))
+    }
+
+    /// Published on change only: the last trusted reading counts until the
+    /// next one (no staleness).
+    pub fn latched(&self) -> bool {
+        matches!(self, Decoder::Lifecycle(_))
     }
 
     /// Does an announced (DDS or ROS) type name match?
@@ -434,6 +492,14 @@ impl Decoder {
             Decoder::Odometry(_) => {
                 MessageKind::from_type_name(announced) == Some(MessageKind::Odometry)
             }
+            Decoder::UnitreeSport(_) => {
+                UnitreeKind::from_type_name(announced) == Some(UnitreeKind::GoSportModeState)
+            }
+            Decoder::UnitreeLow(k, _) => UnitreeKind::from_type_name(announced) == Some(*k),
+            Decoder::Wireless(_) => {
+                UnitreeKind::from_type_name(announced) == Some(UnitreeKind::GoWirelessController)
+            }
+            Decoder::Lifecycle(_) => robodr_cdr::lifecycle::is_transition_event(announced),
         }
     }
 }
@@ -448,6 +514,9 @@ pub struct TopicSpec {
     /// no writer).
     pub writers: BTreeSet<String>,
     pub stale_after_ms: u64,
+    /// The operational-context fields this source reports, with their
+    /// `on_stale` values (empty for a pure safety source).
+    pub ctx: CtxRole,
 }
 
 /// A validated socket source.
@@ -502,6 +571,15 @@ impl SocketSpec {
 pub struct FeedSpec {
     pub topics: Vec<TopicSpec>,
     pub socket: Option<SocketSpec>,
+    /// Live connectivity from the uplink's status file.
+    pub uplink: Option<UplinkSpec>,
+}
+
+impl FeedSpec {
+    /// Some source reports the operational context.
+    pub fn has_context(&self) -> bool {
+        self.uplink.is_some() || self.topics.iter().any(|t| !t.ctx.is_empty())
+    }
 }
 
 fn is_hex_lower(s: &str) -> bool {
@@ -524,7 +602,10 @@ pub fn is_ros_topic(name: &str) -> bool {
     name.starts_with('/') && rn.kind == RosNameKind::Topic && rn.name == name
 }
 
-fn claims(what: &str, values: &BTreeMap<String, String>) -> Result<Vec<(String, Claim)>, String> {
+pub(crate) fn claims(
+    what: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<Vec<(String, Claim)>, String> {
     if values.is_empty() {
         return Err(format!("{what}.values must not be empty"));
     }
@@ -541,7 +622,7 @@ fn claims(what: &str, values: &BTreeMap<String, String>) -> Result<Vec<(String, 
         .collect()
 }
 
-fn check_motion(what: &str, m: &MotionThresholds) -> Result<(), String> {
+pub(crate) fn check_motion(what: &str, m: &MotionThresholds) -> Result<(), String> {
     let pos = |name: &str, v: f64| {
         if v.is_finite() && v > 0.0 {
             Ok(())
@@ -599,13 +680,19 @@ impl SafetyFeedSection {
                 Some(v) => check_stale(&format!("{what}.stale_after_ms"), v)?,
                 None => default_stale,
             };
+            let mut role = CtxRole::default();
+            let special = resolve_special(&what, t)?;
             let std = StdKind::from_type_name(&t.type_name);
             let odom = MessageKind::from_type_name(&t.type_name) == Some(MessageKind::Odometry);
             if !odom && t.motion.is_some() {
                 return Err(format!("{what}.motion is only for nav_msgs/msg/Odometry"));
             }
-            let decoder = match (std, odom) {
-                (Some(StdKind::Bool), _) => {
+            let decoder = match (std, odom, special) {
+                (_, _, Some((d, r))) => {
+                    role = r;
+                    d
+                }
+                (Some(StdKind::Bool), _, None) => {
                     let c = claims(&what, &t.values)?;
                     let get = |k: &str| c.iter().find(|(key, _)| key == k).map(|(_, c)| *c);
                     if c.len() != 2 {
@@ -622,7 +709,7 @@ impl SafetyFeedSection {
                         }
                     }
                 }
-                (Some(StdKind::UInt8), _) => {
+                (Some(StdKind::UInt8), _, None) => {
                     let mut m = BTreeMap::new();
                     for (k, c) in claims(&what, &t.values)? {
                         let v: u8 = k.parse().map_err(|_| {
@@ -637,7 +724,7 @@ impl SafetyFeedSection {
                     }
                     Decoder::UInt8(m)
                 }
-                (Some(StdKind::String), _) => {
+                (Some(StdKind::String), _, None) => {
                     let mut m = BTreeMap::new();
                     for (k, c) in claims(&what, &t.values)? {
                         if k.len() > MAX_VALUE_KEY_LEN || k.chars().any(char::is_control) {
@@ -651,7 +738,7 @@ impl SafetyFeedSection {
                     }
                     Decoder::Text(m)
                 }
-                (None, true) => {
+                (None, true, None) => {
                     if !t.values.is_empty() {
                         return Err(format!(
                             "{what}.values is not used for Odometry (use motion)"
@@ -663,10 +750,12 @@ impl SafetyFeedSection {
                     check_motion(&what, &m)?;
                     Decoder::Odometry(m)
                 }
-                (None, false) => {
+                (None, false, None) => {
                     return Err(format!(
                         "{what}.type {:?}: supported are std_msgs/msg/Bool, std_msgs/msg/UInt8, \
-                         std_msgs/msg/String and nav_msgs/msg/Odometry (ROS or DDS names)",
+                         std_msgs/msg/String, nav_msgs/msg/Odometry, unitree_go SportModeState_ / \
+                         WirelessController_, unitree_go / unitree_hg LowState_ and \
+                         lifecycle_msgs/msg/TransitionEvent (ROS or DDS names)",
                         sanitize(&t.type_name)
                     ))
                 }
@@ -725,8 +814,22 @@ impl SafetyFeedSection {
                 decoder,
                 writers,
                 stale_after_ms: stale,
+                ctx: role,
             });
         }
+        if self.socket.is_none() && !topics.iter().any(|t| t.decoder.is_safety()) {
+            return Err(
+                "safety_feed: configure at least one safety-state source (a socket, or a topic \
+                 other than wireless_controller / lifecycle, which report only the operational \
+                 context)"
+                    .into(),
+            );
+        }
+        let uplink = self
+            .uplink_status
+            .as_ref()
+            .map(UplinkSection::resolve)
+            .transpose()?;
         let socket = match &self.socket {
             None => None,
             Some(s) => {
@@ -777,8 +880,98 @@ impl SafetyFeedSection {
                 })
             }
         };
-        Ok((FeedSpec { topics, socket }, warnings))
+        Ok((
+            FeedSpec {
+                topics,
+                socket,
+                uplink,
+            },
+            warnings,
+        ))
     }
+}
+
+/// The decoder and context role of a Unitree / lifecycle topic source
+/// (`None` for the `std_msgs` / Odometry types).
+fn resolve_special(
+    what: &str,
+    t: &TopicSourceSection,
+) -> Result<Option<(Decoder, CtxRole)>, String> {
+    let kind = UnitreeKind::from_type_name(&t.type_name);
+    let lifecycle_type = robodr_cdr::lifecycle::is_transition_event(&t.type_name);
+    let sections = [
+        t.unitree_sport.is_some(),
+        t.unitree_low.is_some(),
+        t.wireless_controller.is_some(),
+        t.lifecycle.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if kind.is_none() && !lifecycle_type && sections == 0 {
+        if t.on_stale.is_some() {
+            return Err(format!(
+                "{what}.on_stale is only for sources that report the operational context"
+            ));
+        }
+        return Ok(None);
+    }
+    let mismatch = || {
+        format!(
+            "{what}: type {:?} needs exactly the section that matches it: unitree_sport \
+             (unitree_go SportModeState_), unitree_low (unitree_go / unitree_hg LowState_), \
+             wireless_controller (unitree_go WirelessController_) or lifecycle \
+             (lifecycle_msgs/msg/TransitionEvent)",
+            sanitize(&t.type_name)
+        )
+    };
+    if sections != 1 || (kind.is_none() && !lifecycle_type) {
+        return Err(mismatch());
+    }
+    if !t.values.is_empty() || t.motion.is_some() {
+        return Err(format!(
+            "{what}: values / motion are not used with type {} (use its own section)",
+            sanitize(&t.type_name)
+        ));
+    }
+    let on_stale = t.on_stale.unwrap_or_default();
+    let (decoder, role) = match kind {
+        Some(UnitreeKind::GoSportModeState) => {
+            let Some(sec) = &t.unitree_sport else {
+                return Err(mismatch());
+            };
+            let spec = sec.resolve(what)?;
+            let role = on_stale.role(!spec.control.is_empty(), !spec.phase.is_empty(), false);
+            (Decoder::UnitreeSport(Box::new(spec)), role)
+        }
+        Some(k @ (UnitreeKind::GoLowState | UnitreeKind::HgLowState)) => {
+            let Some(sec) = &t.unitree_low else {
+                return Err(mismatch());
+            };
+            (
+                Decoder::UnitreeLow(k, sec.resolve(what)?),
+                CtxRole::default(),
+            )
+        }
+        Some(UnitreeKind::GoWirelessController) => {
+            let Some(sec) = &t.wireless_controller else {
+                return Err(mismatch());
+            };
+            let role = on_stale.role(true, false, false);
+            (Decoder::Wireless(sec.resolve(what)?), role)
+        }
+        None if lifecycle_type => {
+            let Some(sec) = &t.lifecycle else {
+                return Err(mismatch());
+            };
+            let spec = sec.resolve(what)?;
+            let role = on_stale.role(!spec.control.is_empty(), !spec.phase.is_empty(), false);
+            (Decoder::Lifecycle(Box::new(spec)), role)
+        }
+        _ => return Err(mismatch()),
+    };
+    on_stale.check(what, &role)?;
+    Ok(Some((decoder, role)))
 }
 
 /// One line of the safety socket: `{"state":"estop_active"}`.
@@ -841,6 +1034,10 @@ struct Reading {
     claim: Claim,
     at_ms: u64,
     level: Level,
+    /// What it says about the operational context.
+    ctx: CtxReading,
+    /// Last remote activity (`wireless_controller` sources).
+    active_at: Option<u64>,
 }
 
 /// Eviction rank of a claim: `none` lowest, then [`conservativeness`].
@@ -864,6 +1061,12 @@ enum SetOutcome {
 struct Source {
     name: String,
     stale_after_ms: u64,
+    /// Takes part in the safety state ([`Decoder::is_safety`]).
+    safety: bool,
+    /// Operational-context fields reported, with their `on_stale` values.
+    ctx: CtxRole,
+    /// A reading counts until the next one ([`Decoder::latched`]).
+    latched: bool,
     readings: BTreeMap<String, Reading>,
     evicted: u64,
     /// Time of the last overflow, if any.
@@ -876,6 +1079,9 @@ impl Source {
         Self {
             name,
             stale_after_ms,
+            safety: true,
+            ctx: CtxRole::default(),
+            latched: false,
             readings: BTreeMap::new(),
             evicted: 0,
             overflow_at: None,
@@ -884,7 +1090,7 @@ impl Source {
     }
 
     fn fresh(&self, r: &Reading, now_ms: u64) -> bool {
-        now_ms.saturating_sub(r.at_ms) <= self.stale_after_ms
+        self.latched || now_ms.saturating_sub(r.at_ms) <= self.stale_after_ms
     }
 
     /// Overflowed within the last `stale_after_ms`.
@@ -920,14 +1126,26 @@ impl Source {
         }
     }
 
-    /// Record `writer`'s latest claim. See the module docs ("Bounded writer
-    /// tables") for what happens when the table is full.
+    /// [`Source::set_reading`] of a bare claim (tests).
+    #[cfg(test)]
     fn set(&mut self, writer: &str, claim: Claim, level: Level, now_ms: u64) -> SetOutcome {
-        let reading = Reading {
-            claim,
-            at_ms: now_ms,
-            level,
-        };
+        self.set_reading(
+            writer,
+            Reading {
+                claim,
+                at_ms: now_ms,
+                level,
+                ctx: CtxReading::default(),
+                active_at: None,
+            },
+        )
+    }
+
+    /// Record `writer`'s latest reading. See the module docs ("Bounded
+    /// writer tables") for what happens when the table is full.
+    fn set_reading(&mut self, writer: &str, reading: Reading) -> SetOutcome {
+        let now_ms = reading.at_ms;
+        let claim = reading.claim;
         if self.readings.contains_key(writer) || self.readings.len() < MAX_WRITERS_PER_SOURCE {
             self.readings.insert(writer.to_string(), reading);
             return SetOutcome::Stored;
@@ -1012,6 +1230,8 @@ pub struct FeedStats {
     pub writers_evicted: u64,
     /// Writer-table overflows over all sources (module docs).
     pub source_overflows: u64,
+    /// Changes of the live operational context.
+    pub context_transitions: u64,
 }
 
 /// The feed's current view (status file).
@@ -1020,6 +1240,9 @@ pub struct FeedStatus {
     pub state: Claim,
     pub sources: Vec<SourceView>,
     pub stats: FeedStats,
+    /// The live operational context (absent without context sources).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextStatus>,
 }
 
 /// A deviation the feed raised, with what the finding's subject needs.
@@ -1112,6 +1335,11 @@ pub struct SafetyFeed {
     /// Participant prefix -> profile identity it holds now
     /// ([`SafetyFeed::set_identities`]), for `identity:<name>` writers.
     identities: BTreeMap<[u8; 12], String>,
+    /// The uplink status source, if configured.
+    uplink: Option<UplinkSource>,
+    /// The live context as of the last [`SafetyFeed::evaluate_context`].
+    live: Option<LiveContext>,
+    context_views: Vec<ContextSourceView>,
 }
 
 impl std::fmt::Debug for SafetyFeed {
@@ -1133,7 +1361,12 @@ impl SafetyFeed {
         let mut sources: Vec<Source> = spec
             .topics
             .iter()
-            .map(|t| Source::new(t.topic.clone(), t.stale_after_ms))
+            .map(|t| Source {
+                safety: t.decoder.is_safety(),
+                ctx: t.ctx,
+                latched: t.decoder.latched(),
+                ..Source::new(t.topic.clone(), t.stale_after_ms)
+            })
             .collect();
         if let Some(s) = &spec.socket {
             sources.push(Source::new(
@@ -1141,6 +1374,7 @@ impl SafetyFeed {
                 s.stale_after_ms,
             ));
         }
+        let uplink_spec = spec.uplink.clone();
         Self {
             spec,
             sources,
@@ -1154,6 +1388,9 @@ impl SafetyFeed {
             },
             limits_odom: Limits::default(),
             identities: BTreeMap::new(),
+            uplink: uplink_spec.map(UplinkSource::new),
+            live: None,
+            context_views: Vec::new(),
         }
     }
 
@@ -1177,6 +1414,7 @@ impl SafetyFeed {
     fn views(&self, now_ms: u64) -> Vec<SourceView> {
         self.sources
             .iter()
+            .filter(|s| s.safety)
             .map(|s| SourceView {
                 name: s.name.clone(),
                 claim: s.claim(now_ms),
@@ -1198,7 +1436,93 @@ impl SafetyFeed {
             state: Claim::State(self.current),
             sources: self.views(now_ms),
             stats: self.stats(),
+            context: self.spec.has_context().then(|| ContextStatus {
+                context: self.live,
+                sources: self.context_views.clone(),
+            }),
         }
+    }
+
+    /// The live operational context as of the last
+    /// [`SafetyFeed::evaluate_context`] (`None` before it, or without
+    /// context sources).
+    pub fn live_context(&self) -> Option<LiveContext> {
+        self.live
+    }
+
+    /// Feed the uplink source a status read elsewhere (tests).
+    pub fn set_uplink(&mut self, now_ms: u64, r: Result<robodr_responder::Connectivity, String>) {
+        if let Some(u) = self.uplink.as_mut() {
+            u.set(now_ms, r);
+        }
+    }
+
+    /// Re-read the uplink status when due and recompute the live
+    /// operational context at `now_ms` (daemon uptime; `now_wall_ms`: wall
+    /// clock, the uplink file's time base). `fallback` is the configured
+    /// `context.*`, used for a field no live source contributes to (see
+    /// [`crate::safety_feed::context`]). `None` without context sources;
+    /// else the context and, if it changed (the first evaluation compares
+    /// with `fallback`), the transition.
+    pub fn evaluate_context(
+        &mut self,
+        now_ms: u64,
+        now_wall_ms: u64,
+        fallback: LiveContext,
+    ) -> Option<(LiveContext, Option<ContextTransition>)> {
+        if !self.spec.has_context() {
+            return None;
+        }
+        if let Some(u) = self.uplink.as_mut() {
+            u.poll(now_ms, now_wall_ms);
+        }
+        let mut all = Contributions::default();
+        let mut views = Vec::new();
+        for s in self.sources.iter().filter(|s| !s.ctx.is_empty()) {
+            let mut c = Contributions::default();
+            let fresh: Vec<&Reading> = s.readings.values().filter(|r| s.fresh(r, now_ms)).collect();
+            if fresh.is_empty() || s.overflowing(now_ms) {
+                c.stale(&s.ctx);
+            }
+            for r in &fresh {
+                c.reading(&r.ctx, &s.ctx);
+            }
+            let (control, phase, connectivity) = c.view();
+            views.push(ContextSourceView {
+                name: s.name.clone(),
+                fresh: !fresh.is_empty(),
+                age_ms: s
+                    .readings
+                    .values()
+                    .map(|r| now_ms.saturating_sub(r.at_ms))
+                    .min(),
+                control,
+                phase,
+                connectivity,
+                error: None,
+            });
+            all.extend(c);
+        }
+        if let Some(u) = &self.uplink {
+            all.extend(u.contributions());
+            views.push(u.view(now_ms));
+        }
+        let next = all.combine(fallback);
+        let from = self.live.unwrap_or(fallback);
+        self.live = Some(next);
+        self.context_views.clone_from(&views);
+        let transition = (next != from).then(|| {
+            self.stats.context_transitions += 1;
+            ContextTransition {
+                kind: ctx::TRANSITION_KIND,
+                from,
+                to: next,
+                at_ms: now_ms,
+                conflict: all.conflict(),
+                sources: views,
+            }
+        });
+        Some((next, transition))
     }
 
     /// Recompute the combined state at `now_ms` (daemon uptime). Returns the
@@ -1222,7 +1546,7 @@ impl SafetyFeed {
                 Claim::None => None,
             })
             .collect();
-        let writer_conflict = self.sources.iter().any(|s| {
+        let writer_conflict = self.sources.iter().filter(|s| s.safety).any(|s| {
             let set: BTreeSet<&'static str> = s
                 .readings
                 .values()
@@ -1276,7 +1600,16 @@ impl SafetyFeed {
         let Some(source) = self.sources.get_mut(idx) else {
             return out;
         };
-        let outcome = source.set(&writer, Claim::State(report.state), Level::Idle, now_ms);
+        let outcome = source.set_reading(
+            &writer,
+            Reading {
+                claim: Claim::State(report.state),
+                at_ms: now_ms,
+                level: Level::Idle,
+                ctx: CtxReading::default(),
+                active_at: None,
+            },
+        );
         self.stats.applied += 1;
         if outcome == SetOutcome::Overflow {
             self.overflow_finding(&mut out, idx, "", &writer);
@@ -1496,29 +1829,48 @@ impl SafetyFeed {
                     .sources
                     .get(idx)
                     .and_then(|src| src.readings.get(&writer))
-                    .map(|r| r.level)
-                    .unwrap_or_default();
+                    .copied();
+                let prev_level = prev.map(|r| r.level).unwrap_or_default();
+                let prev_active = prev.and_then(|r| r.active_at);
                 let decoded = if s.non_standard_payload {
                     Err("non-standard payload (N flag)".to_string())
                 } else {
-                    self.decode(&spec.decoder, &s.payload, prev)
+                    self.decode(&spec.decoder, &s.payload, prev_level, prev_active, now_ms)
                 };
-                let (claim, level) = match decoded {
-                    Ok((Some(claim), level)) => (claim, level),
-                    Ok((None, level)) => {
-                        self.stats.unmapped += 1;
-                        let dev = Deviation::new(
-                            rules::UNMAPPED_VALUE,
-                            Severity::Low,
-                            format!(
-                                "safety-state topic {} carried a value the safety_feed mapping \
-                                 does not list (writer {writer}); read as unknown",
-                                spec.topic
-                            ),
-                        );
-                        let key = format!("m|{}|{writer}", spec.topic);
-                        self.finding(&mut out, key, dev, &datagram.src_ip, &spec.topic, &writer);
-                        (Claim::State(SafetyState::Unknown), level)
+                let reading = match decoded {
+                    Ok(d) => {
+                        let claim = match d.claim {
+                            Some(c) => c,
+                            None => {
+                                self.stats.unmapped += 1;
+                                let dev = Deviation::new(
+                                    rules::UNMAPPED_VALUE,
+                                    Severity::Low,
+                                    format!(
+                                        "safety-state topic {} carried a value the safety_feed \
+                                         mapping does not list (writer {writer}); read as unknown",
+                                        spec.topic
+                                    ),
+                                );
+                                let key = format!("m|{}|{writer}", spec.topic);
+                                self.finding(
+                                    &mut out,
+                                    key,
+                                    dev,
+                                    &datagram.src_ip,
+                                    &spec.topic,
+                                    &writer,
+                                );
+                                Claim::State(SafetyState::Unknown)
+                            }
+                        };
+                        Reading {
+                            claim,
+                            at_ms: now_ms,
+                            level: d.level,
+                            ctx: d.ctx,
+                            active_at: d.active_at,
+                        }
                     }
                     Err(why) => {
                         self.stats.undecodable += 1;
@@ -1533,13 +1885,19 @@ impl SafetyFeed {
                         );
                         let key = format!("d|{}|{writer}|{why}", spec.topic);
                         self.finding(&mut out, key, dev, &datagram.src_ip, &spec.topic, &writer);
-                        (Claim::State(SafetyState::Unknown), prev)
+                        Reading {
+                            claim: Claim::State(SafetyState::Unknown),
+                            at_ms: now_ms,
+                            level: prev_level,
+                            ctx: CtxReading::unknown(&spec.ctx),
+                            active_at: prev_active,
+                        }
                     }
                 };
                 let Some(source) = self.sources.get_mut(idx) else {
                     continue;
                 };
-                let outcome = source.set(&writer, claim, level, now_ms);
+                let outcome = source.set_reading(&writer, reading);
                 self.stats.applied += 1;
                 if outcome == SetOutcome::Overflow {
                     self.overflow_finding(&mut out, idx, &datagram.src_ip, &writer);
@@ -1549,27 +1907,41 @@ impl SafetyFeed {
         out
     }
 
-    /// Decode one payload: `Ok((Some(claim), level))`, `Ok((None, _))` for a
-    /// value the mapping does not list, `Err(reason)` if undecodable.
+    /// Decode one payload. `claim: None` is a value the mapping does not
+    /// list; `Err(reason)` if undecodable.
     fn decode(
         &self,
         decoder: &Decoder,
         payload: &[u8],
         prev: Level,
-    ) -> Result<(Option<Claim>, Level), String> {
+        prev_active: Option<u64>,
+        now_ms: u64,
+    ) -> Result<Decoded, String> {
         let std_value = |kind: StdKind| std_value(kind, payload, &self.limits_std);
+        let plain = |claim: Option<Claim>, level: Level| Decoded {
+            claim,
+            level,
+            ctx: CtxReading::default(),
+            active_at: None,
+        };
+        let unitree = |o: unitree::Outcome| Decoded {
+            claim: o.claim,
+            level: o.level,
+            ctx: o.ctx,
+            active_at: None,
+        };
         match decoder {
             Decoder::Bool { on_true, on_false } => match std_value(StdKind::Bool)? {
-                StdValue::Bool(true) => Ok((Some(*on_true), prev)),
-                StdValue::Bool(false) => Ok((Some(*on_false), prev)),
+                StdValue::Bool(true) => Ok(plain(Some(*on_true), prev)),
+                StdValue::Bool(false) => Ok(plain(Some(*on_false), prev)),
                 _ => Err("wrong value type".into()),
             },
             Decoder::UInt8(m) => match std_value(StdKind::UInt8)? {
-                StdValue::UInt8(v) => Ok((m.get(&v).copied(), prev)),
+                StdValue::UInt8(v) => Ok(plain(m.get(&v).copied(), prev)),
                 _ => Err("wrong value type".into()),
             },
             Decoder::Text(m) => match std_value(StdKind::String)? {
-                StdValue::String(s) => Ok((m.get(s.as_bytes()).copied(), prev)),
+                StdValue::String(s) => Ok(plain(m.get(s.as_bytes()).copied(), prev)),
                 _ => Err("wrong value type".into()),
             },
             Decoder::Odometry(t) => {
@@ -1582,13 +1954,63 @@ impl SafetyFeed {
                 let angular = o.twist.twist.angular.norm();
                 if !(speed.is_finite() && angular.is_finite()) {
                     // A non-finite speed says nothing trustworthy.
-                    return Ok((Some(Claim::State(SafetyState::Unknown)), prev));
+                    return Ok(plain(Some(Claim::State(SafetyState::Unknown)), prev));
                 }
                 let level = next_level(prev, speed, angular, t);
-                Ok((Some(Claim::State(level.claim())), level))
+                Ok(plain(Some(Claim::State(level.claim())), level))
+            }
+            Decoder::UnitreeSport(spec) => {
+                unitree::decode_sport(spec, payload, &self.limits_odom, prev)
+                    .map(unitree)
+                    .map_err(|e| short(&e))
+            }
+            Decoder::UnitreeLow(kind, t) => {
+                unitree::decode_low(*kind, t, payload, &self.limits_odom, prev)
+                    .map(unitree)
+                    .map_err(|e| short(&e))
+            }
+            Decoder::Wireless(w) => {
+                let d =
+                    decode_unitree(UnitreeKind::GoWirelessController, payload, &self.limits_std)
+                        .map_err(|e| short(&e.to_string()))?;
+                let UnitreeMessage::GoWirelessController(c) = d.message else {
+                    return Err("wrong message type".into());
+                };
+                let (control, active_at) = ctx::remote_reading(w, &c, prev_active, now_ms);
+                Ok(Decoded {
+                    claim: Some(Claim::None),
+                    level: prev,
+                    ctx: CtxReading {
+                        control,
+                        ..CtxReading::default()
+                    },
+                    active_at,
+                })
+            }
+            Decoder::Lifecycle(l) => {
+                let d = robodr_cdr::lifecycle::decode_transition_event(payload, &self.limits_std)
+                    .map_err(|e| short(&e.to_string()))?;
+                let goal = d.event.goal_state.id;
+                Ok(Decoded {
+                    // An unlisted goal state is reported like any unmapped
+                    // value; its fields read `on_stale`.
+                    claim: l.maps(goal).then_some(Claim::None),
+                    level: prev,
+                    ctx: l.reading(goal),
+                    active_at: None,
+                })
             }
         }
     }
+}
+
+/// One decoded sample.
+#[derive(Debug, Clone, Copy)]
+struct Decoded {
+    claim: Option<Claim>,
+    level: Level,
+    ctx: CtxReading,
+    active_at: Option<u64>,
 }
 
 /// Decode a `std_msgs` value; the error is a short, value-free reason.
@@ -1693,6 +2115,7 @@ mod tests {
                 },
                 writers: BTreeSet::new(),
                 stale_after_ms: stale,
+                ctx: CtxRole::default(),
             }],
             socket: Some(SocketSpec {
                 path: "/run/x.sock".into(),
@@ -1703,6 +2126,7 @@ mod tests {
                 allowed_uids: Vec::new(),
                 allowed_gids: Vec::new(),
             }),
+            uplink: None,
         })
     }
 
@@ -1868,6 +2292,7 @@ mod tests {
                 allowed_uids: Vec::new(),
                 allowed_gids: Vec::new(),
             }),
+            uplink: None,
         });
         let r = |state| SafetyReport { state };
         assert!(f
