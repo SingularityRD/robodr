@@ -1,0 +1,117 @@
+# RoboDR one-command demo (gap T28). Start with ./demo/run.sh, which builds
+# or locates the release binaries and runs `docker compose up`.
+#
+#   robot      commission a profile from a real ROS 2 capture with ephemeral
+#              keys, merge the attack scenarios into it, replay through
+#              robodr-agentd (signed black box, signed findings), exit
+#   soc        robodr-demo-soc: ingest API + viewer on http://127.0.0.1:8080
+#   uplink     robodr-uplink: robot spool -> SOC ingest API (signed batches)
+#   kafka      Apache Kafka (KRaft, one node): the SIEM path
+#   publisher  robodr-kafka-publish: a copy of the spool -> topic robodr.findings
+#
+# Profile "live" (./demo/run.sh --live) adds a robot capturing live on its
+# interface and an attacker sending the rogue-participant scenario to it,
+# for measured time to detect and time to SOC.
+#
+# Every key is generated fresh into demo/state by the robot container.
+# Nothing here is a production deployment: plain HTTP on loopback inside the
+# SOC container, plain Kafka on a private bridge, root in containers.
+
+name: robodr-demo
+
+x-robodr: &robodr
+  # Ubuntu 24.04 (glibc 2.39, as the release packages); pinned.
+  image: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  volumes:
+    - ${ROBODR_BIN:-../target/release}:/opt/robodr/bin:ro
+    - ./scripts:/demo/scripts:ro
+    - ./config:/demo/config:ro
+    - ../fixtures/captures/ros2-jazzy:/demo/fixtures:ro
+    - ./state:/demo/state
+
+services:
+  robot:
+    <<: *robodr
+    command: ["/demo/scripts/robot.sh"]
+    networks: [demo]
+
+  soc:
+    <<: *robodr
+    command: ["/opt/robodr/bin/robodr-demo-soc", "--config", "/demo/state/soc.json",
+              "--listen", "0.0.0.0:8080", "--store", "/demo/state/soc-findings.ndjson"]
+    ports: ["127.0.0.1:${DEMO_SOC_PORT:-8080}:8080"]
+    networks: [demo]
+    depends_on:
+      robot: { condition: service_completed_successfully }
+
+  uplink:
+    <<: *robodr
+    # Same network namespace as the SOC: robodr-uplink sends plain HTTP only
+    # to a loopback address.
+    network_mode: "service:soc"
+    command: ["/opt/robodr/bin/robodr-uplink", "--url", "http://127.0.0.1:8080",
+              "--key-file", "/demo/state/keys/uplink.key", "--state-dir", "/demo/state/uplink",
+              "--spool", "/demo/state/spool", "--interval-ms", "1000"]
+    depends_on:
+      soc: { condition: service_started }
+
+  kafka:
+    image: apache/kafka:3.9.1@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks: [demo]
+
+  publisher:
+    <<: *robodr
+    command: ["/opt/robodr/bin/robodr-kafka-publish", "--bootstrap", "kafka:9092",
+              "--state-dir", "/demo/state/kafka-publish", "--spool", "/demo/state/spool-siem",
+              "--allow-plaintext", "--interval-ms", "2000"]
+    networks: [demo]
+    depends_on:
+      robot: { condition: service_completed_successfully }
+      kafka: { condition: service_started }
+
+  robot-live:
+    <<: *robodr
+    profiles: [live]
+    command: ["/demo/scripts/robot-live.sh"]
+    cap_add: [NET_RAW, NET_ADMIN]
+    networks:
+      demo: { ipv4_address: 172.30.77.20 }
+    depends_on:
+      robot: { condition: service_completed_successfully }
+
+  uplink-live:
+    <<: *robodr
+    profiles: [live]
+    network_mode: "service:soc"
+    command: ["/opt/robodr/bin/robodr-uplink", "--url", "http://127.0.0.1:8080",
+              "--key-file", "/demo/state/keys/uplink-live.key", "--state-dir", "/demo/state/uplink-live",
+              "--spool", "/demo/state/spool-live", "--interval-ms", "200"]
+    depends_on:
+      soc: { condition: service_started }
+      robot-live: { condition: service_started }
+
+  attacker:
+    <<: *robodr
+    profiles: [live]
+    command: ["/demo/scripts/attacker.sh"]
+    networks:
+      demo: { ipv4_address: 172.30.77.66 }
+    depends_on:
+      robot-live: { condition: service_started }
+
+networks:
+  demo:
+    ipam:
+      config: [{ subnet: 172.30.77.0/24 }]

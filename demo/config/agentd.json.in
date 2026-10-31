@@ -1,0 +1,33 @@
+{
+  "robot": { "id": "@ROBOT@@SUFFIX@", "site": "demo-lab" },
+  "sensor": {
+    "profile_path": "/demo/state/commission/locked.json",
+    "listen_spdp": false,
+    "capture": { "enabled": true, @CAPTURE@ },
+    "motion": { "feedback_topics": ["/odom"] },
+    "unitree_legacy": { "enabled": true, "command_senders": ["10.77.10.21"] },
+    "profile_trust": {
+      "trusted_keys": "/demo/state/commission/profile-trust.json",
+      "state_file": "/demo/state/profile-state@SUFFIX@.json",
+      "expect_platform": "lab-ugv"
+    }
+  },
+  "firewall": {
+    "max_angular": { "/cmd_vel": 1.0 },
+    "allow": { "/cmd_vel": ["identity:teleop_twist"] }
+  },
+  "motion_monitor": { "feedback_sources": { "/odom": "wheel_odometry" } },
+  "policy_path": "/demo/config/response-policy.json",
+  "blackbox": {
+    "dir": "/demo/state/blackbox@SUFFIX@",
+    "key_file": "/demo/state/keys/blackbox@SUFFIX@.key",
+    "boot_id": "demo"
+  },
+  "finding_signing": { "key_file": "/demo/state/keys/finding@SUFFIX@.key" },
+  "spool": { "dir": "/demo/state/spool@SUFFIX@" },
+  "event_inputs": [],
+  "context": { "safety_state": "moving_slow", "control": "teleop" },
+  "correlation": { "enabled": true, "include_default_rules": true },
+  "daemon": { "tick_ms": 200, "heartbeat_ms": 2000, "silence_ms": 600000,
+              "health_report_ms": 0, "exit_when_inputs_end": @EXIT@ }
+}
