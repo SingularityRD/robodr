@@ -38,7 +38,8 @@
 //! * [`host`]: the optional `host_threats` socket: Pulsar threats handed
 //!   over by the `robodr-threat-forward` Pulsar module (peer-uid checked,
 //!   strictly parsed, heartbeat liveness) become host-side correlation
-//!   signals and `robot.host.pulsar_threat` findings.
+//!   signals and `robot.host.<rule>` findings (one id per shipped Pulsar
+//!   rule, `robot.host.pulsar_threat` for any other).
 //! * [`control`]: the optional control-plane API `robodr-control-plane/v2`
 //!   (`control_plane`, off by default): over mutual TLS (or loopback / a
 //!   unix socket), a SOC's Ed25519-signed, replay-protected action request

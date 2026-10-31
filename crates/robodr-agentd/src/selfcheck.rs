@@ -247,6 +247,40 @@ pub fn clock_health(
     h
 }
 
+/// Reachability of a component fed by one or more inputs (`(ended,
+/// last_rx_ms)` each, daemon time): an input is reachable when heard
+/// within `silence_ms`, unknown before `silence_ms` has passed without a
+/// word, unreachable otherwise or once ended. Several inputs report the
+/// worst one, with that input's age, so a dead input is never hidden by a
+/// live one and the state and `last_ok_age_ms` describe the same input.
+pub fn inputs_reachability(
+    inputs: impl IntoIterator<Item = (bool, Option<u64>)>,
+    now_ms: u64,
+    silence_ms: u64,
+) -> (robodr_ocsf::ReachState, Option<u64>) {
+    use robodr_ocsf::ReachState;
+    let rank = |s: ReachState| match s {
+        ReachState::Unreachable => 3,
+        ReachState::Unknown => 2,
+        ReachState::Reachable => 1,
+        ReachState::NotConfigured => 0,
+    };
+    let mut worst = (ReachState::NotConfigured, None);
+    for (ended, last_rx) in inputs {
+        let state = match last_rx {
+            _ if ended => ReachState::Unreachable,
+            None if now_ms < silence_ms => ReachState::Unknown,
+            None => ReachState::Unreachable,
+            Some(t) if now_ms.saturating_sub(t) < silence_ms => ReachState::Reachable,
+            Some(_) => ReachState::Unreachable,
+        };
+        if rank(state) > rank(worst.0) {
+            worst = (state, last_rx.map(|t| now_ms.saturating_sub(t)));
+        }
+    }
+    worst
+}
+
 /// Milliseconds from `path`'s modification time to `wall_ms` (Unix ms);
 /// 0 for a time in the future, `None` if it cannot be read.
 pub fn file_age_ms(path: &Path, wall_ms: u64) -> Option<u64> {
@@ -867,6 +901,46 @@ mod tests {
         assert_eq!(file_age_ms(&marker, 0), Some(0), "future mtime reads 0");
         assert_eq!(file_age_ms(&dir.join("absent"), now_ms), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several inputs of one component: the worst one is reported, with
+    /// its own age (before: the last input's state and the first one's
+    /// age, so a dead input could hide behind a live one).
+    #[test]
+    fn reachability_reports_the_worst_input_with_its_age() {
+        use robodr_ocsf::ReachState as R;
+        let silence = 1_000;
+        let now = 10_000;
+        assert_eq!(
+            inputs_reachability([], now, silence),
+            (R::NotConfigured, None)
+        );
+        let live = (false, Some(9_900));
+        let dead = (false, Some(2_000));
+        let ended = (true, Some(9_950));
+        for set in [vec![dead, live], vec![live, dead]] {
+            assert_eq!(
+                inputs_reachability(set, now, silence),
+                (R::Unreachable, Some(8_000))
+            );
+        }
+        assert_eq!(
+            inputs_reachability([live, ended], now, silence),
+            (R::Unreachable, Some(50))
+        );
+        assert_eq!(
+            inputs_reachability([live, (false, Some(9_990))], now, silence),
+            (R::Reachable, Some(100))
+        );
+        // Not heard yet: unknown during the first silence window.
+        assert_eq!(
+            inputs_reachability([(false, None), (false, Some(500))], 800, silence),
+            (R::Unknown, None)
+        );
+        assert_eq!(
+            inputs_reachability([(false, None)], now, silence),
+            (R::Unreachable, None)
+        );
     }
 
     /// Under the shipped unit `adjtimex(2)` fails with EPERM (seccomp

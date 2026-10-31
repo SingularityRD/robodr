@@ -735,7 +735,7 @@ bytes (`robodr_ocsf::health_limits`):
 | `inputs[]` | `{name, last_rx_age_ms?, received, dropped, malformed, ended}` per input |
 | `counters` | `findings_spooled`, `finding_errors`, `health_findings`, `spool_dropped`, `spool_write_errors`, `note_errors` |
 | `blackbox` | `{degraded, anchored, anchor_failures}` |
-| `reachability[]` | `{component, state, last_ok_age_ms?}` for `executor`, `gateway` (the in-path gateway's feed) and `pulsard` (the host-threat forwarder): `reachable` \| `unreachable` \| `unknown` (configured, not heard yet) \| `not_configured` |
+| `reachability[]` | `{component, state, last_ok_age_ms?}` for `executor`, `gateway` (the in-path gateway's feed) and `pulsard` (the host-threat forwarder): `reachable` \| `unreachable` \| `unknown` (configured, not heard yet) \| `not_configured`; a component fed by several inputs reports its worst input, and `last_ok_age_ms` is that input's |
 | `credentials[]` | `{name, expires_ms, days_to_expiry}`: the control plane's server certificate (`control_plane.server_cert`) and each CRL's `nextUpdate` (`control_plane.crl:<issuer>`) |
 | `clock` | `{synchronized?, max_error_ms?, source?, adjtimex_errno?, timesync_age_ms?, wall_jumps}`: `synchronized` / `max_error_ms` from `adjtimex(2)` (`source` `adjtimex`); where that call fails, `adjtimex_errno` (1 = `EPERM`, the shipped unit's `@clock` seccomp filter) and, if systemd-timesyncd touched `/run/systemd/timesync/synchronized` within 4 096 s, `synchronized: true` with `source` `timesyncd` (no error estimate; an older or absent marker leaves `synchronized` out); `timesync_age_ms` is that marker's age; `wall_jumps` from agentd's time guard |
 | `disks[]` | `{name, free_bytes, total_bytes}` for `blackbox`, `spool` and `control_plane` |
