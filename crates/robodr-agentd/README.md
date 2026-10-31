@@ -212,8 +212,11 @@ path:
   for a Go1), `config/agentd.unitree-edu.example.json` (on the EDU dev
   computer of a G1, with the joint firewall) and
   `config/agentd.unitree-go2.example.json` (Go2 EDU). The two EDU examples
-  read the safety state and the operational context live (sport mode, low
-  state, remote; "Live safety state" below).
+  read the safety state and the operational context live: the Go2 example
+  from sport mode, low state and the remote, the G1 example from the `hg`
+  low state and the remote (the G1 has no sport-mode topic in the SDK
+  model table). Neither reads the uplink status (packaging gap below);
+  "Live safety state" below.
 
 Not verified on a real Unitree robot: everything above has only seen
 synthetic traffic built from the published IDL / `comm.h` layouts and the
@@ -307,8 +310,11 @@ profile, IP binding):
   while `error_code` is not 0.
 - **Low state** (`unitree_go` or `unitree_hg` `LowState_`): a sample whose
   Unitree CRC does not match is undecodable (`unknown`, Medium finding:
-  corrupt or forged); else the motion level from the fastest joint's
-  `|dq|` over every slot.
+  corrupted); else the motion level from the fastest joint's `|dq|` over
+  every slot. The Unitree CRC is an unkeyed CRC32 that anyone can
+  recompute: it detects corruption, not forgery. A forged sample with a
+  correct CRC decodes normally; writer pinning and the IP binding are what
+  keep a forger out.
 - The mode codes in `config/agentd.unitree-go2.example.json` follow
   Unitree's Go2 documentation and the thresholds are illustrative: check
   both on the robot before sign-off.
@@ -342,13 +348,22 @@ and `unitree_sport` may add `"phase"` / `"control"` maps (sport mode code
 - **Lifecycle** (Nav2 or any managed node): the goal state of each
   transition event, mapped by name (`unconfigured`, `inactive`, `active`,
   `finalized` and the transition states). Events come on change only, so
-  the source is latched: the last trusted event counts until the next.
-  An unlisted state reads `on_stale` and is reported (Low).
+  the source is latched: the last trusted event counts until the next,
+  but only while the writer's participant is alive. It reads `on_stale`
+  again one SPDP lease (the announced `lease_duration`, clamped to
+  10..600 s; 100 s if none is known) after the participant's latest SPDP
+  from an IP bound to it, or after the event if no such SPDP followed, and
+  at once when the participant or the writer disposes itself (a dispose
+  from an IP outside the participant's binding is ignored). So a crashed
+  Nav2 holds its last state for at most one lease. A node that hangs while
+  its process stays up, or that dies while other nodes sharing its DDS
+  participant keep running, is not detected. An unlisted state reads
+  `on_stale` and is reported (Low).
 - **Uplink status**: `ok` -> `connected`, `retrying` / `starting` ->
   `degraded`, `blocked` -> `disconnected`. A missing, unreadable,
   symlinked, oversized, foreign-format or stale file (by its
-  `updated_at_ms`, unless a pending retry `next_attempt_at_ms` is still
-  ahead) reads `on_stale`. **Packaging gap:** `robodr-uplink` writes the
+  `updated_at_ms`; a failing, non-`ok` status stays current until its
+  pending retry `next_attempt_at_ms`, at most 24 h) reads `on_stale`. **Packaging gap:** `robodr-uplink` writes the
   file mode 0600 (user `robodr-uplink`), so under the shipped units
   `robodr-agentd` cannot read it and connectivity stays `on_stale`
   (`disconnected`, the conservative value) until the uplink writes it
@@ -363,7 +378,10 @@ and `unitree_sport` may add `"phase"` / `"control"` maps (sport mode code
   (default control `manual`, phase `unknown`, connectivity
   `disconnected`; the least conservative value of a field is refused as
   `on_stale`). If nothing contributes, `context.*` is used. A spoofed
-  or silenced source can therefore never make the context more permissive.
+  source can therefore never make the context more permissive, and a
+  silenced one falls back to its `on_stale` value, except a lifecycle
+  source, which holds its last trusted value while its writer's
+  participant is alive (above).
   Context-only sources (remote, lifecycle, uplink) never affect the safety
   state.
 - **Recording**: every change is a `robodr.context_transition` note
@@ -853,8 +871,8 @@ request.
 | `tests/control_plane_vectors.rs` | The contract vectors `docs/contracts/fixtures/control-plane-v2/` are byte-identical to the generator (`examples/control_plane_vectors.rs`) and hold against the implementation: requests authenticate (or are refused 401) and route as stated, answer and manifest signatures verify, chunks reassemble to the bundle, the bundle verifies with the black-box public key and the tampered copy does not. |
 | `tests/fuzz_smoke.rs` | The `control_plane_request` libFuzzer harness (`fuzz/harness/control_plane_request.rs`) driven by the std-only mutator over generated, signed seeds of every route (the seeds take the success path; the corpus equals the generator). |
 | `tests/unitree_live.rs` | Unitree end to end on synthetic captures, the profile **learned** with `robodr-commission` from a clean capture and locked: Go2 (`unitree_go`, 12 of 20 slots), G1 (`unitree_hg`, 29 of 35, arm SDK), H1 (`unitree_go`, 20 slots, arm SDK) and Go1 (legacy UDP). Clean replay: no finding, every joint frame checked by the joint firewall. Rogue `rt/lowcmd` writer (unknown participant, unauthorized motion writer, `rejected_unknown_source`); torque / kp / step over the envelope (profile + joint firewall would-haves); `rt/arm_sdk` frames with mode 0 counted as motion; `2^32 + id` api aliasing (High); velocity over the envelope (Critical); a model-specific api id `Unknown` without `robot_model`, classified with it; humanoids never record a zero / damping substitute and a limp frame is a would-have rejection; the independent `robodr-cdr` vectors decode with `crc_ok` true; Go1: unknown sender (Critical / Medium), trick mode, joint torque, compressed frame, legacy off = nothing captured. |
-| `tests/unitree_examples.rs` | Every Unitree example: a strict, valid profile per supported model with its topics and joint bounds; the firewall examples fit their profiles; the EDU and sensor-box daemon examples pass `--check-config`; morphology / slot-count / unknown-model / unsafe-substitute / `max_angular`-on-a-joint-channel refusals; every model's profile loads in the daemon with its `robot_model`; the Go2 and G1 EDU examples ship live sport / low-state / remote / uplink sources without warnings. |
-| `tests/unitree_context_feed.rs` | Unitree safety-state sources: sport mode codes, body speed, `error_code`, non-finite and unlisted values, staleness; rogue and wrong-IP sport writers ignored; low state with the Unitree CRC (a wrong CRC is undecodable), go and hg, `|dq|` thresholds, truncations. Live context: remote activity with hold, sport phase vs lifecycle (most conservative), latched lifecycle, stale sources to `on_stale`, context-only sources leave the safety state alone, a spoofed idle remote or forged lifecycle never restores autonomy, uplink status file to connectivity (stale, symlink-free read). End to end: the remote in use makes the over-envelope command's motion steps proposals (`human_in_command`) and the context changes are black-box notes. |
+| `tests/unitree_examples.rs` | Every Unitree example: a strict, valid profile per supported model with its topics and joint bounds; the firewall examples fit their profiles; the EDU and sensor-box daemon examples pass `--check-config`; morphology / slot-count / unknown-model / unsafe-substitute / `max_angular`-on-a-joint-channel refusals; every model's profile loads in the daemon with its `robot_model`; the Go2 EDU example ships live sport / low-state / remote sources and the G1 EDU example live `hg` low-state / remote sources, without warnings and without an uplink status source. |
+| `tests/unitree_context_feed.rs` | Unitree safety-state sources: sport mode codes, body speed, `error_code`, non-finite and unlisted values, staleness; rogue and wrong-IP sport writers ignored; low state with the Unitree CRC (a wrong CRC is undecodable; the CRC detects corruption only), go and hg, `|dq|` thresholds, truncations. Live context: remote activity with hold, sport phase vs lifecycle (most conservative), latched lifecycle (ends one lease after its participant's last trusted SPDP or at its participant's / writer's dispose; a spoofed SPDP or dispose changes nothing), stale sources to `on_stale`, context-only sources leave the safety state alone, a spoofed idle remote or forged lifecycle never restores autonomy, uplink status file to connectivity (stale, symlink-free read). End to end: the remote in use makes the over-envelope command's motion steps proposals (`human_in_command`) and the context changes are black-box notes. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. Control plane: the journal's crash points (killed during an append, between write and fsync, before the compaction's fsync / rename / directory fsync), damage quarantine, rollback of a survived failed append; the request state across restarts and the crash points around the black-box note (commit or abort from the black box, also for reverts), a journal that refuses fails closed, compaction bounds; the persisted replay store (replay after a restart, expiry, fence on damage or removal, a failing store refuses); evidence exports from a real recorder (multi-segment, rotation, time / finding selectors, gaps, limits, chunk reassembly, tamper, stored-export corruption and expiry); the HTTP head bound independent of read sizes and the answer write deadline. |

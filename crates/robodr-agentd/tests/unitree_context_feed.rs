@@ -445,7 +445,8 @@ fn low_state_joint_speed_with_crc_check() {
     assert_eq!(b.state(4), S::MovingSlow, "hg: no fast threshold");
     b.send(HG_W, &low(UnitreeKind::HgLowState, 0.0, true), 5);
     assert_eq!(b.state(5), S::Idle);
-    // A wrong CRC is corrupt or forged: undecodable, unknown.
+    // A wrong CRC is a corrupted sample (the CRC is unkeyed: it says
+    // nothing about forgery): undecodable, unknown.
     let f = b.send(LOW_W, &low(UnitreeKind::GoLowState, 0.0, false), 6);
     assert_eq!(rule_ids(&f), vec![rules::UNDECODABLE]);
     assert_eq!(f[0].deviation.severity, Severity::Medium);
@@ -610,12 +611,121 @@ fn live_context_from_remote_sport_mode_and_lifecycle() {
     // An unlisted lifecycle state reads on_stale (and is reported once).
     let f = b.send(LIFE_W, &transition(12), 5001);
     assert_eq!(rule_ids(&f), vec![rules::UNMAPPED_VALUE]);
+    // The finding says what happened: the context reads on_stale, the
+    // safety state is untouched.
+    let detail = &f[0].deviation.detail;
+    assert!(detail.contains("operational-context topic"), "{detail}");
+    assert!(detail.contains("on_stale"), "{detail}");
+    assert!(!detail.contains("read as unknown"), "{detail}");
     assert_eq!(b.ctx(5001).phase, P::Unknown);
     // Transitions are recorded with the sources' views.
     let st = b.feed.status(5001);
     let ctx = st.context.unwrap();
     assert_eq!(ctx.sources.len(), 3);
     assert!(b.feed.stats().context_transitions >= 5);
+}
+
+/// SPDP of `prefix` on `ip` with an explicit lease (seconds).
+fn spdp_with_lease(prefix: [u8; 12], ip: Ipv4Addr, lease_s: i32) -> Vec<u8> {
+    let mut lease = lease_s.to_le_bytes().to_vec();
+    lease.extend_from_slice(&0u32.to_le_bytes());
+    let payload = pl_payload(&[
+        param(0x0015, &[2, 3, 0, 0]),
+        param(0x0016, &[0x01, 0x0f, 0, 0]),
+        param(0x0050, &guid(prefix, [0, 0, 1, 0xc1])),
+        param(0x0002, &lease), // PARTICIPANT_LEASE_DURATION
+        param(0x0032, &locator_v4(ip, 7410)),
+        param(0x0031, &locator_v4(ip, 7411)),
+    ]);
+    datagram(prefix, &[data(ENTITY_SPDP_WRITER, 2, &payload)])
+}
+
+/// A dispose (inline KEY_HASH + STATUS_INFO disposed|unregistered, no
+/// payload) of instance `key` by builtin writer `by`, sent by `sender`.
+fn dispose(sender: [u8; 12], by: [u8; 4], key: [u8; 16]) -> Vec<u8> {
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(&[0, 0, 0, 0]);
+    body.extend_from_slice(&by);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&3u32.to_le_bytes());
+    body.extend_from_slice(&param(0x0070, &key));
+    body.extend_from_slice(&param(0x0071, &[0, 0, 0, 3]));
+    body.extend_from_slice(&[1, 0, 0, 0]); // sentinel
+    let mut sub = vec![0x15, 0x03]; // DATA, E|Q
+    sub.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    sub.extend_from_slice(&body);
+    datagram(sender, &[sub])
+}
+
+/// The lifecycle source as the only context source (beside a sport-mode
+/// safety source without context mappings).
+fn lifecycle_only() -> serde_json::Value {
+    let mut f = context_feed();
+    let life = f["topics"][2].clone();
+    f["topics"] = serde_json::json!([sport_source(), life]);
+    f
+}
+
+#[test]
+fn a_latched_lifecycle_reading_ends_with_its_participant() {
+    let active = |c: LiveContext| (c.control, c.phase) == (C::Autonomous, P::Transit);
+    let stale = |c: LiveContext| (c.control, c.phase) == (C::Manual, P::Unknown);
+    // No lease announced (the discovery in Bus::new): the RTPS default,
+    // 100 s after the event.
+    let mut b = Bus::new(lifecycle_only());
+    b.send(LIFE_W, &transition(3), 1_000);
+    assert!(active(b.ctx(1_000)));
+    assert!(active(b.ctx(101_000)), "within one lease");
+    assert!(
+        stale(b.ctx(101_001)),
+        "Nav2 crashed (no SPDP since): its last state must not hold forever"
+    );
+    // A trusted SPDP keeps the participant (and the reading) alive ...
+    b.send(LIFE_W, &transition(3), 200_000);
+    b.raw(ROBOT_IP, spdp_with_lease(LEGIT, ROBOT_IP, 30), 250_000);
+    assert!(active(b.ctx(280_000)), "lease refreshed by its SPDP");
+    // ... for its announced lease (30 s), not the default.
+    assert!(stale(b.ctx(280_001)));
+    // A later event uses the announced lease too.
+    b.send(LIFE_W, &transition(3), 300_000);
+    assert!(active(b.ctx(330_000)));
+    assert!(stale(b.ctx(330_001)));
+    // An SPDP of the participant from a rogue IP keeps nothing alive.
+    b.send(LIFE_W, &transition(3), 400_000);
+    b.raw(ROGUE_IP, spdp_with_lease(LEGIT, ROBOT_IP, 600), 420_000);
+    assert!(stale(b.ctx(430_001)), "a spoofed SPDP is no refresh");
+
+    // A self-dispose of the participant: on_stale at once. A spoofed one
+    // from another host changes nothing.
+    let mut b = Bus::new(lifecycle_only());
+    b.send(LIFE_W, &transition(3), 1_000);
+    let participant = guid(LEGIT, [0, 0, 1, 0xc1]);
+    b.raw(
+        ROGUE_IP,
+        dispose(ROGUE, ENTITY_SPDP_WRITER, participant),
+        2_000,
+    );
+    assert!(active(b.ctx(2_000)), "a dispose from a rogue IP is ignored");
+    b.raw(
+        ROBOT_IP,
+        dispose(LEGIT, ENTITY_SPDP_WRITER, participant),
+        3_000,
+    );
+    assert!(stale(b.ctx(3_000)), "the participant left");
+    let st = b.feed.status(3_000).context.unwrap();
+    assert!(!st.sources[0].fresh);
+
+    // The writer itself is disposed (the node shut down, its participant
+    // stays): on_stale at once.
+    let mut b = Bus::new(lifecycle_only());
+    b.send(LIFE_W, &transition(3), 1_000);
+    b.raw(
+        ROBOT_IP,
+        dispose(LEGIT, ENTITY_SEDP_PUB_WRITER, guid(LEGIT, LIFE_W)),
+        2_000,
+    );
+    assert!(stale(b.ctx(2_000)), "the writer left");
 }
 
 #[test]

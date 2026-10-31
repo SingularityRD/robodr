@@ -41,9 +41,14 @@
 //!   must be checked on the robot (sales-readiness B1).
 //! * Lifecycle events are published on change only. A lifecycle source is
 //!   therefore **latched**: its last trusted event counts until the next
-//!   one, and it reads `on_stale` only until the first event after the
-//!   daemon starts. A node that crashes publishes nothing; pair it with
-//!   `on_stale` values you can live with.
+//!   one, but only while the writer's participant is alive (its SPDP lease
+//!   runs, it has not disposed itself or the writer; see
+//!   [`crate::safety`], "Latched sources"); otherwise, and until the first
+//!   event after the daemon starts, it reads `on_stale`. A crashed node's
+//!   last state can therefore hold for up to one SPDP lease (at most
+//!   10 min), and for as long as its participant stays up if only the node
+//!   hangs or other nodes share its participant; pair it with `on_stale`
+//!   values you can live with.
 //! * The uplink status file must be readable by the daemon's user.
 //!   `robodr-uplink` writes it mode 0600 under its own user, so with the
 //!   shipped units it is not (a packaging change, see
@@ -671,7 +676,9 @@ struct UplinkStatusFile {
 /// `ok` -> connected, `retrying` / `starting` -> degraded, `blocked` ->
 /// disconnected; anything else, a foreign format, a stamp more than
 /// [`MAX_FUTURE_SKEW_MS`] ahead or a stale status -> `Err(why)`
-/// (`on_stale`).
+/// (`on_stale`). A status is stale `stale_after_ms` after `updated_at_ms`,
+/// or, for a failing (non-`ok`) one, after its announced
+/// `next_attempt_at_ms` (at most [`MAX_RETRY_HORIZON_MS`] later).
 pub fn parse_uplink_status(
     bytes: &[u8],
     now_wall_ms: u64,
@@ -685,10 +692,14 @@ pub fn parse_uplink_status(
     if s.updated_at_ms > now_wall_ms.saturating_add(MAX_FUTURE_SKEW_MS) {
         return Err("status stamped in the future".into());
     }
-    // A failing uplink waits (backoff) before it rewrites the file; the
-    // status stays current until the announced attempt (bounded).
+    // A failing uplink waits (backoff) before it rewrites the file; a
+    // failing status stays current until the announced attempt (bounded).
+    // An `ok` status never does: the uplink announces its next run after a
+    // success too, and an uplink that died right after one must not read
+    // connected for a whole (possibly long) interval.
     let until = s
         .next_attempt_at_ms
+        .filter(|_| s.state != "ok")
         .filter(|n| *n >= s.updated_at_ms)
         .map(|n| n.min(s.updated_at_ms.saturating_add(MAX_RETRY_HORIZON_MS)))
         .unwrap_or(s.updated_at_ms);
@@ -971,6 +982,16 @@ mod tests {
                 st
             ),
             Ok(Connectivity::Disconnected)
+        );
+        // An `ok` status is not extended by its next run: an uplink that
+        // died after a success is not connected for its whole interval.
+        assert!(
+            parse_uplink_status(&status("ok", now - 31_000, Some(now + 3_600_000)), now, st)
+                .is_err()
+        );
+        assert_eq!(
+            parse_uplink_status(&status("ok", now - 29_000, Some(now + 3_600_000)), now, st),
+            Ok(Connectivity::Connected)
         );
         // ... but not forever, and not from the future.
         assert!(
