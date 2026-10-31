@@ -1505,6 +1505,76 @@ mod tests {
         der(0x30, &[tbs, alg, der(0x03, &[0, 1, 2, 3])].concat())
     }
 
+    /// `crl_without_number` with `next_update` (tag, bytes) as nextUpdate
+    /// and a CRL number.
+    fn crl_with_next_update(tag: u8, next_update: &[u8]) -> Vec<u8> {
+        let alg = der(
+            0x30,
+            &der(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]),
+        );
+        let cn = der(0x0c, b"RoboDR test CA with CRLs");
+        let name = der(
+            0x30,
+            &der(
+                0x31,
+                &der(0x30, &[der(0x06, &[0x55, 0x04, 0x03]), cn].concat()),
+            ),
+        );
+        let number = der(
+            0x30,
+            &[der(0x06, &[0x55, 0x1d, 0x14]), der(0x04, &der(0x02, &[9]))].concat(),
+        );
+        let tbs = der(
+            0x30,
+            &[
+                der(0x02, &[1]),
+                alg.clone(),
+                name,
+                der(0x17, b"000101000000Z"),
+                der(tag, next_update),
+                der(0xa0, &der(0x30, &number)),
+            ]
+            .concat(),
+        );
+        der(0x30, &[tbs, alg, der(0x03, &[0, 1, 2, 3])].concat())
+    }
+
+    /// Since T6 the nextUpdate is read for expiry warnings. One that does
+    /// not parse makes the whole CRL unreadable, as an unreadable
+    /// thisUpdate always did: the CRL is refused at load (fail closed:
+    /// handshakes needing it are refused), never used without a date. The
+    /// TLS layer (webpki) refuses the same CRL, so this changes no
+    /// handshake outcome.
+    #[test]
+    fn a_crl_with_an_unreadable_next_update_is_refused() {
+        let ok = crl_with_next_update(0x18, b"21250101000000Z");
+        let meta = CrlMeta::parse(&ok).unwrap();
+        assert_eq!(meta.next_update, Some(4_891_363_200));
+        assert_eq!(meta.number.as_deref(), Some(&[9u8][..]));
+        for bad in [
+            &b"2125010100000Z"[..], // one digit short
+            b"2125010100000aZ",     // not a digit
+            b"21250101000000",      // no Z
+        ] {
+            let raw = crl_with_next_update(0x18, bad);
+            assert!(CrlMeta::parse(&raw).is_none(), "{bad:?}");
+            assert!(
+                webpki::OwnedCertRevocationList::from_der(&raw).is_err(),
+                "webpki accepts {bad:?}"
+            );
+            let d = tmp("badnext");
+            std::fs::write(d.join("ca.crl"), &raw).unwrap();
+            std::fs::set_permissions(d.join("ca.crl"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            let refused = match CrlFiles::new("crl_files", &[d.join("ca.crl")]) {
+                Err(_) | Ok(None) => true,
+                Ok(Some(f)) => server_verifier(roots(), provider(), Some(f)).is_err(),
+            };
+            assert!(refused, "{bad:?}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
     /// Finding 1: a CRL without a CRL number cannot be ordered: refused.
     #[test]
     fn a_crl_without_a_number_is_refused() {
