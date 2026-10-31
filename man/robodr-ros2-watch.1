@@ -47,9 +47,16 @@ Validate the
 section offline, as the daemon would read it: TOML syntax, keys the daemon
 would ignore (typos; Pulsar only logs them), value ranges and paths, and the
 profile with its trust (signature, metadata, revocation, anti\-rollback
-decision). Read\-only: the anti\-rollback state file is not written, nothing
-is captured. Warnings and errors go to stderr, a summary to stdout. No other
-option may be combined with it.
+decision), the SROS 2 keystore when set, and
+.B /dev/shm
+of the host running the check for DDS shared\-memory segments (a warning
+only when some are found; run the check on the robot). Read\-only: the
+anti\-rollback state file is not written, nothing is captured. Warnings and
+errors go to stderr, a summary to stdout. Limits that hold for every
+deployment (shared\-memory transports are invisible to the capture; what an
+SROS 2 governance leaves visible) are summary lines starting with
+.BR note: ,
+not warnings. No other option may be combined with it.
 .TP
 .B \-\-strict
 With
