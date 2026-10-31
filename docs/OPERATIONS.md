@@ -3439,18 +3439,22 @@ is refused.
 
 ## 9. Decommissioning
 
-The package never deletes evidence or keys, not even on `apt purge`.
+The package never deletes evidence or keys, not even on `apt purge`. The
+end-of-life checklist, with the commands and the proof each step leaves,
+is [`DECOMMISSION.md`](DECOMMISSION.md); run its steps in this order:
 
-1. Export everything (section 8) and confirm verification on the far side.
-2. `sudo systemctl disable --now robodr-agentd robodr-pulsard`
-3. `sudo apt purge robodr` (or `dpkg -P robodr`).
-4. Tell the SOC to retire the unit's keys (fleet: remove the robot), so its
-   uplink and finding keys authenticate nothing any more.
-5. Following the site's evidence-retention and media-sanitisation rules, and
-   only after the far side has confirmed it holds verified copies:
-   archive or destroy `/var/lib/robodr`, then destroy `/etc/robodr/keys`
-   (`shred -u`). Destroying the keys makes remaining copies of the evidence
-   unverifiable on the robot side.
+1. Export the evidence (section 8) and have the far side verify it.
+2. Stop every RoboDR service, not only agentd and pulsard.
+3. Inline units: take the Motion Firewall gateway out of the path.
+   Stopping it or purging the package leaves its rules in place, and with
+   `fail_closed` the bridge keeps dropping motion commands (section 6.6).
+4. Retire the unit's keys at the SOC (`robodr-enroll decommission`, signed
+   receipt).
+5. Revoke the unit at the site depot (`robodr-depot unit revoke`).
+6. Remove the unit from the anchor receiver.
+7. Release its TPM resources (`tpm2_nvundefine`, `robodr-seal erase`).
+8. Purge the package, then destroy and sanitise the data per NIST SP
+   800-88 (`shred` is best effort on flash media).
 
 ## 10. Troubleshooting
 

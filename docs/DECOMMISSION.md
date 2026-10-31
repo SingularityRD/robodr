@@ -96,9 +96,10 @@ if $IPT -t raw -n -L ROBODR_GW_RAW >/dev/null 2>&1; then
 fi
 nft delete table bridge robodr_gw_l2 2>/dev/null || true
 nft delete table bridge robodr_gw_rtc 2>/dev/null || true
-# check: both print nothing
-$IPT-save | grep ROBODR
-nft list tables | grep robodr_gw
+# check: both print 0 (the count of what is left; `|| true` because grep
+# exits 1 when it counts nothing, which is the success case here)
+$IPT-save | grep -c ROBODR || true
+nft list tables | grep -c robodr_gw || true
 ```
 
 Then remove the bridge / re-cable the motion link as it was before
@@ -107,7 +108,7 @@ sysctls back to the values in that record (or reboot: with the rules unit
 disabled nothing sets them again; if `/etc/modules-load.d/robodr.conf`
 was installed for the gateway, remove its `br_netfilter` line first).
 
-Proof: the empty output of the checks above, and a motion command reaching
+Proof: the two `0` counts of the checks above, and a motion command reaching
 the actuator controller without the gateway (bench test), recorded in the
 site log.
 

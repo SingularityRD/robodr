@@ -114,7 +114,7 @@ adds to the "at rest" column.
   legal-claims / legal-obligation exceptions your counsel identifies.
   Findings in your SOC, Kafka and media follow your own deletion
   processes.
-- **Decommissioning:** OPERATIONS §9: the package never deletes evidence or keys itself; after the far side holds verified copies, the operator archives or destroys `/var/lib/robodr` and shreds `/etc/robodr/keys`;
+- **Decommissioning:** [`DECOMMISSION.md`](../DECOMMISSION.md) (summary in OPERATIONS §9): the package never deletes evidence or keys itself; after the far side holds verified copies, the operator destroys `/var/lib/robodr` and `/etc/robodr` and sanitises the storage per NIST SP 800-88;
   sealed delivery content is crypto-erased.
 
 ## 7. International transfers
