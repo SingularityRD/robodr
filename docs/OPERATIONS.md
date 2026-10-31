@@ -121,15 +121,18 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    check and the extraction below read that copy only; the file named by
    `--tarball` is never opened again, so swapping it afterwards changes
    nothing;
-2. checks the copy's minisign signature against the pinned key, and that
+2. checks the copy's minisign signature against the pinned key (with the
+   **built-in verifier**, `robodr-deliverd verify-minisign`, once a release
+   carrying it is installed; with the `minisign` program before that), and that
    the signature's **trusted comment** names the tarball's file name
    (releases sign with `robodr <version> <file>`): a signed bundle renamed
    to pass for another one (e.g. a `robodr-focal` bundle named like a
    `robodr` one) is refused. If the release's `SHA256SUMS` was signed, its
    signature is checked too and the tarball must be listed in it with its
    hash. Without `--pubkey`/`--tarball` it refuses unless
-   `ROBODR_ALLOW_UNSIGNED=1` (labs only; the bundle is then the directory
-   the script runs from);
+   `ROBODR_ALLOW_UNSIGNED=1` (labs only, and **only on a unit without the
+   built-in verifier**; the bundle is then the directory the script runs
+   from);
 3. extracts the verified copy in the private directory and checks every
    file there against the inner `SHA256SUMS` (any unlisted file fails).
    Everything below uses that extraction, never an already extracted
@@ -144,7 +147,9 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    (`robodr` / `robodr-focal`; the focal variant has no `robodr-pulsard`)
    is **refused** unless `--allow-variant-switch`;
 5. runs the black-box format gate (section 7);
-6. runs `dpkg -i`. The package creates the users `robodr` (owner of the
+6. runs the **safety-state gate** for the gateway and the executor
+   (section 7, "Package upgrades and the safety state"), then `dpkg -i`.
+   The package creates the users `robodr` (owner of the
    shared group, runs nothing), `robodr-agentd` (agentd), `robodr-exec`
    (executor), one user per network-facing service (`robodr-spool`,
    `robodr-kafka`, `robodr-uplink`, `robodr-gw`; section 11.6) and the
@@ -152,13 +157,29 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    directories (tmpfiles), installs the units **disabled**, and installs
    `/usr/lib/robodr/install-bundle.sh`, the trusted verifier for the next
    upgrade;
-7. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
-   rollback.
+7. checks the unit's **health** (every RoboDR unit that ran before runs
+   again, agentd's heartbeat is fresh) and **rolls back automatically** to
+   the previous kept release if it is not healthy (section 7);
+8. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
+   rollback (`--keep N` keeps only the N newest).
 
-If `minisign` is not on the robot, verify on the entry station (section 2),
-extract the verified tarball into a fresh root-only directory on the robot
-and install with `ROBODR_ALLOW_UNSIGNED=1`. Record in the site log that the
-signature was checked at the entry station.
+Every default above and its only override are listed in
+`docs/SECURE-DEFAULTS.md`.
+
+**Signature checks on the robot.** Every release installs RoboDR's own
+minisign verifier (`robodr-deliverd verify-minisign`, `robodr-pkg`'s
+`minisign` module: prehashed signatures, strict Ed25519, the trusted
+comment checked), so from the first installed release on the robot needs
+no `minisign` program and `install-bundle.sh` checks every later release
+with that verifier, after its built-in known-answer self-test. Only the
+**first** install needs a verifier from outside: `minisign` on the robot,
+or the entry station. If `minisign` is not on the robot for the first
+install, verify on the entry station (section 2), extract the verified
+tarball into a fresh root-only directory on the robot and install with
+`ROBODR_ALLOW_UNSIGNED=1`; record in the site log that the signature was
+checked at the entry station. Once a release with the built-in verifier is
+installed, `ROBODR_ALLOW_UNSIGNED` is **refused**: lab builds are signed
+with a lab key (`minisign -G`) and installed with `--pubkey lab.pub`.
 
 After installing, nothing runs yet. Continue with keys (section 4) and
 commissioning (section 5).
@@ -2244,9 +2265,68 @@ while the chain is flushed.
 `sudo sh /usr/lib/robodr/install-bundle.sh install --pubkey … --tarball …`
 (the trusted copy the installed release brought; section 3). `dpkg` keeps local edits to
 `/etc/robodr/pulsar.toml` (a conffile) and asks before replacing an edited
-one. Services that were running are restarted on the new binaries.
-`/etc/robodr` (profile, keys, configs) and `/var/lib/robodr` (evidence) are
-never touched.
+one. Services that were running are restarted on the new binaries, except
+the gateway and the executor, which restart only through the safety-state
+gate (below). `/etc/robodr` (profile, keys, configs) and `/var/lib/robodr`
+(evidence) are never touched.
+
+**Package upgrades and the safety state.** Restarting
+`robodr-firewall-gw` drops the motion commands queued in it (with
+`fail_closed` the bridge refuses motion while it is down, section 6.6), and
+restarting `robodr-executor` drops its pending actions. A package upgrade
+therefore never restarts these two unguarded:
+
+- the package's maintainer scripts (deb `postinst`, rpm `post`) restart
+  the other running services but leave the gateway and the executor on the
+  previous binaries and record them in `/var/lib/robodr/pending-restart`
+  (also when the package is installed with plain `dpkg`/`rpm` or by
+  `robodr-deliverd`);
+- `install-bundle.sh install` and `rollback` read the **live** safety state
+  first (`robodr-deliverd safety-state`: agentd's status socket, checked
+  with `SO_PEERCRED`, fresh, on this boot, from a live safety feed: the
+  same rule `robodr-deliverd`'s own installs use). If the gateway or the
+  executor runs and the state is not `idle` or `safe_state_active`
+  (moving, human nearby, e-stop, `unknown`, or no live safety feed
+  configured), the install is **refused before anything changes**;
+- when the state allows it, the two are restarted right after the package
+  is installed (the state is read again first; if it closed meanwhile, the
+  restart is deferred);
+- `--defer-restart` installs now and leaves the two running the old
+  binaries; `sudo sh /usr/lib/robodr/install-bundle.sh restart-pending`
+  restarts them later, again only while the state allows it (exit 1 and
+  nothing restarted otherwise). A reboot also starts the new binaries;
+- `--allow-gateway-restart` restarts them whatever the state says. It is
+  a deliberate operator decision: motion through the gateway is
+  interrupted. Use it only with the robot stopped by other means (e.g.
+  an agentd without a live safety feed on a parked robot).
+
+Exception: the upgrade from 0.1.0-alpha.1 moves the gateway's state to its
+own user once and must stop the gateway for that; it cannot be deferred
+(`--defer-restart` is refused, and a plain `dpkg -i` leaves the package
+unconfigured with nothing stopped until `restart-pending` configures it
+through the gate; for an `.rpm`, install the release again with
+`install-bundle.sh` once the robot is idle). Upgrading **from a release
+whose `robodr-deliverd` has no `safety-state` command** (0.1.0-alpha.1)
+cannot read the gate before the upgrade: stop the gateway at a safe moment
+or pass `--allow-gateway-restart`.
+
+**Health check and automatic rollback.** After `install` and `rollback`,
+every RoboDR unit that was active before must be active again (two checks
+in a row, a second apart) and, if `robodr-agentd` was active, its
+heartbeat must be fresh (`robodr-deliverd safety-state`, `agentd_fresh`),
+within `--health-timeout SECS` (default 120). If not, `install`
+reinstalls the release that was installed before (it must be kept under
+`/var/lib/robodr/releases`, at or above the security floor and pass the
+black-box format gate), checks health again and exits 1; the failed
+release is not kept. `--no-auto-rollback` only reports (exit 1). With no
+RoboDR unit running (before commissioning) there is nothing to check.
+
+**Kept releases.** `install --keep N` (after a healthy install) or
+`install-bundle.sh prune --keep N` keeps the N newest kept releases and
+always the installed one; the others are deleted. The formats file of a
+pruned release is kept under `releases/formats-archive/`, so the
+black-box format gate still treats what that release wrote as verified.
+Keep at least 2 (the installed release and the one to roll back to).
 
 Before upgrading:
 
@@ -2313,7 +2393,9 @@ sudo sh /usr/lib/robodr/install-bundle.sh rollback 0.1.0~alpha.1-1
 
 Rollback reinstalls the kept `.deb` (or `.rpm`) after re-checking its hashes. The
 version must be one `list` shows (a version string, never a path). Evidence
-written by the newer version stays in place.
+written by the newer version stays in place. Rollback goes through the same
+safety-state gate and health check as an upgrade (`--defer-restart`,
+`--allow-gateway-restart`, `--health-timeout`).
 
 **Downgrades and the security floor.** `install` of a release older than
 the installed one is refused as a downgrade (it may bring back fixed
@@ -3031,6 +3113,9 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | `install-bundle: REFUSED: … a downgrade` / `below this unit's security floor` | an older release, or one below the floor | `rollback` or `--allow-downgrade` for a deliberate downgrade; nothing goes below the floor (section 7) |
 | `robodr-enroll rotate`: `holds key … but the SOC has …` | the key file was replaced by hand | restore the registered key, or re-enroll |
 | `install-bundle: REFUSED: release … reads black-box formats` | rollback/downgrade across a black-box format change | section 7: export and archive the chain first, or `--accept-unreadable <segment>` |
+| `install-bundle: REFUSED: … would restart robodr-firewall-gw.service …` | the gateway or executor runs and the live safety state is not idle / safe_state_active | section 7 "Package upgrades and the safety state": wait, `--defer-restart` then `restart-pending`, or `--allow-gateway-restart` |
+| `install-bundle: HEALTH CHECK FAILED` / `AUTOMATIC ROLLBACK` | a unit did not come back, or agentd's heartbeat is stale, after the install | the previous release is back; read `journalctl -u <unit>` for the failed one (section 7) |
+| `install-bundle: REFUSED: … built-in verifier … ROBODR_ALLOW_UNSIGNED is not accepted` | unsigned lab install on a unit that can check signatures | sign the build with a lab key and pass `--pubkey` (section 3) |
 | capture sees only `lo` | no default route on an air-gapped robot | list the DDS interfaces in `[module.robodr-sensor-ros2.capture] interfaces` |
 
 ## 11. Secure delivery on a unit (`robodr-deliverd`, Sprint 13b)

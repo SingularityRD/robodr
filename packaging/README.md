@@ -34,7 +34,7 @@ operator installs on a robot. The procedures that use it are in
 | `build-deb.sh` | (build time) | reproducible `.deb` from built binaries: `robodr` (default) or `robodr-focal` (`--variant focal`, static binaries only); `--stage-only DIR` writes just the file tree (for `build-rpm.sh`). `Depends:` from `dpkg-shlibdeps` and a soname table, libc6 floor from `readelf -V` (docs/BUILD.md "Release build userlands") |
 | `build-rpm.sh` | (build time) | `robodr` RPM (RHEL / Rocky / Alma 9, Fedora) from binaries built on Rocky Linux 9, with the `.deb`'s file tree; reproducible mtimes and build time |
 | `make-bundle.sh` | (build time) | offline install bundle: `--deb` (Debian / Ubuntu / JetPack) or `--rpm` (`robodr-<ver>-<arch>-rpm-offline.tar.gz`, RHEL / Rocky / Alma 9, Fedora) |
-| `install-bundle.sh` | inside the bundle; `/usr/lib/robodr/install-bundle.sh` | verify (signature, then a private extraction), install, list, roll back on the robot, with dpkg or `rpm -U` (same checks for both formats); the installed copy is the trusted verifier for the next upgrade |
+| `install-bundle.sh` | inside the bundle; `/usr/lib/robodr/install-bundle.sh` | verify (signature, then a private extraction), install, list, roll back on the robot, with dpkg or `rpm -U` (same checks for both formats); the installed copy is the trusted verifier for the next upgrade. Signatures are checked with the installed release's built-in verifier (`robodr-deliverd verify-minisign`), gateway / executor restarts go through the safety-state gate, every install is health-checked with automatic rollback, `--keep N` prunes kept releases (`docs/SECURE-DEFAULTS.md`) |
 | `release-maintainer.sh` | (build time; sourced by `build-deb.sh`, `build-rpm.sh`) | with `ROBODR_RELEASE=1` (release.yml) the `.deb` `Maintainer:` / RPM `Packager:` (`DEB_MAINTAINER`, `RPM_PACKAGER`; repository variable `ROBODR_MAINTAINER`) must be `Name <address>` and not a placeholder (`@invalid`, `example.*`, `localhost`); development builds keep `robodr-maintainers@invalid` |
 | `licenses/MIT.txt` | (build time) | MIT template for `THIRD_PARTY_NOTICES`: filled only with a crate's real copyright holders (`OVERRIDES` in `scripts/third_party_notices.py`) or the Rust project's; never shipped with a placeholder |
 | `licenses/musl-1.2.5-COPYRIGHT`, `licenses/Unicode-3.0.txt`, `licenses/LLVM-exception.txt` | (build time) | texts of the statically linked runtime code in `THIRD_PARTY_NOTICES`: musl libc and LLVM libunwind (robodr-focal), the Rust standard library |
@@ -164,7 +164,9 @@ Neither watchdog has been exercised under a real systemd yet.
 ├── deliverd-media/              0700 root:root     media packs put here for robodr-deliverd (untrusted)
 ├── depot/                       0700 robodr-depot:robodr-depot  robodr-depot (depot box only): database, store, deployments, unit CA, depot.lock
 ├── releases/<version>/          0750 root:root     .deb kept for rollback (install-bundle.sh)
-└── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
+├── releases/security-floor      0644 root:root     lowest release install/rollback may reach (only rises)
+├── releases/formats-archive/    0750 root:root     formats files of kept releases pruned by --keep (format gate)
+└── pending-restart              0644 root:root     gateway / executor units waiting for a safety-gated restart
 /run/robodr-pulsard/pulsar.sock                     Pulsar API socket (RuntimeDirectory)
 /run/robodr-executor/executor.sock                  agentd -> robodr-executor (0660 robodr-exec:robodr, dir 0750)
 /run/robodr-agentd/                                 agentd's sockets (0751 robodr-agentd:robodr-agentd): status.sock
