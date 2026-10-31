@@ -39,8 +39,9 @@ Why 1.87: `u*::is_multiple_of` is used in library code of `robodr-capture`,
 `-firewall`, `-motion`, `-ros2-pipeline`). Because the crates declare it,
 clippy's `incompatible_msrv` lint (on by default, an error under
 `-D warnings`) rejects any std API newer than 1.87. The `msrv` CI job
-compiles the pure crates with 1.87 itself; it is still marked informational
-in `ci.yml` (see [Verification status](#verification-status)).
+compiles the pure crates with 1.87 itself and is required (2026-10-31: the
+`cargo +1.87.0 check --locked` of the pure crates passes locally on the
+committed lock, p256 0.14 included).
 
 A host that does not have 1.98.1 (for example the dev sandbox, which only has
 a newer stable and no network) can override **for local work only**:
@@ -607,7 +608,7 @@ same units).
 | `scripts` | yes | Python self-tests of the CI scripts, Pulsar rule validation, `scripts/check-focal-units.py` (systemd 245 unit variants and the drop-in examples `robodr-focal` ships in step), `scripts/check-packages.py` (programs per variant, `ROBODR_DEB_REQUIRE` lists, deb/rpm scripts), `shellcheck` of `scripts/*.sh`, `packaging/*.sh`, the maintainer scripts, the rpm scriptlets and the focal / BTF helpers |
 | `pure` | yes | `fmt --check`, `clippy -D warnings`, `test` for every member except Pulsar-bound ones |
 | `pulsar` | yes | Installs Pulsar's build packages, then `build` / `clippy -D warnings` / `test` of every Pulsar-bound member (`robodr-sensor-ros2`, `robodr-pulsard`). No kernel load |
-| `msrv` | informational | `cargo +1.87.0 check` of the pure crates |
+| `msrv` | yes | `cargo +1.87.0 check` of the pure crates |
 | `deny` | yes | `cargo deny check advisories bans licenses sources` (`deny.toml`) |
 | `sbom` | yes | CycloneDX via cargo-cyclonedx **and** the std-only fallback; uploaded as artifact |
 | `fuzz` | yes | If `fuzz/` exists: every `cargo fuzz` target for 60 s on a pinned nightly; crashes uploaded |
@@ -622,6 +623,125 @@ All third-party actions are pinned by full commit SHA (resolved with
 comment; container images by multi-arch index digest (resolved with
 `docker buildx imagetools inspect`). Workflow token permissions are
 `contents: read`.
+
+## Extended CI
+
+`.github/workflows/ci-extended.yml` has the same triggers as `ci.yml`. It
+holds the jobs that need a privileged runner, the arm64 runner, a real
+broker or a real kernel. All of them are required.
+
+| Job | What |
+|---|---|
+| `arm64` | `clippy -D warnings` and `test` of the pure crates on `ubuntu-24.04-arm`. These cover the hand-written FFI constants and layouts: deliverd `fdio.rs`, firewall-gw `restrict.rs`, agentd `host.rs` |
+| `privileged` | `scripts/ci-privileged-tests.sh` runs the test binaries that need root, swtpm and tpm2-tools, network namespaces, nftables, AF_PACKET, dm-crypt or Tang: the seal, depot, deliverd, blackbox and agentd TPM tests, executor `netns`, firewall-gw `netns_e2e --ignored`, and the capture and ros2-pipeline live-capture tests. The binaries are built as the runner user and run as root, with `--nocapture` and `ROBODR_SWTPM=1 ROBODR_SEAL_DM=1 ROBODR_TANG=1 ROBODR_REQUIRE_NETNS=1 ROBODR_REQUIRE_DPKG_TEST=1`. `scripts/ci-no-skips.py` then fails the job on any "skipped" line, on a binary that ran no test, or on a test still ignored under `--ignored`. The logs are uploaded |
+| `kafka` | First `scripts/kafka-it.sh`: a single-node KRaft broker in docker, image pinned by digest. It covers plaintext, clean refusal of SASL/PLAIN and of self-signed TLS, ACL denial, quota, the Java partitioner, a broker restart mid-stream, and a `kafka-dump-log` CRC re-check. Then `scripts/kafka-tls-it.sh`: TLS, mutual TLS, and SASL_SSL SCRAM-SHA-256/512 with re-authentication, against the Apache Kafka 3.9.1 distribution (SHA-512 checked) |
+| `ebpf-load` | On amd64 and arm64: builds `robodr-pulsard` in release and runs `scripts/ebpf-load-smoke.sh` as root. The probes load into the runner's kernel with `rules/robodr`. The script sets off one real event per rule family: an interactive shell, a program run from `/tmp`, an interpreter one-liner, a tracer, a shell network connection, writes to the linker path and module autoload configuration, and a directory created under `/etc/robodr`. Each event must fire on stdout **and** arrive on the agentd-side host-threats socket through `robodr-threat-forward`. That socket is a stand-in listener that checks the wire format |
+| `coverage` | `cargo llvm-cov nextest` over the pure crates (cargo-llvm-cov 0.9.1, cargo-nextest 0.9.148, profile `ci` of `.config/nextest.toml`). It uploads `lcov.info`, the JUnit XML and the line-coverage summary, and shows the summary on the run page. There is no floor yet: set one with `--fail-under-lines` once the first runs give a number |
+
+`.github/workflows/lifecycle.yml` runs after every successful `ci.yml` run
+of a push or a same-repository pull request. It takes that run's `pkg-*`
+artifacts as N, the package under test.
+
+`scripts/systemd-lifecycle-matrix.sh` boots Debian 12, Ubuntu 22.04,
+Ubuntu 24.04 and Rocky Linux 9 containers with systemd as PID 1. The
+containers are privileged and get their own cgroup namespace. `/` is made
+`rshared` so that `LoadCredential=` works as on a booted host.
+
+In each container, `scripts/systemd-lifecycle.sh` runs these steps:
+
+1. Install N-1.
+2. Commission a minimal agentd.
+3. `systemctl enable --now`.
+4. Check the heartbeat: the unit is active, the `status.json` heartbeats
+   advance, and there was no automatic restart.
+5. Upgrade to N.
+6. Roll back to N-1.
+7. Purge.
+
+After each step the key, `agentd.json` and every black-box segment written
+before must be unchanged, and `robodr-blackbox verify` must report INTACT
+across the whole chain.
+
+N-1 is the latest GitHub release's package, checked against that release's
+`SHA256SUMS`. Until a release exists, N-1 is the same `.deb` relabelled
+`0.0.0~ci.prev-1`, and the Rocky row is reported NOT RUN with a warning.
+
+Two things are still outside CI:
+
+- SELinux enforcing. The AVC check of `systemd-lifecycle.sh` runs only in a
+  Rocky or RHEL VM; a container cannot enforce SELinux.
+- The deliverd self-upgrade (T52).
+
+**First local run (2026-10-31, Ubuntu 24.04 row, systemd 255): the shipped
+unit does not start `robodr-agentd`.** systemd 254 and newer hand
+credentials over as root-owned files with a POSIX ACL for the service user,
+so `st_mode` reads 0440. agentd's key check refuses that: "mode 440 lets
+group/others access it". With the check relaxed in a local build that was
+not committed, every other step passed. The fix belongs in the key loaders
+(agentd, executor, deliverd, blackbox, fleet), not in the test. Until it
+lands, the Ubuntu 24.04 row (and any newer one) fails.
+
+## Nightly
+
+`.github/workflows/nightly.yml` runs at 01:41 UTC and can be started by
+hand. It has two parts.
+
+**`fuzz`.** Every `cargo fuzz` target is built once (ASan, debug
+assertions). Then one job per target runs for `fuzz_seconds` (default
+3 600). Each job starts from `fuzz/corpus/<target>/` plus the corpus grown
+on earlier nights, kept in `actions/cache` and minimised with `-merge=1`
+before it is saved. The committed seeds are never written.
+
+A crash, leak, timeout (30 s per input) or invariant violation fails the
+job. The reproducer is uploaded, and the job opens one issue per target
+with the label `fuzz-crash`, or comments on the issue already open.
+
+The 24 h acceptance campaign does not fit a GitHub-hosted job, which is
+limited to 6 h. Run the workflow by hand with `fuzz_seconds` up to 19 800
+for a few targets at a time, or run it on a self-hosted runner.
+
+**`redteam`.** `tools/e2e/nightly-redteam.sh` runs the network-side red
+team (`tools/e2e/REDTEAM.md` R1-R4) with release binaries, against a live
+agentd in a network namespace. It asserts that:
+
+- the rogue participant and the rogue motion writer are detected;
+- the GUID spray is detected without amplification: fewer than 300
+  findings for 3 000 GUIDs;
+- agentd survives the malformed and oversized RTPS with bounded RSS;
+- the safety-state spoof is refused;
+- agentd stops cleanly and the black box verifies INTACT.
+
+`results.json` is uploaded. The AutoSecOps-side scenarios (R5-R7: control
+plane, executor, ingest) need that stack and stay manual.
+
+## Dependency updates
+
+`.github/dependabot.yml` opens update PRs for:
+
+- the workspace's crates, weekly, with minor and patch updates grouped and
+  each semver-major update in a PR of its own;
+- the GitHub Actions, weekly, keeping the SHA pins and their tag comments
+  in step;
+- the `vendor/pulsar` submodule, weekly;
+- the `fuzz/` workspace, monthly.
+
+Every update goes through the full CI, `cargo deny` included.
+
+## Code owners
+
+`.github/CODEOWNERS` assigns an owner to each risk area:
+
+- cryptography and keys;
+- parsers of attacker-controlled input, and their fuzz targets;
+- the response path;
+- eBPF and Pulsar;
+- packaging and the supply chain;
+- CI.
+
+The file takes effect only once the repository setting "Require review from
+Code Owners" is turned on in branch protection. Today one maintainer owns
+every area; replace a section's owner with an area team once those teams
+exist.
 
 ## Local CI verification
 
@@ -1023,17 +1143,17 @@ cargo-cyclonedx / cargo-deny / shellcheck installed):
   [arm64](#arm64-cross-compiled-2026-10-18)).
 - `Cargo.lock` is committed (2026-10-17); the bootstrap path of the
   `lockfile` job is therefore no longer exercised.
-- MSRV: passed `cargo +1.87.0 check` locally on 2026-10-17; the job is still
-  `continue-on-error` until it has passed on the runners. Earlier note
+- MSRV: passed `cargo +1.87.0 check` locally on 2026-10-17 and again on
+  2026-10-31 (`--locked`, after the p256 0.14 upgrade); the job is required
+  since 2026-10-31. Earlier note
   (2026-10-16): all crates now inherit `rust-version.workspace = true`.
   In the sandbox (Rust 1.97 only) `clippy -D warnings` of the pure crates is
   clean at `rust-version = "1.87"`, and fails at `"1.86"` on
   `is_multiple_of` (first hit `robodr-capture/src/ports.rs`) — so 1.87 is the
   floor *for std APIs*. Language features are not covered by that lint, and no
   1.87 compiler was available, so an actual 1.87 build is unverified until the
-  `msrv` CI job runs. Once it has passed, flip its `continue-on-error` off in
-  `ci.yml` (its comment says to do so when every crate opts in, which is now
-  the case). The Pulsar-bound crates were not checked at all.
+  `msrv` CI job runs. The Pulsar-bound crates are not checked on the MSRV
+  (Pulsar's own floor is 1.85).
 - The air-gapped procedures (mirror, vendored tarball, offline toolchain,
   advisory-DB snapshot) are documented, not yet rehearsed in the lab.
 - Release signing (minisign in `release.yml`'s `publish` job) has never run

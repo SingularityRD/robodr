@@ -1,0 +1,1 @@
+{"method":"POST","target":"/api/v2/robots/robot-fuzz/action-requests/act-1/revert","key_id":"soc-fuzz","timestamp":1760000000,"nonce":"fuzz-nonce-revert-0001","signature":"d02f4e3cfc24b4abbcd3cabbafd146b0050f337210ee862ae961c49507441941e9f21aca6122c8aa4e886a397be502b34eeda4f7982c76ee4d053a486dc82203","body":"{\"requested_by\":\"analyst\",\"reason\":\"contained\"}"}

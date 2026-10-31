@@ -1,0 +1,69 @@
+# Code owners (T57 of docs/SALES-READINESS.md; docs/BUILD.md "Code
+# owners"). With branch protection's "Require review from Code Owners", a
+# change below needs an approval from the listed owner.
+#
+# The sections are by risk area, not by person: crypto and key handling,
+# parsers of attacker-controlled bytes, the response path that touches the
+# robot's network, packaging and release, CI. Today one maintainer owns
+# them all; when area teams exist, replace the owner of a section with its
+# team (e.g. @SingularityRD/robodr-crypto). Later lines win.
+
+# Default
+*                                               @anilyagiz
+
+# --- Cryptography, keys, signatures, sealing, trust -------------------------
+/crates/robodr-blackbox/src/crypto.rs           @anilyagiz
+/crates/robodr-blackbox/src/keys.rs             @anilyagiz
+/crates/robodr-blackbox/src/sign*.rs            @anilyagiz
+/crates/robodr-blackbox/src/state_seal.rs       @anilyagiz
+/crates/robodr-blackbox/src/tls.rs              @anilyagiz
+/crates/robodr-blackbox/src/crl.rs              @anilyagiz
+/crates/robodr-blackbox/src/tpm_anchor.rs       @anilyagiz
+/crates/robodr-blackbox/src/remote_anchor.rs    @anilyagiz
+/crates/robodr-seal/                            @anilyagiz
+/crates/robodr-pkg/                             @anilyagiz
+/crates/robodr-release/                         @anilyagiz
+/crates/robodr-fleet/                           @anilyagiz
+/crates/robodr-export/src/kafka/sasl.rs         @anilyagiz
+/crates/robodr-export/src/uplink/http.rs        @anilyagiz
+/crates/robodr-agentd/src/control/              @anilyagiz
+/crates/robodr-executor/src/proto.rs            @anilyagiz
+/crates/robodr-executor/src/soc.rs              @anilyagiz
+/fixtures/tls/                                  @anilyagiz
+
+# --- Parsers of attacker-controlled input, and their fuzz targets ----------
+/crates/robodr-rtps/                            @anilyagiz
+/crates/robodr-cdr/                             @anilyagiz
+/crates/robodr-capture/                         @anilyagiz
+/crates/robodr-ros2-pipeline/                   @anilyagiz
+/crates/robodr-ocsf/                            @anilyagiz
+/crates/robodr-diode/                           @anilyagiz
+/crates/robodr-export/src/kafka/                @anilyagiz
+/crates/robodr-firewall-gw/                     @anilyagiz
+/fuzz/                                          @anilyagiz
+
+# --- Response path (acts on the robot's network and motion) ----------------
+/crates/robodr-executor/                        @anilyagiz
+/crates/robodr-responder/                       @anilyagiz
+/crates/robodr-firewall/                        @anilyagiz
+/crates/robodr-motion/                          @anilyagiz
+
+# --- eBPF / Pulsar (loaded into the robot's kernel) ------------------------
+/vendor/                                        @anilyagiz
+/rules/                                         @anilyagiz
+/crates/robodr-pulsard/                         @anilyagiz
+/crates/robodr-threat-forward/                  @anilyagiz
+/GPL-2.0-SOURCE-OFFER                           @anilyagiz
+
+# --- Packaging, release, supply chain ----------------------------------------
+/packaging/                                     @anilyagiz
+/scripts/                                       @anilyagiz
+/Cargo.lock                                     @anilyagiz
+/deny.toml                                      @anilyagiz
+/rust-toolchain.toml                            @anilyagiz
+/THIRD_PARTY_NOTICES                            @anilyagiz
+/LICENSES/                                      @anilyagiz
+
+# --- CI and repository settings ---------------------------------------------
+/.github/                                       @anilyagiz
+/.config/                                       @anilyagiz

@@ -1,0 +1,92 @@
+# Package lifecycle under a running systemd (T10 of docs/SALES-READINESS.md):
+# install, enable --now, heartbeat, upgrade N-1 -> N, rollback, purge, per
+# distribution, in containers where systemd is PID 1
+# (scripts/systemd-lifecycle-matrix.sh, scripts/systemd-lifecycle.sh).
+#
+# N is the package CI just built: this workflow runs after ci.yml and takes
+# its pkg-* artifacts, so the package is built once. N-1 is the latest
+# GitHub release's package (checked against its SHA256SUMS); while there is
+# no release yet, it is the same .deb relabelled with a lower version (the
+# maintainer scripts' upgrade and downgrade paths still run) and the Rocky
+# row is reported NOT RUN with a warning. SELinux enforcing (AVC check)
+# needs a Rocky / RHEL VM, not a container: docs/BUILD.md "Extended CI".
+#
+# Runs only for pushes and same-repository pull requests (no secrets are
+# used; the token is read-only).
+name: Lifecycle (systemd)
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ci.yml run whose pkg-* artifacts to test"
+        required: true
+      head_sha:
+        description: "commit of that run"
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  lifecycle:
+    name: systemd lifecycle (${{ matrix.arch }})
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            rpmarch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            rpmarch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha || inputs.head_sha }}
+      ARCH: ${{ matrix.arch }}
+      RPMARCH: ${{ matrix.rpmarch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
+      - name: N (this commit's packages, from the CI run)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+          pattern: pkg-*-${{ matrix.arch }}-${{ env.HEAD_SHA }}
+          merge-multiple: true
+          path: dist/new
+      - name: N-1 (latest release, or a relabelled stand-in)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -f dist/new/robodr-focal_*.deb
+          ls -l dist/new
+          mkdir -p dist/old
+          if tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null) && [ -n "$tag" ]; then
+            echo "N-1: release $tag"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dist/old \
+              --pattern "robodr_*_${ARCH}.deb" --pattern "robodr-*.${RPMARCH}.rpm" --pattern 'SHA256SUMS*'
+            (cd dist/old && cat SHA256SUMS* | sha256sum --ignore-missing --strict -c -)
+            rm -f dist/old/SHA256SUMS*
+          else
+            echo "::warning::no release yet: N-1 is this .deb relabelled 0.0.0~ci.prev-1 (same files); the Rocky Linux row is not run"
+            deb=$(ls dist/new/robodr_*.deb)
+            scripts/systemd-lifecycle-matrix.sh relabel-deb "$deb" 0.0.0~ci.prev-1 dist/old
+            echo "ROBODR_LIFECYCLE_NO_RPM_PREV=1" >> "$GITHUB_ENV"
+          fi
+          ls -l dist/old
+      - name: Lifecycle per distribution
+        run: scripts/systemd-lifecycle-matrix.sh dist/old dist/new

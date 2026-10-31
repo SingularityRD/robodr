@@ -248,12 +248,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   msrv:
-    # Informational. Every crate now opts in with `rust-version.workspace = true`;
-    # flip continue-on-error off once this job has passed on the runners (it has
-    # not been run on 1.87 outside CI). Checks the pure crates on the MSRV.
-    name: MSRV check (informational)
+    # Required (T89): every crate opts in with `rust-version.workspace = true`,
+    # so a change that needs a newer Rust than [workspace.package]
+    # rust-version fails here instead of on a customer's pinned toolchain.
+    # Checks the pure crates on the MSRV.
+    name: MSRV check
     runs-on: ubuntu-24.04
-    continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -1,0 +1,267 @@
+# RoboDR CI, second workflow: the jobs that need a privileged runner, a
+# second architecture, a real broker or a real kernel (T10 / T24 / T25 /
+# T26 / T27 / T90 of docs/SALES-READINESS.md). Policy and procedures:
+# docs/BUILD.md "Extended CI". Same rules as ci.yml: every job is required
+# unless marked "informational"; actions are pinned by full commit SHA (the
+# comment gives the tag); tools installed with `cargo install` are pinned by
+# version + --locked; container images by digest.
+name: CI (extended)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-extended-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  ROBODR_CRATES_MIRROR: ${{ vars.ROBODR_CRATES_MIRROR }}
+  CARGO_LLVM_COV_VERSION: 0.9.1
+  CARGO_NEXTEST_VERSION: 0.9.148
+  # apache/kafka:3.9.1, multi-arch index digest (resolved 2026-10-31 with
+  # `docker buildx imagetools inspect`). Also verified with 4.1.0.
+  KAFKA_IT_IMAGE: docker.io/apache/kafka:3.9.1@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
+  # The broker distribution scripts/kafka-tls-it.sh runs (TLS, mTLS, SCRAM),
+  # checked against Apache's published SHA-512.
+  KAFKA_DIST_CDN_URL: https://dlcdn.apache.org/kafka/3.9.1/kafka_2.13-3.9.1.tgz
+  KAFKA_DIST_URL: https://archive.apache.org/dist/kafka/3.9.1/kafka_2.13-3.9.1.tgz
+  KAFKA_DIST_SHA512: 1ea204ba73411737a275429ca976d440f007ff0957b90b19be41dc5a4bae52617267769be9f0b5791714d0b3c4c760605bd426faea39edd90763585523fa2cfe
+
+jobs:
+  # ---------------------------------------------------------------------------
+  arm64:
+    # T26: the pure crates' clippy and tests on arm64 (hand-written FFI
+    # constants: deliverd fdio.rs, firewall-gw restrict.rs, agentd host.rs;
+    # struct layouts, `c_char` signedness). ci.yml covers amd64.
+    name: Pure crates on arm64 (clippy, test)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: pure-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: clippy
+        run: cargo clippy --workspace $PURE_EXCLUDES $CARGO_LOCKED --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace $PURE_EXCLUDES $CARGO_LOCKED
+
+  # ---------------------------------------------------------------------------
+  privileged:
+    # T24: the root / software-TPM / network-namespace / nftables / live
+    # capture tests, run for real (scripts/ci-privileged-tests.sh): a test
+    # that prints "skipped", a binary that runs no test, or a failure fails
+    # the job (scripts/ci-no-skips.py). Test binaries are built as the
+    # runner user and run as root.
+    name: Privileged tests (root, swtpm, netns, nftables, AF_PACKET, dm-crypt)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: System packages (swtpm, tpm2-tools, nftables, iproute2, tang, clevis, cryptsetup)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            swtpm swtpm-tools tpm2-tools nftables iproute2 iptables \
+            tang clevis clevis-luks cryptsetup-bin dpkg python3
+          # Kernel modules the netns, gateway and runtime-volume tests use.
+          sudo modprobe -a nfnetlink_queue nf_tables veth loop dm_crypt || true
+          swtpm --version
+          tpm2_createprimary --version
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: privileged
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked)
+        run: scripts/ci-setup.sh
+      - name: Checker self-test
+        run: python3 scripts/ci-no-skips.py --self-test
+      - name: Privileged tests (no skip allowed)
+        run: scripts/ci-privileged-tests.sh "$RUNNER_TEMP/privileged-logs"
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: privileged-logs-${{ github.sha }}
+          path: ${{ runner.temp }}/privileged-logs
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  kafka:
+    # T25 (CI part): the producer against a real Apache Kafka (KRaft, single
+    # node): scripts/kafka-it.sh (plaintext; SASL/PLAIN and self-signed TLS
+    # must fail cleanly; ACL denial, quota throttling, the Java partitioner,
+    # broker restart mid-stream; kafka-dump-log re-checks every CRC), then
+    # scripts/kafka-tls-it.sh (TLS, mutual TLS, SASL_SSL SCRAM-SHA-256/512
+    # with re-authentication) against the same release run from a checked
+    # distribution.
+    name: Kafka real-broker integration (plain, TLS, mTLS, SCRAM)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: kafka
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked)
+        run: scripts/ci-setup.sh
+      - name: Real broker in docker (scripts/kafka-it.sh)
+        env:
+          CARGO_FLAGS: --locked
+        run: scripts/kafka-it.sh
+      - name: Kafka distribution (SHA-512 checked)
+        run: |
+          # Apache's CDN first (fast; it keeps current releases only), then
+          # the archive (every release, slow). Same file, same checksum.
+          curl -fsSL --retry 3 --max-time 600 -o "$RUNNER_TEMP/kafka.tgz" "$KAFKA_DIST_CDN_URL" ||
+            curl -fsSL --retry 3 --max-time 1800 -o "$RUNNER_TEMP/kafka.tgz" "$KAFKA_DIST_URL"
+          echo "$KAFKA_DIST_SHA512  $RUNNER_TEMP/kafka.tgz" | sha512sum -c -
+          mkdir -p "$RUNNER_TEMP/kafka"
+          tar -xzf "$RUNNER_TEMP/kafka.tgz" -C "$RUNNER_TEMP/kafka" --strip-components=1
+          java -version
+      - name: TLS, mutual TLS and SCRAM (scripts/kafka-tls-it.sh)
+        env:
+          CARGO_FLAGS: --locked
+        run: KAFKA_HOME="$RUNNER_TEMP/kafka" scripts/kafka-tls-it.sh
+
+  # ---------------------------------------------------------------------------
+  ebpf-load:
+    # T27: robodr-pulsard's probes loaded into the runner's own kernel with
+    # the shipped rules (rules/robodr), one real event per rule family set
+    # off, each rule's threat checked on stdout AND on the agentd-side
+    # host-threats socket (robodr-threat-forward): scripts/ebpf-load-smoke.sh.
+    name: eBPF load + live rules on the runner kernel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Pulsar build dependencies (as ci.yml's pulsar job) and triggers
+        run: |
+          sudo apt-get update
+          if sudo apt-get install -y --no-install-recommends clang-20 lld-20 llvm-20; then
+            sudo ln -sf /usr/bin/clang-20 /usr/local/bin/clang
+            sudo ln -sf /usr/bin/llvm-strip-20 /usr/local/bin/llvm-strip
+          else
+            echo "::warning::clang-20 not available from the runner's apt sources; using the distribution clang/llvm (Pulsar pins 20)"
+            sudo apt-get install -y --no-install-recommends clang lld llvm
+          fi
+          sudo apt-get install -y --no-install-recommends libssl-dev libsqlite3-dev pkg-config strace
+          uname -r
+          test -e /sys/kernel/btf/vmlinux
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ebpf-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked)
+        run: scripts/ci-setup.sh
+      - name: Build robodr-pulsard (release)
+        run: cargo build --release -p robodr-pulsard $CARGO_LOCKED
+      - name: Load, set off, check (root)
+        run: sudo scripts/ebpf-load-smoke.sh target/release/robodr-pulsard rules/robodr "$RUNNER_TEMP/ebpf"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ebpf-load-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ebpf
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  coverage:
+    # T90: line coverage of the pure crates (cargo-llvm-cov over
+    # cargo-nextest, profile `ci` of .config/nextest.toml: JUnit report).
+    # Informational numbers, required job: it fails when the tests fail or
+    # the reports are not produced. lcov.info, the JUnit XML and a summary
+    # are uploaded; the summary is also on the run page.
+    name: Coverage (cargo-llvm-cov, nextest JUnit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml) and llvm-tools
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Install cargo-llvm-cov and cargo-nextest
+        run: |
+          if ! cargo llvm-cov --version 2>/dev/null | grep -q " $CARGO_LLVM_COV_VERSION"; then
+            cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+          fi
+          if ! cargo nextest --version 2>/dev/null | grep -q " $CARGO_NEXTEST_VERSION"; then
+            cargo install cargo-nextest --locked --version "$CARGO_NEXTEST_VERSION"
+          fi
+      - name: Tests under coverage
+        run: |
+          cargo llvm-cov nextest --workspace $PURE_EXCLUDES $CARGO_LOCKED \
+            --profile ci --lcov --output-path target/lcov.info
+          cargo llvm-cov report --summary-only | tee target/coverage-summary.txt
+          {
+            echo '### Line coverage (pure crates)'
+            echo '```'
+            cat target/coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test -s target/lcov.info
+          # nextest writes under the target directory cargo-llvm-cov uses
+          # (target/llvm-cov-target): copy the report to a fixed place.
+          junit=$(find target -path '*/nextest/ci/junit.xml' | head -n 1)
+          test -s "$junit"
+          cp "$junit" target/junit.xml
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ github.sha }}
+          path: |
+            target/lcov.info
+            target/coverage-summary.txt
+            target/junit.xml
+          if-no-files-found: warn
+          retention-days: 30

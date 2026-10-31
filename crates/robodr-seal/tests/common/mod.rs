@@ -82,18 +82,65 @@ pub fn cryptsetup_enabled(test: &str) -> bool {
 }
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+static PCRS_N: AtomicU16 = AtomicU16::new(0);
 
+/// A TCP port for a test server (swtpm, Tang). With `ROBODR_SWTPM_PORT`
+/// set, the next one counting up from it (two apart); otherwise one the
+/// kernel reports free right now (bind to port 0, then release).
+///
+/// It used to be `40_000 + pid % 5000 * 4` counting up by two: the test
+/// binaries of another process (pid one higher, base four higher) walked
+/// the same ports, so with two TPM test binaries running at once swtpm
+/// failed with "Address already in use" on all eight attempts ("swtpm did
+/// not start", T24 of docs/SALES-READINESS.md;
+/// `two_processes_get_disjoint_ports` below).
 pub fn port() -> u16 {
-    let base: u16 = std::env::var("ROBODR_SWTPM_PORT")
+    if let Some(base) = std::env::var("ROBODR_SWTPM_PORT")
         .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(40_000 + (std::process::id() % 5000) as u16 * 4);
-    base + NEXT_PORT.fetch_add(2, Ordering::SeqCst)
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        return base + NEXT_PORT.fetch_add(2, Ordering::SeqCst);
+    }
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("a free loopback port")
+}
+
+/// Two consecutive free ports `(p, p + 1)`: swtpm's server and control
+/// channels (the TSS `swtpm` TCTI reaches the control channel at the
+/// server port + 1). With `ROBODR_SWTPM_PORT` set, the next pair counting
+/// up from it.
+pub fn port_pair() -> (u16, u16) {
+    if std::env::var("ROBODR_SWTPM_PORT").is_ok() {
+        let p = port();
+        return (p, p + 1);
+    }
+    for _ in 0..64 {
+        let Ok(a) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+            continue;
+        };
+        let Some(p) = a.local_addr().ok().map(|x| x.port()) else {
+            continue;
+        };
+        if p < u16::MAX && std::net::TcpListener::bind(("127.0.0.1", p + 1)).is_ok() {
+            return (p, p + 1);
+        }
+    }
+    panic!("no two consecutive free loopback ports");
+}
+
+/// Something listens on `port` (not a TCP self-connection: a connect to a
+/// free port in the ephemeral range can be answered by the connecting
+/// socket itself).
+pub fn listening(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
 }
 
 fn wait_port(port: u16, what: &str) {
     let t0 = Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+    while !listening(port) {
         assert!(
             t0.elapsed() < Duration::from_secs(10),
             "{what} did not start"
@@ -110,6 +157,8 @@ pub const OWNER_AUTH: &[u8] = b"test-owner-auth";
 pub struct SwTpm {
     child: Child,
     pub port: u16,
+    /// The control channel's port.
+    ctrl: u16,
     pub state: PathBuf,
 }
 
@@ -119,14 +168,21 @@ impl SwTpm {
         // A port may be taken by another process: swtpm then exits at
         // once, and the next pair of ports is tried.
         for _ in 0..8 {
-            let port = port();
-            let mut child = Self::spawn(state, port);
+            let (port, ctrl) = port_pair();
+            let mut child = Self::spawn(state, port, ctrl);
             let t0 = Instant::now();
             loop {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                // Ours: something answers on the port AND our swtpm is
+                // still running a moment later (one that lost the port to
+                // another listener exits at once).
+                if listening(port) && {
+                    std::thread::sleep(Duration::from_millis(50));
+                    child.try_wait().unwrap().is_none()
+                } {
                     return Self {
                         child,
                         port,
+                        ctrl,
                         state: state.to_path_buf(),
                     };
                 }
@@ -138,10 +194,12 @@ impl SwTpm {
                 std::thread::sleep(Duration::from_millis(30));
             }
         }
-        panic!("swtpm did not start");
+        let log = std::fs::read_to_string(state.join("swtpm.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(8).collect();
+        panic!("swtpm did not start (swtpm.log, newest first: {tail:?})");
     }
 
-    fn spawn(state: &Path, port: u16) -> Child {
+    fn spawn(state: &Path, port: u16, ctrl: u16) -> Child {
         Command::new("swtpm")
             .args([
                 "socket",
@@ -149,14 +207,21 @@ impl SwTpm {
                 "--server",
                 &format!("type=tcp,port={port}"),
                 "--ctrl",
-                &format!("type=tcp,port={}", port + 1),
+                &format!("type=tcp,port={ctrl}"),
                 "--tpmstate",
                 &format!("dir={}", state.display()),
                 "--flags",
                 "not-need-init,startup-clear",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(state.join("swtpm.log"))
+                    .map(Stdio::from)
+                    .unwrap_or_else(|_| Stdio::null()),
+            )
             .spawn()
             .expect("swtpm")
     }
@@ -187,7 +252,7 @@ impl SwTpm {
         let _ = self.child.wait();
         // The port may linger briefly.
         std::thread::sleep(Duration::from_millis(200));
-        self.child = Self::spawn(&self.state, self.port);
+        self.child = Self::spawn(&self.state, self.port, self.ctrl);
         wait_port(self.port, "swtpm");
     }
 
@@ -234,7 +299,10 @@ impl SwTpm {
     /// Current SHA-256 values of `pcrs`.
     pub fn pcrs(&self, pcrs: &[u8]) -> Vec<(u8, [u8; 32])> {
         let list: Vec<String> = pcrs.iter().map(|p| p.to_string()).collect();
-        let out = self.state.join(format!("pcrs-{}.bin", port()));
+        let out = self.state.join(format!(
+            "pcrs-{}.bin",
+            PCRS_N.fetch_add(1, Ordering::SeqCst)
+        ));
         let o = self.tool(
             "tpm2_pcrread",
             &[
