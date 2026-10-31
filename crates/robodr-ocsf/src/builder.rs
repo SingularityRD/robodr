@@ -1230,6 +1230,11 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.",
             AGENT,
         ),
+        "robot.agent.control_plane_saturated" => e(
+            "Control-plane connections refused or cut before authentication",
+            "The robot's control-plane listener refused or cut connections before they authenticated because every slot they could use was busy: a TLS handshake flood or slowloris against the API, or more legitimate clients than its connection limit. SOC requests may fail until it ends; nothing was judged or executed.",
+            AGENT,
+        ),
         "robot.agent.selftest" => e(
             "Agent field acceptance self-test",
             "A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection.",

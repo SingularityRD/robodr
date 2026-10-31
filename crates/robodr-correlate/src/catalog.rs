@@ -185,9 +185,13 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.agent.clock_jump",
     "robot.agent.disk_low",
     "robot.agent.executor_unreachable",
-    // Contract 2.5 ids reserved for their producers (control-plane replay
-    // fence, field self-test, in-path gateway overload).
+    // robodr-agentd control-plane API (contract 2.5): signed requests
+    // refused by the replay fence, connections refused or cut before they
+    // authenticated.
     "robot.agent.control_plane_request_fenced",
+    "robot.agent.control_plane_saturated",
+    // Contract 2.5 ids reserved for their producers (field self-test,
+    // in-path gateway overload).
     "robot.agent.selftest",
     "robot.gateway.overload",
     // robodr-agentd commissioning: a safety configuration file (response

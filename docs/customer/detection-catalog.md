@@ -8,9 +8,8 @@
 > `scripts/check-detection-catalog.py`, which fails when this page and the
 > code disagree. Verification levels (V0–V3) are those of
 > [`support-matrix.md`](support-matrix.md). Nothing here has been verified
-> on a customer robot. Three ids are catalogued in 2.5 for features
-> that do not emit them yet: `robot.agent.control_plane_request_fenced`,
-> `robot.agent.selftest` and `robot.gateway.overload`.
+> on a customer robot. One id is catalogued in 2.5 for a feature that
+> does not emit it yet: `robot.agent.selftest`.
 
 ## How to read a finding
 
@@ -96,9 +95,9 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-251 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+252 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (25)
+### `robot.agent.*` (26)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -107,6 +106,7 @@ correlation entry.
 | `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | `robodr_agent` | — | 1.3 |
 | `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | `robodr_agent` | — | 2.5 |
+| `robot.agent.control_plane_saturated` | Control-plane connections refused or cut before authentication | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | `robodr_agent` | — | 2.4 |
 | `robot.agent.control_plane_unauthenticated` | Control-plane request failed authentication | `robodr_agent` | — | 1.3 |
 | `robot.agent.correlation_pressure` | Correlation engine state under pressure | `robodr_agent` | — | 1.3 |

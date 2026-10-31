@@ -189,10 +189,13 @@
 //! requests are staged and dispatched to `robodr-executor` once stored, and
 //! every outcome the link reports is journalled at once
 //! ([`crate::control::api::Engine::sync`]).
-//! Failed authentications and authenticated invalid requests become the
-//! observe-only self-health findings
-//! `robot.agent.control_plane_unauthenticated` (High) and
-//! `robot.agent.control_plane_invalid` (Medium), rate-limited by
+//! Failed authentications, authenticated invalid requests, signed requests
+//! refused by the replay fence and connections refused or cut before they
+//! authenticated become the observe-only self-health findings
+//! `robot.agent.control_plane_unauthenticated` (High),
+//! `robot.agent.control_plane_invalid` (Medium),
+//! `robot.agent.control_plane_request_fenced` (Low) and
+//! `robot.agent.control_plane_saturated` (Medium), each rate-limited by
 //! `health_report_ms`. The control plane is not an input: a quiet SOC never
 //! makes the state `unknown`.
 
@@ -564,9 +567,9 @@ struct Daemon<'a> {
     /// The control-plane API (`None` = off).
     control: Option<ControlPlane>,
     /// Control-plane counters at their last finding, and when it was raised
-    /// (unauthenticated, invalid).
-    control_reported: [u64; 2],
-    control_reported_at_ms: [Option<u64>; 2],
+    /// (unauthenticated, invalid, fenced, refused or cut connections).
+    control_reported: [u64; 4],
+    control_reported_at_ms: [Option<u64>; 4],
     /// The control-plane journals' heads last recorded in the black box
     /// (gap 1: [`crate::control::anchor`]).
     state_heads_recorded: Option<crate::control::anchor::StateHeads>,
@@ -1339,8 +1342,8 @@ impl<'a> Daemon<'a> {
             retention_watch: crate::retention::RetentionWatch::default(),
             host_upstream_seen: Vec::new(),
             control,
-            control_reported: [0; 2],
-            control_reported_at_ms: [None; 2],
+            control_reported: [0; 4],
+            control_reported_at_ms: [None; 4],
             state_heads_recorded: None,
             state_heads_segment: None,
             last_note_segment: None,
@@ -3069,9 +3072,14 @@ impl<'a> Daemon<'a> {
         let Some(cp) = &self.control else {
             return;
         };
+        let c = cp.counters();
+        let rejected = c.connections_rejected.load(Ordering::Relaxed);
+        let evicted = c.connections_evicted.load(Ordering::Relaxed);
         let counts = [
-            cp.counters().unauthenticated.load(Ordering::Relaxed),
+            c.unauthenticated.load(Ordering::Relaxed),
             cp.engine.stats.invalid,
+            c.fenced.load(Ordering::Relaxed),
+            rejected.saturating_add(evicted),
         ];
         let last = cp.counters().last_auth_failure();
         let now_ms = self.now_ms();
@@ -3089,8 +3097,8 @@ impl<'a> Daemon<'a> {
             let delta = count - *reported;
             *reported = count;
             *reported_at = Some(now_ms);
-            let dev = if i == 0 {
-                robodr_events::Deviation::new(
+            let dev = match i {
+                0 => robodr_events::Deviation::new(
                     health_rules::CONTROL_PLANE_UNAUTHENTICATED,
                     robodr_events::Severity::High,
                     format!(
@@ -3102,9 +3110,8 @@ impl<'a> Daemon<'a> {
                         count,
                         last.as_deref().unwrap_or("-")
                     ),
-                )
-            } else {
-                robodr_events::Deviation::new(
+                ),
+                1 => robodr_events::Deviation::new(
                     health_rules::CONTROL_PLANE_INVALID,
                     robodr_events::Severity::Medium,
                     format!(
@@ -3114,7 +3121,29 @@ impl<'a> Daemon<'a> {
                          note; nothing was executed",
                         count
                     ),
-                )
+                ),
+                2 => robodr_events::Deviation::new(
+                    health_rules::CONTROL_PLANE_REQUEST_FENCED,
+                    robodr_events::Severity::Low,
+                    format!(
+                        "the control-plane API refused {delta} correctly signed request(s) \
+                         ({count} in total) signed at or before the replay fence it set after \
+                         a restart or a state repair; nothing was judged or executed; the SOC \
+                         should re-sign and resend them"
+                    ),
+                ),
+                _ => robodr_events::Deviation::new(
+                    health_rules::CONTROL_PLANE_SATURATED,
+                    robodr_events::Severity::Medium,
+                    format!(
+                        "the control-plane listener refused or cut {delta} connection(s) before \
+                         they authenticated ({count} in total: {rejected} refused, {evicted} \
+                         cut to make room): every slot they could use was busy; a handshake \
+                         flood or slowloris against the API, or more legitimate clients than \
+                         max_connections; SOC requests may be failing (soc_sources keeps a \
+                         reserved slot for the SOC)"
+                    ),
+                ),
             };
             self.self_health("agentd:control_plane", dev);
         }
