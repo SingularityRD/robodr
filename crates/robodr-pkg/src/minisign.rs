@@ -277,25 +277,70 @@ impl Signature {
     }
 }
 
+/// A known-answer check of the verifier (a fixed key, file and real
+/// minisign signature): [`run_self_test`]. `install-bundle.sh` runs it
+/// (`robodr-deliverd verify-minisign --self-test`) before it trusts the
+/// built-in verifier, so a broken build never passes for a verifier.
+pub mod self_test {
+    // Made with minisign 0.11 (`-G -W`, `-S -t "robodr 0.1.0 f"`, and
+    // `-S -l` for the legacy form) over FILE.
+    pub(crate) const FILE: &[u8] = b"robodr minisign fixture\n";
+    pub(crate) const PUB: &str = "untrusted comment: minisign public key 449F1A6A159EC097\n\
+        RWSXwJ4VahqfRNkH47hg/lslMnEr9VK4A6iMo0vbcHIu+AJJeJ5woqxf\n";
+    pub(crate) const SIG: &str = "untrusted comment: signature from minisign secret key\n\
+        RUSXwJ4VahqfRBAZYlck+aZqCDxVxpZZFcy2GsXI+p9QYwMTpAtukjdQ6do3bmwmKuYw4gW6pUBpwoakeUXsXh4k3UfNA+ENUwE=\n\
+        trusted comment: robodr 0.1.0 f\n\
+        FdTqD3Z6+DWSv/buzVqtrYhZeyfUkKVQjuIz6oG1NyBoMknkYwaXzPv/QlRUEPbatidMlnwGGxQ86oJvao/UDw==\n";
+    pub(crate) const LEGACY: &str = "untrusted comment: signature from minisign secret key\n\
+        RWSXwJ4VahqfRNxNVcyEHxAOjteRTcfo3VTg7pCEGWPIcU5UgF7hK5MSOeK639yRGH2BNZQ2AugG2xxOuKT6V1CzEi4z5HUoiwE=\n\
+        trusted comment: robodr 0.1.0 f\n\
+        TitMlioluvL5GaAOB1gF4TfOgK16fpQ6RfdvgFlifAFm/vCFSoX+6uadO1ctCYDNdwJz1yB79ZT6XXiv0bYUBg==\n";
+    pub(crate) const OTHER_PUB: &str = "untrusted comment: minisign public key 8640313FA20CA9A6\n\
+        RWSmqQyiPzFAhg0/V7Dt05JWBCfsstMxDCPsjDE6CQHp66dFsFjnQoYs\n";
+}
+
+/// The known answers: the fixture verifies, and the same signature over
+/// other bytes, by another key, with a changed trusted comment, and the
+/// legacy form are refused.
+pub fn run_self_test() -> Result<(), Refusal> {
+    use self_test::{FILE, LEGACY, OTHER_PUB, PUB, SIG};
+    let fail = |what: &str| refuse(Code::Invalid, format!("minisign self-test: {what}"));
+    let pk = PublicKey::parse(PUB.as_bytes())?;
+    let s = Signature::parse(SIG.as_bytes())?;
+    if s.verify(&pk, FILE)? != "robodr 0.1.0 f" {
+        return Err(fail("wrong trusted comment"));
+    }
+    if s.verify(&pk, b"robodr minisign fixture?\n").is_ok() {
+        return Err(fail("accepted other bytes"));
+    }
+    if s.verify(&PublicKey::parse(OTHER_PUB.as_bytes())?, FILE)
+        .is_ok()
+    {
+        return Err(fail("accepted another key"));
+    }
+    let renamed = SIG.replace("robodr 0.1.0 f", "robodr 0.1.0 g");
+    if Signature::parse(renamed.as_bytes())?
+        .verify(&pk, FILE)
+        .is_ok()
+    {
+        return Err(fail("accepted a changed trusted comment"));
+    }
+    if Signature::parse(LEGACY.as_bytes()).is_ok() {
+        return Err(fail("accepted a legacy signature"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Made with minisign 0.11 (`-G -W`, `-S -t "robodr 0.1.0 f"`, and
-    // `-S -l` for the legacy form) over FILE.
-    const FILE: &[u8] = b"robodr minisign fixture\n";
-    const PUB: &str = "untrusted comment: minisign public key 449F1A6A159EC097\n\
-        RWSXwJ4VahqfRNkH47hg/lslMnEr9VK4A6iMo0vbcHIu+AJJeJ5woqxf\n";
-    const SIG: &str = "untrusted comment: signature from minisign secret key\n\
-        RUSXwJ4VahqfRBAZYlck+aZqCDxVxpZZFcy2GsXI+p9QYwMTpAtukjdQ6do3bmwmKuYw4gW6pUBpwoakeUXsXh4k3UfNA+ENUwE=\n\
-        trusted comment: robodr 0.1.0 f\n\
-        FdTqD3Z6+DWSv/buzVqtrYhZeyfUkKVQjuIz6oG1NyBoMknkYwaXzPv/QlRUEPbatidMlnwGGxQ86oJvao/UDw==\n";
-    const LEGACY: &str = "untrusted comment: signature from minisign secret key\n\
-        RWSXwJ4VahqfRNxNVcyEHxAOjteRTcfo3VTg7pCEGWPIcU5UgF7hK5MSOeK639yRGH2BNZQ2AugG2xxOuKT6V1CzEi4z5HUoiwE=\n\
-        trusted comment: robodr 0.1.0 f\n\
-        TitMlioluvL5GaAOB1gF4TfOgK16fpQ6RfdvgFlifAFm/vCFSoX+6uadO1ctCYDNdwJz1yB79ZT6XXiv0bYUBg==\n";
-    const OTHER_PUB: &str = "untrusted comment: minisign public key 8640313FA20CA9A6\n\
-        RWSmqQyiPzFAhg0/V7Dt05JWBCfsstMxDCPsjDE6CQHp66dFsFjnQoYs\n";
+    use super::self_test::{FILE, LEGACY, OTHER_PUB, PUB, SIG};
+
+    #[test]
+    fn self_test_passes() {
+        run_self_test().unwrap();
+    }
 
     #[test]
     fn verifies_a_real_minisign_signature() {

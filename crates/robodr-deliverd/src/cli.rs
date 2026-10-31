@@ -23,6 +23,9 @@ usage:
   robodr-deliverd report       --config FILE [--out FILE]
   robodr-deliverd lease        --config FILE --lease FILE
   robodr-deliverd tamper       --socket PATH [--trigger tamper|attestation_failed|auth_failures]
+  robodr-deliverd safety-state [--config FILE]
+  robodr-deliverd verify-minisign --pubkey FILE --file FILE [--sig FILE]
+  robodr-deliverd verify-minisign --self-test
   robodr-deliverd --version
 
 The on-unit delivery agent (docs/SECURE-DELIVERY.md §4.2, §6; man
@@ -83,6 +86,20 @@ tamper        the platform feeder's side of the erase trigger socket
               (erase.trigger_socket): sends one trigger line. The agent
               plans the erase with the responder and runs it when the
               live safety state allows (never while moving; Sprint 14b).
+safety-state  print the live safety state as the install gate sees it
+              (agentd's status socket, peer-checked; the safety section
+              of --config, or its defaults) and whether agentd's
+              heartbeat is fresh. Exit 0 when an install / restart of
+              the gateway and executor may run now (idle or
+              safe_state_active), 1 when it must wait. Used by
+              install-bundle.sh (package upgrades, OPERATIONS.md 7).
+verify-minisign
+              check a minisign signature (FILE.minisig, or --sig) of
+              FILE against the public key file with RoboDR's built-in
+              verifier (prehashed signatures only, as release.yml
+              makes them); prints the trusted comment. --self-test runs
+              the verifier's known-answer test. Used by
+              install-bundle.sh instead of the minisign program.
 
 Exit codes: 0 ok, 1 refused or error, 2 usage.";
 
@@ -141,6 +158,8 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "report" => &["config", "out"],
         "lease" => &["config", "lease"],
         "tamper" => &["socket", "trigger"],
+        "safety-state" => &["config"],
+        "verify-minisign" => &["pubkey", "file", "sig"],
         other => {
             return usage(
                 &format!("unknown command {other:?}"),
@@ -149,10 +168,30 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
             )
         }
     };
-    let a = match parse_args_with_switches(rest, known, &[]) {
+    let switches: &[&str] = if cmd == "verify-minisign" {
+        &["self-test"]
+    } else {
+        &[]
+    };
+    let a = match parse_args_with_switches(rest, known, switches) {
         Ok(a) => a,
         Err(e) => return usage(&e, USAGE, "robodr-deliverd"),
     };
+    if cmd == "verify-minisign" {
+        return match verify_minisign(&a) {
+            Ok(tc) => {
+                println!("{tc}");
+                0
+            }
+            Err(e) => {
+                eprintln!("robodr-deliverd: verify-minisign: {e}");
+                1
+            }
+        };
+    }
+    if cmd == "safety-state" {
+        return safety_state(&a);
+    }
     if cmd == "tamper" {
         let r = (|| -> Result<(), String> {
             let t = a.one("trigger")?.unwrap_or("tamper");
@@ -202,6 +241,77 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
             eprintln!("robodr-deliverd: {e}");
             1
         }
+    }
+}
+
+/// `verify-minisign`: the trusted comment of a valid signature.
+fn verify_minisign(a: &Args) -> Result<String, String> {
+    use robodr_pkg::minisign::{self, PublicKey, Signature, MAX_FILE};
+    use std::io::Read;
+    if a.flag("self-test") {
+        if a.one("pubkey")?.is_some() || a.one("file")?.is_some() || a.one("sig")?.is_some() {
+            return Err("--self-test takes no other option".into());
+        }
+        minisign::run_self_test().map_err(|r| r.to_string())?;
+        return Ok("self-test ok".into());
+    }
+    let file = Path::new(a.req("file")?);
+    let sig = match a.one("sig")? {
+        Some(s) => std::path::PathBuf::from(s),
+        None => {
+            let mut s = file.as_os_str().to_os_string();
+            s.push(".minisig");
+            std::path::PathBuf::from(s)
+        }
+    };
+    let read = |p: &Path| robodr_release::fsio::read_capped(p, MAX_FILE).map_err(|e| e.to_string());
+    let pk = PublicKey::parse(&read(Path::new(a.req("pubkey")?))?)
+        .map_err(|r| format!("public key: {r}"))?;
+    let s = Signature::parse(&read(&sig)?).map_err(|r| format!("{}: {r}", sig.display()))?;
+    let (mut f, _) = robodr_release::fsio::open_regular(file).map_err(|e| e.to_string())?;
+    let mut h = robodr_pkg::blake2b::Blake2b512::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        if n == 0 {
+            break;
+        }
+        h.update(buf.get(..n).unwrap_or_default());
+    }
+    let tc = s
+        .verify_digest(&pk, &h.finalize())
+        .map_err(|r| format!("{}: {r}", file.display()))?;
+    Ok(tc.to_string())
+}
+
+/// `safety-state`: exit 0 when the gate is open, 1 when it is not.
+fn safety_state(a: &Args) -> i32 {
+    let cfg = match a.one("config") {
+        Ok(Some(p)) => match Config::load(Path::new(p)) {
+            Ok(c) => c.safety,
+            Err(e) => {
+                eprintln!("robodr-deliverd: configuration: {e}");
+                return 2;
+            }
+        },
+        Ok(None) => crate::config::SafetyCfg::default(),
+        Err(e) => return usage(&e, USAGE, "robodr-deliverd"),
+    };
+    let (o, hb) = crate::safety::observe_with_heartbeat(&cfg);
+    print(serde_json::json!({
+        "safety_state": crate::safety::state_name(o.state),
+        "allows_restart": o.allows_install(),
+        "why": o.why,
+        "agentd_health": o.agentd_health,
+        "agentd_fresh": hb.is_ok(),
+        "agentd_why": hb.err(),
+    }));
+    if o.allows_install() {
+        0
+    } else {
+        1
     }
 }
 

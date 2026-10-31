@@ -98,31 +98,48 @@ pub fn state_name(s: SafetyState) -> &'static str {
     }
 }
 
-/// Judge `status.json` bytes read at `now_mono_ms` on boot `boot_id`.
-pub fn judge(status: &[u8], now_mono_ms: u64, boot_id: &str) -> Observed {
+/// agentd's heartbeat: the status is agentd's, says it is running on
+/// this boot and is fresh by `CLOCK_MONOTONIC`. Returns the parsed status,
+/// or why not. (The first half of [`judge`]; `robodr-deliverd
+/// safety-state` reports it as `agentd_fresh`, and the post-install
+/// health check of `install-bundle.sh` waits for it.)
+pub fn heartbeat(
+    status: &[u8],
+    now_mono_ms: u64,
+    boot_id: &str,
+) -> Result<serde_json::Value, String> {
     if status.len() > MAX_STATUS_BYTES {
-        return Observed::unknown("agentd status too large");
+        return Err("agentd status too large".into());
     }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(status) else {
-        return Observed::unknown("agentd status is not JSON");
+        return Err("agentd status is not JSON".into());
     };
     let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
     let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
     if s("kind") != Some("robodr.agentd_status") {
-        return Observed::unknown("not an agentd status");
+        return Err("not an agentd status".into());
     }
     if v.get("running").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Observed::unknown("agentd is not running");
+        return Err("agentd is not running".into());
     }
     if boot_id.is_empty() || s("boot_id") != Some(boot_id) {
-        return Observed::unknown("agentd status is from another boot");
+        return Err("agentd status is from another boot".into());
     }
     let (Some(at), Some(stale)) = (n("updated_mono_ms"), n("stale_after_ms")) else {
-        return Observed::unknown("agentd status has no freshness fields");
+        return Err("agentd status has no freshness fields".into());
     };
     if at > now_mono_ms || now_mono_ms - at > stale.min(MAX_STALE_MS) {
-        return Observed::unknown("agentd status is stale");
+        return Err("agentd status is stale".into());
     }
+    Ok(v)
+}
+
+/// Judge `status.json` bytes read at `now_mono_ms` on boot `boot_id`.
+pub fn judge(status: &[u8], now_mono_ms: u64, boot_id: &str) -> Observed {
+    let v = match heartbeat(status, now_mono_ms, boot_id) {
+        Ok(v) => v,
+        Err(why) => return Observed::unknown(why),
+    };
     if v.get("safety_feed").is_none_or(|f| f.is_null()) {
         return Observed::unknown(
             "agentd has no live safety feed (a configured static state is not a reading)",
@@ -135,7 +152,10 @@ pub fn judge(status: &[u8], now_mono_ms: u64, boot_id: &str) -> Observed {
     Observed {
         state,
         why: None,
-        agentd_health: s("state").map(str::to_string),
+        agentd_health: v
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     }
 }
 
@@ -235,6 +255,19 @@ pub fn read_status(path: &Path, trusted: &[u32]) -> Result<Vec<u8>, String> {
         ));
     }
     bounded(f)
+}
+
+/// Read agentd's status now: the gate's view and whether agentd's
+/// heartbeat is fresh (`Err(why)` if not), from one read.
+pub fn observe_with_heartbeat(cfg: &SafetyCfg) -> (Observed, Result<(), String>) {
+    let bytes = match read_status(&cfg.agentd_status, &trusted_uids(cfg)) {
+        Ok(b) => b,
+        Err(why) => return (Observed::unknown(why.clone()), Err(why)),
+    };
+    let now = robodr_agentd::notify::monotonic_ms();
+    let boot = boot_id(&cfg.boot_id);
+    let hb = heartbeat(&bytes, now, &boot).map(|_| ());
+    (judge(&bytes, now, &boot), hb)
 }
 
 /// Read agentd's status now.
