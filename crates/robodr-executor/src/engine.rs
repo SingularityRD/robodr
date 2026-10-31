@@ -742,9 +742,20 @@ impl Engine {
     }
 
     /// The commissioning notes of the configuration this engine was opened
-    /// with (already logged by the caller): a re-read logs and journals its
-    /// notes only when they differ.
-    pub fn with_commissioning_notes(mut self, notes: Vec<String>) -> Self {
+    /// with (already logged by the caller). Each is journalled as a
+    /// `commissioning` event at `now_ms` (review WP6: a start with unsigned
+    /// or unattested flags reaches agentd, not only stderr); a re-read logs
+    /// and journals its notes only when they differ.
+    pub fn with_commissioning_notes(mut self, notes: Vec<String>, now_ms: u64) -> Self {
+        if !notes.is_empty() {
+            for n in &notes {
+                self.state
+                    .event(now_ms, EventKind::Commissioning, None, None, n.clone());
+            }
+            // A failed write is counted (status `journal_errors`) and the
+            // events are written with the next save.
+            let _ = self.save();
+        }
         self.commissioning_notes = notes;
         self
     }
@@ -773,15 +784,16 @@ impl Engine {
         let (mut new, policy, notes) =
             crate::config::load_commissioned_pinned(p, pinned.as_ref()).map_err(fail)?;
         if notes != self.commissioning_notes {
-            let detail = if notes.is_empty() {
-                "commissioning: the configuration re-read is honoured as signed again (no notes)"
-                    .to_string()
+            let details = if notes.is_empty() {
+                vec![crate::config::NOTES_CLEARED.to_string()]
             } else {
-                format!("commissioning changed: {}", notes.join("; "))
+                notes.clone()
             };
-            eprintln!("robodr-executor: {detail}");
-            self.state
-                .event(now_ms, EventKind::Reconciled, None, None, detail);
+            for d in details {
+                eprintln!("robodr-executor: commissioning changed: {d}");
+                self.state
+                    .event(now_ms, EventKind::Commissioning, None, None, d);
+            }
             let _ = self.save();
             self.commissioning_notes = notes;
         }

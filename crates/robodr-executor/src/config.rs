@@ -739,6 +739,48 @@ pub fn load_commissioned_pinned(
     Ok((cfg, policy, notes))
 }
 
+/// The note [`apply_commissioning`] returns for `oem_validated` flags read
+/// without a `commissioning` section.
+pub const UNSIGNED_NOTE: &str = "WARNING: oem_validated flags are UNSIGNED (no `commissioning` \
+     section): they are not bound to a signed, quorum-attested commissioning; configure \
+     `commissioning` (robodr-commission bind) so the executor verifies them itself";
+
+/// The detail the executor journals when a configuration re-read has no
+/// commissioning notes any more after having some.
+pub const NOTES_CLEARED: &str =
+    "commissioning: the configuration re-read is honoured as signed again (no notes)";
+
+/// What a commissioning note means (agentd's finding decision on the
+/// executor's `commissioning` events, review WP6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteClass {
+    /// [`UNSIGNED_NOTE`]: the flags are honoured without verification.
+    Unsigned,
+    /// The profile was accepted under a lab-only trust chain (`poc-init`).
+    LabOnly,
+    /// [`NOTES_CLEARED`].
+    Cleared,
+    /// A flag not honoured (not bound, profile refused), or the
+    /// `commissioning` section removed or changed at runtime.
+    Unattested,
+}
+
+/// The class of a note from [`load_commissioned`] / [`apply_commissioning`]
+/// (or [`NOTES_CLEARED`]).
+pub fn note_class(note: &str) -> NoteClass {
+    if note == UNSIGNED_NOTE {
+        NoteClass::Unsigned
+    } else if note == NOTES_CLEARED {
+        NoteClass::Cleared
+    } else if note.starts_with("WARNING: ")
+        && note.ends_with(&format!(": {}", robodr_commission::poc::LAB_ONLY_BANNER))
+    {
+        NoteClass::LabOnly
+    } else {
+        NoteClass::Unattested
+    }
+}
+
 /// The commissioning decision (see [`Commissioning`]) on a configuration
 /// whose file text is `config_text` and a policy whose file text is
 /// `policy_text`. Downgrades `policy` and the motion section in place;
@@ -761,12 +803,7 @@ pub fn apply_commissioning(
         .is_some_and(crate::motion::MotionSection::any_validated);
     let Some(c) = cfg.config.commissioning.clone() else {
         if policy.oem_validated || motion_claims {
-            notes.push(
-                "WARNING: oem_validated flags are UNSIGNED (no `commissioning` section): they \
-                 are not bound to a signed, quorum-attested commissioning; configure \
-                 `commissioning` (robodr-commission bind) so the executor verifies them itself"
-                    .into(),
-            );
+            notes.push(UNSIGNED_NOTE.into());
         }
         return notes;
     };

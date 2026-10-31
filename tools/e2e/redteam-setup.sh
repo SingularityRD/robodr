@@ -47,6 +47,10 @@ e = {
   "soc": {"keys": [sys.argv[0] and None] if False else [], "max_clock_skew_s": 30,
           "robot_keys": [f"{rt}/blackbox.key.pub", f"{rt}/finding.key.pub"]},
   "require_approval_for_all_containment": False,
+  # The executor verifies the policy's oem_validated against the signed
+  # profile itself (commission.sh binds the policy agentd-config.py installs).
+  "commissioning": {"profile_path": f"{rt}/locked.json",
+                    "trusted_keys": f"{rt}/profile-trust.json"},
 }
 json.dump(e, open(f"{rt}/executor.json", "w"), indent=2)
 PY

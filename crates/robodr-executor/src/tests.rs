@@ -1892,13 +1892,21 @@ fn wp6_commissioning_section_is_sticky_and_its_notes_are_journalled() {
     let mut e = Engine::open(c, p, Box::new(nft.clone()), "b1", 1_000)
         .unwrap()
         .with_reload(cfg_path.clone())
-        .with_commissioning_notes(notes.clone());
+        .with_commissioning_notes(notes.clone(), 1_000);
     let commissioning_events = |e: &Engine| {
         e.events_since(0, 10_000)
             .into_iter()
-            .filter(|ev| ev.kind == EventKind::Reconciled && ev.detail.contains("commissioning"))
-            .count()
+            .filter(|ev| ev.kind == EventKind::Commissioning)
+            .collect::<Vec<_>>()
     };
+    // The start's note (the policy is not bound) is journalled once, as an
+    // unattested `commissioning` event agentd turns into a finding.
+    let start = commissioning_events(&e);
+    assert_eq!(start.len(), 1, "{start:?}");
+    assert_eq!(
+        crate::config::note_class(&start[0].detail),
+        crate::config::NoteClass::Unattested
+    );
     let isolate = |id: &str| {
         order(
             id,
@@ -1915,7 +1923,7 @@ fn wp6_commissioning_section_is_sticky_and_its_notes_are_journalled() {
         codes::OBSERVE_MODE
     );
     // Same notes as at start: nothing new is logged.
-    assert_eq!(commissioning_events(&e), 0);
+    assert_eq!(commissioning_events(&e).len(), 1);
 
     // The section is deleted at runtime: still verified against it.
     v.as_object_mut().unwrap().remove("commissioning");
@@ -1934,7 +1942,14 @@ fn wp6_commissioning_section_is_sticky_and_its_notes_are_journalled() {
         "{:?}",
         e.commissioning_notes()
     );
-    assert_eq!(commissioning_events(&e), 1);
+    // One event per note: the removal and the unbound policy, both
+    // unattested (a finding at agentd).
+    let evs = commissioning_events(&e);
+    assert_eq!(evs.len(), 3, "{evs:?}");
+    assert!(evs[1].detail.contains("removed"), "{evs:?}");
+    assert!(evs[1..]
+        .iter()
+        .all(|ev| crate::config::note_class(&ev.detail) == crate::config::NoteClass::Unattested));
 
     // Re-pointed at other trust anchors: the same.
     v["commissioning"] = json!({"profile_path": "/elsewhere/profile.json",
@@ -1948,8 +1963,97 @@ fn wp6_commissioning_section_is_sticky_and_its_notes_are_journalled() {
         codes::OBSERVE_MODE
     );
     assert!(e.commissioning_notes()[0].contains("changed"));
-    assert_eq!(commissioning_events(&e), 2);
+    assert_eq!(commissioning_events(&e).len(), 5);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Review WP6 (low 1 and 2): an executor that starts with UNSIGNED flags
+/// (its `commissioning` section deleted, then restarted) journals the
+/// warning as a `commissioning` event, so agentd can report it; a re-read
+/// whose notes clear journals that too. Before, the start notes went to
+/// stderr only and a change was a `reconciled` event agentd ignored.
+#[test]
+fn wp6_start_notes_are_commissioning_events() {
+    let d = tmpdir("start-notes");
+    let pol_path = d.join("policy.json");
+    let cfg_path = d.join("executor.json");
+    let p = policy(Morphology::WheeledMobile, true, &[]);
+    std::fs::write(&pol_path, serde_json::to_string(&p).unwrap()).unwrap();
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["policy_path"] = json!(pol_path);
+    std::fs::write(&cfg_path, v.to_string()).unwrap();
+    let (c, p, notes) = crate::config::load_commissioned(&cfg_path).unwrap();
+    assert_eq!(notes, vec![crate::config::UNSIGNED_NOTE.to_string()]);
+    let mut e = Engine::open(c, p, Box::new(FakeNft::default()), "b1", 1_000)
+        .unwrap()
+        .with_reload(cfg_path.clone())
+        .with_commissioning_notes(notes, 1_000);
+    let evs: Vec<_> = e
+        .events_since(0, 10_000)
+        .into_iter()
+        .filter(|ev| ev.kind == EventKind::Commissioning)
+        .collect();
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert_eq!(
+        crate::config::note_class(&evs[0].detail),
+        crate::config::NoteClass::Unsigned
+    );
+    // The journal on disk holds it (agentd reads it after a restart too).
+    match Journal::new(&d).load() {
+        Loaded::State(s) => assert!(
+            s.events
+                .iter()
+                .any(|ev| ev.kind == EventKind::Commissioning),
+            "{:?}",
+            s.events
+        ),
+        _ => panic!("the journal does not load"),
+    }
+
+    // The policy stops claiming validation: no note, and the change is
+    // journalled as cleared.
+    let p2 = policy(Morphology::WheeledMobile, false, &[]);
+    std::fs::write(&pol_path, serde_json::to_string(&p2).unwrap()).unwrap();
+    let i = order(
+        "i1",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let _ = e.submit(&i, &mut idle(), 1_100);
+    assert!(e.commissioning_notes().is_empty());
+    let last = e
+        .events_since(0, 10_000)
+        .into_iter()
+        .rev()
+        .find(|ev| ev.kind == EventKind::Commissioning)
+        .unwrap();
+    assert_eq!(
+        crate::config::note_class(&last.detail),
+        crate::config::NoteClass::Cleared
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The lab-only note classifies as such (agentd raises no finding for it:
+/// it warns about a lab-only chain itself).
+#[test]
+fn wp6_note_classes() {
+    use crate::config::{note_class, NoteClass};
+    let lab = format!(
+        "WARNING: /etc/robodr/profile.json: {}",
+        robodr_commission::poc::LAB_ONLY_BANNER
+    );
+    assert_eq!(note_class(&lab), NoteClass::LabOnly);
+    assert_eq!(
+        note_class(crate::config::UNSIGNED_NOTE),
+        NoteClass::Unsigned
+    );
+    assert_eq!(note_class(crate::config::NOTES_CLEARED), NoteClass::Cleared);
+    assert_eq!(
+        note_class("response policy /p: not bound; treated as NOT OEM-validated"),
+        NoteClass::Unattested
+    );
 }
 
 /// M5 (model): a revert whose journal write fails is reported `reverting`

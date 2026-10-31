@@ -952,7 +952,12 @@ signed the accepted profile**, verified against `profile_trust.trusted_keys`
 digest and the firewall file's exact bytes. An edited file, a signature
 made for another profile (an older envelope cannot be paired with a newer
 profile, so the profile's anti-rollback covers it) or another key is
-refused. `observe` mode starts without one and warns. The signature is
+refused. When the accepted profile also binds a `motion_firewall` file
+(`robodr-commission bind`), the firewall file must be exactly that one:
+another envelope the same key signed for the same profile (an older or a
+lab one) is refused in `enforce` mode and warned about in `observe` mode.
+A profile that binds none relies on the signature alone. `observe` mode
+starts without a signature and warns. The signature is
 checked at start (and by `check-config`); the decision summaries record the
 digests (above). Not covered: the gateway configuration itself
 (`firewall-gw.json`: channels, allowlists, ports) is not signed, and

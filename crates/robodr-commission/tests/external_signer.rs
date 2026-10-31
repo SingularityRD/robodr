@@ -52,6 +52,25 @@ impl Drop for Dir {
     }
 }
 
+/// The test tree's ancestors must pass the signer's trusted-path rule for
+/// the stand-in token to run (they do on a normal checkout; a target dir
+/// under a world-writable /tmp does not). Skips like a missing `openssl`:
+/// off CI with a message, on CI as a failure.
+fn trusted_tree(d: &Dir) -> bool {
+    let probe = d.0.join("probe.sh");
+    fs::write(&probe, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    match robodr_signer::external::check_trusted_executable(&probe) {
+        Ok(_) => true,
+        Err(e) => {
+            skip(&format!(
+                "the test directory is not a trusted path here ({e})"
+            ));
+            false
+        }
+    }
+}
+
 fn have_openssl() -> bool {
     let ok = Command::new("openssl")
         .arg("version")
@@ -181,10 +200,10 @@ fn lock(p: &Path, so: &Path, out: &Path, key: &Path) -> Output {
 
 #[test]
 fn a_profile_signed_by_a_token_verifies_and_a_wrong_token_signs_nothing() {
-    if !have_openssl() {
+    let d = Dir::new("lock");
+    if !trusted_tree(&d) || !have_openssl() {
         return;
     }
-    let d = Dir::new("lock");
     let (key, trust) = keygen(&d.0, "oem-a");
     let (other, _) = keygen(&d.0, "oem-b");
     let (p, so) = draft(&d.0);

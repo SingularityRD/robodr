@@ -1261,7 +1261,7 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
         ),
         "robot.agent.config_unattested" => e(
             "Safety configuration not bound to the commissioning",
-            "A safety configuration file the robot's agent loaded (response policy, Motion Firewall joint configuration) claims more than the signed commissioning attested: it is not bound to the trusted locked profile, so the agent treats it as not validated and stays observe-only for what it governs. The detail names the file and why the binding failed.",
+            "A safety configuration file the robot's agent or executor loaded (response policy, Motion Firewall joint configuration, the executor's motion section) claims more than the signed commissioning attested. Either it is not bound to the trusted locked profile, so it is treated as not validated and stays observe-only for what it governs; or the executor's commissioning settings were removed or changed while it ran (it keeps verifying against the ones it started with until a restart); or, on a unit whose profile binds the executor's files, the executor runs without commissioning settings and honours its validation flags unsigned. The detail names the file or setting and why.",
             AGENT,
         ),
         "robot.capture.unsupported_transport" => e(

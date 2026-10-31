@@ -35,6 +35,13 @@ chmod 600 "$run"/tls/*.key "$run"/tls/anchor/*.key
 [ -f "$run/soc.key" ] || "$B/robodr-blackbox" keygen --out "$run/soc.key" --key-id soc:soak:1 >/dev/null
 
 # --- profile (real commissioning CLI flow on the Gazebo baseline) ----------
+# commission.sh binds the response policy agentd-config.py installs, so
+# agentd honours its oem_validated (T11). A profile cached from before that
+# binds nothing (agentd then runs observe-only): remove "$run/profile" to
+# re-commission. The executor below has no `commissioning` section (its
+# motion section, with run-specific paths, is not bound): it runs its flags
+# UNSIGNED, and agentd reports that as robot.agent.config_unattested (High)
+# when the executor starts, because the profile binds the policy.
 [ -f "$run/profile/locked.json" ] || "$H/commission.sh" "$run/profile" "$F/fastrtps_gz_baseline.pcap" >/dev/null
 cp "$run/profile"/{locked.json,locked.json.sig,profile-trust.json} "$ugv/"
 [ -f "$ugv/executor.key" ] || "$B/robodr-executor" keygen --out "$ugv/executor.key" >/dev/null

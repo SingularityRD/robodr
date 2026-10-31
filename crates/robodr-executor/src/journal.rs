@@ -239,9 +239,7 @@ pub enum EventKind {
     /// `nft delete table inet robodr`): every action is dropped, nothing is
     /// re-applied.
     RemovedExternally,
-    /// Restart reconciliation finished (detail: what it did); also the
-    /// commissioning notes of a configuration re-read changed (detail
-    /// starts with `commissioning`).
+    /// Restart reconciliation finished (detail: what it did).
     Reconciled,
     /// The journal was unreadable: the table was deleted and the executor
     /// started empty. High severity: whatever was in force is gone and its
@@ -259,6 +257,15 @@ pub enum EventKind {
     /// T42): the latch cancelled it / set hold again (detail: what it
     /// found). agentd reports it as High.
     Overridden,
+    /// A note of the signed-commissioning decision on the configuration
+    /// (sales-readiness T12, review WP6): one event per note at start and
+    /// whenever a re-read's notes differ from the previous ones (detail:
+    /// the note; [`crate::config::note_class`] says what it means). agentd
+    /// reports an unattested flag, or a section removed or changed at
+    /// runtime, as High `robot.agent.config_unattested`, and unsigned flags
+    /// as the same finding when its trusted profile binds the executor's
+    /// files.
+    Commissioning,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

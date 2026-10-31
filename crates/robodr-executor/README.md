@@ -747,6 +747,15 @@ and `src/config.rs` for every field and its limits. agentd's side is the
   at most 16 keys; `actions` 1..=7 distinct action names, `max_ttl_s`
   1..=`ttl.max_s`) and `soc.require_key_scopes` (default `false`): see
   "Key scopes".
+* `commissioning` (sales-readiness T12): the signed profile the policy's
+  `oem_validated` and the `motion` section's validation must be bound
+  into (`crates/robodr-commission/README.md`, "What the unit does").
+  Every note of that check (a flag not honoured, the section removed or
+  changed at runtime, UNSIGNED flags, a lab-only chain) is logged and
+  journalled as a `commissioning` event, at start and whenever a re-read's
+  notes change; agentd turns the first two, and UNSIGNED flags on a unit
+  whose profile binds the executor's files, into
+  `robot.agent.config_unattested` (High).
 * `network.quarantine` (`cidrs`, `udp_ports`): where a quarantine may act
   (review F4). `cidrs` may not be `/0` nor overlap a management / uplink
   entry; empty refuses every quarantine.
