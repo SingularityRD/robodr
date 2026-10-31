@@ -45,7 +45,10 @@ unit, TLS to the SOC stub:
 | Units | enroll p50 / p95 | rotate p50 / p95 | retire p50 / p95 | check p50 / p95 | decommission p50 / p95 | Wall | Invariants |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 50 | 1396 / 1972 ms | 2995 / 3764 ms | 1521 / 2216 ms | 203 / 422 ms | 4768 / 5919 ms | 71 s | pass |
-| 500 | see below | | | | | | |
+| 500 | 914 / 1915 ms | 1932 / 4017 ms | 1056 / 2336 ms | 163 / 396 ms | 3227 / 6708 ms | 533 s | pass (2000 distinct keys, 0 active, 0 open rotations) |
+
+(The 50-unit run shared the machine with a parallel test run; the 500-unit
+run had it for most of the time.)
 
 Per-step time is dominated by key generation, fsync'd state and journal
 writes on the unit (each unit is a separate process with its own state
