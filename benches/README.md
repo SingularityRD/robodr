@@ -21,6 +21,12 @@ datagrams/s for the same workload on the host below), so gate there with
 `--tolerance 0.5` and treat it as a guard against order-of-magnitude
 regressions; a dedicated runner can use the default.
 
+CI: the `bench` job of `.github/workflows/ci-extended.yml` runs the quick
+suite with `--gate benches/results/baseline-quick.json --tolerance 0.5` and
+uploads the result. It is informational (`continue-on-error`) until a
+baseline recorded on that runner class replaces the one from the host
+below.
+
 ## Workloads
 
 **agentd** (`robodr-agentd` end to end: pcap replay -> capture decode -> ROS 2

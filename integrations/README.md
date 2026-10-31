@@ -20,15 +20,23 @@ schema, every rule id it names is in the detection catalog
 (`docs/customer/detection-catalog.md`), the Elastic pipeline produces the
 expected ECS document from real findings, the Elastic index template does
 not index any of their attacker-controlled locations, every shared detection
-carries the verification filter below, and the Sentinel DCR's columns match
-its table. `crates/robodr-ocsf/tests/integrations_content.rs` runs it.
+carries the verification filter below, a verification status in a finding
+that no verifier checked is discarded (forged-status cases run through the
+Elastic pipelines), and the Sentinel DCR's columns match its table. `crates/robodr-ocsf/tests/integrations_content.rs` runs it.
 
 **What is and is not verified.** The checks above run in RoboDR's tests.
-None of this content has been loaded into a running Splunk, Elastic or
-Sentinel instance yet; doing that with a design partner's SIEM is the
-remaining step (no licence or tenant was available). The Elastic check
-evaluates the pipeline with an in-repo evaluator of the processors it uses,
-not Elasticsearch itself.
+The Elastic check there evaluates the pipelines with an in-repo evaluator of
+the processors they use. `elastic/live_check.py` runs the same findings
+through a real Elasticsearch (both ingest pipelines, the index template,
+indexing and search) and `elastic/live_check_rules.py` creates the six
+detection rules in a real Kibana and previews them on verified, unsigned,
+unverified and forged-status documents. The test runs them when
+`ROBODR_ES_URL` (and `ROBODR_KIBANA_URL`) name a scratch deployment; both
+passed on Elasticsearch and Kibana 8.15.3 (single node, Docker images
+`elasticsearch:8.15.3` and `kibana:8.15.3`) on 2026-10-31. They do not run
+in CI. The Splunk add-on and the Sentinel content have not been loaded into
+a running instance yet; doing that with a design partner's SIEM is the
+remaining step (no licence or tenant was available).
 
 ## How findings reach a SIEM
 
@@ -72,21 +80,40 @@ object: any re-formatting breaks the signature on purpose).
 and it is a file spool (`/var/spool/robodr-verify/`) plus a run of
 `robodr_verify.py` that you schedule; its output feeds Elasticsearch.
 Splunk Connect for Kafka and the Event Hubs / data collection rule path for
-Sentinel have no verification step: findings arrive without
-`robodr_verification`, anyone able to produce to the topic can forge them,
-and nothing here wires a verifier into those paths. To verify for Splunk or
-Sentinel, run `robodr_verify.py` on your own Kafka consumer and send its
-output by HEC or the Logs Ingestion API; that is not shipped or tested.
+Sentinel have no verification step: anyone able to produce to the topic can
+forge findings there, and nothing here wires a verifier into those paths.
+To verify for Splunk or Sentinel, run `robodr_verify.py` on your own Kafka
+consumer and send its output by HEC (sourcetype `robodr:finding:verified`)
+or the Logs Ingestion API (stream `Custom-RoboDRFindingsVerified`); that is
+not shipped or tested.
+
+**The status counts only where a verifier wrote it.** A finding never
+carries `robodr_verification` itself (the contract schema allows no extra
+top-level field); `robodr_verify.py` adds it. A forger who can produce to the
+topic can add one too, so each SIEM takes the status only from the route the
+verifier's output arrives on and discards it everywhere else:
+
+| SIEM | Verified route (status kept) | Every other route (status discarded) |
+|---|---|---|
+| Splunk | sourcetype `robodr:finding:verified` | sourcetype `robodr:finding`: `robodr_verification_status` is set to null whatever the event carries |
+| Elastic | ingest pipeline `robodr-findings-verified` | ingest pipeline `robodr-findings`: removes `robodr_verification` and any `robodr` object before mapping |
+| Sentinel | DCR stream `Custom-RoboDRFindingsVerified` | DCR stream `Custom-RoboDRFindingsRaw`: does not declare `robodr_verification`; `VerificationStatus` is empty |
+
+This holds only while nothing but the verifier's output uses the verified
+route: the Splunk Connect for Kafka connector must set sourcetype
+`robodr:finding` and not take Splunk metadata from Kafka record headers
+(`splunk.header.support` off), and only the verifier's HEC token or Entra
+application may send the verified sourcetype or stream.
 
 **How the detections use the status.** Each of the five shared detections
-(below) drops findings whose `robodr_verification.status` is present and not
-`verified` (Splunk: `NOT robodr_verification.status=* OR
-robodr_verification.status="verified"`; Elastic: `robodr.verification.status`;
-Sentinel: `VerificationStatus`). Findings with no status, i.e. every finding
-on a path without a verifier, still raise them. A sixth, low-severity
-detection, **Unverified findings**, reports every finding that is not
-verified, including those with no status, so an unverified path shows up in
-each SIEM. An unverified finding must not trigger an automated response.
+(below) drops findings whose status is present and not `verified` (Splunk:
+`NOT robodr_verification_status=* OR robodr_verification_status="verified"`;
+Elastic: `robodr.verification.status`; Sentinel: `VerificationStatus`).
+Findings with no status, i.e. every finding on a route without a verifier,
+still raise them. A sixth, low-severity detection, **Unverified findings**,
+reports every finding that is not verified, including those with no status,
+so an unverified path shows up in each SIEM. An unverified finding must not
+trigger an automated response.
 
 Keyring for `robodr_verify.py`: JSON `{"<robot id>": {"<key id>": "<64 hex public key>"}}`,
 built from the finding keys registered at commissioning (one per robot,

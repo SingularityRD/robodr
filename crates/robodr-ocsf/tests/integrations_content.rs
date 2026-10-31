@@ -4,8 +4,10 @@
 //! * `integrations/check_content.py`: every field the Splunk, Elastic and
 //!   Sentinel content reads is in the contract schema, every rule id it
 //!   names is in the catalog, the generated detections are current, and the
-//!   Elastic ingest pipeline maps each finding below to the expected ECS
-//!   document.
+//!   Elastic ingest pipelines map each finding below to the expected ECS
+//!   document, and a verification status the finding itself carries is
+//!   discarded on every route a verifier did not write it on (Splunk
+//!   sourcetype, Elastic pipeline, Sentinel stream).
 //! * `integrations/verify/robodr_verify.py`: findings signed by this crate
 //!   verify; tampered values, another robot's key, duplicate or malformed
 //!   headers and (under the strict policy) missing headers are rejected.
@@ -20,12 +22,15 @@ mod common;
 #[path = "support/python.rs"]
 mod py_support;
 
+use curve25519_dalek::scalar::{clamp_integer, Scalar};
 use py_support::missing_module;
-use robodr_blackbox::Ed25519SigningKey;
+use robodr_blackbox::sign::SignError;
+use robodr_blackbox::{Ed25519SigningKey, Signer};
 use robodr_events::graph::Participant;
 use robodr_events::{Deviation, Severity};
 use robodr_ocsf::{sign_value, to_json, FindingBuilder, Subject};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -122,15 +127,103 @@ fn siem_content_matches_the_contract_and_maps_real_findings() {
         stderr.contains(&format!("{} finding(s)", lines.len())),
         "{stderr}"
     );
+    // The same findings against a real Elasticsearch, when one is given
+    // (a scratch cluster: the pipelines and template are overwritten).
+    if let Some(es) = std::env::var_os("ROBODR_ES_URL") {
+        let o = Command::new("python3")
+            .arg("-I")
+            .arg(root().join("integrations/elastic/live_check.py"))
+            .arg("--es")
+            .arg(&es)
+            .arg("--findings")
+            .arg(&f)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{stdout}\n{stderr}");
+        eprintln!("{stderr}");
+        // And the detection rules, previewed in a real Kibana.
+        if let Some(kb) = std::env::var_os("ROBODR_KIBANA_URL") {
+            let o = Command::new("python3")
+                .arg("-I")
+                .arg(root().join("integrations/elastic/live_check_rules.py"))
+                .arg("--es")
+                .arg(&es)
+                .arg("--kibana")
+                .arg(&kb)
+                .arg("--findings")
+                .arg(&f)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{stdout}\n{stderr}");
+            eprintln!("{stderr}");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn key(robot: &str) -> Ed25519SigningKey {
+fn seed(robot: &str) -> [u8; 32] {
     let mut seed = [0x5a; 32];
     for (d, s) in seed.iter_mut().zip(robot.bytes()) {
         *d ^= s;
     }
-    Ed25519SigningKey::from_seed(format!("finding:{robot}:1"), &seed).unwrap()
+    seed
+}
+
+fn key(robot: &str) -> Ed25519SigningKey {
+    Ed25519SigningKey::from_seed(format!("finding:{robot}:1"), &seed(robot)).unwrap()
+}
+
+/// Signs with R = the identity point (small order) under `robot`'s real
+/// key: S = k * a, so [S]B = R + [k]A holds and a cofactorless check that
+/// does not look at R (the `cryptography` package) accepts it. Only the
+/// strict small-order-R check refuses it.
+struct SmallOrderR {
+    key_id: String,
+    a: Scalar,
+    public: [u8; 32],
+}
+
+const IDENTITY: [u8; 32] = {
+    let mut b = [0u8; 32];
+    b[0] = 1;
+    b
+};
+
+impl SmallOrderR {
+    fn new(robot: &str) -> Self {
+        let h = Sha512::digest(seed(robot));
+        let mut lo = [0u8; 32];
+        lo.copy_from_slice(&h[..32]);
+        Self {
+            key_id: format!("finding:{robot}:1"),
+            a: Scalar::from_bytes_mod_order(clamp_integer(lo)),
+            public: key(robot).public_key(),
+        }
+    }
+}
+
+impl Signer for SmallOrderR {
+    fn algorithm(&self) -> &str {
+        "ed25519"
+    }
+    fn key_id(&self) -> &str {
+        &self.key_id
+    }
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, SignError> {
+        let k = Scalar::from_hash(
+            Sha512::new()
+                .chain_update(IDENTITY)
+                .chain_update(self.public)
+                .chain_update(message),
+        );
+        let mut sig = IDENTITY.to_vec();
+        sig.extend_from_slice((k * self.a).as_bytes());
+        Ok(sig)
+    }
 }
 
 fn record(value: &str, headers: Value) -> String {
@@ -357,10 +450,15 @@ fn pipeline_verifier_refuses_small_order_keys_and_signatures() {
     );
     assert_eq!(o.status.code(), Some(1), "{err}");
     assert!(err.contains("weak or non-canonical"), "{err}");
-    // A small-order R under a real key: rejected as a record.
-    let weak_r = format!(
-        "{{\"alg\":\"ed25519\",\"key_id\":\"finding:ugv-007:1\",\"sig\":\"{identity}{}\"}}",
-        "00".repeat(32)
+    // A small-order R under the robot's real key, with S chosen so the
+    // cofactorless equation holds: the `cryptography` package alone accepts
+    // it; the strict R check must reject it, and say so.
+    let weak_r = sign_value(&value, &SmallOrderR::new("ugv-007"))
+        .unwrap()
+        .to_header_value();
+    assert!(
+        weak_r.contains(&format!("\"sig\":\"{identity}")),
+        "{weak_r}"
     );
     std::fs::write(
         &input,
@@ -378,7 +476,13 @@ fn pipeline_verifier_refuses_small_order_keys_and_signatures() {
         Some(&input),
     )
     .unwrap();
-    assert!(o.stdout.is_empty());
-    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        o.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("weak or non-canonical point"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

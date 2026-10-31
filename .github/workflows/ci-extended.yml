@@ -265,3 +265,42 @@ jobs:
             target/junit.xml
           if-no-files-found: warn
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  bench:
+    # T32: the quick throughput suite (benches/README.md), gated against
+    # benches/results/baseline-quick.json with the shared-runner tolerance.
+    # Informational (continue-on-error): that baseline was recorded on a
+    # different host class, so a failure here is a prompt to look, not a
+    # verdict. The JSON result is uploaded; commit one as this runner's
+    # baseline and drop continue-on-error to make the job a gate.
+    name: Throughput benchmark (quick, informational)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup (mirror, --locked, Pulsar-bound excludes)
+        run: scripts/ci-setup.sh
+      - name: Quick suite against the recorded baseline
+        run: |
+          cargo build --release -p robodr-benches $CARGO_LOCKED
+          mkdir -p target/bench
+          target/release/robodr-bench --quick --out target/bench/quick.json \
+            --gate benches/results/baseline-quick.json --tolerance 0.5
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-quick-${{ github.sha }}
+          path: target/bench/quick.json
+          if-no-files-found: warn
+          retention-days: 30

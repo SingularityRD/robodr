@@ -13,9 +13,13 @@ Splunk's copies are hand-written in splunk/TA-robodr/default/savedsearches.conf
 (check_content.py checks they name the same rule ids).
 
 Verification status (integrations/verify/robodr_verify.py): each of the five
-drops findings whose robodr_verification.status is present and not
-"verified" (under --policy optional: "unsigned"). Findings that reached the
-SIEM on a path with no verifier carry no status and still alert. A sixth,
+drops findings whose status (Elastic robodr.verification.status, Sentinel
+VerificationStatus) is present and not "verified" (under --policy optional:
+"unsigned"). The status is kept only from the verifier: the
+robodr-findings-verified ingest pipeline and the DCR's
+Custom-RoboDRFindingsVerified stream. Findings that reached the SIEM on a
+path with no verifier have no status, whatever robodr_verification they
+carried, and still alert. A sixth,
 low-severity detection, UNVERIFIED, reports every finding that is not
 verified (including those with no status), so an unverified path is visible.
 """

@@ -31,12 +31,16 @@ For each record (docs/contracts/robodr.findings.md section 2, "Verification"):
    by robot, so every key is bound to the one robot it is listed under
    (the contract's device binding);
 4. Ed25519 over ``"robodr-ocsf/finding-sig/v1" NUL || u32be(len alg) || alg
-   || u32be(len key_id) || key_id || u64be(len value) || value``, with the
-   ``verify_strict`` checks the Rust verifier applies on top of the
-   ``cryptography`` package's verification: the public key and the
-   signature's R must be canonical encodings of points that are not of
-   small order, and S must be below the group order. Keyring keys that fail
-   this are refused when the keyring is loaded.
+   || u32be(len key_id) || key_id || u64be(len value) || value``, with
+   strict checks on top of the ``cryptography`` package's verification:
+   the public key and the signature's R must be canonical encodings of
+   points that are not of small order, and S must be below the group order.
+   These are the Rust verifier's ``verify_strict`` checks, except that for
+   the public key this script is stricter: it also refuses a non-canonical
+   encoding (y >= p, or x = 0 with the sign bit set), which
+   curve25519-dalek's decompression accepts. Keys generated normally are
+   always canonical. Keyring keys that fail are refused when the keyring
+   is loaded.
 
 Verified findings are written to stdout as the finding object plus
 ``"robodr_verification": {"status": "verified", "key_id": ...}``. With

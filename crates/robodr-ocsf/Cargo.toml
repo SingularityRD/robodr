@@ -16,3 +16,8 @@ robodr-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+# Test-only: forges a small-order-R signature under a real key
+# (tests/integrations_content.rs). Already in the graph via ed25519-dalek.
+curve25519-dalek = { workspace = true }

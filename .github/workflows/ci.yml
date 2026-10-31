@@ -197,7 +197,19 @@ jobs:
         # PURE_EXCLUDES only names members that exist (older cargo errors on
         # `--exclude` of an unknown package), see scripts/ci-pure-excludes.py.
         run: cargo clippy --workspace $PURE_EXCLUDES $CARGO_LOCKED --all-targets -- -D warnings
+      - name: Python packages for the external-validator tests (hash-pinned)
+        # robodr-ocsf's external_validator.rs and integrations_content.rs run
+        # integrations/ scripts with `python3 -I` (jsonschema, PyYAML,
+        # cryptography). The venv goes first on PATH so `python3` is its
+        # interpreter. An air-gapped runner sets PIP_INDEX_URL to its mirror.
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyenv"
+          "$RUNNER_TEMP/pyenv/bin/pip" install --require-hashes --only-binary=:all: -r scripts/ci-python-requirements.txt
+          echo "$RUNNER_TEMP/pyenv/bin" >> "$GITHUB_PATH"
       - name: test
+        env:
+          # A missing python3 module fails those tests instead of skipping them.
+          ROBODR_REQUIRE_EXTERNAL_VALIDATOR: "1"
         run: cargo test --workspace $PURE_EXCLUDES $CARGO_LOCKED
       - name: install-bundle.sh against a real dpkg and rpm (root; update/rollback tests)
         # The test binary is built as the runner user and run as root, so no
