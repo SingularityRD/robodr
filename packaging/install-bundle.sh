@@ -26,6 +26,7 @@
 #                             [--health-timeout SECS]
 #                                          (reinstall a kept release)
 #   install-bundle.sh restart-pending [--allow-gateway-restart]
+#                             [--health-timeout SECS]
 #                                          (deferred gateway / executor restart)
 #   install-bundle.sh prune --keep N       (drop older kept releases)
 #   install-bundle.sh ring                 (SOC update-ring information)
@@ -103,10 +104,18 @@
 #                            the next reboot;
 #   --allow-gateway-restart  restart them anyway (deliberate: motion
 #                            through the gateway is interrupted).
-# The state is checked again right before the restart (the upgrade takes
-# time); if it closed meanwhile the restart is deferred. A one-time
-# migration that must stop the gateway (the gateway user split, upgrading
-# from 0.1.0-alpha.1) cannot be deferred.
+# The gate is decided before anything on the unit changes (before the
+# security floor is raised, before dpkg / rpm). The state is checked again
+# right before the restart (the upgrade takes time); if it closed meanwhile
+# the restart is deferred. Not deferrable: a one-time migration that must
+# stop the gateway (the gateway user split, upgrading from 0.1.0-alpha.1),
+# and installing or rolling back to a package whose post-install script
+# predates the gate (no gated_restart block: 0.1.0-alpha.1), which
+# try-restarts the two itself; with the gate closed both are REFUSED
+# unless --allow-gateway-restart. When the installed robodr-deliverd has no
+# safety-state command (0.1.0-alpha.1), install reads the state with the
+# robodr-deliverd of the package being installed (after its verification,
+# from a copy in the private staging directory).
 #
 # Health check and automatic rollback (T50). After install and rollback,
 # every RoboDR unit that was active before must be active again (on two
@@ -114,11 +123,16 @@
 # its heartbeat must be fresh, within --health-timeout seconds (default
 # 120). If not, install reinstalls the release that was installed before
 # (when it is kept under /var/lib/robodr/releases and allowed by the
-# security floor and the format gate), checks health again, and exits 1;
-# the failed release is not kept. --no-auto-rollback only reports.
+# security floor and the format gate, and, for a release from before the
+# gate, while the safety state allows its unconditional restart), checks
+# health again, and exits 1; the failed release is not kept.
+# --no-auto-rollback only reports. restart-pending checks health the same
+# way after its restarts and exits 1 when unhealthy (no automatic
+# rollback). `list` shows the units still waiting for a restart.
 #
 # Kept releases (T50). --keep N (install) or `prune --keep N` keeps the N
-# newest kept releases and always the installed one. The formats file of
+# newest kept releases and always the installed one; prune is REFUSED when
+# neither dpkg nor rpm reports the installed version. The formats file of
 # a pruned release is archived under releases/formats-archive, so the
 # black-box format gate still knows what that release wrote.
 #
@@ -485,6 +499,22 @@ installed_pkgs() { # format
     esac
 }
 
+# The installed robodr version on this host, whichever package manager
+# holds it. Sets $inst (empty if none can be found) and $pkgfmt: the format
+# of the manager that holds it (versions then compare by it), or, with
+# nothing found, rpm on a host with rpm and no dpkg.
+host_installed() {
+    inst=""
+    for hf in deb rpm; do
+        inst=$(installed_pkgs "$hf" | sed -n '1s/^[^ ]* //p')
+        if [ -n "$inst" ]; then
+            pkgfmt=$hf
+            return 0
+        fi
+    done
+    if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then pkgfmt=rpm; fi
+}
+
 # Refuse a package of one format where robodr is installed through the other.
 check_other_format() { # format
     case "$1" in deb) o=rpm ;; *) o=deb ;; esac
@@ -492,22 +522,39 @@ check_other_format() { # format
     [ -z "$other" ] || die 1 "REFUSED: robodr is installed here as an $o package ($(echo "$other" | tr '\n' ' ')); this bundle holds a $1 package. Use the $o bundle."
 }
 
-# The formats file of a package on stdout (empty for a legacy release).
-pkg_formats() { # file
+# The content of the file PATH (absolute) of a package file on stdout;
+# returns 1 when the package does not carry it.
+pkg_cat() { # file path
     case "$(format_of "$1")" in
-    deb) dpkg-deb --fsys-tarfile "$1" | tar -xOf - ./usr/share/robodr/formats 2>/dev/null || true ;;
+    deb) dpkg-deb --fsys-tarfile "$1" | tar -xOf - ".$2" 2>/dev/null ;;
     rpm)
-        rpm -qpl --nosignature "$1" 2>/dev/null | grep -qx /usr/share/robodr/formats || return 0
+        rpm -qpl --nosignature "$1" 2>/dev/null | grep -qx "$2" || return 1
         if command -v rpm2archive >/dev/null 2>&1; then
-            rpm2archive - <"$1" | tar -xzOf - ./usr/share/robodr/formats ||
-                die 1 "cannot read /usr/share/robodr/formats from $1"
+            rpm2archive - <"$1" | tar -xzOf - ".$2" ||
+                die 1 "cannot read $2 from $1"
         elif command -v rpm2cpio >/dev/null 2>&1 && command -v cpio >/dev/null 2>&1; then
-            rpm2cpio "$1" | cpio --quiet -i --to-stdout ./usr/share/robodr/formats ||
-                die 1 "cannot read /usr/share/robodr/formats from $1"
+            rpm2cpio "$1" | cpio --quiet -i --to-stdout ".$2" ||
+                die 1 "cannot read $2 from $1"
         else
-            die 2 "rpm2archive (or rpm2cpio and cpio) needed to read the formats file of $1"
+            die 2 "rpm2archive (or rpm2cpio and cpio) needed to read $2 from $1"
         fi
         ;;
+    esac
+}
+
+# The formats file of a package on stdout (empty for a legacy release).
+pkg_formats() { # file
+    pkg_cat "$1" /usr/share/robodr/formats || true
+}
+
+# Whether a package's post-install script leaves the gateway and the
+# executor to the safety-state gate (its gated_restart block defines
+# mark_pending_restart). The post-install script of a release from before
+# the gate (0.1.0-alpha.1) try-restarts both unconditionally.
+pkg_gate_aware() { # file
+    case "$(format_of "$1")" in
+    deb) dpkg-deb --ctrl-tarfile "$1" | tar -xOf - ./postinst 2>/dev/null | grep -q '^mark_pending_restart()' ;;
+    rpm) rpm -qp --nosignature --scripts "$1" 2>/dev/null | grep -q '^mark_pending_restart()' ;;
     esac
 }
 
@@ -625,10 +672,12 @@ floor_now() {
 }
 
 # Raise the recorded floor to VERSION if it is higher (never lowers it).
+# (POSIX sh has no local variables: rf_old is used nowhere else; install's
+# $prev_ver, the release it replaces, is the automatic rollback target.)
 raise_floor() { # version source
     valid_version "$1" || die 1 "$2 names a malformed minimum version ($1)"
-    cur=$(floor_now)
-    if [ -z "$cur" ] || ver_lt "$cur" "$1"; then
+    rf_old=$(floor_now)
+    if [ -z "$rf_old" ] || ver_lt "$rf_old" "$1"; then
         install -d -m 0750 "$releases"
         printf 'min_version=%s\nsource=%s\n' "$1" "$2" >"$floor_file.tmp"
         mv "$floor_file.tmp" "$floor_file"
@@ -726,16 +775,48 @@ active_units() {
     done
 }
 
-# Whether the gate is open now: robodr-deliverd safety-state (the installed
-# release's) says idle or safe_state_active. Sets $gate_why.
+# Whether a robodr-deliverd binary has the safety-state command (every
+# release since WP8a; not 0.1.0-alpha.1).
+has_safety_state() { # binary
+    regular_file "$1" && [ -x "$1" ] && "$1" --help 2>/dev/null | grep -q 'safety-state'
+}
+
+# The safety-state reader of the package being installed, when the
+# installed release has none (an upgrade from 0.1.0-alpha.1): the
+# package's own robodr-deliverd, verified with the package above, copied
+# into the private staging directory. Sets $bundle_reader (or leaves it
+# empty).
+bundle_reader=""
+pick_bundle_reader() { # package file
+    bundle_reader=""
+    ! has_safety_state "$deliverd_bin" || return 0
+    [ -n "$stage" ] || make_stage
+    [ -d "$stage/gate" ] || mkdir -m 0700 "$stage/gate"
+    br=$stage/gate/robodr-deliverd
+    if pkg_cat "$1" /usr/sbin/robodr-deliverd >"$br" 2>/dev/null; then
+        chmod 0700 "$br"
+        if has_safety_state "$br"; then
+            bundle_reader=$br
+            echo "install-bundle: the installed robodr-deliverd cannot read the safety state; reading it with the new package's robodr-deliverd"
+        fi
+    fi
+}
+
+# Whether the gate is open now: robodr-deliverd safety-state says idle or
+# safe_state_active. The reader is the installed release's robodr-deliverd
+# or, while that one has no safety-state command, the new package's
+# (pick_bundle_reader). Sets $gate_why and $gate_out.
 gate_open() {
+    rd=$deliverd_bin
+    if [ -n "$bundle_reader" ] && ! has_safety_state "$rd"; then rd=$bundle_reader; fi
+    gate_out=""
     gate_why="no safety-state reader ($deliverd_bin)"
-    [ -x "$deliverd_bin" ] || return 1
+    [ -x "$rd" ] || return 1
     gate_rc=0
     if [ -f "$deliverd_cfg" ]; then
-        gate_out=$("$deliverd_bin" safety-state --config "$deliverd_cfg" 2>&1) || gate_rc=$?
+        gate_out=$("$rd" safety-state --config "$deliverd_cfg" 2>&1) || gate_rc=$?
     else
-        gate_out=$("$deliverd_bin" safety-state 2>&1) || gate_rc=$?
+        gate_out=$("$rd" safety-state 2>&1) || gate_rc=$?
     fi
     gate_why=$(printf '%s\n' "$gate_out" | tr -d '\n' | tr -s ' ' | cut -c1-300)
     [ "$gate_rc" -eq 0 ]
@@ -743,7 +824,7 @@ gate_open() {
 
 # Decide, before any change, what happens to the running gated units.
 # Sets $gate (none: none running; open; override; defer) or refuses.
-decide_gate() { # active-units what
+decide_gate() { # active-units what package-file
     gated_active=""
     for u in $gated_units; do
         case "$nl$1$nl" in *"$nl$u$nl"*) gated_active="$gated_active $u" ;; esac
@@ -769,6 +850,11 @@ decide_gate() { # active-units what
             die 1 "REFUSED: this upgrade must stop robodr-firewall-gw once to move its state to its own user (upgrade from 0.1.0-alpha.1); that cannot be deferred. Run it when the robot is idle or in its safe state, or with --allow-gateway-restart." ;;
         esac
     fi
+    # A package from before the gate restarts the two itself,
+    # unconditionally, from its post-install script: never deferred.
+    if [ "$gate" = defer ] && ! pkg_gate_aware "$3"; then
+        die 1 "REFUSED: $2: that release's maintainer scripts predate the safety-state gate and restart$gated_active unconditionally, so the restart cannot be deferred. Run it when the robot is idle or in its safe state, or with --allow-gateway-restart."
+    fi
 }
 
 # Install a package file with the gate's decision handed to the
@@ -780,6 +866,9 @@ pkg_install_gated() { # file
     else
         pkg_install "$1"
     fi
+    # A package from before the gate has just try-restarted the running
+    # gated units itself: nothing is pending any more.
+    if ! pkg_gate_aware "$1"; then rm -f "$pending_file"; fi
 }
 
 # Restart what the maintainer scripts left in the pending-restart file,
@@ -835,10 +924,11 @@ healthy_now() { # active-units
         fi
         agentd_note=", agentd heartbeat fresh"
         gate_open || true
-        case "$gate_out" in
-        *'"agentd_fresh": true'*) ;;
-        *) health_why="$health_why agentd heartbeat not fresh;" ;;
-        esac
+        # The JSON field, pretty-printed or compact (install_gate.rs
+        # checks the real binary's output against this expression).
+        if ! printf '%s\n' "$gate_out" | grep -Eq '"agentd_fresh"[[:space:]]*:[[:space:]]*true'; then
+            health_why="$health_why agentd heartbeat not fresh;"
+        fi
         ;;
     esac
     [ -z "$health_why" ]
@@ -1020,21 +1110,25 @@ install)
     have=$(installed_pkgs "$pkgfmt")
     check_variant "$pkg" "$have"
     prev=""
-    cur=""
+    prev_ver=""
     while read -r p v; do
         [ -n "$p" ] || continue
         prev="$prev $p $v"
-        cur=$v
+        prev_ver=$v
     done <<EOF
 $have
 EOF
     echo "install-bundle: installing $pkg $ver ($pkgfmt; currently installed:${prev:- none})"
-    if [ -n "$cur" ] && ver_lt "$ver" "$cur"; then
+    if [ -n "$prev_ver" ] && ver_lt "$ver" "$prev_ver"; then
         if [ "$allow_downgrade" -ne 1 ]; then
-            die 1 "REFUSED: $ver is older than the installed $cur: a downgrade (it may bring back fixed vulnerabilities). Roll back to a kept release (rollback), or pass --allow-downgrade if this downgrade is deliberate; neither goes below the security floor."
+            die 1 "REFUSED: $ver is older than the installed $prev_ver: a downgrade (it may bring back fixed vulnerabilities). Roll back to a kept release (rollback), or pass --allow-downgrade if this downgrade is deliberate; neither goes below the security floor."
         fi
-        echo "install-bundle: WARNING: downgrading from $cur to $ver (--allow-downgrade)"
+        echo "install-bundle: WARNING: downgrading from $prev_ver to $ver (--allow-downgrade)"
     fi
+    # The safety-state gate, before anything on the unit changes.
+    before=$(active_units)
+    pick_bundle_reader "$pkgfile"
+    decide_gate "$before" "installing $ver" "$pkgfile"
     ring_note "$ver"
     floor_from_ring
     if [ -f "$bundle/security-floor" ]; then
@@ -1045,44 +1139,58 @@ EOF
     fmt=$(mktemp)
     pkg_formats "$pkgfile" >"$fmt"
     check_formats "$fmt" "$ver" || { rm -f "$fmt"; exit 1; }
-    before=$(active_units)
-    decide_gate "$before" "installing $ver"
+    new_pkg=$pkg
     pkg_install_gated "$pkgfile"
     restart_pending "$gate" || true
     if ! health_check "$before"; then
         if [ "$auto_rollback" -ne 1 ]; then
-            die 1 "$pkg $ver is installed but the unit is not healthy (--no-auto-rollback): check the units, then '$0 rollback <version>'"
+            die 1 "$new_pkg $ver is installed but the unit is not healthy (--no-auto-rollback): check the units, then '$0 rollback <version>'"
         fi
-        if [ -z "$cur" ] || [ "$cur" = "$ver" ]; then
-            die 1 "$pkg $ver is installed but the unit is not healthy, and there is no earlier release to roll back to"
+        if [ -z "$prev_ver" ] || [ "$prev_ver" = "$ver" ]; then
+            die 1 "$new_pkg $ver is installed but the unit is not healthy, and there is no earlier release to roll back to"
         fi
-        prevdir=$releases/$cur
+        prevdir=$releases/$prev_ver
         if [ ! -d "$prevdir" ] || [ -L "$prevdir" ]; then
-            die 1 "$pkg $ver is installed but the unit is not healthy, and the release it replaced ($cur) is not kept in $releases: roll back by hand"
+            die 1 "$new_pkg $ver is installed but the unit is not healthy, and the release it replaced ($prev_ver) is not kept in $releases: roll back by hand"
         fi
-        echo "install-bundle: AUTOMATIC ROLLBACK to $cur"
+        echo "install-bundle: AUTOMATIC ROLLBACK to $prev_ver"
         (cd "$prevdir" && sha256sum --strict --quiet --ignore-missing -c SHA256SUMS) ||
-            die 1 "automatic rollback impossible: the kept release $cur fails its checksums"
+            die 1 "automatic rollback impossible: the kept release $prev_ver fails its checksums"
         find_pkg "$prevdir"
+        [ "$(pkg_version "$pkgfile")" = "$prev_ver" ] ||
+            die 1 "automatic rollback impossible: the kept package in $prevdir is not version $prev_ver"
         f=$(floor_now)
-        if [ -n "$f" ] && ver_lt "$cur" "$f"; then
-            die 1 "automatic rollback impossible: $cur is below the security floor $f; $pkg $ver stays installed, unhealthy"
+        if [ -n "$f" ] && ver_lt "$prev_ver" "$f"; then
+            die 1 "automatic rollback impossible: $prev_ver is below the security floor $f; $new_pkg $ver stays installed, unhealthy"
         fi
         pfmt=$(mktemp)
         if [ -f "$prevdir/formats" ]; then cp "$prevdir/formats" "$pfmt"; else pkg_formats "$pkgfile" >"$pfmt"; fi
-        if ! check_formats "$pfmt" "$cur"; then
+        if ! check_formats "$pfmt" "$prev_ver"; then
             rm -f "$pfmt"
             die 1 "automatic rollback impossible (format gate); $ver stays installed, unhealthy"
         fi
         rm -f "$pfmt"
+        # A release from before the gate restarts the gateway and the
+        # executor itself, unconditionally: only while the safety state
+        # allows that now.
+        case "$gate" in
+        open | defer)
+            if ! pkg_gate_aware "$pkgfile"; then
+                if ! gate_open; then
+                    die 1 "automatic rollback impossible: the maintainer scripts of $prev_ver predate the safety-state gate and would restart$gated_active unconditionally, and the safety state does not allow that now ($gate_why); $new_pkg $ver stays installed, unhealthy. Roll back with '$0 rollback $prev_ver' when the robot is idle or in its safe state."
+                fi
+                gate=open
+            fi
+            ;;
+        esac
         pkg_install_gated "$pkgfile"
         restart_pending "$gate" || true
         if health_check "$before"; then
-            echo "install-bundle: rolled back to $cur; it is healthy" >&2
+            echo "install-bundle: rolled back to $prev_ver; it is healthy" >&2
         else
-            echo "install-bundle: rolled back to $cur, which is NOT healthy either: check the units" >&2
+            echo "install-bundle: rolled back to $prev_ver, which is NOT healthy either: check the units" >&2
         fi
-        die 1 "$pkg $ver failed its post-install health check and was rolled back to $cur (the failed release is not kept)"
+        die 1 "$new_pkg $ver failed its post-install health check and was rolled back to $prev_ver (the failed release is not kept)"
     fi
     install -d -m 0750 "$releases/$ver"
     # One package per kept version: the variant installed last (robodr and
@@ -1099,6 +1207,9 @@ restart-pending)
     [ "$have_version" -eq 0 ] || die 2 "restart-pending takes no version"
     need_root
     if [ "$allow_gateway_restart" -eq 1 ]; then g=override; else g=check; fi
+    # What runs now must run again afterwards (the health check below).
+    before=$(active_units)
+    configured=0
     # A package whose configuration was deferred by its maintainer script
     # (the one-time gateway migration with the gate closed): configure it
     # now, through the gate.
@@ -1113,31 +1224,45 @@ restart-pending)
                 fi
                 echo "install-bundle: configuring $p (deferred configuration)"
                 ROBODR_GATED_RESTART=allow dpkg_ --configure "$p"
+                configured=1
                 ;;
             esac
         done
     fi
     if ! regular_file "$pending_file"; then
         echo "install-bundle: nothing pending"
+        if [ "$configured" -eq 1 ]; then
+            health_check "$before" || die 1 "the unit is not healthy after the deferred configuration: check the units"
+        fi
         exit 0
     fi
     restart_pending "$g" || exit 1
     echo "install-bundle: pending restarts done"
+    # No automatic rollback here (the package was installed earlier and
+    # passed its own check); an unhealthy restart is reported, exit 1.
+    health_check "$before" ||
+        die 1 "the restarted units are not healthy: check them; '$0 rollback <version>' goes back to a kept release"
     ;;
 prune)
     [ "$have_version" -eq 0 ] || die 2 "prune takes no version"
     need_root
     [ -n "$keep" ] || die 2 "prune needs --keep N"
-    if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then pkgfmt=rpm; fi
-    inst=$( (installed_pkgs "${pkgfmt:-deb}") | sed -n '1s/^[^ ]* //p')
+    host_installed
+    # Without the installed version it could not be protected.
+    [ -n "$inst" ] ||
+        die 1 "REFUSED: cannot determine the installed robodr version (neither dpkg nor rpm reports one); nothing pruned"
     prune_releases "$keep" "$inst"
     ;;
 list)
     [ -d "$releases" ] || die 1 "no releases kept in $releases"
-    # Versions compare by this host's package manager.
-    if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then pkgfmt=rpm; fi
+    # Versions compare by the package manager that holds robodr.
+    host_installed
     f=$(floor_now)
+    echo "installed: ${inst:-unknown}"
     echo "security floor: ${f:-none}"
+    if regular_file "$pending_file"; then
+        echo "pending restart (still on the previous binaries; restart-pending): $(LC_ALL=C sort -u "$pending_file" | tr '\n' ' ')"
+    fi
     for d in "$releases"/*/; do
         [ -d "$d" ] || continue
         v=$(basename "$d")
@@ -1166,14 +1291,15 @@ rollback)
         die 1 "the kept package in $dir is not version $version_arg"
     check_other_format "$pkgfmt"
     check_variant "$pkg" "$(installed_pkgs "$pkgfmt")"
+    # The safety-state gate, before anything on the unit changes.
+    before=$(active_units)
+    decide_gate "$before" "rolling back to $version_arg" "$pkgfile"
     floor_from_ring
     check_floor "$version_arg"
     fmt=$(mktemp)
     if [ -f "$dir/formats" ]; then cp "$dir/formats" "$fmt"; else pkg_formats "$pkgfile" >"$fmt"; fi
     check_formats "$fmt" "$version_arg" || { rm -f "$fmt"; exit 1; }
     rm -f "$fmt"
-    before=$(active_units)
-    decide_gate "$before" "rolling back to $version_arg"
     echo "install-bundle: rolling back to $pkg $version_arg ($pkgfmt)"
     pkg_install_gated "$pkgfile"
     restart_pending "$gate" || true

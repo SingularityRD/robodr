@@ -15,6 +15,30 @@ fn deliverd(args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Whether install-bundle.sh's heartbeat expression (healthy_now: the
+/// `grep -Eq '...agentd_fresh...'` line, taken from the script itself)
+/// matches `stdout`.
+fn heartbeat_grep(stdout: &[u8]) -> bool {
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/install-bundle.sh"),
+    )
+    .unwrap();
+    let line = script
+        .lines()
+        .find(|l| l.contains("grep -Eq '\"agentd_fresh\""))
+        .expect("install-bundle.sh: the agentd_fresh grep line");
+    let a = line.find("-Eq '").unwrap() + 5;
+    let b = a + line[a..].find('\'').unwrap();
+    let mut c = Command::new("grep")
+        .args(["-Eq", &line[a..b]])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    c.stdin.take().unwrap().write_all(stdout).unwrap();
+    c.wait().unwrap().success()
+}
+
 fn json(o: &Output) -> serde_json::Value {
     serde_json::from_slice(&o.stdout)
         .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)))
@@ -46,6 +70,9 @@ fn safety_state_opens_only_for_idle_or_safe_state_from_a_fresh_agentd() {
         assert_eq!(v["safety_state"], state);
         assert_eq!(v["allows_restart"], open);
         assert_eq!(v["agentd_fresh"], true, "{v}");
+        // install-bundle.sh reads the heartbeat from this output with a
+        // grep expression, not a JSON parser: it must match the real text.
+        assert!(heartbeat_grep(&o.stdout), "{state}: {v}");
     }
     // agentd gone: closed, and no heartbeat.
     std::fs::remove_file(&u.cfg.safety.agentd_status).unwrap();
@@ -54,6 +81,7 @@ fn safety_state_opens_only_for_idle_or_safe_state_from_a_fresh_agentd() {
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(v["safety_state"], "unknown");
     assert_eq!(v["agentd_fresh"], false);
+    assert!(!heartbeat_grep(&o.stdout), "{v}");
     // A status written by agentd but without a live feed: fresh heartbeat,
     // gate closed (a configured static state is not a reading).
     let st = serde_json::json!({

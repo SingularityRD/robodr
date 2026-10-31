@@ -102,7 +102,8 @@ fn write_exec(p: &Path, text: &str) {
 
 /// The fake systemd of the test: `is-active` from `<sd>/active/<unit>`
 /// (and not `<sd>/crashing/<unit>`), every other verb logged to
-/// `<sd>/log`. Inside the dpkg chroot the state is `/fake-sd`.
+/// `<sd>/log`; `try-restart` of a unit in `<sd>/crash-on-restart` makes it
+/// crash. Inside the dpkg chroot the state is `/fake-sd`.
 const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
 if [ -d /fake-sd ]; then d=/fake-sd; else d=$FAKE_SD; fi
 case "$1" in
@@ -111,9 +112,25 @@ is-active)
     [ "$1" != --quiet ] || shift
     [ -e "$d/active/$1" ] && [ ! -e "$d/crashing/$1" ]
     ;;
-*) echo "$*" >>"$d/log" ;;
+*)
+    echo "$*" >>"$d/log"
+    if [ "$1" = try-restart ] && [ -e "$d/crash-on-restart/$2" ]; then : >"$d/crashing/$2"; fi
+    ;;
 esac
 "#;
+
+/// The `robodr-deliverd` of 0.1.0-alpha.1: no `safety-state` command.
+const OLD_DELIVERD: &str = r#"#!/bin/sh
+case "$1" in
+--help) echo "usage: robodr-deliverd run|once|status" ;;
+*) echo "robodr-deliverd: unknown command $1" >&2; exit 2 ;;
+esac
+"#;
+
+/// The post-install script of a release from before the safety-state
+/// gate (0.1.0-alpha.1): it try-restarts the gateway and the executor
+/// unconditionally.
+const LEGACY_POSTINST: &str = "#!/bin/sh\nfor u in robodr-executor.service robodr-firewall-gw.service; do\n    systemctl try-restart \"$u\" || true\ndone\n";
 
 /// A fake `robodr-deliverd` with `safety-state` only: the state from
 /// `<sd>/safety`, the heartbeat stale when `<sd>/stale` exists.
@@ -143,6 +160,7 @@ fn dpkg_root(dir: &Path) -> PathBuf {
         "var/lib/robodr",
         "fake-sd/active",
         "fake-sd/crashing",
+        "fake-sd/crash-on-restart",
     ] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
@@ -183,10 +201,23 @@ fn dpkg_root(dir: &Path) -> PathBuf {
 
 /// The maintainer scripts' `gated_restart` block (packaging/deb/postinst).
 fn gated_block() -> String {
-    let t = std::fs::read_to_string(repo().join("packaging/deb/postinst")).unwrap();
+    gated_block_of("packaging/deb/postinst")
+}
+
+fn gated_block_of(file: &str) -> String {
+    let t = std::fs::read_to_string(repo().join(file)).unwrap();
     let a = t.find("# >>> gated_restart").unwrap();
     let b = t.find("# <<< gated_restart").unwrap();
     t[a..b].to_string()
+}
+
+/// The rpm `post` scriptlet carries the very block the tests run (and
+/// install-bundle.sh recognises a gate-aware package by it).
+#[test]
+fn the_rpm_post_scriptlet_carries_the_same_gated_restart_block() {
+    let deb = gated_block();
+    assert_eq!(gated_block_of("packaging/rpm/post"), deb);
+    assert!(deb.contains("\nmark_pending_restart() {"), "{deb}");
 }
 
 /// What the real postinst does on upgrade with the gated units (and,
@@ -201,7 +232,16 @@ fn upgrade_postinst() -> String {
 
 /// A stub `robodr` package (formats RBF1:1) with `postinst`.
 fn stub_deb(dir: &Path, version: &str, postinst: &str) -> PathBuf {
+    stub_deb_with(dir, version, postinst, &[])
+}
+
+/// A stub `robodr` package with `postinst` and the executables `files`
+/// (path inside the package, content).
+fn stub_deb_with(dir: &Path, version: &str, postinst: &str, files: &[(&str, &str)]) -> PathBuf {
     let st = dir.join(format!("stage-{version}"));
+    for (p, text) in files {
+        write_exec(&st.join(p), text);
+    }
     std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
     std::fs::create_dir_all(st.join("usr/lib/robodr")).unwrap();
     std::fs::create_dir_all(st.join("usr/share/robodr")).unwrap();
@@ -232,8 +272,17 @@ fn stub_deb(dir: &Path, version: &str, postinst: &str) -> PathBuf {
 
 /// An extracted bundle directory around `deb`.
 fn bundle(dir: &Path, deb: &Path, name: &str) -> PathBuf {
+    bundle_floor(dir, deb, name, None)
+}
+
+/// An extracted bundle directory around `deb`, with a `security-floor`
+/// file naming `floor` when given.
+fn bundle_floor(dir: &Path, deb: &Path, name: &str, floor: Option<&str>) -> PathBuf {
     let b = dir.join(name);
     std::fs::create_dir_all(&b).unwrap();
+    if let Some(f) = floor {
+        std::fs::write(b.join("security-floor"), format!("min_version={f}\n")).unwrap();
+    }
     std::fs::copy(deb, b.join(deb.file_name().unwrap())).unwrap();
     let s = b.join("install-bundle.sh");
     std::fs::copy(repo().join("packaging/install-bundle.sh"), &s).unwrap();
@@ -700,4 +749,280 @@ fn the_builtin_verifier_replaces_minisign_and_refuses_unsigned() {
     let o = run(&[t.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(2), "{}", out(&o));
     assert!(out(&o).contains("self-test"), "{}", out(&o));
+}
+
+/// Phase 2 review (high): a bundle's `security-floor` used to overwrite the
+/// release the automatic rollback goes back to with the old floor value.
+#[test]
+fn auto_rollback_goes_to_the_replaced_release_when_the_bundle_raises_the_floor() {
+    if !available("floor_rollback", &[]) {
+        return;
+    }
+    let u = Unit::new("floorrb", true);
+    u.migrated();
+    let good = "#!/bin/sh\nrm -f /fake-sd/crashing/robodr-agentd.service\n";
+    let bad = "#!/bin/sh\n: >/fake-sd/crashing/robodr-agentd.service\n";
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", good), "b1");
+    let b2 = bundle_floor(
+        &u.dir,
+        &stub_deb(&u.dir, "0.2.0-1", bad),
+        "b2",
+        Some("0.0.9-1"),
+    );
+    let b3 = bundle_floor(
+        &u.dir,
+        &stub_deb(&u.dir, "0.3.0-1", good),
+        "b3",
+        Some("0.0.9-1"),
+    );
+    let b4 = bundle_floor(
+        &u.dir,
+        &stub_deb(&u.dir, "0.4.0-1", bad),
+        "b4",
+        Some("0.1.0-1"),
+    );
+    ok(&u.run(&b1, &["install"], true));
+    u.active(AG);
+    u.safety("idle");
+    // No floor recorded before: the bundle's floor is the first one.
+    let o = u.run(&b2, &["install", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("AUTOMATIC ROLLBACK to 0.1.0-1"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.1.0-1");
+    // The bundle raises the recorded floor (0.0.9-1 to 0.1.0-1): the
+    // rollback still goes to the replaced 0.3.0-1, not to the old floor.
+    ok(&u.run(&b3, &["install", "--health-timeout", "3"], true));
+    let o = u.run(&b4, &["install", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("AUTOMATIC ROLLBACK to 0.3.0-1")
+            && out(&o).contains("rolled back to 0.3.0-1"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.3.0-1");
+}
+
+/// Phase 2 review (high): a release from before the safety-state gate
+/// restarts the gateway and the executor from its own post-install
+/// script, so a rollback to it can never be deferred.
+#[test]
+fn rollback_to_a_release_without_the_gate_is_never_deferred() {
+    if !available("legacy_rollback", &[]) {
+        return;
+    }
+    let u = Unit::new("legacyrb", true);
+    u.migrated();
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", LEGACY_POSTINST), "b1");
+    let pi = upgrade_postinst();
+    let b2 = bundle(&u.dir, &stub_deb(&u.dir, "0.2.0-1", &pi), "b2");
+    let bad = format!("{pi}: >/fake-sd/crashing/robodr-agentd.service\n");
+    let b3 = bundle(&u.dir, &stub_deb(&u.dir, "0.3.0-1", &bad), "b3");
+    ok(&u.run(&b1, &["install"], true));
+    for s in [GW, EX, AG] {
+        u.active(s);
+    }
+    u.safety("idle");
+    ok(&u.run(&b2, &["install", "--health-timeout", "3"], true));
+    assert_eq!(u.installed(), "0.2.0-1");
+    // Moving: rollback --defer-restart to the legacy release is refused,
+    // nothing installed, nothing restarted.
+    u.safety("moving_fast");
+    u.clear_log();
+    let o = u.run(
+        &b2,
+        &[
+            "rollback",
+            "0.1.0-1",
+            "--defer-restart",
+            "--health-timeout",
+            "2",
+        ],
+        true,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("REFUSED") && out(&o).contains("predate the safety-state gate"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.2.0-1");
+    assert!(!u.log().contains("try-restart"), "{}", u.log());
+    // A deferred upgrade whose automatic rollback would land on the legacy
+    // release: refused while the state is still closed (the unhealthy
+    // release stays, nothing is restarted).
+    ok(&u.run(
+        &b2,
+        &[
+            "rollback",
+            "0.1.0-1",
+            "--allow-gateway-restart",
+            "--health-timeout",
+            "3",
+        ],
+        true,
+    ));
+    assert_eq!(u.installed(), "0.1.0-1");
+    u.clear_log();
+    let o = u.run(
+        &b3,
+        &["install", "--defer-restart", "--health-timeout", "2"],
+        true,
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("automatic rollback impossible")
+            && out(&o).contains("predate the safety-state gate"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.3.0-1");
+    assert!(
+        !u.log().contains(&format!("try-restart {GW}")),
+        "{}",
+        u.log()
+    );
+    // Gate open: the rollback to the legacy release runs (its own
+    // postinst restarts the two) and nothing stays pending.
+    std::fs::remove_file(u.sd.join("crashing").join(AG)).unwrap();
+    u.safety("idle");
+    u.clear_log();
+    ok(&u.run(&b3, &["rollback", "0.1.0-1", "--health-timeout", "3"], true));
+    assert_eq!(u.installed(), "0.1.0-1");
+    assert!(
+        u.log().contains(&format!("try-restart {GW}")),
+        "{}",
+        u.log()
+    );
+    assert_eq!(u.pending(), "");
+}
+
+/// Phase 2 review (medium): `restart-pending` checks the unit's health
+/// after the restart, and `list` shows what is still pending.
+#[test]
+fn restart_pending_checks_health_and_list_shows_pending() {
+    if !available("pending_health", &[]) {
+        return;
+    }
+    let u = Unit::new("pendhealth", true);
+    u.migrated();
+    let pi = upgrade_postinst();
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", &pi), "b1");
+    let b2 = bundle(&u.dir, &stub_deb(&u.dir, "0.2.0-1", &pi), "b2");
+    ok(&u.run(&b1, &["install"], true));
+    for s in [GW, EX, AG] {
+        u.active(s);
+    }
+    u.safety("moving_slow");
+    ok(&u.run(
+        &b2,
+        &["install", "--defer-restart", "--health-timeout", "2"],
+        true,
+    ));
+    let o = ok(&u.run(&b2, &["list"], true));
+    assert!(
+        o.contains("pending restart") && o.contains(GW) && o.contains(EX),
+        "{o}"
+    );
+    assert!(o.contains("installed: 0.2.0-1"), "{o}");
+    // The gateway does not come back on the new binaries.
+    std::fs::write(u.sd.join("crash-on-restart").join(GW), "").unwrap();
+    u.safety("idle");
+    let o = u.run(&b2, &["restart-pending", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("HEALTH CHECK FAILED") && out(&o).contains(GW),
+        "{}",
+        out(&o)
+    );
+}
+
+/// Phase 2 review (low): `prune` never runs without knowing the installed
+/// release (it could delete the installed release's kept copy).
+#[test]
+fn prune_refuses_without_the_installed_version() {
+    if !available("prune_unknown", &[]) {
+        return;
+    }
+    let u = Unit::new("pruneunk", false);
+    let b1 = bundle(&u.dir, &stub_deb(&u.dir, "0.1.0-1", "#!/bin/sh\n"), "b1");
+    let b2 = bundle(&u.dir, &stub_deb(&u.dir, "0.2.0-1", "#!/bin/sh\n"), "b2");
+    ok(&u.run(&b1, &["install"], true));
+    ok(&u.run(&b2, &["install"], true));
+    ok(&u.run(&b2, &["rollback", "0.1.0-1"], true));
+    // The package database no longer reports robodr (removed, config
+    // files left): the installed version is unknown.
+    ok(&Command::new("dpkg")
+        .arg(format!("--root={}", u.root.display()))
+        .args(["-r", "robodr"])
+        .env("PATH", &u.path)
+        .output()
+        .unwrap());
+    let o = u.run(&b2, &["prune", "--keep", "1"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(out(&o).contains("cannot determine"), "{}", out(&o));
+    let rel = u.root.join("var/lib/robodr/releases");
+    assert!(rel.join("0.1.0-1").is_dir() && rel.join("0.2.0-1").is_dir());
+}
+
+/// Phase 1 not_done T9-alpha1-gate: upgrading from a release whose
+/// robodr-deliverd has no `safety-state` reads the gate with the new
+/// package's own robodr-deliverd (from the verified bundle).
+#[test]
+fn an_upgrade_from_alpha1_reads_the_gate_with_the_new_package() {
+    if !available("alpha1_gate", &[]) {
+        return;
+    }
+    let u = Unit::new("alpha1", true);
+    u.migrated();
+    write_exec(&u.root.join("usr/sbin/robodr-deliverd"), OLD_DELIVERD);
+    let b1 = bundle(
+        &u.dir,
+        &stub_deb_with(
+            &u.dir,
+            "0.1.0-1",
+            LEGACY_POSTINST,
+            &[("usr/sbin/robodr-deliverd", OLD_DELIVERD)],
+        ),
+        "b1",
+    );
+    let pi = upgrade_postinst();
+    let b2 = bundle(
+        &u.dir,
+        &stub_deb_with(
+            &u.dir,
+            "0.2.0-1",
+            &pi,
+            &[("usr/sbin/robodr-deliverd", FAKE_DELIVERD)],
+        ),
+        "b2",
+    );
+    ok(&u.run(&b1, &["install"], true));
+    u.active(GW);
+    // Moving: refused, the state named (read by the new package's reader).
+    u.safety("moving_fast");
+    let o = u.run(&b2, &["install", "--health-timeout", "2"], true);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("REFUSED") && out(&o).contains("moving_fast"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(u.installed(), "0.1.0-1");
+    // Idle: installed and the gateway restarted through the gate.
+    u.safety("idle");
+    u.clear_log();
+    let o = ok(&u.run(&b2, &["install", "--health-timeout", "3"], true));
+    assert!(o.contains("new package's robodr-deliverd"), "{o}");
+    assert_eq!(u.installed(), "0.2.0-1");
+    assert!(
+        u.log().contains(&format!("try-restart {GW}")),
+        "{}",
+        u.log()
+    );
+    assert_eq!(u.pending(), "");
 }
