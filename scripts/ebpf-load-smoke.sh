@@ -7,6 +7,7 @@
 # to set the rules off, and removes what it wrote.
 #
 #   scripts/ebpf-load-smoke.sh PULSARD_BINARY [RULES_DIR] [OUT_DIR]
+#   scripts/ebpf-load-smoke.sh --self-test   (the /etc cleanup; no root)
 #
 # The agentd end is a stand-in: a unix stream socket that records the
 # threat-forward protocol lines (`{"kind":"threat","rule":...}`), the same
@@ -22,6 +23,70 @@
 # Needs: a kernel with BTF (/sys/kernel/btf/vmlinux), bash, python3, strace.
 # Exit: 0 every expected rule fired and was forwarded, 1 otherwise, 2 usage.
 set -euo pipefail
+
+# What the triggers write under /etc is removed again on exit. `etc` is /etc
+# except in --self-test, which runs the same cleanup against a temp dir.
+etc=/etc
+pids=()
+work=""
+etc_robodr_existed=0
+# The /etc/robodr trigger creates /etc/robodr too when it is missing (a
+# runner without robodr installed): remove it again then, and only then
+# (rmdir: never a directory something else has put files into meanwhile).
+note_etc_robodr() {
+    etc_robodr_existed=0
+    if [[ -d "$etc/robodr" ]]; then etc_robodr_existed=1; fi
+}
+# shellcheck disable=SC2317 # called by the EXIT trap
+cleanup() {
+    for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+    wait 2>/dev/null || true
+    rm -f "$etc/ld.so.conf.d/zz-robodr-ebpf-smoke.conf" "$etc/modules-load.d/zz-robodr-ebpf-smoke.conf"
+    rmdir "$etc/robodr/zz-ebpf-smoke" 2>/dev/null || true
+    [[ $etc_robodr_existed == 1 ]] || rmdir "$etc/robodr" 2>/dev/null || true
+    if [[ -n "$work" ]]; then rm -rf "$work"; fi
+}
+
+# The cleanup above against a temp dir standing in for /etc (no root, no
+# eBPF): what the triggers write goes, /etc/robodr goes only when this run
+# created it and it holds nothing else.
+self_test() {
+    local t ok=0
+    t="$(mktemp -d)"
+    etc="$t/etc"
+    # check NAME BEFORE DURING EXPECT: bash snippets run in $etc before the
+    # run starts, while it runs, and (must succeed) after the cleanup.
+    check() {
+        rm -rf "$etc" && mkdir -p "$etc/ld.so.conf.d" "$etc/modules-load.d"
+        (cd "$etc" && bash -c "$2")
+        work="$(mktemp -d "$t/work.XXXXXX")"
+        note_etc_robodr
+        mkdir -p "$etc/robodr/zz-ebpf-smoke"
+        echo x >"$etc/ld.so.conf.d/zz-robodr-ebpf-smoke.conf"
+        echo x >"$etc/modules-load.d/zz-robodr-ebpf-smoke.conf"
+        (cd "$etc" && bash -c "$3")
+        cleanup
+        if [[ -e "$etc/ld.so.conf.d/zz-robodr-ebpf-smoke.conf" || -e "$etc/modules-load.d/zz-robodr-ebpf-smoke.conf" \
+            || -e "$etc/robodr/zz-ebpf-smoke" || -e "$work" ]] || ! (cd "$etc" && bash -c "$4"); then
+            echo "self-test FAIL: $1" >&2
+        else
+            ok=$((ok + 1))
+        fi
+    }
+    check "absent before: /etc/robodr removed" "" "" "[[ ! -e robodr ]]"
+    check "present and empty before: kept" "mkdir robodr" "" "[[ -d robodr ]]"
+    check "present with a file before: kept with it" "mkdir robodr && echo c >robodr/agentd.toml" "" \
+        "[[ -f robodr/agentd.toml ]]"
+    check "absent before, a file added during the run: kept" "" "echo c >robodr/agentd.toml" \
+        "[[ -f robodr/agentd.toml ]]"
+    rm -rf "$t"
+    echo "self-test: $ok/4 passed"
+    [[ $ok -eq 4 ]]
+}
+if [[ "${1:-}" == --self-test ]]; then
+    self_test
+    exit
+fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -49,20 +114,7 @@ TRIGGERS=(
     "RoboDR: Directory created in a RoboDR or Pulsar protected path|mkdir -p /etc/robodr/zz-ebpf-smoke"
 )
 
-pids=()
-# The /etc/robodr trigger creates /etc/robodr too when it is missing (a
-# runner without robodr installed): remove it again then, and only then.
-etc_robodr_existed=0
-[[ -d /etc/robodr ]] && etc_robodr_existed=1
-# shellcheck disable=SC2317 # called by the EXIT trap
-cleanup() {
-    for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-    wait 2>/dev/null || true
-    rm -f /etc/ld.so.conf.d/zz-robodr-ebpf-smoke.conf /etc/modules-load.d/zz-robodr-ebpf-smoke.conf
-    rmdir /etc/robodr/zz-ebpf-smoke 2>/dev/null || true
-    [[ $etc_robodr_existed == 1 ]] || rmdir /etc/robodr 2>/dev/null || true
-    rm -rf "$work"
-}
+note_etc_robodr
 trap cleanup EXIT
 
 # A TCP listener for the connect trigger, and the agentd stand-in.
