@@ -22,7 +22,7 @@
 //! |---|---|
 //! | the SPDP was sent by the participant itself (not relayed) and carries one `PID_PARTICIPANT_GUID` | a relayed or ambiguous announcement says nothing about where the participant runs |
 //! | its source IP is one of the identity's `ips`, and the binding check does not reject it (not contested, not outside an existing binding, not a forged loopback source) | the identity is a place on the robot's network |
-//! | `PID_VENDORID` equals `vendor` | a Cyclone process cannot take a Fast DDS node's place |
+//! | `PID_VENDORID` equals `vendor`; for a DDS-Security participant (identity token in SPDP, prefix top bit set) the first two prefix bytes may match instead | a Cyclone process cannot take a Fast DDS node's place; a secured prefix is derived from the certificate subject, and `learn` takes `vendor` from the prefix |
 //! | the SPDP user-data enclave equals `enclave`, when set | the SROS 2 enclave is stable per node set |
 //! | fewer than `max_instances` live prefixes hold the identity | a rogue started next to the live controller stays unknown |
 //!
@@ -335,10 +335,16 @@ impl IdentityResolver {
             return Resolution::NoMatch;
         };
         let enclave = spdp.enclave();
+        // DDS-Security derives a secured participant's GUID prefix from its
+        // certificate subject (top bit set), so a profile learned from the
+        // prefix holds those subject-hash bytes as `vendor` (seen on real
+        // Fast DDS 2.6 SROS 2 captures). They are stable per certificate
+        // subject and can never equal a real vendor id (0x01xx).
+        let secured_hash = (spdp.security.is_secured() && p[0] & 0x80 != 0).then_some([p[0], p[1]]);
         let mut full: Option<Resolution> = None;
         for (idx, m) in self.ids.iter().enumerate() {
             if !m.ips.contains(&ip)
-                || m.vendor != vendor
+                || (m.vendor != vendor && Some(m.vendor) != secured_hash)
                 || m.enclave.as_deref().is_some_and(|e| enclave != Some(e))
             {
                 continue;
@@ -353,7 +359,9 @@ impl IdentityResolver {
                         last: now,
                         lease,
                         ip,
-                        vendor,
+                        // The matched form (vendor id, or subject hash of
+                        // a secured participant), for node-evidence moves.
+                        vendor: m.vendor,
                         confirmed,
                     },
                 );
@@ -452,6 +460,7 @@ mod tests {
             default_multicast: Vec::new(),
             alternate_guid_prefixes: Vec::new(),
             from_fragments: false,
+            security: Default::default(),
         }
     }
 
@@ -606,6 +615,7 @@ mod node_evidence_tests {
             default_multicast: Vec::new(),
             alternate_guid_prefixes: Vec::new(),
             from_fragments: false,
+            security: Default::default(),
         }
     }
 

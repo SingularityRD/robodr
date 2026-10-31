@@ -12,7 +12,10 @@
 //!    pass), so a key the daemon would ignore with a log warning (a typo such
 //!    as `bindng`, `hold_msec`) is reported here as a warning too;
 //! 3. runs [`Config::validate`] (ranges, absolute paths, port overlap, ...);
-//! 4. reads the profile and evaluates its trust (signature, metadata,
+//! 4. lists `/dev/shm` for DDS shared-memory segments (Fast DDS SHM,
+//!    data sharing, iceoryx): their traffic is invisible to the capture
+//!    (warning; see `robodr_capture::shm`);
+//! 5. reads the profile and evaluates its trust (signature, metadata,
 //!    revocation, anti-rollback decision against the current state file)
 //!    with [`load_profile_deferred`], **without writing** the state file,
 //!    and reports whether the daemon would enforce it.
@@ -74,7 +77,18 @@ impl CheckReport {
 /// Check the file at `path` (see the module docs).
 pub fn check_config_file(path: &Path) -> CheckReport {
     match read_bounded(path) {
-        Ok(text) => check_config_text(&text, crate::config::system_default_route_interface),
+        Ok(text) => {
+            let mut r = check_config_text(&text, crate::config::system_default_route_interface);
+            match robodr_capture::shm::scan_dir(Path::new(robodr_capture::shm::DEV_SHM)) {
+                Ok(scan) => r.warnings.extend(shm_warning(&scan)),
+                Err(e) => r.warnings.push(format!(
+                    "cannot list {}: {} (DDS shared-memory use on this host not checked)",
+                    robodr_capture::shm::DEV_SHM,
+                    sanitize(&e.to_string())
+                )),
+            }
+            r
+        }
         Err(e) => CheckReport {
             errors: vec![format!(
                 "{}: {}",
@@ -84,6 +98,26 @@ pub fn check_config_file(path: &Path) -> CheckReport {
             ..CheckReport::default()
         },
     }
+}
+
+/// The warning for DDS shared-memory segments found on this host
+/// (`/dev/shm`), if any: DDS traffic between this host's participants over
+/// them is never captured.
+pub fn shm_warning(scan: &robodr_capture::shm::ShmScan) -> Option<String> {
+    (!scan.is_empty()).then(|| {
+        format!(
+            "{} holds DDS shared-memory segments ({}{}): DDS traffic between processes on this \
+             host goes over shared memory and is invisible to the capture; commission the \
+             robot with UDP-only transports (docs/DDS-TRANSPORTS.md)",
+            robodr_capture::shm::DEV_SHM,
+            scan.summary(),
+            if scan.truncated {
+                ", listing truncated"
+            } else {
+                ""
+            }
+        )
+    })
 }
 
 fn read_bounded(path: &Path) -> Result<String, String> {
@@ -253,6 +287,16 @@ pub fn check_config_text(
             "listen_spdp = false and capture.enabled = false: the sensor has no datagram source"
                 .into(),
         );
+    }
+
+    if let Some(policy) = &settings.pipeline.sros2 {
+        r.summary.push(format!(
+            "SROS 2 keystore: {} grant(s); DDS-Security identities are checked against it",
+            policy.grants.len()
+        ));
+        r.summary.extend(policy.publish_summary());
+        r.warnings
+            .extend(policy.visibility().into_iter().map(|v| sanitize(&v)));
     }
 
     // Profile + trust, without writing the anti-rollback state.
@@ -470,6 +514,45 @@ mod tests {
         );
         assert!(r.errors.iter().any(|e| e.contains("pcap_replay")), "{r:?}");
         assert!(r.warnings.iter().any(|w| w.contains("LAB ONLY")), "{r:?}");
+    }
+
+    #[test]
+    fn shared_memory_segments_on_this_host_are_warned() {
+        let s = robodr_capture::shm::scan_names(["fastrtps_port7411", "fastrtps_port7411_el"]);
+        let w = shm_warning(&s).unwrap();
+        assert!(w.contains("Fast DDS shared-memory transport (1)"), "{w}");
+        assert!(shm_warning(&robodr_capture::shm::scan_names(["x"])).is_none());
+    }
+
+    #[test]
+    fn sros2_keystore_is_loaded_and_summarised() {
+        let d = tmpdir("sros2");
+        let p = unlocked_profile(&d);
+        let ks = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/captures/ros2-humble/sros2");
+        let r = check_config_text(
+            &section(
+                &p,
+                &format!("sros2_keystore = {:?}\n", ks.display().to_string()),
+            ),
+            eth0,
+        );
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert!(r.summary.iter().any(|s| s.contains("2 grant(s)")), "{r:?}");
+        assert!(r.warnings.iter().any(|w| w.contains("no topic")), "{r:?}");
+        let r = check_config_text(
+            &section(&p, "sros2_keystore = \"relative/enclaves\"\n"),
+            eth0,
+        );
+        assert!(r.errors.iter().any(|e| e.contains("absolute")), "{r:?}");
+        let r = check_config_text(
+            &section(&p, "sros2_keystore = \"/nonexistent/enclaves\"\n"),
+            eth0,
+        );
+        assert!(
+            r.errors.iter().any(|e| e.contains("sros2_keystore")),
+            "{r:?}"
+        );
     }
 
     #[test]

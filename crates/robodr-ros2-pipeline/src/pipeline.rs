@@ -27,6 +27,8 @@
 //! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*`: [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_REFUSED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`] | Medium |
 //! | | [`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`] (geometry, timeout, distance rule), [`rules::CAPTURE_NOT_UDP`] | Low |
 //! | | [`rules::CAPTURE_BAD_CHECKSUM`] | Low; Medium when bursty |
+//! | with an SROS 2 policy ([`PipelineOptions::sros2`]): an SPDP without a DDS-Security identity on a domain requiring authentication, or claiming a certificate subject no keystore grant names | [`crate::sros2::rules::UNTRUSTED_SECURITY_IDENTITY`] | Medium / High |
+//! | an SPDP announcement advertises shared-memory (Fast DDS SHM, Cyclone Iceoryx, Connext SHMEM), TCP or unknown-kind locators | [`rules::CAPTURE_UNSUPPORTED_TRANSPORT`] (one per host and transport set) | Medium |
 //! | | [`rules::CAPTURE_UNSUPPORTED_MIDDLEWARE`]: Zenoh (`rmw_zenoh_cpp`) packets on the bus, which the sensor cannot decode | **High** while the capture has accepted no RTPS at all (the sensor is blind to this robot), Medium when RTPS is seen too (part of the bus is not inspected) |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
@@ -330,6 +332,16 @@ pub mod rules {
     /// at all (blind), Medium otherwise. Rate limited like every
     /// `robot.capture.*` rule.
     pub const CAPTURE_UNSUPPORTED_MIDDLEWARE: &str = "robot.capture.unsupported_middleware";
+    /// Participants on a host advertise SPDP locators of a transport the
+    /// capture cannot inspect: shared memory (Fast DDS SHM, on by default in
+    /// Fast DDS 2.x / ROS 2 Humble; Cyclone DDS Iceoryx; Connext SHMEM),
+    /// whose traffic between participants on that host never reaches any
+    /// interface, or TCP / unknown kinds, which are not decoded. Motion
+    /// commands between same-host processes may then be invisible. One
+    /// finding per (source IP, transports), Medium. Rate limited like every
+    /// `robot.capture.*` rule. Commissioning: UDP-only transports
+    /// (docs/DDS-TRANSPORTS.md).
+    pub const CAPTURE_UNSUPPORTED_TRANSPORT: &str = "robot.capture.unsupported_transport";
     /// A discovery announcement repeats an identity parameter (topic, type,
     /// GUID, key hash, status) with conflicting values: DDS stacks differ on
     /// which value wins, so what was inspected may not be what a stack acts
@@ -383,6 +395,10 @@ pub struct PipelineOptions {
     /// Unitree legacy UDP (Go1 generation, [`crate::legacy`]); off by
     /// default.
     pub legacy: LegacyOptions,
+    /// The robot's SROS 2 keystore policy ([`crate::sros2`]): SPDP
+    /// DDS-Security identities are judged against it. `None` (default) =
+    /// not checked.
+    pub sros2: Option<std::sync::Arc<crate::sros2::Sros2Policy>>,
 }
 
 impl Default for PipelineOptions {
@@ -398,6 +414,7 @@ impl Default for PipelineOptions {
             max_findings_per_datagram: DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
             motion: MotionOptions::default(),
             legacy: LegacyOptions::default(),
+            sros2: None,
         }
     }
 }
@@ -1082,6 +1099,7 @@ impl Pipeline {
         self.profile_findings(&report, src_ip, &mut out);
         self.binding_findings(&report, ip, ingress, ambiguity.any(), &mut out, now);
         self.removal_findings(&report, src_ip, ip, ingress, now, &mut out);
+        self.transport_findings(&report, src_ip, &mut out);
         self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
@@ -1904,6 +1922,62 @@ impl Pipeline {
             src_ip,
             prefix,
         );
+    }
+
+    /// SPDP locators of transports the capture cannot inspect
+    /// ([`rules::CAPTURE_UNSUPPORTED_TRANSPORT`]). The detail names the host
+    /// and the transports only (not the participant), so dedup keeps it to
+    /// one finding per host and transport set; the participant is attached
+    /// as the finding's subject.
+    fn transport_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        out: &mut Vec<Candidate>,
+    ) {
+        if let Some(policy) = self.opts.sros2.clone() {
+            for spdp in &report.participants {
+                if let Some(dev) = policy.judge_spdp(spdp, src_ip) {
+                    self.push_for(out, dev, src_ip, Some(spdp.guid_prefix));
+                }
+            }
+        }
+        for spdp in &report.participants {
+            let t = spdp.uninspected_transports();
+            if t.is_empty() {
+                continue;
+            }
+            let shm = t
+                .iter()
+                .any(|(t, _)| *t == robodr_rtps::LocatorTransport::SharedMemory);
+            let kinds: Vec<String> = t
+                .iter()
+                .map(|(t, k)| format!("{} ({k})", t.name()))
+                .collect();
+            let why = if shm {
+                "traffic between DDS participants on that host over shared memory never reaches \
+                 a network interface, so their discovery and data (motion commands included) \
+                 are not inspected"
+            } else {
+                "RoboDR does not decode RTPS over these transports, so traffic on them is not \
+                 inspected"
+            };
+            let detail = format!(
+                "participant(s) on {src_ip} advertise {} locators: {why}; commission the robot \
+                 with UDP-only DDS transports (docs/DDS-TRANSPORTS.md)",
+                kinds.join(", ")
+            );
+            self.push_for(
+                out,
+                Deviation::new(
+                    rules::CAPTURE_UNSUPPORTED_TRANSPORT,
+                    Severity::Medium,
+                    detail,
+                ),
+                src_ip,
+                Some(spdp.guid_prefix),
+            );
+        }
     }
 
     fn protocol_findings(

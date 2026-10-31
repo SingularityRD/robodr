@@ -93,8 +93,14 @@
 //!   traffic never touches a network interface, not even loopback. For
 //!   same-host discovery this depends on the vendor and version (Fast DDS
 //!   still sends SPDP/SEDP over UDP while data goes over SHM; with
-//!   data-sharing / Iceoryx, user data is invisible here). Per-vendor
-//!   validation and an SHM observation path are Sprint 2 follow-ups.
+//!   data-sharing / Iceoryx, user data is invisible here). What is
+//!   reported instead: a participant's SPDP advertising shared-memory
+//!   locators (`robot.capture.unsupported_transport` in
+//!   `robodr-ros2-pipeline`; on real Fast DDS 2.6 / ROS 2 Humble captures
+//!   every participant with default transports does), and the host's DDS
+//!   segments in `/dev/shm` ([`shm`], `robodr-ros2-watch --check-config`).
+//!   Commissioning prerequisite: UDP-only transports
+//!   (`docs/DDS-TRANSPORTS.md`).
 //! - RTPS over TCP (Fast DDS TCP transport, Connext TCP/TLS) is not decoded.
 //! - DDS Security with RTPS-level protection (SRTPS) or encrypted discovery
 //!   hides topic names; the RTPS header (participant GUID) is still visible.
@@ -149,6 +155,7 @@ pub mod middleware;
 pub mod pcap;
 pub mod ports;
 pub mod reassembly;
+pub mod shm;
 pub mod source;
 pub mod synth;
 

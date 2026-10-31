@@ -2388,6 +2388,7 @@ mod tests {
             default_multicast: Vec::new(),
             alternate_guid_prefixes: Vec::new(),
             from_fragments: false,
+            security: Default::default(),
         }
     }
 

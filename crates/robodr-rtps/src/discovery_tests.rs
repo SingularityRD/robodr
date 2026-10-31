@@ -174,8 +174,16 @@ fn spdp_ipv6_and_non_udp_locators() {
     let p = &r.participants[0];
     assert_eq!(p.metatraffic_unicast.len(), 2);
     assert_eq!(p.metatraffic_unicast[1].kind, 16);
-    assert_eq!(p.metatraffic_unicast[1].kind_name(), "other");
+    assert_eq!(p.metatraffic_unicast[1].kind_name(), "shm");
+    assert_eq!(
+        p.metatraffic_unicast[1].transport(),
+        crate::LocatorTransport::SharedMemory
+    );
     assert_eq!(p.unicast_locator_strings(), vec!["[fd00::20]:7410"]);
+    assert_eq!(
+        p.uninspected_transports(),
+        vec![(crate::LocatorTransport::SharedMemory, "shm")]
+    );
 }
 
 #[test]

@@ -398,6 +398,9 @@ pub struct SpdpInfo {
     /// gets a participant event.
     pub alternate_guid_prefixes: Vec<GuidPrefix>,
     pub from_fragments: bool,
+    /// DDS-Security parameters (identity / permissions tokens, security
+    /// info); default = none announced. See [`crate::security`].
+    pub security: crate::security::SpdpSecurity,
 }
 
 impl SpdpInfo {
@@ -419,6 +422,29 @@ impl SpdpInfo {
     /// Relayed by someone other than the participant itself.
     pub fn relayed(&self) -> bool {
         self.guid_prefix != self.source
+    }
+
+    /// Every transport the participant advertises a locator for that a
+    /// packet capture cannot inspect (shared memory, TCP, unknown kinds),
+    /// with the locator kind name, de-duplicated and sorted. Empty for a
+    /// UDP-only participant. Shared memory means peers on the same host may
+    /// exchange discovery and data that never reaches any interface.
+    pub fn uninspected_transports(&self) -> Vec<(crate::LocatorTransport, &'static str)> {
+        let mut out: Vec<(crate::LocatorTransport, &'static str)> = Vec::new();
+        for l in self
+            .metatraffic_unicast
+            .iter()
+            .chain(&self.metatraffic_multicast)
+            .chain(&self.default_unicast)
+            .chain(&self.default_multicast)
+        {
+            let t = l.transport();
+            if t.uninspected() && !out.contains(&(t, l.kind_name())) {
+                out.push((t, l.kind_name()));
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Renderable unicast locators (metatraffic first, then default),
@@ -663,6 +689,8 @@ struct Params {
     /// Endpoint locators (SEDP `PID_UNICAST_LOCATOR` / `PID_MULTICAST_LOCATOR`).
     eu: Vec<Locator>,
     em: Vec<Locator>,
+    /// DDS-Security tokens (SPDP).
+    security: crate::security::SpdpSecurity,
 }
 
 type Report = DatagramReport;
@@ -1031,6 +1059,13 @@ impl Report {
             PID_DEFAULT_MULTICAST_LOCATOR => push(self, &mut out.dm, v, le, pid),
             PID_UNICAST_LOCATOR => push(self, &mut out.eu, v, le, pid),
             PID_MULTICAST_LOCATOR => push(self, &mut out.em, v, le, pid),
+            crate::security::PID_IDENTITY_TOKEN
+            | crate::security::PID_PERMISSIONS_TOKEN
+            | crate::security::PID_PARTICIPANT_SECURITY_INFO
+                if !crate::security::apply_param(&mut out.security, pid, v, le) =>
+            {
+                self.anomaly(Anomaly::BadParameterValue(pid));
+            }
             _ => {} // everything else (QoS, vendor-specific 0x8000 PIDs) is ignored
         }
     }
@@ -1117,6 +1152,7 @@ impl Report {
                     default_multicast: p.dm,
                     alternate_guid_prefixes,
                     from_fragments: s.from_fragments,
+                    security: p.security,
                 });
             }
             DiscoveryTopic::Publications | DiscoveryTopic::Subscriptions => {
@@ -1404,6 +1440,7 @@ mod tests {
             default_multicast: Vec::new(),
             alternate_guid_prefixes: Vec::new(),
             from_fragments: false,
+            security: Default::default(),
         }
     }
 
