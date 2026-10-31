@@ -203,6 +203,53 @@ struct Shared {
     /// Journal heads that changed the epoch or went backwards, with the
     /// alarm they call for (taken by the main loop: recorded, finding).
     head_alarms: VecDeque<(JournalHead, String)>,
+    /// Whether the executor answers its event poll (sales-readiness T41).
+    reach: Reach,
+}
+
+/// The executor's reachability as the worker's event poll sees it.
+#[derive(Debug, Default, Clone)]
+struct Reach {
+    last_ok: Option<Instant>,
+    failing_since: Option<Instant>,
+    last_error: Option<String>,
+}
+
+/// The executor's reachability at one moment (see
+/// [`ExecutorLink::reach`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LinkReach {
+    /// Milliseconds since the executor last answered (`None`: never yet).
+    pub last_ok_age_ms: Option<u64>,
+    /// Milliseconds it has failed to answer (`None`: it answers, or has
+    /// not been polled yet).
+    pub unreachable_for_ms: Option<u64>,
+    /// The last error, while it fails.
+    pub last_error: Option<String>,
+}
+
+impl Reach {
+    fn ok(&mut self, now: Instant) {
+        self.last_ok = Some(now);
+        self.failing_since = None;
+        self.last_error = None;
+    }
+
+    fn fail(&mut self, now: Instant, e: &str) {
+        self.failing_since.get_or_insert(now);
+        self.last_error = Some(robodr_ros2_pipeline::sanitize(e));
+    }
+
+    fn at(&self, now: Instant) -> LinkReach {
+        let ms = |t: Instant| {
+            u64::try_from(now.saturating_duration_since(t).as_millis()).unwrap_or(u64::MAX)
+        };
+        LinkReach {
+            last_ok_age_ms: self.last_ok.map(ms),
+            unreachable_for_ms: self.failing_since.map(ms),
+            last_error: self.failing_since.and(self.last_error.clone()),
+        }
+    }
 }
 
 /// What an `events` answer's head means against the head agentd knew
@@ -418,10 +465,19 @@ impl ExecutorLink {
                             let g = lock(&sh);
                             (g.last_seq, g.head.clone())
                         };
-                        let Ok((evs, head)) =
-                            client.events_anchored(since, anchor.as_ref(), &mut || cell.get())
-                        else {
-                            break;
+                        let (evs, head) = match client.events_anchored(
+                            since,
+                            anchor.as_ref(),
+                            &mut || cell.get(),
+                        ) {
+                            Ok(r) => {
+                                lock(&sh).reach.ok(Instant::now());
+                                r
+                            }
+                            Err(e) => {
+                                lock(&sh).reach.fail(Instant::now(), &e);
+                                break;
+                            }
                         };
                         let Some(head) = head else {
                             // An executor that reports no head (older).
@@ -592,6 +648,12 @@ impl ExecutorLink {
 
     pub fn stats(&self) -> LinkStats {
         lock(&self.shared).stats
+    }
+
+    /// Whether the executor answers (its event poll runs every [`POLL`]):
+    /// `robot.agent.executor_unreachable` and the health record.
+    pub fn reach(&self) -> LinkReach {
+        lock(&self.shared).reach.at(Instant::now())
     }
 
     pub fn shutdown(&mut self) {

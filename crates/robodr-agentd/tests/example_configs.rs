@@ -151,7 +151,8 @@ fn full_example_control_plane_loads_with_its_soc_key() {
 /// (`rule_overrides[].rule` in `config/*.json` and the agent's example
 /// policy) is one some detector raises, i.e. in the OCSF rule catalog. An
 /// override of an id nothing emits silently does nothing (Pulsar host
-/// detections all arrive as `robot.host.pulsar_threat`).
+/// detections arrive as `robot.host.<rule>` since contract 2.5; an override
+/// of `robot.host.pulsar_threat` still covers every one of them).
 #[test]
 fn policy_overrides_name_cataloged_rules() {
     let generic = robodr_ocsf::rule_info("robot.nope.nothing");

@@ -824,6 +824,9 @@ pub struct DaemonSection {
     /// queue is drained. Off for a live daemon: an input that ends is then a
     /// health finding and the daemon keeps running ("unknown" state).
     pub exit_when_inputs_end: bool,
+    /// The periodic health record and the early-warning thresholds
+    /// ([`crate::selfcheck::SelfHealthSection`]).
+    pub self_health: crate::selfcheck::SelfHealthSection,
 }
 
 impl Default for DaemonSection {
@@ -837,6 +840,7 @@ impl Default for DaemonSection {
             lag_ms: 2_000,
             health_report_ms: 10_000,
             exit_when_inputs_end: false,
+            self_health: crate::selfcheck::SelfHealthSection::default(),
         }
     }
 }
@@ -1106,6 +1110,7 @@ pub fn validate_daemon(d: &DaemonSection) -> Result<(), String> {
     range("silence_ms", d.silence_ms, d.tick_ms, 86_400_000)?;
     range("lag_ms", d.lag_ms, 10, 3_600_000)?;
     range("health_report_ms", d.health_report_ms, 0, 86_400_000)?;
+    d.self_health.validate()?;
     Ok(())
 }
 

@@ -56,7 +56,7 @@ level, and every path must be absolute.
 | `gateway_feed` | Optional. Same keys as `host_threats`: the socket the in-path gateway writes its findings to. See "In-path gateway feed" below. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
 | `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `crl_files` (PEM or DER CRLs of the client CAs, reloaded when they change; `client_crl` is the older single-file spelling), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
-| `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
+| `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false, `self_health` (the health record and early warnings, below: `health_record_ms` 60000 (1000..=3600000; 0 = off), `credential_warn_days` 14, `credential_critical_days` 3, `clock_unsynced_grace_ms` 300000, `disk_warn_percent` 10, `disk_critical_percent` 3, `executor_unreachable_ms` 30000) |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
 is either a secret key file as written by `robodr-blackbox keygen --out FILE`
@@ -291,7 +291,11 @@ one JSON object per line:
 {"kind":"heartbeat","v":1,"sent":17,"dropped":0,"skipped_own":3}
 ```
 
-- **What a threat becomes.** A `robot.host.pulsar_threat` finding
+- **What a threat becomes.** A `robot.host.<rule>` finding: since
+  findings contract 2.5 each Pulsar rule RoboDR ships has its own id
+  (`robodr_ocsf::HOST_RULES`, e.g. `robot.host.interactive_shell`,
+  `robot.host.sros2_key_read`; title = the rule name), and a rule RoboDR
+  does not ship (a deployment's own) keeps `robot.host.pulsar_threat`
   (`Detector::Sensor`, source `host:<module>`, the rule's severity, Medium
   if none; OCSF data source `host_runtime`; the Pulsar rule name, pid,
   image and uid in the detail) and a correlation signal
@@ -303,10 +307,10 @@ one JSON object per line:
   `host_process_persistence`) fire. A threat from `robodr-sensor-ros2` is
   dropped and counted (`daemon.host_threats_own_skipped`): the daemon has
   it from its own pipeline. A response-policy `rule_overrides` entry is
-  matched on the finding's rule id, so it can only target
-  `robot.host.pulsar_threat` as a whole, never one Pulsar rule (the
-  shipped policy examples therefore no longer carry the former
-  `robot.host.unexpected_egress` override, which nothing emits).
+  matched on the finding's rule id, so it can target one host rule
+  (`robot.host.ros2_external_connection`); an override of
+  `robot.host.pulsar_threat` (written before 2.5) still covers every host
+  id without an override of its own.
 - **Peers.** The socket's directory must be owned by root or the daemon's
   user and not writable by group or others; an existing path must be a
   socket owned by the daemon's user. The socket is created `0600` or `0660`.
@@ -648,6 +652,36 @@ once per silence episode), `input_ended` (High), `queue_overflow` (Medium,
 deltas), `input_malformed` (Low, deltas), `pipeline_lag` (Medium, with
 hysteresis), `spool_full` (High) and `evidence_degraded` (High). Recurring
 counter findings are rate-limited by `health_report_ms`.
+
+### Health record and early warnings (`daemon.self_health`, `src/selfcheck.rs`)
+
+Every `health_record_ms` (default 60 s; the first one a period after
+start) the daemon reports a Low `robot.agent.health` finding that carries
+`entity_context.agent_health` (findings contract 2.5, §3g): the state and
+its reasons, the record's period, uptime and sequence number, the
+versions of `robodr-agentd` and the findings contract, every input's
+freshness and counters, finding / spool counters, the black box's state,
+the reachability of the executor, the in-path gateway's feed and the
+Pulsar forwarder, credential expiry, the kernel clock and the free space
+of the black-box, spool and control-plane filesystems. It is one finding
+per robot (an Update each period), signed and exported like any other: a
+SOC alerts when a robot's newest record is older than about three periods,
+which tells a dead or blind agent from a quiet robot. It is never fed to
+the correlation engine. `status.json` carries the same probes under
+`self_health`.
+
+The same probes raise early warnings (observe-only, like every health
+finding):
+
+| Rule | Severity | Raised |
+|---|---|---|
+| `robot.agent.credential_expiring` | Medium at `credential_warn_days` (14) or less before the control plane's certificate `notAfter` or a CRL's `nextUpdate`; High at `credential_critical_days` (3) or less, or expired | per credential on each escalation, then daily |
+| `robot.agent.clock_unsynced` | Medium | `adjtimex(2)` reports the clock unsynchronised for `clock_unsynced_grace_ms` (5 min); once per episode |
+| `robot.agent.clock_jump` | High | the agent's time guard saw the wall clock jump against the monotonic clock (> 1 s); at most every `health_report_ms` |
+| `robot.agent.disk_low` | Medium below `disk_warn_percent` (10 %) free, High below `disk_critical_percent` (3 %) | per filesystem (black box, spool, control-plane state) on each escalation, before `spool_full` / `evidence_degraded` |
+| `robot.agent.executor_unreachable` | High | executor v1 has not answered its event poll for `executor_unreachable_ms` (30 s); once per outage |
+
+Time synchronisation baseline (chrony with NTS, PTP): [`docs/TIME-SYNC.md`](../../docs/TIME-SYNC.md).
 
 Health findings are handed to the agent as `Detector::SelfHealth` and are
 **always observe-only**. A health problem, including an attacker starving or

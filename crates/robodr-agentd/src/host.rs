@@ -20,11 +20,14 @@
 //!    finding's black-box record as evidence reference, in the finding's
 //!    (already stricter) mode.
 //! 2. A finding through `Agent::handle_external(Detector::Sensor,
-//!    "host:<module>", ..)` with the single catalog rule id
-//!    [`HOST_THREAT_RULE`] (`robot.host.pulsar_threat`, data source
-//!    `host_runtime`): the Pulsar rule name is not an OCSF rule id
-//!    (`[a-z0-9._]`), so it travels in the finding's detail. Severity is the
-//!    rule's (`low`..`critical`), Medium when the producer gave none.
+//!    "host:<module>", ..)` with the rule's own OCSF rule id
+//!    `robot.host.<rule>` (findings contract 2.5,
+//!    [`robodr_ocsf::HOST_RULES`], data source `host_runtime`) when RoboDR
+//!    ships the Pulsar rule, else the fallback [`HOST_THREAT_RULE`]
+//!    (`robot.host.pulsar_threat`): a deployment's own rule. The Pulsar
+//!    rule name itself is not an OCSF rule id (`[a-z0-9._]`); it travels
+//!    in the finding's detail either way. Severity is the rule's
+//!    (`low`..`critical`), Medium when the producer gave none.
 //!
 //! A threat whose `source` is `robodr-sensor-ros2` is dropped and counted
 //! (`daemon.host_threats_own_skipped`): the forwarder should already skip it.
@@ -71,8 +74,15 @@ use serde::Deserialize;
 
 use crate::input::{EventSocket, Payload};
 
-/// OCSF rule id of a forwarded host threat's finding.
+/// OCSF rule id of a forwarded host threat's finding when its Pulsar rule
+/// has no id of its own (a deployment's own rule; contract 2.5).
 pub const HOST_THREAT_RULE: &str = "robot.host.pulsar_threat";
+
+/// Whether `rule` is a host-threat finding id (`robot.host.*`): never fed
+/// to the correlator as such (the threat's signal is its Pulsar rule).
+pub fn is_host_rule(rule: &str) -> bool {
+    rule.starts_with("robot.host.")
+}
 /// Threats of this Pulsar module are not taken (agentd has them already).
 pub const SENSOR_MODULE: &str = "robodr-sensor-ros2";
 /// Line protocol version.
@@ -238,7 +248,14 @@ impl HostThreat {
         self.pid.to_string()
     }
 
-    /// The finding's deviation ([`HOST_THREAT_RULE`]).
+    /// The finding's OCSF rule id: the Pulsar rule's own id when RoboDR
+    /// ships it ([`robodr_ocsf::host_rule_id`], exact name match), else
+    /// [`HOST_THREAT_RULE`].
+    pub fn finding_rule(&self) -> &'static str {
+        robodr_ocsf::host_rule_id(&self.rule).unwrap_or(HOST_THREAT_RULE)
+    }
+
+    /// The finding's deviation ([`Self::finding_rule`]).
     pub fn deviation(&self) -> Deviation {
         let mut ctx = format!("module {}", self.source);
         if let Some(c) = &self.category {
@@ -257,7 +274,7 @@ impl HostThreat {
             who.push_str(", in a container");
         }
         Deviation::new(
-            HOST_THREAT_RULE,
+            self.finding_rule(),
             self.severity(),
             format!("Pulsar host rule {:?} ({ctx}) fired for {who}", self.rule),
         )
@@ -604,7 +621,9 @@ mod tests {
         assert_eq!(t.process_entity(), "4242");
         assert!(!t.is_own_sensor());
         let d = t.deviation();
-        assert_eq!(d.rule_str(), HOST_THREAT_RULE);
+        // Contract 2.5 (T45): a shipped Pulsar rule has its own id.
+        assert_eq!(d.rule_str(), "robot.host.interactive_shell");
+        assert!(is_host_rule(d.rule_str()));
         assert!(
             d.detail.contains("RoboDR: Interactive shell"),
             "{}",
@@ -619,6 +638,10 @@ mod tests {
         let t = threat(r#"{"kind":"threat","v":1,"rule":"x","source":"m","pid":1}"#);
         assert_eq!(t.severity(), Severity::Medium);
         assert!(t.deviation().detail.contains("image unknown"));
+        // A rule RoboDR does not ship keeps the fallback id.
+        assert_eq!(t.deviation().rule_str(), HOST_THREAT_RULE);
+        assert!(is_host_rule(HOST_THREAT_RULE));
+        assert!(!is_host_rule("robot.agent.health"));
         assert_eq!(
             parse_host(r#"{"kind":"heartbeat","v":1,"sent":3,"dropped":2,"skipped_own":1}"#)
                 .unwrap(),

@@ -2366,3 +2366,42 @@ fn plan_serializes_to_json() {
     let back: ResponsePlan = serde_json::from_str(&j).unwrap();
     assert_eq!(back, plan);
 }
+
+/// Findings contract 2.5 (sales-readiness T45): a host finding's own id
+/// `robot.host.<rule>` takes its own override, else the one a policy wrote
+/// for the pre-2.5 single id `robot.host.pulsar_threat`; nothing else does.
+#[test]
+fn host_rule_overrides_fall_back_to_the_pulsar_threat_override() {
+    let mut p = ResponsePolicy::conservative_default(PlatformFamily::Ugv);
+    let ov = |rule: &str, max: Step| RuleOverride {
+        rule: rule.into(),
+        min_step: Step::Record,
+        max_step: max,
+        restrict: None,
+    };
+    assert!(p.override_for("robot.host.interactive_shell").is_none());
+    p.rule_overrides
+        .push(ov(policy::HOST_THREAT_FALLBACK_RULE, Step::Record));
+    p.validate().unwrap();
+    for id in [
+        "robot.host.interactive_shell",
+        "robot.host.pulsar_threat",
+        "robot.host.anything_new",
+    ] {
+        assert_eq!(
+            p.override_for(id).map(|o| o.rule.as_str()),
+            Some("robot.host.pulsar_threat"),
+            "{id}"
+        );
+    }
+    assert!(p.override_for(RULE_A).is_none());
+    assert!(p.override_for("robot.hostile.x").is_none());
+    // An override of the rule's own id wins.
+    p.rule_overrides
+        .push(ov("robot.host.interactive_shell", Step::Restrict));
+    assert_eq!(
+        p.override_for("robot.host.interactive_shell")
+            .map(|o| o.max_step),
+        Some(Step::Restrict)
+    );
+}

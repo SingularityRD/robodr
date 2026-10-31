@@ -102,6 +102,10 @@ pub struct TlsSpec {
     pub client_crls: usize,
     /// Live revocation counters (with CRLs).
     pub crl: Option<Arc<robodr_blackbox::crl::CrlStats>>,
+    /// `notAfter` (Unix seconds) of the robot's own certificate (the leaf
+    /// of `cert_chain`), for `robot.agent.credential_expiring`; `None` if
+    /// it could not be read.
+    pub server_not_after: Option<i64>,
 }
 
 impl fmt::Debug for TlsSpec {
@@ -272,6 +276,7 @@ impl TlsSection {
                 self.cert_chain.display()
             )
         })?;
+        let server_not_after = robodr_blackbox::crl::cert_not_after(leaf.as_ref());
         let client_cas = roots.len();
         let files: Vec<PathBuf> = self
             .client_crl
@@ -297,6 +302,7 @@ impl TlsSection {
             client_pins: pins.len(),
             client_crls,
             crl,
+            server_not_after,
         })
     }
 }

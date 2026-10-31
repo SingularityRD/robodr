@@ -198,6 +198,9 @@ pub const CATALOG_2_2_MINOR: u64 = 2;
 pub const CATALOG_2_3_MINOR: u64 = 3;
 /// Contract 2.x minor that added [`catalog_2_4`]'s entries.
 pub const CATALOG_2_4_MINOR: u64 = 4;
+/// Contract 2.x minor that added [`catalog_2_5`]'s entries (and
+/// `entity_context.agent_health`).
+pub const CATALOG_2_5_MINOR: u64 = 5;
 
 /// The trusted rule catalog of the current contract
 /// ([`crate::CONTRACT_VERSION`]). Unknown rule ids get a generic entry (the
@@ -210,6 +213,7 @@ pub fn rule_info(rule: &str) -> RuleInfo {
         .or_else(|| catalog_2_2(rule))
         .or_else(|| catalog_2_3(rule))
         .or_else(|| catalog_2_4(rule))
+        .or_else(|| catalog_2_5(rule))
         .unwrap_or(GENERIC)
 }
 
@@ -224,6 +228,7 @@ pub fn rule_known(rule: &str) -> bool {
         .or_else(|| catalog_2_2(rule))
         .or_else(|| catalog_2_3(rule))
         .or_else(|| catalog_2_4(rule))
+        .or_else(|| catalog_2_5(rule))
         .is_some()
 }
 
@@ -239,7 +244,8 @@ pub fn rule_known(rule: &str) -> bool {
 /// | 2.1 | base + 1.3 + 2.1 ([`catalog_2_1`]) |
 /// | 2.2 | base + 1.3 + 2.1 + 2.2 ([`catalog_2_2`]) |
 /// | 2.3 | base + 1.3 + 2.1 + 2.2 + 2.3 ([`catalog_2_3`]) |
-/// | 2.4+ | base + 1.3 + 2.1 + 2.2 + 2.3 + 2.4 ([`catalog_2_4`]) |
+/// | 2.4 | base + 1.3 + 2.1 + 2.2 + 2.3 + 2.4 ([`catalog_2_4`]) |
+/// | 2.5+ | base + 1.3 + 2.1 + 2.2 + 2.3 + 2.4 + 2.5 ([`catalog_2_5`]) |
 ///
 /// A malformed version gets the current catalog (and is rejected anyway).
 pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
@@ -257,12 +263,15 @@ pub fn rule_info_for_contract(rule: &str, contract_version: &str) -> RuleInfo {
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_3_MINOR);
     let with_2_4 =
         major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_4_MINOR);
+    let with_2_5 =
+        major > CONTRACT_MAJOR || (major == CONTRACT_MAJOR && minor >= CATALOG_2_5_MINOR);
     catalog_1_0(rule)
         .or_else(|| with_1_3.then(|| catalog_1_3(rule)).flatten())
         .or_else(|| with_2_1.then(|| catalog_2_1(rule)).flatten())
         .or_else(|| with_2_2.then(|| catalog_2_2(rule)).flatten())
         .or_else(|| with_2_3.then(|| catalog_2_3(rule)).flatten())
         .or_else(|| with_2_4.then(|| catalog_2_4(rule)).flatten())
+        .or_else(|| with_2_5.then(|| catalog_2_5(rule)).flatten())
         .unwrap_or(GENERIC)
 }
 
@@ -1103,6 +1112,83 @@ fn catalog_2_4(rule: &str) -> Option<RuleInfo> {
     })
 }
 
+/// Entries added in contract **2.5** (sales-readiness WP2): agentd's
+/// periodic health record and operational early warnings (data source
+/// `robodr_agent`), the ids other packages emit later (control-plane
+/// fencing, field self-test, gateway overload) and one id per shipped
+/// Pulsar host rule (data source `host_runtime`,
+/// [`crate::host_rules::HOST_RULES`]). No techniques. Not in 2.4 or
+/// earlier: an older validator applies the generic entry to these ids, and
+/// so does a 2.5 validator to an older message ([`rule_info_for_contract`]).
+fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
+    const AGENT: &str = "robodr_agent";
+    const MOTION: &str = "ros2_motion_commands";
+    const HOST: &str = "host_runtime";
+    const fn e(title: &'static str, desc: &'static str, data_source: &'static str) -> RuleInfo {
+        RuleInfo {
+            title,
+            desc,
+            data_source,
+            techniques: &[],
+        }
+    }
+    if let Some(title) = crate::host_rules::host_rule_title(rule) {
+        return Some(e(
+            title,
+            "A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process.",
+            HOST,
+        ));
+    }
+    Some(match rule {
+        "robot.agent.health" => e(
+            "Agent health record",
+            "Periodic health and liveness record of the robot's RoboDR agent: monitoring state, component versions, input freshness, counters, black-box state, reachability of the executor, gateway and host sensor, credential expiry, clock synchronisation and free disk space. A robot whose newest record is older than a few record periods is silent.",
+            AGENT,
+        ),
+        "robot.agent.credential_expiring" => e(
+            "Agent credential expires soon",
+            "A certificate or certificate revocation list the robot's agent depends on expires or reaches its next-update time soon (or already has): renew it before the control plane refuses every SOC client.",
+            AGENT,
+        ),
+        "robot.agent.clock_unsynced" => e(
+            "Robot clock not synchronised",
+            "The robot's kernel reports its wall clock unsynchronised (no NTP, NTS or PTP lock) or with a large error estimate: finding and evidence times may be wrong.",
+            AGENT,
+        ),
+        "robot.agent.clock_jump" => e(
+            "Robot wall clock jumped",
+            "The robot's wall clock moved away from what its monotonic clock says elapsed (a time step, an RTC reset or a spoofed time source). Durations are unaffected; finding and evidence times around the jump may be wrong.",
+            AGENT,
+        ),
+        "robot.agent.disk_low" => e(
+            "Agent storage running out of space",
+            "A filesystem the robot's agent writes evidence, findings or control-plane state to is nearly full: free space before recording stops.",
+            AGENT,
+        ),
+        "robot.agent.executor_unreachable" => e(
+            "Response executor unreachable",
+            "The robot's agent cannot reach its response executor: containment actions cannot be applied, verified or reverted, and actions in force are not watched, until it answers again.",
+            AGENT,
+        ),
+        "robot.agent.control_plane_request_fenced" => e(
+            "Control-plane request refused by the replay fence",
+            "A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.",
+            AGENT,
+        ),
+        "robot.agent.selftest" => e(
+            "Agent field acceptance self-test",
+            "A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection.",
+            AGENT,
+        ),
+        "robot.gateway.overload" => e(
+            "In-path gateway overloaded",
+            "The in-path motion gateway could not process every command in time over the last interval (late or shed packets, aggregated): commands were delayed or dropped by its fail behaviour. Not a gateway fault.",
+            MOTION,
+        ),
+        _ => return None,
+    })
+}
+
 /// Entries added in contract **2.3**. Each feature that adds entries in
 /// this minor keeps its own block below (one function per block), so
 /// additions merge without touching each other.
@@ -1513,6 +1599,56 @@ pub struct FindingBuilder<'a> {
     evidence: Vec<BlackBoxRef>,
     bus_message_id: Option<u32>,
     anomaly_score: Option<f64>,
+    agent_health: Option<AgentHealth>,
+}
+
+/// A trusted label for `entity_context.agent_health`: printable ASCII
+/// without `<`, `>` or `` ` `` (anything else becomes `?`), at most `max`
+/// bytes. Names come from agentd's own configuration (input names carry
+/// configured paths), never from the bus.
+fn health_label(s: &str, max: usize) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() && !matches!(c, '<' | '>' | '`') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .take(max)
+        .collect()
+}
+
+/// [`AgentHealth`] cut to [`health_limits`], every string made a trusted
+/// label (see [`FindingBuilder::agent_health`]).
+fn bounded_health(mut h: AgentHealth) -> AgentHealth {
+    use health_limits::{ITEMS, NAME_BYTES, REASONS, REASON_BYTES};
+    h.reasons.truncate(REASONS);
+    for r in &mut h.reasons {
+        *r = health_label(r, REASON_BYTES);
+    }
+    h.versions.truncate(ITEMS);
+    for v in &mut h.versions {
+        v.component = health_label(&v.component, NAME_BYTES);
+        v.version = health_label(&v.version, NAME_BYTES);
+    }
+    h.inputs.truncate(ITEMS);
+    for i in &mut h.inputs {
+        i.name = health_label(&i.name, NAME_BYTES);
+    }
+    h.reachability.truncate(ITEMS);
+    for r in &mut h.reachability {
+        r.component = health_label(&r.component, NAME_BYTES);
+    }
+    h.credentials.truncate(ITEMS);
+    for c in &mut h.credentials {
+        c.name = health_label(&c.name, NAME_BYTES);
+    }
+    h.disks.truncate(ITEMS);
+    for d in &mut h.disks {
+        d.name = health_label(&d.name, NAME_BYTES);
+    }
+    h
 }
 
 impl<'a> FindingBuilder<'a> {
@@ -1531,6 +1667,7 @@ impl<'a> FindingBuilder<'a> {
             evidence: Vec::new(),
             bus_message_id: None,
             anomaly_score: None,
+            agent_health: None,
         }
     }
 
@@ -1612,6 +1749,14 @@ impl<'a> FindingBuilder<'a> {
         self
     }
 
+    /// Attach the agent's health record (contract 2.5; only valid on a
+    /// [`AGENT_HEALTH_RULE`] finding, which in turn requires it). Lists are
+    /// cut to [`health_limits`] and strings made printable ASCII.
+    pub fn agent_health(mut self, h: AgentHealth) -> Self {
+        self.agent_health = Some(bounded_health(h));
+        self
+    }
+
     /// The deterministic finding uid this builder will produce.
     pub fn finding_uid(&self) -> String {
         finding_uid(&self.ctx.robot.id, self.dev.rule_str(), &self.subject)
@@ -1663,6 +1808,7 @@ impl<'a> FindingBuilder<'a> {
             bus_message_id: self.bus_message_id,
             occurrence_count: self.count,
             detail: Tainted::new(&dev.detail, caps::DETAIL),
+            agent_health: self.agent_health,
         };
 
         let mut evidence = self.evidence;

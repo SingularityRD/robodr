@@ -155,6 +155,12 @@ pub struct CrlInUse {
     pub crl_number: String,
     /// `thisUpdate`, Unix seconds.
     pub this_update: i64,
+    /// `nextUpdate`, Unix seconds (absent in the CRL: `None`). Past it the
+    /// CRL no longer vouches for anything and every handshake that needs
+    /// it is refused, so this is the date a fresh CRL must be installed by
+    /// (agentd's `robot.agent.credential_expiring`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_update: Option<i64>,
     /// The file it came from.
     pub file: String,
     /// Its signature was verified at load against a trust anchor (then its
@@ -384,6 +390,7 @@ impl CrlFiles {
                 scope_sha256: crate::crypto::to_hex(&crate::crypto::sha256(&scope)),
                 crl_number: crate::crypto::to_hex(&number),
                 this_update: m.this_update,
+                next_update: m.next_update,
                 file: shown.to_string(),
                 signature_verified: verified,
             },
@@ -465,6 +472,7 @@ struct CrlMeta<'a> {
     /// Issuer `Name` (content of the SEQUENCE, as trust anchors keep it).
     issuer: &'a [u8],
     this_update: i64,
+    next_update: Option<i64>,
     number: Option<Vec<u8>>,
     idp: Option<&'a [u8]>,
 }
@@ -485,8 +493,11 @@ impl<'a> CrlMeta<'a> {
         let (tu, r) = tlv(r)?;
         let this_update = der_time(&tu)?;
         let mut r = r;
+        let mut next_update = None;
         if matches!(r.first(), Some(0x17 | 0x18)) {
-            r = tlv(r)?.1; // nextUpdate
+            let (nu, rest) = tlv(r)?;
+            next_update = Some(der_time(&nu)?);
+            r = rest;
         }
         if r.first() == Some(&0x30) {
             r = tlv(r)?.1; // revokedCertificates
@@ -526,6 +537,7 @@ impl<'a> CrlMeta<'a> {
             sig,
             issuer: issuer.content,
             this_update,
+            next_update,
             number,
             idp,
         })
@@ -580,6 +592,27 @@ fn der_time(t: &Tlv<'_>) -> Option<i64> {
     let n = |i: usize| -> Option<i64> { rest.get(i..i + 2)?.parse().ok() };
     let (mo, d, h, mi, se) = (n(0)?, n(2)?, n(4)?, n(6)?, n(8)?);
     Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se)
+}
+
+/// `notAfter` (Unix seconds) of a DER X.509 certificate, `None` if it does
+/// not parse that far. Reads only the outer structure (`tbsCertificate`:
+/// optional version, serial, signature, issuer, validity); the certificate
+/// must already have been accepted by the TLS stack. For expiry warnings
+/// (agentd's `robot.agent.credential_expiring`), never for a trust decision.
+pub fn cert_not_after(der: &[u8]) -> Option<i64> {
+    let (cert, _) = expect(der, 0x30)?;
+    let (tbs, _) = expect(cert.content, 0x30)?;
+    let mut r = tbs.content;
+    if r.first() == Some(&0xa0) {
+        r = tlv(r)?.1; // [0] version
+    }
+    let (_, r) = expect(r, 0x02)?; // serialNumber
+    let (_, r) = expect(r, 0x30)?; // signature
+    let (_, r) = expect(r, 0x30)?; // issuer
+    let (validity, _) = expect(r, 0x30)?;
+    let (_, rest) = tlv(validity.content)?; // notBefore
+    let (not_after, _) = tlv(rest)?;
+    der_time(&not_after)
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
@@ -1398,7 +1431,29 @@ mod tests {
         assert_eq!(u.crl_number, "02");
         assert_eq!(u.issuer, "RoboDR test CA with CRLs");
         assert!(u.signature_verified);
+        // nextUpdate is reported (agentd warns before it passes):
+        // 2125-01-01T00:00:00Z.
+        assert_eq!(u.next_update, Some(4_891_363_200));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn pem_der(name: &str) -> Vec<u8> {
+        let pem = std::fs::read(fixture(name)).unwrap();
+        let mut it = rustls::pki_types::CertificateDer::pem_slice_iter(&pem);
+        it.next().unwrap().unwrap().as_ref().to_vec()
+    }
+
+    /// Sales-readiness T6: a certificate's `notAfter`, for expiry warnings.
+    #[test]
+    fn cert_not_after_reads_the_validity() {
+        // 2125-01-01T00:00:00Z and 2001-01-01T00:00:00Z.
+        assert_eq!(cert_not_after(&pem_der("server.pem")), Some(4_891_363_200));
+        assert_eq!(cert_not_after(&pem_der("expired.pem")), Some(978_307_200));
+        assert_eq!(cert_not_after(b""), None);
+        assert_eq!(cert_not_after(&[0x30, 0x03, 0x30, 0x01, 0x00]), None);
+        let mut cut = pem_der("server.pem");
+        cut.truncate(cut.len() / 3);
+        assert_eq!(cert_not_after(&cut), None);
     }
 
     fn der(tag: u8, content: &[u8]) -> Vec<u8> {

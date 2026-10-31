@@ -1,5 +1,6 @@
 //! The `host_threats` input: Pulsar threats from `robodr-threat-forward`
-//! reach the agent (as `robot.host.pulsar_threat` findings) and the
+//! reach the agent (as `robot.host.<rule>` findings, `robot.host.pulsar_threat`
+//! for a rule RoboDR does not ship) and the
 //! correlator (as host signals named by their Pulsar rule), so the
 //! host-dependent default correlation rules fire in the daemon. The
 //! forwarder is played by the test (same line protocol).
@@ -154,16 +155,35 @@ fn pulsar_threats_fire_the_host_dependent_correlations() {
     let r = rules(&found);
     // One finding per forwarded host threat; the sensor's own one is not
     // there twice.
+    // Contract 2.5 (T45): each shipped Pulsar rule has its own id.
     let host: Vec<_> = found
         .iter()
-        .filter(|(_, e)| e.entity_context.rule_id == "robot.host.pulsar_threat")
+        .filter(|(_, e)| e.entity_context.rule_id.starts_with("robot.host."))
         .collect();
     assert_eq!(host.len(), 3, "{r:?}\n{log}");
-    let env = &host[0].1;
+    let mut ids: Vec<&str> = host
+        .iter()
+        .map(|(_, e)| e.entity_context.rule_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "robot.host.debugger_started",
+            "robot.host.exec_from_tmp",
+            "robot.host.interactive_shell"
+        ],
+        "{r:?}"
+    );
+    let env = &host
+        .iter()
+        .find(|(_, e)| e.entity_context.rule_id == "robot.host.interactive_shell")
+        .unwrap()
+        .1;
     assert_eq!(env.ocsf.finding_info.data_sources, vec!["host_runtime"]);
     assert_eq!(
-        env.title,
-        robodr_ocsf::rule_info("robot.host.pulsar_threat").title
+        env.title, "Interactive shell started on robot controller",
+        "the Pulsar rule name is the title"
     );
     // The Pulsar rule name and the process travel in the (tainted) detail.
     let detail = &env.entity_context.detail.value;

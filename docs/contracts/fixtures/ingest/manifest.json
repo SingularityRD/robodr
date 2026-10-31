@@ -199,6 +199,13 @@
       "requests": [
         "cases/26-body-too-large/1"
       ]
+    },
+    {
+      "description": "findings contract 2.5: two signed robot.agent.health records of one robot (one finding: created, then updated)",
+      "name": "27-agent-health",
+      "requests": [
+        "cases/27-agent-health/1"
+      ]
     }
   ],
   "contract": "robodr.ingest HTTP API v1 (docs/contracts/robodr.ingest-api.md)",

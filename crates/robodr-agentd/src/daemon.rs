@@ -13,7 +13,11 @@
 //!    `Pipeline::capture_findings` with the capture source's latest health;
 //! 2. handles inputs that ended (drain the queue first, then for the capture
 //!    input `Pipeline::finish`, as `robodr-ros2-watch` does at end of input);
-//! 3. evaluates self-health ([`crate::health`]) and reports issues;
+//! 3. evaluates self-health ([`crate::health`]) and the early warnings
+//!    ([`crate::selfcheck`]: credential expiry, kernel clock, wall-clock
+//!    jumps, free disk space, executor reachability) and reports issues;
+//!    every `self_health.health_record_ms` it reports the signed
+//!    `robot.agent.health` record (findings contract 2.5);
 //! 4. writes `status.json` into the spool; prunes acked spool records;
 //! 5. every `heartbeat_ms`, appends a `robodr.agentd_heartbeat` note to the
 //!    black box (state, reasons, per-input counters, pipeline / agent /
@@ -454,6 +458,22 @@ struct Status<'a> {
     /// executor v1 link counters (absent when the executor is off).
     #[serde(skip_serializing_if = "Option::is_none")]
     executor: Option<crate::executor_link::LinkStats>,
+    /// Early-warning probes (sales-readiness T5 - T7, T40, T41).
+    self_health: &'a SelfView,
+}
+
+/// What the early-warning probes saw at the last tick (`status.json`
+/// `self_health`; the health record carries the same values).
+#[derive(Debug, Clone, Default, Serialize)]
+struct SelfView {
+    /// Health records emitted so far, and the period (0: off).
+    health_records: u64,
+    health_record_ms: u64,
+    clock: robodr_ocsf::ClockHealth,
+    disks: Vec<robodr_ocsf::DiskHealth>,
+    /// Certificate `notAfter` / CRL `nextUpdate`, with `days_to_expiry`.
+    credentials: Vec<robodr_ocsf::CredentialExpiry>,
+    reachability: Vec<robodr_ocsf::Reachability>,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -545,6 +565,15 @@ struct Daemon<'a> {
     revert_failed_reported: std::collections::BTreeSet<String>,
     /// executor v1: the link to robodr-executor (`None` = off).
     executor: Option<crate::executor_link::ExecutorLink>,
+    /// Early warnings: credential expiry, clock, disk, executor
+    /// reachability ([`crate::selfcheck`]).
+    warnings: crate::selfcheck::Warnings,
+    /// What the early-warning probes saw at the last tick (`status.json`
+    /// `self_health`, the health record).
+    self_view: SelfView,
+    /// Health records emitted, and when the last one was (daemon ms).
+    health_records: u64,
+    health_record_at_ms: u64,
     /// The packet timeline of a pcap replay (`None` for a live capture:
     /// handling time is the observation time there).
     replay: Option<ReplayTimeline>,
@@ -1279,6 +1308,13 @@ impl<'a> Daemon<'a> {
             executor_head_recorded: None,
             revert_failed_reported: std::collections::BTreeSet::new(),
             executor,
+            warnings: crate::selfcheck::Warnings::new(
+                cfg.daemon.self_health.clone(),
+                cfg.daemon.health_report_ms,
+            ),
+            self_view: SelfView::default(),
+            health_records: 0,
+            health_record_at_ms: 0,
             replay: r
                 .sensor
                 .capture
@@ -1969,8 +2005,9 @@ impl<'a> Daemon<'a> {
         self.emit(o);
     }
 
-    /// A Pulsar threat: a `robot.host.pulsar_threat` finding (agent, black
-    /// box, spool), then a host-side correlation signal named by the Pulsar
+    /// A Pulsar threat: a `robot.host.<rule>` finding (its own id for a
+    /// shipped rule, else `robot.host.pulsar_threat`; agent, black box,
+    /// spool), then a host-side correlation signal named by the Pulsar
     /// rule, with the process entity and the finding's evidence.
     fn host_threat(&mut self, t: &crate::host::HostThreat) {
         if t.is_own_sensor() {
@@ -2004,8 +2041,8 @@ impl<'a> Daemon<'a> {
         if let Some(r) = &o.evidence.deviation {
             sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
         }
-        // `emit` does not correlate the `robot.host.pulsar_threat` finding
-        // itself: the signal below (named by the Pulsar rule) stands for it.
+        // `emit` does not correlate the `robot.host.*` finding itself: the
+        // signal below (named by the Pulsar rule) stands for it.
         self.emit(o);
         if self.correlator.is_some() {
             self.observe_signal(&sig);
@@ -2031,7 +2068,8 @@ impl<'a> Daemon<'a> {
         if self.correlator.is_none()
             || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
             || rule == health_rules::CORRELATION_PRESSURE
-            || rule == crate::host::HOST_THREAT_RULE
+            || rule == crate::selfcheck::rules::HEALTH
+            || crate::host::is_host_rule(rule)
         {
             return;
         }
@@ -2436,6 +2474,223 @@ impl<'a> Daemon<'a> {
         self.emit(o);
     }
 
+    /// Probe credentials, clock, disks and reachability, refresh
+    /// [`SelfView`] and report what got worse ([`crate::selfcheck`]).
+    fn early_warnings(&mut self) {
+        use crate::selfcheck::{credential, fs_space, kernel_clock};
+        use robodr_ocsf::{ClockHealth, DiskHealth, ReachState, Reachability};
+        let now_ms = self.now_ms();
+        let wall_ms = self.clock.now().wall_ns / 1_000_000;
+        // Credentials: the control plane's own certificate and its CRLs.
+        let mut creds = Vec::new();
+        if let Some(t) = self.r.control_plane.as_ref().and_then(|c| c.tls.as_ref()) {
+            if let Some(na) = t.server_not_after {
+                creds.push(credential("control_plane.server_cert", na, wall_ms));
+            }
+            if let Some(crl) = &t.crl {
+                for u in crl.status().in_use {
+                    if let Some(nu) = u.next_update {
+                        creds.push(credential(
+                            &format!("control_plane.crl:{}", u.issuer),
+                            nu,
+                            wall_ms,
+                        ));
+                    }
+                }
+            }
+        }
+        // Clock.
+        let kernel = kernel_clock();
+        let wall_jumps = self.agent.stats().wall_clock_jumps;
+        let clock = ClockHealth {
+            synchronized: kernel.map(|k| k.synchronized),
+            max_error_ms: kernel.map(|k| k.max_error_us / 1000),
+            wall_jumps,
+        };
+        // Disks.
+        let mut dirs: Vec<(&str, &std::path::Path)> = vec![
+            ("blackbox", self.r.config.blackbox.dir.as_path()),
+            ("spool", self.r.config.spool.dir.as_path()),
+        ];
+        if let Some(c) = &self.r.control_plane {
+            dirs.push(("control_plane", c.state_dir.as_path()));
+        }
+        let disks: Vec<DiskHealth> = dirs
+            .into_iter()
+            .filter_map(|(name, dir)| {
+                fs_space(dir).map(|(free_bytes, total_bytes)| DiskHealth {
+                    name: name.into(),
+                    free_bytes,
+                    total_bytes,
+                })
+            })
+            .collect();
+        // Reachability: the executor link, the gateway feed and the Pulsar
+        // forwarder (their sockets are inputs: heard within silence_ms).
+        let silence = self.r.config.daemon.silence_ms;
+        let input_reach = |prefix: &str| -> ReachState {
+            let mut state = ReachState::NotConfigured;
+            for i in self.inputs.iter().filter(|i| i.name.starts_with(prefix)) {
+                state = match i.stats.last_rx_ms() {
+                    _ if i.stats.ended.load(Ordering::SeqCst) => ReachState::Unreachable,
+                    None if now_ms < silence => ReachState::Unknown,
+                    None => ReachState::Unreachable,
+                    Some(t) if now_ms.saturating_sub(t) < silence => ReachState::Reachable,
+                    Some(_) => ReachState::Unreachable,
+                };
+            }
+            state
+        };
+        let input_age = |prefix: &str| -> Option<u64> {
+            self.inputs
+                .iter()
+                .find(|i| i.name.starts_with(prefix))
+                .and_then(|i| i.stats.last_rx_ms())
+                .map(|t| now_ms.saturating_sub(t))
+        };
+        let exec = self.executor.as_ref().map(|l| l.reach());
+        let reachability = vec![
+            Reachability {
+                component: "executor".into(),
+                state: match &exec {
+                    None => ReachState::NotConfigured,
+                    Some(r) if r.unreachable_for_ms.is_some() => ReachState::Unreachable,
+                    Some(r) if r.last_ok_age_ms.is_some() => ReachState::Reachable,
+                    Some(_) => ReachState::Unknown,
+                },
+                last_ok_age_ms: exec.as_ref().and_then(|r| r.last_ok_age_ms),
+            },
+            Reachability {
+                component: "gateway".into(),
+                state: input_reach("gateway:"),
+                last_ok_age_ms: input_age("gateway:"),
+            },
+            Reachability {
+                component: "pulsard".into(),
+                state: input_reach("host:"),
+                last_ok_age_ms: input_age("host:"),
+            },
+        ];
+
+        let mut found = self.warnings.credentials(now_ms, &creds);
+        found.extend(self.warnings.clock(now_ms, kernel, wall_jumps));
+        found.extend(self.warnings.disks(&disks));
+        found.extend(self.warnings.executor(
+            exec.as_ref().and_then(|r| r.unreachable_for_ms),
+            exec.as_ref().and_then(|r| r.last_error.as_deref()),
+        ));
+        self.self_view = SelfView {
+            health_records: self.health_records,
+            health_record_ms: self.warnings.config().health_record_ms,
+            clock,
+            disks,
+            credentials: creds,
+            reachability,
+        };
+        for w in found {
+            self.self_health("agentd:self_health", w.deviation());
+        }
+    }
+
+    /// Every `daemon.self_health.health_record_ms` (first one period after
+    /// start): the signed `robot.agent.health` finding (findings contract
+    /// 2.5, §3g) with what [`Self::early_warnings`] just saw.
+    fn health_record(&mut self) {
+        use robodr_ocsf::{
+            AgentHealth, BlackBoxHealth, ComponentVersion, HealthCounters, HealthLabel,
+            InputFreshness,
+        };
+        let every = self.warnings.config().health_record_ms;
+        let now_ms = self.now_ms();
+        if every == 0 || now_ms.saturating_sub(self.health_record_at_ms) < every {
+            return;
+        }
+        self.health_record_at_ms = now_ms;
+        self.health_records += 1;
+        self.self_view.health_records = self.health_records;
+        let spool = self.spool.stats();
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|i| InputFreshness {
+                name: i.name.clone(),
+                last_rx_age_ms: i.stats.last_rx_ms().map(|t| now_ms.saturating_sub(t)),
+                received: i.stats.received.load(Ordering::Relaxed),
+                dropped: i
+                    .stats
+                    .dropped
+                    .load(Ordering::Relaxed)
+                    .saturating_add(i.stats.upstream_dropped.load(Ordering::Relaxed)),
+                malformed: i.stats.malformed.load(Ordering::Relaxed),
+                ended: i.stats.ended.load(Ordering::SeqCst),
+            })
+            .collect();
+        let v = &self.self_view;
+        let record = AgentHealth {
+            state: match self.last_state.state {
+                State::Ok => HealthLabel::Ok,
+                State::Degraded => HealthLabel::Degraded,
+                State::Unknown => HealthLabel::Unknown,
+            },
+            reasons: self.last_state.reasons.clone(),
+            interval_ms: every,
+            uptime_ms: now_ms,
+            seq: self.health_records,
+            versions: vec![
+                ComponentVersion {
+                    component: "robodr-agentd".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+                ComponentVersion {
+                    component: robodr_ocsf::CONTRACT_NAME.into(),
+                    version: robodr_ocsf::CONTRACT_VERSION.into(),
+                },
+            ],
+            inputs,
+            counters: HealthCounters {
+                findings_spooled: self.stats.findings_spooled,
+                finding_errors: self.stats.finding_errors,
+                health_findings: self.stats.health_findings,
+                spool_dropped: spool.dropped_full,
+                spool_write_errors: spool.write_errors,
+                note_errors: self.stats.note_errors,
+            },
+            blackbox: BlackBoxHealth {
+                degraded: self.agent.evidence_degraded(),
+                anchored: self.agent.blackbox_anchored(),
+                anchor_failures: self.agent.blackbox_anchor_failures(),
+            },
+            reachability: v.reachability.clone(),
+            credentials: v.credentials.clone(),
+            clock: v.clock,
+            disks: v.disks.clone(),
+        };
+        let st = match record.state {
+            HealthLabel::Ok => "ok",
+            HealthLabel::Degraded => "degraded",
+            HealthLabel::Unknown => "unknown",
+        };
+        let dev = robodr_events::Deviation::new(
+            crate::selfcheck::rules::HEALTH,
+            robodr_events::Severity::Low,
+            format!(
+                "health record {} of robodr-agentd (state {st}, up {} s)",
+                self.health_records,
+                now_ms / 1000
+            ),
+        );
+        let subject = Subject {
+            node: Some("robodr-agentd".into()),
+            ..Subject::default()
+        };
+        let safety = self.safety();
+        let now = self.clock.now();
+        let o = self
+            .agent
+            .report_health(now, "agentd:health", subject, dev, record, safety);
+        self.emit(o);
+    }
+
     fn snapshots(&self) -> Vec<InputSnapshot> {
         self.inputs
             .iter()
@@ -2550,6 +2805,8 @@ impl<'a> Daemon<'a> {
         }
         self.correlation_tick();
         self.control_findings();
+        self.early_warnings();
+        self.health_record();
         self.evidence_incidents();
         self.mark_head();
         for f in self.agent.take_faults() {
@@ -2758,6 +3015,7 @@ impl<'a> Daemon<'a> {
             queue_bytes_max: self.budget.max(),
             control_plane: self.control.as_ref().map(ControlPlane::status),
             executor: self.executor.as_ref().map(|l| l.stats()),
+            self_health: &self.self_view,
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)

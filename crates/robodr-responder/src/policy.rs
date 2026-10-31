@@ -113,6 +113,12 @@ impl Matrix {
     }
 }
 
+/// The finding id every Pulsar host detection had before findings contract
+/// 2.5 (and still has for a Pulsar rule RoboDR does not ship): its override
+/// covers every `robot.host.*` id without one of its own
+/// ([`ResponsePolicy::override_for`]).
+pub const HOST_THREAT_FALLBACK_RULE: &str = "robot.host.pulsar_threat";
+
 /// Per-rule override. The matrix step for this rule is clamped into
 /// `[min_step, max_step]`; `restrict`, if given, replaces the default
 /// restrict targets.
@@ -408,9 +414,24 @@ impl ResponsePolicy {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     }
 
-    /// Look up the override for a rule id.
+    /// Look up the override for a rule id. A host (Pulsar) finding id
+    /// `robot.host.<rule>` without an override of its own takes the one of
+    /// `robot.host.pulsar_threat`: until findings contract 2.5 every host
+    /// detection arrived under that single id, and a policy written then
+    /// must keep applying to them.
     pub fn override_for(&self, rule: &str) -> Option<&RuleOverride> {
-        self.rule_overrides.iter().find(|o| o.rule == rule)
+        self.rule_overrides
+            .iter()
+            .find(|o| o.rule == rule)
+            .or_else(|| {
+                rule.starts_with("robot.host.")
+                    .then(|| {
+                        self.rule_overrides
+                            .iter()
+                            .find(|o| o.rule == HOST_THREAT_FALLBACK_RULE)
+                    })
+                    .flatten()
+            })
     }
 
     /// Reject any policy that tries to exceed the invariants or is malformed.
