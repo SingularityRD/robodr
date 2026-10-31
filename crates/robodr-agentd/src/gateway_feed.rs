@@ -24,6 +24,23 @@
 //! catalog (`robodr_ocsf::builder::rule_known`), or oversized fields are
 //! malformed and dropped (counted by the input). The detail is kept as the
 //! gateway wrote it (sanitized when logged; tainted in the finding).
+//!
+//! # Flood limit (sales-readiness T82, red team W2-5)
+//!
+//! The gateway aggregates per housekeeping period (100 ms by default), so
+//! a sustained condition, or a process that may write to the socket and
+//! floods it, could still put up to one line per (rule, channel) every
+//! 100 ms into the spool. [`FeedLimiter`] bounds that per fixed window of
+//! [`WINDOW_NS`] (60 s, opened by the first line): the first [`PER_KEY`]
+//! lines of a (rule, channel) are reported one by one ([`CRITICAL_PER_KEY`]
+//! for Critical lines), at most [`PER_WINDOW`] in all. A line past its
+//! budget is **folded**: still recorded in the black box, not reported;
+//! when the window closes each key with folded lines is reported once as
+//! an aggregate with the same rule and channel, the most severe folded
+//! severity (a Critical fold stays Critical), the summed gateway count and
+//! the first folded line's detail. Lines of keys beyond [`MAX_KEYS`] are
+//! folded into one `robot.gateway.findings_dropped` aggregate (with the
+//! most severe folded severity).
 
 use serde::Deserialize;
 
@@ -126,6 +143,174 @@ fn rule_ok(r: &str) -> bool {
         && r.len() <= MAX_RULE
         && r.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
+}
+
+/// Window of the feed limit (module docs, "Flood limit").
+pub const WINDOW_NS: u64 = 60_000_000_000;
+/// Lines below Critical reported per (rule, channel) and window.
+pub const PER_KEY: u32 = 4;
+/// Critical lines reported per (rule, channel) and window.
+pub const CRITICAL_PER_KEY: u32 = 8;
+/// Lines reported per window in all.
+pub const PER_WINDOW: u32 = 256;
+/// (rule, channel) keys counted per window.
+pub const MAX_KEYS: usize = 128;
+/// The rule of the aggregate of lines whose key was not counted.
+pub const OVERFLOW_RULE: &str = "robot.gateway.findings_dropped";
+
+/// The decision of [`FeedLimiter::admit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    /// Report the line.
+    Report,
+    /// Record it only: it is counted into its key's aggregate.
+    Fold,
+}
+
+#[derive(Debug, Clone)]
+struct Folded {
+    lines: u64,
+    count: u64,
+    severity: robodr_events::Severity,
+    mode: robodr_events::Mode,
+    first: String,
+}
+
+impl Folded {
+    fn new(l: &GatewayLine) -> Self {
+        Folded {
+            lines: 0,
+            count: 0,
+            severity: l.severity,
+            mode: l.mode,
+            first: l.detail.clone(),
+        }
+    }
+
+    fn add(&mut self, l: &GatewayLine) {
+        self.lines = self.lines.saturating_add(1);
+        self.count = self.count.saturating_add(l.count);
+        self.severity = self.severity.max(l.severity);
+        // An enforce-mode line makes the aggregate enforce mode.
+        if l.mode == robodr_events::Mode::Enforce {
+            self.mode = l.mode;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct KeyState {
+    reported: u32,
+    reported_critical: u32,
+    folded: Option<Folded>,
+}
+
+/// The feed's flood limit (module docs, "Flood limit").
+#[derive(Debug, Default)]
+pub struct FeedLimiter {
+    start_ns: Option<u64>,
+    reported: u32,
+    keys: std::collections::BTreeMap<(String, Option<String>), KeyState>,
+    overflow: Option<(Folded, Option<String>)>,
+    /// Lines folded since start (status).
+    pub folded_total: u64,
+    /// Aggregates reported since start (status).
+    pub aggregates_total: u64,
+}
+
+impl FeedLimiter {
+    /// Report or fold `l` at monotonic `now_ns`. Closes an expired window
+    /// first: its aggregates are returned with the decision and must be
+    /// reported before the line.
+    pub fn admit(&mut self, l: &GatewayLine, now_ns: u64) -> (Admit, Vec<GatewayLine>) {
+        let closed = self.tick(now_ns);
+        self.start_ns.get_or_insert(now_ns);
+        let key = (l.rule.clone(), l.channel.clone());
+        let tracked = self.keys.contains_key(&key) || self.keys.len() < MAX_KEYS;
+        if !tracked {
+            let (f, _) = self
+                .overflow
+                .get_or_insert_with(|| (Folded::new(l), l.channel.clone()));
+            f.add(l);
+            self.folded_total = self.folded_total.saturating_add(1);
+            return (Admit::Fold, closed);
+        }
+        let critical = l.severity == robodr_events::Severity::Critical;
+        let window_open = self.reported < PER_WINDOW;
+        let k = self.keys.entry(key).or_default();
+        let within = if critical {
+            k.reported_critical < CRITICAL_PER_KEY
+        } else {
+            k.reported < PER_KEY
+        };
+        if within && window_open {
+            if critical {
+                k.reported_critical += 1;
+            } else {
+                k.reported += 1;
+            }
+            self.reported += 1;
+            return (Admit::Report, closed);
+        }
+        k.folded.get_or_insert_with(|| Folded::new(l)).add(l);
+        self.folded_total = self.folded_total.saturating_add(1);
+        (Admit::Fold, closed)
+    }
+
+    /// Housekeeping at monotonic `now_ns`: the aggregates of a window that
+    /// is [`WINDOW_NS`] old (and the window closed).
+    pub fn tick(&mut self, now_ns: u64) -> Vec<GatewayLine> {
+        match self.start_ns {
+            Some(s) if now_ns.saturating_sub(s) >= WINDOW_NS => self.flush(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Close the window now (also at stop): one aggregate per key with
+    /// folded lines, and the overflow aggregate.
+    pub fn flush(&mut self) -> Vec<GatewayLine> {
+        self.start_ns = None;
+        self.reported = 0;
+        let keys = std::mem::take(&mut self.keys);
+        let mut out: Vec<GatewayLine> = keys
+            .into_iter()
+            .filter_map(|((rule, channel), k)| {
+                k.folded
+                    .map(|f| aggregate(rule, channel, &f, "this rule and channel"))
+            })
+            .collect();
+        if let Some((f, channel)) = self.overflow.take() {
+            out.push(aggregate(
+                OVERFLOW_RULE.to_string(),
+                channel,
+                &f,
+                &format!("more than {MAX_KEYS} rule and channel pairs"),
+            ));
+        }
+        self.aggregates_total = self.aggregates_total.saturating_add(out.len() as u64);
+        out
+    }
+}
+
+fn aggregate(rule: String, channel: Option<String>, f: &Folded, what: &str) -> GatewayLine {
+    let mut detail = format!(
+        "{} gateway lines, gateway count {}, folded by the agentd feed limit: {what}, \
+         {PER_KEY} or {CRITICAL_PER_KEY} Critical per {} s reported one by one; first: ",
+        f.lines,
+        f.count,
+        WINDOW_NS / 1_000_000_000
+    );
+    let room = MAX_DETAIL.saturating_sub(detail.chars().count());
+    detail.extend(f.first.chars().take(room));
+    GatewayLine {
+        format: FORMAT.to_string(),
+        rule,
+        severity: f.severity,
+        detail,
+        mode: f.mode,
+        channel,
+        count: f.count.max(1),
+    }
 }
 
 /// [`crate::input::LineParser`] of the gateway feed.
@@ -243,6 +428,114 @@ mod tests {
         ] {
             assert!(parse_gateway_line(&bad).is_err(), "{bad}");
         }
+    }
+
+    fn line(rule: &str, sev: robodr_events::Severity, channel: &str) -> GatewayLine {
+        GatewayLine {
+            format: FORMAT.into(),
+            rule: rule.into(),
+            severity: sev,
+            detail: "d".into(),
+            mode: robodr_events::Mode::Enforce,
+            channel: Some(channel.into()),
+            count: 3,
+        }
+    }
+
+    /// Sales-readiness T82 (red team W2-5, G8 / G9): every gateway line
+    /// became a spool record; a process allowed on the socket (or a
+    /// sustained condition, one line per 100 ms housekeeping) filled the
+    /// spool. Now each (rule, channel) gets a budget per window and the
+    /// rest is one aggregate, Critical included.
+    #[test]
+    fn a_flood_of_one_rule_is_folded_into_one_aggregate_per_window() {
+        use robodr_events::Severity::{Critical, High};
+        let mut f = FeedLimiter::default();
+        let ms = 1_000_000;
+        let mut reported = 0;
+        let mut aggregates = Vec::new();
+        // 10 lines a second for 60 s, High and Critical, one channel.
+        for i in 0..600u64 {
+            for sev in [High, Critical] {
+                let rule = if sev == Critical {
+                    "robot.firewall.rejected_stale"
+                } else {
+                    "robot.gateway.trajectory_rejected"
+                };
+                let (a, closed) = f.admit(&line(rule, sev, "/arm"), i * 100 * ms);
+                aggregates.extend(closed);
+                if a == Admit::Report {
+                    reported += 1;
+                }
+            }
+        }
+        assert_eq!(reported, PER_KEY + CRITICAL_PER_KEY);
+        assert!(aggregates.is_empty());
+        aggregates.extend(f.tick(WINDOW_NS));
+        assert_eq!(aggregates.len(), 2, "{aggregates:?}");
+        let crit = aggregates
+            .iter()
+            .find(|a| a.rule == "robot.firewall.rejected_stale")
+            .unwrap();
+        assert_eq!(crit.severity, Critical);
+        assert_eq!(crit.count, 3 * u64::from(600 - CRITICAL_PER_KEY));
+        assert_eq!(crit.channel.as_deref(), Some("/arm"));
+        assert!(crit.detail.chars().count() <= MAX_DETAIL);
+        // Aggregates are valid lines of the feed.
+        for a in &aggregates {
+            let j = format!(
+                r#"{{"format":"{}","rule":"{}","severity":"{}","detail":{},"mode":"enforce","channel":"/arm","count":{}}}"#,
+                a.format,
+                a.rule,
+                serde_json::to_value(a.severity).unwrap().as_str().unwrap(),
+                serde_json::to_string(&a.detail).unwrap(),
+                a.count
+            );
+            assert!(parse_gateway_line(&j).is_ok(), "{j}");
+        }
+        // A new window: the budget is back.
+        let (a, _) = f.admit(
+            &line("robot.gateway.trajectory_rejected", High, "/arm"),
+            WINDOW_NS + ms,
+        );
+        assert_eq!(a, Admit::Report);
+        assert_eq!(
+            f.folded_total,
+            2 * 600 - u64::from(PER_KEY + CRITICAL_PER_KEY)
+        );
+    }
+
+    /// Many channels: at most PER_WINDOW lines a window in all, keys
+    /// beyond MAX_KEYS folded into one `findings_dropped` aggregate that
+    /// keeps the most severe severity; another channel's first lines are
+    /// not hidden by one busy channel.
+    #[test]
+    fn the_window_and_the_key_table_are_bounded() {
+        use robodr_events::Severity::{Critical, Medium};
+        let mut f = FeedLimiter::default();
+        let busy = "robot.gateway.sequence_jump";
+        for _ in 0..100 {
+            f.admit(&line(busy, Medium, "/busy"), 0);
+        }
+        let (a, _) = f.admit(&line(busy, Medium, "/quiet"), 1);
+        assert_eq!(a, Admit::Report, "a busy channel never hides another");
+        let mut reported = 0;
+        for i in 0..1000 {
+            for _ in 0..PER_KEY {
+                let (a, _) = f.admit(&line(busy, Medium, &format!("/c{i}")), 2);
+                if a == Admit::Report {
+                    reported += 1;
+                }
+            }
+        }
+        let (a, _) = f.admit(&line(busy, Critical, "/late"), 3);
+        assert_eq!(a, Admit::Fold);
+        // /busy reported PER_KEY, /quiet 1.
+        assert_eq!(reported + PER_KEY + 1, PER_WINDOW);
+        let out = f.flush();
+        let over = out.iter().find(|l| l.rule == OVERFLOW_RULE).unwrap();
+        assert_eq!(over.severity, Critical);
+        assert!(robodr_ocsf::builder::rule_known(OVERFLOW_RULE));
     }
 
     /// Red team 2026-10-30 (gateway feed spoofing, G3): a line naming

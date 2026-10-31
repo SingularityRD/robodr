@@ -301,6 +301,11 @@ pub struct DaemonStats {
     pub host_threats: u64,
     /// In-path gateway findings taken from the gateway feed.
     pub gateway_findings: u64,
+    /// Gateway lines folded by the feed limit (recorded in the black box,
+    /// reported in an aggregate; `crate::gateway_feed`, T82).
+    pub gateway_folded: u64,
+    /// Aggregates of folded gateway lines reported.
+    pub gateway_aggregates: u64,
     /// Forwarder heartbeats received.
     pub host_heartbeats: u64,
     /// In-path gateway feed heartbeats received.
@@ -536,6 +541,8 @@ struct Daemon<'a> {
     correlator: Option<Correlator>,
     /// Discovery-flood aggregation of pipeline findings ([`crate::flood`]).
     flood: crate::flood::FloodGuard,
+    /// The gateway feed's flood limit ([`crate::gateway_feed::FeedLimiter`]).
+    gateway_limit: crate::gateway_feed::FeedLimiter,
     /// `groups_evicted + groups_refused` at the last pressure report.
     correlation_pressure_reported: u64,
     /// When the last pressure finding was raised (daemon ms).
@@ -1318,6 +1325,7 @@ impl<'a> Daemon<'a> {
             profile_accepted: None,
             correlator,
             flood: crate::flood::FloodGuard::default(),
+            gateway_limit: crate::gateway_feed::FeedLimiter::default(),
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
             incidents_reported: None,
@@ -2090,6 +2098,50 @@ impl<'a> Daemon<'a> {
     /// subject is the gateway's channel.
     fn gateway_finding(&mut self, g: &crate::gateway_feed::GatewayLine) {
         self.stats.gateway_findings += 1;
+        // The feed's flood limit (T82): a line past its (rule, channel)
+        // budget is recorded in the black box only and reported in the
+        // window's aggregate.
+        let ns = self.signal_ns();
+        let (admit, closed) = self.gateway_limit.admit(g, ns);
+        for a in closed {
+            self.gateway_aggregate(&a);
+        }
+        if admit == crate::gateway_feed::Admit::Fold {
+            self.stats.gateway_folded += 1;
+            let now = self.clock.now();
+            if self
+                .agent
+                .record_deviation(now, Detector::Sensor, &g.deviation())
+                .is_err()
+            {
+                self.stats.note_errors += 1;
+            }
+            return;
+        }
+        self.gateway_report(g);
+    }
+
+    /// An aggregate of folded gateway lines: reported like a line.
+    fn gateway_aggregate(&mut self, a: &crate::gateway_feed::GatewayLine) {
+        self.stats.gateway_aggregates += 1;
+        self.gateway_report(a);
+    }
+
+    /// Close an expired feed-limit window (tick) or the open one (`all`,
+    /// at stop) and report its aggregates.
+    fn gateway_close(&mut self, all: bool) {
+        let out = if all {
+            self.gateway_limit.flush()
+        } else {
+            let ns = self.signal_ns();
+            self.gateway_limit.tick(ns)
+        };
+        for a in out {
+            self.gateway_aggregate(&a);
+        }
+    }
+
+    fn gateway_report(&mut self, g: &crate::gateway_feed::GatewayLine) {
         let _ = writeln!(
             self.log,
             "robodr-agentd: gateway: {} x{}: {}",
@@ -2891,6 +2943,7 @@ impl<'a> Daemon<'a> {
         }
         self.sensor_findings(found);
         self.flood_close(false);
+        self.gateway_close(false);
         self.handle_ended();
 
         let spool = self.spool.stats();
@@ -3241,6 +3294,7 @@ impl<'a> Daemon<'a> {
         found.extend(self.pipeline.finish());
         self.sensor_findings(found);
         self.flood_close(true);
+        self.gateway_close(true);
         // Gap 1: the listeners are joined and the queue drained, so nothing
         // is appended after this head: the next start may verify it exactly.
         self.record_state_heads("stop");

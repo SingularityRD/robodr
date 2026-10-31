@@ -461,6 +461,12 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   catalogued gateway / firewall finding and its severity (G7) and can
   flood agentd's spool with one finding per line (G8 / G9); agentd's
   flood folding covers discovery findings, not this channel.
+  **Update (sales-readiness T82):** agentd folds the feed per (rule,
+  channel) and 60 s window (`gateway_feed::FeedLimiter`: 4 lines, 8
+  Critical, 256 in all reported one by one, the rest in one aggregate,
+  every line in the black box); regression
+  `tests/gateway_feed.rs::a_feed_flood_is_folded_into_one_aggregate`. The
+  trust by uid (G7) is unchanged.
 - **O1 (environment, product question).** On this host the gateway read
   0.46 % (16,573 of 3,623,018 packets) of the soak's LowCmd frames more than `max_queue_delay_ns` (5 ms)
   after their arrival, even at FIFO priority: each got the fault verdict

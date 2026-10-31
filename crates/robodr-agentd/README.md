@@ -438,8 +438,16 @@ counted — and becomes a finding of the normal pipeline
 (`Agent::handle_external`, source `gateway:<channel>`, subject topic the
 channel). An idle gateway writes a heartbeat line
 (`robodr-gateway-heartbeat/v1`, every 5 s): activity on the input, never a
-finding, so a quiet gateway is not reported silent. Status:
-`daemon.gateway_findings`, `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
+finding, so a quiet gateway is not reported silent. Flood limit
+(sales-readiness T82): per (rule, channel) and 60 s window the first 4
+lines (8 for Critical ones) are reported one by one, at most 256 lines a
+window in all, at most 128 (rule, channel) pairs counted; a line past its
+budget is recorded in the black box only and folded into one aggregate per
+(rule, channel) with the most severe folded severity (Critical stays
+Critical) and the summed count, reported when the window closes (or at
+stop); lines of uncounted pairs go to one `robot.gateway.findings_dropped`
+aggregate. Status: `daemon.gateway_findings`, `daemon.gateway_folded`,
+`daemon.gateway_aggregates`, `daemon.gateway_heartbeats`. Point the gateway's `findings_socket` at the
 same path; with `socket_mode: "0660"` give the gateway's user the daemon's
 group. Test: `tests/gateway_feed.rs` (the gateway's own writer against a
 running daemon).

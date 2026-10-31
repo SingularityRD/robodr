@@ -2469,7 +2469,11 @@ while the chain is flushed.
   gateway's user in agentd's group) and the gateway's `findings_socket` to
   the same path. `status.json` `findings_feed` shows `connected`, `sent`,
   `pending`, `dropped`, `last_error`; agentd counts
-  `daemon.gateway_findings`. An idle gateway writes a heartbeat line
+  `daemon.gateway_findings`; past 4 lines (8 Critical) per rule, channel
+  and minute agentd folds the rest into one aggregate per minute, kept in
+  the black box line by line (`daemon.gateway_folded`,
+  `daemon.gateway_aggregates`; agentd README, "In-path gateway feed").
+  An idle gateway writes a heartbeat line
   every 5 s (`daemon.gateway_heartbeats`), so a quiet gateway is not
   reported as a silent input; a gateway that stops writing still is
   (`robot.agent.input_silent` after `daemon.silence_ms`). Upgrade agentd

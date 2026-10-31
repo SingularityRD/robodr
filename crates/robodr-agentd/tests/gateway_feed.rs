@@ -194,3 +194,74 @@ fn gateway_heartbeats_keep_a_quiet_feed_alive() {
         "{st}"
     );
 }
+
+/// Sales-readiness T82 (red team W2-5, G8 / G9): a process allowed on the
+/// feed socket wrote one finding per line, each a spool record. Now a
+/// (rule, channel) past its budget is folded: the black box has every
+/// line, the spool the first `PER_KEY` and one aggregate (at the window's
+/// end, here at stop).
+#[test]
+fn a_feed_flood_is_folded_into_one_aggregate() {
+    let s = setup("gw-flood", &robot_profile(true));
+    let run = s.dir.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock = run.join("gateway-feed.sock");
+    let mut cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "unix_socket", "path": run.join("events.sock")}]),
+        serde_json::json!({}),
+    );
+    cfg["gateway_feed"] = serde_json::json!({
+        "socket_path": sock,
+        "allowed_uids": [robodr_agentd::config::effective_uid()],
+    });
+    let r = s.resolve(&cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    let h = std::thread::spawn(move || {
+        let mut log = Vec::new();
+        let res = robodr_agentd::run(&r, &|| s2.load(Ordering::SeqCst), &mut log)
+            .map_err(|e| e.to_string());
+        (res, String::from_utf8_lossy(&log).into_owned())
+    });
+    wait_for(10, "socket", || sock.exists().then_some(()));
+    let mut c = UnixStream::connect(&sock).unwrap();
+    const N: u64 = 50;
+    for i in 0..N {
+        let d = Deviation::new(
+            "robot.firewall.rejected_stale",
+            Severity::Critical,
+            format!("flood {i}"),
+        );
+        writeln!(c, "{}", feed::line(&d, Some("/lowcmd"), 2).unwrap()).unwrap();
+    }
+    c.flush().unwrap();
+    let per_key = u64::from(robodr_agentd::gateway_feed::CRITICAL_PER_KEY);
+    let st = wait_for(10, "gateway lines", || {
+        let st = status(&s.spool)?;
+        (st["daemon"]["gateway_findings"].as_u64()? == N).then_some(st)
+    });
+    assert_eq!(st["daemon"]["gateway_folded"].as_u64(), Some(N - per_key));
+    stop.store(true, Ordering::SeqCst);
+    let (res, log) = h.join().unwrap();
+    res.unwrap_or_else(|e| panic!("{e}\n{log}"));
+    let found = spooled(&s.spool);
+    let g: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.firewall.rejected_stale")
+        .collect();
+    assert_eq!(g.len() as u64, per_key + 1, "{log}");
+    let agg = g
+        .iter()
+        .find(|(_, e)| e.entity_context.detail.value.contains("folded"))
+        .unwrap();
+    assert_eq!(agg.1.severity, Severity::Critical);
+    let v = &agg.1.entity_context.detail.value;
+    assert!(v.contains(&format!(
+        "{} gateway lines, gateway count {},",
+        N - per_key,
+        2 * (N - per_key)
+    )), "{v}");
+    assert_verified(&s.blackbox, None, &found);
+}
