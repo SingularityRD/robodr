@@ -203,7 +203,17 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   a tombstone (with its `done/` marker): should that unit's import state
   be reset, a different batch under the same name then goes to the
   importer's hash-suffixed name and is published, instead of landing
-  under a name already marked done. Use these flags
+  under a name already marked done. `--out-max-count` and
+  `--out-max-bytes` rank every batch directory that still has a payload,
+  finished or not, from the newest (an unfinished one counts against the
+  bounds but is held); tombstones are not counted, so `--out-max-count`
+  bounds the batches with a payload, not the entries of `out/`. A batch
+  whose payload this tool may not delete (typically the importer's
+  `out/<batch>/` without write permission for this tool's user: run it
+  as the importer's user or give its group write access there) does not
+  stop publishing or delivery: the other batches are pruned, the error
+  (path and remedy) is `out_prune_error` in the publisher's JSON report
+  and in `uplink-status.json`, and it is logged once while it lasts. Use these flags
   only when this tool is the **only consumer** of `out/` (a second
   publisher or uplink on the same `out/` would lose those batches; the
   importer itself does not need them). `--rejected-max-age-s` /
@@ -219,7 +229,12 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   dead letter's `record` copy. Sizes: `state_usage` (`{entries, bytes}` of
   `done_markers`, `dead_letters`, `diode_out` or `spool_rejected`, and
   `reinject` for the uplink) in the publisher's JSON report and in
-  `uplink-status.json`, measured at most once a minute. Deletions are
+  `uplink-status.json`, measured at most once a minute (the uplink
+  service keeps that pace across its per-run re-opens; the publisher
+  prints a report on every run that measured, so at least once a minute
+  while idle). Measuring is monitoring: a failed measurement is reported
+  as `state_usage_error` (the status file keeps the last good
+  `state_usage`) and logged once, and never fails a run. Deletions are
   single `unlink`s plus a directory fsync (an `out/` payload loses its
   records file first; a pass interrupted after that is completed by the
   next one): crash-safe at any point.

@@ -320,3 +320,73 @@ fn publisher_prunes_spool_rejected_only_when_asked() {
     assert_eq!(rep.pruned_rejected.removed, 1);
     assert_eq!(fs::read_dir(spool.join("rejected")).unwrap().count(), 0);
 }
+
+/// Review finding (WP16): measuring the state's usage is monitoring. A
+/// measurement that fails (here `<spool>/rejected` is not a directory)
+/// is reported in the run's report and never fails the run (it used to
+/// stop `robodr-kafka-publish`).
+#[test]
+fn a_failed_usage_measurement_does_not_fail_the_run() {
+    let tmp = TempDir::new("ret-usage-err");
+    let spool = tmp.path().join("spool");
+    let state = tmp.path().join("state");
+    for d in ["ready", "acked"] {
+        fs::create_dir_all(spool.join(d)).unwrap();
+    }
+    let cfg = PublishConfig::new(Source::Spool(spool.clone()), &state);
+    let mut p = Publisher::open(cfg, OkSink).unwrap();
+    // Broken after open (which creates it).
+    fs::remove_dir_all(spool.join("rejected")).unwrap();
+    fs::write(spool.join("rejected"), b"not a directory").unwrap();
+    let rep = p
+        .run_once()
+        .expect("measurement errors do not fail the run");
+    assert_eq!(rep.state_usage, None);
+    let e = rep.state_usage_error.expect("reported");
+    assert!(e.contains("rejected"), "{e}");
+    // Within the interval: not measured (nor reported) again.
+    let rep = p.run_once().unwrap();
+    assert_eq!((rep.state_usage, rep.state_usage_error), (None, None));
+}
+
+/// Review finding (WP16): `--out-max-*` where this tool may not delete an
+/// `out/` batch's payload (the importer's files, no write permission on
+/// its directory) does not stop publishing: the failure is reported with
+/// the batch's path and what to do, and the other batches are pruned.
+#[test]
+fn out_pruning_that_fails_does_not_stop_publishing() {
+    let tmp = TempDir::new("ret-out-err");
+    let out = tmp.path().join("out");
+    let state = tmp.path().join("state");
+    for b in ["rdd_a_1", "rdd_a_2"] {
+        write_batch(&out, b, 1);
+    }
+    let mut cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &state);
+    let first = Publisher::open(cfg.clone(), OkSink)
+        .unwrap()
+        .run_once()
+        .unwrap();
+    assert_eq!(first.published, 2);
+    let stuck = out.join("rdd_a_1");
+    let Some(_guard) = undeletable(&stuck, &stuck.join("records.jsonl")) else {
+        eprintln!("skipped: cannot make a file undeletable here");
+        return;
+    };
+    write_batch(&out, "rdd_a_3", 1);
+    cfg.out_retention = Retention {
+        max_count: Some(0),
+        ..Default::default()
+    };
+    let mut p = Publisher::open(cfg, OkSink).unwrap();
+    let rep = p.run_once().expect("pruning errors do not stop publishing");
+    assert_eq!(rep.published, 1, "the new batch is published");
+    assert_eq!(rep.batches_done, ["rdd_a_3"]);
+    let e = rep.out_prune_error.clone().expect("reported");
+    assert!(e.contains("rdd_a_1") && e.contains("--out-max"), "{e}");
+    assert!(stuck.join("records.jsonl").exists());
+    assert_eq!(rep.pruned_out.removed, 2, "the others are pruned: {rep:?}");
+    assert!(!out.join("rdd_a_2").join("records.jsonl").exists());
+    assert!(!out.join("rdd_a_3").join("records.jsonl").exists());
+    // Every pass reports it while it lasts.
+    assert!(p.run_once().unwrap().out_prune_error.is_some());
+}

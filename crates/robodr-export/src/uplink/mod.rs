@@ -84,7 +84,12 @@
 //! `done`) stays ([`crate::retention::prune_reinject_payloads`]). A record
 //! whose original copy was pruned is re-injected from its dead letter's
 //! `record` copy. The status file's `state_usage` gives the entries and
-//! bytes of each (measured at most every [`UplinkConfig::usage_interval`]).
+//! bytes of each (measured at most every [`UplinkConfig::usage_interval`],
+//! also across the service loop's re-opens). Measuring and pruning `out/`
+//! are housekeeping: a failure there is in the status file
+//! (`state_usage_error`, `out_prune_error`) and logged once while it
+//! lasts, and never fails a run or blocks delivery. Every other retention
+//! failure fails the run as before.
 
 pub mod check;
 pub mod http;
@@ -596,6 +601,15 @@ impl UplinkState {
     }
 }
 
+/// Housekeeping that outlives one [`Uplink`] (see
+/// [`Uplink::take_upkeep`]): when the state's usage was last measured,
+/// and the last `out/` pruning error.
+#[derive(Debug, Clone, Default)]
+pub struct Upkeep {
+    usage: crate::retention::UsageMeter,
+    out_prune_error: Option<String>,
+}
+
 /// What one run did.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct UplinkReport {
@@ -825,8 +839,8 @@ pub struct Uplink<T: Transport> {
     dead: DeadLetters,
     dead_loaded: bool,
     dead_malformed_unreported: u64,
-    /// The state's disk usage and when it was measured.
-    usage: Option<(std::time::Instant, crate::retention::StateUsage)>,
+    /// Housekeeping kept across runs ([`Upkeep`]).
+    upkeep: Upkeep,
     max_lines_now: usize,
     clock: Box<dyn FnMut() -> u64 + Send>,
     sleeper: Box<dyn FnMut(Duration) + Send>,
@@ -931,7 +945,7 @@ impl<T: Transport> Uplink<T> {
             dead,
             dead_loaded: false,
             dead_malformed_unreported: 0,
-            usage: None,
+            upkeep: Upkeep::default(),
             max_lines_now,
             clock: Box::new(fsutil::now_ms),
             sleeper: Box::new(std::thread::sleep),
@@ -981,8 +995,27 @@ impl<T: Transport> Uplink<T> {
         &self.key_id
     }
 
+    /// Housekeeping state to carry into the next [`Uplink`] on the same
+    /// state directory ([`Uplink::with_upkeep`]): the service loop opens
+    /// one per run, and would otherwise measure the state's usage on every
+    /// run and log a lasting `out/` pruning error every time.
+    pub fn take_upkeep(&mut self) -> Upkeep {
+        std::mem::take(&mut self.upkeep)
+    }
+
+    /// Continue with the housekeeping state of an earlier [`Uplink`] on
+    /// the same state directory ([`Uplink::take_upkeep`]).
+    pub fn with_upkeep(mut self, u: Upkeep) -> Self {
+        self.upkeep = u;
+        self
+    }
+
     /// Pending batch, backlog and totals, for the status file
-    /// ([`service`]).
+    /// ([`service`]). The state's usage is measured at most every
+    /// [`UplinkConfig::usage_interval`]; a failed measurement is reported
+    /// in the snapshot (`state_usage_error`, the last good measurement
+    /// kept) and logged once while it lasts, never a reason to fail the
+    /// snapshot.
     pub fn snapshot(&mut self) -> Result<service::Snapshot, UplinkError> {
         let mut backlog = service::Backlog::default();
         match &self.cfg.source {
@@ -1003,18 +1036,15 @@ impl<T: Transport> Uplink<T> {
                 .iter()
                 .filter(|g| !g.done)
                 .count() as u64;
-        let due = self
+        let (state_dir, source) = (&self.cfg.state_dir, &self.cfg.source);
+        let measured = self
+            .upkeep
             .usage
-            .as_ref()
-            .is_none_or(|(t, _)| t.elapsed() >= self.cfg.usage_interval);
-        if due {
-            let u = crate::retention::state_usage(
-                &self.cfg.state_dir,
-                DEAD_LETTER_FILE,
-                &self.cfg.source,
-                true,
-            )?;
-            self.usage = Some((std::time::Instant::now(), u));
+            .measure_if_due(self.cfg.usage_interval, || {
+                crate::retention::state_usage(state_dir, DEAD_LETTER_FILE, source, true)
+            });
+        if let crate::retention::Measured::Failed { error, new: true } = &measured {
+            (self.log)(error);
         }
         let p = self.state.pending.as_ref();
         Ok(service::Snapshot {
@@ -1026,7 +1056,9 @@ impl<T: Transport> Uplink<T> {
             accepted_total: self.state.accepted_total,
             rejected_total: self.state.rejected_total,
             dead_lettered_total: self.state.dead_lettered_total,
-            state_usage: self.usage.as_ref().map(|(_, u)| u.clone()),
+            state_usage: self.upkeep.usage.last().cloned(),
+            state_usage_error: self.upkeep.usage.error().map(str::to_string),
+            out_prune_error: self.upkeep.out_prune_error.clone(),
         })
     }
 
@@ -1607,12 +1639,22 @@ impl<T: Transport> Uplink<T> {
                 &self.cfg.done_retention,
                 now,
             )?;
-            report.pruned_out = crate::retention::prune_diode_out(
+            let (pruned, err) = crate::retention::prune_diode_out(
                 out,
                 &self.cfg.state_dir.join(DONE_DIR),
                 &self.cfg.out_retention,
                 now,
-            )?;
+            );
+            report.pruned_out = pruned;
+            // Housekeeping: in the status (logged once while it lasts),
+            // never a reason to stop delivering.
+            let msg = err.as_ref().map(crate::retention::out_prune_failure);
+            if let Some(m) = &msg {
+                if self.upkeep.out_prune_error.as_ref() != Some(m) {
+                    (self.log)(m);
+                }
+            }
+            self.upkeep.out_prune_error = msg;
         }
         if let Source::Spool(root) = &self.cfg.source {
             report.pruned_rejected = crate::spool_export::prune_rejected(

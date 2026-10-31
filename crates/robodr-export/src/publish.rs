@@ -120,7 +120,12 @@
 //!
 //! The report's `state_usage` gives the entries and bytes of `done/`, the
 //! dead-letter files and `out/` or `rejected/` (measured at most every
-//! [`PublishConfig::usage_interval`]).
+//! [`PublishConfig::usage_interval`]). Measuring and pruning `out/` are
+//! housekeeping: a failure there is reported (`state_usage_error`,
+//! `out_prune_error`, a warning on stderr once while it lasts) and never
+//! stops publishing. Every other retention failure (`done/`, dead
+//! letters, `rejected/`) is in the publisher's own state or the spool
+//! and fails the run as before.
 
 use crate::deadletter::{DeadLetters, Rotation};
 use crate::fsutil::{self, ReadError};
@@ -473,6 +478,15 @@ pub struct PublishReport {
     /// [`PublishConfig::usage_interval`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_usage: Option<crate::retention::StateUsage>,
+    /// The measurement of this run failed (monitoring only: the run goes
+    /// on; retried after the interval).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_usage_error: Option<String>,
+    /// Pruning `out/` (`out_retention`) failed in this run, with the path
+    /// and what to do; publishing goes on, that payload stays
+    /// ([`crate::retention::prune_diode_out`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_prune_error: Option<String>,
 }
 
 /// One input record, as the importer writes it (and as agentd spools it).
@@ -827,8 +841,10 @@ pub struct Publisher<S: Sink> {
     /// The dead-letter file (dedup set loaded on the first dead letter).
     dead: DeadLetters,
     dead_loaded: bool,
-    /// When the state usage was last measured.
-    usage_at: Option<std::time::Instant>,
+    /// The state usage, measured at most every `usage_interval`.
+    usage: crate::retention::UsageMeter,
+    /// The last `out/` pruning error (logged once while it lasts).
+    out_prune_error: Option<String>,
 }
 
 fn save_progress(state_dir: &Path, p: &Progress) -> Result<(), PublishError> {
@@ -918,7 +934,8 @@ impl<S: Sink> Publisher<S> {
             chunks_sent: 0,
             dead,
             dead_loaded: false,
-            usage_at: None,
+            usage: Default::default(),
+            out_prune_error: None,
         })
     }
 
@@ -973,12 +990,23 @@ impl<S: Sink> Publisher<S> {
                 &self.cfg.done_retention,
                 now,
             )?;
-            report.pruned_out = crate::retention::prune_diode_out(
+            let (pruned, err) = crate::retention::prune_diode_out(
                 out,
                 &self.cfg.state_dir.join(DONE_DIR),
                 &self.cfg.out_retention,
                 now,
-            )?;
+            );
+            report.pruned_out = pruned;
+            // Housekeeping: reported (logged once while it lasts), never a
+            // reason to stop publishing.
+            let msg = err.as_ref().map(crate::retention::out_prune_failure);
+            if let Some(m) = &msg {
+                if self.out_prune_error.as_ref() != Some(m) {
+                    eprintln!("robodr-kafka-publish: WARNING: {m}");
+                }
+            }
+            report.out_prune_error.clone_from(&msg);
+            self.out_prune_error = msg;
         }
         if let Source::Spool(root) = &self.cfg.source {
             report.pruned_rejected = crate::spool_export::prune_rejected(
@@ -996,17 +1024,18 @@ impl<S: Sink> Publisher<S> {
         let res = dead.prune(&r, now, |s, p| self.dead_letter_needed(s, p));
         self.dead = dead;
         report.pruned_dead_letters = res?;
-        let due = self
-            .usage_at
-            .is_none_or(|t| t.elapsed() >= self.cfg.usage_interval);
-        if due {
-            report.state_usage = Some(crate::retention::state_usage(
-                &self.cfg.state_dir,
-                DEAD_LETTER_FILE,
-                &self.cfg.source,
-                false,
-            )?);
-            self.usage_at = Some(std::time::Instant::now());
+        let (state_dir, source) = (&self.cfg.state_dir, &self.cfg.source);
+        match self.usage.measure_if_due(self.cfg.usage_interval, || {
+            crate::retention::state_usage(state_dir, DEAD_LETTER_FILE, source, false)
+        }) {
+            crate::retention::Measured::NotDue => {}
+            crate::retention::Measured::Fresh(u) => report.state_usage = Some(u),
+            crate::retention::Measured::Failed { error, new } => {
+                if new {
+                    eprintln!("robodr-kafka-publish: WARNING: {error}");
+                }
+                report.state_usage_error = Some(error);
+            }
         }
         Ok(())
     }

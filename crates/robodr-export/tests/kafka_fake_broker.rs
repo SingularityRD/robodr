@@ -993,3 +993,50 @@ fn sequence_numbers_wrap_like_kafka() {
     assert_eq!(increment_sequence(i32::MAX, 10), 9);
     assert_eq!(inc_seq(i32::MAX, 10), 9);
 }
+
+/// Review finding (WP16): a batch numbered under an older epoch (another
+/// partition's batch in doubt across an epoch bump) answered
+/// INVALID_PRODUCER_EPOCH / PRODUCER_FENCED: someone else writes with this
+/// producer id at a higher epoch (a cloned state directory). The producer
+/// resets to a new producer id, as the module docs say, instead of going
+/// on at the bumped epoch, where the other writer's batches could be
+/// answered DUPLICATE_SEQUENCE_NUMBER (reported delivered, never written).
+#[test]
+fn fencing_of_an_older_epochs_batch_resets_the_producer_id() {
+    for code in [47i16, 90] {
+        let c = Cluster::start(2, 2);
+        {
+            let mut st = c.state.lock().unwrap();
+            st.leaders = vec![1, 2];
+            st.init_pid_max_version = 4;
+        }
+        let mut p = Producer::new(cfg(&c)).unwrap();
+        assert_eq!(delivered(&p.send(TOPIC, &recs(4, 2)).unwrap()), 4);
+        // Partition 0 (node 1): appended, reply lost. Partition 1 (node
+        // 2): out of order (epoch bump). Partition 0's re-send under the
+        // older epoch: fenced.
+        c.script([
+            Action::DisconnectAfterAppend,
+            Action::Error(45),
+            Action::Error(code),
+        ]);
+        let out = p.send(TOPIC, &recs(6, 2)).unwrap();
+        assert_eq!(delivered(&out), 6, "code {code}");
+        let s = p.stats();
+        assert_eq!(s.epoch_bumps, 1, "code {code}");
+        assert_eq!(s.producer_id_resets, 1, "code {code}: a new producer id");
+        let st = p.idempotent_state().unwrap();
+        assert_ne!(st.producer_id, 1000, "code {code}");
+        assert_eq!(c.init_pid_requests(), 2, "code {code}");
+        // Partition 0 continues under the new producer id.
+        assert_eq!(delivered(&p.send(TOPIC, &recs(2, 2)).unwrap()), 2);
+        assert!(
+            appended(&c)
+                .iter()
+                .rfind(|a| a.0 == 0)
+                .is_some_and(|a| a.1 != 1000),
+            "{:?}",
+            appended(&c)
+        );
+    }
+}

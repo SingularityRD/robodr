@@ -1524,3 +1524,150 @@ fn rejected_and_reinject_payloads_are_pruned_on_request_and_measured() {
     // pruned generation: re-injected from the dead letters' own copies.
     assert_eq!(again.from_dead_letter, 2, "{again:?}");
 }
+
+/// Run the service loop `runs` times with `cfg`; `between` runs after each
+/// sleep. Returns the log lines.
+fn run_service_with(
+    r: &Rig,
+    cfg: UplinkConfig,
+    runs: usize,
+    mut between: impl FnMut(usize),
+) -> Vec<String> {
+    let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let l1 = logs.clone();
+    let mut left = runs;
+    let mut n = 0;
+    let mut env = Env {
+        now_ms: Box::new(|| NOW),
+        sleep: Box::new(move |_| {
+            n += 1;
+            between(n);
+        }),
+        rng: Box::new(|| 0),
+        notify: Box::new(|_| {}),
+        log: Box::new(move |m| l1.lock().unwrap().push(m.to_string())),
+        report: Box::new(|_| {}),
+        stop: Box::new(move || {
+            left -= 1;
+            left == 0
+        }),
+    };
+    let l2 = logs.clone();
+    let open = || {
+        let l = l2.clone();
+        Ok(r.uplink(cfg.clone())
+            .with_log(move |m| l.lock().unwrap().push(m.to_string())))
+    };
+    assert_eq!(service::run(&svc(), &r.state, open, &mut env), 0);
+    drop(env);
+    let v = logs.lock().unwrap().clone();
+    v
+}
+
+/// Review finding (WP16): the service re-opens the uplink for every run;
+/// the state's usage (a walk of `done/`, the dead letters, `out/` or
+/// `rejected/`, `reinject/`) is still measured at most once per
+/// `usage_interval`, not on every run (every 2 s).
+#[test]
+fn service_measures_state_usage_at_most_once_per_interval() {
+    for (interval, want) in [(Duration::from_secs(3600), 0u64), (Duration::ZERO, 3)] {
+        let r = Rig::new("usage-svc", Role::Uplink);
+        r.spool(UNIT, 0, 1, false);
+        let mut cfg = r.spool_cfg();
+        cfg.usage_interval = interval;
+        let done = r.state.join("done");
+        // A file appears in done/ after each of the first runs.
+        run_service_with(&r, cfg, 4, |n| {
+            if n < 4 {
+                fs::write(done.join(format!("x{n}")), b"").unwrap();
+            }
+        });
+        let u = status_of(&r).snapshot.state_usage.expect("measured");
+        assert_eq!(u.done_markers.entries, want, "interval {interval:?}");
+    }
+}
+
+/// Review finding (WP16): a failed measurement of the state's usage
+/// (here `<spool>/rejected` is not a directory) no longer throws away the
+/// status snapshot (pending batch, backlog, totals): the snapshot carries
+/// the error instead, the service logs it once, and the run succeeds.
+#[test]
+fn a_failed_usage_measurement_keeps_the_status_snapshot() {
+    let r = Rig::new("usage-err", Role::Uplink);
+    r.spool(UNIT, 0, 2, false);
+    let mut cfg = r.spool_cfg();
+    cfg.usage_interval = Duration::ZERO;
+    let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let l = logs.clone();
+    let mut u = r
+        .uplink(cfg)
+        .with_log(move |m| l.lock().unwrap().push(m.to_string()));
+    // Broken after open (which creates it).
+    let rejected = r.spool.join("rejected");
+    fs::remove_dir_all(&rejected).unwrap();
+    fs::write(&rejected, b"not a directory").unwrap();
+    u.run_once().unwrap();
+    let snap = u.snapshot().expect("the snapshot survives");
+    assert_eq!(snap.accepted_total, 2);
+    assert_eq!(snap.backlog.spool_ready, Some(0));
+    assert_eq!(snap.state_usage, None);
+    assert!(
+        snap.state_usage_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rejected")),
+        "{snap:?}"
+    );
+    // Measured again (interval 0), failing the same way: logged once.
+    assert!(u.snapshot().unwrap().state_usage_error.is_some());
+    let warned = logs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("state usage"))
+        .count();
+    assert_eq!(warned, 1, "logged once while it lasts: {logs:?}");
+    // Repaired: measured, the error gone.
+    fs::remove_file(&rejected).unwrap();
+    fs::create_dir(&rejected).unwrap();
+    let snap = u.snapshot().unwrap();
+    assert_eq!(snap.state_usage_error, None);
+    assert!(snap.state_usage.is_some());
+}
+
+/// Review finding (WP16): `--out-max-*` where the uplink may not delete an
+/// `out/` batch's payload does not block delivery: the run succeeds, the
+/// status carries the error (path and remedy) and it is logged once.
+#[test]
+fn out_pruning_that_fails_does_not_block_the_uplink() {
+    let r = Rig::new("out-err", Role::Relay);
+    diode_batch(&r.out, "rdd_ugv-007_0000000000000001", UNIT, 0, 1, None);
+    let mut cfg = r.cfg(Source::DiodeOut(r.out.clone()));
+    r.uplink(cfg.clone()).run_once().unwrap();
+    let stuck = r.out.join("rdd_ugv-007_0000000000000001");
+    let Some(_guard) = undeletable(&stuck, &stuck.join("records.jsonl")) else {
+        eprintln!("skipped: cannot make a file undeletable here");
+        return;
+    };
+    diode_batch(&r.out, "rdd_ugv-007_0000000000000002", UNIT, 1, 1, None);
+    cfg.out_retention = robodr_export::retention::Retention {
+        max_count: Some(0),
+        ..Default::default()
+    };
+    let logs = run_service_with(&r, cfg, 3, |_| {});
+    let st = status_of(&r);
+    assert_eq!(st.state, "ok", "{:?}", st.last_error);
+    assert_eq!(st.snapshot.accepted_total, 2, "the new batch is delivered");
+    let e = st.snapshot.out_prune_error.expect("in the status");
+    assert!(
+        e.contains("0000000000000001") && e.contains("--out-max"),
+        "{e}"
+    );
+    assert!(stuck.join("records.jsonl").exists());
+    assert!(!r
+        .out
+        .join("rdd_ugv-007_0000000000000002")
+        .join("records.jsonl")
+        .exists());
+    let warned = logs.iter().filter(|l| l.contains("--out-max")).count();
+    assert_eq!(warned, 1, "logged once while it lasts: {logs:?}");
+}
