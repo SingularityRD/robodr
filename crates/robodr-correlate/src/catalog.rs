@@ -54,6 +54,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.capture.bad_checksum",
     "robot.capture.not_udp",
     "robot.capture.unsupported_middleware",
+    "robot.capture.unsupported_transport",
     "robot.ros2.ambiguous_discovery",
     "robot.rtps.discovery_not_inspected",
     "robot.sensor.findings_capped",
@@ -61,6 +62,7 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     "robot.ros2.endpoint_unannounced_participant",
     "robot.ros2.participant_source_mismatch",
     "robot.ros2.identity_instances_exceeded",
+    "robot.ros2.untrusted_security_identity",
     "robot.motion.undecodable_sample",
     "robot.motion.unattributed_sample",
     "robot.motion.sample_source_mismatch",
@@ -175,6 +177,22 @@ pub const NETWORK_AND_AGENT_RULES: &[&str] = &[
     // robodr-agentd executor link (failed revert, executor journal reset)
     "robot.agent.executor_revert_failed",
     "robot.agent.executor_journal_reset",
+    "robot.agent.executor_pause_overridden",
+    // robodr-agentd early warnings (contract 2.5, `selfcheck`). The
+    // periodic `robot.agent.health` record is never fed to the engine.
+    "robot.agent.credential_expiring",
+    "robot.agent.clock_unsynced",
+    "robot.agent.clock_jump",
+    "robot.agent.disk_low",
+    "robot.agent.executor_unreachable",
+    // Contract 2.5 ids reserved for their producers (control-plane replay
+    // fence, field self-test, in-path gateway overload).
+    "robot.agent.control_plane_request_fenced",
+    "robot.agent.selftest",
+    "robot.gateway.overload",
+    // robodr-agentd commissioning: a safety configuration file (response
+    // policy, firewall joint config) not bound to the trusted locked profile
+    "robot.agent.config_unattested",
     // robodr-agentd live safety-state feed
     "robot.safety_state.untrusted_source",
     "robot.safety_state.undecodable_sample",

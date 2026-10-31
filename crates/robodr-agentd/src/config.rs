@@ -128,6 +128,10 @@
 //!   group/other-writable, not this robot's own keys), optional `evidence`.
 //!   Needs `finding_signing` (answers are signed). Requests are judged and
 //!   recorded, never executed; see [`crate::control`].
+//! * `key_protection` (optional, [`crate::key_protection::KeyProtectionSection`]):
+//!   `{"require": "tpm2"}` refuses to start unless every private key is a
+//!   TPM-sealed systemd credential; without it every key is classified and
+//!   reported in `status.json` (`key_protection`, the file fallback flagged).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -275,6 +279,10 @@ pub struct DaemonConfig {
     /// = nothing is executed.
     #[serde(default)]
     pub executor: Option<crate::executor_link::ExecutorSection>,
+    /// How the private keys must be protected at rest (see
+    /// [`crate::key_protection`]); absent = report only.
+    #[serde(default)]
+    pub key_protection: Option<crate::key_protection::KeyProtectionSection>,
 }
 
 /// `correlation`: the `robodr-correlate` engine over every finding the
@@ -412,6 +420,11 @@ pub struct BlackboxSection {
     /// `tpm_nv_counter` or the `remote` kind.
     #[serde(default)]
     pub head_anchor: Option<HeadAnchorConfig>,
+    /// Retention and pending-export protection; see
+    /// [`crate::retention`]. Absent: the recorder's defaults (cyclic,
+    /// 8 x 8 MiB, no reserve).
+    #[serde(default)]
+    pub retention: Option<crate::retention::RetentionConfig>,
 }
 
 /// `blackbox.head_anchor`.
@@ -716,7 +729,11 @@ fn default_connections() -> usize {
 
 /// Platform context. Without a `safety_feed`, the configured
 /// `safety_state` is used for every plan (default `unknown`); with one, the
-/// feed decides and this must stay `unknown`.
+/// feed decides and this must stay `unknown`. `control`, `phase` and
+/// `connectivity` are replaced, field by field, by the live context when a
+/// `safety_feed` source reports that field
+/// ([`crate::safety_feed::context`]); they remain the value used while no
+/// live source contributes.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSection {
@@ -824,6 +841,9 @@ pub struct DaemonSection {
     /// queue is drained. Off for a live daemon: an input that ends is then a
     /// health finding and the daemon keeps running ("unknown" state).
     pub exit_when_inputs_end: bool,
+    /// The periodic health record and the early-warning thresholds
+    /// ([`crate::selfcheck::SelfHealthSection`]).
+    pub self_health: crate::selfcheck::SelfHealthSection,
 }
 
 impl Default for DaemonSection {
@@ -837,12 +857,13 @@ impl Default for DaemonSection {
             lag_ms: 2_000,
             health_report_ms: 10_000,
             exit_when_inputs_end: false,
+            self_health: crate::selfcheck::SelfHealthSection::default(),
         }
     }
 }
 
 /// A validated configuration with every referenced file loaded.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Resolved {
     pub config: DaemonConfig,
     /// The validated sensor section.
@@ -895,6 +916,13 @@ pub struct Resolved {
     pub robot_model: Option<robodr_cdr::UnitreeModel>,
     /// Non-fatal warnings to log at start.
     pub warnings: Vec<String>,
+    /// How each private key is protected at rest (`status.json`
+    /// `key_protection`; see [`crate::key_protection`]).
+    pub key_protection: crate::key_protection::KeyReport,
+    /// Safety configuration files that claim more than the commissioning
+    /// signed (`crate::commissioned`): one `robot.agent.config_unattested`
+    /// finding each at start.
+    pub config_unattested: Vec<String>,
 }
 
 impl std::fmt::Debug for KeyBytes {
@@ -903,9 +931,17 @@ impl std::fmt::Debug for KeyBytes {
     }
 }
 
-/// Key material wrapper that does not print its bytes.
-#[derive(Clone)]
-pub struct KeyBytes(pub Vec<u8>);
+/// Key material wrapper: does not print its bytes, wipes them on drop
+/// (`zeroize`), and is not `Clone` (one copy of the secret, not one per
+/// clone left behind in freed memory).
+pub struct KeyBytes(pub zeroize::Zeroizing<Vec<u8>>);
+
+impl KeyBytes {
+    /// Take ownership of `bytes` (wiped when the `KeyBytes` drops).
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(zeroize::Zeroizing::new(bytes))
+    }
+}
 
 /// Read a size-capped UTF-8 file.
 pub fn read_capped(path: &Path, max: u64) -> Result<String, String> {
@@ -1098,6 +1134,7 @@ pub fn validate_daemon(d: &DaemonSection) -> Result<(), String> {
     range("silence_ms", d.silence_ms, d.tick_ms, 86_400_000)?;
     range("lag_ms", d.lag_ms, 10, 3_600_000)?;
     range("health_report_ms", d.health_report_ms, 0, 86_400_000)?;
+    d.self_health.validate()?;
     Ok(())
 }
 
@@ -1133,6 +1170,9 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     require_abs("policy_path", &config.policy_path)?;
     require_abs("blackbox.dir", &config.blackbox.dir)?;
     require_abs("blackbox.key_file", &config.blackbox.key_file)?;
+    if let Some(r) = &config.blackbox.retention {
+        r.validate()?;
+    }
     require_abs("spool.dir", &config.spool.dir)?;
     if config.spool.max_bytes < 64 * 1024 {
         return Err("spool.max_bytes must be >= 65536".into());
@@ -1224,7 +1264,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     }
     warnings.extend(sensor.profile_trust.warnings());
     let policy_text = read_capped(&config.policy_path, MAX_CONFIG_BYTES)?;
-    let policy = ResponsePolicy::from_json(&policy_text)
+    let mut policy = ResponsePolicy::from_json(&policy_text)
         .map_err(|e| format!("{}: {e}", config.policy_path.display()))?;
     if !policy.oem_validated {
         warnings.push(
@@ -1256,6 +1296,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         })?),
     };
     sensor.pipeline.motion.robot_model = robot_model;
+    let mut joint_text: Option<(PathBuf, String)> = None;
     let firewall_joint = match config
         .firewall
         .as_ref()
@@ -1265,6 +1306,7 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         Some(p) => {
             require_abs("firewall.joint_config", p)?;
             let text = read_capped(p, MAX_CONFIG_BYTES)?;
+            joint_text = Some((p.clone(), text.clone()));
             let fc = robodr_firewall::FirewallConfig::from_json(&text)
                 .map_err(|e| format!("{}: {e}", p.display()))?;
             if !fc.channels.is_empty() {
@@ -1376,6 +1418,25 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
     let t = load_profile_checked(&sensor.profile_path, &sensor.profile_trust, chain.as_ref())?;
     if let Some(a) = &t.alarm {
         warnings.push(format!("CRITICAL: {a}"));
+    }
+    // T11 / T12: the policy's oem_validated and the firewall joint file
+    // count only as bound into the trusted locked profile (see
+    // `crate::commissioned`).
+    let commissioned = crate::commissioned::apply(
+        t.accepted
+            .as_ref()
+            .filter(|_| t.loaded.file_check.is_ok())
+            .map(|_| &t.loaded.profile),
+        &config.policy_path,
+        &policy_text,
+        &mut policy,
+        joint_text
+            .as_ref()
+            .map(|(p, text)| (p.as_path(), text.as_str())),
+    );
+    warnings.extend(commissioned.warnings.iter().cloned());
+    if t.lab_only {
+        warnings.push(robodr_commission::poc::LAB_ONLY_BANNER.to_string());
     }
     let safety_feed = match &config.safety_feed {
         None => None,
@@ -1712,6 +1773,9 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
             );
         }
     }
+    // Last: every key path above is valid. Refuses the configuration when
+    // `key_protection.require` is "tpm2" and a key is not TPM-sealed.
+    let key_protection = crate::key_protection::assess(&config)?;
     Ok(Resolved {
         config,
         sensor,
@@ -1738,6 +1802,8 @@ pub fn resolve(config: DaemonConfig) -> Result<Resolved, String> {
         firewall_joint,
         robot_model,
         warnings,
+        key_protection,
+        config_unattested: commissioned.findings,
     })
 }
 
@@ -2182,54 +2248,36 @@ pub fn previous_keys(
             "blackbox.previous_keys: at most {MAX_PREVIOUS_KEY_FILES} files"
         ));
     }
-    let mut all = Vec::new();
     for p in &bb.previous_keys {
         require_abs("blackbox.previous_keys[]", p)?;
-        let shown = p.display();
         if resolve_path(p) == resolve_path(&bb.key_file) {
             return Err(format!(
-                "blackbox.previous_keys {shown} is blackbox.key_file: list the retired keys only"
+                "blackbox.previous_keys {} is blackbox.key_file: list the retired keys only",
+                p.display()
             ));
         }
-        let keys = robodr_blackbox::keys::load_key_files(p)
-            .map_err(|e| format!("blackbox.previous_keys {shown}: {e}"))?;
-        for k in keys {
-            let id = robodr_ros2_pipeline::sanitize(&k.key_id);
-            k.check_hmac_policy(bb.allow_hmac).map_err(|e| {
-                format!("blackbox.previous_keys {shown}: {e} (blackbox.allow_hmac)")
-            })?;
-            if !k.is_symmetric() && !k.is_public() {
-                return Err(format!(
-                    "blackbox.previous_keys {shown}: key {id:?} is a secret key file; a retired \
-                     ed25519 key is listed by its public file (robodr-blackbox export-pub)"
-                ));
-            }
-            if Some(k.key_id.as_str()) == current_key_id {
-                return Err(format!(
-                    "blackbox.previous_keys {shown}: key {id:?} is the current black-box key"
-                ));
-            }
-            if let Some(d) = k.device_id.as_deref() {
-                if d != robot_id {
-                    return Err(format!(
-                        "blackbox.previous_keys {shown}: key {id:?} is bound to device {:?}, \
-                         not robot.id {robot_id:?}",
-                        robodr_ros2_pipeline::sanitize(d)
-                    ));
-                }
-            }
-            if k.is_symmetric() {
-                warnings.push(format!(
-                    "blackbox.previous_keys: {id} is a legacy hmac-sha256 key (allowed by \
-                     blackbox.allow_hmac): whoever holds it can forge the records it signed"
-                ));
-            }
-            all.push(k);
-        }
     }
-    robodr_blackbox::PreviousKeys::from_key_files(&all, bb.allow_hmac)
-        .map(Some)
-        .map_err(|e| format!("blackbox.previous_keys: {e}"))
+    // The per-key checks are shared with `robodr-blackbox rotate
+    // --previous-keys` (robodr_blackbox::keys::load_previous_keys).
+    let paths: Vec<&Path> = bb.previous_keys.iter().map(PathBuf::as_path).collect();
+    let exclude: Vec<(&str, &str)> = current_key_id
+        .map(|k| (k, "the current black-box key"))
+        .into_iter()
+        .collect();
+    let mut w = Vec::new();
+    let keys = robodr_blackbox::keys::load_previous_keys(
+        "blackbox.previous_keys",
+        &paths,
+        robot_id,
+        &exclude,
+        bb.allow_hmac,
+        &mut w,
+    )?;
+    warnings.extend(
+        w.into_iter()
+            .map(|m| format!("{m} (allowed by blackbox.allow_hmac)")),
+    );
+    Ok(Some(keys))
 }
 
 /// [`read_key_material`] without the key id.
@@ -2238,7 +2286,7 @@ pub fn read_key_file(path: &Path) -> Result<KeyBytes, String> {
 }
 
 /// A loaded black-box signing key.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KeyMaterial {
     /// HMAC key or Ed25519 seed.
     pub key: KeyBytes,
@@ -2293,10 +2341,19 @@ pub fn read_key(path: &Path) -> Result<KeyMaterial, String> {
             "key file {shown}: larger than {MAX_KEY_FILE_BYTES} bytes"
         ));
     }
-    let mut text = String::new();
-    f.take(MAX_KEY_FILE_BYTES + 1)
+    // Preallocated to the (bounded) file size so the buffer never
+    // reallocates, which would leave unwiped copies of the key in freed
+    // memory; `wipe_text` clears this one.
+    let mut text =
+        String::with_capacity(usize::try_from(meta.len().min(MAX_KEY_FILE_BYTES)).unwrap_or(0) + 1);
+    let read = f
+        .take(MAX_KEY_FILE_BYTES + 1)
         .read_to_string(&mut text)
-        .map_err(|e| format!("key file {shown}: {e}"))?;
+        .map_err(|e| format!("key file {shown}: {e}"));
+    if let Err(e) = read {
+        wipe_text(&mut text);
+        return Err(e);
+    }
     if text.trim_start().starts_with('{') {
         // The permission checks above already ran on this descriptor;
         // `from_json` only parses (strict, unknown fields refused).
@@ -2306,22 +2363,22 @@ pub fn read_key(path: &Path) -> Result<KeyMaterial, String> {
         // Refuses public key files and unknown algorithms; re-checks lengths.
         kf.signer().map_err(|e| format!("key file {shown}: {e}"))?;
         return Ok(KeyMaterial {
-            key: KeyBytes(kf.secret().to_vec()),
+            key: KeyBytes::new(kf.secret().to_vec()),
             key_id: Some(kf.key_id.clone()),
             algorithm: kf.algorithm.clone(),
         });
     }
-    let key = robodr_blackbox::crypto::from_hex(text.trim());
+    let key = robodr_blackbox::crypto::from_hex(text.trim()).map(KeyBytes::new);
     wipe_text(&mut text);
     let key = key.ok_or_else(|| format!("key file {shown}: not valid hex"))?;
-    if key.len() < 32 {
+    if key.0.len() < 32 {
         return Err(format!(
             "key file {shown}: key is {} bytes, at least 32 needed",
-            key.len()
+            key.0.len()
         ));
     }
     Ok(KeyMaterial {
-        key: KeyBytes(key),
+        key,
         key_id: None,
         algorithm: robodr_blackbox::sign::HMAC_SHA256.into(),
     })
@@ -2354,12 +2411,10 @@ pub fn signer_for(
     }
 }
 
-/// Best-effort overwrite of a string that held key material.
+/// Overwrite a string that held key material (`zeroize`: volatile writes,
+/// not optimized away; the whole buffer, then cleared).
 fn wipe_text(s: &mut String) {
-    let n = s.len();
-    s.clear();
-    s.extend(std::iter::repeat_n('0', n));
-    s.clear();
+    zeroize::Zeroize::zeroize(s);
 }
 
 #[cfg(test)]
@@ -2381,12 +2436,36 @@ mod tests {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Key material is wiped on drop and never duplicated: `KeyBytes` holds
+    /// a `Zeroizing` buffer and is not `Clone` (this does not compile if it
+    /// were: the trait method below would be ambiguous).
+    #[test]
+    fn key_bytes_are_wiped_on_drop_and_not_clone() {
+        trait AmbiguousIfClone<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        #[allow(dead_code)]
+        struct IsClone;
+        impl<T: Clone> AmbiguousIfClone<IsClone> for T {}
+        <KeyBytes as AmbiguousIfClone<_>>::check();
+        let k = KeyBytes::new(vec![7; 32]);
+        let _: &zeroize::Zeroizing<Vec<u8>> = &k.0;
+        // `read_key` reads into a preallocated buffer (no reallocation
+        // leaves a stray copy) and wipes it.
+        let d = tmp("key-wipe");
+        let p = d.join("k.key");
+        write_mode(&p, &format!("{}\n", "cd".repeat(32)), 0o600);
+        assert_eq!(*read_key_file(&p).unwrap().0, vec![0xcd; 32]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn key_file_checks() {
         let d = tmp("key");
         let good = d.join("good.key");
         write_mode(&good, &format!("{}\n", "ab".repeat(32)), 0o600);
-        assert_eq!(read_key_file(&good).unwrap().0, vec![0xab; 32]);
+        assert_eq!(*read_key_file(&good).unwrap().0, vec![0xab; 32]);
         assert_eq!(
             format!("{:?}", read_key_file(&good).unwrap()),
             "KeyBytes(<32 bytes>)"
@@ -2415,7 +2494,7 @@ mod tests {
             robodr_blackbox::KeyFile::hmac_from_secret(&[0xcd; 32], Some("ugv-07-bb")).unwrap();
         kf.write_new(&json).unwrap();
         let (k, id) = read_key_material(&json).unwrap();
-        assert_eq!(k.0, vec![0xcd; 32]);
+        assert_eq!(*k.0, vec![0xcd; 32]);
         assert_eq!(id.as_deref(), Some("ugv-07-bb"));
         assert_eq!(read_key_material(&good).unwrap().1, None);
         let json_open = d.join("json-open.key");
@@ -2433,7 +2512,7 @@ mod tests {
             (m.algorithm.as_str(), m.key_id.as_deref()),
             ("ed25519", Some("ugv-07-ed"))
         );
-        assert_eq!(m.key.0, vec![0x11; 32]);
+        assert_eq!(*m.key.0, vec![0x11; 32]);
         let signer = signer_for(&m.algorithm, &m.key, m.key_id.as_deref()).unwrap();
         assert_eq!(signer.algorithm(), "ed25519");
         assert_eq!(signer.key_id(), "ugv-07-ed");
@@ -2461,9 +2540,9 @@ mod tests {
         );
         assert!(read_key_file(&odd).unwrap_err().contains("unsupported"));
         assert!(signer_for("tpm-ecdsa", &m.key, None).is_err());
-        assert!(signer_for("ed25519", &KeyBytes(vec![1; 31]), None).is_err());
+        assert!(signer_for("ed25519", &KeyBytes::new(vec![1; 31]), None).is_err());
         assert_eq!(
-            signer_for("hmac-sha256", &KeyBytes(vec![1; 32]), None)
+            signer_for("hmac-sha256", &KeyBytes::new(vec![1; 32]), None)
                 .unwrap()
                 .algorithm(),
             "hmac-sha256"

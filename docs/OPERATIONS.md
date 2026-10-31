@@ -84,17 +84,27 @@ an unverified extraction can be modified to skip every check. So **verify
 the tarball before extracting it**, and run the verifier from a trusted
 copy.
 
-*First installation* (no RoboDR on the unit yet):
+*First installation* (no RoboDR on the unit yet). Copy the tarball and its
+signature **once** into a root-owned 0700 directory and verify, extract and
+install **that copy** only: a file on removable media, or in a directory
+another user can write, can be swapped between the check and the
+extraction (the extraction then unpacks something that was never verified,
+and the package's scripts run as root):
 
 ```sh
-minisign -V -p /etc/robodr-trust/robodr-release.pub -m robodr-$V-$A-offline.tar.gz
-sudo mkdir -m 0700 /root/robodr-$V && sudo tar -xzf robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
+sudo install -d -m 0700 -o root -g root /root/robodr-$V
+sudo cp -- robodr-$V-$A-offline.tar.gz robodr-$V-$A-offline.tar.gz.minisig /root/robodr-$V/
+sudo minisign -V -p /etc/robodr-trust/robodr-release.pub -m /root/robodr-$V/robodr-$V-$A-offline.tar.gz
+#   the "Trusted comment" printed must name robodr-$V-$A-offline.tar.gz
+sudo tar -xzf /root/robodr-$V/robodr-$V-$A-offline.tar.gz -C /root/robodr-$V
 sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
     --pubkey /etc/robodr-trust/robodr-release.pub \
-    --tarball robodr-$V-$A-offline.tar.gz
+    --tarball /root/robodr-$V/robodr-$V-$A-offline.tar.gz
 ```
 
-*Upgrades* use the copy the previous, verified release installed:
+*Upgrades* use the copy the previous, verified release installed (it makes
+its own private copy of the tarball, step 1 below, so the tarball may stay
+on the media):
 
 ```sh
 sudo sh /usr/lib/robodr/install-bundle.sh install \
@@ -104,36 +114,72 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
 
 `install-bundle.sh install --pubkey … --tarball …`:
 
-1. checks the tarball's minisign signature against the pinned key; if the
-   release's `SHA256SUMS` and `SHA256SUMS.minisig` lie next to the tarball,
-   checks that signature too and that the tarball is listed in it with its
+1. refuses a tarball that is not a regular file (symlink, FIFO, device),
+   then **copies** it, its `.minisig` and (if present) the release's
+   `SHA256SUMS` / `SHA256SUMS.minisig` next to it **once** into a
+   **private** directory (`mktemp -d`, 0700; removed afterwards). Every
+   check and the extraction below read that copy only; the file named by
+   `--tarball` is never opened again, so swapping it afterwards changes
+   nothing;
+2. checks the copy's minisign signature against the pinned key (with the
+   **built-in verifier**, `robodr-deliverd verify-minisign`, once a release
+   carrying it is installed; with the `minisign` program before that), and that
+   the signature's **trusted comment** names the tarball's file name
+   (releases sign with `robodr <version> <file>`): a signed bundle renamed
+   to pass for another one (e.g. a `robodr-focal` bundle named like a
+   `robodr` one) is refused. If the release's `SHA256SUMS` was signed, its
+   signature is checked too and the tarball must be listed in it with its
    hash. Without `--pubkey`/`--tarball` it refuses unless
-   `ROBODR_ALLOW_UNSIGNED=1` (labs only; the bundle is then the directory
-   the script runs from);
-2. extracts the verified tarball into a **private** directory (`mktemp -d`,
-   0700; removed afterwards) and checks every file there against the inner
-   `SHA256SUMS` (any unlisted file fails). Everything below uses that copy,
-   never an already extracted directory. If the script runs from an
-   extracted bundle directory, that directory must be identical to the
-   signed content, otherwise it was modified after extraction and the run
-   is **refused**;
-3. refuses a **downgrade** (a release older than the installed one) unless
-   `--allow-downgrade`, and anything below the unit's **security floor**
-   (section 7), with no override;
-4. runs the black-box format gate (section 7);
-5. runs `dpkg -i`. The package creates the users `robodr` (exporters),
-   `robodr-agentd` (agentd), `robodr-exec` and the group `robodr-safety`
-   (sysusers) and the
+   `ROBODR_ALLOW_UNSIGNED=1` (labs only, and **only on a unit without the
+   built-in verifier**; the bundle is then the directory the script runs
+   from);
+3. extracts the verified copy in the private directory and checks every
+   file there against the inner `SHA256SUMS` (any unlisted file fails).
+   Everything below uses that extraction, never an already extracted
+   directory. If the script runs from an extracted bundle directory, that
+   directory must be identical to the signed content, otherwise it was
+   modified after extraction and the run is **refused**;
+4. refuses a **downgrade** (a release older than the installed one,
+   including a half-installed or half-configured one left by a failed
+   upgrade) unless `--allow-downgrade`, and anything below the unit's
+   **security floor** (section 7), with no override. A signed tarball must
+   hold the variant its name names, and replacing the installed variant
+   (`robodr` / `robodr-focal`; the focal variant has no `robodr-pulsard`)
+   is **refused** unless `--allow-variant-switch`;
+5. runs the black-box format gate (section 7);
+6. runs the **safety-state gate** for the gateway and the executor
+   (section 7, "Package upgrades and the safety state"), then `dpkg -i`.
+   The package creates the users `robodr` (owner of the
+   shared group, runs nothing), `robodr-agentd` (agentd), `robodr-exec`
+   (executor), one user per network-facing service (`robodr-spool`,
+   `robodr-kafka`, `robodr-uplink`, `robodr-gw`; section 11.6) and the
+   group `robodr-safety` (sysusers) and the
    directories (tmpfiles), installs the units **disabled**, and installs
    `/usr/lib/robodr/install-bundle.sh`, the trusted verifier for the next
    upgrade;
-6. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
-   rollback.
+7. checks the unit's **health** (every RoboDR unit that ran before runs
+   again, agentd's heartbeat is fresh) and **rolls back automatically** to
+   the previous kept release if it is not healthy (section 7);
+8. keeps the `.deb` under `/var/lib/robodr/releases/<version>/` for
+   rollback (`--keep N` keeps only the N newest).
 
-If `minisign` is not on the robot, verify on the entry station (section 2),
-extract the verified tarball into a fresh root-only directory on the robot
-and install with `ROBODR_ALLOW_UNSIGNED=1`. Record in the site log that the
-signature was checked at the entry station.
+Every default above and its only override are listed in
+`docs/SECURE-DEFAULTS.md`.
+
+**Signature checks on the robot.** Every release installs RoboDR's own
+minisign verifier (`robodr-deliverd verify-minisign`, `robodr-pkg`'s
+`minisign` module: prehashed signatures, strict Ed25519, the trusted
+comment checked), so from the first installed release on the robot needs
+no `minisign` program and `install-bundle.sh` checks every later release
+with that verifier, after its built-in known-answer self-test. Only the
+**first** install needs a verifier from outside: `minisign` on the robot,
+or the entry station. If `minisign` is not on the robot for the first
+install, verify on the entry station (section 2), extract the verified
+tarball into a fresh root-only directory on the robot and install with
+`ROBODR_ALLOW_UNSIGNED=1`; record in the site log that the signature was
+checked at the entry station. Once a release with the built-in verifier is
+installed, `ROBODR_ALLOW_UNSIGNED` is **refused**: lab builds are signed
+with a lab key (`minisign -G`) and installed with `--pubkey lab.pub`.
 
 After installing, nothing runs yet. Continue with keys (section 4) and
 commissioning (section 5).
@@ -214,8 +260,10 @@ private copy (`/run/credentials/<unit>/blackbox.key`). The reasons are in
 > `blackbox.allow_hmac: true`, and `robodr-blackbox`, the diode tools and
 > `robodr-spool-export` need `--allow-hmac`; each use then prints a
 > warning. Migrate with `robodr-blackbox rotate --allow-hmac` (4.3). The Ed25519 code
-> is the audited `ed25519-dalek` crate; a TPM-held, non-exportable key is
-> still planned.
+> is the audited `ed25519-dalek` crate. Robot keys can be **sealed to the
+> TPM at rest** (4.7); a TPM-resident, non-exportable signing key is still
+> planned. Commissioning and release keys can stay in a **PKCS#11 token or
+> HSM** (4.6).
 
 ### 4.2 Generate a key
 
@@ -272,6 +320,18 @@ signs with the new key and authenticates the older records with the
 retired key's **public** file listed in `blackbox.previous_keys`. This is
 also how an HMAC unit moves to Ed25519.
 
+A retired key vouches **only for what it signed up to its rotation**:
+records after the `KeyRotation` must be signed by the key the chain names
+for them (the rotation must be signed by its `from` key, and since v2 it
+names the new key's public-key fingerprint); `head.json`,
+`checkpoint.json` and a recovery pin signed by a retired key count only for
+positions at or before that rotation; the export cursor and the TPM anchor
+sidecar must be signed by the current key (`rotate` re-signs the cursor,
+checkpoint and head mark, and with `--tpm-sidecar` the sidecar); a
+segment may never switch back to an earlier key (`KeySwitchRefused`). So
+whoever holds a leaked retired key cannot add or hide records after the
+rotation.
+
 1. Export all pending evidence (section 8) and confirm on the far side that
    the last bundle verified.
 2. Generate the new key (4.2) with a **new key id**, next to the old one:
@@ -290,14 +350,17 @@ also how an HMAC unit moves to Ed25519.
        --device <robot.id> \
        --old-key /etc/robodr/keys/agentd-blackbox.key \
        --new-key /etc/robodr/keys/agentd-blackbox-$new.key \
-       --reason "scheduled rotation"
+       --reason "scheduled rotation" \
+       --tpm-sidecar /var/lib/robodr/anchor/blackbox-tpm-sidecar.json  # TPM head anchor only
    # add --previous-keys <each earlier retired .pub> if the log still holds
    # records of keys retired before; add --allow-hmac when the old key is HMAC
    ```
 
    It refuses a log that is open (agentd still running), the wrong old key,
    an HMAC new key, a reused key id, and a log holding records no given key
-   authenticates. Re-running it after success prints "already rotated".
+   authenticates. `--previous-keys` gets the same checks as agentd's
+   `blackbox.previous_keys` (below). Re-running it after success prints
+   "already rotated" (and re-signs a `--tpm-sidecar` it did not get to).
 4. Retire the old key and install the new one:
 
    ```sh
@@ -333,13 +396,19 @@ also how an HMAC unit moves to Ed25519.
    box.
    `robodr-agentd --check-config` validates the list: absolute paths, at most
    16, public files (an Ed25519 secret is refused), ids distinct and not the
-   current key's, a device binding must name `robot.id`.
+   current key's, a device binding must name `robot.id`, and each file owned
+   by root (or agentd's user) and not group/world-writable (`chmod 0644`
+   as above; the same rule applies to every `--keyring` / keyring file a
+   verifier loads: whoever can write it decides what verifies).
 5. Copy the new `.pub` to the verifiers (fleet console, SOC evidence store)
    on vetted media; verifiers keep the old `.pub` too. With a **remote head
    anchor** (`head_anchor.kind remote`), replace the unit's public key on
    the anchor receiver before the next step (its marks are signed with the
-   current key); a TPM anchor's sidecar written under the old key is
-   accepted through `previous_keys` and rewritten at the next mark.
+   current key). A TPM anchor's sidecar is re-signed by `rotate
+   --tpm-sidecar` (step 3); one still signed by the old key is **refused**
+   (it names no position the rotation could bound): the first start then
+   logs the anchor as unreadable ("signed by a retired key") and the next
+   mark rewrites it under the new key.
 6. `sudo systemctl start robodr-agentd` and check the journal: no black-box
    error, and `robodr-blackbox verify /var/lib/robodr/blackbox/agentd
    --keyring <old>.key.pub --keyring /etc/robodr/keys/agentd-blackbox.key.pub`
@@ -489,6 +558,141 @@ verification), wrapped by `robodr-blackbox` and pinned to the RFC 8032 test
 vectors; key files, key ids and signatures are unchanged from the earlier
 in-crate implementation.
 
+### 4.6 Signing keys in a token or HSM (PKCS#11)
+
+**available** (SALES-READINESS T36). Every key argument of
+`robodr-commission` (`--sign-key`: profile, root, operator keys) and
+`robodr-release sign --key` (release, root, operator keys) takes either a
+key file (4.2) or a **signer file** (`robodr-signer/v1`). A signer file
+holds no secret: it names an external signer command and pins the key's
+public half. The key stays in the token; for each signature the tool runs
+the command, hands it the document on stdin and reads the 64-byte Ed25519
+signature from stdout. **Every signature is verified against the pinned
+public key before it is used**, so a wrong token, slot or key id, or a
+misbehaving adapter, fails the command and writes nothing. The protocol
+(cleared environment, deadline, output cap, trusted-path checks of the
+signer file and of the command and its directories) is documented in
+`crates/robodr-signer/src/lib.rs`.
+
+The shipped adapter `/usr/lib/robodr/robodr-signer-pkcs11` drives OpenSC's
+`pkcs11-tool` (OpenSC 0.25 or later; `CKM_EDDSA`, pure Ed25519) with any
+PKCS#11 module that offers Ed25519: YubiKey 5 (firmware 5.7 or later),
+Nitrokey 3, SoftHSM 2, network HSMs. On the signing station:
+
+```sh
+# 1. Generate the key ON the token
+pkcs11-tool --module /usr/lib/x86_64-linux-gnu/libykcs11.so --login \
+    --keypairgen --key-type EC:edwards25519 --id 01 --label oem-root-2026
+# 2. Write the signer file (reads and pins the token's public key)
+/usr/lib/robodr/robodr-signer-pkcs11 signer-file \
+    --module /usr/lib/x86_64-linux-gnu/libykcs11.so --id 01 \
+    --key-id oem-root-2026 --pin-env ROBODR_PKCS11_PIN > oem-root.signer.json
+chmod 0644 oem-root.signer.json   # owned by root or you, not group/other-writable
+# 3. Check it (a real test signature: PIN, touch)
+read -rs ROBODR_PKCS11_PIN && export ROBODR_PKCS11_PIN
+robodr-signer check --key oem-root.signer.json   # key_id, fingerprint, "external"
+# 4. Use it wherever a key file went
+robodr-commission trust-keys --out profile-trust.json --pub oem-profile.key.pub \
+    --operators operators.json --sign-key oem-root.signer.json
+robodr-release sign --key oem-root.signer.json --target trust.json
+```
+
+`robodr-signer check` prints the key's `public_key_hex` and `fingerprint`
+(for `--root` pins and trust files). The PIN comes from the environment
+variable named by `--pin-env` (listed in the signer file's `pass_env`) or
+from `--pin-file`; with neither, `pkcs11-tool` asks on the terminal. It
+never appears on a command line. The adapter is in the `robodr` package;
+`robodr-signer` (the check tool) is built from the source tree like
+`robodr-release` (`cargo build --release -p robodr-signer`).
+
+Limits: tested end to end against SoftHSM 2 (`ROBODR_PKCS11=1 cargo test
+-p robodr-signer`). YubiKey, Nitrokey and network HSMs use the same
+adapter and mechanism but have not been tested on the hardware yet.
+`robodr-commission keygen` and `robodr-release keygen` make file keys
+only: token keys are generated with the vendor's or OpenSC's tools. Any
+other signer (a vendor CLI, a KMS client) can be used by writing a command
+that follows the same protocol.
+
+### 4.7 Robot keys sealed to the TPM
+
+**available** (SALES-READINESS T66; systemd 250 or newer and a TPM 2.0;
+not in the focal package). By default the robot's private keys are
+root-only files that systemd hands to each service (`LoadCredential=`).
+They can instead be stored **sealed to the unit's TPM** as systemd
+encrypted credentials: a copied disk or SD card then no longer yields
+them. systemd decrypts them at service start into the same place
+(`/run/credentials/robodr-agentd.service/<name>`), so `agentd.json` does
+not change.
+
+```sh
+sudo install -d -m 0750 -o root -g robodr-agentd /etc/robodr/credstore.encrypted
+sudo systemd-creds encrypt --with-key=host+tpm2 --tpm2-pcrs=7 --name=blackbox.key \
+    /etc/robodr/keys/agentd-blackbox.key /etc/robodr/credstore.encrypted/blackbox.key
+sudo chgrp robodr-agentd /etc/robodr/credstore.encrypted/blackbox.key
+sudo chmod 0640 /etc/robodr/credstore.encrypted/blackbox.key
+sudo install -D -m 0644 \
+    /usr/share/doc/robodr/examples/robodr-agentd.service.d/15-tpm-credentials.conf.example \
+    /etc/systemd/system/robodr-agentd.service.d/15-tpm-credentials.conf
+sudo systemctl daemon-reload && sudo systemctl restart robodr-agentd
+sudo robodr-agentd --config /etc/robodr/agentd.json --check-config   # "key blackbox: host+tpm2"
+```
+
+Keep the plaintext key file only until the service has started from the
+sealed credential and its public key is safely with the verifiers; then
+destroy it (on flash storage overwriting is unreliable: rely on the
+volume's encryption, see 9). Seal the other keys (`finding.key`,
+`cp-tls.key`, `anchor-tls.key`, `executor.key`) the same way, replacing
+their drop-in's `LoadCredential=` by `LoadCredentialEncrypted=`.
+`host+tpm2` needs both the TPM and the root-only
+`/var/lib/systemd/credential.secret`; `--tpm2-pcrs=7` binds the credential
+to the Secure Boot state, so a firmware or Secure Boot change needs
+re-sealing: plan it with firmware updates. The sealed file is readable by
+the `robodr-agentd` group only so that agentd can read its header (it
+never decrypts it; the ciphertext is useless without the TPM and the host
+secret).
+
+**What agentd reports.** `status.json` carries `key_protection`:
+
+```json
+"key_protection": {
+  "require": "none", "all_tpm2": false, "fallback": true,
+  "keys": [ { "role": "blackbox",
+              "path": "/run/credentials/robodr-agentd.service/blackbox.key",
+              "protection": "host+tpm2", "tpm2": true, "fallback": false,
+              "sealed_source": "/etc/robodr/credstore.encrypted/blackbox.key" },
+            { "role": "finding_signing",
+              "path": "/run/credentials/robodr-agentd.service/finding.key",
+              "protection": "plain-credential", "tpm2": false, "fallback": true } ]
+}
+```
+
+`protection` is `tpm2` or `host+tpm2` (sealed to this TPM), `host` (host
+key file only), `null` (no confidentiality), `unknown` (sealed source
+unreadable or not recognised), `plain-credential` (a credential without a
+sealed source: `LoadCredential=` from a plain file) or `file` (a plain key
+file outside the credentials directory). Everything but `tpm2` and
+`host+tpm2` is the **fallback** and is flagged (`fallback: true`).
+`robodr-agentd --check-config` prints one line per key. To refuse to
+start unless every key is sealed to the TPM, add to `agentd.json`:
+
+```json
+"key_protection": { "require": "tpm2" }
+```
+
+(`credentials_dir`, default `/run/credentials/robodr-agentd.service`, and
+`encrypted_dir`, default `/etc/robodr/credstore.encrypted`, are optional.)
+
+Limits: sealing protects keys **at rest**. While the service runs, the key
+is in its private credential ramfs and memory and the TPM does not make the
+signatures; root on a running unit can still read it. The report matches a
+credential to `<encrypted_dir>/<name>` by name and reads only the header;
+it does not read the unit file, so it catches a missing or weaker seal, not
+a root user who deliberately misconfigures the unit. `robodr-executor`,
+`robodr-uplink` and the exporters can be sealed with the same systemd
+mechanism but do not report it. Tested against swtpm (`ROBODR_SWTPM=1
+cargo test -p robodr-agentd --test key_protection`), not yet on a hardware
+TPM.
+
 ## 5. Commissioning: learn, sign off, lock
 
 **available.** `robodr-commission` is an operator tool, not a service. See
@@ -628,6 +832,7 @@ Work in `/var/lib/robodr/commission/<date>/` as root.
    sudo install -m 0644 -o root -g root revocations-N.json /etc/robodr/profile-revocations.json
    # profile-state dirs come from tmpfiles.d/robodr.conf (systemd-tmpfiles --create)
    sudoedit /etc/robodr/pulsar.toml      # domain_id, capture, binding, profile_trust
+   sudo robodr-ros2-watch --check-config /etc/robodr/pulsar.toml   # offline, read-only
    sudoedit /etc/robodr/agentd.json      # robot id, policy, paths, sensor.profile_trust
    sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
    sudo systemctl enable --now robodr-pulsard robodr-agentd
@@ -1222,7 +1427,15 @@ sudo systemctl restart robodr-agentd
 - The SOC key file must be a public Ed25519 key file owned by root (or
   `robodr`), not writable by group or others, not a symlink; a `device_id`
   in it must be this robot. Never list the robot's own black-box or finding
-  key (refused). The TLS key file must have no group/other bits (the
+  key (refused). **Scope SOC keys** that do not need every action: a
+  `soc_keys` entry `{"path": "/etc/robodr/soc/tier1.pub",
+  "allowed_actions": ["record_evidence", "isolate_network"],
+  "max_ttl_seconds": 900}` lets that key request (and revert) only those
+  actions, with at most that TTL; anything else is answered 403 and
+  reported as `robot.agent.control_plane_invalid` (contract §4.2). Keep
+  the unscoped key (all seven actions) with the people who may ask for
+  `safe_pause` / `request_safe_state`. The executor does not apply these
+  scopes yet (contract §4.2). The TLS key file must have no group/other bits (the
   systemd credential copy has none); certificate files must not be
   group/other-writable.
 - The SOC signs every request (contract §2) and needs a clock within
@@ -1268,18 +1481,49 @@ sudo systemctl restart robodr-agentd
   black box: it adopts them once, rewrites them sealed, reconciles with the
   black box, fences the replay store and records a
   `robodr.control_plane_state_upgraded` note. No operator step. Once a head
-  note exists, a v1 file in `state_dir` is a downgrade: refused as damage
+  note exists, or once `state_dir/sealed.marker` exists (written at every
+  sealed start), a v1 file in `state_dir` is a downgrade: refused as damage
   (Critical). Downgrading agentd below the sealing release is not
   supported without emptying `state_dir` (first-start fence).
+- **Head notes in a cyclic black box.** The head notes are recorded again
+  whenever the black box moved to a new segment (checked every
+  heartbeat), so the newest segments always hold one. If the black box
+  dropped segments and holds no head note at start (e.g. more than
+  `max_segments` rotated within one heartbeat, or a wiped store), both
+  journals are treated as unanchored: the replay store is fenced and the
+  requests are reconciled with the black box (`state.anchor_lost`).
+- **Notes that do not verify.** Only black-box notes whose record hash and
+  signature verify under the black-box key settle a decision or restore a
+  request; the others are ignored and counted (`state.notes_rejected`, in
+  the `control_plane_state_untrusted` finding).
+- **Unreconciled requests.** When the journal held entries no authentic
+  note backs (an adopted v1 file, a rolled-back copy, lines failing their
+  seal), they are dropped and their request ids refused
+  (`state.dropped_unbacked`, `state.lost_request_ids`). Those ids, and a
+  "refuse every new id" state when the black box could not be read, are
+  kept in the sealed `state_dir/unreconciled` marker: every start
+  reconciles again and keeps refusing them, also after the journal was
+  rewritten clean. It is removed once nothing is left; deleting it by hand
+  ends the refusals (do so only after checking the black box).
 - **Connections.** TCP connections in the TLS handshake (or not yet
   authenticated) and authenticated ones have separate slots of
   `max_connections` (default 4) each; one source address holds at most
   `max_connections_per_source` (default 2): raise it if several SOC
   workers share one NAT address. The unix socket has its own 2 slots, so
   an operator on the robot is never locked out by network peers. Rejected
-  connections count in `connections_rejected`.
+  connections count in `connections_rejected`. When the pre-authentication
+  slots are full, a new connection cuts the oldest handshake older than
+  `pre_auth_evict_after_ms` (default 100; raise it if the SOC's link has
+  long round trips), counted in `connections_evicted`. **Set
+  `soc_sources`** to the SOC's egress networks (e.g.
+  `["203.0.113.0/28"]`): they get `reserved_connections` (default 1) slots
+  of their own and cut any unlisted handshake when they need room, so a
+  TLS slowloris from other addresses cannot lock the SOC out (W2-4). Keep
+  the `IPAddressAllow=` drop-in (§6.4) as well: it stops unlisted peers
+  before agentd sees them.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
-  `last_auth_failure`, `connections_rejected`, `recorded_not_executed`,
+  `last_auth_failure`, `connections_rejected`, `connections_evicted`,
+  `recorded_not_executed`,
   `refused`, `busy`, `rate_limited`, `journal_errors`, `replay_fence`,
   `state.refusing_new_request_ids`, `evidence`) and the
   findings `robot.agent.control_plane_unauthenticated` (High: someone
@@ -1305,8 +1549,11 @@ without a restart.** To cut off a client certificate, revoke it in the
 client CA's CRL (`openssl ca -revoke`, `openssl ca -gencrl`) and install
 it at a `tls.crl_files` path (PEM or DER X.509 v2 CRLs, up to 16 files;
 the older `client_crl` is one more entry). The files are `stat`ed before
-every handshake and re-read when they change; replace them atomically
-(write, then `mv`). Rules (fail closed, not configurable):
+every handshake and re-read when they change; **replace them by
+rename** (write the new file next to the old one, then `mv` it over): an
+in-place rewrite can be read half-written (a file whose `stat` changes
+during the read is read once more, then the load fails closed). Rules
+(fail closed, not configurable):
 
 - every CA in the chain (each client CA, any intermediate) needs a CRL in
   the files: a certificate whose issuer has none is refused;
@@ -1315,10 +1562,35 @@ every handshake and re-read when they change; replace them atomically
   `nextUpdate` (agentd itself keeps running);
 - a replacement that is unreadable, not a CRL or has bad permissions
   refuses every client until fixed (`status.json`
-  `control_plane.tls.crl.error`).
+  `control_plane.tls.crl.error`);
+- every CRL must carry a **CRL number** (`crlnumber` in the `openssl ca`
+  configuration); one without is refused;
+- **one CRL per CA is used**: when the files hold several CRLs of one
+  issuer (an old CRL left in a bundle next to the new one), the highest
+  CRL number wins and the others are ignored; two different CRLs with the
+  same number are a configuration error. `status.json`
+  `control_plane.tls.crl.in_use` names, per issuer, the CRL number,
+  `thisUpdate` and file in use;
+- **no going back**: an older genuine CRL put back in place (a lower CRL
+  number or an older `thisUpdate` than one already loaded) would
+  un-revoke certificates, so it is refused, fail closed
+  (`rollback_refusals`), until the current CRL is back. agentd keeps these
+  high-water marks in `<control_plane.state_dir>/crl-high-water.json`
+  (and the anchor receiver in `<state_dir>/crl-high-water.json`), so a
+  restart does not reset them: an older CRL then refuses start. Only the
+  marks of CRLs whose signature was verified at load against a trust
+  anchor are written there (a CRL of an intermediate CA is checked at the
+  handshake; its mark lasts for the process). The TLS clients without a
+  state directory (the robot's anchor client, `robodr-uplink`,
+  `robodr-enroll`, `robodr-kafka-publish`) keep the marks per process.
+  Remove the state file only to accept an older CRL on purpose (a CA that
+  was re-keyed and restarted its numbering);
+- a CRL claiming a trust anchor as issuer whose signature does not verify
+  under it is a configuration error at load.
 
 `status.json` `control_plane.tls.crl` counts `reloads`,
-`revoked_rejections` (with `last_revoked_spki_sha256`),
+`reload_failures`, `rollback_refusals`, `revoked_rejections` (with
+`last_revoked_spki_sha256`),
 `expired_crl_rejections` and `unknown_status_rejections`; a refused
 revoked client is also a failed authentication
 (`robot.agent.control_plane_unauthenticated`, reason `Revoked`).
@@ -1330,7 +1602,13 @@ of `robodr-anchor-receiver` for unit certificates), `robodr-kafka-publish
 (`soc.crl_files` in `fleet.json`). TLS clients with CRLs never resume a
 session, so a server revoked after the first connection is refused on the
 next one. The site depot's LAN serving needs none: a unit is revoked by
-its identity key (`robodr-depot`), checked on every request.
+its identity key (`robodr-depot`), checked on every request. It admits at
+most `serve.max_connections` connections, `serve.max_connections_per_source`
+(default 4) from one address, and cuts a peer that has not completed the
+TLS handshake after 10 s. The unit's LAN client (`robodr-deliverd`) bounds
+the connect, handshake, request and answer head by one deadline
+(`depot.deadline_s`; a pack body gets `deadline_s` more plus one second
+per MiB), so a peer trickling bytes cannot hold it.
 
 **No OCSP.** Robots run air-gapped or behind a data diode and cannot reach
 an OCSP responder; a soft-fail OCSP check would protect nothing and a
@@ -1370,6 +1648,67 @@ one, a closed segment cut on a frame boundary, the newest segment gone).
 If authentic state proves the newest records were cut, agentd raises
 Critical `robot.agent.evidence_truncated`. Keep the quarantined files for
 the investigation.
+
+**Black-box retention and sizing** (`blackbox.retention`, optional). Without
+it the black box keeps 8 segments of 8 MiB, cyclic: when a ninth starts the
+oldest is dropped (a signed `SegmentDropped` record names it). At the soak's
+write rate (about 4.7 MB per hour on an idle lab robot) that is 12 to 14
+hours of evidence, and much less during an incident. Size it for the site:
+
+```json
+"blackbox": {
+  "dir": "/var/lib/robodr/blackbox/agentd",
+  "key_file": "/run/credentials/robodr-agentd.service/blackbox.key",
+  "retention": {
+    "mode": "cyclic",
+    "segments": 32,
+    "segment_bytes": 33554432,
+    "unexported_reserve_segments": 16,
+    "warn_percent": 80
+  }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `cyclic` | `cyclic`: drop the oldest segment when a new one starts. `saturation`: never drop; once `segments` are full refuse non-critical records (`Saturation` record), keep `critical_reserve_segments` more for critical ones until an export prunes |
+| `segments` | 8 | segments kept (1..=65536) |
+| `segment_bytes` | 8388608 | size of one segment (64 KiB ..= 256 MiB) |
+| `unexported_reserve_segments` | 0 | cyclic only: **pending-export protection**. A segment whose records are not all covered by the signed export cursor (8.2) is kept, up to this many segments beyond `segments`; only then is unexported evidence dropped |
+| `critical_reserve_segments` | 1 | saturation only |
+| `warn_percent` | 80 | unexported share of the capacity that raises the pressure finding (50..=99) |
+
+At start agentd checks that `(segments + reserve) x segment_bytes`, minus
+what the directory's segments already hold, fits in the free space of the
+black box's filesystem, and refuses to start otherwise (exit 2, the message
+names the numbers). With protection on (or in saturation mode) agentd
+re-reads the export cursor every health tick and raises, observe-only:
+
+| Condition | Finding | Severity |
+|---|---|---|
+| unexported segments reach `warn_percent` of the capacity, before anything unexported is dropped (once per episode; clears 10 points below) | `robot.agent.evidence_degraded`, detail `retention pressure: ...` | Medium; High from 95 % |
+| cyclic retention dropped unexported evidence (the reserve was used up) | `robot.agent.evidence_degraded`, detail `unexported evidence dropped: ...` | High |
+
+(These use the catalogued `evidence_degraded` id until the next
+findings-contract minor gives them their own.) Plain cyclic retention with
+no exporter drops by design and raises neither.
+
+Sizing (hours of evidence held; a cyclic store holds between `segments - 1`
+and `segments` full segments; the oldest is the one dropped next):
+
+| Retention | 1 MB/h (quiet) | 4.7 MB/h (soak, idle lab robot) | 20 MB/h (incident, busy bus) |
+|---|---|---|---|
+| 8 x 8 MiB = 64 MiB (default) | 2.8 days | 12-14 h | 3 h |
+| 16 x 16 MiB = 256 MiB | 11 days | 2.4 days | 13 h |
+| 32 x 32 MiB = 1 GiB | 45 days | 9.5 days | 2.2 days |
+| 64 x 64 MiB = 4 GiB | 179 days | 38 days | 9 days |
+
+Measure the rate on the unit (`du -sb` of the black box an hour apart, or
+the segment indices in `status.json` over a day). On a diode or media site
+give the reserve the longest export outage you plan for (diode down, the
+interval between media visits) at the incident rate: `reserve >= hours x
+MB/h / segment MB`, and run the export (8.2) well inside it. The capacity
+needs that much free space on the black box's filesystem.
 
 **Head anchor.** `blackbox.head_anchor` is optional; without it agentd
 warns at start and `status.json` reports `"blackbox": {"anchored":
@@ -1627,9 +1966,17 @@ Limits: tested over loopback with a real receiver process, not across a
 real network. Rollback and truncation become detectable, not prevented;
 the window is the newest marks that have not reached the receiver. With
 `allow_plaintext`, marks (hashes, sequence numbers) are visible on the
-wire. Mutual TLS authenticates the robot's host, not its unit id: any
-certificate `client_ca` accepts may send marks for any configured robot
-(each still has to verify under that robot's key). Revocation by CRL:
+wire. Mutual TLS authenticates the robot's host. Bind each unit's
+`current` queries to its TLS client certificate with
+`units[].client_spki_sha256` (the SHA-256 of the certificate's
+SubjectPublicKeyInfo, `openssl x509 -pubkey -noout | openssl pkey -pubin
+-outform DER | sha256sum`): then only that certificate reads the unit's
+head, and a certificate bound to one unit reads no other (refused `not
+bound`). A unit without it can be queried by any certificate `client_ca`
+accepts (the receiver lists such units at start). Marks keep their
+signature model: any accepted certificate may send marks for any
+configured robot (each still has to verify under that robot's key).
+Revocation by CRL:
 `blackbox.head_anchor.tls.crl_files` on the robot (a revoked receiver
 certificate) and `tls.crl_files` of the receiver (a revoked unit
 certificate), reloaded when the files change, fail closed (the same rules
@@ -1737,6 +2084,12 @@ table.
    * `soc.robot_keys`: the robot's own public keys (the black-box and
      finding keys' public halves, e.g. `robodr-blackbox keygen` public
      files): never accepted as SOC keys.
+   * `soc.key_scopes` (optional): per SOC key id, the `actions` it may
+     approve and revert and its `max_ttl_s`, e.g.
+     `{"soc:tier1": {"actions": ["quarantine_node"], "max_ttl_s": 900}}`;
+     anything else signed with that key is refused `key_scope_denied`.
+     `soc.require_key_scopes: true` makes a key without an entry approve
+     nothing (recommended once every key has one).
    * `network.quarantine.cidrs`: the networks where a participant may be
      quarantined (its SPDP locators must be there, on the robot's DDS
      ports); empty refuses every quarantine (`locator_out_of_scope`).
@@ -1786,11 +2139,20 @@ The executor detects the missing table before its next transaction (a
 new order, a revert, a TTL expiry) or within `verify_interval_s`. It drops
 every action as `removed_externally`, re-installs nothing, also not after a
 restart within the same boot, and **refuses every order**
-(`operator_disabled`) until you re-arm it:
+(`operator_disabled`) until you re-arm it, as root, with the executor
+stopped (the socket agentd uses has no re-arm: agentd holds its key, and
+a compromised agentd must not be able to lift your fence; `rearm` refuses
+while an executor serves the socket):
 
 ```sh
+systemctl stop robodr-executor
 robodr-executor rearm --config /etc/robodr/executor.json --reason "<why>"
+systemctl start robodr-executor
 ```
+
+A `safe_pause` in force is **not** undone by the emergency disable (nor by
+anything else but a two-person signed revert, below): the robot stays
+paused; restore it on the platform once it is safe to move.
 
 To keep it from acting at all:
 
@@ -1868,8 +2230,40 @@ force. Without it the executor does not trust
 the old journal at start: table deleted (every action lifted), a
 `journal_reset`, orders refused until `rearm`. The unsealed SOC replay
 store just fences once. A replaced link key has the same effect as an
-edit (the seal names another key). The seal detects edits, not an older
-sealed copy put back (the executor has no black box to anchor to).
+edit (the seal names another key). `seal-journal` is refused once the
+executor has written its journal sealed (`state_dir/sealed`): an unsealed
+file appearing later is a plant, not an upgrade. The actions it adopts are
+held after it (re-validated and re-armed only with a fresh safety state).
+
+**Older copies, deleted journals (anchor).** The seal alone does not tell
+an older sealed copy from the current one; agentd does. Every journal has
+a random epoch; agentd records the executor's journal head (epoch, next
+event) in its black box (`robodr.executor_journal_head`) and sends it back
+with every event poll. A journal behind it, or of another epoch, is reset
+by the executor (`journal_reset`, orders refused until `rearm`), and agentd
+raises `robot.agent.executor_journal_reset`. Within a boot, an active
+action whose rules are no longer in the table at start is held (re-
+validated, re-armed only with a fresh safety state), never re-installed
+blindly.
+
+**First start (`first-start` marker).** A missing sealed journal is not a
+first start: unless `state_dir/first-start` exists, the executor treats it
+as deleted (table deleted, SOC replay store fenced, `journal_reset`, orders
+refused until `rearm`). The packages create the marker on first install
+(`packaging/deb/postinst`, `packaging/rpm/post`) when no journal exists;
+the first start consumes it. For a manual install, or after deliberately
+emptying the state directory, create it as the unit's user before the
+first start:
+
+```sh
+sudo -u robodr-exec install -m 0600 /dev/null /var/lib/robodr/executor/first-start
+```
+
+**`revert-all` and `stop-cleanup`** undo motion actions through their
+adapters too; one whose undo fails stays `reverting` (retried, a
+`revert_failed`) rather than being reported reverted. `stop-cleanup` reads
+the sealed journal with the link key (the unit's credential); without it
+the table is still deleted but the journal is not marked.
 
 **Motion adapters (Sprint 8).** Off unless `executor.json` has a `motion`
 section (example `config/executor.motion.example.json`; contract §6a,
@@ -1908,14 +2302,44 @@ To enable:
    both `unitree_sport` and `gateway` for `restrict_motion`, list
    `unitree_sport` first (enforced).
 
-What to expect: `restrict_motion` and `safe_pause` answer `verified` and
-are lifted at their TTL (`motion.safe_pause_ttl_s` for a pause) or by
-revert; lifting a pause **releases** it and never resumes a mission
-(Nav2 goals are not restored, PX4 stays in hold); `request_safe_state` and
-`rollback_config` answer `applied` and are not reversible. A pause or safe
-state is refused while `moving_fast` unless the adapter lists it in
-`allowed_states`. Watch the executor's events: an adapter undo that fails
-(`revert_failed`) is retried every tick; check the platform by hand.
+7. On a robot that balances (humanoid, quadruped, unspecified), set
+   `motion.envelope` (`max_linear_speed`, `max_joint_speed`: the profile
+   envelope's) if the SOC sends absolute caps: a cap is accepted only when
+   it is at least the policy's `min_motion_factor` of it, and refused
+   (`fall_hazard`) without an envelope. The planner's `limit_motion` is a
+   factor; a planner order with an absolute cap is refused
+   (`invalid_order`). The gateway applies the same floor on its own (0.05
+   of each channel's limit; a restriction file below it is ignored and
+   reported as `restriction_error`).
+8. `rollback.program` must be a regular file owned by root and not
+   writable by group or others, in a directory with the same properties
+   (otherwise the rollback fails and nothing runs). It runs without the
+   executor's ambient `CAP_NET_ADMIN`.
+
+What to expect: `restrict_motion` answers `verified` and is lifted at its
+TTL or by revert. On a humanoid (or unspecified body), and on every robot
+with `require_approval_for_all_containment`, a `restrict_motion` needs
+a human's approval: the planner's is refused (`needs_approval`).
+`safe_pause` answers `verified` and is **never lifted automatically**
+(ADR-0006): when it reaches `motion.safe_pause_ttl_s` the executor reports
+it (event `expired`, detail `HIGH: ...`) and leaves the robot paused; a
+restart, an emergency disable, a failed apply or re-arm leave it paused
+too. It is lifted only by the SOC's signed revert with two approvers, and
+only when agentd's safety state at that moment is known, fresh, not
+engaged and one the adapter allows (otherwise the revert is refused and
+the pause stays). While paused, the executor re-asserts the pause every
+`motion.safe_pause_latch_s` (default 2 s): Nav2 goals sent meanwhile are
+cancelled and a PX4 mode change is set back to hold (a pilot's manual
+mode is left to the pilot); each is a High finding
+`robot.agent.executor_pause_overridden` (find out who moved the robot).
+Lifting a pause **releases** it and never resumes a
+mission (Nav2 goals are not restored, PX4 stays in hold);
+`request_safe_state` and `rollback_config` answer `applied` and are not
+reversible. A pause or safe state is refused while `moving_fast` unless
+the adapter lists it in `allowed_states`. Watch the executor's events: an
+adapter undo that fails (`revert_failed`) is retried every tick (a pause's
+failed lift is not retried: it stays in force until the next signed
+revert); check the platform by hand.
 
 ### 6.6 Inline Motion Firewall gateway (`robodr-firewall-gw`)
 
@@ -2069,9 +2493,68 @@ while the chain is flushed.
 `sudo sh /usr/lib/robodr/install-bundle.sh install --pubkey … --tarball …`
 (the trusted copy the installed release brought; section 3). `dpkg` keeps local edits to
 `/etc/robodr/pulsar.toml` (a conffile) and asks before replacing an edited
-one. Services that were running are restarted on the new binaries.
-`/etc/robodr` (profile, keys, configs) and `/var/lib/robodr` (evidence) are
-never touched.
+one. Services that were running are restarted on the new binaries, except
+the gateway and the executor, which restart only through the safety-state
+gate (below). `/etc/robodr` (profile, keys, configs) and `/var/lib/robodr`
+(evidence) are never touched.
+
+**Package upgrades and the safety state.** Restarting
+`robodr-firewall-gw` drops the motion commands queued in it (with
+`fail_closed` the bridge refuses motion while it is down, section 6.6), and
+restarting `robodr-executor` drops its pending actions. A package upgrade
+therefore never restarts these two unguarded:
+
+- the package's maintainer scripts (deb `postinst`, rpm `post`) restart
+  the other running services but leave the gateway and the executor on the
+  previous binaries and record them in `/var/lib/robodr/pending-restart`
+  (also when the package is installed with plain `dpkg`/`rpm` or by
+  `robodr-deliverd`);
+- `install-bundle.sh install` and `rollback` read the **live** safety state
+  first (`robodr-deliverd safety-state`: agentd's status socket, checked
+  with `SO_PEERCRED`, fresh, on this boot, from a live safety feed: the
+  same rule `robodr-deliverd`'s own installs use). If the gateway or the
+  executor runs and the state is not `idle` or `safe_state_active`
+  (moving, human nearby, e-stop, `unknown`, or no live safety feed
+  configured), the install is **refused before anything changes**;
+- when the state allows it, the two are restarted right after the package
+  is installed (the state is read again first; if it closed meanwhile, the
+  restart is deferred);
+- `--defer-restart` installs now and leaves the two running the old
+  binaries; `sudo sh /usr/lib/robodr/install-bundle.sh restart-pending`
+  restarts them later, again only while the state allows it (exit 1 and
+  nothing restarted otherwise). A reboot also starts the new binaries;
+- `--allow-gateway-restart` restarts them whatever the state says. It is
+  a deliberate operator decision: motion through the gateway is
+  interrupted. Use it only with the robot stopped by other means (e.g.
+  an agentd without a live safety feed on a parked robot).
+
+Exception: the upgrade from 0.1.0-alpha.1 moves the gateway's state to its
+own user once and must stop the gateway for that; it cannot be deferred
+(`--defer-restart` is refused, and a plain `dpkg -i` leaves the package
+unconfigured with nothing stopped until `restart-pending` configures it
+through the gate; for an `.rpm`, install the release again with
+`install-bundle.sh` once the robot is idle). Upgrading **from a release
+whose `robodr-deliverd` has no `safety-state` command** (0.1.0-alpha.1)
+cannot read the gate before the upgrade: stop the gateway at a safe moment
+or pass `--allow-gateway-restart`.
+
+**Health check and automatic rollback.** After `install` and `rollback`,
+every RoboDR unit that was active before must be active again (two checks
+in a row, a second apart) and, if `robodr-agentd` was active, its
+heartbeat must be fresh (`robodr-deliverd safety-state`, `agentd_fresh`),
+within `--health-timeout SECS` (default 120). If not, `install`
+reinstalls the release that was installed before (it must be kept under
+`/var/lib/robodr/releases`, at or above the security floor and pass the
+black-box format gate), checks health again and exits 1; the failed
+release is not kept. `--no-auto-rollback` only reports (exit 1). With no
+RoboDR unit running (before commissioning) there is nothing to check.
+
+**Kept releases.** `install --keep N` (after a healthy install) or
+`install-bundle.sh prune --keep N` keeps the N newest kept releases and
+always the installed one; the others are deleted. The formats file of a
+pruned release is kept under `releases/formats-archive/`, so the
+black-box format gate still treats what that release wrote as verified.
+Keep at least 2 (the installed release and the one to roll back to).
 
 Before upgrading:
 
@@ -2138,7 +2621,9 @@ sudo sh /usr/lib/robodr/install-bundle.sh rollback 0.1.0~alpha.1-1
 
 Rollback reinstalls the kept `.deb` (or `.rpm`) after re-checking its hashes. The
 version must be one `list` shows (a version string, never a path). Evidence
-written by the newer version stays in place.
+written by the newer version stays in place. Rollback goes through the same
+safety-state gate and health check as an upgrade (`--defer-restart`,
+`--allow-gateway-restart`, `--health-timeout`).
 
 **Downgrades and the security floor.** `install` of a release older than
 the installed one is refused as a downgrade (it may bring back fixed
@@ -2159,7 +2644,15 @@ frame of every segment in `/var/lib/robodr/blackbox` and
 `/var/lib/robodr/fleet/journal` (or the `--blackbox-dir` given) and
 **refuses** a release that cannot read a segment in a recognised format
 (`RBF1:<version>`), naming the segment and its format: an older agent could
-neither verify nor extend that chain. To roll back across a format change,
+neither verify nor extend that chain. The segments are writable by
+`robodr-agentd`, so their first frame is only a claim: it blocks only when
+it is **verified**, i.e. its format is one that a release installed on this
+unit writes, by records only root writes (`blackbox_write=` of the
+installed package's formats file and of every kept release under
+`/var/lib/robodr/releases/`; `RBF1:1` always). A segment claiming a format
+no release here ever wrote is reported as `UNKNOWN` (logged with the
+segment, non-blocking): a compromised agent cannot block every update by
+forging one. Check such a segment with `robodr-blackbox verify`. To roll back across a format change,
 export the chain (section 8.2) and archive the directory as in a key
 rotation (section 4.3, "Alternative, new chain") first, then roll back; or install a release
 that reads the format; or, knowingly, accept that one segment with
@@ -2173,8 +2666,11 @@ journal (6.5), the control plane's request journal and evidence exports
 black-box chains; each daemon checks its own journal's format when it
 opens it. Tested against the real `dpkg` (install, upgrade, rollback,
 a refused rollback across a simulated format change, a refused downgrade,
-the security floor, unknown frames, a fleet-journal segment, a signed install from a tampered
-extracted directory refused, a tampered kept release) in
+the security floor, unknown frames, an unverifiable segment that does not
+block, a fleet-journal segment, a signed install from a tampered
+extracted directory refused, a tarball swapped after its signature check,
+a renamed signed tarball, a variant switch, a half-configured package, a
+tampered kept release) in
 `crates/robodr-fleet/tests/packaging.rs`; not yet on a robot.
 
 **RPM hosts** (RHEL / Rocky / Alma 9, Fedora). The release ships
@@ -2225,17 +2721,48 @@ chunks, and verifies it with the robot's public keys;
 checks a bundle file offline. This does not move the export cursor or prune
 anything: the black box keeps its records (cyclic retention only).
 
-**Diode sites:**
-**planned (CLI); available as a library API.** `robodr-blackbox`'s
-`Recorder::export_pending` produces an `RBBXBND1` bundle of every record after
-the authenticated export cursor. The far side's `Receiver::accept` verifies
-each bundle on its own and its linkage to the previous one, so a gap,
-replay or substitution is detected. There is no command-line exporter in this
-release. Once the agent wires it in, bundles will be written to
-`/var/lib/robodr/export/` and the diode or media picks them up from there.
+**Diode sites: `robodr-blackbox export-pending`.** It exports every
+record after the black box's signed export cursor as `RBBXBND1` bundles
+**while agentd records** (it reads the directory, takes its own
+`export.lock`, never agentd's lock), then advances the cursor, signed with
+the black-box key:
 
-**Interim procedure (available):** export a copy of the chain directory and
-verify it on the far side.
+```sh
+robodr-blackbox export-pending /var/lib/robodr/blackbox/agentd \
+    --key /etc/robodr/keys/agentd-blackbox.key --device <robot-id> \
+    --out-dir /var/lib/robodr/export/blackbox
+# exported seq 0..=40411 (40412 records) to /var/lib/robodr/export/blackbox/rbbx-<robot>-<chain>-...rbbx
+```
+
+Each record's hash, signature and link are checked before it is
+exported; each bundle is written durably before the cursor moves (a crash
+in between re-exports the same records; the far side reports the replay).
+After a key rotation add the retired public keys with `--previous-keys`.
+Records lost before they were exported (a gap after the cursor) are named
+on stderr and the run exits 1 after writing what is there; the far side
+reports them too. On the far side, verify each bundle in order with
+`robodr-blackbox verify BUNDLE --keyring <robot .pub> --device <robot-id>`
+(or `Receiver::accept`, which also checks the link to the previous one, so
+a gap, replay or substitution is detected).
+
+agentd re-reads the cursor before cyclic retention drops a segment: with
+`blackbox.retention.unexported_reserve_segments` (6.4) a segment this has
+not exported is kept, within the reserve, and agentd raises the pressure
+finding before evidence is lost.
+
+Run it periodically with the example units
+`packaging/systemd/blackbox-export/robodr-blackbox-export.{service,timer}`
+(every 15 minutes, as root with only `CAP_DAC_OVERRIDE` and `CAP_CHOWN`,
+the cursor handed to agentd's user, bundles `0640 root:robodr` in
+`/var/lib/robodr/export/blackbox`; site settings in
+`/etc/robodr/blackbox-export.env`, `ROBODR_UNIT_ID=<robot id>`). They are
+not yet installed by the package: copy them to `/etc/systemd/system/` and
+`systemctl enable --now robodr-blackbox-export.timer`. The diode or media
+transfer picks the bundles up from the outbox; remove them there once the
+far side has verified them.
+
+**Copy of the chain directory (still available):** export a copy of the
+chain directory and verify it on the far side.
 
 ```sh
 ts=$(date -u +%Y%m%dT%H%M%SZ)
@@ -2282,7 +2809,7 @@ exactly one.
 
 ```sh
 # Air-gapped / diode site, robot side (low side): spool -> signed diode
-# batches in /var/lib/robodr/export/diode. Runs as robodr (it renames
+# batches in /var/lib/robodr/export/diode. Runs as robodr-spool, group robodr (it renames
 # ready/ -> acked/ in agentd's spool), with no network at all.
 sudo robodr-blackbox keygen --out /etc/robodr/keys/diode.key   # .pub -> SOC importer
 sudo install -m 0640 -o root -g robodr \
@@ -2325,8 +2852,13 @@ packs one diode batch per step with `robodr-diode-pack`'s format (Ed25519
 key file, section 4.4; `--allow-hmac` only for legacy keys) and moves the
 records to `acked/` only once the batch is durably in the outbox; an intent
 journal makes every crash point recoverable without loss or re-packing.
-Invalid records go to `<spool>/rejected/` with a reason file, kept by
-default; `--rejected-max-age-s`, `--rejected-max-count` and
+Invalid records go to `<spool>/rejected/` with a reason file (written
+before the move, so a crash never leaves a record without one), kept by
+default. A spool file that cannot be read (an I/O error such as `EACCES` or
+`EIO`, three attempts) is moved there too with the error as its reason
+(`quarantined_unreadable` in the JSON report) instead of failing every run:
+fix the cause (permissions, disk) and move it back to `ready/` to re-drive.
+ `--rejected-max-age-s`, `--rejected-max-count` and
 `--rejected-max-bytes` (0 = no bound) delete the oldest ones beyond the
 bounds after each run, each with its reason file (a rejected record is never
 packed again, so only its forensic copy goes).
@@ -2339,7 +2871,16 @@ with, `findings.topic`, and records relabelled to `--topic` are counted),
 upgrades unsigned contract 1.x records to 2.0 and dead-letters signed
 ones (section 7), sends with `acks=all`, and
 persists per-batch progress after each acknowledged chunk; invalid or
-broker-rejected records go to a dead-letter file. The producer is
+broker-rejected records go to a dead-letter file. A spool file that cannot
+be read (I/O error, three attempts) is dead-lettered with the error and
+moved to `<spool>/rejected/` (`quarantined_unreadable`; move it back to
+`ready/` once fixed). **Clock:** every record is stamped with the
+publishing host's clock (Kafka CreateTime); Kafka 4.0 refuses records more
+than 1 h ahead of the broker (`log.message.timestamp.after.max.ms`) with
+`INVALID_TIMESTAMP`. The publisher never dead-letters for that: the run
+fails with "check the clock of the publishing host (NTP)", nothing is
+committed, and it retries every `--interval-ms` until the clock is fixed.
+Run NTP on the publishing host. The producer is
 **idempotent** by default: it takes a producer id (InitProducerId) and
 numbers every batch, a batch re-sent after a lost acknowledgement is dropped
 by the broker, and the producer id, sequences and the batches of the chunk
@@ -2358,15 +2899,39 @@ consumers drop duplicates on `event-uid`). Without `--once` it loops every
 `--done-max-age-s` (default 2592000 = 30 days; 0 = keep) or beyond
 `--done-max-count` are deleted, but never while their batch is still in
 the importer's `out/` (the marker is what stops it being published again):
-prune `out/` and the markers follow. `dead-letter.jsonl` rotates at
-`--dead-letter-max-bytes` (default 64 MiB; 0 = one growing file) keeping
-`--dead-letter-keep` rotated files (default 4), optionally also bounded by
-`--dead-letter-max-age-s`; a rotated file over the bounds is deleted only
-when none of its entries is still needed for deduplication (diode batch not
+prune `out/` and the markers follow. Where the tool is the **only
+consumer** of `out/`, it can prune `out/` itself: `--out-max-age-s N` /
+`--out-max-count N` / `--out-max-bytes N` delete the records and bundles of
+the batches it has finished (never one without its `done/` marker); each
+directory stays with its `MANIFEST.json` as a small tombstone, so a batch
+re-emitted after an importer state reset cannot land under a finished
+name. With a spool source,
+`--rejected-max-age-s` / `--rejected-max-count` / `--rejected-max-bytes`
+bound `<spool>/rejected/` (default: kept); `robodr-uplink
+--reinject-max-age-s` / `--reinject-max-count` / `--reinject-max-bytes`
+delete the `records.jsonl` of finished re-injection generations (the
+ledger stays). All of these are off by default. Sizes: `state_usage` in
+`uplink-status.json` and in the publisher's JSON report (entries and bytes
+of `done/`, dead letters, `out/` or `rejected/`, re-injection), measured at
+most once a minute.
+
+Dead letters: **`robodr-kafka-publish` keeps `dead-letter.jsonl` as one
+growing file and never deletes it by default**: its entries are the
+findings Kafka refused or that failed validation, and for diode input they
+are usually the only copy left. Watch its size (it grows only with refused
+records) and archive it off the host as you would `rejected/`. Rotation is
+opt-in there (`--dead-letter-max-bytes N`, e.g. 67108864, with
+`--dead-letter-keep N`, default 4); `robodr-uplink` rotates by default at
+64 MiB keeping 4. With rotation, optionally also bounded by
+`--dead-letter-max-age-s`, a rotated file over the bounds is **deleted**
+once none of its entries is still needed for deduplication (diode batch not
 done, spool file still in `ready/`, re-injected generation not done) and is
 otherwise held and reported (`pruned_dead_letters.held` in the JSON
-report). Copy dead letters off the host before they age out if you need
-them for longer; deleted dead letters can no longer be re-injected.
+report). Every deletion of a file holding entries is logged on stderr
+(`WARNING: deleted rotated dead-letter file ... holding N dead-lettered
+record(s)`) and counted (`pruned_dead_letters.removed_entries`). Copy dead
+letters off the host before they age out if you need them for longer;
+deleted dead letters can no longer be re-injected.
 
 **TLS, mutual TLS, SASL/SCRAM.** TLS is required: `--tls-ca FILE` (PEM,
 the only trust anchors) makes every broker connection TLS and verifies
@@ -2506,8 +3071,8 @@ store (no double processing).
 `/var/lib/robodr/export/uplink/uplink.lock` while it runs (also between
 runs). A manual `robodr-uplink --once` or `robodr-uplink reinject` on the
 same state directory exits 1 ("held by another robodr-uplink"): stop the
-service first, run as user `robodr`
-(`sudo -u robodr robodr-uplink ...`), start it again.
+service first, run as its user `robodr-uplink` (group `robodr`)
+(`sudo -u robodr-uplink -g robodr robodr-uplink ...`), start it again.
 
 #### Is the queue moving? (status, blocked batch)
 
@@ -2565,9 +3130,9 @@ come back by themselves. After fixing the registration:
 ```bash
 sudo systemctl stop robodr-uplink
 cd /var/lib/robodr/export/uplink
-sudo -u robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
+sudo -u robodr-uplink -g robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
     $(ls dead-letter.jsonl* | sed 's/^/--dead-letter /') --dry-run     # check the counts
-sudo -u robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
+sudo -u robodr-uplink -g robodr robodr-uplink reinject --state-dir . --spool /var/lib/robodr/spool/agentd \
     $(ls dead-letter.jsonl* | sed 's/^/--dead-letter /')
 sudo systemctl start robodr-uplink
 ```
@@ -2581,8 +3146,9 @@ original and dead-letter copy are both gone.
 
 Dead letters: `dead-letter.jsonl` rotates at 64 MiB, keeping 4 rotated
 files (`--dead-letter-max-bytes`, `--dead-letter-keep`; older rotated files
-are deleted once nothing in them is needed for deduplication, see
-"Retention of the state directory" above); a line torn by a
+are deleted once nothing in them is needed for deduplication, each such
+deletion logged with its entry count, see "Retention of the state
+directory" above); a line torn by a
 power loss is closed and counted (`dead_letter_malformed`), never merged
 with the next entry.
 
@@ -2600,6 +3166,7 @@ Troubleshooting (journal, `journalctl -u robodr-uplink`):
 | dead letters with `robot_mismatch` | the findings name another robot than the key is bound to (a sensor box watching several robots needs a `relay` key, or one uplink per robot); then re-inject |
 | dead letters with `site_mismatch` | a site-scoped `relay` key sent a robot not registered with its site: fix the robot's site or the key's scope, then re-inject |
 | dead letters with code `local` | the record failed RoboDR's own validation before sending (see `reason`) |
+| dead letters with reason `unreadable (I/O error after 3 attempts: ...)`, `quarantined_unreadable` in the status file | a spool file could not be read (permissions, disk error); it was moved to `<spool>/rejected/`: fix the cause, move it back to `ready/` |
 
 ### 8.6 Fleet lifecycle: enrollment, key rotation, SOC profiles (`robodr-enroll`)
 
@@ -2819,6 +3386,9 @@ The package never deletes evidence or keys, not even on `apt purge`.
 | `install-bundle: REFUSED: … a downgrade` / `below this unit's security floor` | an older release, or one below the floor | `rollback` or `--allow-downgrade` for a deliberate downgrade; nothing goes below the floor (section 7) |
 | `robodr-enroll rotate`: `holds key … but the SOC has …` | the key file was replaced by hand | restore the registered key, or re-enroll |
 | `install-bundle: REFUSED: release … reads black-box formats` | rollback/downgrade across a black-box format change | section 7: export and archive the chain first, or `--accept-unreadable <segment>` |
+| `install-bundle: REFUSED: … would restart robodr-firewall-gw.service …` | the gateway or executor runs and the live safety state is not idle / safe_state_active | section 7 "Package upgrades and the safety state": wait, `--defer-restart` then `restart-pending`, or `--allow-gateway-restart` |
+| `install-bundle: HEALTH CHECK FAILED` / `AUTOMATIC ROLLBACK` | a unit did not come back, or agentd's heartbeat is stale, after the install | the previous release is back; read `journalctl -u <unit>` for the failed one (section 7) |
+| `install-bundle: REFUSED: … built-in verifier … ROBODR_ALLOW_UNSIGNED is not accepted` | unsigned lab install on a unit that can check signatures | sign the build with a lab key and pass `--pubkey` (section 3) |
 | capture sees only `lo` | no default route on an air-gapped robot | list the DDS interfaces in `[module.robodr-sensor-ros2.capture] interfaces` |
 
 ## 11. Secure delivery on a unit (`robodr-deliverd`, Sprint 13b)
@@ -3050,6 +3620,31 @@ or other permissions, as for `--key`.
   package is back at its recorded version or a release of it is
   delivered. Hold them in apt (`apt-mark hold`) or leave them out of
   unattended-upgrades.
+* **deb only (T53).** `deb` is for Debian / Ubuntu units. On a unit
+  without a dpkg database (`<dpkg_root>/var/lib/dpkg/status`: an
+  RPM-based host such as Rocky / RHEL 9) a `deb` RPK is refused before
+  anything is unpacked (`robot.deliver.refused`, "kind deb needs a
+  Debian / Ubuntu unit ... RoboDR delivers no RPM packages"). There is no
+  `rpm` kind: neither the agent nor the depot delivers RPM packages. The
+  other kinds (`files`, `config`, `robodr-rules`) work on RPM hosts; RoboDR
+  itself is updated there with `install-bundle.sh` (section 7).
+* **Delivering RoboDR's own package (self-upgrade, T52).** Every
+  `dpkg --install` of the agent runs with `ROBODR_DELIVERD_INSTALL=1`,
+  which dpkg hands to the maintainer scripts. RoboDR's `postinst` then
+  try-restarts every running RoboDR unit except `robodr-deliverd.service`:
+  restarting the agent from inside the dpkg run it waits for would stop
+  the unit and kill dpkg and the `postinst` with it (a half-configured
+  package). The agent finishes the pass on its old binary (health gate,
+  commit or automatic rollback), then sees its own executable replaced
+  and exits 3; the unit (`RestartForceExitStatus=3`) starts it again on
+  the new binary within `RestartSec=`. Expect one
+  `robodr-deliverd.service: Main process exited, status=3` line per
+  self-upgrade; it is not a failure. The unit also sets `KillMode=mixed`,
+  so `systemctl stop` signals the agent only and a dpkg run in progress
+  finishes with its pass. Tested with the real dpkg and a chrooted
+  `postinst` (`tests/kinds.rs`), the postinst's restart loop and the
+  exit-3 path of `run` (`tests/binary.rs`); the full upgrade on a
+  systemd-booted VM is the VM job of T10 (not yet in CI).
 * Release-allowed maintainer scripts stay root-equivalent: a `preinst`
   can divert a floored package's file (the file-list check then fails the
   switch, but the script has run).
@@ -3114,6 +3709,48 @@ or other permissions, as for `--key`.
   is accepted from this release on; remove any workaround such as
   `allowed_gids` = the `robodr` gid (agentd now refuses to start with
   it).
+
+### 11.6 Upgrading from a release where the exporters and the gateway ran as `robodr`
+
+Earlier releases ran `robodr-spool-export`, `robodr-kafka-publish`,
+`robodr-uplink` and `robodr-firewall-gw` as one shared user, `robodr`.
+Any of them could therefore read the others' credential copies under
+`/run/credentials/<unit>/` (on `robodr-focal`, 0400 files owned by
+`robodr`), e.g. the diode signing key or the uplink key, and rewrite the
+others' state. Each now runs as a user of its own, with `Group=robodr`
+for agentd's spool and `/etc/robodr`:
+
+| unit | user |
+|------|------|
+| `robodr-spool-export` | `robodr-spool` |
+| `robodr-kafka-publish` | `robodr-kafka` |
+| `robodr-uplink` | `robodr-uplink` |
+| `robodr-firewall-gw` | `robodr-gw` |
+
+and sees only its own credentials directory (`TemporaryFileSystem=` over
+`/run/credentials`, its own directory bound back read-only).
+
+* The package (deb `postinst`, RPM `%post`) creates the users (sysusers)
+  and moves the state those releases wrote as `robodr` once:
+  `/var/lib/robodr/export/{diode,spool-export}` to `robodr-spool`,
+  `export/kafka-publish` to `robodr-kafka`, `export/uplink` to
+  `robodr-uplink`, `/var/lib/robodr/firewall-gw` to `robodr-gw`. It stops
+  the four units for that and starts what it stopped again. The
+  migration follows no symlink (it removes symlinks, FIFOs and devices
+  from those trees), replaces hardlinked files by copies, removes
+  group/other write and setuid/setgid bits, and is repeated until it has
+  completed (marker `/var/lib/robodr/.exporter-users-migrated`).
+* `robodr` keeps owning the shared group and runs nothing.
+* Drop-ins you wrote yourself: a `User=robodr` in a drop-in of one of
+  these units undoes the separation; remove it. On `robodr-focal`, a
+  drop-in that still passes `robodr` to `robodr-load-credential` (e.g. a
+  copy of the old `60-tls-credentials.conf.example`) is mapped to the
+  unit's own user with a warning in the journal; update it to
+  `robodr-kafka` (or the unit's user above).
+* Manual runs of the tools on a unit's state directory use its user, e.g.
+  `sudo -u robodr-uplink -g robodr robodr-uplink reinject ...` (section 8.5).
+* A host that installs with `adduser` instead of `systemd-sysusers` gets
+  the four users from the postinst too.
 
 ## 12. Sealed delivery: captured-unit protection (`robodr-seal`, Sprint 13c)
 
@@ -3302,7 +3939,7 @@ journal and findings.
 | `robot.deliver.refused` (`unauthentic_key`) | a wrap in the deployment is not this unit's (another unit's, tampered) | check the depot's re-wrapping |
 | `robot.seal.erased`, `robot.seal.tamper` | crypto-erase ran (trigger, what was destroyed and the volume's state in the detail) | investigate the trigger; if the volume is "STILL OPEN", power the unit off |
 | `robot.seal.lease_expired` | a sealed item waits for a site lease (none yet, or the TPM's clock or reboot budget passed it) | bring the unit back into LAN reach of the depot, or give it a media pack with a fresh lease (§13.5) |
-| `robot.seal.erase_deferred` | an erase trigger fired while the robot moved (or its state was unknown); the erase runs as soon as it is idle, safe-state or e-stopped | treat as tamper in progress; bring the robot to a safe state |
+| `robot.seal.erase_deferred` | an erase trigger fired while the robot moved (or its state was unknown): the keys are already destroyed; stopping services and closing the runtime volume runs as soon as it is idle, safe-state or e-stopped (High once it waited past `erase.max_lockdown_deferral_s`) | treat as tamper in progress; bring the robot to a safe state |
 
 ### 12.8 Executed crypto-erase from platform inputs (Sprint 14b)
 
@@ -3533,6 +4170,22 @@ configurations; if you moved a path in a configuration file, use yours.
 
 ### 14.2 Backup
 
+`robodr-blackbox backup` does this by the table above:
+
+```sh
+# Configuration, drop-ins, receiver state, and a copy of the evidence and
+# spools (keys excluded): verify it, keep it.
+robodr-blackbox backup create --out /root/robodr-$(hostname)-$(date +%F).rbkup
+robodr-blackbox backup verify /root/robodr-$(hostname)-$(date +%F).rbkup
+# The keys, encrypted, to offline media (two-person custody):
+robodr-blackbox backup create --include-keys --out - | age -r <custodian key> \
+    > robodr-keys-$(hostname)-$(date +%F).rbkup.age
+```
+
+`create` archives only the "back up: yes" rows (never symlinks or special
+files), each file with its SHA-256; the "no" rows are not archived. The
+same with `tar` and `age` by hand:
+
 ```sh
 # On the unit, as root. Evidence first: a copy of every chain (8.2,
 # interim procedure), to be verified on the far side.
@@ -3561,7 +4214,17 @@ state re-created by its own procedure, never copied.
    `/var/lib/robodr/releases/security-floor` from the bundle.
 2. Restore `/etc/robodr` (and the drop-ins) from the configuration
    backup, then the keys; `systemd-tmpfiles --create` resets owners and
-   modes. A replaced unit with a new TPM keeps the old keys only if the
+   modes. With an archive of 14.2:
+   `robodr-blackbox backup restore FILE [--evidence-to /srv/archive/<unit>]
+   [--spool-ready] [--dry-run]` (decrypt the keys archive first:
+   `age -d ... > keys.rbkup`). It verifies the whole archive before writing
+   anything, restores configuration (keys 0600 in a 0700 directory, no
+   set-id bits) and the anchor receiver's state, extracts evidence only
+   under `--evidence-to` (never into the unit), restores the spools'
+   `ready/` findings only with `--spool-ready` and only into an empty
+   `ready/`, and **never** restores a "no" row of 14.1, even from an
+   archive that holds one: each refused path is printed with its reason.
+   It refuses paths that escape the root and targets behind a symlink. A replaced unit with a new TPM keeps the old keys only if the
    site decides so; otherwise rotate (4.3).
 3. Do **not** copy any "no" row of 14.1. Re-create instead: seal
    provisioning and enrolment (12.1-12.3) and the anchor sidecar (6.4),
@@ -3576,5 +4239,7 @@ state re-created by its own procedure, never copied.
 
 Status: this procedure follows from the code's checks (anti-rollback,
 replay, security floor, TPM and NV bindings) and the package layout; the
-complete restore has not yet been run on a robot. The package parts
+complete restore has not yet been run on a robot. `robodr-blackbox backup`
+is tested against a tree with every row of 14.1, including archives
+crafted to roll the floors back (`crates/robodr-blackbox/tests/backup_restore.rs`). The package parts
 (steps 1 and the floor) are covered by `crates/robodr-fleet/tests/packaging.rs`.

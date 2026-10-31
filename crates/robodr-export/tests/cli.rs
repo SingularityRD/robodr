@@ -34,6 +34,32 @@ fn usage_errors_exit_2() {
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("--diode-out"));
+    // T83: out/ bounds need a diode source, rejected/ bounds a spool.
+    for (src, flag, want) in [
+        ("--spool", "--out-max-count", "need --diode-out"),
+        ("--diode-out", "--rejected-max-age-s", "need --spool"),
+    ] {
+        let o = Command::new(PUBLISH)
+            .args([
+                "--bootstrap",
+                "x:1",
+                "--allow-plaintext",
+                "--state-dir",
+                "/tmp/x",
+                src,
+                "/tmp/y",
+                flag,
+                "5",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains(want),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
 }
 
 #[test]
@@ -134,6 +160,63 @@ fn export_then_publish_spool_once() {
 /// `--version` prints `<name> <version>` and `--help` the usage, both on
 /// stdout with exit 0 (the release .deb smoke test runs both on every
 /// shipped binary); misuse of either stays a usage error (exit 2).
+/// T13: `robodr-kafka-publish --check` reads metadata only: exit 0 with
+/// the partition count and nothing produced; exit 1 for an unreachable
+/// cluster; `--check --once` is a usage error.
+#[test]
+fn publish_check_reads_metadata_and_produces_nothing() {
+    let t = TempDir::new("cli-check");
+    let spool = t.path().join("spool");
+    let state = t.path().join("state");
+    fs::create_dir_all(&spool).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let c = Cluster::start(1, 3);
+    let run = |bootstrap: &str, extra: &[&str]| {
+        Command::new(PUBLISH)
+            .args([
+                "--bootstrap",
+                bootstrap,
+                "--allow-plaintext",
+                "--topic",
+                TOPIC,
+            ])
+            .args(["--state-dir".as_ref(), state.as_os_str()])
+            .args(["--spool".as_ref(), spool.as_os_str()])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = run(&c.bootstrap()[0], &["--check"]);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("3 partitions"), "{out}");
+    assert!(out.contains("check passed"));
+    assert_eq!(c.total(), 0, "nothing produced");
+    assert_eq!(fs::read_dir(&state).unwrap().count(), 0, "no state written");
+    let o = run(&c.bootstrap()[0], &["--check", "--once"]);
+    assert_eq!(o.status.code(), Some(2));
+    // A closed port: refused within the check's bound, exit 1.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let t0 = std::time::Instant::now();
+    let o = run(&closed, &["--check", "--delivery-timeout-ms", "3000"]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("FAIL"));
+    assert!(t0.elapsed() < std::time::Duration::from_secs(20));
+}
+
 #[test]
 fn version_and_help_exit_0() {
     for (name, exe) in [
@@ -153,7 +236,11 @@ fn version_and_help_exit_0() {
         assert_eq!(o.status.code(), Some(0), "{name} --version");
         assert_eq!(
             String::from_utf8_lossy(&o.stdout),
-            format!("{name} {}\n", env!("CARGO_PKG_VERSION")),
+            // Names the build (commit, SOURCE_DATE_EPOCH, target), not only the version.
+            format!(
+                "{}\n",
+                robodr_buildinfo::version_line(name, env!("CARGO_PKG_VERSION"))
+            ),
             "{name} --version"
         );
         let o = std::process::Command::new(exe)

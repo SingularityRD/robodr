@@ -11,8 +11,9 @@ use robodr_blackbox::sign_ed25519::PUBLIC_KEY_LEN;
 use robodr_blackbox::{Ed25519SigningKey, Signer};
 use robodr_fleet::client::{HttpResponse, SocTransport, TransportError};
 use robodr_fleet::wire::{
-    self, Approval, CancelRequest, EnrollAnswer, EnrollRequest, Envelope, KeyAnswer, KeyRef,
-    RetireRequest, RingInfo, RotateRequest, TokenPayload,
+    self, Approval, CancelRequest, DecommissionAnswer, DecommissionRequest, EnrollAnswer,
+    EnrollRequest, Envelope, KeyAnswer, KeyRef, RetireRequest, RingInfo, RotateRequest,
+    TokenPayload,
 };
 use std::collections::BTreeMap;
 
@@ -56,7 +57,20 @@ impl RotationRec {
     }
 }
 
+/// A decommissioned robot (§5.6).
+#[derive(Debug, Clone)]
+pub struct DecommissionRec {
+    pub decommission_id: String,
+    pub request_digest: String,
+    pub answer: Vec<u8>,
+    /// Every key the decommission retired (the request's and any other
+    /// key of the robot that was still active).
+    pub retired_keys: Vec<String>,
+}
+
 pub struct Soc {
+    /// Decommissioned robots by robot id (the latest decommission).
+    pub decommissions: BTreeMap<String, DecommissionRec>,
     /// The online fleet key (tokens, answers, ring information).
     pub soc_key: Ed25519SigningKey,
     /// The approval key (profile approvals only; §6.3).
@@ -107,6 +121,7 @@ impl Soc {
         now_ms: u64,
     ) -> Self {
         Self {
+            decommissions: BTreeMap::new(),
             soc_key,
             approval_key,
             workspace: workspace.into(),
@@ -299,6 +314,7 @@ impl Soc {
             || post(wire::PATH_RETIRE)
             || post(wire::PATH_CANCEL)
             || post(wire::PATH_PROFILE_DRAFTS)
+            || post(wire::PATH_DECOMMISSION)
         {
             if let Err(r) = check_json(
                 headers,
@@ -321,6 +337,8 @@ impl Soc {
                 self.retire(&robot, &auth_key, body)
             } else if post(wire::PATH_CANCEL) {
                 self.cancel(&robot, &auth_key, body)
+            } else if post(wire::PATH_DECOMMISSION) {
+                self.decommission(&robot, &auth_key, body)
             } else {
                 self.draft(&robot, body)
             };
@@ -389,11 +407,20 @@ impl Soc {
         if sig.len() != 128 || !sig.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(e(400, "bad_header", "X-RoboDR-Signature"));
         }
-        let Some(k) = self
-            .keys
-            .get(key_id)
-            .filter(|k| k.role == "uplink" && k.retired_at.is_none())
-        else {
+        // §5.6: an uplink key retired by a decommission of its robot still
+        // authenticates `POST …/decommission` (a lost answer is fetched by
+        // resending the stored request), and nothing else.
+        let retired_by_decommission = |k: &KeyRec| {
+            method == "POST"
+                && target == wire::PATH_DECOMMISSION
+                && self
+                    .decommissions
+                    .get(&k.robot)
+                    .is_some_and(|d| d.retired_keys.iter().any(|x| x == key_id))
+        };
+        let Some(k) = self.keys.get(key_id).filter(|k| {
+            k.role == "uplink" && (k.retired_at.is_none() || retired_by_decommission(k))
+        }) else {
             return Err(e(401, "unknown_key", "not an active uplink key"));
         };
         if self.now_ms.abs_diff(ts) > wire::MAX_SKEW_MS {
@@ -825,6 +852,121 @@ impl Soc {
                 cancelled: None,
             });
         entry.cancelled = Some((digest, ans.clone()));
+        ok(ans)
+    }
+
+    /// §5.6: retire every key of the robot and close its registration.
+    /// Signed by the robot's three active keys in role order; authenticated
+    /// by the uplink key it names.
+    fn decommission(&mut self, robot: &str, auth_key: &str, body: &[u8]) -> Resp {
+        let o = match Envelope::parse(body, wire::T_DECOMMISSION_REQUEST) {
+            Ok(o) => o,
+            Err(x) => return e(400, "bad_request", &x.0),
+        };
+        let r = match DecommissionRequest::parse(&o.payload) {
+            Ok(r) => r,
+            Err(x) => return e(400, "bad_request", &x.0),
+        };
+        if r.workspace != self.workspace || r.robot_id != robot {
+            return e(
+                403,
+                "robot_mismatch",
+                "decommission of another robot or workspace",
+            );
+        }
+        if r.key("uplink").map(|k| k.key_id.as_str()) != Some(auth_key) {
+            return e(
+                401,
+                "wrong_key",
+                "a decommission is authenticated by the uplink key it retires",
+            );
+        }
+        let digest = o.payload_digest();
+        let active: Vec<String> = self
+            .keys
+            .iter()
+            .filter(|(_, k)| k.robot == robot && k.retired_at.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Some(rec) = self.decommissions.get(robot) {
+            if rec.request_digest == digest {
+                return ok(rec.answer.clone());
+            }
+            if active.is_empty() {
+                return e(
+                    409,
+                    "already_decommissioned",
+                    "the robot was decommissioned by another request",
+                );
+            }
+        }
+        for k in &r.keys {
+            let current = self.keys.get(&k.key_id).filter(|x| {
+                x.robot == robot
+                    && x.role == k.role
+                    && x.retired_at.is_none()
+                    && x.fingerprint == k.fingerprint
+            });
+            if current.is_none() {
+                return e(
+                    409,
+                    "stale_key",
+                    "a listed key is not this robot's active key of that role",
+                );
+            }
+        }
+        let ids: Vec<&str> = r.keys.iter().map(|k| k.key_id.as_str()).collect();
+        let all_verify = r
+            .keys
+            .iter()
+            .all(|k| o.verify_by(&k.key_id, &self.keys[&k.key_id].public).is_ok());
+        if o.signers() != ids || !all_verify {
+            return e(
+                401,
+                "bad_signature",
+                "must be signed by the robot's uplink, finding and blackbox keys, in that order",
+            );
+        }
+        if self
+            .rotations
+            .values()
+            .any(|x| x.robot == robot && x.open())
+        {
+            return e(
+                409,
+                "rotation_in_progress",
+                "finish or cancel the open rotation first",
+            );
+        }
+        for id in &active {
+            if let Some(k) = self.keys.get_mut(id) {
+                k.retired_at = Some(self.now_ms);
+            }
+        }
+        let a = DecommissionAnswer {
+            format: wire::DECOMMISSION_ANSWER_FORMAT.into(),
+            decommission_id: r.decommission_id.clone(),
+            request_digest: digest.clone(),
+            workspace: r.workspace.clone(),
+            robot_id: robot.into(),
+            reason: r.reason.clone(),
+            keys: r.keys.clone(),
+            status: "decommissioned".into(),
+            at_ms: self.now_ms,
+        };
+        let ans = self.sign(
+            wire::T_DECOMMISSION_ANSWER,
+            &wire::payload_bytes(&a).unwrap(),
+        );
+        self.decommissions.insert(
+            robot.into(),
+            DecommissionRec {
+                decommission_id: r.decommission_id,
+                request_digest: digest,
+                answer: ans.clone(),
+                retired_keys: active,
+            },
+        );
         ok(ans)
     }
 

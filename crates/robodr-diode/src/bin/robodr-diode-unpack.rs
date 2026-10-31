@@ -77,7 +77,10 @@ fn main() -> ExitCode {
         }
     };
     if cli::is_version_request(&argv) {
-        println!("robodr-diode-unpack {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-diode-unpack", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     let args = match cli::parse_args_with_switches(argv, FLAGS, SWITCHES) {

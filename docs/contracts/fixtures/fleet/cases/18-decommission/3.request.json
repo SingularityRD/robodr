@@ -1,0 +1,25 @@
+{
+  "body_file": "3.body",
+  "body_sha256": "907e9c17fcb69bbd7b47477185d57c2e36c7ef00d00ca477e39f1bb908199128",
+  "headers": [
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "X-RoboDR-Key-Id",
+      "ed25519:caf521a404f9a7bf"
+    ],
+    [
+      "X-RoboDR-Timestamp",
+      "1790000101000"
+    ],
+    [
+      "X-RoboDR-Signature",
+      "b07a4a1ad86d3adf6b8bf2eabf7e0e091155d10fade8d2a94d741d653ef67ff1930169aad635b63017fde90cb4593f5522fc9211fabf8a5286905a7db66a1204"
+    ]
+  ],
+  "method": "POST",
+  "server_time_ms": 1790000101000,
+  "target": "/api/robot-edr/v2/fleet/decommission"
+}

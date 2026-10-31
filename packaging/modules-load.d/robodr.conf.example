@@ -1,0 +1,28 @@
+# Kernel modules RoboDR's enforcing units need, loaded at boot by
+# systemd-modules-load. Example (installed as
+# /usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example, never
+# active). Install only the part for the units you enable:
+#
+#   install -m 0644 robodr.conf.example /etc/modules-load.d/robodr.conf
+#
+# Why preload: robodr-executor runs with ProtectKernelModules=yes and only
+# CAP_NET_ADMIN, so it cannot load a module itself, and the first
+# containment on a host where nf_tables was never used would otherwise
+# depend on the kernel's on-demand loading. `robodr-setup preflight`
+# reports whether nf_tables is loaded, built in or available.
+#
+# Detection alone (robodr-agentd, robodr-pulsard) needs none of these.
+
+# --- robodr-executor (isolate_network, quarantine_node): table inet robodr
+nf_tables
+
+# --- robodr-firewall-gw (inline gateway on a sensor box; see its README,
+# "Kernel requirements"). robodr-firewall-gw-rules.service loads
+# br_netfilter itself; preloading makes a missing module fail at boot, not
+# at the first start of the gateway. Uncomment on a gateway box only.
+#br_netfilter
+#nfnetlink_queue
+#nfnetlink_log
+#xt_NFQUEUE
+#xt_NFLOG
+#xt_physdev

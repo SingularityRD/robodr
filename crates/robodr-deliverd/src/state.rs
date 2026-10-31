@@ -248,6 +248,14 @@ pub struct PendingErase {
     pub deferrals: u32,
     /// The safety state of the last deferral.
     pub last_state: String,
+    /// Unix seconds when the keys were destroyed (the lockdown of the
+    /// runtime volume may still be pending). Until the whole erase is done
+    /// the agent imports, stores and unwraps nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_destroyed: Option<u64>,
+    /// The overdue lockdown was escalated (High finding).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub escalated: bool,
 }
 
 fn is_zero(v: &u64) -> bool {

@@ -114,5 +114,27 @@ ln -s "$tmp/credentials.real" "$base"
 expect 1 "deliverd symlinked base" load "$d" root "blackbox.key:$keys/blackbox.key"
 absent "$tmp/credentials.real/$d/blackbox.key" "symlinked base not followed"
 
+# 5. The units that used to share the robodr user never hand a credential
+#    to robodr (another of them could read it): to their own user when it
+#    exists, else refused (exit 2) and nothing is written.
+rm -f -- "$base"
+for pair in robodr-spool-export.service:robodr-spool robodr-kafka-publish.service:robodr-kafka \
+    robodr-uplink.service:robodr-uplink robodr-firewall-gw.service:robodr-gw; do
+    u=${pair%%:*}
+    own=${pair#*:}
+    if id -u "$own" >/dev/null 2>&1; then
+        expect 0 "$u load for robodr (mapped to $own)" load "$u" robodr "blackbox.key:$keys/blackbox.key"
+        check_file "$base/$u/blackbox.key" 400 "$own:$(id -gn "$own")" "$u credential mapped to $own"
+        expect 0 "$u clear" clear "$u"
+    else
+        expect 2 "$u load for the shared robodr user" load "$u" robodr "blackbox.key:$keys/blackbox.key"
+        absent "$base/$u/blackbox.key" "$u refused the shared robodr user"
+    fi
+done
+# Their own user (here: nobody, standing in for it) still works.
+expect 0 "uplink load for its own user" load robodr-uplink.service nobody "blackbox.key:$keys/blackbox.key"
+check_file "$base/robodr-uplink.service/blackbox.key" 400 "nobody:$nobody_grp" "uplink credential"
+expect 0 "uplink clear" clear robodr-uplink.service
+
 echo "test-load-credential: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

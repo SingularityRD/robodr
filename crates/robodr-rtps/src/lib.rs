@@ -185,6 +185,7 @@
 
 mod frag;
 mod parse;
+pub mod security;
 mod user;
 pub mod vendor;
 mod wire;
@@ -200,7 +201,8 @@ mod testutil;
 
 pub use frag::{
     EvictionReason, FragmentEvent, FragmentEventKind, FragmentReassembler, ReassemblyLimits,
-    RejectReason, HARD_MAX_PENDING_SAMPLES, HARD_MAX_SAMPLE_BYTES,
+    RejectReason, DEFAULT_MAX_SAMPLE_BYTES, DEFAULT_MAX_TOTAL_BYTES, HARD_MAX_PENDING_SAMPLES,
+    HARD_MAX_SAMPLE_BYTES,
 };
 pub use parse::{
     Anomaly, Attribution, DatagramReport, DiscoveryTopic, EndpointAlternate, EndpointInfo,
@@ -211,13 +213,17 @@ pub use parse::{
     ENTITYID_SPDP_SECURE_WRITER, ENTITYID_SPDP_WRITER, GUIDPREFIX_UNKNOWN, MAX_ANOMALIES,
     MAX_FRAGMENT_EVENTS, MAX_LOCATORS_PER_LIST, MAX_PARAMETER_VALUES,
 };
+pub use security::SpdpSecurity;
 pub use user::{
     is_builtin_entity, walk_user_data, PayloadKind, RtpsTime, SampleAddress, UserAnomaly,
     UserAnomalyKind, UserDataLimits, UserDataReport, UserDataStats, UserDataWalker,
     UserFragmentEvent, UserInlineQos, UserSample, DEFAULT_MAX_SAMPLES_PER_DATAGRAM,
     ENTITYID_UNKNOWN, HARD_MAX_SAMPLES_PER_DATAGRAM, MAX_USER_ANOMALIES, MAX_USER_FRAGMENT_EVENTS,
 };
-pub use wire::{Locator, LOCATOR_KIND_INVALID, LOCATOR_KIND_UDPV4, LOCATOR_KIND_UDPV6};
+pub use wire::{
+    Locator, LocatorTransport, LOCATOR_KIND_INVALID, LOCATOR_KIND_RTI_SHMEM, LOCATOR_KIND_SHM,
+    LOCATOR_KIND_TCPV4, LOCATOR_KIND_TCPV6, LOCATOR_KIND_UDPV4, LOCATOR_KIND_UDPV6,
+};
 
 use robodr_events::RobotEvent;
 

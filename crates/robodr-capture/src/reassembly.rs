@@ -35,9 +35,12 @@
 //!   the datagram; so does a non-last fragment past a known end, or an empty
 //!   fragment. A non-last IPv4 fragment whose length is not a multiple of 8
 //!   is *trimmed* to one; for IPv6 that fragment alone is dropped (the kernel
-//!   sends a parameter problem) and the datagram is kept. An IPv4 datagram
-//!   longer than 65 515 bytes (65 535 minus a 20-byte header) is dropped at
-//!   completion; an IPv6 fragment ending past 65 535 is dropped alone.
+//!   sends a parameter problem) and the datagram is kept. At completion a
+//!   datagram is dropped if its offset-0 fragment's header bytes plus the
+//!   reassembled length exceed 65 535 ([`IpFragment::header_len`]: the IPv4
+//!   header *with options*, `ip_frag_reasm`; for IPv6 the unfragmentable
+//!   extension headers before the Fragment header, `ip6_frag_reasm`); an
+//!   IPv6 fragment ending past 65 535 is dropped alone.
 //!   An IPv6 *atomic* fragment (offset 0, M = 0, RFC 6946) is delivered at
 //!   once without touching any queue.
 //! - **`ipfrag_max_dist`** (IPv4 only, default 64): the kernel counts every
@@ -115,7 +118,10 @@
 //! `refused_capacity`.
 //!
 //! All bookkeeping is O(log n) per fragment (no scans of the table under a
-//! flood), apart from amortised compaction of the expiry queue.
+//! flood), apart from amortised compaction of the expiry queue. That
+//! includes the runs of one datagram: fragments arriving back to front
+//! (8-byte fragments, last first) cost O(log runs) each, not a shift of
+//! every queued run.
 //!
 //! Known differences (all in the "sensor sees a superset" direction, which is
 //! a false positive at worst, never an evasion): non-UDP IPv4 fragments are
@@ -136,7 +142,9 @@ use crate::ingress::IngressInfo;
 /// Largest reassembled payload (IPv4 total length / IPv6 payload length max).
 pub const MAX_DATAGRAM: usize = 65_535;
 
-/// Largest IPv4 reassembled payload Linux accepts (65 535 - 20-byte header).
+/// Largest IPv4 reassembled payload Linux accepts behind an option-less
+/// 20-byte header. The reassembler checks the offset-0 fragment's actual
+/// header length ([`IpFragment::header_len`]): `header_len + len <= 65 535`.
 pub const MAX_IPV4_PAYLOAD: usize = MAX_DATAGRAM - 20;
 
 /// Bytes charged per queued fragment on top of its payload. Deliberately
@@ -256,23 +264,16 @@ struct Key {
 type Pair = (IpAddr, IpAddr);
 
 #[derive(Debug)]
-struct Run {
-    start: usize,
-    bytes: Vec<u8>,
-}
-
-impl Run {
-    fn end(&self) -> usize {
-        self.start + self.bytes.len()
-    }
-}
-
-#[derive(Debug)]
 struct Entry {
     generation: u64,
-    /// Sorted, non-overlapping runs of contiguous fragments (kernel
-    /// `frag_run`s: a run only grows by appending at the tail).
-    runs: Vec<Run>,
+    /// Non-overlapping runs of contiguous fragments by start offset (the
+    /// kernel's rb-tree of `frag_run`s: only the tail run grows, by
+    /// appending; a fragment filling a gap becomes a run of its own). A
+    /// map, not a sorted `Vec`: fragments sent back to front would make
+    /// every insert shift the whole vector (quadratic per datagram).
+    runs: BTreeMap<usize, Vec<u8>>,
+    /// [`IpFragment::header_len`] of the offset-0 fragment (0 until seen).
+    head_len: usize,
     /// Largest end seen (`q.len`).
     len: usize,
     first_in: bool,
@@ -547,7 +548,8 @@ impl Reassembler {
             key,
             Entry {
                 generation,
-                runs: Vec::new(),
+                runs: BTreeMap::new(),
+                head_len: 0,
                 len: 0,
                 first_in: false,
                 last_in: false,
@@ -578,6 +580,7 @@ impl Reassembler {
         self.next_generation += 1;
         if let Some(e) = self.entries.get_mut(key) {
             e.runs.clear();
+            e.head_len = 0;
             e.len = 0;
             e.first_in = false;
             e.last_in = false;
@@ -710,6 +713,7 @@ impl Reassembler {
         if offset == 0 {
             e.first_in = true;
             e.protocol = Some(frag.protocol);
+            e.head_len = frag.header_len;
         }
         match &mut e.ingress {
             Some(m) => m.merge_fragment(ingress),
@@ -718,7 +722,7 @@ impl Reassembler {
         e.meat += data.len();
         self.recharge(&key, data.len() + FRAGMENT_OVERHEAD, 0);
         self.touch(&key);
-        self.finish_if_complete(&key, v4)
+        self.finish_if_complete(&key)
     }
 
     fn kill_invalid<T>(&mut self, key: &Key) -> Option<T> {
@@ -727,20 +731,22 @@ impl Reassembler {
         None
     }
 
-    fn finish_if_complete(&mut self, key: &Key, v4: bool) -> Option<(Reassembled, IngressInfo)> {
+    fn finish_if_complete(&mut self, key: &Key) -> Option<(Reassembled, IngressInfo)> {
         let e = self.entries.get(key)?;
         if !(e.first_in && e.last_in && e.meat == e.len) {
             return None;
         }
         let e = self.remove(key)?;
-        if v4 && e.len > MAX_IPV4_PAYLOAD {
+        // ip_frag_reasm: ip_hdrlen(head) + len > 65535; ip6_frag_reasm:
+        // unfragmentable headers of the head + len > IPV6_MAXPLEN.
+        if e.head_len.saturating_add(e.len) > MAX_DATAGRAM {
             self.stats.dropped_invalid += 1; // "Oversized IP packet"
             return None;
         }
         let mut payload = Vec::with_capacity(e.len);
-        for r in &e.runs {
-            debug_assert_eq!(r.start, payload.len());
-            payload.extend_from_slice(&r.bytes);
+        for (start, bytes) in &e.runs {
+            debug_assert_eq!(*start, payload.len());
+            payload.extend_from_slice(bytes);
         }
         self.stats.completed += 1;
         Some((
@@ -755,35 +761,31 @@ impl Reassembler {
     }
 
     /// `inet_frag_queue_insert`.
+    /// O(log runs) whatever the arrival order.
     fn insert(e: &mut Entry, offset: usize, end: usize, data: &[u8]) -> Insert {
-        let new_run = || Run {
-            start: offset,
-            bytes: data.to_vec(),
-        };
-        let Some(tail) = e.runs.last_mut() else {
-            e.runs.push(new_run());
+        let Some(mut tail) = e.runs.last_entry() else {
+            e.runs.insert(offset, data.to_vec());
             return Insert::Ok;
         };
-        let tail_end = tail.end();
+        let tail_end = *tail.key() + tail.get().len();
         if tail_end < end {
             // Common case: goes to the end.
             if offset < tail_end {
                 return Insert::Overlap;
             }
             if offset == tail_end {
-                tail.bytes.extend_from_slice(data);
+                tail.get_mut().extend_from_slice(data);
             } else {
-                e.runs.push(new_run());
+                e.runs.insert(offset, data.to_vec());
             }
             return Insert::Ok;
         }
-        // First run ending after `offset`: the only candidate to intersect.
-        let idx = e.runs.partition_point(|r| r.end() <= offset);
-        match e.runs.get(idx) {
-            Some(r) if r.start < end => {
-                if offset >= r.start && end <= r.end() {
-                    // Within the run: `r.end() == r.start + r.bytes.len()`.
-                    let held = r.bytes.get(offset - r.start..end - r.start);
+        // Runs are disjoint, so the last run starting before `end` is the
+        // only candidate to intersect [offset, end).
+        match e.runs.range(..end).next_back() {
+            Some((&start, bytes)) if start + bytes.len() > offset => {
+                if offset >= start && end <= start + bytes.len() {
+                    let held = bytes.get(offset - start..end - start);
                     Insert::Dup {
                         conflict: held != Some(data),
                     }
@@ -792,7 +794,9 @@ impl Reassembler {
                 }
             }
             _ => {
-                e.runs.insert(idx, new_run());
+                #[cfg(test)]
+                tests::note_run_insert(e.runs.len());
+                e.runs.insert(offset, data.to_vec());
                 Insert::Ok
             }
         }
@@ -848,6 +852,7 @@ mod tests {
             offset,
             more,
             data,
+            header_len: if src.is_ipv4() { 20 } else { 0 },
         }
     }
 
@@ -1083,6 +1088,7 @@ mod tests {
             offset,
             more,
             data,
+            header_len: if src.is_ipv4() { 20 } else { 0 },
         }
     }
 
@@ -1348,5 +1354,95 @@ mod tests {
         );
         assert_eq!(r.buffered_bytes_for(ip(2)), r.buffered_bytes());
         r.check_invariants();
+    }
+
+    thread_local! {
+        /// Runs examined or relocated by mid-queue inserts on this thread.
+        static RUN_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Called by [`Reassembler::insert`] before inserting a run in front of
+    /// `queued` others. A tree insert touches O(log queued) runs; charge
+    /// `ceil(log2(queued + 1)) + 1`. (A sorted `Vec` would relocate every
+    /// following run: the finding this test guards against.)
+    pub(super) fn note_run_insert(queued: usize) {
+        let cost = u64::from(usize::BITS - queued.leading_zeros()) + 1;
+        RUN_WORK.with(|w| w.set(w.get() + cost));
+    }
+
+    fn run_work() -> u64 {
+        RUN_WORK.with(std::cell::Cell::get)
+    }
+
+    /// Review: a datagram sent back to front in 8-byte fragments (8 191
+    /// fragments, ~0.5 MB on the wire) made every insert shift the whole
+    /// sorted run vector, ~33 M run moves (~1 GB memmove) per datagram. The
+    /// work must be O(n log n): below 20 units per fragment here.
+    #[test]
+    fn reverse_order_fragments_cost_log_per_insert() {
+        let mut r = Reassembler::default();
+        let n = 8_189usize; // 65 512 bytes + 20-byte header
+        let before = run_work();
+        let mut out = None;
+        // Last fragment first, then every other one back to front.
+        for i in (0..n).rev() {
+            let more = i + 1 < n;
+            out = r.push(secs(0), &frag(77, i * 8, more, &[i as u8; 8]));
+            if i > 0 {
+                assert!(out.is_none());
+            }
+        }
+        let work = run_work() - before;
+        assert!(work <= 20 * n as u64, "{work} run moves for {n} fragments");
+        let out = out.expect("datagram completes");
+        assert_eq!(out.payload.len(), n * 8);
+        assert_eq!(out.payload[8..16], [1u8; 8]);
+        // Run semantics unchanged: a fragment spanning two gap-filled runs
+        // is a partial overlap (the kernel never merges runs).
+        let mut r = Reassembler::default();
+        r.push(secs(0), &frag(5, 24, false, &[0; 8]));
+        r.push(secs(0), &frag(5, 16, true, &[0; 8]));
+        r.push(secs(0), &frag(5, 8, true, &[0; 8]));
+        assert!(r.push(secs(0), &frag(5, 8, true, &[0; 16])).is_none());
+        assert_eq!(r.stats().dropped_overlap, 1);
+        r.check_invariants();
+    }
+
+    /// Review: Linux drops an IPv4 datagram when the offset-0 fragment's
+    /// header *with options* plus the reassembled length exceeds 65 535; a
+    /// fixed 20-byte allowance let the sensor accept what the kernel drops.
+    #[test]
+    fn ipv4_oversize_counts_head_options() {
+        for (ihl, kept) in [(20usize, true), (44, true), (60, false)] {
+            let mut r = Reassembler::default();
+            // 65 488 + 44 = 65 532 <= 65 535; with 60 bytes: 65 548 > 65 535.
+            let mut head = frag(1, 0, true, &[0u8; 65_480]);
+            head.header_len = ihl;
+            assert!(r.push(secs(0), &head).is_none());
+            let got = r.push(secs(0), &frag(1, 65_480, false, &[0; 8]));
+            assert_eq!(got.is_some(), kept, "ihl {ihl}");
+            assert_eq!(r.stats().dropped_invalid, u64::from(!kept));
+        }
+        // The header length is taken from the offset-0 fragment only.
+        let mut r = Reassembler::default();
+        let mut tail = frag(2, 65_480, false, &[0; 8]);
+        tail.header_len = 60;
+        r.push(secs(0), &tail);
+        assert!(r.push(secs(0), &frag(2, 0, true, &[0u8; 65_480])).is_some());
+    }
+
+    /// Review: `ip6_frag_reasm` adds the unfragmentable extension headers in
+    /// front of the Fragment header of the offset-0 fragment.
+    #[test]
+    fn ipv6_oversize_counts_unfragmentable_headers() {
+        for (unfrag, kept) in [(0usize, true), (40, true), (48, false)] {
+            let mut r = Reassembler::default();
+            // 65 488 + 48 = 65 536 > 65 535.
+            let mut head = frag_from(v6(1), 3, 0, true, &[0u8; 65_480]);
+            head.header_len = unfrag;
+            assert!(r.push(secs(0), &head).is_none());
+            let got = r.push(secs(0), &frag_from(v6(1), 3, 65_480, false, &[0; 8]));
+            assert_eq!(got.is_some(), kept, "unfrag {unfrag}");
+        }
     }
 }

@@ -227,7 +227,13 @@
 //! binds the chain's *first* key) does not change, later `SegmentStart`s
 //! name the current key. At open the log's current key must be the
 //! signer's; records signed by older keys are authenticated with
-//! `previous_keys` ([`Recorder::open_with_keys`]).
+//! `previous_keys` ([`Recorder::open_with_keys`]), each under exactly the
+//! key the chain names for it. A retired key vouches for nothing after the
+//! `KeyRotation` that retired it (it is usually retired because it
+//! leaked): a rotation must be signed by its `from` key, segments never
+//! switch keys without one or back to an earlier key, state files signed
+//! by a retired key count only for positions up to its rotation, and the
+//! export cursor only under the current key (`rotate_key` re-signs it).
 //!
 //! # Single writer
 //!
@@ -651,6 +657,17 @@ pub struct RecorderConfig {
     /// (default: only the first and last record and the control records the
     /// recorder relies on; hashes and links are always checked in full).
     pub verify_closed_signatures: bool,
+    /// Pending-export protection (cyclic mode only; 0 = off, the default).
+    /// When a rotation would drop the oldest segment and not all of its
+    /// records are covered by the confirmed export position (the signed
+    /// export cursor, or the receiver ack in ack mode, re-read from disk
+    /// first so an exporter in another process counts), the segment is
+    /// kept instead, up to this many segments beyond `max_segments`. Only
+    /// when that reserve is used up too is unexported evidence dropped; it
+    /// is then counted ([`Recorder::unexported_drops`]) and the drop record
+    /// says `exported: false`. See [`Recorder::retention_status`] for the
+    /// pressure a host reports before that happens.
+    pub unexported_reserve_segments: u32,
 }
 
 impl RecorderConfig {
@@ -678,6 +695,7 @@ impl RecorderConfig {
             head_mark_interval_ns: 1_000_000_000,
             head_anchor: None,
             verify_closed_signatures: false,
+            unexported_reserve_segments: 0,
         }
     }
 
@@ -709,8 +727,61 @@ impl RecorderConfig {
             } if max_segments == 0 || critical_reserve_segments == 0 => Err(Error::Config(
                 "saturation needs max_segments >= 1 and critical_reserve_segments >= 1".into(),
             )),
+            RetentionMode::Saturation { .. } if self.unexported_reserve_segments > 0 => {
+                Err(Error::Config(
+                    "unexported_reserve_segments applies to cyclic retention only (saturation \
+                     never drops evidence)"
+                        .into(),
+                ))
+            }
+            RetentionMode::Cyclic { max_segments }
+                if u64::from(max_segments) + u64::from(self.unexported_reserve_segments)
+                    > MAX_RETAINED_SEGMENTS =>
+            {
+                Err(Error::Config(format!(
+                    "max_segments + unexported_reserve_segments must be <= {MAX_RETAINED_SEGMENTS}"
+                )))
+            }
             _ => Ok(()),
         }
+    }
+}
+
+/// Most segments a cyclic configuration may retain (with the
+/// pending-export reserve).
+pub const MAX_RETAINED_SEGMENTS: u64 = 1 << 20;
+
+/// Where retention stands ([`Recorder::retention_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionStatus {
+    /// Retained segments (the active one included).
+    pub segments: u64,
+    /// Segments the configuration lets the store hold before it drops
+    /// (cyclic: `max_segments` + `unexported_reserve_segments`) or refuses
+    /// (saturation: `max_segments` + `critical_reserve_segments`).
+    pub capacity_segments: u64,
+    /// Retained segments holding at least one record after the confirmed
+    /// export position (all of them before the first export).
+    pub unexported_segments: u64,
+    /// Records after the confirmed export position (head seq minus the
+    /// position; an upper bound when segments were dropped).
+    pub unexported_records: u64,
+    /// The confirmed export position (cursor, or ack in ack mode).
+    pub confirmed_export_seq: Option<u64>,
+    /// Segments dropped by cyclic retention with records not exported,
+    /// since this recorder was opened.
+    pub unexported_drops: u64,
+    /// Whether pending-export protection is on.
+    pub protecting: bool,
+}
+
+impl RetentionStatus {
+    /// Unexported share of the capacity, in percent (0..=100).
+    pub fn unexported_fill_percent(&self) -> u64 {
+        if self.capacity_segments == 0 {
+            return 0;
+        }
+        (self.unexported_segments.saturating_mul(100) / self.capacity_segments).min(100)
     }
 }
 
@@ -977,9 +1048,33 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 /// file (mode 0600, `O_NOFOLLOW`), fsync, rename, fsync the directory. A
 /// planted symlink at any predictable path is never followed.
 pub(crate) fn atomic_write(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+    atomic_write_as(dir, name, data, false)
+}
+
+/// [`atomic_write`] for a writer that is not the directory's owner (an
+/// exporter running as root next to a recorder running as its own user):
+/// the file is given the directory's owner and group before it is renamed
+/// into place, so the recorder can read it. Fails rather than leave a file
+/// the recorder cannot read.
+pub(crate) fn atomic_write_owned(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
+    atomic_write_as(dir, name, data, true)
+}
+
+fn atomic_write_as(dir: &Path, name: &str, data: &[u8], as_owner: bool) -> io::Result<()> {
     let tmp = dir.join(tmp_name(name));
     let res = (|| {
         let mut f = create_new_private(&tmp, false)?;
+        #[cfg(unix)]
+        if as_owner {
+            use std::os::unix::fs::MetadataExt;
+            let d = fs::metadata(dir)?;
+            let m = f.metadata()?;
+            if (m.uid(), m.gid()) != (d.uid(), d.gid()) {
+                std::os::unix::fs::fchown(&f, Some(d.uid()), Some(d.gid()))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = as_owner;
         f.write_all(data)?;
         f.sync_all()?;
         fault("atomic.after_tmp")?;
@@ -1122,36 +1217,108 @@ fn segment_identity(name: &str, idx: u64, first: &Record) -> Result<ChainIdentit
     Ok(id)
 }
 
-/// Authenticates records with the recorder's own key: an explicit
-/// [`Verifier`] if one was given, else [`Signer::verify_own`]; then any
-/// retired key (rotated away from in this run, or passed to
-/// [`Recorder::open_with_keys`] for records signed before a rotation).
-/// `previous_keys` is a trusted local input (the operator vouches that
-/// every key in it belongs to this unit), so a keyring there is consulted
-/// with [`Verifier::verify_any`]. Independent verification
-/// ([`crate::verify`]) never does that: it names the key per record.
+/// A key as the chain names it for a record: id and algorithm, plus the
+/// public-key fingerprint when the naming record carries one (a v2
+/// `KeyRotation` / `SegmentStart`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainKey {
+    key: KeyRef,
+    fp: Option<String>,
+}
+
+impl ChainKey {
+    fn of(key: KeyRef) -> Self {
+        Self { key, fp: None }
+    }
+    /// Matches no key: what a record gets when the chain names its key
+    /// inconsistently (a `KeyRotation` whose `from` is not the current key).
+    fn invalid() -> Self {
+        Self::of(KeyRef {
+            key_id: String::new(),
+            algorithm: String::new(),
+        })
+    }
+    fn is(&self, key_id: &str, algorithm: &str) -> bool {
+        self.key.key_id == key_id && self.key.algorithm == algorithm
+    }
+}
+
+/// A named fingerprint is checked only where the key's holder can name its
+/// own (an Ed25519 key can; an HMAC key or an opaque backend cannot).
+fn fp_ok(named: Option<&String>, have: Option<String>) -> bool {
+    match (named, have) {
+        (Some(n), Some(h)) => *n == h,
+        _ => true,
+    }
+}
+
+/// Authenticates records and state with **exactly** the key the chain
+/// names for them.
+///
+/// - [`KeyCheck::by`]: a record of a parsed segment, under the key
+///   [`segment_keys`] expects for it (the recorder's own key, an explicit
+///   [`Verifier`] for it, a key rotated away from in this run, or one of
+///   the `previous_keys` given to [`Recorder::open_with_keys`], looked up
+///   by id and algorithm with [`Verifier::verify_key`]).
+/// - [`KeyCheck::at_seq`]: something that names no key (a state file, an
+///   untrusted frame): the current key, or a retired key only for a
+///   position **at or before** the authenticated `KeyRotation` that
+///   retired it (`until`). A retired key is usually retired because it
+///   leaked; whoever holds it must not be able to vouch for anything after
+///   the rotation.
 struct KeyCheck<'a> {
     signer: &'a dyn Signer,
     ext: Option<&'a dyn Verifier>,
     retired_signers: &'a [Box<dyn Signer>],
     retired: &'a [Box<dyn Verifier>],
+    /// Retired keys and the seq of the `KeyRotation` that retired each.
+    until: &'a [(ChainKey, u64)],
 }
 
 impl KeyCheck<'_> {
-    fn sig(&self, message: &[u8], sig: &[u8]) -> bool {
-        let own = match self.ext {
+    fn own(&self, message: &[u8], sig: &[u8]) -> bool {
+        match self.ext {
             Some(v) => v.verify(message, sig),
             None => self.signer.verify_own(message, sig) == Some(true),
-        };
-        own || self
-            .retired_signers
-            .iter()
-            .any(|s| s.verify_own(message, sig) == Some(true))
-            || self.retired.iter().any(|v| v.verify_any(message, sig))
+        }
     }
-    /// Hash and signature both valid.
+    fn own_fingerprint(&self) -> Option<String> {
+        match self.ext {
+            Some(v) => v.key_fingerprint(v.key_id()),
+            None => self.signer.public_fingerprint(),
+        }
+    }
+    /// Signed by exactly `k` (id, algorithm and, when named, fingerprint).
+    fn by(&self, k: &ChainKey, message: &[u8], sig: &[u8]) -> bool {
+        let (id, alg) = (k.key.key_id.as_str(), k.key.algorithm.as_str());
+        if id.is_empty() {
+            return false;
+        }
+        if k.is(self.signer.key_id(), self.signer.algorithm()) {
+            return fp_ok(k.fp.as_ref(), self.own_fingerprint()) && self.own(message, sig);
+        }
+        self.retired_signers.iter().any(|s| {
+            s.key_id() == id
+                && s.algorithm() == alg
+                && fp_ok(k.fp.as_ref(), s.public_fingerprint())
+                && s.verify_own(message, sig) == Some(true)
+        }) || self.retired.iter().any(|v| {
+            fp_ok(k.fp.as_ref(), v.key_fingerprint(id)) && v.verify_key(id, alg, message, sig)
+        })
+    }
+    /// Signed by the current key, or by a retired key at a position it
+    /// could have signed (`seq` at or before its retirement).
+    fn at_seq(&self, seq: u64, message: &[u8], sig: &[u8]) -> bool {
+        self.own(message, sig)
+            || self
+                .until
+                .iter()
+                .any(|(k, last)| seq <= *last && self.by(k, message, sig))
+    }
+    /// Hash valid and signed by a key that may sign at `r.seq`
+    /// ([`KeyCheck::at_seq`]): for records whose expected key is unknown.
     fn record(&self, r: &Record) -> bool {
-        r.compute_hash() == r.hash && self.sig(&signing_message(&r.hash), &r.sig)
+        r.compute_hash() == r.hash && self.at_seq(r.seq, &signing_message(&r.hash), &r.sig)
     }
 }
 
@@ -1351,31 +1518,10 @@ fn persisted_refusals<'a>(
 }
 
 /// The key that signs records after `tail` (the chain key, or the one named
-/// by the segment's `SegmentStart`, updated by every `KeyRotation`).
+/// by the segment's `SegmentStart`, updated by every `KeyRotation` whose
+/// `from` is the key it replaces).
 fn current_key(identity: &ChainIdentity, tail: &[Record]) -> KeyRef {
-    let mut k = KeyRef {
-        key_id: identity.key_id.clone(),
-        algorithm: identity.algorithm.clone(),
-    };
-    for r in tail {
-        match r.kind {
-            RecordKind::SegmentStart => {
-                if let Some(sk) = r
-                    .payload_json::<SegmentStartPayload>()
-                    .and_then(|p| p.signing_key)
-                {
-                    k = sk;
-                }
-            }
-            RecordKind::KeyRotation => {
-                if let Some(p) = r.payload_json::<KeyRotationPayload>() {
-                    k = p.to;
-                }
-            }
-            _ => {}
-        }
-    }
-    k
+    segment_keys(identity, tail).1.key
 }
 
 /// Result of checking a position against the authenticated log.
@@ -1567,26 +1713,149 @@ fn split_strays(mut segs: SegmentList) -> Result<(SegmentList, Vec<Stray>), Erro
     Ok((segs, Vec::new()))
 }
 
-/// Key id expected to sign each record of a segment (its `SegmentStart`
-/// names it, a `KeyRotation` changes it for the records after it).
-fn expected_keys(identity: &ChainIdentity, recs: &[Record]) -> Vec<String> {
-    let mut k = identity.key_id.clone();
+/// The key expected to sign each record of a segment (its `SegmentStart`
+/// names it, a `KeyRotation` changes it for the records after it), and the
+/// key after the last record.
+///
+/// A `KeyRotation` must be signed by its `from` key, which must be the key
+/// it replaces: one whose `from` names another key (or that does not
+/// parse) is expected under a key that matches nothing (it fails
+/// authentication) and does not change the key.
+fn segment_keys(identity: &ChainIdentity, recs: &[Record]) -> (Vec<ChainKey>, ChainKey) {
+    let chain_key = || {
+        ChainKey::of(KeyRef {
+            key_id: identity.key_id.clone(),
+            algorithm: identity.algorithm.clone(),
+        })
+    };
+    let mut k = chain_key();
     let mut out = Vec::with_capacity(recs.len());
     for r in recs {
-        if r.kind == RecordKind::SegmentStart {
-            k = r
-                .payload_json::<SegmentStartPayload>()
-                .and_then(|p| p.signing_key)
-                .map_or_else(|| identity.key_id.clone(), |sk| sk.key_id);
-        }
-        out.push(k.clone());
-        if r.kind == RecordKind::KeyRotation {
-            if let Some(p) = r.payload_json::<KeyRotationPayload>() {
-                k = p.to.key_id;
+        match r.kind {
+            RecordKind::SegmentStart => {
+                k = match r.payload_json::<SegmentStartPayload>() {
+                    Some(SegmentStartPayload {
+                        signing_key: Some(sk),
+                        signing_key_fingerprint,
+                        ..
+                    }) => ChainKey {
+                        key: sk,
+                        fp: signing_key_fingerprint,
+                    },
+                    _ => chain_key(),
+                };
+                out.push(k.clone());
             }
+            RecordKind::KeyRotation => match r.payload_json::<KeyRotationPayload>() {
+                Some(p) if p.from == k.key => {
+                    out.push(k.clone());
+                    k = ChainKey {
+                        key: p.to,
+                        fp: p.to_fingerprint,
+                    };
+                }
+                _ => out.push(ChainKey::invalid()),
+            },
+            _ => out.push(k.clone()),
         }
     }
-    out
+    (out, k)
+}
+
+/// One retained segment for [`key_timeline`]: index, records, the key
+/// expected for each and the key after the last.
+struct SegKeys<'a> {
+    idx: u64,
+    records: &'a [Record],
+    keys: Vec<ChainKey>,
+    end: ChainKey,
+}
+
+/// Checks the signing keys across the retained segments, given in index
+/// order (each already authenticated record by record under
+/// [`segment_keys`]):
+///
+/// - a segment that directly follows a retained one starts with the key
+///   that one ended with (only a `KeyRotation` changes the key);
+/// - after a gap, a segment may name a key not seen before (a rotation in
+///   the missing segment), never one already used: no switch back to an
+///   earlier key;
+/// - a `KeyRotation` introduces a key not used before it.
+///
+/// Returns the reason for every segment that breaks this (by position in
+/// `segs`; such a segment is left out of the timeline) and the retired
+/// keys with the seq of the rotation that retired each (the earliest, if
+/// a forged later one also names it).
+/// Retired keys, each with the seq of the rotation that retired it.
+type RetiredUntil = Vec<(ChainKey, u64)>;
+
+fn key_timeline(segs: &[SegKeys<'_>]) -> (Vec<(usize, String)>, RetiredUntil) {
+    let mut bad = Vec::new();
+    let mut until: RetiredUntil = Vec::new();
+    let mut used: Vec<KeyRef> = Vec::new();
+    let mut prev: Option<(u64, &ChainKey)> = None;
+    'seg: for (pos, s) in segs.iter().enumerate() {
+        let Some(start) = s.keys.first() else {
+            continue;
+        };
+        if let Some((pidx, pk)) = prev {
+            let fp_differs = matches!((&start.fp, &pk.fp), (Some(a), Some(b)) if a != b);
+            if start.key != pk.key || fp_differs {
+                let why = if pidx + 1 == s.idx {
+                    Some(format!(
+                        "starts with key {} but segment {pidx} ended with key {} (no rotation)",
+                        start.key.key_id, pk.key.key_id
+                    ))
+                } else if used.contains(&start.key) {
+                    Some(format!(
+                        "names key {} after key {} was established: a switch back to an \
+                         earlier key",
+                        start.key.key_id, pk.key.key_id
+                    ))
+                } else {
+                    None
+                };
+                if let Some(w) = why {
+                    bad.push((pos, w));
+                    continue 'seg;
+                }
+            }
+        }
+        let mut local_used = used.clone();
+        if !local_used.contains(&start.key) {
+            local_used.push(start.key.clone());
+        }
+        let mut local_until = Vec::new();
+        for (r, k) in s.records.iter().zip(&s.keys) {
+            if r.kind != RecordKind::KeyRotation {
+                continue;
+            }
+            let Some(p) = r.payload_json::<KeyRotationPayload>() else {
+                continue;
+            };
+            if local_used.contains(&p.to) {
+                bad.push((
+                    pos,
+                    format!(
+                        "record {} rotates to key {}, which signed earlier records",
+                        r.seq, p.to.key_id
+                    ),
+                ));
+                continue 'seg;
+            }
+            local_used.push(p.to);
+            local_until.push((k.clone(), r.seq));
+        }
+        used = local_used;
+        for (k, seq) in local_until {
+            match until.iter_mut().find(|(u, _)| u.key == k.key) {
+                Some((_, s0)) => *s0 = (*s0).min(seq),
+                None => until.push((k, seq)),
+            }
+        }
+        prev = Some((s.idx, &s.end));
+    }
+    (bad, until)
 }
 
 /// Collect an (already authenticated) drop or segment-quarantine record.
@@ -1715,6 +1984,9 @@ pub struct Recorder {
     /// Verifiers for older keys: the one given to [`Recorder::open_with_keys`]
     /// and the explicit verifiers of keys rotated away from.
     retired: Vec<Box<dyn Verifier>>,
+    /// Retired keys and the seq of the authenticated `KeyRotation` that
+    /// retired each: a retired key vouches for nothing after it.
+    retired_until: Vec<(ChainKey, u64)>,
     clock: Box<dyn Clock>,
     identity: ChainIdentity,
     chain_id: Hash,
@@ -1757,6 +2029,8 @@ pub struct Recorder {
     quarantined_now: Vec<u64>,
     /// Evidence trouble found by this open, for the host to report.
     open_incidents: Vec<OpenIncident>,
+    /// Segments dropped by cyclic retention with unexported records.
+    unexported_drops: u64,
 }
 
 impl fmt::Debug for Recorder {
@@ -1789,6 +2063,7 @@ impl Parts {
             ext: self.own_verifier.as_deref(),
             retired_signers: &[],
             retired: self.previous.as_slice(),
+            until: &[],
         }
     }
 }
@@ -1916,6 +2191,7 @@ impl Recorder {
             ext: self.own_verifier.as_deref(),
             retired_signers: &self.retired_signers,
             retired: &self.retired,
+            until: &self.retired_until,
         }
     }
 
@@ -1946,6 +2222,7 @@ impl Recorder {
             own_verifier,
             retired_signers: Vec::new(),
             retired: previous.into_iter().collect(),
+            retired_until: Vec::new(),
             clock,
             identity: identity.clone(),
             chain_id,
@@ -1982,6 +2259,7 @@ impl Recorder {
             quarantined_ranges: Vec::new(),
             quarantined_now: Vec::new(),
             open_incidents: Vec::new(),
+            unexported_drops: 0,
         };
         let genesis = to_json(&GenesisPayload {
             identity,
@@ -2269,8 +2547,10 @@ impl Recorder {
         }
         let chain_id = identity.chain_id();
         let keys = parts.keys();
-        // 4. Authenticate every record we chain onto: never extend a forged head.
-        for r in &tail {
+        // 4. Authenticate every record we chain onto, each under exactly the
+        //    key the chain names for it: never extend a forged head.
+        let (tail_keys, tail_end) = segment_keys(&identity, &tail);
+        for (r, k) in tail.iter().zip(&tail_keys) {
             if r.chain_id != chain_id {
                 return Err(Error::Corrupt {
                     segment: tail_name,
@@ -2278,13 +2558,19 @@ impl Recorder {
                     reason: format!("record {} belongs to another chain", r.seq),
                 });
             }
-            if !keys.sig(&signing_message(&r.hash), &r.sig) {
+            if !keys.by(k, &signing_message(&r.hash), &r.sig) {
+                let named = if k.key.key_id.is_empty() {
+                    "a key rotation whose `from` is not the key it replaces".to_string()
+                } else {
+                    format!("key {}", k.key.key_id)
+                };
                 return Err(Error::Corrupt {
                     segment: tail_name,
                     offset: 0,
                     reason: format!(
-                        "record {} signature does not verify (with this key or any \
-                         previous key given to open_with_keys); refusing to chain onto it",
+                        "record {} signature does not verify under {named}, the key the chain \
+                         names for it (this key, or a previous key given to open_with_keys); \
+                         refusing to chain onto it",
                         r.seq
                     ),
                 });
@@ -2292,18 +2578,22 @@ impl Recorder {
         }
         // Keys proven present: any key that verified some record.
         let mut verified_keys: HashSet<String> =
-            expected_keys(&identity, &tail).into_iter().collect();
+            tail_keys.iter().map(|k| k.key.key_id.clone()).collect();
         let mut tail_drops: Vec<SegmentDroppedPayload> = Vec::new();
         let mut tail_quarantines: Vec<RecoveryPayload> = Vec::new();
         for r in &tail {
             collect_control(r, &mut tail_drops, &mut tail_quarantines);
         }
 
-        // 5. Every other closed segment: chain, identity, signatures.
+        // 5. Every other closed segment: chain, identity, signatures (each
+        //    under the key the chain names for it).
         let verify_all = parts.cfg.verify_closed_signatures;
         let mut sig_failures: Vec<(usize, u64, String)> = Vec::new();
+        let mut closed_keys: Vec<Option<(Vec<ChainKey>, ChainKey)>> =
+            Vec::with_capacity(closed.len());
         for (ci, c) in closed.iter_mut().enumerate() {
             if c.damage.is_some() || Some(ci) == tail_pos {
+                closed_keys.push(None);
                 continue;
             }
             let name = segment_file_name(c.idx);
@@ -2312,16 +2602,18 @@ impl Recorder {
                     format!("record {} belongs to another chain", r.seq),
                     Severity::Critical,
                 ));
+                closed_keys.push(None);
                 continue;
             }
             if let Err(e) = segment_identity(&name, c.idx, &c.records[0]) {
                 c.damage = Some((e.to_string(), Severity::Critical));
+                closed_keys.push(None);
                 continue;
             }
-            let ks = expected_keys(&identity, &c.records);
+            let (ks, end) = segment_keys(&identity, &c.records);
             let n = c.records.len();
             let mut fail = None;
-            for (i, (r, k)) in c.records.iter().zip(ks).enumerate() {
+            for (i, (r, k)) in c.records.iter().zip(&ks).enumerate() {
                 let control = matches!(
                     r.kind,
                     RecordKind::SegmentDropped | RecordKind::Recovery | RecordKind::KeyRotation
@@ -2329,19 +2621,20 @@ impl Recorder {
                 if !(verify_all || i == 0 || i + 1 == n || control) {
                     continue;
                 }
-                if keys.sig(&signing_message(&r.hash), &r.sig) {
-                    verified_keys.insert(k);
+                if keys.by(k, &signing_message(&r.hash), &r.sig) {
+                    verified_keys.insert(k.key.key_id.clone());
                     collect_control(r, &mut c.drops, &mut c.quarantine_records);
                 } else if fail.is_none() {
-                    fail = Some((r.seq, k));
+                    fail = Some((r.seq, k.key.key_id.clone()));
                 }
             }
             if let Some((seq, k)) = fail {
                 sig_failures.push((ci, seq, k));
             }
+            closed_keys.push(Some((ks, end)));
         }
         for (ci, seq, k) in sig_failures {
-            if !verified_keys.contains(&k) {
+            if !k.is_empty() && !verified_keys.contains(&k) {
                 // Not damage we can tell from a missing key: refuse, as for
                 // the head (pass the old key to open_with_keys).
                 return Err(Error::Corrupt {
@@ -2354,8 +2647,13 @@ impl Recorder {
                     ),
                 });
             }
+            let k = if k.is_empty() {
+                "the key it rotates from (its `from` is not the key it replaces)".to_string()
+            } else {
+                format!("key {k}")
+            };
             closed[ci].damage = Some((
-                format!("record {seq} signature does not verify under key {k}"),
+                format!("record {seq} signature does not verify under {k}"),
                 Severity::Critical,
             ));
         }
@@ -2395,6 +2693,67 @@ impl Recorder {
                 }
             }
         }
+
+        // 6a. Keys across segments: no key switch without a rotation, never
+        //     back to an earlier key, and a retired key only up to the
+        //     rotation that retired it (state and untrusted frames below).
+        let retired_until = {
+            let mut order: Vec<(u64, Option<usize>)> = closed
+                .iter()
+                .enumerate()
+                .filter(|(ci, c)| c.damage.is_none() && Some(*ci) != tail_pos)
+                .map(|(ci, c)| (c.idx, Some(ci)))
+                .collect();
+            order.push((tail_idx, None));
+            order.sort_by_key(|(idx, _)| *idx);
+            let segs: Vec<SegKeys<'_>> = order
+                .iter()
+                .filter_map(|(_, ci)| match ci {
+                    Some(ci) => {
+                        let (ks, end) = closed_keys.get(*ci)?.as_ref()?;
+                        let c = closed.get(*ci)?;
+                        Some(SegKeys {
+                            idx: c.idx,
+                            records: &c.records,
+                            keys: ks.clone(),
+                            end: end.clone(),
+                        })
+                    }
+                    None => Some(SegKeys {
+                        idx: tail_idx,
+                        records: &tail,
+                        keys: tail_keys.clone(),
+                        end: tail_end.clone(),
+                    }),
+                })
+                .collect();
+            let (bad, until) = key_timeline(&segs);
+            let bad: Vec<(u64, String)> = bad
+                .into_iter()
+                .filter_map(|(pos, why)| segs.get(pos).map(|s| (s.idx, why)))
+                .collect();
+            drop(segs);
+            for (idx, why) in bad {
+                if idx == tail_idx {
+                    return Err(Error::Corrupt {
+                        segment: tail_name,
+                        offset: 0,
+                        reason: format!(
+                            "{why}; refusing to chain onto it (a retired key cannot sign after \
+                             its rotation)"
+                        ),
+                    });
+                }
+                if let Some(c) = closed.iter_mut().find(|c| c.idx == idx) {
+                    c.damage = Some((format!("key switch refused: {why}"), Severity::Critical));
+                }
+            }
+            until
+        };
+        let keys = KeyCheck {
+            until: &retired_until,
+            ..parts.keys()
+        };
 
         // 6b. Refusal counters persisted before the restart (before the
         //     strays join `closed`).
@@ -2605,7 +2964,9 @@ impl Recorder {
         // The high-water mark proves everything up to it was fsynced.
         let mark_in = read_state(&parts.cfg.dir, HEAD_FILE)?
             .and_then(|s| Checkpoint::from_json(&s))
-            .filter(|c| c.chain_id == chain_id && keys.sig(&signing_message(&c.hash), &c.sig));
+            .filter(|c| {
+                c.chain_id == chain_id && keys.at_seq(c.seq, &signing_message(&c.hash), &c.sig)
+            });
         // A crash explains the hole only if nothing after it was durably
         // synced: no record that is always synced, nothing at or below the
         // mark (and no mark beyond the head: it names a synced record that
@@ -2718,6 +3079,7 @@ impl Recorder {
             own_verifier,
             retired_signers: Vec::new(),
             retired: previous.into_iter().collect(),
+            retired_until,
             clock,
             identity,
             chain_id,
@@ -2755,6 +3117,7 @@ impl Recorder {
             quarantined_ranges: quarantine.iter().filter_map(|q| q.range).collect(),
             quarantined_now: Vec::new(),
             open_incidents: Vec::new(),
+            unexported_drops: 0,
         };
 
         // 10. State: trusted only if authenticated and consistent. An
@@ -2783,7 +3146,7 @@ impl Recorder {
             match Checkpoint::from_json(&s) {
                 Some(c)
                     if c.chain_id == chain_id
-                        && r.keys().sig(&signing_message(&c.hash), &c.sig) =>
+                        && r.keys().at_seq(c.seq, &signing_message(&c.hash), &c.sig) =>
                 {
                     match r.check_position(&c.anchor()) {
                         PosCheck::Ok | PosCheck::Unknown(_) | PosCheck::Quarantined => {
@@ -2810,7 +3173,8 @@ impl Recorder {
                     }
                 }
                 _ => rejected.push(format!(
-                    "{name}: unparseable, foreign or not signed by this key"
+                    "{name}: unparseable, foreign, or not signed by this key (a retired key \
+                     vouches only for positions up to its rotation)"
                 )),
             }
         }
@@ -3057,10 +3421,14 @@ impl Recorder {
     /// authentic and of this chain, but beyond the head (truncation evidence).
     fn check_cursor(&self, s: &str) -> Result<Anchor, (Option<Anchor>, String)> {
         let c = SignedCursor::from_json(s).ok_or((None, "unparseable or unsigned".to_string()))?;
-        if !self.keys().sig(&cursor_signing_message(&c.anchor), &c.sig) {
+        // The current key only: a retired key's holder must not be able to
+        // claim records exported (outside ack mode the cursor bounds
+        // pruning). `rotate_key` re-signs the cursor with the new key.
+        if !self.keys().own(&cursor_signing_message(&c.anchor), &c.sig) {
             return Err((
                 None,
-                "signature does not verify under this recorder's key".into(),
+                "signature does not verify under this recorder's current key (a cursor                  signed by a retired key is not trusted)"
+                    .into(),
             ));
         }
         match self.check_position(&c.anchor) {
@@ -3244,20 +3612,34 @@ impl Recorder {
     }
 
     fn write_segment_start(&mut self) -> Result<(), Error> {
-        let signing_key = (self.signer.key_id() != self.identity.key_id
-            || self.signer.algorithm() != self.identity.algorithm)
-            .then(|| KeyRef {
-                key_id: self.signer.key_id().to_string(),
-                algorithm: self.signer.algorithm().to_string(),
-            });
+        let rotated = self.signer.key_id() != self.identity.key_id
+            || self.signer.algorithm() != self.identity.algorithm;
+        let signing_key = rotated.then(|| KeyRef {
+            key_id: self.signer.key_id().to_string(),
+            algorithm: self.signer.algorithm().to_string(),
+        });
+        let signing_key_fingerprint = if rotated {
+            self.current_fingerprint()
+        } else {
+            None
+        };
         let p = to_json(&SegmentStartPayload {
             identity: self.identity.clone(),
             segment_index: self.seg_index,
             boot_id: self.cfg.boot_id.clone(),
             signing_key,
+            signing_key_fingerprint,
         })?;
         self.write_record(RecordKind::SegmentStart, p, true, true)?;
         Ok(())
+    }
+
+    /// Fingerprint of the current key's public half, if it has one.
+    fn current_fingerprint(&self) -> Option<String> {
+        match &self.own_verifier {
+            Some(v) => v.key_fingerprint(v.key_id()),
+            None => self.signer.public_fingerprint(),
+        }
     }
 
     fn seal_with(&mut self, reason: SealReason) -> Result<Checkpoint, Error> {
@@ -3432,11 +3814,19 @@ impl Recorder {
                 "self-test failed: the new key cannot authenticate its own signature".into(),
             ));
         }
-        let p = to_json(&KeyRotationPayload {
-            from: KeyRef {
+        let to_fingerprint = match &new_verifier {
+            Some(v) => v.key_fingerprint(v.key_id()),
+            None => new_signer.public_fingerprint(),
+        };
+        let from = ChainKey {
+            key: KeyRef {
                 key_id: self.signer.key_id().to_string(),
                 algorithm: self.signer.algorithm().to_string(),
             },
+            fp: self.current_fingerprint(),
+        };
+        let p = to_json(&KeyRotationPayload {
+            from: from.key.clone(),
             to: KeyRef {
                 key_id: new_signer.key_id().to_string(),
                 algorithm: new_signer.algorithm().to_string(),
@@ -3446,14 +3836,29 @@ impl Recorder {
                 .filter(|c| !c.is_control())
                 .take(256)
                 .collect(),
+            to_fingerprint,
         })?;
-        self.write_record(RecordKind::KeyRotation, p, true, true)?;
+        let w = self.write_record(RecordKind::KeyRotation, p, true, true)?;
         let old = std::mem::replace(&mut self.signer, new_signer);
         if let Some(v) = std::mem::replace(&mut self.own_verifier, new_verifier) {
             self.retired.push(v);
         }
         self.retired_signers.push(old);
-        self.seal_with(SealReason::KeyRotation)
+        // The old key vouches for nothing after its rotation record.
+        self.retired_until.push((from, w.seq));
+        let cp = self.seal_with(SealReason::KeyRotation)?;
+        // State signed by the old key is trusted only up to the rotation:
+        // re-sign the export cursor under the new key (the seal above
+        // already rewrote the checkpoint and the head mark).
+        if let Some(a) = self.export_cursor.clone() {
+            let sig = self
+                .signer
+                .sign(&cursor_signing_message(&a))
+                .map_err(Error::Sign)?;
+            let c = SignedCursor { anchor: a, sig };
+            atomic_write(&self.cfg.dir, CURSOR_FILE, c.to_json().as_bytes())?;
+        }
+        Ok(cp)
     }
 
     /// Current signing key id (differs from `identity().key_id` after a
@@ -3485,11 +3890,123 @@ impl Recorder {
         self.write_segment_start()?;
         fault("rotate.after_segment_start")?;
         if let RetentionMode::Cyclic { max_segments } = self.cfg.mode {
+            let reserve = self.cfg.unexported_reserve_segments as usize;
+            if reserve > 0 && self.segments.len() > max_segments as usize {
+                // An exporter in another process may have moved the cursor.
+                self.refresh_export_state();
+            }
             while self.segments.len() > max_segments as usize {
+                if reserve > 0
+                    && !self.oldest_exported()
+                    && self.segments.len() <= max_segments as usize + reserve
+                {
+                    break; // pending-export protection: keep it
+                }
                 self.drop_oldest(DropReason::Cyclic)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether every record of the oldest retained (closed) segment is
+    /// covered by the confirmed export position.
+    fn oldest_exported(&self) -> bool {
+        match (self.confirmed_export(), self.segment_end(0)) {
+            (Some(c), Some((last, _))) => c.seq >= last,
+            _ => false,
+        }
+    }
+
+    /// Re-read the export cursor (and, in ack mode, the receiver ack) from
+    /// the directory and adopt it if it authenticates, matches the chain
+    /// and is ahead of the position held. An exporter running in another
+    /// process (`robodr-blackbox export-pending`) moves the cursor on disk;
+    /// this is how the recorder learns of it. A file that does not
+    /// authenticate is ignored (re-exporting is safe; dropping unexported
+    /// evidence is not). Returns whether the confirmed position advanced.
+    pub fn refresh_export_state(&mut self) -> bool {
+        let mut advanced = false;
+        // Cheap before costly: only a cursor ahead of the held one is
+        // authenticated (which may re-read a segment).
+        let held = self.export_cursor.as_ref().map(|c| c.seq);
+        let ahead = |seq: u64| held.is_none_or(|h| seq > h);
+        if let Ok(Some(s)) = read_state(&self.cfg.dir, CURSOR_FILE) {
+            let newer = SignedCursor::from_json(&s).is_some_and(|c| ahead(c.anchor.seq));
+            if let Some(a) = newer.then(|| self.check_cursor(&s).ok()).flatten() {
+                self.export_cursor = Some(a);
+                advanced = self.ack_verifier.is_none();
+            }
+        }
+        if self.ack_verifier.is_some() {
+            if let Ok(Some(s)) = read_state(&self.cfg.dir, ACK_FILE) {
+                if let Some(ack) = Ack::from_json(&s) {
+                    if self.acked.as_ref().is_none_or(|a| ack.seq > a.seq)
+                        && self.check_ack(&ack).is_ok()
+                    {
+                        self.acked = Some(ack.anchor());
+                        advanced = true;
+                    }
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Where retention stands: how much of the store holds evidence that
+    /// has not been exported, against what the configuration lets it hold.
+    /// A host reports pressure from it before evidence is dropped (agentd:
+    /// `blackbox.retention`). Uses the export position held in memory;
+    /// call [`Recorder::refresh_export_state`] first to pick up an
+    /// exporter in another process.
+    pub fn retention_status(&self) -> RetentionStatus {
+        let (capacity, protecting) = match self.cfg.mode {
+            RetentionMode::Cyclic { max_segments } => (
+                u64::from(max_segments) + u64::from(self.cfg.unexported_reserve_segments),
+                self.cfg.unexported_reserve_segments > 0,
+            ),
+            RetentionMode::Saturation {
+                max_segments,
+                critical_reserve_segments,
+            } => (
+                u64::from(max_segments) + u64::from(critical_reserve_segments),
+                false,
+            ),
+        };
+        let confirmed = self.confirmed_export().map(|a| a.seq);
+        let n = self.segments.len();
+        let unexported_segments = match confirmed {
+            None => n,
+            Some(c) => (0..n)
+                .filter(|&pos| {
+                    if pos + 1 == n {
+                        // The active segment: anything after the position?
+                        self.head.is_some_and(|(h, _)| h > c)
+                    } else {
+                        self.segment_end(pos).is_none_or(|(last, _)| last > c)
+                    }
+                })
+                .count(),
+        } as u64;
+        let unexported_records = match (self.head, confirmed) {
+            (Some((h, _)), Some(c)) => h.saturating_sub(c),
+            (Some((h, _)), None) => h.saturating_add(1),
+            (None, _) => 0,
+        };
+        RetentionStatus {
+            segments: n as u64,
+            capacity_segments: capacity,
+            unexported_segments,
+            unexported_records,
+            confirmed_export_seq: confirmed,
+            unexported_drops: self.unexported_drops,
+            protecting,
+        }
+    }
+
+    /// Segments dropped by cyclic retention with records not exported
+    /// since this recorder was opened.
+    pub fn unexported_drops(&self) -> u64 {
+        self.unexported_drops
     }
 
     /// `(seq, hash)` of the last record of retained segment `pos`, from the
@@ -3554,6 +4071,9 @@ impl Recorder {
             missing,
         })?;
         self.write_record(RecordKind::SegmentDropped, p, true, true)?;
+        if reason == DropReason::Cyclic && !exported {
+            self.unexported_drops += 1;
+        }
         fault("drop.after_record")?;
         if !missing {
             match fs::remove_file(&path) {

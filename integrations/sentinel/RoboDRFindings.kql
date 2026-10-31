@@ -1,0 +1,12 @@
+// Parser function: save as a workspace function named RoboDRFindings.
+// One row per finding emission; repeats of a finding share FindingId
+// (ActivityId 2 = update), EventUid is unique per emission.
+// Unverified rows (VerificationStatus != "verified") must never drive an
+// automated response.
+RoboDRFindings_CL
+| extend RuleFamily = tostring(split(RuleId, ".")[1])
+| extend TechniqueIds = extract_all(@'"technique_id":"(T[0-9.]+)"', tostring(Techniques))
+| project TimeGenerated, RobotId, Site, RuleId, RuleFamily, Title, Severity, SeverityId,
+    Mode, MotionState, SourceIp, Participant, RosTopic, TechniqueIds, DataSources,
+    EvidenceLinks, FindingId, EventUid, ExternalId, ActivityId, OccurrenceCount,
+    VerificationStatus, ContractVersion, Description, RawFinding

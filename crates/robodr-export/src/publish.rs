@@ -33,8 +33,15 @@
 //! retention); the finding time is in the value.
 //!
 //! A record that fails validation, or that the broker rejects as a record
-//! (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`, ...), is appended to
-//! `<state>/dead-letter.jsonl` with the reason and is not retried.
+//! (`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`, `INVALID_RECORD`), is
+//! appended to `<state>/dead-letter.jsonl` with the reason and is not
+//! retried. `INVALID_TIMESTAMP` is **not** a record error here: every
+//! record is stamped with this host's clock, so it means the clock is off;
+//! the run fails (nothing dead-lettered or committed) with a hint to check
+//! NTP, and is retried. A spool file that cannot be read (an I/O error such
+//! as `EACCES` / `EIO`, [`fsutil::READ_ATTEMPTS`] attempts) is dead-lettered
+//! with the error, moved to `<spool>/rejected/` (the file itself is kept
+//! for a re-drive) and counted in `quarantined_unreadable`; the run goes on.
 //!
 //! # Progress (at-least-once, bounded duplication)
 //!
@@ -91,13 +98,31 @@
 //! * a `done/` marker over the bounds is deleted only when its batch is no
 //!   longer in `out/` (while it is, the marker is what keeps the batch from
 //!   being published again);
-//! * the dead-letter file rotates ([`PublishConfig::dead_letter_rotation`])
-//!   and a rotated file past `keep` or over the bounds is deleted only when
-//!   none of its entries can be needed for deduplication any more: diode
-//!   entries while their batch is in `out/` without a `done/` marker, spool
-//!   entries while their file is still in `ready/`.
+//! * the dead-letter file is **one growing file by default**: nothing in it
+//!   is ever deleted. Its entries hold the records Kafka refused or that
+//!   failed validation, and for diode input they are usually the only copy
+//!   left. Rotation is opt-in ([`PublishConfig::dead_letter_rotation`]);
+//!   with it, a rotated file past `keep` or over the bounds is deleted only
+//!   when none of its entries can be needed for deduplication any more
+//!   (diode entries while their batch is in `out/` without a `done/`
+//!   marker, spool entries while their file is still in `ready/`), and every
+//!   deletion of a file holding entries is logged on stderr with its entry
+//!   count (and counted in `pruned_dead_letters.removed_entries`);
+//! * opt-in ([`PublishConfig::out_retention`], diode source, only when
+//!   this publisher is the **sole consumer** of `out/`): a finished batch
+//!   directory of the importer's `out/` (its `done/` marker exists; aged by
+//!   the marker) over the bounds loses its payload (records, bundles) and
+//!   stays as a tombstone with its `MANIFEST.json` and marker
+//!   ([`crate::retention::prune_diode_out`]); an unfinished one is held;
+//! * opt-in ([`PublishConfig::rejected_retention`], spool source):
+//!   `<spool>/rejected/` is bounded as `robodr-spool-export` bounds it
+//!   ([`crate::spool_export::prune_rejected`]).
+//!
+//! The report's `state_usage` gives the entries and bytes of `done/`, the
+//! dead-letter files and `out/` or `rejected/` (measured at most every
+//! [`PublishConfig::usage_interval`]).
 
-use crate::deadletter::{DeadLetters, Rotation, DEFAULT_ROTATION};
+use crate::deadletter::{DeadLetters, Rotation};
 use crate::fsutil::{self, ReadError};
 use crate::kafka::{
     IdempotentState, Outcome, PersistFn, ProduceError, ProduceRecord, Producer, SendJournal,
@@ -204,14 +229,29 @@ pub struct PublishConfig {
     /// upgraded to contract 2.0 (default [`DEFAULT_DATA_SOURCE`]); its topic
     /// becomes [`topic`](Self::topic).
     pub upgrade_data_source: String,
-    /// Dead-letter rotation (default [`DEFAULT_ROTATION`]: 64 MiB, 4 kept;
-    /// `None`: one growing file).
+    /// Dead-letter rotation (default `None`: one growing file, nothing ever
+    /// deleted). Opt-in, e.g. [`crate::deadletter::DEFAULT_ROTATION`] (64 MiB, 4 kept): a
+    /// rotated file past `keep` is deleted once no entry of it is needed
+    /// for deduplication, and its entries may be the **only copy** of
+    /// records Kafka refused (diode input is usually gone by then), so the
+    /// publisher keeps everything unless told otherwise (as
+    /// `robodr-spool-export` keeps `rejected/`).
     pub dead_letter_rotation: Option<Rotation>,
     /// Further bounds on the rotated dead-letter files (default none
     /// beyond the rotation's `keep`), see the module docs.
     pub dead_letter_retention: Retention,
     /// Bounds on `done/` markers (default: 30 days), see the module docs.
     pub done_retention: Retention,
+    /// Bounds on the importer's `out/` batch directories this publisher has
+    /// finished (default: unbounded, kept). Only when this publisher is the
+    /// sole consumer of `out/` ([`crate::retention::prune_diode_out`]).
+    pub out_retention: Retention,
+    /// Bounds on `<spool>/rejected/` (spool source; default: unbounded),
+    /// as `robodr-spool-export`'s ([`crate::spool_export::prune_rejected`]).
+    pub rejected_retention: Retention,
+    /// How often the state's disk usage is measured for the report
+    /// ([`PublishReport::state_usage`]; default 60 s).
+    pub usage_interval: std::time::Duration,
     /// Test hook: fail with [`PublishError::Injected`] after the n-th
     /// chunk (1-based) was acknowledged by Kafka but before progress was
     /// saved — a simulated crash.
@@ -228,9 +268,12 @@ impl PublishConfig {
             chunk_records: 500,
             max_record_bytes: 1024 * 1024,
             upgrade_data_source: DEFAULT_DATA_SOURCE.into(),
-            dead_letter_rotation: Some(DEFAULT_ROTATION),
+            dead_letter_rotation: None,
             dead_letter_retention: Retention::UNBOUNDED,
             done_retention: DEFAULT_DONE_RETENTION,
+            out_retention: Retention::UNBOUNDED,
+            rejected_retention: Retention::UNBOUNDED,
+            usage_interval: std::time::Duration::from_secs(60),
             fail_after_send: None,
         }
     }
@@ -411,12 +454,25 @@ pub struct PublishReport {
     /// Malformed lines found in the dead-letter file when it was loaded in
     /// this run (torn fragments, edits; [`crate::deadletter`]).
     pub dead_letter_malformed: u64,
+    /// Spool files that could not be read (I/O error after
+    /// [`fsutil::READ_ATTEMPTS`] attempts): dead-lettered with the error
+    /// and moved to `<spool>/rejected/` (included in `dead_lettered`).
+    pub quarantined_unreadable: u64,
     /// `done/` markers deleted by retention (and held: over the bounds,
     /// batch still in `out/`).
     pub pruned_done: PruneReport,
     /// Rotated dead-letter files deleted by retention (and held: entries
     /// still needed for deduplication).
     pub pruned_dead_letters: PruneReport,
+    /// Finished `out/` batch payloads deleted by retention (held: not
+    /// finished yet).
+    pub pruned_out: PruneReport,
+    /// `<spool>/rejected/` records deleted by retention.
+    pub pruned_rejected: PruneReport,
+    /// What the state occupies (measured at most every
+    /// [`PublishConfig::usage_interval`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_usage: Option<crate::retention::StateUsage>,
 }
 
 /// One input record, as the importer writes it (and as agentd spools it).
@@ -487,14 +543,19 @@ pub(crate) fn list_ready(ready: &Path) -> io::Result<Vec<(u64, String)>> {
 }
 
 /// One spool file as an input record (`{topic, partition, key, headers,
-/// value}` JSON). Outer `Err`: I/O error (stop); inner `Err`: the record is
-/// unusable (reason; dead-letter it).
+/// value}` JSON). Inner `Err`: the record is unusable (reason; dead-letter
+/// it and move it to `rejected/`). A file that keeps failing with an I/O
+/// error (`EACCES`, `EIO`) is retried a bounded number of times
+/// ([`fsutil::read_capped_retrying`]) and then also returned as inner
+/// `Err` ([`fsutil::UNREADABLE`] reason), so one bad file is quarantined
+/// instead of failing every run forever. The outer `Err` is kept for the
+/// callers' signature and is not produced any more.
 pub(crate) fn read_spool_item(
     path: &Path,
     seq: u64,
     max: usize,
 ) -> io::Result<Result<Vec<u8>, String>> {
-    Ok(match fsutil::read_capped(path, max as u64) {
+    Ok(match fsutil::read_capped_retrying(path, max as u64) {
         Ok(b) => serde_json::from_slice::<SpoolRecord>(&b)
             .map_err(|e| format!("not a spool record: {e}"))
             .and_then(|r| {
@@ -508,7 +569,7 @@ pub(crate) fn read_spool_item(
                     Err(format!("seq {} does not match file name", r.seq))
                 }
             }),
-        Err(ReadError::Io(e)) => return Err(e),
+        Err(ReadError::Io(e)) => Err(fsutil::unreadable_reason(&e)),
         Err(e) => Err(format!("unreadable: {e}")),
     })
 }
@@ -766,6 +827,8 @@ pub struct Publisher<S: Sink> {
     /// The dead-letter file (dedup set loaded on the first dead letter).
     dead: DeadLetters,
     dead_loaded: bool,
+    /// When the state usage was last measured.
+    usage_at: Option<std::time::Instant>,
 }
 
 fn save_progress(state_dir: &Path, p: &Progress) -> Result<(), PublishError> {
@@ -855,6 +918,7 @@ impl<S: Sink> Publisher<S> {
             chunks_sent: 0,
             dead,
             dead_loaded: false,
+            usage_at: None,
         })
     }
 
@@ -909,6 +973,20 @@ impl<S: Sink> Publisher<S> {
                 &self.cfg.done_retention,
                 now,
             )?;
+            report.pruned_out = crate::retention::prune_diode_out(
+                out,
+                &self.cfg.state_dir.join(DONE_DIR),
+                &self.cfg.out_retention,
+                now,
+            )?;
+        }
+        if let Source::Spool(root) = &self.cfg.source {
+            report.pruned_rejected = crate::spool_export::prune_rejected(
+                &root.join("rejected"),
+                &root.join("ready"),
+                &self.cfg.rejected_retention,
+                now,
+            )?;
         }
         let r = self.cfg.dead_letter_retention;
         let mut dead = std::mem::replace(
@@ -918,6 +996,18 @@ impl<S: Sink> Publisher<S> {
         let res = dead.prune(&r, now, |s, p| self.dead_letter_needed(s, p));
         self.dead = dead;
         report.pruned_dead_letters = res?;
+        let due = self
+            .usage_at
+            .is_none_or(|t| t.elapsed() >= self.cfg.usage_interval);
+        if due {
+            report.state_usage = Some(crate::retention::state_usage(
+                &self.cfg.state_dir,
+                DEAD_LETTER_FILE,
+                &self.cfg.source,
+                false,
+            )?);
+            self.usage_at = Some(std::time::Instant::now());
+        }
         Ok(())
     }
 
@@ -1017,6 +1107,13 @@ impl<S: Sink> Publisher<S> {
                     sent_items.push(it);
                 }
                 Err(reason) => {
+                    if reason.starts_with(fsutil::UNREADABLE) {
+                        report.quarantined_unreadable += 1;
+                        eprintln!(
+                            "robodr-kafka-publish: WARNING: {context}: spool record {} quarantined: {reason}",
+                            it.pos
+                        );
+                    }
                     let raw = it.raw.as_deref().unwrap_or(&[]);
                     self.dead_letter(context, it.pos, &reason, raw, report)?;
                     done.push((it.pos, it.file.clone(), false));

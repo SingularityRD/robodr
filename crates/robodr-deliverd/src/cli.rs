@@ -23,6 +23,9 @@ usage:
   robodr-deliverd report       --config FILE [--out FILE]
   robodr-deliverd lease        --config FILE --lease FILE
   robodr-deliverd tamper       --socket PATH [--trigger tamper|attestation_failed|auth_failures]
+  robodr-deliverd safety-state [--config FILE]
+  robodr-deliverd verify-minisign --pubkey FILE --file FILE [--sig FILE]
+  robodr-deliverd verify-minisign --self-test
   robodr-deliverd --version
 
 The on-unit delivery agent (docs/SECURE-DELIVERY.md §4.2, §6; man
@@ -83,8 +86,29 @@ tamper        the platform feeder's side of the erase trigger socket
               (erase.trigger_socket): sends one trigger line. The agent
               plans the erase with the responder and runs it when the
               live safety state allows (never while moving; Sprint 14b).
+safety-state  print the live safety state as the install gate sees it
+              (agentd's status socket, peer-checked; the safety section
+              of --config, or its defaults) and whether agentd's
+              heartbeat is fresh. Exit 0 when an install / restart of
+              the gateway and executor may run now (idle or
+              safe_state_active), 1 when it must wait. Used by
+              install-bundle.sh (package upgrades, OPERATIONS.md 7).
+verify-minisign
+              check a minisign signature (FILE.minisig, or --sig) of
+              FILE against the public key file with RoboDR's built-in
+              verifier (prehashed signatures only, as release.yml
+              makes them); prints the trusted comment. --self-test runs
+              the verifier's known-answer test. Used by
+              install-bundle.sh instead of the minisign program.
 
-Exit codes: 0 ok, 1 refused or error, 2 usage.";
+Exit codes: 0 ok, 1 refused or error, 2 usage, 3 (run only) the agent's
+own executable was replaced (a self-upgrade): the pass in progress was
+finished, start it again (the unit does: RestartForceExitStatus=3).";
+
+/// `run` stopped after its pass because its own executable was replaced on
+/// disk (T52: RoboDR's package upgraded by this agent; the postinst leaves
+/// the restart to it). The unit restarts it on that code.
+pub const EXIT_RESTART: i32 = 3;
 
 pub const REPLAY_USAGE: &str = "\
 usage:
@@ -119,7 +143,10 @@ pub fn main_deliverd() -> i32 {
 /// Run one `robodr-deliverd` command line (without the program name).
 pub fn run_deliverd(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-deliverd {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-deliverd", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     if matches!(args.as_slice(), [a] if a == "--help" || a == "-h") {
@@ -141,6 +168,8 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "report" => &["config", "out"],
         "lease" => &["config", "lease"],
         "tamper" => &["socket", "trigger"],
+        "safety-state" => &["config"],
+        "verify-minisign" => &["pubkey", "file", "sig"],
         other => {
             return usage(
                 &format!("unknown command {other:?}"),
@@ -149,10 +178,30 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
             )
         }
     };
-    let a = match parse_args_with_switches(rest, known, &[]) {
+    let switches: &[&str] = if cmd == "verify-minisign" {
+        &["self-test"]
+    } else {
+        &[]
+    };
+    let a = match parse_args_with_switches(rest, known, switches) {
         Ok(a) => a,
         Err(e) => return usage(&e, USAGE, "robodr-deliverd"),
     };
+    if cmd == "verify-minisign" {
+        return match verify_minisign(&a) {
+            Ok(tc) => {
+                println!("{tc}");
+                0
+            }
+            Err(e) => {
+                eprintln!("robodr-deliverd: verify-minisign: {e}");
+                1
+            }
+        };
+    }
+    if cmd == "safety-state" {
+        return safety_state(&a);
+    }
     if cmd == "tamper" {
         let r = (|| -> Result<(), String> {
             let t = a.one("trigger")?.unwrap_or("tamper");
@@ -194,7 +243,17 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "pull" => crate::lan::pull(&cfg).map(|p| print(serde_json::json!({"pack": p}))),
         "report" => report_cmd(cfg, &a),
         "lease" => lease_cmd(cfg, &a),
-        _ => run_loop(cfg),
+        _ => match run_loop(cfg) {
+            Ok(Stop::Replaced) => {
+                eprintln!(
+                    "robodr-deliverd: this program was replaced on disk (an upgrade); \
+                     exiting {EXIT_RESTART} to be started again on the new one"
+                );
+                return EXIT_RESTART;
+            }
+            Ok(Stop::Signal) => Ok(()),
+            Err(e) => Err(e),
+        },
     };
     match r {
         Ok(()) => 0,
@@ -202,6 +261,77 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
             eprintln!("robodr-deliverd: {e}");
             1
         }
+    }
+}
+
+/// `verify-minisign`: the trusted comment of a valid signature.
+fn verify_minisign(a: &Args) -> Result<String, String> {
+    use robodr_pkg::minisign::{self, PublicKey, Signature, MAX_FILE};
+    use std::io::Read;
+    if a.flag("self-test") {
+        if a.one("pubkey")?.is_some() || a.one("file")?.is_some() || a.one("sig")?.is_some() {
+            return Err("--self-test takes no other option".into());
+        }
+        minisign::run_self_test().map_err(|r| r.to_string())?;
+        return Ok("self-test ok".into());
+    }
+    let file = Path::new(a.req("file")?);
+    let sig = match a.one("sig")? {
+        Some(s) => std::path::PathBuf::from(s),
+        None => {
+            let mut s = file.as_os_str().to_os_string();
+            s.push(".minisig");
+            std::path::PathBuf::from(s)
+        }
+    };
+    let read = |p: &Path| robodr_release::fsio::read_capped(p, MAX_FILE).map_err(|e| e.to_string());
+    let pk = PublicKey::parse(&read(Path::new(a.req("pubkey")?))?)
+        .map_err(|r| format!("public key: {r}"))?;
+    let s = Signature::parse(&read(&sig)?).map_err(|r| format!("{}: {r}", sig.display()))?;
+    let (mut f, _) = robodr_release::fsio::open_regular(file).map_err(|e| e.to_string())?;
+    let mut h = robodr_pkg::blake2b::Blake2b512::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        if n == 0 {
+            break;
+        }
+        h.update(buf.get(..n).unwrap_or_default());
+    }
+    let tc = s
+        .verify_digest(&pk, &h.finalize())
+        .map_err(|r| format!("{}: {r}", file.display()))?;
+    Ok(tc.to_string())
+}
+
+/// `safety-state`: exit 0 when the gate is open, 1 when it is not.
+fn safety_state(a: &Args) -> i32 {
+    let cfg = match a.one("config") {
+        Ok(Some(p)) => match Config::load(Path::new(p)) {
+            Ok(c) => c.safety,
+            Err(e) => {
+                eprintln!("robodr-deliverd: configuration: {e}");
+                return 2;
+            }
+        },
+        Ok(None) => crate::config::SafetyCfg::default(),
+        Err(e) => return usage(&e, USAGE, "robodr-deliverd"),
+    };
+    let (o, hb) = crate::safety::observe_with_heartbeat(&cfg);
+    print(serde_json::json!({
+        "safety_state": crate::safety::state_name(o.state),
+        "allows_restart": o.allows_install(),
+        "why": o.why,
+        "agentd_health": o.agentd_health,
+        "agentd_fresh": hb.is_ok(),
+        "agentd_why": hb.err(),
+    }));
+    if o.allows_install() {
+        0
+    } else {
+        1
     }
 }
 
@@ -370,7 +500,66 @@ fn once(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-fn run_loop(cfg: Config) -> Result<(), String> {
+/// Why `run` stopped (without an error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// SIGTERM / SIGINT.
+    Signal,
+    /// The agent's own executable was replaced ([`OwnBinary`]).
+    Replaced,
+}
+
+/// The executable this process was started from, as path, device and
+/// inode taken at start (T52). dpkg replaces a file by renaming a new one
+/// over it, so after an upgrade the path names another inode (or nothing)
+/// while this process still runs the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnBinary {
+    path: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl OwnBinary {
+    /// Of this process (`/proc/self/exe`). `None`: not knowable (already
+    /// replaced before the start, or no `/proc`): never reports a change.
+    pub fn of_self() -> Option<Self> {
+        Self::of(Path::new("/proc/self/exe"))
+    }
+
+    /// Of the executable `link` resolves to (`/proc/<pid>/exe`, or any
+    /// path in tests).
+    pub fn of(link: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::fs::canonicalize(link).ok()?;
+        // The kernel marks an unlinked executable " (deleted)".
+        if path.to_string_lossy().ends_with(" (deleted)") {
+            return None;
+        }
+        let m = std::fs::metadata(link).ok()?;
+        let p = std::fs::metadata(&path).ok()?;
+        if (m.dev(), m.ino()) != (p.dev(), p.ino()) {
+            return None;
+        }
+        Some(Self {
+            path,
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+
+    /// The path now names another file, or none.
+    pub fn replaced(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(&self.path) {
+            Ok(m) => (m.dev(), m.ino()) != (self.dev, self.ino),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+}
+
+fn run_loop(cfg: Config) -> Result<Stop, String> {
+    let own = OwnBinary::of_self();
     robodr_agentd::signal::install().map_err(|e| format!("signal handler: {e}"))?;
     let interval = Duration::from_millis(cfg.interval_ms);
     let triggers = match &cfg.erase {
@@ -383,7 +572,7 @@ fn run_loop(cfg: Config) -> Result<(), String> {
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
     let notifier = robodr_agentd::notify::Notifier::from_env();
     notifier.notify("READY=1");
-    let mut res = Ok(());
+    let mut res = Ok(Stop::Signal);
     while !robodr_agentd::signal::requested() {
         // Sprint 14b: erase triggers first (planned by the responder,
         // executed when the safety state allows).
@@ -444,6 +633,13 @@ fn run_loop(cfg: Config) -> Result<(), String> {
                 break;
             }
         }
+        // T52: checked between passes only, so a pass that installed
+        // RoboDR's own package has finished (health gate, commit or
+        // rollback) on the old binary first.
+        if own.as_ref().is_some_and(OwnBinary::replaced) {
+            res = Ok(Stop::Replaced);
+            break;
+        }
         let until = Instant::now() + interval;
         while Instant::now() < until && !robodr_agentd::signal::requested() {
             std::thread::sleep(Duration::from_millis(50));
@@ -451,8 +647,9 @@ fn run_loop(cfg: Config) -> Result<(), String> {
     }
     notifier.notify("STOPPING=1");
     let closed = e.close().map_err(|e| e.0);
-    res?;
-    closed
+    let stop = res?;
+    closed?;
+    Ok(stop)
 }
 
 /// Entry point of `robodr-safety-replay`.
@@ -466,7 +663,10 @@ pub fn main_replay() -> i32 {
 /// Run one `robodr-safety-replay` command line.
 pub fn run_replay(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-safety-replay {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-safety-replay", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     let a = match parse_args_with_switches(

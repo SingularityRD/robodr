@@ -45,6 +45,8 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .I ID
 .RB [ \-\-previous\-keys
 .IR FILE ]...
+.RB [ \-\-tpm\-sidecar
+.IR FILE ]
 .RB [ \-\-boot\-id
 .IR ID ]
 .RB [ \-\-reason
@@ -66,6 +68,43 @@ robodr\-blackbox \- create black\-box keys, verify and inspect RoboDR black\-box
 .RB [ \-\-out
 .IR FILE ]
 .RB [ \-\-allow\-hmac ]
+.PP
+.B robodr\-blackbox export\-pending
+.I DIR
+.B \-\-key
+.I FILE
+.B \-\-device
+.I ID
+.B \-\-out\-dir
+.I DIR
+.RB [ \-\-previous\-keys
+.IR FILE ]...
+.RB [ \-\-max\-records
+.IR N ]
+.RB [ \-\-max\-bytes
+.IR N ]
+.RB [ \-\-max\-bundles
+.IR N ]
+.RB [ \-\-allow\-hmac ]
+.PP
+.B robodr\-blackbox backup create
+.B \-\-out
+.IR FILE | \-
+.RB [ \-\-root
+.IR DIR ]
+.RB [ \-\-include\-keys ]
+.PP
+.B robodr\-blackbox backup verify
+.I FILE
+.PP
+.B robodr\-blackbox backup restore
+.I FILE
+.RB [ \-\-root
+.IR DIR ]
+.RB [ \-\-spool\-ready ]
+.RB [ \-\-evidence\-to
+.IR DIR ]
+.RB [ \-\-dry\-run ]
 .SH DESCRIPTION
 The RoboDR black box is an append\-only, hash\-chained, signed log of evidence
 records split into segment files. This tool manages its keys and checks logs.
@@ -168,6 +207,17 @@ HMAC) needs
 Re\-running after a successful rotation reports
 .I already rotated
 and exits 0.
+.B \-\-previous\-keys
+files get the checks of robodr\-agentd's
+.IR blackbox.previous_keys :
+public files only, bound to
+.B \-\-device
+if bound, owned by root or this user and not group/world\-writable.
+The export cursor, checkpoint and head mark are re\-signed under the new key
+(a retired key vouches only for positions up to its rotation);
+.B \-\-tpm\-sidecar
+re\-signs the TPM head anchor's sidecar too (a sidecar under a retired key
+is refused).
 .B \-\-reason
 is recorded;
 .B \-\-boot\-id
@@ -195,6 +245,57 @@ and applied by
 .BR "robodr\-anchor\-receiver ingest" (8).
 An HMAC key needs
 .BR \-\-allow\-hmac .
+.TP
+.B export\-pending
+Export every record after the black box's signed export cursor as
+RBBXBND1 bundles into
+.BR \-\-out\-dir ,
+while the recorder runs (read only, its own
+.IR export.lock ).
+Each record's hash, signature and link are checked; each bundle is written
+durably before the cursor is advanced, signed with
+.B \-\-key
+(the recorder's current secret key; records signed by retired keys need
+.BR \-\-previous\-keys ).
+At most
+.B \-\-max\-bundles
+(64) bundles of
+.B \-\-max\-records
+(100000) records or
+.B \-\-max\-bytes
+(64 MiB) per run. Records lost before they were exported are reported and
+make the run exit 1 after writing what is there.
+.TP
+.B backup create
+Archive a unit's configuration, drop\-ins, anchor\-receiver state and a
+copy of its evidence and spools (the "back up" rows of OPERATIONS 14.1)
+under
+.B \-\-root
+(default /) into
+.I FILE
+(created new, mode 0600) or standard output. Keys only with
+.BR \-\-include\-keys :
+encrypt such an archive before it leaves the unit.
+.TP
+.B backup verify
+Check an archive end to end (exit 1 if damaged).
+.TP
+.B backup restore
+Verify the whole archive, then restore configuration under
+.BR \-\-root .
+Evidence goes only to
+.BR \-\-evidence\-to ,
+never into the unit; spool
+.I ready/
+findings only with
+.B \-\-spool\-ready
+into an empty
+.IR ready/ .
+Anti\-rollback floors, replay stores, the security floor, TPM\-bound material
+and exporter sequence state are never restored, even if the archive holds
+them; every refused path is printed with its reason.
+.B \-\-dry\-run
+writes nothing.
 .SH EXIT STATUS
 .TP
 .B 0

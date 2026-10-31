@@ -124,7 +124,7 @@ fn json_key_files_and_non_utf8_arguments() {
     cfg["blackbox"].as_object_mut().unwrap().remove("key_id");
     let r = s.resolve(&cfg);
     assert_eq!(r.key_id.as_deref(), Some(KEY_ID));
-    assert_eq!(r.key.0, KEY.to_vec());
+    assert_eq!(*r.key.0, KEY.to_vec());
     // Contradicting ids.
     cfg["blackbox"]["key_id"] = serde_json::json!("other-key");
     let out = check(&cfg);

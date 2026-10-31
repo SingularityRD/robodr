@@ -1,0 +1,30 @@
+[package]
+name = "robodr-attack-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "RoboDR attack simulator for POCs and demos: the tools/e2e red-team scenarios (rogue SPDP participant, GUID spray, malformed RTPS, spoofed out-of-envelope cmd_vel, Unitree LowCmd torque) as an offline pcap generator, a guarded live sender and a scorer of the findings they must produce."
+
+# std + RoboDR crates only: frames come from robodr-capture's builders and
+# pcap reader/writer, the LowCmd frame from robodr-cdr's legacy encoder.
+[dependencies]
+robodr-capture = { workspace = true }
+robodr-cdr = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# tests/agentd_e2e.rs: every scenario through the real daemon.
+robodr-agentd = { workspace = true }
+robodr-blackbox = { workspace = true }
+robodr-commission = { workspace = true }
+robodr-events = { workspace = true }
+robodr-ocsf = { workspace = true }
+
+[[bin]]
+name = "robodr-attack-sim"
+path = "src/bin/robodr-attack-sim.rs"

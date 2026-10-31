@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Fast DDS: a small UDPv4 maxMessageSize, so discovery (SEDP; Fast DDS 2.6 / Humble sends no type information, so
+     640 is not small enough there) and large samples go out as DATA_FRAG. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_small</transport_id>
+      <type>UDPv4</type>
+      <maxMessageSize>400</maxMessageSize>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="robodr_lab_frag_400" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_small</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

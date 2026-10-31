@@ -1,0 +1,7 @@
+# The ROS 2 peer image with rmw_cyclonedds_cpp (tools/e2e/ros2-peer/run.sh
+# cyclonedds robodr-ros2-cyclone). ROS_DISTRO follows the base image.
+ARG BASE=mirror.gcr.io/library/ros:humble-ros-core
+FROM ${BASE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
+ && rm -rf /var/lib/apt/lists/*

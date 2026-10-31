@@ -5,6 +5,7 @@
 # glibc 2.39 (docs/BUILD.md "Static (musl) build", docs/UNITREE.md 3.2).
 #
 #   scripts/build-static.sh <x86_64-unknown-linux-musl|aarch64-unknown-linux-musl> [--out DIR]
+#   scripts/build-static.sh <triple> --check-dir DIR
 #
 # Builds exactly what scripts/ci-repro.sh builds (the pure workspace,
 # Pulsar-bound members excluded with scripts/ci-pure-excludes.py), for the
@@ -12,6 +13,7 @@
 # commit time, --remap-path-prefix for the checkout and CARGO_HOME. Then it
 # CHECKS every robodr-* binary and refuses to finish unless each one is
 #   * an ELF for the target's machine (62 x86-64, 183 AArch64),
+#   * position-independent: e_type ET_DYN (static-pie; see below),
 #   * static: no PT_INTERP program header and no DT_NEEDED entry, so it
 #     runs on any Linux kernel the Rust musl target supports, whatever the
 #     host's libc,
@@ -20,8 +22,9 @@
 #
 # Linker: rust-lld, shipped with the Rust toolchain, for both triples (no C
 # cross linker, no musl-gcc; the musl CRT objects and libc come from the
-# target's rust-std, "self-contained" linking). Set
-# CARGO_TARGET_<TRIPLE>_LINKER yourself to override.
+# target's rust-std, "self-contained" linking); for aarch64 through the
+# scripts/static-pie-ld wrapper. Set CARGO_TARGET_<TRIPLE>_LINKER yourself
+# to override.
 #
 # C compiler: one dependency has C and assembly, `ring` (the crypto provider
 # of rustls, used by robodr-uplink's TLS); everything else is pure Rust.
@@ -33,10 +36,18 @@
 # (local experiments; the result is not a release build). The toolchain
 # versions are written to DIR/TOOLCHAIN.txt.
 #
-# Executable layout: x86_64-unknown-linux-musl links static-pie (ASLR of the
-# image); the Rust aarch64-unknown-linux-musl target does not support
-# static-pie, so the arm64 binaries are static, non-PIE (stack, heap and
-# mmap are still randomised; the executable image is at a fixed address).
+# Executable layout: static-pie on both triples (ET_DYN, no interpreter: the
+# image is randomised by ASLR like stack, heap and mmap). x86_64 is
+# static-pie in Rust's target; aarch64-unknown-linux-musl is not, so its
+# linker defaults to scripts/static-pie-ld (rust-lld with rustc's own
+# static-pie link: rcrt1.o, -pie --no-dynamic-linker -z text; tested by
+# scripts/test-static-pie-ld.sh). Every binary must be ET_DYN; a non-PIE
+# arm64 binary is accepted (with a WARNING) only when the caller set
+# CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER to something else and
+# ROBODR_REQUIRE_STATIC_PIE is not 1 (release.yml sets it).
+#
+# Check only (no build): --check-dir DIR checks the robodr-* binaries in DIR
+# exactly as after a build and copies nothing.
 #
 # robodr-pulsard is NOT built: it links libsqlite3/OpenSSL and embeds
 # clang-built eBPF objects, and it needs a BTF kernel that JetPack 5 does
@@ -55,8 +66,10 @@ root="$(cd "$here/.." && pwd)"
 
 triple=""
 out=""
+check_dir=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+    --check-dir) [[ $# -ge 2 ]] || { echo "build-static: --check-dir needs a value" >&2; exit 2; }; check_dir="$2"; shift 2 ;;
     --out) [[ $# -ge 2 ]] || { echo "build-static: --out needs a value" >&2; exit 2; }; out="$2"; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     -*) echo "build-static: unknown option $1" >&2; exit 2 ;;
@@ -70,6 +83,60 @@ aarch64-unknown-linux-musl) want_machine=183 ;;
 esac
 [[ -n "$out" ]] || out="$root/dist/static/$triple"
 command -v readelf >/dev/null || { echo "build-static: readelf (binutils) not found" >&2; exit 2; }
+linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
+# Is a non-PIE binary tolerated (see "Executable layout")?
+pie_optional=0
+if [[ "$triple" == aarch64-unknown-linux-musl && -n "${!linker_var:-}" &&
+    "${!linker_var}" != */static-pie-ld && "${ROBODR_REQUIRE_STATIC_PIE:-0}" != 1 ]]; then
+    pie_optional=1
+fi
+
+# check_bins DIR NAME...: the release checks of every binary; 0 all pass.
+check_bins() {
+    local dir="$1" rc=0 b f machine etype
+    shift
+    for b in "$@"; do
+        f="$dir/$b"
+        machine="$(od -An -tu2 -j18 -N2 "$f" | tr -d '[:space:]')"
+        if [[ "$(head -c4 "$f" | od -An -tx1 | tr -d '[:space:]')" != 7f454c46 || "$machine" != "$want_machine" ]]; then
+            echo "build-static: FAIL $b: not an ELF for $triple (e_machine $machine)" >&2
+            rc=1
+            continue
+        fi
+        etype="$(od -An -tu2 -j16 -N2 "$f" | tr -d '[:space:]')"
+        if [[ "$etype" != 3 ]]; then
+            if [[ $pie_optional == 1 ]]; then
+                echo "build-static: WARNING $b: not position-independent (e_type $etype): $linker_var=${!linker_var} overrides scripts/static-pie-ld" >&2
+            else
+                echo "build-static: FAIL $b: not position-independent (e_type $etype, want 3 ET_DYN: static-pie)" >&2
+                rc=1
+            fi
+        fi
+        if readelf -lW "$f" | grep -q 'INTERP'; then
+            echo "build-static: FAIL $b: has a program interpreter (dynamically linked)" >&2
+            rc=1
+        fi
+        if readelf -dW "$f" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "build-static: FAIL $b: needs shared libraries: $(readelf -dW "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')" >&2
+            rc=1
+        fi
+        if readelf -dW "$f" 2>/dev/null | grep -q 'TEXTREL'; then
+            echo "build-static: FAIL $b: text relocations" >&2
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+list_bins() {
+    find "$1" -maxdepth 1 -type f -name 'robodr-*' -perm -u+x ! -name '*.d' -printf '%f\n' | LC_ALL=C sort
+}
+if [[ -n "$check_dir" ]]; then
+    mapfile -t bins < <(list_bins "$check_dir")
+    [[ ${#bins[@]} -gt 0 ]] || { echo "build-static: FAIL: no robodr-* binaries in $check_dir" >&2; exit 1; }
+    check_bins "$check_dir" "${bins[@]}" || exit 1
+    echo "build-static: ${#bins[@]} binaries in $check_dir pass the static checks" >&2
+    exit 0
+fi
 
 cd "$root"
 read -r -a cargo_flags <<<"${CARGO_FLAGS:-}"
@@ -86,9 +153,12 @@ cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 # Same flags as release.yml / ci-repro.sh. With --target, RUSTFLAGS applies to
 # the target artefacts only (build scripts and proc macros stay host-native).
 export RUSTFLAGS="--remap-path-prefix=$root=/build/robodr --remap-path-prefix=$cargo_home=/cargo"
-linker_var="CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_LINKER"
 if [[ -z "${!linker_var:-}" ]]; then
-    export "$linker_var=rust-lld"
+    if [[ "$triple" == aarch64-unknown-linux-musl ]]; then
+        export "$linker_var=$here/static-pie-ld"
+    else
+        export "$linker_var=rust-lld"
+    fi
 fi
 # shellcheck source=scripts/c-toolchain.sh disable=SC1091
 . "$here/c-toolchain.sh"
@@ -96,7 +166,11 @@ robodr_pin_cc "$triple" build-static || exit 1
 cc_var="CC_$(printf '%s' "$triple" | tr '-' '_')"
 echo "build-static: $triple, linker ${!linker_var}, C compiler ${!cc_var}, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >&2
 
-if ! rustup target list --installed 2>/dev/null | grep -qx "$triple"; then
+# The target's standard library must be installed: through rustup, or in
+# the sysroot of a toolchain installed without it
+# (scripts/ci-install-pinned-toolchain.sh, release.yml's rebuild).
+if ! rustup target list --installed 2>/dev/null | grep -qx "$triple" &&
+    [[ ! -d "$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$triple/lib" ]]; then
     echo "build-static: target $triple not installed: rustup target add $triple" >&2
     exit 1
 fi
@@ -107,32 +181,12 @@ read -r -a exclude_args <<<"$excludes"
 cargo build --release --locked --target "$triple" --workspace "${exclude_args[@]}" "${cargo_flags[@]}"
 
 bin_dir="${CARGO_TARGET_DIR:-$root/target}/$triple/release"
-mapfile -t bins < <(find "$bin_dir" -maxdepth 1 -type f -name 'robodr-*' -perm -u+x ! -name '*.d' \
-    -printf '%f\n' | LC_ALL=C sort)
+mapfile -t bins < <(list_bins "$bin_dir")
 if [[ ${#bins[@]} -eq 0 ]]; then
     echo "build-static: FAIL: no robodr-* binaries in $bin_dir" >&2
     exit 1
 fi
-
-rc=0
-for b in "${bins[@]}"; do
-    f="$bin_dir/$b"
-    machine="$(od -An -tu2 -j18 -N2 "$f" | tr -d '[:space:]')"
-    if [[ "$(head -c4 "$f" | od -An -tx1 | tr -d '[:space:]')" != 7f454c46 || "$machine" != "$want_machine" ]]; then
-        echo "build-static: FAIL $b: not an ELF for $triple (e_machine $machine)" >&2
-        rc=1
-        continue
-    fi
-    if readelf -lW "$f" | grep -q 'INTERP'; then
-        echo "build-static: FAIL $b: has a program interpreter (dynamically linked)" >&2
-        rc=1
-    fi
-    if readelf -dW "$f" 2>/dev/null | grep -q '(NEEDED)'; then
-        echo "build-static: FAIL $b: needs shared libraries: $(readelf -dW "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')" >&2
-        rc=1
-    fi
-done
-[[ $rc -eq 0 ]] || exit 1
+check_bins "$bin_dir" "${bins[@]}" || exit 1
 
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"

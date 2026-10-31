@@ -1,7 +1,7 @@
 .\" robodr-anchor-receiver(8). Source of truth: the module docs of
 .\" crates/robodr-blackbox/src/bin/robodr-anchor-receiver.rs and
 .\" crates/robodr-blackbox/src/remote_anchor.rs. Keep them in sync.
-.TH ROBODR\-ANCHOR\-RECEIVER 8 "2026-10-18" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
+.TH ROBODR\-ANCHOR\-RECEIVER 8 "2026-10-31" "RoboDR 0.1.0-alpha.1" "RoboDR Manual"
 .SH NAME
 robodr\-anchor\-receiver \- off\-unit home of black\-box head marks (remote head anchor)
 .SH SYNOPSIS
@@ -15,6 +15,10 @@ robodr\-anchor\-receiver \- off\-unit home of black\-box head marks (remote head
 .IR MARKFILE ...
 .br
 .B robodr\-anchor\-receiver status
+.B \-\-config
+.I FILE
+.br
+.B robodr\-anchor\-receiver check
 .B \-\-config
 .I FILE
 .SH DESCRIPTION
@@ -43,6 +47,16 @@ Listen on \fBlisten\fR (one JSON request line per connection,
 protocol \fBrobodr\-anchor/v1\fR, at most 16 KiB; slow peers are cut after
 \fBio_timeout_ms\fR; at most \fBmax_connections\fR at a time). Prints
 \fBlistening on ADDR\fR on stdout once bound.
+.IP
+Unit\-list reload: every \fBreload_poll_ms\fR (default 5000, 100..600000)
+\fBserve\fR checks the configuration file and the unit key files it names;
+when they changed it reloads \fBunits\fR and their client bindings without
+a restart. A unit added is served; a unit removed is refused from then on
+(its state file stays in \fIstate_dir\fR\fB/units/\fR: archive it); a unit
+whose key changed is re\-verified from its state file as at start. A
+configuration that does not load is refused as a whole and the previous
+list stays in force. Other changes (listen, keys, TLS, limits) need a
+restart; they are logged as ignored. Each reload is one line on stderr.
 .TP
 .B ingest
 Apply mark files written on a robot by
@@ -54,6 +68,14 @@ directory's lock (not while \fBserve\fR runs on it).
 .B status
 Print, as JSON, the held mark and alert count per robot. Read\-only; works
 while \fBserve\fR runs.
+.TP
+.B check
+Site acceptance: load everything \fBserve\fR loads (configuration, every
+robot key, the receiver key, the TLS chain, key, client CA and CRLs: an
+expired or unusable CRL fails here), re\-verify every robot's stored state
+and probe the listen address (in use by a running receiver is fine). One
+line per step; exit 0 when all pass, 2 otherwise. Read\-only; works while
+\fBserve\fR runs.
 .SH CONFIGURATION
 JSON, unknown fields refused, paths absolute:
 .PP
@@ -62,8 +84,10 @@ JSON, unknown fields refused, paths absolute:
  "state_dir": "/var/lib/robodr\-anchor\-receiver",
  "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver.key",
  "units": [{"unit": "ugv\-07",
-            "public_key": "/etc/robodr\-anchor\-receiver/units/ugv\-07.pub"}],
+            "public_key": "/etc/robodr\-anchor\-receiver/units/ugv\-07.pub",
+            "client_spki_sha256": ["<64 hex digits>"]}],
  "max_connections": 64, "max_connections_per_source": 8, "io_timeout_ms": 5000,
+ "reload_poll_ms": 5000,
  "tls": {"cert_chain": "/etc/robodr\-anchor\-receiver/tls/receiver.pem",
          "key_file": "/run/credentials/robodr\-anchor\-receiver.service/receiver\-tls.key",
          "client_ca": "/etc/robodr\-anchor\-receiver/tls/robots\-ca.pem",
@@ -73,7 +97,13 @@ JSON, unknown fields refused, paths absolute:
 \fBkey_file\fR is an Ed25519 secret key file (\fBrobodr\-blackbox keygen\fR,
 mode 0600); the robots get its \fB.pub\fR. \fBunit\fR is the robot id;
 \fBpublic_key\fR the robot's black\-box public key file (a key bound to a
-device must name that robot).
+device must name that robot). \fBclient_spki_sha256\fR (optional, needs
+\fBtls.client_ca\fR) lists the SHA\-256 of the robot's TLS client
+certificate SubjectPublicKeyInfo: only such a certificate may query the
+robot's head (\fBcurrent\fR), and it may query no other robot's (refused
+\fBnot bound\fR). Robots without it can be queried by any accepted client
+certificate; \fBserve\fR lists them at start. Marks (\fBadvance\fR) are
+accepted from any client and must verify under the robot's key.
 .PP
 \fBserve\fR speaks TLS: \fBtls.cert_chain\fR and \fBtls.key_file\fR are the
 receiver's certificate chain and key (key: no access for others, no group
@@ -81,6 +111,10 @@ write); with \fBtls.client_ca\fR every robot must present a client
 certificate chaining to it (mutual TLS); with \fBtls.crl_files\fR (PEM or
 DER CRLs of that CA, re\-read when they change) a revoked robot certificate
 is refused, and so is every robot while a CRL is expired or unusable.
+Every CRL needs a CRL number; of several CRLs of one CA the highest number
+is used; an older CRL put back (lower number) is refused, fail closed, also
+across restarts (\fIstate_dir\fR\fB/crl\-high\-water.json\fR). Replace CRL
+files by rename.
 Without \fBtls\fR, \fBserve\fR exits
 2 unless \fB"allow_plaintext": true\fR is set (lab or private link only);
 both together are refused. \fBio_timeout_ms\fR bounds a whole connection,
@@ -102,7 +136,8 @@ Marks and answers are authenticated with Ed25519 whatever the transport; TLS
 adds confidentiality and, with \fBclient_ca\fR, keeps unknown hosts out. A
 network attacker can drop marks or answers (the robot counts anchor
 failures) but cannot make the receiver go back or a robot accept a lower
-mark. Mutual TLS authenticates hosts, not unit ids; no CRL or OCSP check.
+mark. Mutual TLS authenticates hosts; \fBclient_spki_sha256\fR binds a
+robot's head queries to its certificate. Revocation by CRL only, no OCSP.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-blackbox (1)

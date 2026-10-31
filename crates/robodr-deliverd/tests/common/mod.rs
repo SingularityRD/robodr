@@ -406,16 +406,24 @@ impl Unit {
             .unwrap();
         std::fs::write(d.join("boot_id"), format!("{BOOT}\n")).unwrap();
         // Probe user: nobody (65534) when root, else this process's user.
-        let (uid, gid) = if robodr_deliverd::users::is_root() {
-            (65_534, 65_534)
+        // agentd (`safety.agentd_user`, whose uid besides root's the status
+        // file must be owned by): this process's user when not root, since
+        // the test writes agentd-status.json itself; when root the file is
+        // root's (always trusted) and agentd gets an unrelated uid. Without
+        // the line, `safety.passwd` would be the host's /etc/passwd, which
+        // has no robodr-agentd: as a non-root user every status read was
+        // untrusted (safety_state:unknown).
+        let (uid, gid, agentd) = if robodr_deliverd::users::is_root() {
+            (65_534, 65_534, 65_533)
         } else {
             let u = robodr_deliverd::users::effective_uid().unwrap();
-            (u, u)
+            (u, u, u)
         };
         std::fs::write(
             d.join("passwd"),
             format!(
-                "root:x:0:0:root:/root:/bin/sh\nprobe:x:{uid}:{gid}::/nonexistent:/usr/sbin/nologin\n"
+                "root:x:0:0:root:/root:/bin/sh\nprobe:x:{uid}:{gid}::/nonexistent:/usr/sbin/nologin\n\
+                 robodr-agentd:x:{agentd}:{agentd}::/nonexistent:/usr/sbin/nologin\n"
             ),
         )
         .unwrap();
@@ -433,7 +441,8 @@ impl Unit {
             },
             "health": {"passwd": d.join("passwd"), "probe_uid_min": 1, "probe_uid_max": 65534,
                        "systemctl": "/bin/true"},
-            "safety": {"agentd_status": d.join("agentd-status.json"), "boot_id": d.join("boot_id")},
+            "safety": {"agentd_status": d.join("agentd-status.json"), "boot_id": d.join("boot_id"),
+                       "passwd": d.join("passwd")},
             "blackbox": {"dir": d.join("blackbox"), "key": d.join("bb.key")},
             "findings": {"spool": d.join("spool")},
             "interval_ms": 100

@@ -1,19 +1,28 @@
 //! Crypto-erase in the responder's vocabulary (`docs/SECURE-DELIVERY.md`
 //! §7.6, Sprint 14b): the **first executed response**.
 //!
-//! Erase destroys the unit's sealing keys (`robodr-seal`: the TPM erase
-//! epoch moves on); it touches no actuator, so it is safe in every
-//! safety state as far as the robot's motion goes. It is still graded by
-//! the safety state like every other action, because erase also stops the
-//! services that run delivered software from the runtime volume and
-//! closes that volume (§7.6): **never mid-motion**, unless the platform's
-//! own safety system already holds the robot.
+//! Erase has two parts, graded separately:
 //!
-//! | safety state | decision |
-//! |---|---|
-//! | `idle`, `safe_state_active`, `estop_active` | execute |
-//! | `moving_slow`, `moving_fast`, `collaborative_human_nearby` | defer (until one of the above) |
-//! | `unknown` | defer (the state must be known) |
+//! * **Key destruction** (the TPM erase epoch moves on, the UWK blobs and
+//!   the volume wrap are deleted; without a TPM the runtime volume's
+//!   keyslots are wiped). It touches no actuator and stops nothing, so it
+//!   runs **at once in every safety state**, `unknown` included: deferring
+//!   it would leave the keys an attacker wants usable for as long as the
+//!   attacker can keep the robot moving or its safety feed unknown
+//!   (unplugged, spoofed).
+//! * **Lockdown** of the open runtime volume (stop the services that run
+//!   delivered software from it, unmount it, close the mapping). Stopping
+//!   services may change what the robot does, so this part is **never
+//!   mid-motion**, unless the platform's own safety system already holds
+//!   the robot. A lockdown deferred longer than its cap
+//!   ([`DEFAULT_MAX_LOCKDOWN_DEFERRAL_S`], [`lockdown_overdue`]) escalates
+//!   (a High finding); it still waits for a safe state.
+//!
+//! | safety state | keys | lockdown |
+//! |---|---|---|
+//! | `idle`, `safe_state_active`, `estop_active` | destroyed now | now |
+//! | `moving_slow`, `moving_fast`, `collaborative_human_nearby` | destroyed now | deferred (until one of the above) |
+//! | `unknown` | destroyed now | deferred (the state must be known) |
 //!
 //! Who may trigger it (§7.6 table): the local triggers the platform wires
 //! to the agent (enclosure tamper, repeated attestation failure, repeated
@@ -93,19 +102,27 @@ impl EraseTrigger {
     }
 }
 
+/// Longest a deferred lockdown waits before it escalates (seconds).
+pub const DEFAULT_MAX_LOCKDOWN_DEFERRAL_S: u64 = 600;
+
 /// What to do now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum EraseDecision {
+    /// Destroy the keys and lock the runtime volume down.
     Execute,
-    /// Wait for a state that allows it; keep the erase pending.
-    Defer {
-        until: String,
-    },
+    /// Destroy the keys now; the lockdown waits for a state that allows
+    /// it (the erase stays pending until then).
+    DestroyKeysDeferLockdown { until: String },
     /// Two different people must approve first.
-    AwaitApproval {
-        persons: u8,
-    },
+    AwaitApproval { persons: u8 },
+}
+
+impl EraseDecision {
+    /// Whether the keys are destroyed now.
+    pub fn destroys_keys(&self) -> bool {
+        !matches!(self, EraseDecision::AwaitApproval { .. })
+    }
 }
 
 /// The responder's plan for one erase trigger.
@@ -118,12 +135,20 @@ pub struct ErasePlan {
     pub rationale: String,
 }
 
-/// Whether erase may run in `s` (see the module table).
-pub fn erase_allowed_in(s: SafetyState) -> bool {
+/// Whether the lockdown part of erase (stop services, unmount, close the
+/// runtime volume) may run in `s` (see the module table). Key destruction
+/// runs in every state.
+pub fn lockdown_allowed_in(s: SafetyState) -> bool {
     matches!(
         s,
         SafetyState::Idle | SafetyState::SafeStateActive | SafetyState::EStopActive
     )
+}
+
+/// Whether a lockdown deferred for `deferred_s` seconds is past its cap
+/// `max_s` and escalates.
+pub fn lockdown_overdue(deferred_s: u64, max_s: u64) -> bool {
+    deferred_s >= max_s
 }
 
 /// Plan an erase for `trigger` in safety state `state`, with `approvers`
@@ -137,29 +162,32 @@ pub fn plan_erase(trigger: EraseTrigger, state: SafetyState, approvers: u8) -> E
                 trigger.as_str()
             ),
         )
-    } else if erase_allowed_in(state) {
+    } else if lockdown_allowed_in(state) {
         (
             EraseDecision::Execute,
             format!(
-                "{state:?}: the robot is idle or its safety system holds it; erase touches no \
-                 actuator"
+                "{state:?}: the robot is idle or its safety system holds it; keys destroyed and \
+                 the runtime volume locked down"
             ),
         )
     } else if state == SafetyState::Unknown {
         (
-            EraseDecision::Defer {
+            EraseDecision::DestroyKeysDeferLockdown {
                 until: "a known safety state of idle, safe_state_active or estop_active".into(),
             },
-            "safety state unknown: erase stops services and closes the runtime volume, so the \
-             state must be known"
+            "safety state unknown: the keys are destroyed now (no actuator involved); stopping \
+             services and closing the runtime volume waits until the state is known"
                 .into(),
         )
     } else {
         (
-            EraseDecision::Defer {
+            EraseDecision::DestroyKeysDeferLockdown {
                 until: "idle, safe_state_active or estop_active".into(),
             },
-            format!("{state:?}: never mid-motion; deferred until the robot is idle"),
+            format!(
+                "{state:?}: the keys are destroyed now (no actuator involved); stopping services \
+                 is never done mid-motion and waits until the robot is idle"
+            ),
         )
     };
     ErasePlan {
@@ -180,7 +208,7 @@ mod tests {
         for s in SafetyState::ALL {
             let p = plan_erase(EraseTrigger::Tamper, s, 0);
             let exec = p.decision == EraseDecision::Execute;
-            assert_eq!(exec, erase_allowed_in(s), "{s:?}");
+            assert_eq!(exec, lockdown_allowed_in(s), "{s:?}");
             assert_eq!(
                 exec,
                 matches!(
@@ -191,12 +219,29 @@ mod tests {
         }
         assert!(matches!(
             plan_erase(EraseTrigger::Tamper, SafetyState::MovingFast, 0).decision,
-            EraseDecision::Defer { .. }
+            EraseDecision::DestroyKeysDeferLockdown { .. }
         ));
         assert!(matches!(
             plan_erase(EraseTrigger::Tamper, SafetyState::Unknown, 0).decision,
-            EraseDecision::Defer { .. }
+            EraseDecision::DestroyKeysDeferLockdown { .. }
         ));
+    }
+
+    /// Review finding (HIGH): `unknown` and every moving state deferred
+    /// the whole erase, without limit, so an attacker who keeps the safety
+    /// feed unknown (unplugged, spoofed) or the robot moving kept the keys
+    /// alive. Key destruction touches no actuator: it is planned in every
+    /// state; only the lockdown waits, and escalates past its cap.
+    #[test]
+    fn keys_are_destroyed_in_every_safety_state() {
+        for t in EraseTrigger::ALL {
+            for s in SafetyState::ALL {
+                let p = plan_erase(t, s, 2);
+                assert!(p.decision.destroys_keys(), "{t:?} in {s:?}: {p:?}");
+            }
+        }
+        assert!(!lockdown_overdue(DEFAULT_MAX_LOCKDOWN_DEFERRAL_S - 1, 600));
+        assert!(lockdown_overdue(DEFAULT_MAX_LOCKDOWN_DEFERRAL_S, 600));
     }
 
     #[test]
@@ -210,10 +255,10 @@ mod tests {
                 plan_erase(t, SafetyState::Idle, 2).decision,
                 EraseDecision::Execute
             );
-            // Approved, but moving: still deferred.
+            // Approved, but moving: keys now, the lockdown deferred.
             assert!(matches!(
                 plan_erase(t, SafetyState::MovingSlow, 2).decision,
-                EraseDecision::Defer { .. }
+                EraseDecision::DestroyKeysDeferLockdown { .. }
             ));
         }
         for t in EraseTrigger::ALL {

@@ -394,6 +394,97 @@ fn minor_at_least(v: &str, min: u64) -> bool {
         .is_none_or(|m| m >= min)
 }
 
+/// The message's contract has `entity_context.agent_health` (2.5 or a
+/// later 2.x / major).
+fn has_agent_health_field(v: &str) -> bool {
+    let mut parts = v.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => {
+            major > CONTRACT_MAJOR
+                || (major == CONTRACT_MAJOR && minor >= crate::builder::CATALOG_2_5_MINOR)
+        }
+        _ => false,
+    }
+}
+
+/// `entity_context.agent_health`: exactly on a 2.5+ `robot.agent.health`
+/// finding, within [`health_limits`]; names and versions non-empty.
+fn check_agent_health(env: &FindingEnvelope, c: &mut Checker) {
+    use health_limits::{ITEMS, NAME_BYTES, REASONS, REASON_BYTES};
+    let ec = &env.entity_context;
+    let is_health = ec.rule_id == AGENT_HEALTH_RULE;
+    let allowed = has_agent_health_field(&env.contract_version);
+    let Some(h) = &ec.agent_health else {
+        c.fmt(
+            !(is_health && allowed),
+            "/entity_context/agent_health",
+            "a robot.agent.health finding must carry agent_health",
+        );
+        return;
+    };
+    c.fmt(
+        is_health && allowed,
+        "/entity_context/agent_health",
+        "agent_health is only allowed on a 2.5+ robot.agent.health finding",
+    );
+    let p = "/entity_context/agent_health";
+    let count = |name: &str, n: usize, max: usize, c: &mut Checker| {
+        if n > max {
+            c.push(ValidationError::TooLong {
+                path: format!("{p}/{name}"),
+                len: n,
+                max,
+            });
+        }
+    };
+    count("reasons", h.reasons.len(), REASONS, c);
+    count("versions", h.versions.len(), ITEMS, c);
+    count("inputs", h.inputs.len(), ITEMS, c);
+    count("reachability", h.reachability.len(), ITEMS, c);
+    count("credentials", h.credentials.len(), ITEMS, c);
+    count("disks", h.disks.len(), ITEMS, c);
+    for (i, r) in h.reasons.iter().enumerate() {
+        c.len(&format!("{p}/reasons/{i}"), r, 1, REASON_BYTES);
+    }
+    for (i, v) in h.versions.iter().enumerate() {
+        c.len(
+            &format!("{p}/versions/{i}/component"),
+            &v.component,
+            1,
+            NAME_BYTES,
+        );
+        c.len(
+            &format!("{p}/versions/{i}/version"),
+            &v.version,
+            1,
+            NAME_BYTES,
+        );
+    }
+    for (i, x) in h.inputs.iter().enumerate() {
+        c.len(&format!("{p}/inputs/{i}/name"), &x.name, 1, NAME_BYTES);
+    }
+    for (i, x) in h.reachability.iter().enumerate() {
+        c.len(
+            &format!("{p}/reachability/{i}/component"),
+            &x.component,
+            1,
+            NAME_BYTES,
+        );
+    }
+    for (i, x) in h.credentials.iter().enumerate() {
+        c.len(&format!("{p}/credentials/{i}/name"), &x.name, 1, NAME_BYTES);
+    }
+    for (i, x) in h.disks.iter().enumerate() {
+        c.len(&format!("{p}/disks/{i}/name"), &x.name, 1, NAME_BYTES);
+        c.fmt(
+            x.free_bytes <= x.total_bytes,
+            &format!("{p}/disks/{i}/free_bytes"),
+            "free_bytes must not exceed total_bytes",
+        );
+    }
+    c.fmt(h.seq >= 1, &format!("{p}/seq"), "seq starts at 1");
+}
+
 /// A topic name a producer may use (also `ocsf.metadata.log_name`): Kafka's
 /// rule, 1..=249 characters of `[A-Za-z0-9._-]`, not `.` or `..`.
 pub fn is_valid_topic(s: &str) -> bool {
@@ -742,6 +833,9 @@ pub fn validate(env: &FindingEnvelope) -> Result<(), Vec<ValidationError>> {
             "attacks[].technique.name",
         );
     }
+
+    // --- agent health record (contract 2.5)
+    check_agent_health(env, &mut c);
 
     // --- device
     c.eq(&o.device.uid, &ec.robot.id, "device.uid == robot id");

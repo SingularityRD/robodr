@@ -1,0 +1,26 @@
+{
+  "rule_id": "d8c7621e-f693-5b91-9a79-25b7a84558ba",
+  "name": "RoboDR - Motion outside the envelope",
+  "description": "Commanded motion beyond the robot's locked profile (linear, angular or joint speed, joint torque). Observe-only: alerts, never responds.",
+  "type": "query",
+  "language": "kuery",
+  "index": [
+    "logs-robodr.findings-*"
+  ],
+  "query": "event.module : \"robodr\" and (rule.id : \"robot.motion.linear_over_envelope\" or rule.id : \"robot.motion.angular_over_envelope\" or rule.id : \"robot.motion.joint_over_envelope\" or rule.id : \"robot.firewall.joint_torque_out_of_envelope\")",
+  "severity": "high",
+  "risk_score": 73,
+  "interval": "5m",
+  "from": "now-6m",
+  "enabled": false,
+  "author": [
+    "Singularity RD"
+  ],
+  "tags": [
+    "RoboDR",
+    "Robotics",
+    "OT"
+  ],
+  "max_signals": 100,
+  "version": 1
+}

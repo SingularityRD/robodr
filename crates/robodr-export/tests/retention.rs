@@ -84,8 +84,9 @@ fn publisher_prunes_markers_and_dead_letters_it_no_longer_needs() {
     // deleting a marker would publish its batch again.
     assert_eq!((rep.pruned_done.removed, rep.pruned_done.held), (0, 3));
     // Three dead letters, one per file; past keep = 1 the oldest goes
-    // (its batch is done: the entry protects nothing).
+    // (its batch is done: the entry protects nothing), counted and logged.
     assert_eq!(rep.pruned_dead_letters.removed, 1, "{rep:?}");
+    assert_eq!(rep.pruned_dead_letters.removed_entries, 1, "{rep:?}");
     assert_eq!(
         dl_files(&state),
         ["dead-letter.jsonl.1", "dead-letter.jsonl"]
@@ -159,6 +160,37 @@ fn spool_dead_letters_are_held_while_the_file_is_in_ready() {
     assert_eq!(dl_files(&state), ["dead-letter.jsonl.2"]);
 }
 
+/// Review finding: the publisher rotated by default, and pruning deleted
+/// rotated files whose entries could be the only copy of Kafka-refused
+/// findings. Rotation is now opt-in: by default nothing is ever deleted,
+/// whatever the batches' state.
+#[test]
+fn publisher_keeps_every_dead_letter_by_default() {
+    let tmp = TempDir::new("ret-default");
+    let out = tmp.path().join("out");
+    let state = tmp.path().join("state");
+    for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        write_batch(&out, b, 1);
+    }
+    let cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &state);
+    assert_eq!(cfg.dead_letter_rotation, None, "rotation is opt-in");
+    let mut p = Publisher::open(cfg, OkSink).unwrap();
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.dead_lettered, 3);
+    // The batches are done and even gone from out/: their entries protect
+    // nothing for deduplication, yet nothing is deleted.
+    for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        fs::remove_dir_all(out.join(b)).unwrap();
+    }
+    for _ in 0..2 {
+        let rep = p.run_once().unwrap();
+        assert_eq!(rep.pruned_dead_letters, Default::default());
+    }
+    assert_eq!(dl_files(&state), ["dead-letter.jsonl"]);
+    let dl = fs::read_to_string(state.join("dead-letter.jsonl")).unwrap();
+    assert_eq!(dl.lines().count(), 3);
+}
+
 #[test]
 fn bad_rotation_is_refused() {
     let tmp = TempDir::new("ret-bad");
@@ -168,4 +200,123 @@ fn bad_rotation_is_refused() {
         keep: 1,
     });
     assert!(Publisher::open(cfg, OkSink).is_err());
+}
+
+/// T83: with `out_retention` (opt-in; this publisher the sole consumer of
+/// `out/`), the importer's batch directories the publisher has finished
+/// are deleted; nothing is published again, the `done/` markers stay
+/// (their own retention follows once the batch has left `out/`), and the
+/// report carries the state's sizes (measured at most once per
+/// `usage_interval`). By default `out/` is never touched.
+#[test]
+fn publisher_prunes_finished_out_batches_only_when_asked() {
+    let tmp = TempDir::new("ret-out");
+    let out = tmp.path().join("out");
+    let state = tmp.path().join("state");
+    for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        write_batch(&out, b, 2);
+    }
+    let cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &state);
+    assert!(cfg.out_retention.is_unbounded(), "opt-in");
+    let mut p = Publisher::open(cfg.clone(), OkSink).unwrap();
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.published, 6);
+    assert_eq!(rep.pruned_out, Default::default());
+    let u = rep.state_usage.expect("measured on the first run");
+    let o = u.diode_out.expect("diode source");
+    assert_eq!(o.entries, 3);
+    assert!(o.bytes > 3 * 70_000, "{o:?}");
+    assert_eq!(u.done_markers.entries, 3);
+    assert_eq!(u.spool_rejected, None);
+    assert_eq!(u.reinject, None);
+    // Within the interval: not measured again.
+    assert_eq!(p.run_once().unwrap().state_usage, None);
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 3, "default: kept");
+    drop(p);
+
+    let mut cfg = cfg;
+    cfg.out_retention = Retention {
+        max_count: Some(1),
+        ..Default::default()
+    };
+    cfg.usage_interval = std::time::Duration::ZERO;
+    // The count bound keeps one (the newest by done/ marker) and deletes
+    // two.
+    let mut p = Publisher::open(cfg.clone(), OkSink).unwrap();
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.published, 0, "nothing republished");
+    assert_eq!(rep.pruned_out.removed, 2, "{rep:?}");
+    assert!(rep.pruned_out.removed_bytes > 2 * 70_000);
+    // Two payloads gone; the directories stay as tombstones (with the
+    // manifest copy the importer writes; none in this test), so the
+    // importer never re-emits a different batch under a finished name.
+    let with_records = ["rdd_a_1", "rdd_a_2", "rdd_a_3"]
+        .iter()
+        .filter(|b| out.join(b).join("records.jsonl").exists())
+        .count();
+    assert_eq!(with_records, 1);
+    for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        assert!(out.join(b).is_dir(), "tombstone");
+        assert!(state.join("done").join(b).exists(), "markers stay");
+    }
+    let u = rep.state_usage.unwrap();
+    let o = u.diode_out.unwrap();
+    assert_eq!(o.entries, 3);
+    assert!(o.bytes < 100_000, "{o:?}");
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.published, 0);
+    assert_eq!(rep.pruned_out.removed, 0, "tombstones are not pruned again");
+}
+
+/// T83: with a spool source, `rejected_retention` bounds `<spool>/rejected/`
+/// like `robodr-spool-export` does (default: kept). A record moved there
+/// by the publisher has no reason file (its reason is in the dead-letter
+/// file): it is dated by the first pass that sees it.
+#[test]
+fn publisher_prunes_spool_rejected_only_when_asked() {
+    let tmp = TempDir::new("ret-rej");
+    let spool = tmp.path().join("spool");
+    let state = tmp.path().join("state");
+    for d in ["ready", "acked"] {
+        fs::create_dir_all(spool.join(d)).unwrap();
+    }
+    fs::write(
+        spool.join("ready").join(format!("{:020}.json", 1)),
+        b"garbage",
+    )
+    .unwrap();
+    let cfg = PublishConfig::new(Source::Spool(spool.clone()), &state);
+    let mut p = Publisher::open(cfg.clone(), OkSink).unwrap();
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.dead_lettered, 1);
+    assert_eq!(rep.pruned_rejected, Default::default());
+    let u = rep.state_usage.unwrap();
+    assert_eq!(u.spool_rejected.map(|x| x.entries), Some(1));
+    assert_eq!(u.diode_out, None);
+    assert!(spool
+        .join("rejected")
+        .join(format!("{:020}.json", 1))
+        .exists());
+    drop(p);
+    let mut cfg = cfg;
+    cfg.rejected_retention = Retention::max_age(std::time::Duration::from_secs(3600));
+    let mut p = Publisher::open(cfg.clone(), OkSink).unwrap();
+    // Dated now: not old yet.
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.pruned_rejected.removed, 0);
+    let why = spool
+        .join("rejected")
+        .join(format!("{:020}.json.reason.json", 1));
+    assert!(why.exists());
+    assert!(fs::read_to_string(&why)
+        .unwrap()
+        .contains("dead-letter file"));
+    drop(p);
+    cfg.rejected_retention = Retention {
+        max_count: Some(0),
+        ..Default::default()
+    };
+    let rep = Publisher::open(cfg, OkSink).unwrap().run_once().unwrap();
+    assert_eq!(rep.pruned_rejected.removed, 1);
+    assert_eq!(fs::read_dir(spool.join("rejected")).unwrap().count(), 0);
 }

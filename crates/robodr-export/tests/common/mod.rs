@@ -134,6 +134,13 @@ pub struct State {
     /// A partition's `records` (all its batches) longer than this get
     /// MESSAGE_TOO_LARGE, like a topic's `max.message.bytes`.
     pub max_batch_bytes: usize,
+    /// `log.message.timestamp.after.max.ms`: a record whose CreateTime is
+    /// further ahead of the broker's clock gets INVALID_TIMESTAMP (32), as
+    /// Kafka 4.0 does by default (1 h). `None`: not checked.
+    pub timestamp_after_max_ms: Option<i64>,
+    /// The broker's clock relative to the test host's (ms): -7_200_000
+    /// makes a publisher look 2 h ahead.
+    pub clock_offset_ms: i64,
     /// Close a connection with no request for this long (the broker's
     /// `connections.max.idle.ms`); read when a connection is accepted.
     pub idle_close: Option<Duration>,
@@ -148,8 +155,11 @@ pub struct State {
     pub authenticated: u64,
     /// SCRAM attempts refused.
     pub auth_failures: u64,
-    /// Offer InitProducerId (v0-4) in ApiVersions.
+    /// Offer InitProducerId (v0 to `init_pid_max_version`) in ApiVersions.
     pub init_pid_supported: bool,
+    /// Highest InitProducerId version offered: 4 (default) is Kafka 2.5+
+    /// (KIP-360 epoch bumps), 1 or 2 an older broker.
+    pub init_pid_max_version: i16,
     /// Answer InitProducerId with this error (e.g. 31,
     /// CLUSTER_AUTHORIZATION_FAILED).
     pub init_pid_error: Option<i16>,
@@ -270,6 +280,7 @@ impl Cluster {
             max_batch_bytes: usize::MAX,
             produce_max_version: 8,
             init_pid_supported: true,
+            init_pid_max_version: 4,
             next_pid: 1000,
             ..Default::default()
         };
@@ -560,14 +571,18 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                 }
             }
             proto::API_VERSIONS => {
-                let (pmax, init_pid) = {
+                let (pmax, init_pid, init_pid_max) = {
                     let g = st.lock().unwrap();
-                    (g.produce_max_version, g.init_pid_supported)
+                    (
+                        g.produce_max_version,
+                        g.init_pid_supported,
+                        g.init_pid_max_version,
+                    )
                 };
                 let init_pid_api = init_pid.then_some(ApiRange {
                     api_key: proto::API_INIT_PRODUCER_ID,
                     min: 0,
-                    max: 4,
+                    max: init_pid_max,
                 });
                 let mut apis = vec![
                     ApiRange {
@@ -687,6 +702,20 @@ fn serve<S: Read + Write>(node: i32, mut s: S, st: Arc<Mutex<State>>) {
                         }
                         if code == 0 && bytes.len() > st.max_batch_bytes {
                             code = 10;
+                        }
+                        if let Some(after) = st.timestamp_after_max_ms {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64
+                                + st.clock_offset_ms;
+                            let ahead = batches
+                                .iter()
+                                .flat_map(|b| &b.records)
+                                .any(|r| r.timestamp_ms > now + after);
+                            if code == 0 && ahead {
+                                code = 32;
+                            }
                         }
                         let mut base = -1;
                         if code == 0 && append {

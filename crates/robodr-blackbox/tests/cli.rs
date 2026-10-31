@@ -674,7 +674,11 @@ fn version_and_help_exit_0() {
         assert_eq!(o.status.code(), Some(0), "{name} --version");
         assert_eq!(
             String::from_utf8_lossy(&o.stdout),
-            format!("{name} {}\n", env!("CARGO_PKG_VERSION")),
+            // Names the build (commit, SOURCE_DATE_EPOCH, target), not only the version.
+            format!(
+                "{}\n",
+                robodr_buildinfo::version_line(name, env!("CARGO_PKG_VERSION"))
+            ),
             "{name} --version"
         );
         let o = std::process::Command::new(exe)
@@ -858,4 +862,123 @@ fn rotate_refusals_and_the_hmac_migration() {
     ]);
     assert!(o.status.success(), "{}", text(&o));
     assert!(text(&o).contains("bb-h -> bb-e"), "{}", text(&o));
+}
+
+/// `rotate --previous-keys` gets robodr-agentd's `previous_keys` checks: a
+/// secret key file (the retired signing key left on disk), a key bound to
+/// another unit, or a group-writable trust file is refused; a public file
+/// of this unit works. `--tpm-sidecar` names a sidecar to re-sign (none
+/// here: reported, not an error).
+#[test]
+fn rotate_previous_keys_get_the_agentd_checks() {
+    let d = TestDir::new("cli-rotate-prev");
+    let ka = KeyFile::generate_ed25519(Some("bb-a")).unwrap();
+    let kb = KeyFile::generate_ed25519(Some("bb-b")).unwrap();
+    let kc = KeyFile::generate_ed25519(Some("bb-c")).unwrap();
+    let mut kf = KeyFile::generate_ed25519(Some("bb-f")).unwrap();
+    kf.device_id = Some("ugv-99".into());
+    let (sa, pa) = write_pair(&d, "a", &ka);
+    let (sb, _) = write_pair(&d, "b", &kb);
+    let (sc, _) = write_pair(&d, "c", &kc);
+    let (_, pf) = write_pair(&d, "f", &kf);
+    let dir = d.sub("log");
+    let mut r = Recorder::open(cfg(&dir, big()), ka.signer().unwrap(), clock()).unwrap();
+    recorded(r.append_note(&note(0), false).unwrap());
+    r.close().unwrap();
+    assert!(run(&rotate_args(&dir, &sa, &sb)).status.success());
+
+    let attempt = |prev: &Path| {
+        let mut a = rotate_args(&dir, &sb, &sc);
+        a.extend(["--previous-keys", s(prev)]);
+        run(&a)
+    };
+    let o = attempt(&sa);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("secret key file"), "{}", text(&o));
+    let mut a = rotate_args(&dir, &sb, &sc);
+    a.extend(["--previous-keys", s(&pa), "--previous-keys", s(&pf)]);
+    let o = run(&a);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(text(&o).contains("bound to device"), "{}", text(&o));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pa, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let o = attempt(&pa);
+        assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+        assert!(text(&o).contains("trust anchor"), "{}", text(&o));
+        std::fs::set_permissions(&pa, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let sidecar = d.sub("tpm-sidecar.json");
+    let mut a = rotate_args(&dir, &sb, &sc);
+    a.extend(["--previous-keys", s(&pa), "--tpm-sidecar", s(&sidecar)]);
+    let o = run(&a);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("no TPM anchor sidecar"), "{}", text(&o));
+}
+
+/// T15: `export-pending` writes bundles that `verify` accepts, advances the
+/// cursor, and on a second run has nothing to do; a wrong device is a
+/// usage error and writes nothing.
+#[test]
+fn export_pending_writes_verifiable_bundles_and_advances_the_cursor() {
+    let d = TestDir::new("cli-export-pending");
+    let (k, dir) = log_with_key_file(&d);
+    let out = d.sub("outbox");
+    std::fs::create_dir(&out).unwrap();
+    let o = run(&[
+        "export-pending",
+        s(&dir),
+        "--key",
+        s(&k),
+        "--device",
+        "other-unit",
+        "--out-dir",
+        s(&out),
+    ]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(!dir.join(robodr_blackbox::store::CURSOR_FILE).exists());
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    let o = run(&[
+        "export-pending",
+        s(&dir),
+        "--key",
+        s(&k),
+        "--device",
+        "ugv-01",
+        "--out-dir",
+        s(&out),
+        "--max-records",
+        "8",
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    let mut bundles: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    bundles.sort();
+    assert!(bundles.len() >= 3, "{}", text(&o));
+    for b in &bundles {
+        let v = run(&["verify", s(b), "--keyring", s(&k), "--device", "ugv-01"]);
+        assert!(v.status.success(), "{}", text(&v));
+    }
+    assert!(dir.join(robodr_blackbox::store::CURSOR_FILE).exists());
+    let o = run(&[
+        "export-pending",
+        s(&dir),
+        "--key",
+        s(&k),
+        "--device",
+        "ugv-01",
+        "--out-dir",
+        s(&out),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("nothing pending"), "{}", text(&o));
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), bundles.len());
+    // The recorder accepts the cursor the CLI wrote.
+    let key = KeyFile::load(&k).unwrap().signer().unwrap();
+    let mut c = cfg(&dir, big());
+    c.device_id = "ugv-01".into();
+    let r = Recorder::open(c, key, clock()).unwrap();
+    assert!(r.export_cursor().is_some());
 }

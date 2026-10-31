@@ -54,12 +54,16 @@ pub fn run(data: &[u8]) {
     let Some((&flags, mut rest)) = data.split_first() else {
         return;
     };
-    let fx = if flags & 1 == 0 {
+    let channels = flags & 4 != 0;
+    // Bit 2 (the G1 channels fixture) overrides bit 0: that fixture has no
+    // Go1 legacy channels, so the legacy-port invariant below must not be
+    // armed by a stray bit 0 (it would assert a CRC on a frame the gateway
+    // rightly passes as an unconfigured port).
+    let fx = if flags & 1 == 0 || channels {
         Fixture::G1
     } else {
         Fixture::Go2
     };
-    let channels = flags & 4 != 0;
     let mut cfg = if channels {
         testkit::g1_channels_config(|_| {})
     } else {

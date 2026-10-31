@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use robodr_fleet::client::Https;
 use robodr_fleet::config::{AgentdFacts, Config, DEFAULT_CONFIG};
 use robodr_fleet::state::{self, Ctx};
-use robodr_fleet::{enroll, fsx, profile, revocation, ring, rotate};
+use robodr_fleet::{check, decommission, enroll, fsx, profile, revocation, ring, rotate};
 
 const USAGE: &str = "\
 usage:
@@ -44,6 +44,16 @@ usage:
   robodr-enroll profile  status
   robodr-enroll ring     [--file FILE]
   robodr-enroll status
+  robodr-enroll check
+  robodr-enroll decommission --reason end_of_life|transfer|repair [--request-out FILE | --answer FILE]
+                             [--receipt-out FILE]
+  robodr-enroll decommission [--answer FILE] [--receipt-out FILE]   (resume / show the receipt)
+  robodr-enroll decommission --abort
+check: SOC keys, TLS (CA bundle, pins, CRLs), the fleet API and, once enrolled, request
+authentication with the uplink key; read-only (site acceptance, docs/SITE-ACCEPTANCE.md).
+decommission: retires every key of the unit at the SOC (request signed by its uplink,
+finding and blackbox keys), then shreds the uplink and finding keys; procedure:
+docs/DECOMMISSION.md.
 common options:
   --config FILE          fleet configuration (default /etc/robodr/fleet.json)
   --soc-url URL          SOC API root (https://host/api; overrides soc.url)
@@ -85,6 +95,8 @@ const VALUED: &[&str] = &[
     "--profile",
     "--sig",
     "--approval",
+    "--reason",
+    "--receipt-out",
     "--config",
     "--soc-url",
     "--ca-bundle",
@@ -465,13 +477,112 @@ fn run(a: &Args) -> Result<(), Fail> {
                     m.digest, m.profile_version
                 );
             }
+            if let Some(d) = decommission::current(&ctx)? {
+                println!(
+                    "decommission {} ({}): {:?}{}",
+                    d.decommission_id,
+                    d.reason,
+                    d.phase,
+                    d.decommissioned_at_ms
+                        .map(|t| format!(", retired at the SOC at {t} ms"))
+                        .unwrap_or_default()
+                );
+            }
             Ok(())
+        }
+        ["decommission"] => cmd_decommission(a),
+        ["check"] => {
+            a.allow(&[])?;
+            let ctx = context(a)?;
+            let mut t = transport(&ctx)?;
+            let r = check::run(&ctx, &mut t);
+            for line in &r.lines {
+                println!("{line}");
+            }
+            match r.outcome {
+                check::Outcome::Ok => Ok(()),
+                check::Outcome::Refused(e) => Err(Fail::Refused(e)),
+                check::Outcome::Unreachable(e) => Err(Fail::Unreachable(e)),
+            }
         }
         _ => Err(Fail::Usage(format!(
             "unknown command {:?}",
             a.cmd.join(" ")
         ))),
     }
+}
+
+fn cmd_decommission(a: &Args) -> Result<(), Fail> {
+    a.allow(&[
+        "--reason",
+        "--request-out",
+        "--answer",
+        "--receipt-out",
+        "--abort",
+    ])?;
+    if a.get("--request-out").is_some() && a.get("--answer").is_some() {
+        return Err(Fail::Usage(
+            "--request-out and --answer are separate steps".into(),
+        ));
+    }
+    let ctx = context(a)?;
+    if a.flag("--abort") {
+        if ["--reason", "--request-out", "--answer", "--receipt-out"]
+            .iter()
+            .any(|o| a.get(o).is_some())
+        {
+            return Err(Fail::Usage(
+                "--abort takes no other decommission option".into(),
+            ));
+        }
+        decommission::abort(&ctx)?;
+        println!("decommission aborted (the request never left this unit)");
+        return Ok(());
+    }
+    let d = match (decommission::current(&ctx)?, a.get("--reason")) {
+        (Some(d), None) => d,
+        (_, Some(reason)) => decommission::prepare(&ctx, reason)?,
+        (_, None) => {
+            return Err(Fail::Usage(
+                "decommission needs --reason end_of_life|transfer|repair".into(),
+            ))
+        }
+    };
+    if let Some(out) = a.get("--request-out") {
+        write_out(out, &decommission::request_out(&ctx)?)?;
+        println!(
+            "decommission request {} written to {out}; carry it to the SOC, then run \
+             robodr-enroll decommission --answer FILE",
+            d.decommission_id
+        );
+        return Ok(());
+    }
+    let d = match a.get("--answer") {
+        Some(f) => decommission::accept(&ctx, &read_file(f, 64 * 1024)?)?,
+        None if d.phase == decommission::Phase::Prepared => {
+            decommission::submit(&ctx, &mut transport(&ctx)?)?
+        }
+        None => decommission::complete(&ctx)?,
+    };
+    let receipt = decommission::receipt_bytes(&d)?;
+    if let Some(out) = a.get("--receipt-out") {
+        write_out(out, &receipt)?;
+    }
+    println!(
+        "decommissioned: robot {} in workspace {} ({}); the SOC retired its keys at {} ms \
+         (answer signed by {}). The uplink and finding keys are shredded; the black-box key \
+         stays until the unit's data is sanitised (docs/DECOMMISSION.md). Receipt: {}{}",
+        d.robot_id,
+        d.workspace,
+        d.reason,
+        d.decommissioned_at_ms.unwrap_or(0),
+        d.soc_key_id.as_deref().unwrap_or("-"),
+        ctx.path(decommission::STATE_FILE).display(),
+        a.get("--receipt-out")
+            .map(|o| format!(" (copy: {o})"))
+            .unwrap_or_default()
+    );
+    Ok(())
 }
 
 fn report_revocations(r: &revocation::Installed) {
@@ -700,7 +811,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if a.flag("--version") {
-        println!("robodr-enroll {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-enroll", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     match run(&a) {

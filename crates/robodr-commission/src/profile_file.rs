@@ -87,9 +87,14 @@ pub const PROFILE_KEYS: [&str; 9] = [
     "raw_dds_topics",
 ];
 /// Optional top-level keys (`metadata` is written by `lock`;
-/// `participant_identities` and `motion_types` by `learn`, omitted when
-/// empty).
-pub const OPTIONAL_PROFILE_KEYS: [&str; 3] = ["metadata", "participant_identities", "motion_types"];
+/// `participant_identities` and `motion_types` by `learn`, `bound_config`
+/// by `bind`; omitted when empty).
+pub const OPTIONAL_PROFILE_KEYS: [&str; 4] = [
+    "metadata",
+    "participant_identities",
+    "motion_types",
+    "bound_config",
+];
 /// Keys of one `participant_identities` entry; `ips` and `vendor` are
 /// required, the rest optional.
 pub const IDENTITY_KEYS: [&str; 5] = ["ips", "vendor", "enclave", "nodes", "max_instances"];

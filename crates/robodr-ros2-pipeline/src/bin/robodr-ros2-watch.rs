@@ -38,8 +38,26 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Version => {
-            println!("robodr-ros2-watch {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                robodr_buildinfo::version_line("robodr-ros2-watch", env!("CARGO_PKG_VERSION"))
+            );
             return ExitCode::SUCCESS;
+        }
+        Command::CheckConfig { path, strict } => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let ok = robodr_ros2_pipeline::watch::run_check(
+                &path,
+                strict,
+                &mut stdout.lock(),
+                &mut stderr.lock(),
+            );
+            return if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            };
         }
         Command::Run(a) => a,
     };

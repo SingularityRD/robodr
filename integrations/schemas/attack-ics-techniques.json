@@ -1,0 +1,198 @@
+{
+ "source": "https://github.com/mitre-attack/attack-stix-data ics-attack/ics-attack.json",
+ "attack_version": "20.0",
+ "bundle_sha256": "c9ca0ce523a1b5e512060a390415e8aefe8f6d32c5f82d7de81264960c1e1183",
+ "techniques": {
+  "T0800": "Activate Firmware Update Mode",
+  "T0801": "Monitor Process State",
+  "T0802": "Automated Collection",
+  "T0806": "Brute Force I/O",
+  "T0809": "Data Destruction",
+  "T0811": "Data from Information Repositories",
+  "T0813": "Denial of Control",
+  "T0814": "Denial of Service",
+  "T0815": "Denial of View",
+  "T0816": "Device Restart/Shutdown",
+  "T0817": "Drive-by Compromise",
+  "T0819": "Exploit Public-Facing Application",
+  "T0820": "Exploitation for Evasion",
+  "T0821": "Modify Controller Tasking",
+  "T0822": "External Remote Services",
+  "T0823": "Graphical User Interface",
+  "T0826": "Loss of Availability",
+  "T0827": "Loss of Control",
+  "T0828": "Loss of Productivity and Revenue",
+  "T0829": "Loss of View",
+  "T0830": "Adversary-in-the-Middle",
+  "T0831": "Manipulation of Control",
+  "T0832": "Manipulation of View",
+  "T0834": "Native API",
+  "T0835": "Manipulate I/O Image",
+  "T0836": "Modify Parameter",
+  "T0837": "Loss of Protection",
+  "T0838": "Modify Alarm Settings",
+  "T0840": "Network Connection Enumeration",
+  "T0842": "Network Sniffing",
+  "T0843": "Program Download",
+  "T0843.001": "Download All",
+  "T0843.002": "Online Edit",
+  "T0843.003": "Program Append",
+  "T0845": "Program Upload",
+  "T0846": "Remote System Discovery",
+  "T0846.001": "Port Scan",
+  "T0846.002": "Broadcast Discovery",
+  "T0846.003": "Multicast Discovery",
+  "T0847": "Replication Through Removable Media",
+  "T0848": "Rogue Master",
+  "T0849": "Masquerading",
+  "T0851": "Rootkit",
+  "T0852": "Screen Capture",
+  "T0858": "Change Operating Mode",
+  "T0859": "Valid Accounts",
+  "T0860": "Wireless Compromise",
+  "T0861": "Point & Tag Identification",
+  "T0862": "Supply Chain Compromise",
+  "T0863": "User Execution",
+  "T0864": "Transient Cyber Asset",
+  "T0865": "Spearphishing Attachment",
+  "T0866": "Exploitation of Remote Services",
+  "T0867": "Lateral Tool Transfer",
+  "T0868": "Detect Operating Mode",
+  "T0869": "Standard Application Layer Protocol",
+  "T0869.001": "DNS",
+  "T0869.002": "Publish/Subscribe Protocols",
+  "T0871": "Execution through API",
+  "T0872": "Indicator Removal on Host",
+  "T0873": "Project File Infection",
+  "T0873.001": "Siemens Project File Format",
+  "T0874": "Hooking",
+  "T0877": "I/O Image",
+  "T0878": "Alarm Suppression",
+  "T0879": "Damage to Property",
+  "T0880": "Loss of Safety",
+  "T0881": "Service Stop",
+  "T0882": "Theft of Operational Information",
+  "T0883": "Internet Accessible Device",
+  "T0884": "Connection Proxy",
+  "T0885": "Commonly Used Port",
+  "T0886": "Remote Services",
+  "T0887": "Wireless Sniffing",
+  "T0888": "Remote System Information Discovery",
+  "T0889": "Modify Program",
+  "T0890": "Exploitation for Privilege Escalation",
+  "T0892": "Change Credential",
+  "T0893": "Data from Local System",
+  "T0894": "System Binary Proxy Execution",
+  "T0895": "Autorun Image",
+  "T1691": "Block Operational Technology Message",
+  "T1691.001": "Command Message",
+  "T1691.002": "Reporting Message",
+  "T1692": "Unauthorized Message",
+  "T1692.001": "Command Message",
+  "T1692.002": "Reporting Message",
+  "T1693": "Modify Firmware",
+  "T1693.001": "System Firmware",
+  "T1693.002": "Module Firmware",
+  "T1694": "Insecure Credentials",
+  "T1694.001": "Default Credentials",
+  "T1694.002": "Hardcoded Credentials",
+  "T1695": "Block Communications",
+  "T1695.001": "Serial COM",
+  "T1695.002": "Ethernet",
+  "T1695.003": "Wi-Fi",
+  "T1701": "Command and Scripting Interpreter",
+  "T1701.001": "PowerShell",
+  "T1701.002": "Windows Command Shell",
+  "T1701.003": "Unix Shell",
+  "T1701.004": "Visual Basic",
+  "T1701.005": "Python",
+  "T1701.006": "JavaScript"
+ },
+ "revoked": {
+  "T0803": {
+   "name": "Block Command Message",
+   "revoked_by": [
+    [
+     "T1691.001",
+     "Command Message"
+    ]
+   ]
+  },
+  "T0804": {
+   "name": "Block Reporting Message",
+   "revoked_by": [
+    [
+     "T1691.002",
+     "Reporting Message"
+    ]
+   ]
+  },
+  "T0805": {
+   "name": "Block Serial COM",
+   "revoked_by": [
+    [
+     "T1695.001",
+     "Serial COM"
+    ]
+   ]
+  },
+  "T0812": {
+   "name": "Default Credentials",
+   "revoked_by": [
+    [
+     "T1694.001",
+     "Default Credentials"
+    ]
+   ]
+  },
+  "T0839": {
+   "name": "Module Firmware",
+   "revoked_by": [
+    [
+     "T1693.002",
+     "Module Firmware"
+    ]
+   ]
+  },
+  "T0855": {
+   "name": "Unauthorized Command Message",
+   "revoked_by": [
+    [
+     "T1692.001",
+     "Command Message"
+    ]
+   ]
+  },
+  "T0856": {
+   "name": "Spoof Reporting Message",
+   "revoked_by": [
+    [
+     "T1692.002",
+     "Reporting Message"
+    ]
+   ]
+  },
+  "T0857": {
+   "name": "System Firmware",
+   "revoked_by": [
+    [
+     "T1693.001",
+     "System Firmware"
+    ]
+   ]
+  },
+  "T0891": {
+   "name": "Hardcoded Credentials",
+   "revoked_by": [
+    [
+     "T1694.002",
+     "Hardcoded Credentials"
+    ]
+   ]
+  }
+ },
+ "deprecated": {
+  "T0807": "Command-Line Interface",
+  "T0853": "Scripting"
+ }
+}

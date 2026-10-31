@@ -78,7 +78,9 @@
 //! one is configured, else from static configuration; the feed was only
 //! run against synthetic traffic, not a real safety PLC or e-stop. The
 //! rest of the operational context (control mode, mission phase,
-//! connectivity) is still static configuration. The black box uses the
+//! connectivity) is live where a context source is configured
+//! ([`safety_feed::context`]: Unitree remote and sport mode, ROS 2
+//! lifecycle, uplink status), else static configuration. The black box uses the
 //! HMAC placeholder key.
 
 // S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc
@@ -105,6 +107,7 @@
     )
 )]
 
+pub mod commissioned;
 pub mod config;
 pub mod control;
 pub mod daemon;
@@ -116,9 +119,18 @@ pub mod gateway_feed;
 pub mod health;
 pub mod host;
 pub mod input;
+/// How the private keys are protected at rest (T66; `status.json`
+/// `key_protection`).
+pub mod key_protection;
 pub mod notify;
 pub mod profile_chain;
+pub mod retention;
 pub mod safety;
+/// Unitree safety-state sources and the live operational context.
+pub mod safety_feed;
+/// Health record and early warnings (credential expiry, clock, disk,
+/// executor reachability).
+pub mod selfcheck;
 pub mod signal;
 pub mod spool;
 

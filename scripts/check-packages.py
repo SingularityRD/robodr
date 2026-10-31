@@ -18,6 +18,48 @@ Static checks (no package needed; CI job `scripts`):
      try-restart (on upgrade) exactly the same units: every shipped
      service except robodr-firewall-gw-rules.service, which is never
      stopped on purpose (its ruleset keeps a fail-closed bridge closed).
+     The units in GATED (gateway, executor; T9) are never try-restarted
+     on upgrade: the deb postinst / rpm post hand exactly them to
+     mark_pending_restart (install-bundle.sh restarts them through the
+     safety-state gate).
+
+  8. Service identities (review: one uid shared by the exporters and the
+     gateway let each read the others' credentials): no two units run as
+     the same non-root User=; every User= and every tmpfiles.d owner is a
+     sysusers.d user; the units in OWN_USER run as exactly that user (the
+     focal variants too), hide /run/credentials except their own
+     directory, and the deb postinst / rpm post migration
+     (migrate_exporter_users, the same block in both) moves exactly the
+     tmpfiles directories of those users (and the gateway's
+     StateDirectory) from robodr to them; the focal credential helper maps
+     the same units to the same users.
+  9. robodr-firewall-gw-rules.service (regular and focal) renders the
+     ruleset into a file and applies that file: no pipe into a shell, a
+     bounded CapabilityBoundingSet (RULES_CAPS), ProtectSystem=strict,
+     ProtectHome=, PrivateTmp=, NoNewPrivileges=, a SystemCallFilter=.
+
+  10. release.yml: `prepare` and `publish` refuse a tag whose commit is
+     not on main (git merge-base --is-ancestor); every build job has an
+     independent rebuild job (the toolchain from
+     scripts/ci-install-pinned-toolchain.sh, never rustup) that `publish`
+     needs, and `publish` runs scripts/compare-rebuild.py before it writes
+     SHA256SUMS and signs.
+
+  11. Resource caps (sales-readiness T76): every long-running service
+     (regular and focal; Type= other than oneshot) sets MemoryMax=, so a
+     runaway RoboDR daemon hits its own cgroup limit before it can push the
+     OOM killer onto the robot's motion stack; the units in CPU_CAPPED
+     (event-driven detectors that an event storm could make spin) also set
+     CPUQuota=. (The inline gateway is deliberately not CPU-capped: it is a
+     real-time process in the motion path, where throttling is latency.)
+
+  12. The sensor box image recipe (packaging/sensor-box/image, T77): the
+     root partition is read-only (ReadOnly=yes), build-image.sh verifies
+     the bundle's minisign signature before it extracts anything and then
+     its SHA256SUMS, has no unsigned switch, the post-install script checks
+     the package digest and refuses an image with keys, the first-boot
+     script generates the keys with robodr-setup init, and no file of the
+     recipe holds key material.
 
   5a. Every unit (regular and focal) and every unit with each of its
      drop-in examples applied: with SecureBits=noroot / noroot-locked, a
@@ -32,7 +74,9 @@ Package checks (`--deb FILE ... --rpm FILE ...`; CI jobs `package-*`):
      /etc/robodr, no private key material (PEM private keys, minisign
      secret keys) anywhere in the payload; exactly the variant's programs,
      each unit together with its program, and a man page for every
-     shipped program that has one in man/.
+     shipped program that has one in man/; the customer documentation
+     (no drafts), the demo captures and the operator examples
+     (SHIPPED_DOCS).
   6. robodr .deb vs robodr .rpm of the same architecture: the same paths
      with the same modes, and byte-identical content except the programs
      (built in different userlands).
@@ -86,6 +130,11 @@ PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
     "robodr-seal": ("usr/sbin", BOTH),
     "robodr-depot": ("usr/sbin", BOTH),
     "robodr-enroll": ("usr/sbin", BOTH),
+    # Operator tools (crates/robodr-ops): first-boot setup, support bundle,
+    # metrics textfile exporter.
+    "robodr-setup": ("usr/sbin", BOTH),
+    "robodr-support-bundle": ("usr/sbin", BOTH),
+    "robodr-metrics": ("usr/bin", BOTH),
     # Pulsar-bound (glibc, eBPF, needs BTF): not static, not on systemd 245.
     "robodr-pulsard": ("usr/sbin", frozenset({STD})),
     # Base station only: use the robodr package there.
@@ -94,9 +143,11 @@ PROGRAMS: dict[str, tuple[str, frozenset[str]]] = {
 NEVER_PACKAGED = {
     "robodr-safety-replay": "test tool of robodr-deliverd",
     "robodr-release": "SOC / build-side delivery artifact tool",
+    "robodr-signer": "key-ceremony check tool, used next to robodr-release (the PKCS#11 adapter script is packaged)",
 }
 # build-deb.sh requires these whatever ROBODR_DEB_REQUIRE says.
-ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch"}
+ALWAYS_REQUIRED = {"robodr-commission", "robodr-replay", "robodr-ros2-watch",
+                   "robodr-setup", "robodr-support-bundle", "robodr-metrics"}
 
 # program -> units installed with it.
 UNITS = {
@@ -112,6 +163,21 @@ UNITS = {
     "robodr-depot": ["robodr-depot.service"],
 }
 NOT_STOPPED = {"robodr-firewall-gw-rules.service"}
+# Restarted on upgrade only through the safety-state gate (T9): the
+# maintainer scripts mark them pending, never try-restart them.
+GATED = {"robodr-executor.service", "robodr-firewall-gw.service"}
+
+# Units that used to share the robodr user, and their own users now.
+OWN_USER = {
+    "robodr-spool-export.service": "robodr-spool",
+    "robodr-kafka-publish.service": "robodr-kafka",
+    "robodr-uplink.service": "robodr-uplink",
+    "robodr-firewall-gw.service": "robodr-gw",
+}
+# Units that must also cap their CPU time (check 11).
+CPU_CAPPED = {"robodr-pulsard.service"}
+# The only capabilities the firewall ruleset's commands need.
+RULES_CAPS = {"CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SYS_MODULE"}
 
 # robodr-focal vs robodr (same architecture), as path globs.
 STANDARD_ONLY = [
@@ -138,6 +204,21 @@ ALLOWED_ROOTS = ("/usr/", "/etc/robodr")
 NOTICE_FILES = (
     "/usr/share/doc/robodr/THIRD_PARTY_NOTICES",
     "/usr/share/doc/robodr/GPL-2.0-SOURCE-OFFER",
+)
+# Every variant ships the customer documentation, the demo data and the
+# operator examples (sales-readiness T49, T70, T87).
+SHIPPED_DOCS = (
+    "/usr/share/doc/robodr/customer/quick-start.md",
+    "/usr/share/doc/robodr/customer/known-limitations.md",
+    "/usr/share/doc/robodr/customer/support-matrix.md",
+    "/usr/share/doc/robodr/demo/README.md",
+    "/usr/share/doc/robodr/demo/SHA256SUMS",
+    "/usr/share/doc/robodr/demo/fastrtps_baseline.pcap",
+    "/usr/share/doc/robodr/demo/fastrtps_rogue_cmd_vel.pcap",
+    "/usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
+    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.service.example",
+    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.timer.example",
+    "/usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
 )
 SECRET_MARKERS = (
     re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -224,7 +305,9 @@ def workflow_requires(text: str) -> list[tuple[int, str, set[str]]]:
     """(line, variant, programs) for every ROBODR_DEB_REQUIRE in a workflow.
 
     The variant is robodr-focal when the step's run script passes
-    `--variant focal`. A step is the text up to the next "- name:" line.
+    `--variant focal` (build-deb.sh) or runs `scripts/ci-rebuild.sh focal`
+    (release.yml's independent rebuild). A step is the text up to the next
+    "- name:" line.
     """
     lines = text.splitlines()
     out = []
@@ -240,7 +323,7 @@ def workflow_requires(text: str) -> list[tuple[int, str, set[str]]]:
         while end < len(lines) and not re.match(r"\s*- (name|uses):", lines[end]):
             end += 1
         step = "\n".join(lines[start:end])
-        variant = FOCAL if "--variant focal" in step else STD
+        variant = FOCAL if re.search(r"--variant focal|ci-rebuild\.sh focal\b", step) else STD
         out.append((i + 1, variant, set(m.group(1).split())))
     return out
 
@@ -278,7 +361,8 @@ def unit_loops(text: str) -> dict[str, set[str]]:
     for m in FOR_RE.finditer(text):
         units = set(re.findall(r"robodr-[a-z0-9-]+\.service", m.group(1)))
         body = m.group(2)
-        verb = "try-restart" if "try-restart" in body else "stop" if "systemctl stop" in body else "other"
+        verb = ("try-restart" if "try-restart" in body else "stop" if "systemctl stop" in body
+                else "pending" if "mark_pending_restart" in body else "other")
         if units and verb != "other":
             # postinst stops the migration's four units in a loop of its own
             # (guarded by is-active): keep the larger list per verb.
@@ -302,15 +386,26 @@ def check_scripts(root: Path) -> list[str]:
         ("rpm/preun", "stop"),
     ]
     for rel, verb in checks:
-        loops = unit_loops((pk / rel).read_text())
-        got = loops.get(verb)
-        if got is None:
-            errs.append(f"packaging/{rel}: no `for u in ...` loop that runs systemctl {verb}")
-            continue
-        for u in sorted(want - got):
-            errs.append(f"packaging/{rel}: does not {verb} {u}")
-        for u in sorted(got - want):
-            errs.append(f"packaging/{rel}: {verb}s {u}, which is not a shipped, stoppable unit")
+        errs += check_unit_loops(rel, verb, unit_loops((pk / rel).read_text()), want)
+    return errs
+
+
+def check_unit_loops(rel: str, verb: str, loops: dict[str, set[str]], want: set[str]) -> list[str]:
+    errs = []
+    if verb == "try-restart":
+        # T9: the gated units go to mark_pending_restart instead.
+        pend = loops.get("pending")
+        if pend != GATED:
+            errs.append(f"packaging/{rel}: marks {sorted(pend or [])} pending-restart, want exactly {sorted(GATED)}")
+        want = want - GATED
+    got = loops.get(verb)
+    if got is None:
+        return errs + [f"packaging/{rel}: no `for u in ...` loop that runs systemctl {verb}"]
+    for u in sorted(want - got):
+        errs.append(f"packaging/{rel}: does not {verb} {u}")
+    for u in sorted(got - want):
+        errs.append(f"packaging/{rel}: {verb}s {u}, which is not a shipped, stoppable unit"
+                    + (" (a gated unit: only through the safety-state gate)" if u in GATED else ""))
     return errs
 
 
@@ -362,6 +457,251 @@ def check_units_caps(root: Path) -> list[str]:
     return errs
 
 
+def check_unit_resources_text(name: str, text: str) -> list[str]:
+    if (unit_values(text, "Type") or ["simple"])[-1] == "oneshot":
+        return []
+    errs = []
+    if not unit_values(text, "MemoryMax"):
+        errs.append(f"{name}: long-running service without MemoryMax= (a runaway daemon is not capped by its own cgroup)")
+    if Path(name).name in CPU_CAPPED and not unit_values(text, "CPUQuota"):
+        errs.append(f"{name}: without CPUQuota= (an event storm must not take the robot's CPU)")
+    return errs
+
+
+def check_unit_resources(root: Path) -> list[str]:
+    errs = []
+    sysd = root / "packaging" / "systemd"
+    for d in (sysd, sysd / "focal"):
+        for unit in sorted(d.glob("*.service")):
+            errs += check_unit_resources_text(str(unit.relative_to(sysd)), unit.read_text())
+    return errs
+
+
+def check_image_recipe_texts(files: dict[str, bytes]) -> list[str]:
+    """files: path relative to packaging/sensor-box/image -> content."""
+    errs = []
+    t = {k: v.decode("utf-8", "replace") for k, v in files.items()}
+    where = "packaging/sensor-box/image"
+    root = t.get("mkosi.repart/10-root.conf", "")
+    if unit_values(root, "Type") != ["root"] or unit_values(root, "ReadOnly") != ["yes"]:
+        errs.append(f"{where}/mkosi.repart/10-root.conf: the root partition must be Type=root, ReadOnly=yes")
+    code = "\n".join(ln for ln in t.get("build-image.sh", "").splitlines() if not ln.lstrip().startswith("#"))
+    v, x = code.find("minisign -V"), code.find("tar ")
+    if v < 0 or x < 0 or v > x:
+        errs.append(f"{where}/build-image.sh: must verify the minisign signature before extracting the bundle")
+    if x < 0 or "sha256sum -c" not in code[x:]:
+        errs.append(f"{where}/build-image.sh: must check the bundle's SHA256SUMS after extracting it")
+    if re.search(r"unsigned|minisign -V[^\n]*\|\|\s*true", code, re.I):
+        errs.append(f"{where}/build-image.sh: has a way around the signature check")
+    post = t.get("mkosi.postinst.chroot", "")
+    if "sha256sum -c" not in post or "/etc/robodr/keys" not in post:
+        errs.append(f"{where}/mkosi.postinst.chroot: must check the package digest and refuse an image with keys")
+    late = t.get("mkosi.extra/usr/lib/robodr-image/robodr-image-late", "")
+    if 'robodr-setup "$@"' not in late or "set -- init" not in late:
+        errs.append(f"{where}/robodr-image-late: first boot must generate the keys with robodr-setup init")
+    for name, body in sorted(files.items()):
+        if name.endswith((".key", ".pem")):
+            errs.append(f"{where}/{name}: key file in the image recipe")
+        for m in SECRET_MARKERS:
+            if m.search(body):
+                errs.append(f"{where}/{name}: contains private key material")
+    return errs
+
+
+def check_image_recipe(root: Path) -> list[str]:
+    d = root / "packaging" / "sensor-box" / "image"
+    if not d.is_dir():
+        return ["packaging/sensor-box/image: missing"]
+    files = {str(f.relative_to(d)): f.read_bytes() for f in sorted(d.rglob("*")) if f.is_file()}
+    return check_image_recipe_texts(files)
+
+
+def unit_values(text: str, key: str) -> list[str]:
+    """Every value of KEY= in a unit (in order; an empty one resets)."""
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        k, v = (x.strip() for x in line.split("=", 1))
+        if k == key:
+            out = [] if not v else out + [v]
+    return out
+
+
+def sysusers_users(text: str) -> set[str]:
+    return {f[1] for f in (ln.split() for ln in text.splitlines()) if len(f) > 1 and f[0] == "u"}
+
+
+def tmpfiles_owners(text: str) -> dict[str, str]:
+    """path -> user of every `d` line."""
+    out = {}
+    for ln in text.splitlines():
+        f = ln.split()
+        if len(f) >= 4 and f[0] == "d":
+            out[f[1]] = f[3]
+    return out
+
+
+MIGRATE_RE = re.compile(r"# >>> migrate_agentd_tree.*?# <<< migrate_exporter_users\n", re.S)
+
+
+def check_identities_text(units: dict[str, str], focal: dict[str, str], sysusers: str, tmpfiles: str,
+                          postinst: str, rpm_post: str, helper: str) -> list[str]:
+    errs = []
+    users = sysusers_users(sysusers)
+    seen: dict[str, str] = {}
+    for name, text in sorted(units.items()):
+        us = unit_values(text, "User")
+        u = us[-1] if us else ""
+        if u and u != "root":
+            if u not in users:
+                errs.append(f"packaging/systemd/{name}: User={u} is not a sysusers.d user")
+            if u in seen:
+                errs.append(f"packaging/systemd/{name}: User={u} is also {seen[u]}'s user (one uid per service)")
+            seen[u] = name
+    for path, owner in tmpfiles_owners(tmpfiles).items():
+        if owner != "root" and owner not in users:
+            errs.append(f"packaging/tmpfiles.d/robodr.conf: {path} owner {owner} is not a sysusers.d user")
+    for name, want in OWN_USER.items():
+        for label, texts in (("", units), ("focal/", focal)):
+            text = texts.get(name)
+            if text is None:
+                errs.append(f"packaging/systemd/{label}{name}: missing")
+                continue
+            us = unit_values(text, "User")
+            if us != [want]:
+                errs.append(f"packaging/systemd/{label}{name}: User={us} (want {want}, its own user)")
+            if unit_values(text, "TemporaryFileSystem") != ["/run/credentials:ro"]:
+                errs.append(f"packaging/systemd/{label}{name}: no TemporaryFileSystem=/run/credentials:ro "
+                            "(other units' credentials visible)")
+            binds = unit_values(text, "BindReadOnlyPaths")
+            if any(b.lstrip("-") != f"/run/credentials/{name}" for b in binds):
+                errs.append(f"packaging/systemd/{label}{name}: BindReadOnlyPaths={binds} exposes more than its own credentials")
+            if (unit_values(text, "LoadCredential") or "robodr-load-credential load" in text) and not binds:
+                errs.append(f"packaging/systemd/{label}{name}: loads credentials but does not bind /run/credentials/{name}")
+            if label and f"load {name} " in text and f"load {name} {want} " not in text:
+                errs.append(f"packaging/systemd/focal/{name}: robodr-load-credential hands the credential to another user than {want}")
+            if f"{name}) own={want} ;;" not in helper:
+                errs.append(f"packaging/focal/robodr-load-credential: does not map {name} to {want}")
+    owners = tmpfiles_owners(tmpfiles)
+    want_pairs = {f"{p}:{u}" for p, u in owners.items() if u in OWN_USER.values()}
+    gw = units.get("robodr-firewall-gw.service", "")
+    for sd in unit_values(gw, "StateDirectory"):
+        want_pairs.add(f"/var/lib/{sd}:{OWN_USER['robodr-firewall-gw.service']}")
+    m_deb, m_rpm = MIGRATE_RE.search(postinst), MIGRATE_RE.search(rpm_post)
+    if not m_deb:
+        errs.append("packaging/deb/postinst: no migrate_agentd_tree .. migrate_exporter_users block")
+    else:
+        got = set(re.findall(r"(/var/lib/robodr/[a-z0-9/_-]+:robodr-[a-z]+)", m_deb.group(0)))
+        for x in sorted(want_pairs - got):
+            errs.append(f"packaging/deb/postinst: migrate_exporter_users does not move {x}")
+        for x in sorted(got - want_pairs):
+            errs.append(f"packaging/deb/postinst: migrate_exporter_users moves {x}, not a tree of that user")
+        if not m_rpm or m_rpm.group(0) != m_deb.group(0):
+            errs.append("packaging/rpm/post: its migrate block differs from packaging/deb/postinst's")
+    for label, text in (("deb/postinst", postinst), ("rpm/post", rpm_post)):
+        if not re.search(r"^\s*migrate_exporter_users$", text, re.M):
+            errs.append(f"packaging/{label}: never calls migrate_exporter_users")
+    return errs
+
+
+def check_identities(root: Path) -> list[str]:
+    pk = root / "packaging"
+    units = {f.name: f.read_text() for f in (pk / "systemd").glob("*.service")}
+    focal = {f.name: f.read_text() for f in (pk / "systemd" / "focal").glob("*.service")}
+    return check_identities_text(
+        units, focal,
+        (pk / "sysusers.d" / "robodr.conf").read_text(),
+        (pk / "tmpfiles.d" / "robodr.conf").read_text(),
+        (pk / "deb" / "postinst").read_text(),
+        (pk / "rpm" / "post").read_text(),
+        (pk / "focal" / "robodr-load-credential").read_text(),
+    )
+
+
+def check_rules_unit_text(name: str, text: str) -> list[str]:
+    errs = []
+    for k in ("ExecStart", "ExecStartPre"):
+        for v in unit_values(text, k):
+            if re.search(r"\|\s*(/bin/|/usr/bin/)?(ba|da)?sh\b", v):
+                errs.append(f"{name}: {k}= pipes into a shell ({v})")
+    starts = unit_values(text, "ExecStart")
+    if len(starts) != 1 or not re.fullmatch(r"/bin/sh -eu /run/robodr-firewall-gw-rules/\S+", starts[0]):
+        errs.append(f"{name}: ExecStart= must apply the rendered file (/bin/sh -eu /run/robodr-firewall-gw-rules/...), got {starts}")
+    caps = set(" ".join(unit_values(text, "CapabilityBoundingSet")).split())
+    if not caps or caps - RULES_CAPS or any(c.startswith("~") for c in caps):
+        errs.append(f"{name}: CapabilityBoundingSet={sorted(caps)} (allowed at most {sorted(RULES_CAPS)})")
+    for k, v in (("ProtectSystem", "strict"), ("ProtectHome", "yes"), ("PrivateTmp", "yes"), ("NoNewPrivileges", "yes")):
+        if unit_values(text, k)[-1:] != [v]:
+            errs.append(f"{name}: needs {k}={v}")
+    if not any("@system-service" in v for v in unit_values(text, "SystemCallFilter")):
+        errs.append(f"{name}: needs SystemCallFilter=@system-service")
+    return errs
+
+
+def check_rules_unit(root: Path) -> list[str]:
+    sd = root / "packaging" / "systemd"
+    errs = []
+    for f in (sd / "robodr-firewall-gw-rules.service", sd / "focal" / "robodr-firewall-gw-rules.service"):
+        errs += check_rules_unit_text(str(f.relative_to(root)), f.read_text())
+    return errs
+
+
+def job_blocks(text: str) -> dict[str, str]:
+    """Top-level jobs of a workflow: name -> its text (by indentation)."""
+    out, name, buf, on = {}, None, [], False
+    for ln in text.splitlines():
+        if re.match(r"^jobs:\s*$", ln):
+            on = True
+            continue
+        if not on:
+            continue
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", ln)
+        if m:
+            if name:
+                out[name] = "\n".join(buf)
+            name, buf = m.group(1), []
+        elif name:
+            buf.append(ln)
+    if name:
+        out[name] = "\n".join(buf)
+    return out
+
+
+REBUILDS = {"build": "rebuild-deb", "build-rpm": "rebuild-rpm", "build-static": "rebuild-static"}
+
+
+def check_release_workflow_text(text: str) -> list[str]:
+    errs = []
+    jobs = job_blocks(text)
+    for j in ("prepare", "publish"):
+        if "merge-base --is-ancestor" not in jobs.get(j, "") or "origin/main" not in jobs.get(j, ""):
+            errs.append(f"release.yml: job {j} does not check that the tagged commit is on main")
+    pub = jobs.get("publish", "")
+    m = re.search(r"needs:\s*\[([^\]]*)\]", pub)
+    needs = {x.strip() for x in m.group(1).split(",")} if m else set()
+    for build, rebuild in REBUILDS.items():
+        rb = jobs.get(rebuild, "")
+        if not rb:
+            errs.append(f"release.yml: no independent rebuild job {rebuild} for {build}")
+            continue
+        if "ci-install-pinned-toolchain.sh" not in rb or "ci-install-rustup.sh" in rb or "rustup " in rb:
+            errs.append(f"release.yml: {rebuild} must install the toolchain from pinned artifacts, not rustup")
+        if "ci-rebuild.sh" not in rb:
+            errs.append(f"release.yml: {rebuild} does not run scripts/ci-rebuild.sh")
+        if rebuild not in needs:
+            errs.append(f"release.yml: publish does not need {rebuild}")
+    cmp_at, sums_at, sign_at = pub.find("python3 scripts/compare-rebuild.py"), pub.find("> SHA256SUMS"), pub.find("minisign -S")
+    if cmp_at < 0 or not (0 <= cmp_at < sums_at < sign_at):
+        errs.append("release.yml: publish must run scripts/compare-rebuild.py before writing SHA256SUMS and signing")
+    return errs
+
+
+def check_release_workflow(root: Path) -> list[str]:
+    return check_release_workflow_text((root / ".github" / "workflows" / "release.yml").read_text())
+
+
 def static_checks(root: Path) -> list[str]:
     return (
         check_classified(workspace_programs(root))
@@ -369,6 +709,11 @@ def static_checks(root: Path) -> list[str]:
         + check_build_deb(root)
         + check_scripts(root)
         + check_units_caps(root)
+        + check_unit_resources(root)
+        + check_image_recipe(root)
+        + check_identities(root)
+        + check_rules_unit(root)
+        + check_release_workflow(root)
     )
 
 
@@ -529,6 +874,12 @@ def check_package(label: str, variant: str, entries: dict[str, Entry], contents:
     for p in NOTICE_FILES:
         if p not in entries:
             errs.append(f"{label}: lacks {p} (scripts/third_party_notices.py)")
+    for p in SHIPPED_DOCS:
+        if p not in entries:
+            errs.append(f"{label}: lacks {p} (packaging/build-deb.sh)")
+    for p in entries:
+        if p.startswith("/usr/share/doc/robodr/customer/") and p.endswith("-draft.md"):
+            errs.append(f"{label}: ships the draft {p}")
     for prog in sorted(progs):
         for page in sorted((root / "man").glob(f"{prog}.[1-8]")):
             sec = page.suffix[1:]
@@ -653,11 +1004,22 @@ def self_test() -> int:
     expect("workflow lists match", wf_errs(wf.format(std=std, foc=foc)), True)
     expect("focal list lacks seal", wf_errs(wf.format(std=std, foc=foc.replace("robodr-seal", ""))), False)
     expect("focal list names pulsard", wf_errs(wf.format(std=std, foc=foc + " robodr-pulsard")), False)
+    rebuild = wf.format(std=std, foc=foc).replace(
+        "packaging/build-deb.sh --variant focal --bin-dir x --arch amd64", "scripts/ci-rebuild.sh focal amd64 out")
+    expect("rebuild step is focal", [] if [v for _, v, _ in workflow_requires(rebuild)] == [STD, FOCAL] else ["v"], True)
     expect("unclassified program", check_classified(set(PROGRAMS) | {"robodr-new"}), False)
     expect("all classified", check_classified(set(PROGRAMS) | set(NEVER_PACKAGED)), True)
 
     loops = unit_loops("for u in a.service robodr-x.service robodr-y.service; do\n    systemctl try-restart \"$u\" || true\ndone\n")
     expect("loop parse", [] if loops.get("try-restart") == {"robodr-x.service", "robodr-y.service"} else [str(loops)], True)
+    gated_ok = ("for u in robodr-a.service; do\n    systemctl try-restart \"$u\" || true\ndone\n"
+                "for u in robodr-executor.service robodr-firewall-gw.service; do\n    mark_pending_restart \"$u\"\ndone\n")
+    want_t = {"robodr-a.service"} | GATED
+    expect("gated units pending", check_unit_loops("t", "try-restart", unit_loops(gated_ok), want_t), True)
+    expect("gated unit try-restarted", check_unit_loops("t", "try-restart", unit_loops(
+        gated_ok.replace("robodr-a.service;", "robodr-a.service robodr-executor.service;")), want_t), False)
+    expect("gated unit not pending", check_unit_loops("t", "try-restart", unit_loops(
+        gated_ok.replace(" robodr-firewall-gw.service; do\n    mark", "; do\n    mark")), want_t), False)
 
     def ent(kind="f", mode=0o644, owner="root", digest="x"):
         return Entry(kind, mode, owner, "root", digest)
@@ -669,11 +1031,15 @@ def self_test() -> int:
     for page in (ROOT / "man").glob("robodr-*.[1-8]"):
         if page.stem in base or any(k.endswith("/" + page.stem) for k in base):
             base[f"/usr/share/man/man{page.suffix[1:]}/{page.name}.gz"] = ent()
-    for n in NOTICE_FILES:
+    for n in NOTICE_FILES + SHIPPED_DOCS:
         base[n] = ent()
     expect("clean package", check_package("t", STD, base, {}, ROOT), True)
     no_notices = {k: v for k, v in base.items() if not k.endswith("/THIRD_PARTY_NOTICES")}
     expect("notices missing", check_package("t", STD, no_notices, {}, ROOT), False)
+    no_demo = {k: v for k, v in base.items() if not k.endswith("/fastrtps_rogue_cmd_vel.pcap")}
+    expect("demo capture missing", check_package("t", STD, no_demo, {}, ROOT), False)
+    expect("draft shipped", check_package(
+        "t", STD, {**base, "/usr/share/doc/robodr/customer/eula-draft.md": ent()}, {}, ROOT), False)
     expect("setuid", check_package("t", STD, {**base, "/usr/bin/robodr-replay": ent(mode=0o4755)}, {}, ROOT), False)
     expect("not root", check_package("t", STD, {**base, "/usr/share/x": ent(owner="robodr")}, {}, ROOT), False)
     expect("state in payload", check_package("t", STD, {**base, "/var/lib/robodr/x": ent()}, {}, ROOT), False)
@@ -707,7 +1073,72 @@ def self_test() -> int:
     root_only, _ = read_tar(_tar_with("."))
     expect("archive root skipped", [] if not root_only else [str(root_only)], True)
     expect("hidden name keeps its dot", [] if "/.hidden" in hidden else [str(hidden)], True)
-    total = 35
+    # 8. Service identities: the real tree passes; a shared uid, a missing
+    # credentials tmpfs, a migration that misses a tree, a helper that
+    # hands the credential to robodr, and rpm/deb blocks that differ fail.
+    pk = ROOT / "packaging"
+    units = {f.name: f.read_text() for f in (pk / "systemd").glob("*.service")}
+    focal = {f.name: f.read_text() for f in (pk / "systemd" / "focal").glob("*.service")}
+    real = [(pk / x).read_text() for x in ("sysusers.d/robodr.conf", "tmpfiles.d/robodr.conf", "deb/postinst",
+                                           "rpm/post", "focal/robodr-load-credential")]
+    expect("identities ok", check_identities_text(units, focal, *real), True)
+    shared = dict(units)
+    shared["robodr-uplink.service"] = shared["robodr-uplink.service"].replace("User=robodr-uplink", "User=robodr-spool")
+    expect("shared uid", check_identities_text(shared, focal, *real), False)
+    nocred = dict(focal)
+    nocred["robodr-spool-export.service"] = nocred["robodr-spool-export.service"].replace(
+        "TemporaryFileSystem=/run/credentials:ro", "")
+    expect("credentials visible", check_identities_text(units, nocred, *real), False)
+    oldload = dict(focal)
+    oldload["robodr-uplink.service"] = oldload["robodr-uplink.service"].replace(
+        "load robodr-uplink.service robodr-uplink ", "load robodr-uplink.service robodr ")
+    expect("focal credential to robodr", check_identities_text(units, oldload, *real), False)
+    sysu, tmpf, post, rpost, helper = real
+    expect("migration misses a tree", check_identities_text(
+        units, focal, sysu, tmpf, post.replace("/var/lib/robodr/export/uplink:robodr-uplink \\\n", ""), rpost, helper), False)
+    expect("rpm block differs", check_identities_text(
+        units, focal, sysu, tmpf, post, rpost.replace("robodr-kafka", "robodr-kafkaa"), helper), False)
+    expect("unknown tmpfiles owner", check_identities_text(
+        units, focal, sysu, tmpf + "d /var/lib/robodr/x 0750 robodr-nobody robodr -\n", post, rpost, helper), False)
+    # 9. The rules unit.
+    rules = (pk / "systemd" / "robodr-firewall-gw-rules.service").read_text()
+    expect("rules unit ok", check_rules_unit_text("r", rules), True)
+    piped = rules.replace("ExecStart=/bin/sh -eu /run/robodr-firewall-gw-rules/ruleset.sh",
+                          "ExecStart=/bin/sh -c '/usr/sbin/robodr-firewall-gw ruleset --config x | /bin/sh -eu'")
+    expect("rules piped into sh", check_rules_unit_text("r", piped), False)
+    expect("rules full caps", check_rules_unit_text("r", rules.replace(
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE", "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN")), False)
+    expect("rules no ProtectSystem", check_rules_unit_text("r", rules.replace("ProtectSystem=strict", "")), False)
+    # 11. Resource caps: the real units pass; pulsard without its caps fails.
+    expect("unit resources ok", check_unit_resources(ROOT), True)
+    pulsard = (pk / "systemd" / "robodr-pulsard.service").read_text()
+    expect("pulsard without MemoryMax", check_unit_resources_text("p", pulsard.replace("MemoryMax=512M\n", "")), False)
+    expect("pulsard without CPUQuota", check_unit_resources_text(
+        "robodr-pulsard.service", pulsard.replace("CPUQuota=100%\n", "")), False)
+    expect("oneshot needs no cap", check_unit_resources_text("o", "[Service]\nType=oneshot\nExecStart=/bin/true\n"), True)
+    # 12. The sensor box image recipe.
+    img = pk / "sensor-box" / "image"
+    real_img = {str(f.relative_to(img)): f.read_bytes() for f in img.rglob("*") if f.is_file()}
+    expect("image recipe ok", check_image_recipe_texts(real_img), True)
+    rootconf = real_img["mkosi.repart/10-root.conf"].replace(b"ReadOnly=yes", b"")
+    expect("writable root", check_image_recipe_texts({**real_img, "mkosi.repart/10-root.conf": rootconf}), False)
+    bi = real_img["build-image.sh"].decode()
+    moved = bi.replace("minisign -Vq -p", "true -p").replace(
+        "(cd \"$top\" && sha256sum", "minisign -Vq -p \"$pubkey\" -m \"$bundle\"\n(cd \"$top\" && sha256sum")
+    expect("extract before verify", check_image_recipe_texts({**real_img, "build-image.sh": moved.encode()}), False)
+    bypass = bi + "\n[ -n \"${ROBODR_ALLOW_UNSIGNED:-}\" ] && exit 0\n"
+    expect("unsigned switch", check_image_recipe_texts({**real_img, "build-image.sh": bypass.encode()}), False)
+    expect("key in recipe", check_image_recipe_texts({**real_img, "mkosi.extra/etc/robodr/keys/a.key": b"x"}), False)
+    # 10. The release workflow.
+    rel = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    expect("release workflow ok", check_release_workflow_text(rel), True)
+    expect("no main check", check_release_workflow_text(rel.replace("merge-base --is-ancestor", "true")), False)
+    expect("publish without rebuild", check_release_workflow_text(
+        rel.replace(", rebuild-deb, rebuild-rpm, rebuild-static]", "]")), False)
+    expect("rebuild with rustup", check_release_workflow_text(
+        rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
+    expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
+    total = 64
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

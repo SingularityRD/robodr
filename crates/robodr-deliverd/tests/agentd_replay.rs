@@ -69,7 +69,10 @@ fn install_waits_for_the_replayed_safety_state_to_turn_idle() {
     let u = Unit::with_status(
         "replay",
         |v| {
-            v["safety"] = serde_json::json!({"agentd_status": status, "boot_id": boot});
+            // Only these two: the rest of `safety` (the test passwd that
+            // names robodr-agentd as this user) stays as common set it.
+            v["safety"]["agentd_status"] = serde_json::json!(status);
+            v["safety"]["boot_id"] = serde_json::json!(boot);
             // agentd's own health is judged elsewhere (its event input is
             // silent here); this test is about the safety state.
             v["health"]["require_agentd_ok"] = false.into();

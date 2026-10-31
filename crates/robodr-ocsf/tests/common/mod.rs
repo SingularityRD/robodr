@@ -5,6 +5,8 @@ use robodr_events::graph::{Endpoint, Participant};
 use robodr_events::{Deviation, MotionCommand, RobotEvent, Severity};
 use robodr_ocsf::*;
 
+pub mod health;
+
 pub const T0: u64 = 1_790_000_000_000; // 2026-09-21T14:13:20Z
 
 pub fn ctx() -> RobotContext {

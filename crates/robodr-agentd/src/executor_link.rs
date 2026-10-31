@@ -40,7 +40,7 @@ use robodr_agent::executor::{ExecutionRequest, Executor};
 use robodr_executor::client::Client;
 use robodr_executor::decision::codes;
 use robodr_executor::engine::{Outcome, Status as ExStatus};
-use robodr_executor::journal::{Event, EventKind};
+use robodr_executor::journal::{Event, EventKind, JournalHead};
 use robodr_executor::order::{ExcludedAddress, ExcludedLocator, Locator, Order, Origin, Target};
 use robodr_executor::proto::Key;
 use robodr_executor::soc::SocRequest;
@@ -196,6 +196,95 @@ struct Shared {
     events: VecDeque<Event>,
     last_seq: u64,
     stats: LinkStats,
+    /// The executor's journal head as agentd last knew it (from the black
+    /// box at start, then from every `events` answer): sent back as the
+    /// anchor (review of gap 1, findings 1 and 2).
+    head: Option<JournalHead>,
+    /// Journal heads that changed the epoch or went backwards, with the
+    /// alarm they call for (taken by the main loop: recorded, finding).
+    head_alarms: VecDeque<(JournalHead, String)>,
+    /// Whether the executor answers its event poll (sales-readiness T41).
+    reach: Reach,
+}
+
+/// The executor's reachability as the worker's event poll sees it.
+#[derive(Debug, Default, Clone)]
+struct Reach {
+    last_ok: Option<Instant>,
+    failing_since: Option<Instant>,
+    last_error: Option<String>,
+}
+
+/// The executor's reachability at one moment (see
+/// [`ExecutorLink::reach`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LinkReach {
+    /// Milliseconds since the executor last answered (`None`: never yet).
+    pub last_ok_age_ms: Option<u64>,
+    /// Milliseconds it has failed to answer (`None`: it answers, or has
+    /// not been polled yet).
+    pub unreachable_for_ms: Option<u64>,
+    /// The last error, while it fails.
+    pub last_error: Option<String>,
+}
+
+impl Reach {
+    fn ok(&mut self, now: Instant) {
+        self.last_ok = Some(now);
+        self.failing_since = None;
+        self.last_error = None;
+    }
+
+    fn fail(&mut self, now: Instant, e: &str) {
+        self.failing_since.get_or_insert(now);
+        self.last_error = Some(robodr_ros2_pipeline::sanitize(e));
+    }
+
+    fn at(&self, now: Instant) -> LinkReach {
+        let ms = |t: Instant| {
+            u64::try_from(now.saturating_duration_since(t).as_millis()).unwrap_or(u64::MAX)
+        };
+        LinkReach {
+            last_ok_age_ms: self.last_ok.map(ms),
+            unreachable_for_ms: self.failing_since.map(ms),
+            last_error: self.failing_since.and(self.last_error.clone()),
+        }
+    }
+}
+
+/// What an `events` answer's head means against the head agentd knew
+/// (review of gap 1, finding 1). Returns the alarm, if any, and the
+/// `last_seq` to continue from (`None`: unchanged).
+pub fn judge_head(
+    known: Option<&JournalHead>,
+    got: &JournalHead,
+    last_seq: u64,
+) -> (Option<String>, Option<u64>) {
+    let restart = |next_seq: u64| (next_seq.saturating_sub(1) < last_seq).then_some(0);
+    match known {
+        None => (None, restart(got.next_seq)),
+        Some(k) if k.epoch != got.epoch => (
+            Some(format!(
+                "robodr-executor's journal epoch changed ({} to {}, now at event {}): its journal \
+                 was reset or replaced; whatever it held is gone",
+                robodr_ros2_pipeline::sanitize(&k.epoch),
+                robodr_ros2_pipeline::sanitize(&got.epoch),
+                got.next_seq
+            )),
+            restart(got.next_seq),
+        ),
+        Some(k) if got.next_seq < k.next_seq => (
+            Some(format!(
+                "robodr-executor's journal went backwards (event {} after {} in epoch {}): an \
+                 older copy was put back",
+                got.next_seq,
+                k.next_seq,
+                robodr_ros2_pipeline::sanitize(&got.epoch)
+            )),
+            Some(got.next_seq.saturating_sub(1).min(last_seq)),
+        ),
+        Some(_) => (None, None),
+    }
 }
 
 impl Shared {
@@ -282,8 +371,22 @@ fn unreachable_outcome(id: &str, e: &str) -> Outcome {
 impl ExecutorLink {
     /// Start the worker. Nothing is sent until orders are dispatched.
     pub fn start(spec: &ExecutorSpec, safety: SafetyCell) -> Result<Self, String> {
+        Self::start_anchored(spec, safety, None)
+    }
+
+    /// [`ExecutorLink::start`] with the executor journal head agentd's
+    /// black box holds (`anchor`, review of gap 1): sent with every event
+    /// poll, so an older executor journal put back is reset by the executor.
+    pub fn start_anchored(
+        spec: &ExecutorSpec,
+        safety: SafetyCell,
+        anchor: Option<JournalHead>,
+    ) -> Result<Self, String> {
         let (tx, rx) = sync_channel::<Job>(QUEUE);
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared {
+            head: anchor,
+            ..Shared::default()
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let client = Client::new(spec.socket.clone(), spec.key.clone(), spec.timeout);
         let (sh, st, cell) = (shared.clone(), stop.clone(), safety.clone());
@@ -307,7 +410,14 @@ impl ExecutorLink {
                             lock(&sh).put(out);
                         }
                         Ok(Job::Revert(id, reason, soc)) => {
-                            match client.revert_signed(&id, &reason, soc.as_deref()) {
+                            // Lifting a safe_pause needs the safety
+                            // state now (executor review finding 1).
+                            match client.revert_with_safety(
+                                &id,
+                                &reason,
+                                soc.as_deref(),
+                                &mut || cell.get(),
+                            ) {
                                 Ok(out) => lock(&sh).put(out),
                                 Err(e) => {
                                     let mut g = lock(&sh);
@@ -346,10 +456,52 @@ impl ExecutorLink {
                     }
                     // Events (TTL reverts, drift, revert failures) and the
                     // state of watched actions.
-                    let since = lock(&sh).last_seq;
                     // The safety state goes along: actions the executor holds
-                    // after a reboot are re-armed only with a fresh one.
-                    if let Ok(evs) = client.events_with_safety(since, &mut || cell.get()) {
+                    // after a reboot are re-armed only with a fresh one. So
+                    // does the journal head agentd anchored (review of gap 1).
+                    let mut polled = None;
+                    for _ in 0..2 {
+                        let (since, anchor) = {
+                            let g = lock(&sh);
+                            (g.last_seq, g.head.clone())
+                        };
+                        let (evs, head) = match client.events_anchored(
+                            since,
+                            anchor.as_ref(),
+                            &mut || cell.get(),
+                        ) {
+                            Ok(r) => {
+                                lock(&sh).reach.ok(Instant::now());
+                                r
+                            }
+                            Err(e) => {
+                                lock(&sh).reach.fail(Instant::now(), &e);
+                                break;
+                            }
+                        };
+                        let Some(head) = head else {
+                            // An executor that reports no head (older).
+                            polled = Some(evs);
+                            break;
+                        };
+                        let mut g = lock(&sh);
+                        let (alarm, reset) = judge_head(g.head.as_ref(), &head, g.last_seq);
+                        g.head = Some(head.clone());
+                        if let Some(a) = alarm {
+                            g.head_alarms.push_back((head.clone(), a));
+                        }
+                        match reset {
+                            // The sequence restarted: read it again from
+                            // its start (these events were filtered against
+                            // the old one).
+                            Some(s) if s < g.last_seq => g.last_seq = s,
+                            _ => {
+                                polled = Some(evs);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(evs) = polled {
                         let mut changed = Vec::new();
                         {
                             let mut g = lock(&sh);
@@ -483,8 +635,25 @@ impl ExecutorLink {
         lock(&self.shared).events.drain(..).collect()
     }
 
+    /// The executor's journal head as agentd knows it now.
+    pub fn journal_head(&self) -> Option<JournalHead> {
+        lock(&self.shared).head.clone()
+    }
+
+    /// Journal heads that changed the epoch or went backwards, with their
+    /// alarm (review of gap 1).
+    pub fn take_head_alarms(&self) -> Vec<(JournalHead, String)> {
+        lock(&self.shared).head_alarms.drain(..).collect()
+    }
+
     pub fn stats(&self) -> LinkStats {
         lock(&self.shared).stats
+    }
+
+    /// Whether the executor answers (its event poll runs every [`POLL`]):
+    /// `robot.agent.executor_unreachable` and the health record.
+    pub fn reach(&self) -> LinkReach {
+        lock(&self.shared).reach.at(Instant::now())
     }
 
     pub fn shutdown(&mut self) {
@@ -1320,6 +1489,29 @@ mod tests {
                 port: 7412
             }]
         );
+    }
+
+    /// Review of gap 1, finding 1: a new epoch whose sequence restarted
+    /// reads the events again from the start; a sequence that went back
+    /// in the same epoch is an alarm; an older executor (no head) changes
+    /// nothing.
+    #[test]
+    fn journal_heads_are_judged() {
+        let h = |e: &str, n: u64| JournalHead {
+            epoch: e.into(),
+            next_seq: n,
+        };
+        assert_eq!(judge_head(None, &h("a", 40), 39), (None, None));
+        assert_eq!(judge_head(Some(&h("a", 40)), &h("a", 42), 39), (None, None));
+        let (alarm, reset) = judge_head(Some(&h("a", 40)), &h("b", 3), 39);
+        assert!(alarm.unwrap().contains("epoch changed"));
+        assert_eq!(reset, Some(0), "the sequence restarted: read from 0");
+        let (alarm, reset) = judge_head(Some(&h("a", 40)), &h("b", 45), 39);
+        assert!(alarm.is_some());
+        assert_eq!(reset, None, "continued numbering: nothing missed");
+        let (alarm, reset) = judge_head(Some(&h("a", 40)), &h("a", 30), 39);
+        assert!(alarm.unwrap().contains("went backwards"));
+        assert_eq!(reset, Some(29));
     }
 
     #[test]

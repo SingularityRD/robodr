@@ -41,6 +41,10 @@ violated output invariant (documented at the top of its harness file).
 | `pkg_entry` | robodr-pkg | a selector byte + an entry report `report \0 report.sig` (`parse_entry_report` / `verify_entry_report` against the harness site and bundle: canonical, lifetime at most 30 days, sorted lists; a verified report is for that site, bundle and RPK list, signed by an entry key, passing, nothing at or above `fail_on`), a pack-stream listing line (`wire::parse_listing`: media-pack paths only, sorted, size cap), a request head or a response head (`wire::parse_request` / `parse_response`) | `crates/robodr-pkg/tests/fuzz_smoke.rs` |
 | `seal_attest` | robodr-seal | a selector byte + a `TPM2B_PUBLIC`, a `TPMS_ATTEST`, an enrolment request (verified against the harness authority and nonce), a site lease (against the harness lease key) or a signed unit report (against the harness identity key): names a pure function of the bytes, P-256 points on the curve, the TPM-generated magic, no request verifies for another nonce, an expired lease is `LeaseExpired` | `crates/robodr-seal/tests/fuzz_smoke.rs` |
 | `deliverd_inputs` | robodr-deliverd | a selector byte + bytes to agentd's `status.json` as the safety-state gate reads it (`safety::judge`: installs allowed only for a fresh, this-boot, live-feed `idle` / `safe_state_active`), the passwd lookup of probe users, recorded safety reports and their replay schedule, and the structural check of delivered Pulsar rule files | same |
+| `uplink_http` | robodr-export | a selector + body to what `robodr-uplink` parses: `read_response` (whole and through a 1-byte reader, optionally behind interim `100` heads), `Endpoint::parse` (re-parse of the display is the identity; plain `http://` only to a loopback IP literal), `parse_pin`, `parse_retry_after` / `retry_delay` (never sooner than the honoured `Retry-After`) | `crates/robodr-export/tests/fuzz_smoke_uplink.rs` |
+| `kafka_sasl` | robodr-export | a selector + body to SASL/SCRAM: base64 round trips, `ScramClient::client_final` on a server-first message (nonce extension, salt, iteration bounds; PBKDF2 above 8 192 rounds skipped as slow), `verify_final` after the RFC 7677 exchange (only the exchange's signature verifies), SaslHandshake / SaslAuthenticate responses (decode-encode-decode identity) | `crates/robodr-export/tests/fuzz_smoke_sasl.rs` |
+| `executor_proto` | robodr-executor | a selector + body to the agentd-executor protocol: `proto::open` on an envelope line (request / reply, `NonceCache` replay), a `Msg` sealed and opened (same message; `BadMac` under another key, `Stale` outside the window, `WrongReply`), `read_line` (read sizes do not matter), `Key::parse` | `crates/robodr-executor/tests/fuzz_smoke.rs` |
+| `executor_soc` | robodr-executor | a selector + an `Order` or `SocRequest` (JSON), re-signed with the harness SOC key or as is, to `soc::verify` / `verify_revert` with a fresh replay store: an accepted approval is the harness key's deterministic signature over exactly those fields for this robot, accepted once, never for another robot or action; planner orders never carry an approval | same |
 
 `kafka_wire` got its std-only smoke test after the fact (it was added while
 `crates/robodr-export` was being changed by parallel work); it also checks
@@ -179,6 +183,32 @@ timeout or invariant violation:**
 |---|---:|---:|
 | `deliverd_state` | 3 126 173 | 3 146 |
 | `deliverd_inputs` | 2 316 321 | 5 333 |
+
+### New targets (WP9a, 2026-10-31)
+
+`uplink_http`, `kafka_sasl`, `executor_proto` and `executor_soc` (the
+parsers the sales-readiness review found without a harness). Their debug
+smoke runs (20 000 inputs or 8 s, plus three 25 s runs with other PRNG
+seeds for the executor targets and a 30 s run of the two export targets)
+pass. Writing `uplink_http` found that a bare CR in the response head was
+accepted (`Retry-After:\r\r\n` gave the value `"\r"`): the head reader now
+refuses a bare CR or NUL (`uplink::http`, regression test
+`bare_cr_and_nul_in_the_head_are_refused`). Under libFuzzer they run in
+CI's 60 s smoke and in the nightly campaign (`.github/workflows/nightly.yml`).
+First libFuzzer runs (`nightly-2026-09-01`, `cargo-fuzz` 0.13.1,
+AddressSanitizer + debug assertions, `-max_total_time=45`, seeded from a copy
+of `fuzz/corpus/<target>/`, one at a time on a shared 4-core sandbox). **No
+crash, leak, timeout or invariant violation:**
+
+| target | runs | exec/s | coverage (edges) | corpus at end |
+|---|---:|---:|---:|---:|
+| `uplink_http` | 1 255 647 | 27 296 | 1 418 | 824 |
+| `kafka_sasl` | 125 527 | 2 728 | 1 095 | 394 |
+| `executor_proto` | 1 584 765 | 34 451 | 3 165 | 2 004 |
+| `executor_soc` | 1 035 531 | 22 511 | 4 887 | 2 105 |
+
+`kafka_sasl` is slow by design (each accepted server-first message costs
+4 096 to 8 192 PBKDF2 rounds).
 
 ### Smoke runs
 

@@ -68,7 +68,10 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-V" | "--version" => {
-                println!("robodr-agentd {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "{}",
+                    robodr_buildinfo::version_line("robodr-agentd", env!("CARGO_PKG_VERSION"))
+                );
                 return ExitCode::SUCCESS;
             }
             "--check-config" => check = true,
@@ -111,6 +114,18 @@ fn main() -> ExitCode {
             eprintln!(
                 "robodr-agentd: warning: {}",
                 robodr_ros2_pipeline::sanitize(w)
+            );
+        }
+        for k in &resolved.key_protection.keys {
+            eprintln!(
+                "robodr-agentd: key {}: {}{}",
+                k.role,
+                k.protection,
+                if k.fallback {
+                    " (not TPM-sealed: file fallback, flagged in status.json)"
+                } else {
+                    ""
+                }
             );
         }
         eprintln!("robodr-agentd: configuration OK");

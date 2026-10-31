@@ -184,6 +184,63 @@ pub fn value(robot: &str, i: u64, n: u64) -> String {
     to_json(&env).expect("finding serialises")
 }
 
+/// A `robot.agent.health` record of `robot` (findings contract 2.5):
+/// record `seq`, one period (60 s) after the previous one. Every record is
+/// an emission of the same finding.
+pub fn health_value(robot: &str, seq: u64) -> String {
+    let dev = Deviation::new(AGENT_HEALTH_RULE, Severity::Low, "health record")
+        .with_mode(robodr_events::Mode::Observe);
+    let c = ctx(robot);
+    let record = AgentHealth {
+        state: HealthLabel::Ok,
+        reasons: vec![],
+        interval_ms: 60_000,
+        uptime_ms: seq * 60_000,
+        seq,
+        versions: vec![ComponentVersion {
+            component: "robodr-agentd".into(),
+            version: "0.1.0-alpha.1".into(),
+        }],
+        inputs: vec![InputFreshness {
+            name: "capture:eth0".into(),
+            last_rx_age_ms: Some(40),
+            received: 1000 * seq,
+            dropped: 0,
+            malformed: 0,
+            ended: false,
+        }],
+        counters: HealthCounters::default(),
+        blackbox: BlackBoxHealth {
+            degraded: false,
+            anchored: true,
+            anchor_failures: 0,
+        },
+        reachability: vec![Reachability {
+            component: "executor".into(),
+            state: ReachState::NotConfigured,
+            last_ok_age_ms: None,
+        }],
+        credentials: vec![],
+        clock: ClockHealth {
+            synchronized: Some(true),
+            max_error_ms: Some(3),
+            wall_jumps: 0,
+        },
+        disks: vec![DiskHealth {
+            name: "spool".into(),
+            free_bytes: 900,
+            total_bytes: 1000,
+        }],
+    };
+    let env = FindingBuilder::from_deviation(&dev, &c)
+        .agent_health(record)
+        .seen(T0, T0 + (seq - 1) * 60_000)
+        .occurrences(seq)
+        .build()
+        .expect("health finding builds");
+    to_json(&env).expect("health finding serialises")
+}
+
 fn signed(v: &str, k: &VKey) -> FindingSignature {
     sign_value(v, &k.signing()).unwrap()
 }
@@ -800,6 +857,24 @@ pub fn cases() -> Vec<Case> {
     }
 
     cases.extend(cases_2026_10_26_review(&f1));
+
+    // 27: the agent health record (findings contract 2.5): two signed
+    // periods of one robot are one finding, created then updated.
+    let h1 = health_value(ROBOT_1, 1);
+    let h2 = health_value(ROBOT_1, 2);
+    cases.push(simple(
+        27,
+        "27-agent-health",
+        "findings contract 2.5: two signed robot.agent.health records of one robot (one \
+         finding: created, then updated)",
+        up,
+        [
+            line(&h1, Some(&signed(&h1, &f1))),
+            line(&h2, Some(&signed(&h2, &f1))),
+        ]
+        .concat(),
+        |id| ok(id, 1, 1, 0, &[]),
+    ));
     cases
 }
 

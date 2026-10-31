@@ -62,6 +62,9 @@ pub mod kinds {
     pub const ERASE_DEFERRED: &str = "robodr.seal.erase_deferred";
     /// Sprint 14b: the erase is about to run (written before it).
     pub const ERASE_INTENT: &str = "robodr.seal.erase_intent";
+    /// A deferred erase lockdown ran (services stopped, runtime volume
+    /// unmounted and closed or suspended) after the keys were destroyed.
+    pub const ERASE_LOCKDOWN: &str = "robodr.seal.erase_lockdown";
     /// Sprint 14b: a site lease was installed.
     pub const LEASE_INSTALLED: &str = "robodr.seal.lease_installed";
     /// Sprint 14b: a sealed item waits for a site lease.

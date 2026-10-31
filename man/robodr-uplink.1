@@ -55,7 +55,7 @@ robodr\-uplink \- send RoboDR findings to the SOC ingest API over TLS
 .IR TOPIC ]
 .RB [ \-\-interval\-ms
 .IR N ]
-.RB [ \-\-once ]
+.RB [ \-\-once " | " \-\-check ]
 .br
 .B robodr\-uplink reinject
 .B \-\-state\-dir
@@ -127,7 +127,10 @@ to the spool's
 .BR rejected/ ).
 A record that fails the local validation is dead\-lettered with code
 .B local
-and never sent. Network errors,
+and never sent; so is a spool file that cannot be read (I/O error such as
+EACCES or EIO, 3 attempts), with the error as its reason (moved to
+.BR rejected/ ,
+kept for a re\-drive) instead of failing every run. Network errors,
 .BR 408 ,
 .B 429
 and
@@ -328,6 +331,27 @@ Loop interval, > 0 (default 2000).
 .B \-\-once
 One pass, then exit.
 .TP
+.B \-\-check
+Site acceptance, without sending a finding: TLS with the CA bundle, pins and
+CRLs; the ingest endpoint (a request with valid headers and an empty body,
+which the ingest API refuses with
+.B 400 empty_batch
+before authentication and before anything is stored); and, for a
+.B \-\-spool
+(uplink) key, its registration through a read\-only, authenticated fleet
+request
+.RB ( "GET .../robot\-edr/v2/fleet/ring" :
+.B 200
+or
+.B 404 no_ring
+pass,
+.B 401
+names the reason). A relay key
+.RB ( \-\-diode\-out )
+and a SOC without the fleet API skip the key step, said so on the output.
+Takes no lock and writes nothing, so it runs next to the service. Exit 0
+passed, 1 failed.
+.TP
 .B \-\-version
 Print the version and exit.
 .TP
@@ -451,8 +475,9 @@ or
 .BR diode_batches ,
 .BR reinject_generations ),
 .BR next_attempt_at_ms ,
-.B dead_letter_malformed
-and the delivery totals. Times are ms since the epoch.
+.BR dead_letter_malformed ,
+.B quarantined_unreadable
+(spool files this process could not read, see below) and the delivery totals. Times are ms since the epoch.
 .TP
 .IB DIR /uplink.lock
 The state directory's lock (never removed; harmless when stale: the kernel

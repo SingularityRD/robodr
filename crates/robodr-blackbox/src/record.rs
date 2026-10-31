@@ -452,6 +452,112 @@ pub fn scan_frames(bytes: &[u8]) -> SegmentScan {
     scan
 }
 
+/// One step of a [`FrameReader`].
+#[derive(Debug)]
+pub enum FrameRead {
+    /// A complete, decodable frame (hash and signature are *not* checked).
+    Record(ScannedRecord),
+    /// The bytes at this offset are not a complete, decodable frame (bad
+    /// magic, oversized or short body, undecodable body, a torn tail). The
+    /// reader stops here: a caller that needs the resynchronising
+    /// classification of [`scan_frames`] reads the whole segment instead.
+    Irregular { offset: u64 },
+    /// Clean end of input on a frame boundary.
+    End,
+}
+
+/// Streaming counterpart of [`scan_frames`] for the regular case: reads one
+/// frame at a time from `r` into a reused buffer, so walking a segment costs
+/// one frame of memory instead of the segment plus a copy of every record
+/// (review O2: indexing the black box used to double a reader's RSS).
+pub struct FrameReader<R> {
+    r: R,
+    offset: u64,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+impl<R: std::io::Read> FrameReader<R> {
+    pub fn new(r: R) -> Self {
+        Self {
+            r,
+            offset: 0,
+            buf: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Offset of the next frame.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Fill `n` bytes; `Ok(read)` < `n` only at end of input.
+    fn fill(&mut self, n: usize) -> std::io::Result<usize> {
+        self.buf.clear();
+        self.buf.resize(n, 0);
+        let mut got = 0;
+        while got < n {
+            let Some(dst) = self.buf.get_mut(got..) else {
+                break;
+            };
+            match self.r.read(dst) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.buf.truncate(got);
+        Ok(got)
+    }
+
+    /// The next frame. After `Irregular` or `End` it keeps returning
+    /// `End`.
+    pub fn next_frame(&mut self) -> std::io::Result<FrameRead> {
+        if self.done {
+            return Ok(FrameRead::End);
+        }
+        let at = self.offset;
+        let irregular = |s: &mut Self| {
+            s.done = true;
+            Ok(FrameRead::Irregular { offset: at })
+        };
+        let got = self.fill(FRAME_HEADER_LEN)?;
+        if got == 0 {
+            self.done = true;
+            return Ok(FrameRead::End);
+        }
+        let header: [u8; FRAME_HEADER_LEN] = match self.buf.as_slice().try_into() {
+            Ok(h) => h,
+            Err(_) => return irregular(self),
+        };
+        let [m0, m1, m2, m3, l0, l1, l2, l3] = header;
+        if [m0, m1, m2, m3] != FRAME_MAGIC {
+            return irregular(self);
+        }
+        let len = u32::from_be_bytes([l0, l1, l2, l3]) as usize;
+        if len > MAX_FRAME_BODY {
+            return irregular(self);
+        }
+        if self.fill(len)? != len {
+            return irregular(self);
+        }
+        match Record::decode_body(&self.buf) {
+            Ok(record) => {
+                let frame_len = (FRAME_HEADER_LEN + len) as u64;
+                self.offset += frame_len;
+                Ok(FrameRead::Record(ScannedRecord {
+                    offset: at,
+                    frame_len,
+                    record,
+                }))
+            }
+            Err(_) => irregular(self),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chain identity and control payloads
 // ---------------------------------------------------------------------------
@@ -509,6 +615,11 @@ pub struct SegmentStartPayload {
     /// rotation record was dropped. Omitted when equal to the chain key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<KeyRef>,
+    /// [`key_fingerprint`](crate::sign::key_fingerprint) of `signing_key`'s
+    /// public key (payload v2; absent in older logs and for keys without a
+    /// public half). A verifier that knows the key checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_fingerprint: Option<String>,
 }
 
 /// A signing key by id and algorithm.
@@ -662,12 +773,21 @@ pub struct TruncationPayload {
     pub severity: Severity,
 }
 
-/// Payload of [`RecordKind::KeyRotation`] (signed by the old key).
+/// Payload of [`RecordKind::KeyRotation`] (signed by the old key, which
+/// must be `from`).
+///
+/// Version 1 named the new key by id and algorithm only; version 2 adds
+/// `to_fingerprint`, the SHA-256 of the new key's public key
+/// ([`crate::sign::key_fingerprint`]), so the rotation commits to one key,
+/// not to whatever key later carries that id. Absent: a v1 record (still
+/// accepted) or a target without a public half (HMAC).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRotationPayload {
     pub from: KeyRef,
     pub to: KeyRef,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_fingerprint: Option<String>,
 }
 
 /// Why a segment was deleted.
@@ -894,6 +1014,49 @@ mod tests {
         let s = scan_frames(&m);
         assert_eq!(s.items.len(), 2);
         assert!(matches!(s.items[0], ScanItem::Malformed { .. }));
+    }
+
+    #[test]
+    fn frame_reader_matches_scan_and_stops_at_irregular_bytes() {
+        let mut bytes = Vec::new();
+        for i in 0..5 {
+            bytes.extend_from_slice(&sample(i, &vec![b'x'; 100 * i as usize]).encode_frame());
+        }
+        let collect = |b: &[u8]| {
+            let mut fr = FrameReader::new(b);
+            let mut out = Vec::new();
+            loop {
+                match fr.next_frame().unwrap() {
+                    FrameRead::Record(r) => out.push((r.offset, r.frame_len, r.record)),
+                    FrameRead::Irregular { offset } => return (out, Some(offset)),
+                    FrameRead::End => return (out, None),
+                }
+            }
+        };
+        let (got, end) = collect(&bytes);
+        assert_eq!(end, None);
+        let want: Vec<_> = scan_frames(&bytes)
+            .items
+            .into_iter()
+            .filter_map(|i| match i {
+                ScanItem::Record(r) => Some((r.offset, r.frame_len, r.record)),
+                ScanItem::Malformed { .. } => None,
+            })
+            .collect();
+        assert_eq!(got, want);
+        // A torn tail, garbage and zeros all stop the reader at their offset.
+        let len = bytes.len() as u64;
+        for tail in [&b"RBF1\0\0"[..], b"junkjunkjunk", &[0u8; 16]] {
+            let mut b = bytes.clone();
+            b.extend_from_slice(tail);
+            let (got, end) = collect(&b);
+            assert_eq!(got.len(), 5);
+            assert_eq!(end, Some(len));
+        }
+        // An oversized length field does not allocate the claimed body.
+        let mut b = b"RBF1".to_vec();
+        b.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(collect(&b), (vec![], Some(0)));
     }
 
     #[test]

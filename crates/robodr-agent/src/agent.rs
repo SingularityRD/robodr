@@ -267,6 +267,12 @@ impl Signer for SharedSigner {
             .unwrap_or_else(PoisonError::into_inner)
             .verify_own(message, signature)
     }
+    fn public_fingerprint(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .public_fingerprint()
+    }
 }
 
 /// A verifier for the recorder's own key, shared between every recorder the
@@ -284,6 +290,9 @@ impl Verifier for SharedVerifier {
     }
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
         self.0.verify(message, signature)
+    }
+    fn key_fingerprint(&self, key_id: &str) -> Option<String> {
+        self.0.key_fingerprint(key_id)
     }
 }
 
@@ -444,6 +453,9 @@ pub struct Agent {
     seen: BTreeMap<String, (u64, u64)>,
     faults: VecDeque<AgentFault>,
     stats: AgentStats,
+    /// The health record for the finding being built (only between
+    /// [`Agent::report_health`] and its `build_finding`).
+    pending_health: Option<robodr_ocsf::AgentHealth>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -633,6 +645,7 @@ impl Agent {
             seen: BTreeMap::new(),
             faults: VecDeque::new(),
             stats: AgentStats::default(),
+            pending_health: None,
         })
     }
 
@@ -726,6 +739,28 @@ impl Agent {
         }
     }
 
+    /// Replace the live part of the operational context (control mode,
+    /// mission phase, connectivity) that every later plan is made with, as
+    /// read from live sources by the caller (`robodr-agentd`'s context
+    /// feed). The platform, morphology, operator presence and profile lock
+    /// stay as configured.
+    pub fn set_operational(
+        &mut self,
+        control: robodr_responder::ControlMode,
+        phase: robodr_responder::MissionPhase,
+        connectivity: robodr_responder::Connectivity,
+    ) {
+        self.context.control = control;
+        self.context.phase = phase;
+        self.context.connectivity = connectivity;
+    }
+
+    /// The operational context plans are made with (before the per-plan
+    /// observe-mode downgrade).
+    pub fn context(&self) -> OperationalContext {
+        self.context
+    }
+
     pub fn stats(&self) -> AgentStats {
         self.stats
     }
@@ -762,6 +797,17 @@ impl Agent {
             return Ok(false);
         }
         rec.mark_head().map(|()| true).map_err(|e| e.to_string())
+    }
+
+    /// Where the black box's retention stands (T15): unexported segments
+    /// against capacity, unexported drops. Re-reads the export cursor /
+    /// ack first (`Recorder::refresh_export_state`), so an exporter in
+    /// another process (`robodr-blackbox export-pending`) counts. `None`
+    /// while the black box is unavailable.
+    pub fn blackbox_retention(&mut self) -> Option<robodr_blackbox::RetentionStatus> {
+        let rec = self.recorder.as_mut()?;
+        rec.refresh_export_state();
+        Some(rec.retention_status())
     }
 
     /// Closed black-box segments the current recorder found damaged and
@@ -1042,6 +1088,31 @@ impl Agent {
             EvidenceLinks::default(),
             None,
         )
+    }
+
+    /// Report the daemon's periodic health record: a
+    /// [`robodr_ocsf::AGENT_HEALTH_RULE`] deviation handled exactly like
+    /// [`Agent::handle_external`] with [`Detector::SelfHealth`]
+    /// (observe-only, recorded, a validated and signed finding), whose
+    /// finding carries `health` as `entity_context.agent_health` (findings
+    /// contract 2.5). `dev` must have that rule id; for any other the
+    /// record is dropped and the finding is built without it.
+    pub fn report_health(
+        &mut self,
+        now: Timestamp,
+        source: &str,
+        subject: Subject,
+        dev: Deviation,
+        health: robodr_ocsf::AgentHealth,
+        safety: SafetyState,
+    ) -> Outcome {
+        if dev.rule_str() == robodr_ocsf::AGENT_HEALTH_RULE {
+            self.pending_health = Some(health);
+        }
+        let o = self.handle_external(now, Detector::SelfHealth, source, subject, dev, safety);
+        // Never carried over to another finding.
+        self.pending_health = None;
+        o
     }
 
     /// Record a deviation in the black box only, exactly as
@@ -1405,6 +1476,9 @@ impl Agent {
         let mut b = FindingBuilder::from_deviation(dev, &self.ocsf)
             .safety_state(ocsf_safety(safety))
             .attestation(self.attestation);
+        if let Some(h) = self.pending_health.take() {
+            b = b.agent_health(h);
+        }
         let event = match subject {
             FindingSubject::Event(ev) => {
                 b = b.event(ev);

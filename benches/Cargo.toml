@@ -1,0 +1,34 @@
+[package]
+name = "robodr-benches"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Not published (crates.io disallows path deps); also lets cargo-deny
+# accept version-less path dependencies (deny.toml, allow-wildcard-paths).
+publish = false
+repository.workspace = true
+description = "Throughput benchmarks for sizing a RoboDR sensor box: robodr-agentd end to end (synthetic ROS 2 graphs, 1 kHz motion) and the robodr-correlate engine, with a regression gate against a recorded baseline."
+
+# std harness (no criterion): each workload runs in its own child process so
+# its peak RSS is its own; results are JSON.
+[dependencies]
+robodr-agentd = { workspace = true }
+robodr-blackbox = { workspace = true }
+robodr-capture = { workspace = true }
+robodr-commission = { workspace = true }
+robodr-correlate = { workspace = true }
+robodr-events = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "robodr-bench"
+path = "src/bin/robodr-bench.rs"
+
+[[bench]]
+name = "agentd_throughput"
+harness = false
+
+[[bench]]
+name = "correlate_throughput"
+harness = false

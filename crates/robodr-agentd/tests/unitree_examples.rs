@@ -633,3 +633,84 @@ fn a2_inferred_low_level_layout_is_checked() {
             .unwrap_or_else(|e| panic!("{m:?}: {e}"));
     }
 }
+
+/// The shipped live safety-state and context sources (T17 / T46): the Go2
+/// daemon example reads sport mode, low state and the remote; the G1 EDU
+/// example the hg low state and the remote. (No uplink status: the shipped
+/// units do not let agentd read it yet, see the agentd README.)
+/// Both load without a safety-feed warning (every topic is a writer topic
+/// of the model's profile, writers are the profile's participant).
+#[test]
+fn unitree_examples_ship_live_safety_and_context_sources() {
+    use robodr_agentd::safety::Decoder;
+    let r = Root::new(
+        "unitree-go2-feed",
+        UnitreeModel::Go2,
+        "unitree-go2",
+        "unitree-go2-001",
+        "response-policy.unitree-go2.example.json",
+    );
+    std::fs::write(
+        r.dir.join("etc/firewall.json"),
+        example("firewall.unitree-go2.example.json"),
+    )
+    .unwrap();
+    let cfg = r.example("agentd.unitree-go2.example.json");
+    let res = r.load(&cfg).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(res.robot_model, Some(UnitreeModel::Go2));
+    assert!(
+        !res.warnings.iter().any(|w| w.contains("safety_feed")),
+        "{:?}",
+        res.warnings
+    );
+    let feed = res.safety_feed.as_ref().expect("safety_feed");
+    assert!(feed.has_context());
+    assert!(feed.uplink.is_none());
+    let kinds: Vec<&str> = feed
+        .topics
+        .iter()
+        .map(|t| match &t.decoder {
+            Decoder::UnitreeSport(_) => "sport",
+            Decoder::UnitreeLow(..) => "low",
+            Decoder::Wireless(_) => "remote",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["sport", "low", "remote"]);
+    assert!(feed.topics.iter().all(|t| t.writers.contains(P)));
+    // A sport mode code the robot really sends must be listed, or it reads
+    // unknown: every documented Go2 code is.
+    let Decoder::UnitreeSport(s) = &feed.topics[0].decoder else {
+        unreachable!()
+    };
+    for code in [0u8, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13] {
+        assert!(s.modes.contains_key(&code), "{code}");
+    }
+
+    let r = Root::new(
+        "unitree-edu-feed",
+        UnitreeModel::G1,
+        "unitree-g1",
+        "unitree-g1-001",
+        "response-policy.unitree-g1.example.json",
+    );
+    std::fs::write(
+        r.dir.join("etc/firewall.json"),
+        example("firewall.unitree-g1.example.json"),
+    )
+    .unwrap();
+    let res = r
+        .load(&r.example("agentd.unitree-edu.example.json"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !res.warnings.iter().any(|w| w.contains("safety_feed")),
+        "{:?}",
+        res.warnings
+    );
+    let feed = res.safety_feed.as_ref().expect("safety_feed");
+    assert!(matches!(
+        feed.topics[0].decoder,
+        Decoder::UnitreeLow(robodr_cdr::unitree::UnitreeKind::HgLowState, _)
+    ));
+    assert!(feed.has_context());
+}

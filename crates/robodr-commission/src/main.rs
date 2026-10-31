@@ -31,7 +31,9 @@
 //! detached Ed25519 signature `<out>.sig` over the exact sealed bytes, as a
 //! unit with the profile. `verify-profile` runs the same trust check the
 //! loaders run (see `robodr_commission::trust`). Signing keys are read only
-//! from mode-0600 key files, never from the command line.
+//! from mode-0600 key files, never from the command line, or stay in a
+//! token / HSM behind a `robodr-signer/v1` signer file (every `--sign-key`
+//! goes through `robodr_signer::load`; SALES-READINESS T36).
 
 // S10: this crate has no `unsafe` code and must stay that way.
 #![forbid(unsafe_code)]
@@ -49,7 +51,7 @@ use robodr_commission::signoff::{
 };
 use robodr_commission::trust::{
     attestation_for, evaluate_profile_trust, file_digest, key_fingerprint, load_revocation_list,
-    load_signing_key, load_state, load_trust_keys, load_trust_roots, new_signing_key, sig_path_for,
+    load_state, load_trust_keys, load_trust_roots, new_signing_key, sig_path_for,
     trust_file_text_with, trust_keys_text, trust_roots_text, validate_rollback_flag,
     verify_attestation, verify_profile_file, verifying_keys_from_public_files, ProfileSignature,
     RevocationList, RevocationPolicy, SigKind, TrustFileOptions, TrustInputs, TrustPolicy,
@@ -63,6 +65,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+
+mod wp6;
 
 const USAGE: &str = "\
 robodr-commission: learn, review, lock and verify a RoboDR model profile
@@ -123,6 +127,16 @@ USAGE:
   robodr-commission diff    <old.json> <new.json> [--json]
   robodr-commission check   --profile locked.json (--events <f> | --pcap <f>) [...] [--json]
                           [--unitree-legacy] [--unitree-legacy-port N]...
+  robodr-commission bind    --in draft.json --out bound.json [--signoff draft.signoff.json]
+                          [--response-policy policy.json] [--motion-firewall firewall.json]
+                          [--joint-firewall joint.json] [--executor-config executor.json]
+                          [--force]
+  robodr-commission firewall-draft --in draft.json --report report.json --out firewall.json
+                          --max-angular RAD_PER_S [--ceiling-linear M_PER_S]
+                          [--morphology wheeled|quadruped|humanoid|arm|other] [--force]
+  robodr-commission report-html --report report.json --out report.html
+                          [--signoff signoff.json] [--note TEXT] [--force]
+  robodr-commission poc-init --dir DIR [--operator NAME]
   robodr-commission merge   --out merged.json <a.json> <b.json> [...]
                           [--hard-cap-linear 10] [--hard-cap-joint 10] [--force]
                           [--hard-cap-torque 400] [--hard-cap-kp 1000]
@@ -189,7 +203,11 @@ USAGE:
   that attestation unless --allow-unattested (--operators: verify it). keygen makes an Ed25519 key file (mode 0600), its
   public key file <out>.pub and a trust file holding the public key. Key
   files are robodr-blackbox's (robodr-blackbox-key/v2): a key from
-  `robodr-blackbox keygen` signs profiles too. trust-keys builds a trust
+  `robodr-blackbox keygen` signs profiles too. Every --sign-key also takes
+  a robodr-signer/v1 signer file instead: the key stays in a PKCS#11
+  token or HSM and an external signer command (the shipped
+  /usr/lib/robodr/robodr-signer-pkcs11) signs; every signature is checked
+  against the public key pinned in that file (crates/robodr-signer). trust-keys builds a trust
   file from Ed25519 .pub files (secret key files are refused). verify-profile is read-only (exit 0
   trusted, 1 refused).
   Trust roots (keygen/trust-keys --roots: robodr-trust-roots/v1) sign the
@@ -210,6 +228,20 @@ USAGE:
   --state, 1 refused). migrate-legacy re-issues a locked profile from
   before metadata existed (content unchanged, its digest recorded as
   parent).
+  bind writes the digest of each safety-relevant file into a copy of the
+  draft (bound_config: response_policy, motion_firewall, joint_firewall,
+  executor_motion = the executor.json `motion` section) plus a sign-off
+  list with one bound_config item per file (a motion item: motion_quorum
+  applies) and the manifest. After lock + sign the unit honours
+  oem_validated / the firewall envelope only for exactly these files.
+  firewall-draft proposes the Motion Firewall channel file from a learn
+  report (envelopes capped by the OEM ceilings, observed writers as
+  allowed_sources); exit 1 when channels still need the OEM's specs.
+  report-html renders a learn report (and sign-off state) as one inert
+  HTML page for review, archive and print-to-PDF.
+  poc-init creates a LAB-ONLY single-operator signing chain (keys, roots,
+  operators, root-signed trust file marked lab_only) for a proof of
+  concept; units accept it but report it loudly. Never for production.
   Outputs never overwrite an existing file or follow a symlink unless
   --force (symlinks are refused even then).
 
@@ -406,12 +438,19 @@ fn main() -> ExitCode {
         "merge" => cmd_merge(rest),
         "signoff" => cmd_signoff(rest),
         "operators" => cmd_operators(rest),
+        "bind" => wp6::cmd_bind(rest),
+        "firewall-draft" => wp6::cmd_firewall_draft(rest),
+        "report-html" => wp6::cmd_report_html(rest),
+        "poc-init" => wp6::cmd_poc_init(rest),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
         }
         "--version" | "version" => {
-            println!("robodr-commission {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{}",
+                robodr_buildinfo::version_line("robodr-commission", env!("CARGO_PKG_VERSION"))
+            );
             Ok(())
         }
         other => Err(Failure::Error(format!(
@@ -779,7 +818,7 @@ fn locked_at(a: &Args) -> Result<u64, String> {
 /// `(profile text, signature text)`.
 fn seal_and_sign(
     profile: &Profile,
-    key: Option<&robodr_blackbox::Ed25519SigningKey>,
+    key: Option<&robodr_signer::KeySigner>,
 ) -> Result<(String, Option<String>), String> {
     let text = sealed_text(profile).map_err(|e| format!("serialise: {e}"))?;
     let sig = key
@@ -942,7 +981,7 @@ fn cmd_lock(argv: &[String]) -> Outcome {
     };
     let key = a
         .one("sign-key")?
-        .map(|k| load_signing_key(Path::new(k)))
+        .map(|k| robodr_signer::load(Path::new(k)))
         .transpose()?;
     let draft = read_text(input, MAX_PROFILE_BYTES)?;
     // An unreadable draft is an input error (exit 2), not a refusal.
@@ -1036,7 +1075,7 @@ fn cmd_sign(argv: &[String]) -> Outcome {
     let mut inputs = vec![profile, key_path];
     inputs.extend(operators);
     distinct_paths(&[sig_out.as_str()], &inputs)?;
-    let key = load_signing_key(Path::new(key_path))?;
+    let key = robodr_signer::load(Path::new(key_path))?;
     let text = read_text(profile, MAX_PROFILE_BYTES)?;
     let p = parse_profile_text(&text).map_err(|e| format!("{profile}: {e}"))?;
     if !p.locked {
@@ -1099,6 +1138,12 @@ struct VerifyReport {
     rollback: Option<String>,
     revocation_serial: Option<u64>,
     refused: Option<String>,
+    /// `bound_config` of the trusted profile (role -> digest).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    bound_config: BTreeMap<String, String>,
+    /// Accepted under a lab-only (`poc-init`) trust file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    lab_only: bool,
 }
 
 fn cmd_verify_profile(argv: &[String]) -> Outcome {
@@ -1168,6 +1213,8 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
         rollback: None,
         revocation_serial: None,
         refused: None,
+        bound_config: BTreeMap::new(),
+        lab_only: false,
     };
     match eval.result {
         Ok(acc) => {
@@ -1187,6 +1234,8 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
             r.rollback = acc.decision.map(|d| format!("{d:?}"));
             r.revocation_serial = acc.record.as_ref().and_then(|s| s.revocation_serial);
             r.trusted = v.profile.locked;
+            r.bound_config = v.profile.bound_config.clone();
+            r.lab_only = v.lab_only;
             if !v.profile.locked {
                 r.refused = Some("unlocked draft: observe-only, nothing to trust".into());
             }
@@ -1219,6 +1268,12 @@ fn cmd_verify_profile(argv: &[String]) -> Outcome {
         );
         if let Some(ops) = &r.attested_by {
             println!("  attested by operators {ops:?}");
+        }
+        for (role, d) in &r.bound_config {
+            println!("  binds {role} {d}");
+        }
+        if r.lab_only {
+            println!("  {}", robodr_commission::poc::LAB_ONLY_BANNER);
         }
     } else {
         println!(
@@ -1383,6 +1438,7 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
             min_profile_version: floor,
             require_attestation,
             operators: operators.as_ref(),
+            lab_only: false,
         },
     );
     // Check what a unit will check (without roots here: the root signature
@@ -1412,7 +1468,7 @@ fn cmd_trust_keys(argv: &[String]) -> Outcome {
             );
         }
         Some(k) => {
-            let root = load_signing_key(Path::new(k))?;
+            let root = robodr_signer::load(Path::new(k))?;
             if keys.iter().any(|p| p.as_bytes() == &root.public_key()) {
                 return Err(format!(
                     "{k}: the trust root must not be one of the profile keys it signs for"
@@ -1494,7 +1550,7 @@ fn cmd_revoke(argv: &[String]) -> Outcome {
     inputs.extend(key_pubs.iter().copied());
     distinct_paths(&[out], &inputs)?;
     precheck_outputs(&[out], a.switch("force"))?;
-    let root = load_signing_key(Path::new(key_path))?;
+    let root = robodr_signer::load(Path::new(key_path))?;
     let roots = roots_path
         .map(|p| load_trust_roots(Path::new(p)).map_err(|e| e.to_string()))
         .transpose()?;
@@ -1729,7 +1785,7 @@ fn cmd_migrate_legacy(argv: &[String]) -> Outcome {
     let key_path = a.required("sign-key")?;
     let sig_out = sig_path_for(Path::new(out)).display().to_string();
     distinct_paths(&[out, sig_out.as_str()], &[input, key_path])?;
-    let key = load_signing_key(Path::new(key_path))?;
+    let key = robodr_signer::load(Path::new(key_path))?;
     let text = read_text(input, MAX_PROFILE_BYTES)?;
     let mut p = parse_profile_text(&text).map_err(|e| format!("{input}: {e}"))?;
     if !p.locked {
@@ -1927,7 +1983,7 @@ fn cmd_signoff_sign(a: &Args) -> Outcome {
     inputs.extend(a.one("in")?);
     inputs.extend(a.one("operators")?);
     distinct_paths(&[sig_out.as_str()], &inputs)?;
-    let key = load_signing_key(Path::new(key_path))?;
+    let key = robodr_signer::load(Path::new(key_path))?;
     let key_id = robodr_blackbox::Signer::key_id(&key).to_string();
     let text = read_text(so_path, MAX_SIGNOFF_BYTES)?;
     let so: Signoff =

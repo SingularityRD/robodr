@@ -32,6 +32,7 @@ pub const K_REVOCATIONS: &str = "robodr.fleet.revocations_installed";
 pub const K_PROFILE: &str = "robodr.fleet.profile";
 pub const K_RING: &str = "robodr.fleet.ring_info";
 pub const K_REFUSED: &str = "robodr.fleet.refused";
+pub const K_DECOMMISSION: &str = "robodr.fleet.decommission";
 
 /// An open fleet journal.
 pub struct Journal {

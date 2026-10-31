@@ -6,7 +6,9 @@
 //!   `/`), and the other elements are passed as they are, so `;`, `|`,
 //!   `$(...)`, backticks and globs reach the program as literal bytes.
 //! * A fixed minimal environment (`PATH=/usr/sbin:/usr/bin:/sbin:/bin`,
-//!   `LC_ALL=C`), working directory `/`, stdin from `/dev/null`.
+//!   `LC_ALL=C`), working directory `/`, stdin from `/dev/null`. The only
+//!   additions are the agent's own fixed markers ([`run_env`], e.g.
+//!   [`crate::install::DELIVERD_INSTALL_ENV`] for `dpkg --install`).
 //! * Optionally as another user: `setgid`, `setgroups(0)` (std drops every
 //!   supplementary group when it changes the UID of a root process) and
 //!   `setuid` before `execve` (tested: `tests` below runs `id`).
@@ -418,8 +420,15 @@ fn reader(mut r: impl Read + Send + 'static, max: usize) -> mpsc::Receiver<(Vec<
 pub fn run(argv: &[String], user: Option<RunAs>, limits: Limits) -> RunResult {
     match user {
         Some(u) => run_probe(argv, u, limits, ProbeLimits::default()),
-        None => run_inner(argv, None, limits),
+        None => run_inner(argv, None, &[], limits),
     }
+}
+
+/// [`run`] as this process's user with `env` added to the fixed
+/// environment (the agent's own constant markers, never values taken from
+/// content: names and values are `'static`).
+pub fn run_env(argv: &[String], env: &[(&'static str, &'static str)], limits: Limits) -> RunResult {
+    run_inner(argv, None, env, limits)
 }
 
 /// Run `argv` (as this process's user, in a process group of its own,
@@ -507,12 +516,17 @@ pub fn run_reader<T>(
 /// Run `argv` as the probe user `user` with `rl` (see the module docs).
 pub fn run_probe(argv: &[String], user: RunAs, limits: Limits, rl: ProbeLimits) -> RunResult {
     reaper_acquire();
-    let r = run_inner(argv, Some((user, rl)), limits);
+    let r = run_inner(argv, Some((user, rl)), &[], limits);
     reaper_release();
     r
 }
 
-fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits) -> RunResult {
+fn run_inner(
+    argv: &[String],
+    user: Option<(RunAs, ProbeLimits)>,
+    env: &[(&'static str, &'static str)],
+    limits: Limits,
+) -> RunResult {
     let start = Instant::now();
     let mut res = RunResult {
         code: None,
@@ -539,6 +553,7 @@ fn run_inner(argv: &[String], user: Option<(RunAs, ProbeLimits)>, limits: Limits
         .env_clear()
         .env("PATH", FIXED_PATH)
         .env("LC_ALL", "C")
+        .envs(env.iter().copied())
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -692,6 +707,30 @@ mod tests {
         assert!(r.success(), "{r:?}");
         assert_eq!(r.output.trim_end(), evil);
         assert!(!marker.exists(), "a shell interpreted the argv");
+    }
+
+    #[test]
+    fn run_env_adds_only_the_given_markers() {
+        // Nothing of this process's environment reaches the program (it is
+        // cleared); the marker does.
+        let r = run_env(
+            &sv(&["/usr/bin/env"]),
+            &[("ROBODR_DELIVERD_INSTALL", "1")],
+            lim(5000),
+        );
+        assert!(r.success(), "{r:?}");
+        let mut lines: Vec<&str> = r.output.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            [
+                "LC_ALL=C",
+                &format!("PATH={FIXED_PATH}"),
+                "ROBODR_DELIVERD_INSTALL=1"
+            ]
+        );
+        let r = run(&sv(&["/usr/bin/env"]), None, lim(5000));
+        assert!(!r.output.contains("ROBODR_DELIVERD_INSTALL"), "{r:?}");
     }
 
     #[test]

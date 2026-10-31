@@ -29,7 +29,29 @@
 //! never believed (the engine handles it like an unreadable one and refuses
 //! orders until `rearm`). [`Journal::seal_legacy`] is the one-time upgrade
 //! (`robodr-executor seal-journal`). The seal detects edits, not an older
-//! sealed copy put back.
+//! sealed copy put back: that is what the **epoch** and agentd's anchor
+//! are for (below).
+//!
+//! **Epoch and anchor (review of gap 1).** Every journal carries a random
+//! [`State::epoch`] that a reset replaces (the old one is kept as
+//! [`State::prev_epoch`]). Every `events` answer carries the journal's head
+//! ([`JournalHead`]: epoch and `next_seq`); agentd records it in signed
+//! black-box notes and sends the newest head it knows back with every
+//! `events` request ([`crate::engine::Engine::check_anchor`]). A journal
+//! whose epoch is neither the anchored one nor its successor, or whose
+//! `next_seq` is behind the anchor, is an older copy put back (or a
+//! deleted journal): it is reset like one that fails its seal.
+//!
+//! **First start.** A sealed journal that is simply missing is not taken
+//! for a first start: unless the first-start marker [`INIT_MARKER`]
+//! (created by the package on first install) exists in the state
+//! directory, a missing journal is a reset (table deleted, SOC replay
+//! store fenced, orders refused until `rearm`). The marker is consumed by
+//! the first start.
+//!
+//! Every write goes to a fresh temporary file (random name, created
+//! exclusively, no symlink followed) and is renamed into place
+//! ([`write_atomic`]).
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -54,6 +76,78 @@ pub const MAX_HISTORY: usize = 256;
 pub const MAX_EVENTS: usize = 512;
 /// Largest journal file read.
 pub const MAX_JOURNAL_BYTES: u64 = 8 << 20;
+/// The first-start marker (state directory): created by the package on
+/// first install (`packaging/deb/postinst`, `packaging/rpm/post`) or by
+/// the operator; without it a missing sealed journal is a reset.
+pub const INIT_MARKER: &str = "first-start";
+/// Created once the journal has been written sealed: from then on
+/// `seal-journal` (the one-time v1 upgrade) is refused.
+pub const SEALED_MARKER: &str = "sealed";
+
+/// `O_NOFOLLOW` (Linux: 0o400000, except 0o100000 on arm / aarch64 /
+/// powerpc; the BSDs and macOS: 0x100).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const O_NOFOLLOW: i32 = if cfg!(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "powerpc",
+    target_arch = "powerpc64"
+)) {
+    0o100000
+} else {
+    0o400000
+};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const O_NOFOLLOW: i32 = 0x100;
+
+/// 16 random bytes, lower-case hex (journal epochs, temporary names).
+/// Falls back to the clock and the process id when the kernel CSPRNG
+/// cannot be read (an epoch must exist; uniqueness is what matters).
+pub fn random_hex16() -> String {
+    let mut b = [0u8; 16];
+    match robodr_blackbox::crypto::fill_random(&mut b) {
+        Ok(()) => to_hex(&b),
+        Err(_) => format!(
+            "{:016x}{:08x}{:08x}",
+            crate::proto::wall_ms(),
+            std::process::id(),
+            crate::proto::mono_ms() & 0xffff_ffff
+        ),
+    }
+}
+
+/// Atomically replace `dir/name` with `data`: a new temporary file with a
+/// random name (created exclusively, mode 0600, never through a symlink),
+/// fsync, rename, fsync of the directory. A planted file or symlink at a
+/// temporary name is never written through (review finding 8).
+pub fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp-{}", random_hex16()));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, dir.join(name))?;
+        File::open(dir)?.sync_all()
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Where a journal ends, as agentd anchors it: its epoch and the next
+/// event sequence number (review of gap 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalHead {
+    pub epoch: String,
+    pub next_seq: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +252,11 @@ pub enum EventKind {
     Rearmed,
     /// A journal write failed (disk full, I/O error); retried.
     JournalError,
+    /// Someone set the robot moving again while a `safe_pause` was in
+    /// force (a navigation goal, a flight-mode change; sales-readiness
+    /// T42): the latch cancelled it / set hold again (detail: what it
+    /// found). agentd reports it as High.
+    Overridden,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,6 +288,13 @@ pub struct State {
     /// cleared by `rearm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_reset_ms: Option<u64>,
+    /// This journal's random epoch: replaced by every reset (empty in
+    /// journals written before it existed; assigned at the next start).
+    #[serde(default)]
+    pub epoch: String,
+    /// The epoch this one replaced (a reset): agentd may still anchor it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_epoch: Option<String>,
 }
 
 impl State {
@@ -202,6 +308,16 @@ impl State {
             events: VecDeque::new(),
             operator_disabled: false,
             journal_reset_ms: None,
+            epoch: random_hex16(),
+            prev_epoch: None,
+        }
+    }
+
+    /// Where this journal ends (what agentd anchors).
+    pub fn head(&self) -> JournalHead {
+        JournalHead {
+            epoch: self.epoch.clone(),
+            next_seq: self.next_seq,
         }
     }
 
@@ -403,11 +519,26 @@ impl Journal {
 
     /// The one-time upgrade (`robodr-executor seal-journal`, executor
     /// stopped): read an unsealed v1 journal and write it sealed. Refused
-    /// for a journal that is already sealed, missing, or unreadable.
+    /// for a journal that is already sealed, missing, or unreadable, and
+    /// once the journal has ever been written sealed ([`SEALED_MARKER`]):
+    /// then an unsealed file is a plant, not an upgrade (review finding 7).
+    /// The adopted entries are not trusted as installed: the state is
+    /// marked as of no boot, so the next start re-validates every active
+    /// entry and holds it until a fresh safety check ([`Phase::Held`]), and
+    /// it starts a new epoch.
     pub fn seal_legacy(&self) -> Result<String, String> {
         let Some(key) = &self.seal else {
             return Err("no state-seal key".into());
         };
+        let marker = self.dir.join(SEALED_MARKER);
+        if std::fs::symlink_metadata(&marker).is_ok() {
+            return Err(format!(
+                "{} exists: this executor has written its journal sealed before, so an unsealed \
+                 journal is not an upgrade (planted or restored) and is not adopted; start the \
+                 executor: it resets the journal and refuses orders until `rearm`",
+                marker.display()
+            ));
+        }
         let p = self.path();
         let text = crate::config::read_small(&p)?;
         match unseal(key, SEALED_FORMAT, text.as_bytes()) {
@@ -420,13 +551,18 @@ impl Journal {
             }
             Err(Unsealed::Legacy) => {}
         }
-        let s = match Journal::new(&self.dir).load() {
+        let mut s = match Journal::new(&self.dir).load() {
             Loaded::State(s) => s,
             _ => return Err(format!("{} is not a readable v1 journal", p.display())),
         };
+        // Not trusted as installed: re-validated and held at the next start.
+        s.boot_id = String::new();
+        s.prev_epoch = None;
+        s.epoch = random_hex16();
         self.save(&s)?;
+        self.mark_sealed();
         Ok(format!(
-            "{} sealed ({} active action(s), key {})",
+            "{} sealed ({} active action(s), held for re-validation at the next start, key {})",
             p.display(),
             s.entries.len(),
             key.key_id()
@@ -444,20 +580,28 @@ impl Journal {
             None => json,
             Some(k) => seal(k, SEALED_FORMAT, &json),
         };
-        let tmp = self.dir.join(format!("{FILE}.tmp"));
-        let res = (|| -> std::io::Result<()> {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&data)?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, self.path())?;
-            File::open(&self.dir)?.sync_all()
-        })();
-        res.map_err(|e| format!("journal {}: {e}", self.path().display()))
+        write_atomic(&self.dir, FILE, &data)
+            .map_err(|e| format!("journal {}: {e}", self.path().display()))
+    }
+
+    /// Record that the journal has been written sealed ([`SEALED_MARKER`];
+    /// best effort, idempotent).
+    pub fn mark_sealed(&self) {
+        if self.seal.is_none() {
+            return;
+        }
+        if std::fs::symlink_metadata(self.dir.join(SEALED_MARKER)).is_err() {
+            let _ = write_atomic(&self.dir, SEALED_MARKER, b"robodr-executor-journal/v2\n");
+        }
+    }
+
+    /// The first-start marker ([`INIT_MARKER`]) exists.
+    pub fn init_marker(&self) -> bool {
+        std::fs::symlink_metadata(self.dir.join(INIT_MARKER)).is_ok()
+    }
+
+    /// Consume the first-start marker (best effort).
+    pub fn consume_init_marker(&self) {
+        let _ = std::fs::remove_file(self.dir.join(INIT_MARKER));
     }
 }

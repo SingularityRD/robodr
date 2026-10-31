@@ -114,6 +114,92 @@ impl Default for RolloutParams {
 /// (the attestation is taken right after the clock is read).
 pub const MAX_TIME_SKEW_MS: u64 = 60_000;
 
+/// A unit's record at the start of an enrolment (`prev`: its record of an
+/// earlier enrolment, if any). Only the lease sequence carries over: a new
+/// enrolment starts a new report history (review finding: an old,
+/// possibly forged high-water mark carried over would refuse every genuine
+/// report, and its `erased` claim would stick); replays of reports signed
+/// before it are refused by `report_floor`, set from the enrolment quote.
+fn begun_unit(unit: &str, ring: String, nonce: &str, prev: Option<&Unit>) -> Unit {
+    Unit {
+        unit: unit.into(),
+        ring,
+        state: EnrolState::Begun,
+        attestation: Attestation::Unknown,
+        nonce: Some(nonce.into()),
+        secret_sha256: None,
+        record: None,
+        platform: None,
+        identity_public: None,
+        ak_name: None,
+        ak_public: None,
+        ek: None,
+        policy_version: None,
+        approvals: None,
+        enrolled_at: None,
+        cert_serial: None,
+        last_report: None,
+        report_floor: None,
+        erased: false,
+        lease_seq: prev.map_or(0, |p| p.lease_seq),
+    }
+}
+
+/// How a unit report is placed in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportTime {
+    /// The AK's attestation of the TPM time (attested TPM units).
+    attested: Option<robodr_seal::attest::Attest>,
+    /// The `(reset count, clock)` the report is ordered by: the
+    /// **attested** values for an attested unit; zeros otherwise.
+    resets: u32,
+    clock: u64,
+}
+
+/// Judge a verified report's time against the unit's record (review
+/// finding, MED): an attested TPM unit's report needs the AK's attestation
+/// of the TPM time, **also when it says the unit was erased** (an erased
+/// unit's AK is intact: erase moves the epoch, not the endorsement
+/// hierarchy), and it is ordered by the attested time, never the claimed
+/// one; it must be later than the last accepted report, or, after an
+/// enrolment, than the enrolment quote. A unit without a TPM is ordered by
+/// its own `reported_at` (unattested by nature, §7.7).
+fn report_time(u: &Unit, rep: &robodr_seal::report::UnitReport) -> Result<ReportTime, DepotError> {
+    let tpm = u.attestation == Attestation::Verified;
+    let rt = if tpm {
+        let ak = u
+            .ak_public
+            .as_deref()
+            .and_then(robodr_seal::from_hex)
+            .ok_or_else(|| err("the unit's AK is not on record"))?;
+        let a = rep.check_time(&ak, MAX_TIME_SKEW_MS).map_err(fail)?;
+        ReportTime {
+            resets: a.reset_count,
+            clock: a.clock,
+            attested: Some(a),
+        }
+    } else {
+        ReportTime {
+            attested: None,
+            resets: 0,
+            clock: 0,
+        }
+    };
+    let newer = match (&u.last_report, tpm) {
+        (Some(l), true) => (rt.resets, rt.clock) > (l.tpm_resets, l.tpm_clock),
+        (Some(l), false) => rep.reported_at > l.reported_at,
+        (None, true) => u.report_floor.is_none_or(|f| (rt.resets, rt.clock) > f),
+        (None, false) => true,
+    };
+    if !newer {
+        return Err(err(format!(
+            "report of {} is not newer than the last one accepted or the enrolment (replay)",
+            rep.unit
+        )));
+    }
+    Ok(rt)
+}
+
 /// DER certificates.
 type DerCerts = Vec<Vec<u8>>;
 
@@ -270,7 +356,7 @@ impl Depot {
     pub fn open(cfg: Config, now: u64) -> Result<Self, DepotError> {
         let lock = crate::lock::lock(&cfg.state_dir.join("depot.lock"), LOCK_WAIT)?;
         let a = cfg.anchor_path();
-        let site = SiteTrust::anchored(&a, &a, &cfg.roots, &cfg.site, now).map_err(fail)?;
+        let site = SiteTrust::current(&a, &cfg.roots, &cfg.site, now).map_err(fail)?;
         let store = anchor_store(&cfg)?;
         let (db, fresh_lock) = store.open(&cfg.site)?;
         let kf = robodr_blackbox::KeyFile::load_secret(&cfg.keys.signing).map_err(fail)?;
@@ -376,8 +462,7 @@ impl Depot {
         let st = SiteTrust::anchored(presented, &a, &self.cfg.roots, &self.cfg.site, now)
             .map_err(fail)?;
         ops::commit_anchor(&st).map_err(fail)?;
-        self.site =
-            SiteTrust::anchored(&a, &a, &self.cfg.roots, &self.cfg.site, now).map_err(fail)?;
+        self.site = SiteTrust::current(&a, &self.cfg.roots, &self.cfg.site, now).map_err(fail)?;
         Ok(self.site.file().version)
     }
 
@@ -518,30 +603,9 @@ impl Depot {
         }
         let nonce = robodr_seal::to_hex(&crate::random32()?);
         let prev = self.db.units.get(unit).cloned();
-        self.db.units.insert(
-            unit.into(),
-            Unit {
-                unit: unit.into(),
-                ring,
-                state: EnrolState::Begun,
-                attestation: Attestation::Unknown,
-                nonce: Some(nonce.clone()),
-                secret_sha256: None,
-                record: None,
-                platform: None,
-                identity_public: None,
-                ak_name: None,
-                ak_public: None,
-                ek: None,
-                policy_version: None,
-                approvals: None,
-                enrolled_at: None,
-                cert_serial: None,
-                last_report: prev.as_ref().and_then(|p| p.last_report.clone()),
-                erased: false,
-                lease_seq: prev.map_or(0, |p| p.lease_seq),
-            },
-        );
+        self.db
+            .units
+            .insert(unit.into(), begun_unit(unit, ring, &nonce, prev.as_ref()));
         let _ = now;
         self.save()?;
         Ok(nonce)
@@ -650,6 +714,7 @@ impl Depot {
                 nu.ak_public = req.tpm.as_ref().map(|t| t.ak_public.clone());
                 nu.ek = Some(sha256_hex(&ek.tpmt));
                 nu.secret_sha256 = Some(sha256_hex(&secret));
+                nu.report_floor = checked.tpm_time;
                 nu.state = EnrolState::Challenged;
                 nu.attestation = Attestation::Verified;
                 let c = enrol::EnrolChallenge {
@@ -1395,32 +1460,7 @@ impl Depot {
         if rep.site != self.cfg.site {
             return Err(err("report of another site"));
         }
-        let tpm = u.attestation == Attestation::Verified;
-        // An attested unit's TPM time only through its AK's attestation
-        // (root on the unit can have the identity key sign any clock).
-        let attested = if tpm && !rep.erased {
-            let ak = u
-                .ak_public
-                .as_deref()
-                .and_then(robodr_seal::from_hex)
-                .ok_or_else(|| err("the unit's AK is not on record"))?;
-            Some(rep.check_time(&ak, MAX_TIME_SKEW_MS).map_err(fail)?)
-        } else {
-            None
-        };
-        if let Some(l) = &u.last_report {
-            let newer = if tpm {
-                (rep.tpm_resets, rep.tpm_clock) > (l.tpm_resets, l.tpm_clock)
-            } else {
-                rep.reported_at > l.reported_at
-            };
-            if !newer {
-                return Err(err(format!(
-                    "report of {} is not newer than the last one accepted (replay)",
-                    rep.unit
-                )));
-            }
-        }
+        let rt = report_time(&u, &rep)?;
         // Evidence.
         let ev = self
             .cfg
@@ -1428,7 +1468,7 @@ impl Depot {
             .join("units")
             .join(&rep.unit)
             .join("reports")
-            .join(format!("{:010}-{:016}.json", rep.tpm_resets, rep.tpm_clock));
+            .join(format!("{:010}-{:016}.json", rt.resets, rt.clock));
         write_file(&ev, bytes, 0o644)?;
         let mut halt: Option<(String, String)> = None;
         if let Some(d) = self.db.deployments.get(&rep.deployment_seq).cloned() {
@@ -1509,8 +1549,10 @@ impl Depot {
             uu.erased = rep.erased;
             uu.last_report = Some(LastReport {
                 received_at: now,
-                tpm_resets: rep.tpm_resets,
-                tpm_clock: rep.tpm_clock,
+                // Attested values only (review finding): never what the
+                // report merely claims.
+                tpm_resets: rt.resets,
+                tpm_clock: rt.clock,
                 reported_at: rep.reported_at,
                 deployment_seq: rep.deployment_seq,
                 report: rep.clone(),
@@ -1542,7 +1584,8 @@ impl Depot {
                         // Only from the TPM's attestation (`gated`
                         // implies an attested TPM unit).
                         now: {
-                            let a = attested
+                            let a = rt
+                                .attested
                                 .as_ref()
                                 .ok_or_else(|| err("no attested TPM time for the lease"))?;
                             robodr_seal::lease::TpmTime {
@@ -1708,5 +1751,162 @@ impl Depot {
             "rollouts": self.db.rollouts,
             "deployments": self.db.deployments,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::ecdsa::signature::Signer as _;
+    use robodr_seal::attest::{self, AK_ATTRS};
+
+    /// An AK public area (`TPM2B_PUBLIC`) for `pk`.
+    fn ak_public(pk: &[u8; 65]) -> Vec<u8> {
+        let mut t = Vec::new();
+        for v in [attest::TPM_ALG_ECC, attest::TPM_ALG_SHA256] {
+            t.extend_from_slice(&v.to_be_bytes());
+        }
+        t.extend_from_slice(&AK_ATTRS.to_be_bytes());
+        t.extend_from_slice(&0u16.to_be_bytes());
+        for v in [
+            attest::TPM_ALG_NULL,
+            attest::TPM_ALG_ECDSA,
+            attest::TPM_ALG_SHA256,
+            attest::TPM_ECC_NIST_P256,
+            attest::TPM_ALG_NULL,
+        ] {
+            t.extend_from_slice(&v.to_be_bytes());
+        }
+        for c in [&pk[1..33], &pk[33..]] {
+            t.extend_from_slice(&32u16.to_be_bytes());
+            t.extend_from_slice(c);
+        }
+        let mut b = (t.len() as u16).to_be_bytes().to_vec();
+        b.extend_from_slice(&t);
+        b
+    }
+
+    /// A quote (`TPMS_ATTEST`) of the TPM time `resets`, `clock` for
+    /// `extra`.
+    fn quote(extra: &[u8; 32], resets: u32, clock: u64) -> Vec<u8> {
+        let mut b = attest::TPM_GENERATED_VALUE.to_be_bytes().to_vec();
+        b.extend_from_slice(&attest::TPM_ST_ATTEST_QUOTE.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&32u16.to_be_bytes());
+        b.extend_from_slice(extra);
+        b.extend_from_slice(&clock.to_be_bytes());
+        b.extend_from_slice(&resets.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.push(1);
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&attest::TPM_ALG_SHA256.to_be_bytes());
+        b.push(3);
+        b.extend_from_slice(&[1, 0, 0]);
+        b.extend_from_slice(&32u16.to_be_bytes());
+        b.extend_from_slice(&[0u8; 32]);
+        b
+    }
+
+    struct Ak(p256::ecdsa::SigningKey, [u8; 65]);
+
+    fn ak() -> Ak {
+        let k = robodr_seal::wrap::p256_random().unwrap();
+        let pk = robodr_seal::wrap::p256_public_bytes(&k.public_key());
+        Ak(p256::ecdsa::SigningKey::from(&k), pk)
+    }
+
+    fn unit(a: &Ak) -> Unit {
+        let mut u = begun_unit("ugv-07", "ring-1".into(), "00", None);
+        u.state = EnrolState::Enrolled;
+        u.attestation = Attestation::Verified;
+        u.ak_public = Some(robodr_seal::to_hex(&ak_public(&a.1)));
+        u
+    }
+
+    fn report(erased: bool, resets: u32, clock: u64) -> robodr_seal::report::UnitReport {
+        robodr_seal::report::UnitReport {
+            format: robodr_seal::report::REPORT_FORMAT.into(),
+            site: "site-a".into(),
+            unit: "ugv-07".into(),
+            reported_at: 1_790_000_000,
+            tpm_resets: resets,
+            tpm_clock: clock,
+            deployment_id: None,
+            deployment_seq: 0,
+            deployment_digest: None,
+            items: vec![],
+            installed: vec![],
+            erased,
+            time: None,
+        }
+    }
+
+    /// `r` with the AK's attestation of `resets`, `clock`.
+    fn attested(
+        a: &Ak,
+        mut r: robodr_seal::report::UnitReport,
+        resets: u32,
+        clock: u64,
+    ) -> robodr_seal::report::UnitReport {
+        let q = quote(&r.time_digest().unwrap(), resets, clock);
+        let sig: p256::ecdsa::Signature = a.0.sign(&q);
+        r.time = Some(robodr_seal::enrol::SignedHex {
+            attest: robodr_seal::to_hex(&q),
+            sig: robodr_seal::to_hex(sig.to_der().as_bytes()),
+        });
+        r
+    }
+
+    /// Review finding (MED): an attested unit's report saying `erased`
+    /// skipped the AK's time attestation, and its claimed TPM time became
+    /// the high-water mark: root on the unit could sign `erased` with a
+    /// clock of 2^53 and lock every later genuine report out.
+    #[test]
+    fn an_erased_report_needs_the_time_attestation_too() {
+        let a = ak();
+        let u = unit(&a);
+        assert!(report_time(&u, &report(true, 7, 1 << 53)).is_err());
+        // With the attestation it is accepted, ordered by the attested time.
+        let rt = report_time(&u, &attested(&a, report(true, 3, 1000), 3, 31_000)).unwrap();
+        assert_eq!((rt.resets, rt.clock), (3, 31_000));
+        // Another AK's attestation is refused.
+        let b = ak();
+        assert!(report_time(&u, &attested(&b, report(true, 3, 1000), 3, 31_000)).is_err());
+    }
+
+    /// The high-water mark is the attested time, never the claimed one, and
+    /// a new enrolment starts a new history above its quote's time.
+    #[test]
+    fn the_high_water_mark_is_attested_and_reset_by_re_enrolment() {
+        let a = ak();
+        let mut u = unit(&a);
+        u.last_report = Some(LastReport {
+            received_at: 0,
+            tpm_resets: u32::MAX,
+            tpm_clock: u64::MAX,
+            reported_at: 0,
+            deployment_seq: 0,
+            report: report(true, u32::MAX, u64::MAX),
+        });
+        u.erased = true;
+        u.report_floor = Some((3, 5_000));
+        let genuine = attested(&a, report(false, 3, 9_000), 3, 9_000);
+        assert!(report_time(&u, &genuine).is_err(), "behind a forged mark");
+        // Re-enrolment: the forged mark and the erased claim are gone; the
+        // floor (the enrolment quote) refuses reports signed before it.
+        let mut again = begun_unit("ugv-07", "ring-1".into(), "11", Some(&u));
+        assert!(again.last_report.is_none() && !again.erased);
+        assert_eq!(again.lease_seq, u.lease_seq);
+        again.state = EnrolState::Enrolled;
+        again.attestation = Attestation::Verified;
+        again.ak_public = u.ak_public.clone();
+        again.report_floor = Some((3, 10_000));
+        assert!(
+            report_time(&again, &genuine).is_err(),
+            "a pre-enrolment report replayed"
+        );
+        let later = attested(&a, report(false, 3, 12_000), 3, 12_000);
+        assert_eq!(report_time(&again, &later).unwrap().clock, 12_000);
     }
 }

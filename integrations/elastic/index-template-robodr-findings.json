@@ -1,0 +1,92 @@
+{
+  "index_patterns": ["logs-robodr.findings-*"],
+  "data_stream": {},
+  "priority": 200,
+  "template": {
+    "settings": {
+      "index.default_pipeline": "robodr-findings"
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "robodr_tainted_values": {
+            "path_match": "robodr.entity_context.*.value",
+            "mapping": { "type": "keyword", "index": false, "doc_values": false }
+          }
+        },
+        {
+          "robodr_tainted_nested_values": {
+            "path_match": "robodr.entity_context.*.*.value",
+            "mapping": { "type": "keyword", "index": false, "doc_values": false }
+          }
+        },
+        {
+          "robodr_strings": {
+            "path_match": "robodr.*",
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword", "ignore_above": 1024 }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "event": {
+          "properties": {
+            "kind": { "type": "keyword" },
+            "category": { "type": "keyword" },
+            "type": { "type": "keyword" },
+            "module": { "type": "keyword" },
+            "dataset": { "type": "keyword" },
+            "id": { "type": "keyword" },
+            "severity": { "type": "long" }
+          }
+        },
+        "rule": {
+          "properties": {
+            "id": { "type": "keyword" },
+            "name": { "type": "keyword" },
+            "description": { "type": "text" },
+            "ruleset": { "type": "keyword" }
+          }
+        },
+        "log": { "properties": { "level": { "type": "keyword" } } },
+        "host": { "properties": { "id": { "type": "keyword" }, "name": { "type": "keyword" } } },
+        "observer": {
+          "properties": {
+            "vendor": { "type": "keyword" },
+            "product": { "type": "keyword" },
+            "type": { "type": "keyword" },
+            "geo": { "properties": { "name": { "type": "keyword" } } }
+          }
+        },
+        "source": { "properties": { "ip": { "type": "ip" } } },
+        "threat": {
+          "properties": {
+            "framework": { "type": "keyword" },
+            "technique": { "properties": { "id": { "type": "keyword" }, "name": { "type": "keyword" } } }
+          }
+        },
+        "error": { "properties": { "message": { "type": "text" } } },
+        "robodr": {
+          "dynamic": true,
+          "properties": {
+            "description": { "type": "text" },
+            "timestamp": { "type": "date" },
+            "anomaly_score": { "type": "float" },
+            "ocsf": {
+              "properties": {
+                "time": { "type": "date", "format": "epoch_millis" },
+                "severity_id": { "type": "long" },
+                "count": { "type": "long" },
+                "unmapped": { "type": "object", "enabled": false }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "_meta": {
+    "description": "RoboDR findings data stream. Attacker-controlled DDS names (robodr.entity_context.**.value) are stored but not indexed: search and display the escaped .display forms (SR-TAINT). ocsf.unmapped duplicates entity_context and is stored only."
+  }
+}

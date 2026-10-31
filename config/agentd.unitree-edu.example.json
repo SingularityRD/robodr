@@ -1,9 +1,19 @@
 {
-  "robot": { "id": "unitree-g1-001", "site": "site-a", "model": "unitree-g1-edu", "robot_model": "G1" },
+  "robot": {
+    "id": "unitree-g1-001",
+    "site": "site-a",
+    "model": "unitree-g1-edu",
+    "robot_model": "G1"
+  },
   "sensor": {
     "profile_path": "/etc/robodr/profile.json",
     "listen_spdp": false,
-    "capture": { "enabled": true, "interfaces": ["eth0"] },
+    "capture": {
+      "enabled": true,
+      "interfaces": [
+        "eth0"
+      ]
+    },
     "profile_trust": {
       "trusted_keys": "/etc/robodr/profile-trust.json",
       "state_file": "/var/lib/robodr/profile-state/agentd.json",
@@ -16,8 +26,47 @@
     "dir": "/var/lib/robodr/blackbox/agentd",
     "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
   },
-  "spool": { "dir": "/var/lib/robodr/spool/agentd", "status_socket": "/run/robodr-agentd/status.sock" },
-  "context": { "safety_state": "unknown", "control": "autonomous" },
+  "spool": {
+    "dir": "/var/lib/robodr/spool/agentd",
+    "status_socket": "/run/robodr-agentd/status.sock"
+  },
+  "context": {
+    "safety_state": "unknown",
+    "control": "autonomous"
+  },
+  "safety_feed": {
+    "stale_after_ms": 500,
+    "topics": [
+      {
+        "topic": "/lowstate",
+        "type": "unitree_hg::msg::dds_::LowState_",
+        "writers": [
+          "0123456789abcdef01234567"
+        ],
+        "unitree_low": {
+          "moving_above": 0.5,
+          "fast_above": 3.0,
+          "hysteresis": 0.1
+        }
+      },
+      {
+        "topic": "/wirelesscontroller",
+        "type": "unitree_go::msg::dds_::WirelessController_",
+        "writers": [
+          "0123456789abcdef01234567"
+        ],
+        "stale_after_ms": 2000,
+        "wireless_controller": {
+          "deadzone": 0.1,
+          "hold_ms": 5000,
+          "control": "manual"
+        },
+        "on_stale": {
+          "control": "manual"
+        }
+      }
+    ]
+  },
   "firewall": {
     "joint_config": "/etc/robodr/firewall.json",
     "max_angular": {
@@ -27,6 +76,13 @@
       "/api/motion_switcher/request": 0.0
     }
   },
-  "correlation": { "enabled": true, "include_default_rules": true },
-  "daemon": { "tick_ms": 1000, "heartbeat_ms": 10000, "silence_ms": 30000 }
+  "correlation": {
+    "enabled": true,
+    "include_default_rules": true
+  },
+  "daemon": {
+    "tick_ms": 1000,
+    "heartbeat_ms": 10000,
+    "silence_ms": 30000
+  }
 }

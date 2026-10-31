@@ -450,6 +450,12 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   attacker must be on an allowed address. A product fix (evicting the
   oldest pre-authentication connection when a new one arrives, or a
   reserved slot for allow-listed client addresses) was not attempted.
+  **Update (T39, `8e51ad9`):** both are in agentd now
+  (`pre_auth_evict_after_ms`, `soc_sources` / `reserved_connections`,
+  contract §1); the in-process regression
+  `slowloris_cannot_lock_the_listed_soc_out` gets 20/20 SOC requests
+  through an 8-connection trickling attacker (0/20 without the fix). The
+  netns re-run of S2 with the release binaries is still to do.
 - **W2-5 (Low, design note).** The gateway feed is trusted by uid: a
   process running as root or as the gateway's user can claim any
   catalogued gateway / firewall finding and its severity (G7) and can

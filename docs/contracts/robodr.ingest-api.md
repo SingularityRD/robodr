@@ -357,7 +357,9 @@ text requires, for both implementations to test against:
   relay (own site, other site, unregistered robot), the `contract_version`
   syntax rule, lone surrogates, a key twice inside `sig`, a `sig.key_id`
   with a space, a repeated `X-RoboDR-*` header, timestamps 2^64 and
-  2^64−1, no `Content-Type`, a body of 4 MiB + 1.
+  2^64−1, no `Content-Type`, a body of 4 MiB + 1; and (case 27) two
+  signed `robot.agent.health` records of one robot (findings contract 2.5:
+  one finding, created then updated).
 
 Cases are only ever **added** (new directories, new `manifest.json`
 entries and fields); an existing case changes only with a contract change
@@ -371,6 +373,13 @@ every request through a reference consumer of this text
 
 ## 10. Changelog
 
+* **2026-10-30, findings contract 2.5.0** (sales-readiness WP2): no change
+  to this API. The vectors are regenerated: every finding value now says
+  `contract_version` `2.5.0` (bodies, hashes and batch ids change with
+  it, and so do the batch ids in the expected responses; statuses and
+  counts do not), and case 27 adds the agent health
+  record. A consumer that ingests 2.5 findings needs the 2.5 validator
+  (`robodr.findings.md` §3g, §5).
 * **v1 draft, 2026-10-26, fleet** (Sprint 9): §3 names the fleet API as
   the registration path and its `blackbox` role (wrong role here, like
   `finding`). No change to processing or vectors.

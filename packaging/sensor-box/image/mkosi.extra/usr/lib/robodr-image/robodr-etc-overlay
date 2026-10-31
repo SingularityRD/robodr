@@ -1,0 +1,22 @@
+#!/bin/sh
+# robodr-etc-overlay: make /etc/robodr writable on the read-only root, as an
+# overlay whose upper layer is on /var (robodr-etc-overlay.service, before
+# systemd-tmpfiles-setup). The image's own files (pulsar.toml) stay
+# visible; what the box writes (provision.env, agentd.json, the keys,
+# profile, policy, site network and firewall files) persists in
+# /var/lib/robodr-image/etc-robodr/upper.
+set -eu
+. "${ROBODR_IMAGE_ROOT:-}/usr/lib/robodr-image/common.sh"
+
+base="$R/var/lib/robodr-image/etc-robodr"
+install -d -m 0700 "$R/var/lib/robodr-image" "$base" "$base/work"
+install -d -m 0750 "$base/upper"
+gid="$(getent group robodr | cut -d: -f3 || true)"
+[ -n "$gid" ] && chown "0:$gid" "$base/upper"
+if findmnt -n -t overlay --target "$R/etc/robodr" >/dev/null 2>&1 &&
+    [ "$(findmnt -n -o TARGET --target "$R/etc/robodr")" = "$R/etc/robodr" ]; then
+    exit 0
+fi
+mount -t overlay overlay \
+    -o "lowerdir=$R/etc/robodr,upperdir=$base/upper,workdir=$base/work,nosuid,nodev" \
+    "$R/etc/robodr"

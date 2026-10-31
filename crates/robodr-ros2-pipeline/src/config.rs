@@ -43,6 +43,8 @@
 //! max_writers = 4096                   # writer GUID -> topic table bound
 //! max_samples_per_datagram = 256
 //!
+//! # sros2_keystore = "/etc/robodr/sros2/enclaves"  # SROS 2 policy input
+//!
 //! [module.robodr-sensor-ros2.profile_trust]
 //! trusted_keys = "/etc/robodr/profile-trust.json"
 //! state_file = "/var/lib/robodr/profile-state-pulsard/pulsard.json"
@@ -177,6 +179,11 @@ pub struct Config {
     /// Unitree legacy UDP (Go1 generation, `unitree_legacy` sub-table).
     /// See [`crate::legacy`]. Off by default.
     pub unitree_legacy: UnitreeLegacyConfig,
+    /// The robot's SROS 2 keystore `enclaves/` directory (absolute; only
+    /// `governance.xml` and the `permissions.xml` files are read). SPDP
+    /// DDS-Security identities are judged against it
+    /// ([`crate::sros2`]). Unset (default) = not checked.
+    pub sros2_keystore: Option<PathBuf>,
 }
 
 /// `[module.robodr-sensor-ros2.unitree_legacy]`. See [`crate::legacy`].
@@ -414,6 +421,7 @@ impl Default for Config {
             motion: MotionConfig::default(),
             profile_trust: ProfileTrustConfig::default(),
             unitree_legacy: UnitreeLegacyConfig::default(),
+            sros2_keystore: None,
         }
     }
 }
@@ -975,6 +983,27 @@ impl Config {
             }
         }
 
+        let sros2 = match &self.sros2_keystore {
+            None => None,
+            Some(dir) if !dir.is_absolute() => {
+                return Err(format!(
+                    "sros2_keystore must be absolute: {}",
+                    dir.display()
+                ))
+            }
+            Some(dir) => {
+                let policy = crate::sros2::Sros2Policy::load(dir)
+                    .map_err(|e| format!("sros2_keystore: {e}"))?;
+                warnings.extend(
+                    policy
+                        .warnings
+                        .iter()
+                        .map(|w| format!("sros2_keystore: {w}")),
+                );
+                Some(std::sync::Arc::new(policy))
+            }
+        };
+
         Ok((
             Settings {
                 profile_path: self.profile_path.clone(),
@@ -992,6 +1021,7 @@ impl Config {
                     max_findings_per_datagram: self.max_findings_per_datagram,
                     motion,
                     legacy,
+                    sros2,
                 },
                 profile_trust: self.profile_trust.clone(),
             },

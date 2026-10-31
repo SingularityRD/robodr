@@ -62,8 +62,76 @@ impl std::fmt::Display for ReadError {
     }
 }
 
+/// Attempts [`read_capped_retrying`] makes before it gives up on a file
+/// that keeps failing with an I/O error.
+pub const READ_ATTEMPTS: u32 = 3;
+/// Pause before the second attempt (doubled before each further one).
+const READ_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Reason prefix of a spool file quarantined because it could not be read
+/// (see [`unreadable_reason`]); the exporters count these separately.
+pub const UNREADABLE: &str = "unreadable (I/O error";
+
+/// The quarantine reason for a file that failed [`READ_ATTEMPTS`] times.
+pub fn unreadable_reason(e: &io::Error) -> String {
+    format!("{UNREADABLE} after {READ_ATTEMPTS} attempts: {e}); quarantined, fix the cause and move it back to ready/ to re-drive")
+}
+
+/// [`read_capped`], retrying an I/O error (`EIO`, `EACCES`, ...; not a
+/// missing, irregular or oversized file) up to [`READ_ATTEMPTS`] times in
+/// all with a short pause, so one bad file is retried a bounded number of
+/// times instead of failing every run forever. The caller quarantines a
+/// file that still fails.
+pub fn read_capped_retrying(path: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
+    let mut pause = READ_RETRY_PAUSE;
+    let mut attempt = 1;
+    loop {
+        match read_capped(path, max) {
+            Err(ReadError::Io(_)) if attempt < READ_ATTEMPTS => {
+                std::thread::sleep(pause);
+                pause = pause.saturating_mul(2);
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+thread_local! {
+    static FAIL_READS: std::cell::RefCell<std::collections::HashMap<std::ffi::OsString, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Fault injection for tests: the next `times` [`read_capped`] calls on
+/// this thread for a file named `file_name` fail with `EIO`.
+#[doc(hidden)]
+pub fn inject_read_errors(file_name: &str, times: u32) {
+    FAIL_READS.with(|m| {
+        m.borrow_mut().insert(file_name.into(), times);
+    });
+}
+
+fn injected_read_error(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    FAIL_READS.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.get_mut(name) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 /// Read a regular, non-symlink file of at most `max` bytes.
 pub fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
+    if injected_read_error(path) {
+        return Err(ReadError::Io(io::Error::from_raw_os_error(5)));
+    }
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ReadError::Missing),
@@ -93,33 +161,11 @@ pub fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
     Ok(buf)
 }
 
-/// `O_NOFOLLOW` on Linux (all architectures Rust supports there use 0o400000
-/// except a few legacy ones; fall back to 0 = no extra protection).
+/// `O_NOFOLLOW` of the target, from the `libc` crate (T60). The earlier
+/// hand-written table fell back to 0 (no symlink protection at all) on
+/// every architecture it did not list (ppc64le, s390x, mips, ...).
 fn libc_o_nofollow() -> i32 {
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "x86", target_arch = "riscv64")
-    ))]
-    {
-        0o400_000
-    }
-    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-    {
-        0o100_000
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "x86",
-            target_arch = "riscv64",
-            target_arch = "aarch64",
-            target_arch = "arm"
-        )
-    )))]
-    {
-        0
-    }
+    libc::O_NOFOLLOW
 }
 
 /// Append one line (exactly one LF, at its end) to `path` and fsync it.
@@ -191,16 +237,6 @@ pub fn append_durable(path: &Path, line: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-mod sys {
-    //! `flock(2)`, declared by hand as `robodr-diode` and `robodr-blackbox`
-    //! do (no libc crate offline); std links libc on every unix target.
-    pub const LOCK_EX: i32 = 2;
-    pub const LOCK_NB: i32 = 4;
-    extern "C" {
-        pub fn flock(fd: i32, operation: i32) -> i32;
-    }
-}
-
 /// Attempts at `flock` before [`try_lock`] reports the lock as held.
 const LOCK_RETRIES: u32 = 25;
 /// Pause between two attempts (25 x 10 ms: a held lock is reported after
@@ -242,7 +278,7 @@ pub fn try_lock(p: &Path) -> io::Result<Option<File>> {
     loop {
         // SAFETY: `flock` only reads its two integer arguments; the
         // descriptor is owned by `f`, which outlives the call.
-        let rc = unsafe { sys::flock(f.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) };
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
             return Ok(Some(f));
         }
@@ -306,6 +342,14 @@ mod tests {
         append_durable(&d.join("log"), b"b\n").unwrap();
         assert_eq!(fs::read(d.join("log")).unwrap(), b"a\nb\n");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// T60: the symlink guard is never compiled out (the hand-written
+    /// table it replaced was 0 on unlisted architectures).
+    #[test]
+    fn o_nofollow_is_the_platform_value() {
+        assert_ne!(libc_o_nofollow(), 0);
+        assert_eq!(libc_o_nofollow(), libc::O_NOFOLLOW);
     }
 
     #[test]

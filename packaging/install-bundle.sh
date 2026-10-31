@@ -2,8 +2,10 @@
 # RoboDR offline install bundle: verify, install, upgrade, roll back.
 # POSIX sh; needs only coreutils (sha256sum), tar, gzip, the package
 # manager (dpkg for a .deb bundle; rpm, and rpm2archive or rpm2cpio + cpio,
-# for an RPM bundle) and, for signature checks, minisign. Runs on the
-# air-gapped robot (or its entry station).
+# for an RPM bundle) and, for signature checks, RoboDR's built-in verifier
+# (robodr-deliverd verify-minisign, installed by every release since
+# WP8a) or, before the first such release is installed, minisign. Runs on
+# the air-gapped robot (or its entry station).
 #
 # Package formats: a bundle holds exactly one package, robodr_*.deb or
 # robodr-focal_*.deb (Debian / Ubuntu / JetPack: dpkg) or robodr-*.rpm (RHEL /
@@ -13,9 +15,19 @@
 #
 #   install-bundle.sh verify  [--pubkey robodr-release.pub --tarball T]
 #   install-bundle.sh install [--pubkey robodr-release.pub --tarball T]
-#                             [--allow-downgrade] [--accept-unreadable SEG]...
+#                             [--allow-downgrade] [--allow-variant-switch]
+#                             [--accept-unreadable SEG]...
+#                             [--allow-gateway-restart | --defer-restart]
+#                             [--health-timeout SECS] [--no-auto-rollback]
+#                             [--keep N]
 #   install-bundle.sh list                 (releases kept for rollback)
-#   install-bundle.sh rollback <version>   (reinstall a kept release)
+#   install-bundle.sh rollback <version> [--allow-variant-switch]
+#                             [--allow-gateway-restart | --defer-restart]
+#                             [--health-timeout SECS]
+#                                          (reinstall a kept release)
+#   install-bundle.sh restart-pending [--allow-gateway-restart]
+#                                          (deferred gateway / executor restart)
+#   install-bundle.sh prune --keep N       (drop older kept releases)
 #   install-bundle.sh ring                 (SOC update-ring information)
 #
 # Options of install / rollback: --blackbox-dir DIR (repeatable; default
@@ -23,13 +35,31 @@
 # black-box directories whose segment format the release must read;
 # --accept-unreadable SEG (repeatable), see the format gate below.
 #
+# Signature verifier (T51). When the installed release carries the
+# built-in verifier (/usr/sbin/robodr-deliverd verify-minisign: RoboDR's
+# own minisign implementation, robodr-pkg::minisign, installed from a
+# release whose signature was checked), every signature is checked with
+# it, after its known-answer self-test; otherwise with the minisign
+# program. Once such a release is installed, ROBODR_ALLOW_UNSIGNED is
+# REFUSED: the unit can check signatures, so it must. Sign lab builds
+# with a lab key instead (minisign -G; --pubkey lab.pub).
+#
 # Signed installation (--pubkey and --tarball). The tarball's minisign
 # signature (<tarball>.minisig) is checked against the pinned release key;
 # when the release's SHA256SUMS and SHA256SUMS.minisig lie next to the
 # tarball, that signature is checked too and the tarball must be listed in
-# it with its hash. The verified tarball is then extracted into a private
-# directory (mktemp -d, 0700) and everything is checked and installed FROM
-# THERE: nothing is taken from an already extracted directory. If this
+# it with its hash. The tarball must be a regular file (no symlink, FIFO
+# or device). It is COPIED ONCE, with its signature and the release's
+# SHA256SUMS(.minisig), into a private directory (mktemp -d, 0700), and
+# every check (signature, trusted comment, checksum, listing) and the
+# extraction run on that private copy only: the file named by --tarball is
+# never read again, so swapping it after the check (another process of the
+# same user, removable media) cannot change what is installed. The
+# signature's trusted comment must name the tarball's file name (release.yml
+# signs with "robodr <version> <file>"; minisign's default comment
+# "file:<file>" is accepted too): a signed bundle renamed to look like
+# another one is refused. Everything is installed FROM THE PRIVATE
+# EXTRACTION: nothing is taken from an already extracted directory. If this
 # script itself runs from an extracted bundle directory, that directory
 # must be identical to the signed tarball's content, otherwise it was
 # modified after extraction and the run is REFUSED. The public key must
@@ -42,16 +72,55 @@
 # verify   the signed checks above (with --pubkey and --tarball), or only
 #          the SHA256SUMS of the directory this script runs from (a
 #          warning says the signature was not checked).
-# install  verify, then `dpkg -i` the .deb (`rpm -U` the .rpm), and keep a
-#          copy of it under /var/lib/robodr/releases/<version>/ for rollback.
+# install  verify, then `dpkg -i` the .deb (`rpm -U` the .rpm), check the
+#          unit's health and keep a copy of the package under
+#          /var/lib/robodr/releases/<version>/ for rollback.
 #          Services are not enabled; on upgrade the running ones are restarted
-#          by the package's maintainer scripts / scriptlets.
+#          by the package's maintainer scripts / scriptlets, except the
+#          gateway and the executor (see "Safety-state gate").
 #          Refuses to run without a signature check unless
-#          ROBODR_ALLOW_UNSIGNED=1 (lab only; the bundle is then the
-#          directory this script runs from).
+#          ROBODR_ALLOW_UNSIGNED=1 (lab only, and only on a unit without
+#          the built-in verifier; the bundle is then the directory this
+#          script runs from).
 # rollback reinstall a kept release (a dpkg downgrade, or `rpm -U
 #          --oldpackage`). Config files (conffiles, %config(noreplace)) and
 #          evidence are untouched; see OPERATIONS.md "Rollback".
+#
+# Safety-state gate (T9). Restarting robodr-firewall-gw drops the motion
+# commands queued in it (fail_closed: the bridge refuses motion while it
+# is down) and restarting robodr-executor drops its pending actions, so a
+# package upgrade never restarts them unguarded: the maintainer scripts
+# leave them running the old binaries and record them in
+# /var/lib/robodr/pending-restart. install, rollback and restart-pending
+# restart them only while the live safety state (agentd's status,
+# `robodr-deliverd safety-state`, the same peer-checked read deliverd's
+# own installs use) is idle or safe_state_active. If one of them is
+# running and the state is anything else (moving, a human nearby, e-stop,
+# unknown, no live safety feed configured), install and rollback are
+# REFUSED before anything changes, unless:
+#   --defer-restart          install now; the two keep running the old
+#                            binaries until `restart-pending` (gated) or
+#                            the next reboot;
+#   --allow-gateway-restart  restart them anyway (deliberate: motion
+#                            through the gateway is interrupted).
+# The state is checked again right before the restart (the upgrade takes
+# time); if it closed meanwhile the restart is deferred. A one-time
+# migration that must stop the gateway (the gateway user split, upgrading
+# from 0.1.0-alpha.1) cannot be deferred.
+#
+# Health check and automatic rollback (T50). After install and rollback,
+# every RoboDR unit that was active before must be active again (on two
+# consecutive checks one second apart) and, if robodr-agentd was active,
+# its heartbeat must be fresh, within --health-timeout seconds (default
+# 120). If not, install reinstalls the release that was installed before
+# (when it is kept under /var/lib/robodr/releases and allowed by the
+# security floor and the format gate), checks health again, and exits 1;
+# the failed release is not kept. --no-auto-rollback only reports.
+#
+# Kept releases (T50). --keep N (install) or `prune --keep N` keeps the N
+# newest kept releases and always the installed one. The formats file of
+# a pruned release is archived under releases/formats-archive, so the
+# black-box format gate still knows what that release wrote.
 #
 # RPM hosts. The .rpm is installed with `rpm -U` (with --oldpackage and
 # --replacepkgs: whether a downgrade or reinstall is allowed is decided
@@ -64,6 +133,13 @@
 # (<upstream with "-" as "~">-1). A package with an RPM epoch is refused
 # (versions would no longer compare as written). A bundle of one format is
 # refused on a host where robodr is installed through the other one.
+#
+# Variants. robodr and robodr-focal (.deb) conflict: installing one removes
+# the other (robodr-focal has no robodr-pulsard). A signed bundle must hold
+# the variant its signed file name names (robodr-focal-* holds
+# robodr-focal, robodr-* holds robodr), and install / rollback REFUSE to
+# replace the installed variant with the other one unless
+# --allow-variant-switch is given.
 #
 # Downgrades and the security floor. `install` of a release older than the
 # installed one is a downgrade and is REFUSED unless --allow-downgrade
@@ -79,13 +155,21 @@
 # e.g. blackbox_read=RBF1:1; a release without the file is a legacy release
 # that reads RBF1:1 only). Before dpkg runs, the first frame of every
 # segment file in the black-box directories is read (magic + record format
-# version). A segment in a recognised format (RBF1:<v>) the release cannot
-# read REFUSES the release, with the segment named: it could neither verify
-# nor extend that evidence. Export and archive the chain first
-# (OPERATIONS.md 7), or install a release that reads it, or accept that
-# exact segment with --accept-unreadable SEG. A file that does not start
-# with a RoboDR frame (damaged, or not RoboDR's) is reported and does not
-# block. Only segment files (seg-*.rbb) are judged: the other state
+# version). The segment files are writable by robodr-agentd, so a first
+# frame is only a claim: it blocks only when it is VERIFIED, i.e. its
+# format is one that a release installed on this unit writes, by records
+# root keeps and agentd cannot write (blackbox_write= of the installed
+# package's /usr/share/robodr/formats and of every kept release's formats
+# file under /var/lib/robodr/releases; RBF1:1, the legacy format, always).
+# A verified segment in a format the release cannot read REFUSES the
+# release, with the segment named: it could neither verify nor extend that
+# evidence. Export and archive the chain first (OPERATIONS.md 7), or
+# install a release that reads it, or accept that exact segment with
+# --accept-unreadable SEG. A segment claiming a format no release here
+# ever wrote (forged, damaged, or carried over from another unit) is
+# reported as UNKNOWN and does not block, nor does a file that does not
+# start with a RoboDR frame: a compromised agentd cannot block updates by
+# writing such a file. Only segment files (seg-*.rbb) are judged: the other state
 # journals on the unit (robodr-executor-journal/v1 under
 # /var/lib/robodr/executor, robodr-cp-journal/v1 and the RBBXBND1 evidence
 # exports under /var/lib/robodr/control-plane, the gateway's and
@@ -103,7 +187,11 @@
 # rpm with --root DIR (its own rpm database under DIR, `rpm --root DIR
 # --initdb` first).
 #
-# Exit: 0 ok, 1 verification failed or refused, 2 usage or environment error.
+# ROBODR_ROOT also prefixes /run/systemd/system: services are only
+# looked at (systemctl from PATH) when DIR/run/systemd/system exists.
+#
+# Exit: 0 ok, 1 verification failed, refused or unhealthy (rolled back),
+# 2 usage or environment error.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -117,8 +205,22 @@ legacy_read="RBF1:1"
 nl='
 '
 stage=""
+# The private copy of the signed tarball (set by stage_inputs).
+tarcopy=""
 # Temporary formats file of install / rollback (removed on every exit path).
 fmt=""
+# The built-in verifier and safety-state gate (robodr-deliverd of the
+# installed release, root-owned, from a verified package).
+deliverd_bin=$root/usr/sbin/robodr-deliverd
+deliverd_cfg=$root/etc/robodr/deliverd.json
+pending_file=$root/var/lib/robodr/pending-restart
+# Every RoboDR unit the maintainer scripts restart, and the two of them a
+# package upgrade restarts only through the safety-state gate.
+all_units="robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service
+robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service
+robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service
+robodr-depot.service"
+gated_units="robodr-executor.service robodr-firewall-gw.service"
 
 die() { echo "install-bundle: $2" >&2; exit "$1"; }
 
@@ -145,29 +247,110 @@ valid_path() {
     case "$1" in '' | *[[:space:]]* | *[*?[]*) return 1 ;; esac
 }
 
-verify_sig() { # pubkey file
-    command -v minisign >/dev/null 2>&1 || die 2 "minisign not installed; cannot check the signature"
-    [ -f "$1" ] || die 2 "public key $1 not found"
-    [ -f "$2" ] || die 2 "$2 not found"
-    [ -f "$2.minisig" ] || die 1 "signature $2.minisig not found"
-    minisign -V -q -p "$1" -m "$2" || die 1 "SIGNATURE CHECK FAILED for $2"
-    echo "install-bundle: signature OK ($2)"
+# Whether PATH is a regular file (not a symlink, FIFO, device or directory).
+regular_file() { # path
+    [ -f "$1" ] && [ ! -L "$1" ]
 }
 
-# The release's SHA256SUMS next to the tarball, if it is shipped signed.
-verify_release_sums() { # pubkey tarball
-    s=$(dirname "$2")/SHA256SUMS
-    if [ -f "$s.minisig" ]; then
-        [ -f "$s" ] || die 1 "$s.minisig without $s"
-        verify_sig "$1" "$s"
-        want=$(awk -v f="$(basename "$2")" '{ h = $1; sub(/^[0-9a-f]+ [ *]/, "") } $0 == f { print h; exit }' "$s")
-        [ -n "$want" ] || die 1 "$(basename "$2") is not listed in the signed $s"
-        [ "$(sha256sum "$2" | cut -d' ' -f1)" = "$want" ] ||
-            die 1 "CHECKSUM MISMATCH: $2 is not the tarball the signed $s lists"
-        echo "install-bundle: the tarball is listed in the signed release SHA256SUMS"
-    elif [ -f "$s" ]; then
+# Copy SRC once into the private staging directory as NAME; the copy must be
+# a regular file (cp -RP copies a symlink or FIFO swapped in after the check
+# as what it is, never through it, and the check below refuses it).
+stage_copy() { # src name
+    regular_file "$1" || die 1 "REFUSED: $1 is not a regular file (symlink, FIFO, device or directory)"
+    cp -RP -- "$1" "$stage/in/$2" 2>/dev/null || die 1 "cannot copy $1"
+    regular_file "$stage/in/$2" || die 1 "REFUSED: $1 changed while it was copied (no longer a regular file)"
+    chmod 0600 "$stage/in/$2"
+}
+
+# The private staging directory (0700): in/ the copied inputs, x/ the
+# extraction. Sets $stage.
+make_stage() {
+    stage=$(mktemp -d "${TMPDIR:-/tmp}/robodr-bundle.XXXXXXXX") || die 2 "mktemp failed"
+    chmod 0700 "$stage"
+    mkdir -m 0700 "$stage/in" "$stage/x"
+}
+
+# Copy the tarball, its signature and (if shipped signed) the release's
+# SHA256SUMS next to it into the private directory, each read exactly once.
+# Every later check reads the copies only. Sets $tname, $tarcopy and
+# $sumscopy.
+stage_inputs() { # tarball
+    tname=$(basename "$1")
+    case "$tname" in
+    '' | . | .. | SHA256SUMS* | *[!A-Za-z0-9._+~-]*) die 1 "REFUSED: unexpected tarball file name '$tname'" ;;
+    esac
+    make_stage
+    stage_copy "$1" "$tname"
+    tarcopy=$stage/in/$tname
+    if [ -e "$1.minisig" ] || [ -L "$1.minisig" ]; then
+        stage_copy "$1.minisig" "$tname.minisig"
+    fi
+    sumscopy=""
+    s=$(dirname "$1")/SHA256SUMS
+    if [ -e "$s.minisig" ] || [ -L "$s.minisig" ]; then
+        if [ ! -e "$s" ] && [ ! -L "$s" ]; then die 1 "$s.minisig without $s"; fi
+        stage_copy "$s" SHA256SUMS
+        stage_copy "$s.minisig" SHA256SUMS.minisig
+        sumscopy=$stage/in/SHA256SUMS
+    elif [ -e "$s" ]; then
         echo "install-bundle: note: $s has no SHA256SUMS.minisig next to it; not used"
     fi
+}
+
+# Check FILE (a private copy) against FILE.minisig with the pinned key, and
+# that the signature's trusted comment names NAME: "robodr <version> NAME"
+# (release.yml) or minisign's default "...file:NAME...". The comment is
+# signed too (minisign -V checks the global signature over it), so a
+# signed file renamed to pass for another one is refused.
+verify_sig() { # pubkey file name
+    [ -f "$1" ] || die 2 "public key $1 not found"
+    [ -f "$2" ] || die 2 "$3 not found"
+    [ -f "$2.minisig" ] || die 1 "signature $3.minisig not found"
+    if builtin_verifier; then
+        if [ "$selftest_done" -eq 0 ]; then
+            "$deliverd_bin" verify-minisign --self-test >/dev/null 2>&1 ||
+                die 2 "the built-in verifier ($deliverd_bin verify-minisign) fails its self-test; refusing to trust it"
+            selftest_done=1
+        fi
+        tc=$("$deliverd_bin" verify-minisign --pubkey "$1" --file "$2" --sig "$2.minisig") ||
+            die 1 "SIGNATURE CHECK FAILED for $3 (built-in verifier)"
+        echo "install-bundle: verifier: built-in ($deliverd_bin verify-minisign)"
+    else
+        command -v minisign >/dev/null 2>&1 ||
+            die 2 "no signature verifier: neither the built-in one ($deliverd_bin, installed with a release) nor minisign is available"
+        tc=$(minisign -V -Q -p "$1" -m "$2" -x "$2.minisig") || die 1 "SIGNATURE CHECK FAILED for $3"
+    fi
+    ok_name=0
+    set -f
+    for w in $(printf '%s
+' "$tc" | head -n1 | tr '	' ' '); do
+        case "$w" in "$3" | "file:$3") ok_name=1 ;; esac
+    done
+    set +f
+    [ "$ok_name" -eq 1 ] ||
+        die 1 "REFUSED: the signature of $3 is valid but its trusted comment ('$tc') names another file: a signed file renamed to pass for $3"
+    echo "install-bundle: signature OK ($3; trusted comment: $tc)"
+}
+
+# Whether the installed release carries the built-in verifier (a regular,
+# root-owned executable that lists verify-minisign in its usage).
+selftest_done=0
+builtin_verifier() {
+    regular_file "$deliverd_bin" && [ -x "$deliverd_bin" ] || return 1
+    [ "$(stat -c %u "$deliverd_bin")" = 0 ] || return 1
+    "$deliverd_bin" --help 2>/dev/null | grep -q 'verify-minisign'
+}
+
+# The release's SHA256SUMS next to the tarball, if it is shipped signed
+# (both read from the private copies).
+verify_release_sums() { # pubkey
+    [ -n "$sumscopy" ] || return 0
+    verify_sig "$1" "$sumscopy" SHA256SUMS
+    want=$(awk -v f="$tname" '{ h = $1; sub(/^[0-9a-f]+ [ *]/, "") } $0 == f { print h; exit }' "$sumscopy")
+    [ -n "$want" ] || die 1 "$tname is not listed in the signed release SHA256SUMS"
+    [ "$(sha256sum "$tarcopy" | cut -d' ' -f1)" = "$want" ] ||
+        die 1 "CHECKSUM MISMATCH: $tname is not the tarball the signed release SHA256SUMS lists"
+    echo "install-bundle: the tarball is listed in the signed release SHA256SUMS"
 }
 
 # Whether every file of DIR is listed in DIR/SHA256SUMS with its hash and
@@ -189,20 +372,18 @@ verify_sums() { # dir
     echo "install-bundle: checksums OK"
 }
 
-# Extract the verified tarball into a private directory; sets $bundle.
-stage_tarball() { # tarball
-    stage=$(mktemp -d "${TMPDIR:-/tmp}/robodr-bundle.XXXXXXXX") || die 2 "mktemp failed"
-    chmod 0700 "$stage"
+# Extract the verified private copy into the private directory; sets $bundle.
+stage_tarball() { # copy name
     tops=$(tar -tzf "$1" | sed 's|^\./||; s|/.*||' | LC_ALL=C sort -u) ||
-        die 1 "$1 is not a readable tar.gz"
+        die 1 "$2 is not a readable tar.gz"
     case "$tops" in
     *"$nl"* | '' | . | .. | *[!A-Za-z0-9._+~-]*)
-        die 1 "$1 must hold exactly one top-level directory (found: $(echo "$tops" | tr '\n' ' '))"
+        die 1 "$2 must hold exactly one top-level directory (found: $(echo "$tops" | tr '\n' ' '))"
         ;;
     esac
-    tar -xzf "$1" -C "$stage" --no-same-owner || die 1 "extracting $1 failed"
-    bundle=$stage/$tops
-    if [ ! -d "$bundle" ] || [ -L "$bundle" ]; then die 1 "$1: $tops is not a directory"; fi
+    tar -xzf "$1" -C "$stage/x" --no-same-owner || die 1 "extracting $2 failed"
+    bundle=$stage/x/$tops
+    if [ ! -d "$bundle" ] || [ -L "$bundle" ]; then die 1 "$2: $tops is not a directory"; fi
 }
 
 # The directory this script runs from, if it claims to be a bundle, must be
@@ -278,6 +459,11 @@ ver_lt() { # a b
 }
 
 # The installed robodr packages: "<name> <version>" lines (none, or one).
+# A package counts as installed in every dpkg state but not-installed and
+# config-files: half-installed, unpacked, half-configured and
+# triggers-awaiting/pending packages too (a failed or interrupted upgrade
+# must not let the next install pass as a first install, skipping the
+# downgrade and variant checks).
 installed_pkgs() { # format
     case "$1" in
     deb)
@@ -285,7 +471,10 @@ installed_pkgs() { # format
         for p in robodr robodr-focal; do
             # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
             v=$(dpkg_query -W -f '${db:Status-Abbrev} ${Version}' "$p" 2>/dev/null || true)
-            case "$v" in ii*) echo "$p ${v##* }" ;; esac
+            case "$v" in
+            '' | ?n* | ?c*) ;;
+            *) echo "$p ${v##* }" ;;
+            esac
         done
         ;;
     rpm)
@@ -352,6 +541,19 @@ ondisk_formats() {
     done
 }
 
+# The formats releases installed on this unit write (one per line): the
+# installed package's formats file and every kept release's, both written
+# by root only, plus the legacy format. A segment may block only in one of
+# these (see "Black-box format gate" above).
+written_formats() {
+    echo "$legacy_read"
+    for f in "$root/usr/share/robodr/formats" "$releases"/*/formats "$releases"/formats-archive/*.formats; do
+        if [ -f "$f" ] && [ ! -L "$f" ]; then
+            sed -n 's/^blackbox_write=//p' "$f" | tr ',' '\n'
+        fi
+    done
+}
+
 # Whether SEG was named by --accept-unreadable.
 accepted() { # segment
     a=$(readlink -f "$1" 2>/dev/null || echo "$1")
@@ -373,11 +575,19 @@ check_formats() { # formats-file version
         case "$r" in RBF1:*) v=${r#RBF1:}; [ "$v" -gt "$maxv" ] 2>/dev/null && maxv=$v ;; esac
     done
     set +f
+    written=" $(written_formats | tr '\n' ' ') "
     report=$(ondisk_formats | while read -r fmt seg; do
         case " $reads " in *" $fmt "*) continue ;; esac
         case "$fmt" in
         RBF1:*)
-            if [ -n "$(accepted "$seg")" ]; then echo "ACCEPTED $fmt $seg"; else echo "BAD $fmt $seg"; fi
+            if [ -n "$(accepted "$seg")" ]; then
+                echo "ACCEPTED $fmt $seg"
+            else
+                case "$written" in
+                *" $fmt "*) echo "BAD $fmt $seg" ;;
+                *) echo "UNVERIFIED $fmt $seg" ;;
+                esac
+            fi
             ;;
         *) echo "UNKNOWN $fmt $seg" ;;
         esac
@@ -385,6 +595,7 @@ check_formats() { # formats-file version
     printf '%s\n' "$report" | while read -r kind fmt seg; do
         case "$kind" in
         UNKNOWN) echo "install-bundle: WARNING: $seg is not a RoboDR black-box frame ($fmt): damaged, or not a RoboDR segment; the format gate cannot judge it and it does not block. Check it: robodr-blackbox verify $(dirname "$seg")" ;;
+        UNVERIFIED) echo "install-bundle: WARNING: UNKNOWN: $seg claims $fmt, which no release installed on this unit writes (installed and kept releases write: $(written_formats | LC_ALL=C sort -u | tr '\n' ' ')): forged, damaged or from another unit; the claim cannot be verified and does not block. Check it: robodr-blackbox verify $(dirname "$seg")" ;;
         ACCEPTED) echo "install-bundle: WARNING: $seg is $fmt, which $2 does not read; accepted by --accept-unreadable: $2 will neither verify nor extend it" ;;
         esac
     done
@@ -457,8 +668,8 @@ ring_note() { # [deb-version]
         fi
     fi
     bs=$(sed -n 's/^bundle_sha256=//p' "$ring_env")
-    if [ -n "${tarball:-}" ] && [ -n "$bs" ] && [ -f "$tarball" ]; then
-        if [ "$(sha256sum "$tarball" | cut -d' ' -f1)" = "$bs" ]; then
+    if [ -n "$tarcopy" ] && [ -n "$bs" ] && [ -f "$tarcopy" ]; then
+        if [ "$(sha256sum "$tarcopy" | cut -d' ' -f1)" = "$bs" ]; then
             echo "install-bundle: the tarball is the ring's bundle ($bs)"
         else
             echo "install-bundle: note: the tarball is not the ring's bundle $bs (information only)"
@@ -484,13 +695,230 @@ find_pkg() { # dir
     case "$pkgfmt:$pkg" in deb:robodr | deb:robodr-focal | rpm:robodr) ;; *) die 1 "unexpected package $pkg in $pkgfile" ;; esac
 }
 
+# The variant a signed tarball's name names: robodr-focal-* holds
+# robodr-focal, any other robodr-* holds robodr.
+variant_of_name() { # tarball file name
+    case "$1" in robodr-focal-*) echo robodr-focal ;; *) echo robodr ;; esac
+}
+
+# Refuse to replace the installed variant (robodr / robodr-focal) with the
+# other one unless --allow-variant-switch: robodr-focal has no
+# robodr-pulsard, so a switch silently removes a detection layer.
+check_variant() { # package installed-lines
+    others=$(printf '%s\n' "$2" | awk -v p="$1" 'NF && $1 != p { print $1 }')
+    [ -n "$others" ] || return 0
+    o=$(echo "$others" | head -n1)
+    if [ "$allow_variant_switch" -ne 1 ]; then
+        die 1 "REFUSED: $o is installed and this release is $1: installing it REPLACES $o (dpkg removes it; robodr-focal has no robodr-pulsard). Pass --allow-variant-switch if this switch is deliberate."
+    fi
+    echo "install-bundle: WARNING: switching from $o to $1 (--allow-variant-switch)"
+}
+
+# ------------------------------------------------------------- services
+# Whether systemd runs here (the unit tests run without: ROBODR_ROOT).
+have_systemd() { [ -d "$root/run/systemd/system" ]; }
+
+# The RoboDR units active now (one per line).
+active_units() {
+    have_systemd || return 0
+    for u in $all_units; do
+        if systemctl is-active --quiet "$u" 2>/dev/null; then echo "$u"; fi
+    done
+}
+
+# Whether the gate is open now: robodr-deliverd safety-state (the installed
+# release's) says idle or safe_state_active. Sets $gate_why.
+gate_open() {
+    gate_why="no safety-state reader ($deliverd_bin)"
+    [ -x "$deliverd_bin" ] || return 1
+    gate_rc=0
+    if [ -f "$deliverd_cfg" ]; then
+        gate_out=$("$deliverd_bin" safety-state --config "$deliverd_cfg" 2>&1) || gate_rc=$?
+    else
+        gate_out=$("$deliverd_bin" safety-state 2>&1) || gate_rc=$?
+    fi
+    gate_why=$(printf '%s\n' "$gate_out" | tr -d '\n' | tr -s ' ' | cut -c1-300)
+    [ "$gate_rc" -eq 0 ]
+}
+
+# Decide, before any change, what happens to the running gated units.
+# Sets $gate (none: none running; open; override; defer) or refuses.
+decide_gate() { # active-units what
+    gated_active=""
+    for u in $gated_units; do
+        case "$nl$1$nl" in *"$nl$u$nl"*) gated_active="$gated_active $u" ;; esac
+    done
+    gate=none
+    [ -n "$gated_active" ] || return 0
+    if [ "$allow_gateway_restart" -eq 1 ]; then
+        gate=override
+        echo "install-bundle: WARNING: restarting$gated_active without the safety-state gate (--allow-gateway-restart)"
+    elif gate_open; then
+        gate=open
+        echo "install-bundle: safety-state gate open:$gated_active will be restarted ($gate_why)"
+    elif [ "$defer_restart" -eq 1 ]; then
+        gate=defer
+        echo "install-bundle: safety-state gate closed ($gate_why): the restart of$gated_active is deferred (--defer-restart); run '$0 restart-pending' when the robot is idle or in its safe state"
+    else
+        die 1 "REFUSED: $2 would restart$gated_active, and the live safety state does not allow it ($gate_why). Wait until the robot is idle or in its safe state, or pass --defer-restart (install now, restart later with '$0 restart-pending'), or --allow-gateway-restart (deliberate: motion through the gateway is interrupted). OPERATIONS.md section 7."
+    fi
+    # The one-time gateway user migration (upgrade from 0.1.0-alpha.1)
+    # stops the gateway inside the maintainer script: never deferred.
+    if [ "$gate" = defer ] && [ ! -e "$root/var/lib/robodr/.exporter-users-migrated" ]; then
+        case " $gated_active " in *" robodr-firewall-gw.service "*)
+            die 1 "REFUSED: this upgrade must stop robodr-firewall-gw once to move its state to its own user (upgrade from 0.1.0-alpha.1); that cannot be deferred. Run it when the robot is idle or in its safe state, or with --allow-gateway-restart." ;;
+        esac
+    fi
+}
+
+# Install a package file with the gate's decision handed to the
+# maintainer scripts (ROBODR_GATED_RESTART=allow lets the one-time
+# gateway migration stop the gateway; nothing else reads it).
+pkg_install_gated() { # file
+    if [ "$gate" = open ] || [ "$gate" = override ]; then
+        ROBODR_GATED_RESTART=allow pkg_install "$1"
+    else
+        pkg_install "$1"
+    fi
+}
+
+# Restart what the maintainer scripts left in the pending-restart file,
+# through the gate (checked again now) unless overridden. Returns 0 when
+# nothing is pending afterwards.
+restart_pending() { # gate-decision
+    regular_file "$pending_file" || return 0
+    if ! have_systemd; then return 0; fi
+    units=$(LC_ALL=C sort -u "$pending_file")
+    want=""
+    for u in $units; do
+        case " $gated_units " in
+        *" $u "*) want="$want $u" ;;
+        *) echo "install-bundle: WARNING: ignoring '$u' in $pending_file (not a gated unit)" ;;
+        esac
+    done
+    if [ -z "$want" ]; then rm -f "$pending_file"; return 0; fi
+    case "$1" in
+    override) ;;
+    open | check)
+        if ! gate_open; then
+            echo "install-bundle: WARNING: the safety state no longer allows restarting$want ($gate_why): deferred; run '$0 restart-pending' when the robot is idle or in its safe state"
+            return 1
+        fi
+        ;;
+    *)
+        echo "install-bundle: restart of$want deferred ($pending_file); run '$0 restart-pending' when the robot is idle or in its safe state"
+        return 1
+        ;;
+    esac
+    for u in $want; do
+        echo "install-bundle: restarting $u on the new binaries"
+        systemctl try-restart "$u" || echo "install-bundle: WARNING: restarting $u failed"
+    done
+    rm -f "$pending_file"
+}
+
+# Whether the unit is healthy now: every unit in ACTIVE is active, and
+# agentd's heartbeat is fresh if agentd is among them. Sets $health_why.
+healthy_now() { # active-units
+    health_why=""
+    for u in $1; do
+        systemctl is-active --quiet "$u" 2>/dev/null || health_why="$health_why $u not active;"
+    done
+    case "$nl$1$nl" in
+    *"${nl}robodr-agentd.service$nl"*)
+        # A release without `safety-state` (before WP8a) cannot report
+        # the heartbeat: only the units are checked then.
+        if ! "$deliverd_bin" --help 2>/dev/null | grep -q 'safety-state'; then
+            agentd_note=" (agentd heartbeat not checked: this release's robodr-deliverd has no safety-state)"
+            [ -z "$health_why" ]
+            return
+        fi
+        agentd_note=", agentd heartbeat fresh"
+        gate_open || true
+        case "$gate_out" in
+        *'"agentd_fresh": true'*) ;;
+        *) health_why="$health_why agentd heartbeat not fresh;" ;;
+        esac
+        ;;
+    esac
+    [ -z "$health_why" ]
+}
+
+# Wait up to --health-timeout for two consecutive healthy checks.
+health_check() { # active-units
+    have_systemd || return 0
+    [ -n "$1" ] || { echo "install-bundle: health: no RoboDR unit was running; nothing to check"; return 0; }
+    waited=0
+    good=0
+    while :; do
+        if healthy_now "$1"; then
+            good=$((good + 1))
+            if [ "$good" -ge 2 ]; then
+                echo "install-bundle: health OK: $(echo "$1" | tr '\n' ' ')active again${agentd_note:-}"
+                return 0
+            fi
+        else
+            good=0
+        fi
+        [ "$waited" -lt "$health_timeout" ] || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "install-bundle: HEALTH CHECK FAILED after ${health_timeout}s:$health_why" >&2
+    return 1
+}
+
+# Keep the N newest kept releases and the installed one; archive the
+# formats file of every pruned release (the format gate's record).
+prune_releases() { # n installed-version
+    [ -d "$releases" ] || return 0
+    vs=""
+    for d in "$releases"/*/; do
+        [ -d "$d" ] || continue
+        v=$(basename "$d")
+        valid_version "$v" || continue
+        [ ! -L "${d%/}" ] || continue
+        vs="$vs$v$nl"
+    done
+    # Newest first, by the package manager's comparison (insertion sort:
+    # a handful of versions).
+    sorted=""
+    for v in $vs; do
+        out=""
+        placed=0
+        for w in $sorted; do
+            if [ "$placed" -eq 0 ] && ver_lt "$w" "$v"; then out="$out$v$nl"; placed=1; fi
+            out="$out$w$nl"
+        done
+        [ "$placed" -eq 1 ] || out="$out$v$nl"
+        sorted=$out
+    done
+    i=0
+    for v in $sorted; do
+        i=$((i + 1))
+        if [ "$i" -le "$1" ] || [ "$v" = "$2" ]; then continue; fi
+        if [ -f "$releases/$v/formats" ]; then
+            install -d -m 0750 "$releases/formats-archive"
+            install -m 0644 "$releases/$v/formats" "$releases/formats-archive/$v.formats"
+        fi
+        rm -rf -- "${releases:?}/$v"
+        echo "install-bundle: pruned kept release $v (--keep $1)"
+    done
+}
+
 pubkey=""
 tarball=""
 bb_dirs=""
 accept_unreadable=""
 allow_downgrade=0
+allow_variant_switch=0
+allow_gateway_restart=0
+defer_restart=0
+auto_rollback=1
+health_timeout=120
+keep=""
 cmd=${1:-}
-[ -n "$cmd" ] || die 2 "usage: $0 verify|install|list|rollback|ring ..."
+[ -n "$cmd" ] || die 2 "usage: $0 verify|install|list|rollback|restart-pending|prune|ring ..."
 shift
 version_arg=""
 have_version=0
@@ -511,6 +939,24 @@ while [ $# -gt 0 ]; do
         shift 2
         ;;
     --allow-downgrade) allow_downgrade=1; shift ;;
+    --allow-variant-switch) allow_variant_switch=1; shift ;;
+    --allow-gateway-restart) allow_gateway_restart=1; shift ;;
+    --defer-restart) defer_restart=1; shift ;;
+    --no-auto-rollback) auto_rollback=0; shift ;;
+    --health-timeout)
+        [ $# -ge 2 ] || die 2 "--health-timeout needs a value"
+        case "$2" in '' | *[!0-9]*) die 2 "--health-timeout: seconds (0-3600)" ;; esac
+        if [ "${#2}" -gt 4 ] || [ "$2" -gt 3600 ]; then die 2 "--health-timeout: seconds (0-3600)"; fi
+        health_timeout=$2
+        shift 2
+        ;;
+    --keep)
+        [ $# -ge 2 ] || die 2 "--keep needs a value"
+        case "$2" in '' | *[!0-9]*) die 2 "--keep: a number of releases (1-99)" ;; esac
+        if [ "${#2}" -gt 2 ] || [ "$2" -lt 1 ]; then die 2 "--keep: a number of releases (1-99)"; fi
+        keep=$2
+        shift 2
+        ;;
     -*) die 2 "unknown option $1" ;;
     *)
         [ "$have_version" -eq 0 ] || die 2 "unexpected argument $1"
@@ -521,6 +967,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$bb_dirs" ] || bb_dirs="$root/var/lib/robodr/blackbox$nl$root/var/lib/robodr/fleet/journal"
+if [ "$allow_gateway_restart" -eq 1 ] && [ "$defer_restart" -eq 1 ]; then
+    die 2 "--allow-gateway-restart and --defer-restart exclude each other"
+fi
 
 # Verify; sets $signed and $bundle (the directory to install from).
 do_verify() {
@@ -528,9 +977,10 @@ do_verify() {
         if [ -z "$pubkey" ] || [ -z "$tarball" ]; then
             die 2 "--pubkey and --tarball go together"
         fi
-        verify_sig "$pubkey" "$tarball"
-        verify_release_sums "$pubkey" "$tarball"
-        stage_tarball "$tarball"
+        stage_inputs "$tarball"
+        verify_sig "$pubkey" "$tarcopy" "$tname"
+        verify_release_sums "$pubkey"
+        stage_tarball "$tarcopy" "$tname"
         verify_sums "$bundle"
         check_running_copy "$bundle" "$tarball"
         signed=1
@@ -551,13 +1001,24 @@ install)
     [ "$have_version" -eq 0 ] || die 2 "install takes no version"
     need_root
     do_verify
-    if [ "$signed" -ne 1 ] && [ "${ROBODR_ALLOW_UNSIGNED:-0}" != 1 ]; then
-        die 1 "refusing to install without a signature check (--pubkey/--tarball); ROBODR_ALLOW_UNSIGNED=1 for lab use"
+    if [ "$signed" -ne 1 ]; then
+        if builtin_verifier; then
+            die 1 "REFUSED: refusing to install without a signature check (--pubkey/--tarball): this unit has the built-in verifier ($deliverd_bin), so ROBODR_ALLOW_UNSIGNED is not accepted. Sign lab builds with a lab key (minisign -G) and pass --pubkey."
+        fi
+        if [ "${ROBODR_ALLOW_UNSIGNED:-0}" != 1 ]; then
+            die 1 "refusing to install without a signature check (--pubkey/--tarball); ROBODR_ALLOW_UNSIGNED=1 for lab use (only on a unit without the built-in verifier)"
+        fi
+        echo "install-bundle: UNSIGNED install (ROBODR_ALLOW_UNSIGNED=1, lab only): no signature was checked"
     fi
     find_pkg "$bundle"
+    if [ "$signed" -eq 1 ] && [ "$pkgfmt" = deb ] && [ "$pkg" != "$(variant_of_name "$tname")" ]; then
+        die 1 "REFUSED: the signed tarball $tname names the $(variant_of_name "$tname") variant but holds $pkg"
+    fi
     ver=$(pkg_version "$pkgfile")
     valid_version "$ver" || die 1 "the package version $ver is malformed"
     check_other_format "$pkgfmt"
+    have=$(installed_pkgs "$pkgfmt")
+    check_variant "$pkg" "$have"
     prev=""
     cur=""
     while read -r p v; do
@@ -565,7 +1026,7 @@ install)
         prev="$prev $p $v"
         cur=$v
     done <<EOF
-$(installed_pkgs "$pkgfmt")
+$have
 EOF
     echo "install-bundle: installing $pkg $ver ($pkgfmt; currently installed:${prev:- none})"
     if [ -n "$cur" ] && ver_lt "$ver" "$cur"; then
@@ -584,7 +1045,45 @@ EOF
     fmt=$(mktemp)
     pkg_formats "$pkgfile" >"$fmt"
     check_formats "$fmt" "$ver" || { rm -f "$fmt"; exit 1; }
-    pkg_install "$pkgfile"
+    before=$(active_units)
+    decide_gate "$before" "installing $ver"
+    pkg_install_gated "$pkgfile"
+    restart_pending "$gate" || true
+    if ! health_check "$before"; then
+        if [ "$auto_rollback" -ne 1 ]; then
+            die 1 "$pkg $ver is installed but the unit is not healthy (--no-auto-rollback): check the units, then '$0 rollback <version>'"
+        fi
+        if [ -z "$cur" ] || [ "$cur" = "$ver" ]; then
+            die 1 "$pkg $ver is installed but the unit is not healthy, and there is no earlier release to roll back to"
+        fi
+        prevdir=$releases/$cur
+        if [ ! -d "$prevdir" ] || [ -L "$prevdir" ]; then
+            die 1 "$pkg $ver is installed but the unit is not healthy, and the release it replaced ($cur) is not kept in $releases: roll back by hand"
+        fi
+        echo "install-bundle: AUTOMATIC ROLLBACK to $cur"
+        (cd "$prevdir" && sha256sum --strict --quiet --ignore-missing -c SHA256SUMS) ||
+            die 1 "automatic rollback impossible: the kept release $cur fails its checksums"
+        find_pkg "$prevdir"
+        f=$(floor_now)
+        if [ -n "$f" ] && ver_lt "$cur" "$f"; then
+            die 1 "automatic rollback impossible: $cur is below the security floor $f; $pkg $ver stays installed, unhealthy"
+        fi
+        pfmt=$(mktemp)
+        if [ -f "$prevdir/formats" ]; then cp "$prevdir/formats" "$pfmt"; else pkg_formats "$pkgfile" >"$pfmt"; fi
+        if ! check_formats "$pfmt" "$cur"; then
+            rm -f "$pfmt"
+            die 1 "automatic rollback impossible (format gate); $ver stays installed, unhealthy"
+        fi
+        rm -f "$pfmt"
+        pkg_install_gated "$pkgfile"
+        restart_pending "$gate" || true
+        if health_check "$before"; then
+            echo "install-bundle: rolled back to $cur; it is healthy" >&2
+        else
+            echo "install-bundle: rolled back to $cur, which is NOT healthy either: check the units" >&2
+        fi
+        die 1 "$pkg $ver failed its post-install health check and was rolled back to $cur (the failed release is not kept)"
+    fi
     install -d -m 0750 "$releases/$ver"
     # One package per kept version: the variant installed last (robodr and
     # robodr-focal share version numbers).
@@ -594,6 +1093,44 @@ EOF
     if [ -s "$fmt" ]; then install -m 0644 "$fmt" "$releases/$ver/formats"; fi
     rm -f "$fmt"
     echo "install-bundle: kept $releases/$ver for rollback"
+    if [ -n "$keep" ]; then prune_releases "$keep" "$ver"; fi
+    ;;
+restart-pending)
+    [ "$have_version" -eq 0 ] || die 2 "restart-pending takes no version"
+    need_root
+    if [ "$allow_gateway_restart" -eq 1 ]; then g=override; else g=check; fi
+    # A package whose configuration was deferred by its maintainer script
+    # (the one-time gateway migration with the gate closed): configure it
+    # now, through the gate.
+    if command -v dpkg >/dev/null 2>&1; then
+        for p in robodr robodr-focal; do
+            # shellcheck disable=SC2016 # dpkg-query format
+            st=$(dpkg_query -W -f '${db:Status-Abbrev}' "$p" 2>/dev/null || true)
+            case "$st" in
+            ?[FU]*)
+                if [ "$g" = check ] && ! gate_open; then
+                    die 1 "$p is not configured and the safety state does not allow restarting the gateway ($gate_why); try again when idle or in the safe state, or with --allow-gateway-restart"
+                fi
+                echo "install-bundle: configuring $p (deferred configuration)"
+                ROBODR_GATED_RESTART=allow dpkg_ --configure "$p"
+                ;;
+            esac
+        done
+    fi
+    if ! regular_file "$pending_file"; then
+        echo "install-bundle: nothing pending"
+        exit 0
+    fi
+    restart_pending "$g" || exit 1
+    echo "install-bundle: pending restarts done"
+    ;;
+prune)
+    [ "$have_version" -eq 0 ] || die 2 "prune takes no version"
+    need_root
+    [ -n "$keep" ] || die 2 "prune needs --keep N"
+    if ! command -v dpkg >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then pkgfmt=rpm; fi
+    inst=$( (installed_pkgs "${pkgfmt:-deb}") | sed -n '1s/^[^ ]* //p')
+    prune_releases "$keep" "$inst"
     ;;
 list)
     [ -d "$releases" ] || die 1 "no releases kept in $releases"
@@ -628,16 +1165,21 @@ rollback)
     [ "$(pkg_version "$pkgfile")" = "$version_arg" ] ||
         die 1 "the kept package in $dir is not version $version_arg"
     check_other_format "$pkgfmt"
+    check_variant "$pkg" "$(installed_pkgs "$pkgfmt")"
     floor_from_ring
     check_floor "$version_arg"
     fmt=$(mktemp)
     if [ -f "$dir/formats" ]; then cp "$dir/formats" "$fmt"; else pkg_formats "$pkgfile" >"$fmt"; fi
     check_formats "$fmt" "$version_arg" || { rm -f "$fmt"; exit 1; }
     rm -f "$fmt"
+    before=$(active_units)
+    decide_gate "$before" "rolling back to $version_arg"
     echo "install-bundle: rolling back to $pkg $version_arg ($pkgfmt)"
-    pkg_install "$pkgfile"
+    pkg_install_gated "$pkgfile"
+    restart_pending "$gate" || true
+    health_check "$before" || die 1 "rolled back to $version_arg, but the unit is not healthy: check the units"
     ;;
 *)
-    die 2 "unknown command $cmd (verify|install|list|rollback|ring)"
+    die 2 "unknown command $cmd (verify|install|list|rollback|restart-pending|prune|ring)"
     ;;
 esac

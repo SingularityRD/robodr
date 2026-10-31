@@ -15,8 +15,12 @@ description = "RoboDR live daemon: capture / pcap / JSONL events -> ROS 2 pipeli
 # TLS stack (mutual TLS, `src/control/tls.rs`), the same crates and versions
 # robodr-uplink uses (workspace Cargo.toml).
 [dependencies]
+robodr-buildinfo = { workspace = true }
 robodr-agent = { workspace = true }
 robodr-blackbox = { workspace = true }
+# Classification of systemd encrypted credentials (key_protection, T66).
+robodr-signer = { workspace = true }
+zeroize = { workspace = true }
 # std_msgs / Odometry decoders of the live safety-state feed.
 robodr-cdr = { workspace = true }
 # Passive SEDP + user-DATA walk for safety-state topics (`safety`).

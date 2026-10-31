@@ -297,7 +297,16 @@ fn f5_feed_hand_off_never_blocks() {
         "{:?}",
         t0.elapsed()
     );
-    assert!(f.status().dropped >= 10);
+    // Either the feed thread is stuck behind the full listener and the
+    // hand-off overflowed (dropped), or the kernel let it connect and it
+    // kept up (lines queued or sent). Which one happens depends on the
+    // host's socket backlog; the property under test is the timing above.
+    let s = f.status();
+    let accounted = s.dropped + s.sent + s.pending as u64;
+    assert!(
+        s.dropped >= 10 || accounted >= robodr_firewall_gw::feed::HANDOFF as u64,
+        "{s:?}"
+    );
 }
 
 /// F8: while a restriction is in force the sport `SpeedLevel` cannot be
@@ -352,4 +361,38 @@ fn too_many_points_is_reported_as_such() {
     assert_eq!(devs.len(), 1, "{devs:?}");
     assert_eq!(devs[0].deviation.rule, rules::TRAJECTORY_REJECTED);
     assert!(devs[0].deviation.detail.contains("too_many_points"));
+}
+
+/// Executor review finding 3: the gateway applied any cap > 0, so a
+/// restriction file with `max_linear_speed: 0.0001` or `factor: 0.01`
+/// near-stopped a humanoid's locomotion (a fall). On a robot that
+/// balances it is now ignored (reported as `restriction_error`) and the
+/// restriction in force stays.
+#[test]
+fn executor_review_f3_restriction_floor_on_a_humanoid() {
+    use robodr_firewall_gw::runtime::apply_restriction;
+    let mut g = Gateway::new(
+        &g1_channels_config(|_| {}),
+        &g1_channels_profile(),
+        &g1_channels_firewall(),
+    )
+    .unwrap();
+    let r = |lin: Option<f64>, factor: Option<f64>| Restriction {
+        id: "r".into(),
+        max_linear_speed: lin,
+        max_joint_speed: None,
+        factor,
+        expires_unix_ms: u64::MAX,
+    };
+    let ok = r(None, Some(0.5));
+    assert_eq!(
+        apply_restriction(&mut g, Some(Ok(Some(ok.clone()))), None, 1, 1),
+        None
+    );
+    assert_eq!(g.restriction(), Some(&ok));
+    for bad in [r(Some(0.0001), None), r(None, Some(0.01))] {
+        let err = apply_restriction(&mut g, Some(Ok(Some(bad))), None, 1, 1);
+        assert!(err.is_some_and(|e| e.contains("balances")));
+        assert_eq!(g.restriction(), Some(&ok), "the one in force stays");
+    }
 }

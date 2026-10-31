@@ -367,11 +367,11 @@ systemd 255 and their start sequence simulated without systemd; they have
 
 **Static binaries.** `robodr-focal` contains static musl executables
 (`scripts/build-static.sh`; docs/BUILD.md "Static (musl) build"): no
-program interpreter and no shared library, so they run on any glibc. The
-arm64 ones are static but not position-independent (the Rust
-`aarch64-unknown-linux-musl` target has no static-pie): the executable image
-is not address-randomised, the stack, heap and mappings are. The amd64 ones
-are static-pie. The musl resolver does not read `nsswitch.conf`: give
+program interpreter and no shared library, so they run on any glibc. Both
+the arm64 and the amd64 ones are static-pie (the executable image is
+address-randomised like the stack, heap and mappings; arm64 is linked
+through `scripts/static-pie-ld`, since Rust's target alone links it
+non-PIE). The musl resolver does not read `nsswitch.conf`: give
 `robodr-kafka-publish` IP literals (it then needs no resolver at all).
 
 #### 3.2.1 External BTF for an L4T kernel (JetPack 6, `robodr` package)
@@ -949,8 +949,9 @@ the contract's section 5.
   Its static binaries were built and smoke-run (amd64 natively, arm64 under
   qemu-user: `--version`, `--check-config`, a short agentd run, black-box
   verification), its units pass `systemd-analyze verify` (systemd 255) and
-  their credential start sequence was simulated without systemd. The arm64
-  binaries are static non-PIE (no ASLR of the executable image).
+  their credential start sequence was simulated without systemd. (Since
+  2026-10-31 the arm64 binaries are static-pie; that build was smoke-run
+  under qemu-user, not on a Jetson.)
 * **The UniPwn script and bluetoothd rules prove nothing about a closed
   controller.** They fire only where the provisioning service runs on the
   pulsard host (section 7); the controller itself is covered only by the

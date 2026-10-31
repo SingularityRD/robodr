@@ -31,8 +31,10 @@
 //!
 //! `rearm` ends an operator's emergency disable (`nft delete table inet
 //! robodr`, after which every order is refused) and acknowledges a journal
-//! reset, through the running executor's socket (or the journal directly
-//! when none runs).
+//! reset. It works on the journal only, as root on the host, while the
+//! executor is **stopped** (`systemctl stop robodr-executor` first): the
+//! socket agentd uses has no re-arm (review finding 2: agentd holds its
+//! key, and must not be able to lift the operator's fence).
 
 // S10: this crate has no `unsafe` code and must stay that way.
 #![forbid(unsafe_code)]
@@ -118,9 +120,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
 }
 
 fn load(path: &std::path::Path) -> Result<(Resolved, robodr_responder::ResponsePolicy), String> {
-    let text = config::read_small(path)?;
-    let cfg = ExecutorConfig::parse(&text)?.validate()?;
-    let policy = config::load_policy(&cfg.config.policy_path)?;
+    let (cfg, policy, notes) = config::load_commissioned(path)?;
+    for n in notes {
+        eprintln!("robodr-executor: {n}");
+    }
     Ok((cfg, policy))
 }
 
@@ -194,7 +197,10 @@ fn keygen(out: &PathBuf) -> ExitCode {
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "--version") {
-        println!("robodr-executor {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-executor", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     if argv.iter().any(|a| a == "--help" || a == "-h") {
@@ -461,7 +467,9 @@ fn fatal_start(cfg: Option<&Resolved>, why: &str) {
         "executor start failed ({}): table inet robodr deleted, every action reverted",
         why.chars().take(200).collect::<String>()
     );
-    match engine::abandon(cfg, &mut nft, &why, proto::wall_ms()) {
+    let seal = cfg.and_then(seal_key_of);
+    let mut ports = robodr_executor::motion::SystemPorts;
+    match engine::abandon(cfg, &mut nft, &why, proto::wall_ms(), seal, &mut ports) {
         Ok(n) => eprintln!("robodr-executor: {why} ({n} journalled)"),
         Err(e) => eprintln!("robodr-executor: deleting table inet robodr failed: {e}"),
     }
@@ -498,7 +506,16 @@ fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
                 .collect()
         }
     );
-    match engine::abandon(cfg.as_ref(), &mut nft, &why, proto::wall_ms()) {
+    let seal = cfg.as_ref().and_then(seal_key_of);
+    let mut ports = robodr_executor::motion::SystemPorts;
+    match engine::abandon(
+        cfg.as_ref(),
+        &mut nft,
+        &why,
+        proto::wall_ms(),
+        seal,
+        &mut ports,
+    ) {
         Ok(n) => {
             eprintln!("robodr-executor: {why} ({n} action(s))");
             ExitCode::SUCCESS
@@ -506,6 +523,19 @@ fn stop_cleanup(cfg_path: &std::path::Path) -> ExitCode {
         Err(e) => {
             eprintln!("robodr-executor: stop-cleanup: deleting table inet robodr failed: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+/// The state-seal key (review finding 10: `stop-cleanup` reads and marks
+/// the sealed journal). `None` when the link key cannot be loaded: the
+/// journal is then left alone (the table is deleted all the same).
+fn seal_key_of(cfg: &Resolved) -> Option<std::sync::Arc<robodr_blackbox::StateSealKey>> {
+    match Key::load(&cfg.config.key_file).and_then(|k| k.state_seal_key()) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!("robodr-executor: {e}: the journal is not marked");
+            None
         }
     }
 }
@@ -519,7 +549,9 @@ fn sealed_journal(cfg: &Resolved) -> Result<robodr_executor::journal::Journal, S
     ))
 }
 
-/// `rearm`: through the running executor, or on the journal when none runs.
+/// `rearm`: on the journal, only while no executor serves the socket
+/// (review finding 2: the protocol socket, whose key agentd holds, has no
+/// re-arm).
 fn rearm(
     cfg: Resolved,
     policy: robodr_responder::ResponsePolicy,
@@ -542,27 +574,22 @@ fn rearm(
             return ExitCode::from(2);
         }
     };
-    {
-        let client = robodr_executor::client::Client::new(
-            cfg.config.socket.clone(),
-            key,
-            std::time::Duration::from_secs(10),
-        );
-        match client.rearm(reason) {
-            Ok(was) => {
-                println!(
-                    "robodr-executor: re-armed{}",
-                    if was { "" } else { " (it was not disabled)" }
-                );
-                return ExitCode::SUCCESS;
-            }
-            Err(e) if e.contains("executor socket") => {
-                eprintln!("robodr-executor: {e}: not running, re-arming on the journal");
-            }
-            Err(e) => {
-                eprintln!("robodr-executor: rearm: {e}");
-                return ExitCode::from(1);
-            }
+    match server::serving(&cfg.config.socket) {
+        Ok(false) => {}
+        Ok(true) => {
+            eprintln!(
+                "robodr-executor: rearm: the executor is running ({}): stop it first \
+                 (systemctl stop robodr-executor), re-arm, then start it",
+                cfg.config.socket.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "robodr-executor: rearm: cannot tell whether the executor runs ({e}): run as \
+                 root with the executor stopped"
+            );
+            return ExitCode::from(1);
         }
     }
     let boot = robodr_executor::boot_id();

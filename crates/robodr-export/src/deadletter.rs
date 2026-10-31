@@ -33,6 +33,11 @@
 //! needs: once a record cannot come back, its entry protects nothing, and
 //! deleting it cannot cause a second dead letter. The current file is never
 //! deleted. Malformed lines carry no key and protect nothing either.
+//! Every deleted file that held entries is **logged on stderr** with its
+//! entry count and counted in [`PruneReport::removed_entries`]: a dead
+//! letter may be the only copy of its record. (`robodr-kafka-publish` does
+//! not rotate by default, so nothing is deleted unless an operator opts
+//! in.)
 
 use crate::fsutil;
 use crate::retention::{file_meta, Candidate, PruneReport, Retention};
@@ -332,8 +337,11 @@ impl DeadLetters {
             newest = Some(t);
         }
         let cur = self.path();
-        crate::retention::prune(&self.dir, &candidates, &bounds, now, |c| {
+        // Files approved for deletion, with their entries (logged below).
+        let mut doomed: Vec<(PathBuf, u64)> = Vec::new();
+        let res = crate::retention::prune(&self.dir, &candidates, &bounds, now, |c| {
             let mut still = false;
+            let mut entries = 0u64;
             for p in &c.paths {
                 if *p == cur {
                     return Ok(false);
@@ -346,6 +354,7 @@ impl DeadLetters {
                 for line in BufReader::new(file).split(b'\n') {
                     let line = line?;
                     if let Ok(k) = serde_json::from_slice::<KeyFields>(&line) {
+                        entries += 1;
                         if needed(&k.source, k.position)? {
                             still = true;
                             break;
@@ -353,8 +362,31 @@ impl DeadLetters {
                     }
                 }
             }
+            if !still {
+                if let Some(p) = c.paths.first() {
+                    doomed.push((p.clone(), entries));
+                }
+            }
             Ok(!still)
-        })
+        });
+        // Deleting dead letters destroys records (often their only copy):
+        // never quietly. Logged for whatever was approved, even if a later
+        // deletion failed.
+        let mut removed_entries = 0u64;
+        for (p, n) in &doomed {
+            if *n > 0 && fs::symlink_metadata(p).is_err() {
+                removed_entries += n;
+                eprintln!(
+                    "robodr-export: WARNING: deleted rotated dead-letter file {} holding {n} \
+                     dead-lettered record(s) (retention: rotation keep / dead-letter bounds); \
+                     these records may have had no other copy",
+                    p.display()
+                );
+            }
+        }
+        let mut rep = res?;
+        rep.removed_entries = removed_entries;
+        Ok(rep)
         // The dedup set keeps the keys of deleted files until the next
         // load; that only suppresses re-appending records already
         // dead-lettered, which is the intent.
@@ -443,6 +475,7 @@ mod tests {
             .prune(&Retention::UNBOUNDED, SystemTime::now(), |_, _| Ok(false))
             .unwrap();
         assert_eq!((rep.removed, rep.held), (1, 0));
+        assert_eq!(rep.removed_entries, 2, "entries 1-2 went with .3");
         assert_eq!(names(&d), ["dl.jsonl.2", "dl.jsonl.1", "dl.jsonl"]);
         // 7 entries, 2 per file: the current file holds 7, .1 holds 5-6,
         // .2 holds 3-4; 1-2 were rotated out.

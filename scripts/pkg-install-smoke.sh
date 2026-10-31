@@ -92,12 +92,12 @@ else
 fi
 
 step "users and groups"
-for u in robodr robodr-agentd robodr-exec; do
+for u in robodr robodr-agentd robodr-exec robodr-spool robodr-kafka robodr-uplink robodr-gw; do
     getent passwd "$u" >/dev/null || bad "user $u missing"
 done
 getent group robodr-safety >/dev/null || bad "group robodr-safety missing"
 id -nG robodr-agentd 2>/dev/null | tr ' ' '\n' | grep -x robodr >/dev/null || bad "robodr-agentd is not in group robodr"
-for u in robodr robodr-agentd robodr-exec; do
+for u in robodr robodr-agentd robodr-exec robodr-spool robodr-kafka robodr-uplink robodr-gw; do
     sh_="$(getent passwd "$u" | cut -d: -f7)"
     case "$sh_" in */nologin | */false) ;; *) bad "user $u has login shell $sh_" ;; esac
 done
@@ -115,6 +115,9 @@ check_dir /var/lib/robodr/blackbox/agentd 750 robodr-agentd robodr
 check_dir /var/lib/robodr/spool/agentd 2750 robodr-agentd robodr
 check_dir /var/lib/robodr/spool/agentd/ready 2770 robodr-agentd robodr
 check_dir /var/lib/robodr/executor 700 robodr-exec robodr
+check_dir /var/lib/robodr/export/diode 750 robodr-spool robodr
+check_dir /var/lib/robodr/export/kafka-publish 750 robodr-kafka robodr
+check_dir /var/lib/robodr/export/uplink 750 robodr-uplink robodr
 check_dir /var/lib/robodr/fleet 700 root root
 check_dir /var/lib/robodr/deliverd 700 root root
 check_dir /var/lib/robodr/releases 750 root root

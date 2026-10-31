@@ -27,6 +27,7 @@ const TOP_KEYS: &[&str] = &[
     "max_findings_per_datagram",
     "rate_limit_burst",
     "rate_limit_interval_ms",
+    "sros2_keystore",
 ];
 const BINDING_KEYS: &[&str] = &["enabled", "hold_ms", "max_participants", "discovery_server"];
 const MOTION_KEYS: &[&str] = &[
@@ -230,6 +231,20 @@ fn example_keys_are_known_and_parse() {
         }
         binding.insert("participant_ips".into(), Value::Object(pins));
         let mut obj = top.clone();
+        if uncomment {
+            // The keystore is read at validation: point the example's
+            // path at the lab keystore copy.
+            assert_eq!(
+                obj.get("sros2_keystore").and_then(Value::as_str),
+                Some("/etc/robodr/sros2/enclaves")
+            );
+            let ks = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/captures/ros2-humble/sros2");
+            obj.insert(
+                "sros2_keystore".into(),
+                Value::String(ks.to_string_lossy().into_owned()),
+            );
+        }
         obj.insert("capture".into(), Value::Object(cap));
         obj.insert("binding".into(), Value::Object(binding));
         obj.insert("motion".into(), Value::Object(motion));

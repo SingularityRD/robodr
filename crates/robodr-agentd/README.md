@@ -43,20 +43,20 @@ level, and every path must be absolute.
 | `robot` | `id` (also the black-box device id), `site`, optional `model`, `kafka_partitions` (`profile_version` was removed: the version in findings is the signed profile's `metadata.profile_version`), optional `robot_model` (a Unitree model, see "Unitree" below) |
 | `sensor` | The ROS 2 sensor's own `[module.robodr-sensor-ros2]` section in JSON form, validated by `robodr_ros2_pipeline::Config::validate`. It sets the profile path, capture (live interfaces or `pcap_replay`), the SPDP socket (`listen_spdp`, default **true**) and the binding settings. Its profile is used by the pipeline and by the agent. |
 | `policy_path` | Response policy (`robodr.response-policy/v1`; its `morphology` — required once OEM-validated or for platform `other`, e.g. `humanoid` — makes safe pause / safe state advisory only and sets the balancing-robot rules, see `robodr-responder`) |
-| `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`), optional `previous_keys` (retired keys after a key rotation, public key or keyring files, at most 16), `allow_hmac` (default `false`: a legacy HMAC key is refused), optional `head_anchor` |
+| `blackbox` | `dir`, `key_file`, optional `key_id`, optional `boot_id` (default `/proc/sys/kernel/random/boot_id`), optional `previous_keys` (retired keys after a key rotation, public key or keyring files, at most 16), `allow_hmac` (default `false`: a legacy HMAC key is refused), optional `head_anchor`, optional `retention` (`mode` cyclic|saturation, `segments`, `segment_bytes`, `unexported_reserve_segments`, `critical_reserve_segments`, `warn_percent`; checked against the free space at start; OPERATIONS 6.4 "Black-box retention and sizing") |
 | `spool` | `dir`, `max_bytes` (default 64 MiB), `max_files` (default 10000) |
 | `findings` | Optional. `topic` (default `robodr.findings`) and `data_source` (default `robodr`): the deployment labels every finding carries (`robodr.findings` contract 2.x) |
 | `event_inputs` | `[{"kind":"stdin"}]` and/or `[{"kind":"unix_socket","path":...,"max_connections":4}]` |
-| `context` | `safety_state` (default `unknown`; must stay `unknown` when `safety_feed` is set), `control`, `phase`, `connectivity`, `operator_present` |
-| `safety_feed` | Optional. The live safety-state feed (see below): `stale_after_ms` (default 1000), `topics` (ROS topics decoded from the captured bus) and/or `socket` (a local safety-PLC gateway socket). |
+| `context` | `safety_state` (default `unknown`; must stay `unknown` when `safety_feed` is set), `control`, `phase`, `connectivity`, `operator_present`. With live context sources (below) `control` / `phase` / `connectivity` are only the value used while no live source contributes to that field. |
+| `safety_feed` | Optional. The live safety-state feed and live operational context (see below): `stale_after_ms` (default 1000), `topics` (ROS / Unitree / lifecycle topics decoded from the captured bus), `socket` (a local safety-PLC gateway socket) and `uplink_status` (the `robodr-uplink` status file, live connectivity). |
 | `firewall` | Optional. `max_angular` (rad/s for every profiled Twist channel), `allow` (writer GUIDs per channel) and `joint_config` (a Motion Firewall JSON file whose `joint_channels` / `platform` check Unitree low-level joint frames, e.g. `config/firewall.unitree-g1.example.json`). Runs **recording-only** (see below). |
 | `motion_monitor` | Optional. `config_path` (strict `MonitorConfig`; default: the UGV defaults on the profile's motion channels) and `feedback_sources`. Feedback sources that are ROS topic names (`/odom`) are also decoded from the bus. |
 | `sensor.motion` | Optional. The live motion decode path: `enabled` (default true), `feedback_topics` (e.g. `["/odom"]`), `max_writers`, `max_samples_per_datagram` (`evaluate_commands` is accepted but the daemon always lets the agent evaluate). Unknown keys are refused. |
 | `sensor.unitree_legacy` | Optional, off by default. Unitree legacy UDP (Go1 generation): `enabled`, `ports` (default `[8007, 8080, 8082, 8090]`), `command_senders` (IPs allowed to send `HighCmd` / `LowCmd`, or tables `{"ip", "mac"?, "label"?}`; `mac` binds the sender to its link-layer source), `robot_addresses` (default `192.168.123.10`, `192.168.123.161`). Needs `sensor.capture`. Unknown keys are refused. |
 | `gateway_feed` | Optional. Same keys as `host_threats`: the socket the in-path gateway writes its findings to. See "In-path gateway feed" below. |
 | `host_threats` | Optional. `socket_path` (the socket `robodr-threat-forward` writes Pulsar threats to), `socket_mode` (`"0600"` default or `"0660"`), `allowed_uids` (peers besides uid 0), `max_connections` (default 2, max 8). See "Host threats" below. |
-| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `crl_files` (PEM or DER CRLs of the client CAs, reloaded when they change; `client_crl` is the older single-file spelling), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
-| `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false |
+| `control_plane` | Optional, off when absent. The SOC API `robodr-control-plane/v2`: `listen_tcp` (with `tls` any address, mutual TLS; without, loopback only), `tls` (`cert_chain`, `key_file`, `client_ca`, optional `crl_files` (PEM or DER CRLs of the client CAs, reloaded when they change; `client_crl` is the older single-file spelling), optional `client_spki_sha256` pins), `unix_socket` (`socket_mode` `"0600"`/`"0660"`), `state_dir` (required, private 0700: request journal, replay store, exports), `soc_keys` (Ed25519 public key files: a path, or `{"path", "allowed_actions", "max_ttl_seconds"}` to scope a key; out of scope is 403, contract §4.2), `max_clock_skew_s` 30, `rate_per_minute` 30, `burst` 10, `max_connections` 4 (TCP, counted apart for handshakes and authenticated connections; the unix socket has its own 2), `max_connections_per_source` 2, `soc_sources` (the SOC's networks: reserved pre-authentication slots, see "Abuse" below), `reserved_connections` 1, `pre_auth_evict_after_ms` 100, `max_requests` 1024, `answer_timeout_ms` 5000, `evidence` (optional; evidence API, see below). Needs `finding_signing` (answers are signed). Requests are judged and recorded, **never executed** unless `executor` is enabled. See "Control plane" below. |
+| `daemon` | `queue_capacity` 4096 (max 65536), `queue_bytes` 33554432 (32 MiB; 1 MiB..=256 MiB), `tick_ms` 1000, `heartbeat_ms` 10000, `silence_ms` 30000, `lag_ms` 2000, `health_report_ms` 10000, `exit_when_inputs_end` false, `self_health` (the health record and early warnings, below: `health_record_ms` 60000 (1000..=3600000; 0 = off), `credential_warn_days` 14, `credential_critical_days` 3, `clock_unsynced_grace_ms` 300000, `disk_warn_percent` 10, `disk_critical_percent` 3, `executor_unreachable_ms` 30000) |
 
 **Key.** Keys are never accepted on the command line. `blackbox.key_file`
 is either a secret key file as written by `robodr-blackbox keygen --out FILE`
@@ -80,11 +80,15 @@ under the new key after a `KeyRotation` record signed by the old one. The
 daemon then runs with the new key in `blackbox.key_file` and the retired
 key's **public** file in `blackbox.previous_keys`; those keys authenticate
 the records signed before the rotation at every open and reopen of the
-black box, the TPM anchor sidecar written before it, and the
-accepted-profile records the profile anti-rollback reads. Each previous key
-must have another id than the current key, a `device_id` binding must name
-`robot.id`, an Ed25519 secret is refused (the `.pub` suffices) and an HMAC
-key needs `allow_hmac`. Without the key that signed a retained record the
+black box and the accepted-profile records the profile anti-rollback
+reads, **only up to the `KeyRotation` that retired them** (a leaked
+retired key cannot add records, marks or profile notes after it). The
+export cursor and the TPM anchor sidecar must be signed by the current key
+(`rotate --tpm-sidecar` re-signs the sidecar). Each previous key must have
+another id than the current key, a `device_id` binding must name
+`robot.id`, an Ed25519 secret is refused (the `.pub` suffices), an HMAC
+key needs `allow_hmac`, and the file must be owned by root (or the
+daemon's user) and not group/world-writable. Without the key that signed a retained record the
 daemon refuses to start (fail closed) and names `blackbox.previous_keys`;
 once the old segments have rotated out, the entry can be removed.
 
@@ -205,8 +209,11 @@ path:
   `EXAMPLE-replace-with-OEM-data`; A1 / Aliengo / B1 have no decodable
   frame layout and no example), `config/agentd.unitree-sensor-box.example.json`
   (passive capture on a mirror / tap port, no control plane, legacy UDP
-  for a Go1) and `config/agentd.unitree-edu.example.json` (on the EDU dev
-  computer of a G1, with the joint firewall).
+  for a Go1), `config/agentd.unitree-edu.example.json` (on the EDU dev
+  computer of a G1, with the joint firewall) and
+  `config/agentd.unitree-go2.example.json` (Go2 EDU). The two EDU examples
+  read the safety state and the operational context live (sport mode, low
+  state, remote; "Live safety state" below).
 
 Not verified on a real Unitree robot: everything above has only seen
 synthetic traffic built from the published IDL / `comm.h` layouts and the
@@ -274,6 +281,96 @@ safety system.
   whether fresh sources disagreed, each source's claim, freshness and
   age); `status.json` carries `safety_state` and `safety_feed`.
 
+### Unitree safety-state sources (`src/safety_feed/unitree.rs`)
+
+Unitree SDK2 robots publish no `std_msgs` e-stop; their state is in
+`rt/sportmodestate` / `rt/lf/sportmodestate` and `rt/lowstate`. Both are
+topic sources with the same writer pinning as above (`writers` mandatory,
+profile, IP binding):
+
+```json
+{ "topic": "/sportmodestate", "type": "unitree_go::msg::dds_::SportModeState_",
+  "writers": ["<sport service participant prefix>"],
+  "unitree_sport": {
+    "modes": { "1": "none", "3": "none", "7": "safe_state_active", "8": "moving_slow" },
+    "motion": { "moving_above": 0.05, "fast_above": 1.0 },
+    "error_code_nonzero": "unknown" } },
+{ "topic": "/lowstate", "type": "unitree_hg::msg::dds_::LowState_",
+  "writers": ["<prefix>"],
+  "unitree_low": { "moving_above": 0.5, "fast_above": 3.0 } }
+```
+
+- **Sport mode**: the most conservative of `modes[mode]` (`none` lets the
+  speed decide; an unlisted code reads `unknown`, Low finding), the motion
+  level from `‖velocity‖` and `|yaw_speed|` (hysteresis as for Odometry;
+  non-finite reads `unknown`) and `error_code_nonzero` (default `unknown`)
+  while `error_code` is not 0.
+- **Low state** (`unitree_go` or `unitree_hg` `LowState_`): a sample whose
+  Unitree CRC does not match is undecodable (`unknown`, Medium finding:
+  corrupt or forged); else the motion level from the fastest joint's
+  `|dq|` over every slot.
+- The mode codes in `config/agentd.unitree-go2.example.json` follow
+  Unitree's Go2 documentation and the thresholds are illustrative: check
+  both on the robot before sign-off.
+
+### Live operational context (`src/safety_feed/context.rs`)
+
+Control mode, mission phase and connectivity are live inputs too (the
+planner gates motion steps on approval when a human is in command or the
+phase is transient, and notes a missing approval channel when
+disconnected):
+
+```json
+{ "topic": "/wirelesscontroller", "type": "unitree_go::msg::dds_::WirelessController_",
+  "writers": ["<prefix>"],
+  "wireless_controller": { "deadzone": 0.1, "hold_ms": 5000, "control": "manual" } },
+{ "topic": "/bt_navigator/transition_event", "type": "lifecycle_msgs/msg/TransitionEvent",
+  "writers": ["<Nav2 participant prefix>"],
+  "lifecycle": { "states": {
+    "active":   { "control": "autonomous", "phase": "transit" },
+    "inactive": { "control": "autonomous", "phase": "parked" } } } },
+"uplink_status": { "path": "/var/lib/robodr/export/uplink/uplink-status.json",
+                   "stale_after_ms": 30000 }
+```
+
+and `unitree_sport` may add `"phase"` / `"control"` maps (sport mode code
+-> value).
+
+- **Remote**: a stick beyond `deadzone` or a pressed key is `control`
+  (`manual` or `teleop`, never `autonomous`) for `hold_ms` after the last
+  activity; an idle remote says nothing.
+- **Lifecycle** (Nav2 or any managed node): the goal state of each
+  transition event, mapped by name (`unconfigured`, `inactive`, `active`,
+  `finalized` and the transition states). Events come on change only, so
+  the source is latched: the last trusted event counts until the next.
+  An unlisted state reads `on_stale` and is reported (Low).
+- **Uplink status**: `ok` -> `connected`, `retrying` / `starting` ->
+  `degraded`, `blocked` -> `disconnected`. A missing, unreadable,
+  symlinked, oversized, foreign-format or stale file (by its
+  `updated_at_ms`, unless a pending retry `next_attempt_at_ms` is still
+  ahead) reads `on_stale`. **Packaging gap:** `robodr-uplink` writes the
+  file mode 0600 (user `robodr-uplink`), so under the shipped units
+  `robodr-agentd` cannot read it and connectivity stays `on_stale`
+  (`disconnected`, the conservative value) until the uplink writes it
+  readable for `robodr-agentd` (a packaging / exporter change, not made
+  here). The read itself never follows a symlink, refuses anything but a
+  regular file and caps the size at 64 KiB.
+- **Combining**: per field, the most conservative contribution of all
+  sources (control `manual` > `teleop` > `autonomous`; phase `landing` /
+  `takeoff` > `unknown` > `task` > `transit` > `parked`; connectivity
+  `disconnected` > `degraded` > `connected`). A stale source, an unlisted
+  value and an undecodable sample contribute the source's `on_stale`
+  (default control `manual`, phase `unknown`, connectivity
+  `disconnected`; the least conservative value of a field is refused as
+  `on_stale`). If nothing contributes, `context.*` is used. A spoofed
+  or silenced source can therefore never make the context more permissive.
+  Context-only sources (remote, lifecycle, uplink) never affect the safety
+  state.
+- **Recording**: every change is a `robodr.context_transition` note
+  (from, to, conflict, each source's contribution); `status.json` carries
+  it under `safety_feed.context`; the control plane's robot snapshot and
+  every plan use the live context.
+
 ## Host threats (Pulsar)
 
 With `host_threats`, the Pulsar module `robodr-threat-forward` (registered
@@ -287,7 +384,11 @@ one JSON object per line:
 {"kind":"heartbeat","v":1,"sent":17,"dropped":0,"skipped_own":3}
 ```
 
-- **What a threat becomes.** A `robot.host.pulsar_threat` finding
+- **What a threat becomes.** A `robot.host.<rule>` finding: since
+  findings contract 2.5 each Pulsar rule RoboDR ships has its own id
+  (`robodr_ocsf::HOST_RULES`, e.g. `robot.host.interactive_shell`,
+  `robot.host.sros2_key_read`; title = the rule name), and a rule RoboDR
+  does not ship (a deployment's own) keeps `robot.host.pulsar_threat`
   (`Detector::Sensor`, source `host:<module>`, the rule's severity, Medium
   if none; OCSF data source `host_runtime`; the Pulsar rule name, pid,
   image and uid in the detail) and a correlation signal
@@ -299,10 +400,10 @@ one JSON object per line:
   `host_process_persistence`) fire. A threat from `robodr-sensor-ros2` is
   dropped and counted (`daemon.host_threats_own_skipped`): the daemon has
   it from its own pipeline. A response-policy `rule_overrides` entry is
-  matched on the finding's rule id, so it can only target
-  `robot.host.pulsar_threat` as a whole, never one Pulsar rule (the
-  shipped policy examples therefore no longer carry the former
-  `robot.host.unexpected_egress` override, which nothing emits).
+  matched on the finding's rule id, so it can target one host rule
+  (`robot.host.ros2_external_connection`); an override of
+  `robot.host.pulsar_threat` (written before 2.5) still covers every host
+  id without an override of its own.
 - **Peers.** The socket's directory must be owned by root or the daemon's
   user and not writable by group or others; an existing path must be a
   socket owned by the daemon's user. The socket is created `0600` or `0660`.
@@ -379,7 +480,10 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   must chain to `client_ca`, be valid and permit `clientAuth`, and — with
   pins — have a pinned SPKI; with `crl_files`, not be revoked (an issuer
   without a CRL, an expired CRL or an unusable replacement fails closed;
-  the files are re-read when they change, no restart; counters in
+  the files are re-read when they change, no restart; a CRL number is
+  required, the highest per CA wins, an older CRL put back is refused
+  (high-water marks in `<state_dir>/crl-high-water.json`); files are
+  opened `O_NOFOLLOW | O_NONBLOCK` and checked on the descriptor; counters in
   `status.json` `control_plane.tls.crl`, `robodr_blackbox::crl`); no
   session resumption. Without `tls`,
   `listen_tcp` must be loopback (plain HTTP, tests / a local relay); the
@@ -460,7 +564,10 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   separate connection slots per listener (the root-only unix socket can
   never be locked out by TCP peers), TCP handshakes counted apart from
   authenticated connections, at most `max_connections_per_source` per
-  source address, a bounded queue to the main loop (full: 503 `busy`). Failed
+  source address, the oldest stale handshake cut when the slots are full
+  (`pre_auth_evict_after_ms`), reserved slots for the SOC's networks
+  (`soc_sources`, `reserved_connections`) so a TLS slowloris cannot lock
+  the SOC out, a bounded queue to the main loop (full: 503 `busy`). Failed
   authentications raise `robot.agent.control_plane_unauthenticated` (High),
   authenticated invalid requests `robot.agent.control_plane_invalid`
   (Medium); both observe-only self-health, rate-limited by
@@ -642,6 +749,36 @@ deltas), `input_malformed` (Low, deltas), `pipeline_lag` (Medium, with
 hysteresis), `spool_full` (High) and `evidence_degraded` (High). Recurring
 counter findings are rate-limited by `health_report_ms`.
 
+### Health record and early warnings (`daemon.self_health`, `src/selfcheck.rs`)
+
+Every `health_record_ms` (default 60 s; the first one a period after
+start) the daemon reports a Low `robot.agent.health` finding that carries
+`entity_context.agent_health` (findings contract 2.5, §3g): the state and
+its reasons, the record's period, uptime and sequence number, the
+versions of `robodr-agentd` and the findings contract, every input's
+freshness and counters, finding / spool counters, the black box's state,
+the reachability of the executor, the in-path gateway's feed and the
+Pulsar forwarder, credential expiry, the kernel clock and the free space
+of the black-box, spool and control-plane filesystems. It is one finding
+per robot (an Update each period), signed and exported like any other: a
+SOC alerts when a robot's newest record is older than about three periods,
+which tells a dead or blind agent from a quiet robot. It is never fed to
+the correlation engine. `status.json` carries the same probes under
+`self_health`.
+
+The same probes raise early warnings (observe-only, like every health
+finding):
+
+| Rule | Severity | Raised |
+|---|---|---|
+| `robot.agent.credential_expiring` | Medium at `credential_warn_days` (14) or less before the control plane's certificate `notAfter` or a CRL's `nextUpdate`; High at `credential_critical_days` (3) or less, or expired | per credential on each escalation, then daily |
+| `robot.agent.clock_unsynced` | Medium | `adjtimex(2)` reports the clock unsynchronised for `clock_unsynced_grace_ms` (5 min); once per episode |
+| `robot.agent.clock_jump` | High | the agent's time guard saw the wall clock jump against the monotonic clock (> 1 s); at most every `health_report_ms` |
+| `robot.agent.disk_low` | Medium below `disk_warn_percent` (10 %) free, High below `disk_critical_percent` (3 %) | per filesystem (black box, spool, control-plane state) on each escalation, before `spool_full` / `evidence_degraded` |
+| `robot.agent.executor_unreachable` | High | executor v1 has not answered its event poll for `executor_unreachable_ms` (30 s); once per outage |
+
+Time synchronisation baseline (chrony with NTS, PTP): [`docs/TIME-SYNC.md`](../../docs/TIME-SYNC.md).
+
 Health findings are handed to the agent as `Detector::SelfHealth` and are
 **always observe-only**. A health problem, including an attacker starving or
 flooding an input, is recorded and reported but never feeds a motion
@@ -699,7 +836,8 @@ request.
 | `tests/control_plane_vectors.rs` | The contract vectors `docs/contracts/fixtures/control-plane-v2/` are byte-identical to the generator (`examples/control_plane_vectors.rs`) and hold against the implementation: requests authenticate (or are refused 401) and route as stated, answer and manifest signatures verify, chunks reassemble to the bundle, the bundle verifies with the black-box public key and the tampered copy does not. |
 | `tests/fuzz_smoke.rs` | The `control_plane_request` libFuzzer harness (`fuzz/harness/control_plane_request.rs`) driven by the std-only mutator over generated, signed seeds of every route (the seeds take the success path; the corpus equals the generator). |
 | `tests/unitree_live.rs` | Unitree end to end on synthetic captures, the profile **learned** with `robodr-commission` from a clean capture and locked: Go2 (`unitree_go`, 12 of 20 slots), G1 (`unitree_hg`, 29 of 35, arm SDK), H1 (`unitree_go`, 20 slots, arm SDK) and Go1 (legacy UDP). Clean replay: no finding, every joint frame checked by the joint firewall. Rogue `rt/lowcmd` writer (unknown participant, unauthorized motion writer, `rejected_unknown_source`); torque / kp / step over the envelope (profile + joint firewall would-haves); `rt/arm_sdk` frames with mode 0 counted as motion; `2^32 + id` api aliasing (High); velocity over the envelope (Critical); a model-specific api id `Unknown` without `robot_model`, classified with it; humanoids never record a zero / damping substitute and a limp frame is a would-have rejection; the independent `robodr-cdr` vectors decode with `crc_ok` true; Go1: unknown sender (Critical / Medium), trick mode, joint torque, compressed frame, legacy off = nothing captured. |
-| `tests/unitree_examples.rs` | Every Unitree example: a strict, valid profile per supported model with its topics and joint bounds; the firewall examples fit their profiles; the EDU and sensor-box daemon examples pass `--check-config`; morphology / slot-count / unknown-model / unsafe-substitute / `max_angular`-on-a-joint-channel refusals; every model's profile loads in the daemon with its `robot_model`. |
+| `tests/unitree_examples.rs` | Every Unitree example: a strict, valid profile per supported model with its topics and joint bounds; the firewall examples fit their profiles; the EDU and sensor-box daemon examples pass `--check-config`; morphology / slot-count / unknown-model / unsafe-substitute / `max_angular`-on-a-joint-channel refusals; every model's profile loads in the daemon with its `robot_model`; the Go2 and G1 EDU examples ship live sport / low-state / remote / uplink sources without warnings. |
+| `tests/unitree_context_feed.rs` | Unitree safety-state sources: sport mode codes, body speed, `error_code`, non-finite and unlisted values, staleness; rogue and wrong-IP sport writers ignored; low state with the Unitree CRC (a wrong CRC is undecodable), go and hg, `|dq|` thresholds, truncations. Live context: remote activity with hold, sport phase vs lifecycle (most conservative), latched lifecycle, stale sources to `on_stale`, context-only sources leave the safety state alone, a spoofed idle remote or forged lifecycle never restores autonomy, uplink status file to connectivity (stale, symlink-free read). End to end: the remote in use makes the over-envelope command's motion steps proposals (`human_in_command`) and the context changes are black-box notes. |
 | `tests/agent_api.rs` | `Agent::handle_external`: sensor deviations get real plans when enforcing. Self-health and observe-mode deviations never get an action plan. |
 | `tests/safety_feed.rs` | The live safety feed: Bool / UInt8 / String / Odometry mappings (with hysteresis, non-finite speed), staleness to `unknown`, conflicts to the most conservative state, unprofiled / IP-spoofed / wrong-type / non-allowlisted writers ignored with a High finding, undecodable and unmapped values read `unknown`. End to end through the daemon: an e-stop on the bus turns the plan for a Critical over-envelope command into Record (`request_safe_state` with the e-stop released); a rogue writer's "release" is reported and ignored; the PLC socket feed grades plans, goes stale to `unknown` (approval-gated plan) and every transition is in the black box. |
 | unit tests | Config strictness and key file checks, spool atomicity and bounds, the line reader (CRLF, overlong lines, timeouts, a full queue), the unix socket, the peer-uid policy, the host-threat line parser and socket permission checks, and the health state machine. Control plane: the journal's crash points (killed during an append, between write and fsync, before the compaction's fsync / rename / directory fsync), damage quarantine, rollback of a survived failed append; the request state across restarts and the crash points around the black-box note (commit or abort from the black box, also for reverts), a journal that refuses fails closed, compaction bounds; the persisted replay store (replay after a restart, expiry, fence on damage or removal, a failing store refuses); evidence exports from a real recorder (multi-segment, rotation, time / finding selectors, gaps, limits, chunk reassembly, tamper, stored-export corruption and expiry); the HTTP head bound independent of read sizes and the answer write deadline. |

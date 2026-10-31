@@ -235,6 +235,39 @@ fn spool_partial_acceptance_dead_letters_and_acks() {
     );
 }
 
+/// Review finding: an I/O error (EACCES, EIO) reading one spool file failed
+/// every run forever. Now it is quarantined after a bounded number of
+/// attempts (local dead letter with the error, moved to rejected/) and the
+/// rest is sent.
+#[test]
+fn unreadable_spool_file_is_quarantined_not_fatal() {
+    let r = Rig::new("eio", Role::Uplink);
+    r.spool(UNIT, 0, 3, false);
+    let bad = r.ready()[1].clone();
+    let mut u = r.uplink(r.spool_cfg());
+    robodr_export::inject_read_errors(&bad, u32::MAX);
+    let rep = u.run_once();
+    robodr_export::inject_read_errors(&bad, 0);
+    let rep = rep.unwrap();
+    assert_eq!(
+        (rep.accepted, rep.quarantined_unreadable),
+        (2, 1),
+        "{rep:?}"
+    );
+    assert_eq!(rep.dead_lettered_local, 1);
+    assert!(r.ready().is_empty());
+    assert_eq!(r.rejected(), vec![bad]);
+    let dl = r.dead_letters();
+    assert_eq!(dl.len(), 1);
+    assert!(
+        dl[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("unreadable (I/O error"),
+        "{dl:?}"
+    );
+}
+
 #[test]
 fn request_headers_and_signature_follow_the_contract() {
     let r = Rig::new("headers", Role::Uplink);
@@ -1344,4 +1377,68 @@ fn reinject_diode_records_and_resume_after_a_crash() {
     assert_eq!(hdr(&r.requests()[n], wire::H_BATCH_ID), p.batch_id);
     assert_eq!(r.c().finding_count(), 3);
     assert!(r.uplink(cfg).state().reinject.is_empty());
+}
+
+/// T83: the uplink's remaining state is bounded on request and measured.
+/// By default `rejected/` and the re-injection generations are kept; with
+/// bounds, the rejected records and the finished generation's
+/// `records.jsonl` go, the generation's ledger (`origin.jsonl`, `done`)
+/// stays, so re-injecting the same dead letters again queues nothing, and
+/// a record rejected again after its generation was pruned is re-injected
+/// from its dead letter's copy. The status snapshot carries the sizes.
+#[test]
+fn rejected_and_reinject_payloads_are_pruned_on_request_and_measured() {
+    use robodr_export::retention::Retention;
+    let r = Rig::new("t83-spool", Role::Relay);
+    r.c().reg.robots.remove(OTHER_ROBOT);
+    r.spool(UNIT, 0, 2, false);
+    r.spool(OTHER_ROBOT, 0, 2, false); // unknown_robot
+    r.spool_garbage();
+    let mut u = r.uplink(r.spool_cfg());
+    u.run_once().unwrap();
+    let snap = u.snapshot().unwrap();
+    let usage = snap.state_usage.clone().expect("measured");
+    assert_eq!(usage.spool_rejected.map(|x| x.entries), Some(3));
+    assert!(usage.spool_rejected.unwrap().bytes > 0);
+    assert_eq!(usage.diode_out, None);
+    assert_eq!(usage.dead_letters.entries, 1, "one dead-letter file");
+    assert!(usage.dead_letters.bytes > 0);
+    drop(u);
+    let o = reinject_opts(&r, Source::Spool(r.spool.clone()));
+    let gen = reinject::reinject(&o).unwrap().generation.unwrap();
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    assert_eq!(rep.reinjected_done, std::slice::from_ref(&gen));
+    let gdir = r.state.join("reinject").join(&gen);
+    // Default: kept.
+    let rep = r.uplink(r.spool_cfg()).run_once().unwrap();
+    assert_eq!(rep.pruned_rejected, Default::default());
+    assert_eq!(rep.pruned_reinject, Default::default());
+    assert_eq!(r.rejected().len(), 3);
+    assert!(gdir.join("records.jsonl").exists());
+
+    let mut cfg = r.spool_cfg();
+    let none = Retention {
+        max_count: Some(0),
+        ..Default::default()
+    };
+    cfg.rejected_retention = none;
+    cfg.reinject_retention = none;
+    let mut u = r.uplink(cfg);
+    let rep = u.run_once().unwrap();
+    assert_eq!(rep.pruned_rejected.removed, 3, "{rep:?}");
+    assert_eq!(rep.pruned_reinject.removed, 1, "{rep:?}");
+    assert!(rep.pruned_reinject.removed_bytes > 0);
+    assert!(r.rejected().is_empty());
+    assert!(!gdir.join("records.jsonl").exists());
+    assert!(gdir.join("origin.jsonl").exists() && gdir.join("done").exists());
+    let snap = u.snapshot().unwrap();
+    let usage = snap.state_usage.unwrap();
+    assert_eq!(usage.reinject.map(|x| x.entries), Some(1));
+    drop(u);
+    // The ledger still knows the first round.
+    let again = reinject::reinject(&o).unwrap();
+    assert_eq!((again.queued, again.already_queued), (2, 2), "{again:?}");
+    // The second round's dead letters (source reinject:<gen>) came from the
+    // pruned generation: re-injected from the dead letters' own copies.
+    assert_eq!(again.from_dead_letter, 2, "{again:?}");
 }

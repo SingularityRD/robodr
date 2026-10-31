@@ -18,9 +18,9 @@ usage:
   robodr-release build bundle --programme P --seq N [--prev-bundle DIR | --prev-hash HEX]
         --rpk DIR [--rpk DIR]... TRUST [--parity M [--parity-group K] [--shard-size BYTES]]
         [--created-at SECS] [--now SECS] --out DIR
-  robodr-release sign --key SECRET_KEY_FILE --target RPK_DIR|BUNDLE_DIR|DEPLOYMENT.json TRUST
-        [--now SECS]
-  robodr-release sign --key SECRET_KEY_FILE --target TRUST.json [TRUST]
+  robodr-release sign --key SECRET_KEY_FILE|SIGNER_FILE --target RPK_DIR|BUNDLE_DIR|DEPLOYMENT.json
+        TRUST [--now SECS]
+  robodr-release sign --key SECRET_KEY_FILE|SIGNER_FILE --target TRUST.json [TRUST]
   robodr-release verify rpk --dir DIR TRUST [--now SECS]
   robodr-release verify bundle --dir DIR TRUST CHAIN [--now SECS]
   robodr-release verify trust TRUST [--init-anchor | --commit] [--now SECS]
@@ -37,7 +37,11 @@ Formats: docs/SECURE-DELIVERY.md §3 (robodr-pkg/1, robodr-bundle/1,
 robodr-deployment/1, robodr-delivery-trust/1, robodr-sigset/1).
 
 Keys are robodr-blackbox Ed25519 key files (keygen writes FILE, mode 0600,
-and FILE.pub). sign adds one signature to the document's detached signature
+and FILE.pub). sign --key also takes a robodr-signer/v1 SIGNER_FILE: the key
+stays in a PKCS#11 token or HSM and an external signer command signs (the
+PKCS#11 adapter robodr-signer-pkcs11 writes the file with `signer-file`);
+every signature is checked against the public key pinned in the file
+(crates/robodr-signer). sign adds one signature to the document's detached signature
 file (MANIFEST.sig, bundle.sig, or FILE.sig); a quorum is reached by running
 it once per key holder. sign checks the document first (an RPK's or bundle's
 files must match it exactly, every RPK in a bundle must verify) and refuses
@@ -107,7 +111,10 @@ pub fn main_with_env() -> i32 {
 /// Run one command line (without the program name).
 pub fn run(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-release {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-release", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     // Help only as the whole command line: a stray -h spliced into a
@@ -476,11 +483,8 @@ fn sign(args: Vec<String>) -> Result<(), Cmd> {
         &TRUST_SWITCHES,
     )?;
     let kpath = Path::new(req(&a, "key")?);
-    let k =
-        KeyFile::load_secret(kpath).map_err(|e| Fail::Io(format!("{}: {e}", kpath.display())))?;
-    let signer = k
-        .ed25519_signing_key()
-        .map_err(|e| Fail::Io(format!("{}: {e} (only ed25519 keys sign)", kpath.display())))?;
+    // A key file or a robodr-signer/v1 signer file (token / HSM; T36).
+    let signer = robodr_signer::load(kpath).map_err(Fail::Io)?;
     let target = Target::detect(Path::new(req(&a, "target")?))?;
     let n = now(&a)?;
     let t = match (&target, opt(&a, "trust")?) {
@@ -498,6 +502,7 @@ fn sign(args: Vec<String>) -> Result<(), Cmd> {
         "signatures": n,
         "key_id": robodr_blackbox::Signer::key_id(&signer),
         "fingerprint": fingerprint(&signer.public_key()),
+        "backend": signer.backend().as_str(),
     }));
     Ok(())
 }

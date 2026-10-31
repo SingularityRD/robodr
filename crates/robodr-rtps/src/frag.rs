@@ -168,12 +168,23 @@ pub struct ReassemblyLimits {
     pub stale_after_fragments: u64,
 }
 
+/// Default [`ReassemblyLimits::max_sample_bytes`]. DDS stacks reassemble
+/// SEDP samples far above 64 KiB (the previous default), so a padded
+/// announcement used to be refused here while the robot accepted it.
+pub const DEFAULT_MAX_SAMPLE_BYTES: usize = HARD_MAX_SAMPLE_BYTES / 2;
+/// Default [`ReassemblyLimits::max_total_bytes`]: 16 samples of the
+/// default maximum size.
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 16 * DEFAULT_MAX_SAMPLE_BYTES;
+
 impl Default for ReassemblyLimits {
+    /// `max_sample_bytes` [`DEFAULT_MAX_SAMPLE_BYTES`] (512 KiB),
+    /// `max_total_bytes` [`DEFAULT_MAX_TOTAL_BYTES`] (8 MiB), 256 pending
+    /// samples, 64 per source, stale after 1024 fragments.
     fn default() -> Self {
         Self {
-            max_sample_bytes: 64 * 1024,
+            max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
             max_pending_samples: 256,
-            max_total_bytes: 1024 * 1024,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_pending_per_source: 64,
             stale_after_fragments: 1024,
         }

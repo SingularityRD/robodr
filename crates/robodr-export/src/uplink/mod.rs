@@ -73,7 +73,20 @@
 //! done (see [`crate::deadletter`]). What is held is reported and looked at
 //! again on the next run. Deleted dead letters can no longer be
 //! re-injected (`reinject` reads the files present).
+//!
+//! Opt-in, kept by default: [`UplinkConfig::out_retention`] (diode source,
+//! sole consumer of `out/` only) deletes the payload of finished `out/`
+//! batches, leaving tombstones ([`crate::retention::prune_diode_out`]), [`UplinkConfig::rejected_retention`]
+//! (spool source) bounds `<spool>/rejected/`
+//! ([`crate::spool_export::prune_rejected`]), and
+//! [`UplinkConfig::reinject_retention`] deletes the `records.jsonl` of
+//! finished re-injection generations while their ledger (`origin.jsonl`,
+//! `done`) stays ([`crate::retention::prune_reinject_payloads`]). A record
+//! whose original copy was pruned is re-injected from its dead letter's
+//! `record` copy. The status file's `state_usage` gives the entries and
+//! bytes of each (measured at most every [`UplinkConfig::usage_interval`]).
 
+pub mod check;
 pub mod http;
 pub mod reinject;
 pub mod service;
@@ -216,6 +229,20 @@ pub struct UplinkConfig {
     /// Bounds on `done/` markers (default
     /// [`crate::publish::DEFAULT_DONE_RETENTION`]: 30 days).
     pub done_retention: Retention,
+    /// Bounds on the importer's `out/` batch directories this uplink has
+    /// finished (default: unbounded, kept); only when it is the sole
+    /// consumer of `out/` ([`crate::retention::prune_diode_out`]).
+    pub out_retention: Retention,
+    /// Bounds on `<spool>/rejected/` (spool source; default: unbounded),
+    /// as `robodr-spool-export`'s ([`crate::spool_export::prune_rejected`]).
+    pub rejected_retention: Retention,
+    /// Bounds on the `records.jsonl` of finished re-injection generations
+    /// (default: unbounded; the ledger stays,
+    /// [`crate::retention::prune_reinject_payloads`]).
+    pub reinject_retention: Retention,
+    /// How often the state's disk usage is measured for the status file
+    /// ([`service::Snapshot::state_usage`]; default 60 s).
+    pub usage_interval: Duration,
     /// Test hook: fail with [`UplinkError::Injected`] at this point (once).
     #[doc(hidden)]
     pub fail_point: Option<FailPoint>,
@@ -235,6 +262,10 @@ impl UplinkConfig {
             dead_letter_rotation: Some(DEFAULT_DEAD_LETTER_ROTATION),
             dead_letter_retention: Retention::UNBOUNDED,
             done_retention: crate::publish::DEFAULT_DONE_RETENTION,
+            out_retention: Retention::UNBOUNDED,
+            rejected_retention: Retention::UNBOUNDED,
+            reinject_retention: Retention::UNBOUNDED,
+            usage_interval: Duration::from_secs(60),
             fail_point: None,
         }
     }
@@ -584,6 +615,10 @@ pub struct UplinkReport {
     pub retries: u64,
     /// Records refused by the local validation (dead-lettered, not sent).
     pub dead_lettered_local: u64,
+    /// Spool files that could not be read (I/O error after
+    /// [`fsutil::READ_ATTEMPTS`] attempts): dead-lettered with the error and
+    /// moved to `<spool>/rejected/` (included in `dead_lettered_local`).
+    pub quarantined_unreadable: u64,
     /// `413`s that halved the line cap.
     pub split_413: u64,
     /// A pending batch from an earlier run was re-sent / finished.
@@ -603,6 +638,13 @@ pub struct UplinkReport {
     /// Rotated dead-letter files deleted by retention (held: entries still
     /// needed for deduplication).
     pub pruned_dead_letters: PruneReport,
+    /// Finished `out/` batch payloads deleted by retention (held: not
+    /// finished yet).
+    pub pruned_out: PruneReport,
+    /// `<spool>/rejected/` records deleted by retention.
+    pub pruned_rejected: PruneReport,
+    /// `records.jsonl` of finished re-injection generations deleted.
+    pub pruned_reinject: PruneReport,
 }
 
 impl UplinkReport {
@@ -612,6 +654,7 @@ impl UplinkReport {
         let mut s = self.clone();
         s.pruned_done.held = 0;
         s.pruned_dead_letters.held = 0;
+        s.pruned_out.held = 0;
         s == Self::default()
     }
 }
@@ -782,6 +825,8 @@ pub struct Uplink<T: Transport> {
     dead: DeadLetters,
     dead_loaded: bool,
     dead_malformed_unreported: u64,
+    /// The state's disk usage and when it was measured.
+    usage: Option<(std::time::Instant, crate::retention::StateUsage)>,
     max_lines_now: usize,
     clock: Box<dyn FnMut() -> u64 + Send>,
     sleeper: Box<dyn FnMut(Duration) + Send>,
@@ -886,6 +931,7 @@ impl<T: Transport> Uplink<T> {
             dead,
             dead_loaded: false,
             dead_malformed_unreported: 0,
+            usage: None,
             max_lines_now,
             clock: Box::new(fsutil::now_ms),
             sleeper: Box::new(std::thread::sleep),
@@ -937,7 +983,7 @@ impl<T: Transport> Uplink<T> {
 
     /// Pending batch, backlog and totals, for the status file
     /// ([`service`]).
-    pub fn snapshot(&self) -> Result<service::Snapshot, UplinkError> {
+    pub fn snapshot(&mut self) -> Result<service::Snapshot, UplinkError> {
         let mut backlog = service::Backlog::default();
         match &self.cfg.source {
             Source::Spool(root) => {
@@ -957,6 +1003,19 @@ impl<T: Transport> Uplink<T> {
                 .iter()
                 .filter(|g| !g.done)
                 .count() as u64;
+        let due = self
+            .usage
+            .as_ref()
+            .is_none_or(|(t, _)| t.elapsed() >= self.cfg.usage_interval);
+        if due {
+            let u = crate::retention::state_usage(
+                &self.cfg.state_dir,
+                DEAD_LETTER_FILE,
+                &self.cfg.source,
+                true,
+            )?;
+            self.usage = Some((std::time::Instant::now(), u));
+        }
         let p = self.state.pending.as_ref();
         Ok(service::Snapshot {
             pending_batch_id: p.map(|p| p.batch_id.clone()),
@@ -967,6 +1026,7 @@ impl<T: Transport> Uplink<T> {
             accepted_total: self.state.accepted_total,
             rejected_total: self.state.rejected_total,
             dead_lettered_total: self.state.dead_lettered_total,
+            state_usage: self.usage.as_ref().map(|(_, u)| u.clone()),
         })
     }
 
@@ -1069,6 +1129,13 @@ impl<T: Transport> Uplink<T> {
             };
             match encoded {
                 Err(reason) => {
+                    if reason.starts_with(fsutil::UNREADABLE) {
+                        report.quarantined_unreadable += 1;
+                        (self.log)(&format!(
+                            "WARNING: {context}: spool record {} quarantined: {reason}",
+                            item.pos
+                        ));
+                    }
                     let raw = item.raw.as_deref().unwrap_or(&[]).to_vec();
                     self.dead_letter(&context, item.pos, LOCAL_CODE, &reason, None, &raw)?;
                     report.dead_lettered_local += 1;
@@ -1540,7 +1607,26 @@ impl<T: Transport> Uplink<T> {
                 &self.cfg.done_retention,
                 now,
             )?;
+            report.pruned_out = crate::retention::prune_diode_out(
+                out,
+                &self.cfg.state_dir.join(DONE_DIR),
+                &self.cfg.out_retention,
+                now,
+            )?;
         }
+        if let Source::Spool(root) = &self.cfg.source {
+            report.pruned_rejected = crate::spool_export::prune_rejected(
+                &root.join("rejected"),
+                &root.join("ready"),
+                &self.cfg.rejected_retention,
+                now,
+            )?;
+        }
+        report.pruned_reinject = crate::retention::prune_reinject_payloads(
+            &self.cfg.state_dir.join(REINJECT_DIR),
+            &self.cfg.reinject_retention,
+            now,
+        )?;
         let r = self.cfg.dead_letter_retention;
         let mut dead = std::mem::replace(
             &mut self.dead,

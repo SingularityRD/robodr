@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 pub const CONTRACT_NAME: &str = "robodr.findings";
 /// Contract (envelope) schema version emitted, semver. See
 /// `docs/contracts/robodr.findings.md`.
-pub const CONTRACT_VERSION: &str = "2.4.0";
+pub const CONTRACT_VERSION: &str = "2.5.0";
 /// Contract major emitted and validated in full.
 pub const CONTRACT_MAJOR: u64 = 2;
 /// Older contract major still accepted on parse (replay, migration), never
@@ -275,6 +275,166 @@ pub struct EntityContext {
     /// The deviation's raw detail line. It interpolates attacker-chosen names,
     /// so it is carried only as tainted data.
     pub detail: Tainted,
+    /// The agent's periodic health record (contract 2.5): present exactly
+    /// on `robot.agent.health` findings, absent on every other rule.
+    /// Sensor-authored (agentd's own counters and configuration), never
+    /// tainted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_health: Option<AgentHealth>,
+}
+
+/// Rule id of the agent's periodic health record (contract 2.5).
+pub const AGENT_HEALTH_RULE: &str = "robot.agent.health";
+
+/// Bounds of [`AgentHealth`] (the validator enforces them; the builder
+/// truncates to them).
+pub mod health_limits {
+    /// Entries of `reasons`.
+    pub const REASONS: usize = 16;
+    /// Bytes of one reason.
+    pub const REASON_BYTES: usize = 256;
+    /// Entries of `versions`, `inputs`, `reachability`, `credentials` and
+    /// `disks` (each).
+    pub const ITEMS: usize = 16;
+    /// Bytes of a name or version.
+    pub const NAME_BYTES: usize = 128;
+}
+
+/// The robot's monitoring state as agentd evaluates it (`status.json`
+/// `state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthLabel {
+    Ok,
+    Degraded,
+    Unknown,
+}
+
+/// A component's version as the agent knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentVersion {
+    /// e.g. `robodr-agentd`, `robodr.findings`.
+    pub component: String,
+    pub version: String,
+}
+
+/// One input's freshness and counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputFreshness {
+    /// The input's name as configured (`capture:eth0`, `host:...`).
+    pub name: String,
+    /// Milliseconds since its last valid item; absent: nothing yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rx_age_ms: Option<u64>,
+    pub received: u64,
+    /// Items lost before inspection (queue and producer drops).
+    pub dropped: u64,
+    pub malformed: u64,
+    pub ended: bool,
+}
+
+/// Finding and spool counters since the agent started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCounters {
+    pub findings_spooled: u64,
+    pub finding_errors: u64,
+    pub health_findings: u64,
+    /// Findings not spooled because the spool was full.
+    pub spool_dropped: u64,
+    pub spool_write_errors: u64,
+    /// Black-box notes not recorded.
+    pub note_errors: u64,
+}
+
+/// The black box's state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlackBoxHealth {
+    /// Appends are failing: findings go out without evidence links.
+    pub degraded: bool,
+    /// An external head anchor is configured.
+    pub anchored: bool,
+    pub anchor_failures: u64,
+}
+
+/// Whether a component agentd depends on answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachState {
+    Reachable,
+    Unreachable,
+    /// Configured but not heard from yet.
+    Unknown,
+    NotConfigured,
+}
+
+/// Reachability of one component (`executor`, `gateway`, `pulsard`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reachability {
+    pub component: String,
+    pub state: ReachState,
+    /// Milliseconds since it last answered (absent: never, or not
+    /// configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_age_ms: Option<u64>,
+}
+
+/// One credential's expiry (certificate `notAfter`, CRL `nextUpdate`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialExpiry {
+    /// e.g. `control_plane.server_cert`, `control_plane.crl`.
+    pub name: String,
+    /// Unix time (ms) it expires (certificate) or must be replaced (CRL).
+    pub expires_ms: u64,
+    /// Whole days left, rounded down (negative: expired).
+    pub days_to_expiry: i64,
+}
+
+/// The kernel's clock discipline (`adjtimex(2)`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockHealth {
+    /// `false`: the kernel reports the clock unsynchronised (`STA_UNSYNC`
+    /// / `TIME_ERROR`); absent: not known on this platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronized: Option<bool>,
+    /// The kernel's maximum error estimate (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_error_ms: Option<u64>,
+    /// Wall-clock jumps against the monotonic clock since start.
+    pub wall_jumps: u64,
+}
+
+/// Free space of one filesystem agentd writes to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskHealth {
+    /// `blackbox`, `spool`, `control_plane`.
+    pub name: String,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// `entity_context.agent_health` of a [`AGENT_HEALTH_RULE`] finding
+/// (contract 2.5, §3g): agentd's periodic, signed liveness and health
+/// record. The profile digest and the safety state are the finding's own
+/// `entity_context.profile` and `entity_context.safety_state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHealth {
+    pub state: HealthLabel,
+    /// Why the state is not `ok` (empty when it is).
+    pub reasons: Vec<String>,
+    /// The record's period (ms): a SOC treats a robot whose newest record
+    /// is older than a few periods as silent.
+    pub interval_ms: u64,
+    pub uptime_ms: u64,
+    /// Sequence number of this record since the agent started (1, 2, ...).
+    pub seq: u64,
+    pub versions: Vec<ComponentVersion>,
+    pub inputs: Vec<InputFreshness>,
+    pub counters: HealthCounters,
+    pub blackbox: BlackBoxHealth,
+    pub reachability: Vec<Reachability>,
+    pub credentials: Vec<CredentialExpiry>,
+    pub clock: ClockHealth,
+    pub disks: Vec<DiskHealth>,
 }
 
 /// A reference to one record in the signed, hash-chained black box.

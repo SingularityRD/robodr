@@ -467,12 +467,17 @@ pub fn apply_restriction(
         None => previous_error,
         // The one in force, read again: its monotonic deadline rules.
         Some(Ok(Some(r))) if gw.restriction() == Some(&r) => None,
-        Some(Ok(Some(r))) if !r.expired(now_unix_ms) => {
-            let left = r.expires_unix_ms.saturating_sub(now_unix_ms);
-            gw.set_restriction(Some(r));
-            gw.set_restriction_deadline_ms(Some(now_mono_ms.saturating_add(left)));
-            None
-        }
+        Some(Ok(Some(r))) if !r.expired(now_unix_ms) => match gw.restriction_floor_ok(&r) {
+            Ok(()) => {
+                let left = r.expires_unix_ms.saturating_sub(now_unix_ms);
+                gw.set_restriction(Some(r));
+                gw.set_restriction_deadline_ms(Some(now_mono_ms.saturating_add(left)));
+                None
+            }
+            // Review finding 3: below the floor on a robot that balances;
+            // ignored like a malformed file.
+            Err(e) => Some(e),
+        },
         Some(Ok(_)) => {
             gw.set_restriction(None);
             None

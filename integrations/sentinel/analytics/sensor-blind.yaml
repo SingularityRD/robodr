@@ -1,0 +1,31 @@
+id: c0216afb-f733-5811-81f9-e02ea2566a3a
+name: RoboDR - Sensor blind or tampered
+description: |
+  The robot's sensor cannot see (input silent or ended, queue overflow, evidence truncated, discovery not inspected). Treat its silence as unknown, not safe. Observe-only: alerts, never responds.
+  RoboDR rule ids (docs/customer/detection-catalog.md):
+    - robot.agent.input_silent
+    - robot.agent.input_ended
+    - robot.agent.queue_overflow
+    - robot.agent.evidence_truncated
+    - robot.rtps.discovery_not_inspected
+severity: Medium
+requiredDataConnectors: []
+queryFrequency: 5m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics: []
+relevantTechniques: []
+query: |
+  RoboDRFindings
+  | where RuleId in ("robot.agent.input_silent", "robot.agent.input_ended", "robot.agent.queue_overflow", "robot.agent.evidence_truncated", "robot.rtps.discovery_not_inspected")
+  | summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+      RuleIds = make_set(RuleId), SourceIps = make_set(SourceIp), Verification = make_set(VerificationStatus)
+      by RobotId, Site
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: RobotId
+version: 1.0.0
+kind: Scheduled

@@ -1,0 +1,38 @@
+{
+  "body_file": "10.response.body",
+  "body_sha256": "0b859973bbb61f6cd8f85b712a43117c95f85a9c8aae8d35268cfd2dedadf587",
+  "envelope": {
+    "payload": {
+      "at_ms": 1790000108000,
+      "decommission_id": "rfd1-02020202020202020202020202020202",
+      "format": "robodr-fleet-decommission-answer/v1",
+      "keys": [
+        {
+          "fingerprint": "sha256:b6fc96191abd27af2a51ed32e9ccd9cca8e991d5969b9b42fedb39b9abcccde4",
+          "key_id": "ed25519:caf521a404f9a7bf",
+          "role": "uplink"
+        },
+        {
+          "fingerprint": "sha256:2d3bb9ef976d407955e4188df05c25f511cd1fe3c85fe70fc221c4d8f8e66261",
+          "key_id": "ed25519:bd1a186a203ad9e3",
+          "role": "finding"
+        },
+        {
+          "fingerprint": "sha256:2b61f0ec7a2b23523274ba3f5b0a4a9e66f75a1165e11ced25862d8a1692761d",
+          "key_id": "ed25519:3d2af05f349c1712",
+          "role": "blackbox"
+        }
+      ],
+      "reason": "end_of_life",
+      "request_digest": "sha256:6e36983b52203ba6470f712ecf9d68648b6c3352fd93d75fa2a8269df654fd62",
+      "robot_id": "ugv-001",
+      "status": "decommissioned",
+      "workspace": "ws-test-0001"
+    },
+    "signed_by": [
+      "ed25519:370ede82195fa32b"
+    ],
+    "type": "decommission-answer"
+  },
+  "status": 200
+}

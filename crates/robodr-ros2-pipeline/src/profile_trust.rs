@@ -285,6 +285,9 @@ pub struct TrustLoad {
     pub signed_by: Option<String>,
     /// The rollback decision (`None`: no state file, or refused).
     pub decision: Option<RollbackDecision>,
+    /// The profile was accepted under a lab-only trust file
+    /// (`robodr-commission poc-init`): report it loudly.
+    pub lab_only: bool,
 }
 
 /// [`load_profile_deferred`] with the black box's latest accepted-profile
@@ -307,6 +310,7 @@ pub fn load_profile_checked(
         accepted: None,
         signed_by: None,
         decision: None,
+        lab_only: false,
     };
     match eval.result {
         Ok(a) => {
@@ -320,6 +324,7 @@ pub fn load_profile_checked(
             t.accepted = a.record;
             t.signed_by = a.verified.signed_by;
             t.decision = a.decision;
+            t.lab_only = a.verified.lab_only && a.verified.profile.locked;
         }
         Err(e) => t.loaded.file_check = Err(e),
     }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use robodr_responder::SafetyState;
 
 use crate::engine::Outcome;
-use crate::journal::Event;
+use crate::journal::{Event, JournalHead};
 use crate::order::Order;
 use crate::proto::{self, Key, Msg};
 
@@ -123,18 +123,42 @@ impl Client {
         self.revert_signed(id, reason, None)
     }
 
-    /// A revert with the SOC's signed revert request (review finding F3).
+    /// A revert with the SOC's signed revert request (review finding F3),
+    /// telling the executor that no safety state is available (an active
+    /// `safe_pause` then stays in force: [`Client::revert_with_safety`]).
     pub fn revert_signed(
         &self,
         id: &str,
         reason: &str,
         soc: Option<&crate::soc::SocRequest>,
     ) -> Result<Outcome, String> {
-        match self.call(&Msg::Revert {
-            id: id.into(),
-            reason: reason.into(),
-            soc: soc.map(|s| Box::new(s.clone())),
-        })? {
+        self.revert_with_safety(id, reason, soc, &mut || {
+            Err("this client supplies no safety state".into())
+        })
+    }
+
+    /// A revert with the SOC's signed revert request. Lifting an active
+    /// `safe_pause` (review finding 1) first asks for the safety state now
+    /// (`safety`): it must be known, fresh, not engaged and one the
+    /// pause's adapters allow, or the pause stays in force.
+    pub fn revert_with_safety(
+        &self,
+        id: &str,
+        reason: &str,
+        soc: Option<&crate::soc::SocRequest>,
+        safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
+    ) -> Result<Outcome, String> {
+        let mut c = self.connect()?;
+        let n = self.send(
+            &mut c,
+            "",
+            &Msg::Revert {
+                id: id.into(),
+                reason: reason.into(),
+                soc: soc.map(|s| Box::new(s.clone())),
+            },
+        )?;
+        match self.answer_confirm(&mut c, &n, id, safety)?.msg {
             Msg::Outcome { outcome } => Ok(*outcome),
             _ => Err("unexpected executor answer".into()),
         }
@@ -163,10 +187,30 @@ impl Client {
         since: u64,
         safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
     ) -> Result<Vec<Event>, String> {
+        self.events_anchored(since, None, safety).map(|(e, _)| e)
+    }
+
+    /// [`Client::events_with_safety`] sending the journal head agentd
+    /// anchored (`anchor`, review of gap 1) and returning the executor's
+    /// current head with the events (`None` from an executor that does not
+    /// report one).
+    pub fn events_anchored(
+        &self,
+        since: u64,
+        anchor: Option<&JournalHead>,
+        safety: &mut dyn FnMut() -> Result<(SafetyState, u64), String>,
+    ) -> Result<(Vec<Event>, Option<JournalHead>), String> {
         let mut c = self.connect()?;
-        let n = self.send(&mut c, "", &Msg::Events { since })?;
+        let n = self.send(
+            &mut c,
+            "",
+            &Msg::Events {
+                since,
+                anchor: anchor.cloned(),
+            },
+        )?;
         match self.answer_confirm(&mut c, &n, "rearm", safety)?.msg {
-            Msg::EventList { events } => Ok(events),
+            Msg::EventList { events, head } => Ok((events, head)),
             _ => Err("unexpected executor answer".into()),
         }
     }
@@ -192,18 +236,6 @@ impl Client {
                 journal_reset,
                 held,
             }),
-            _ => Err("unexpected executor answer".into()),
-        }
-    }
-
-    /// Re-arm the executor after an operator's emergency disable (and
-    /// acknowledge a journal reset). Returns whether it was disabled.
-    pub fn rearm(&self, reason: &str) -> Result<bool, String> {
-        match self.call(&Msg::Rearm {
-            reason: reason.into(),
-        })? {
-            Msg::Rearmed { was_disabled } => Ok(was_disabled),
-            Msg::Error { code, message } => Err(format!("executor error {code}: {message}")),
             _ => Err("unexpected executor answer".into()),
         }
     }

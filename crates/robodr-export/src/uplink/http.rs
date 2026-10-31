@@ -743,6 +743,12 @@ fn read_line<R: BufRead>(r: &mut R, budget: &mut usize) -> io::Result<String> {
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
+    // RFC 9112 §2.2 / RFC 9110 §5.5: a bare CR or a NUL in the head is
+    // invalid; refused rather than passed on (e.g. into `Retry-After` and
+    // from there into a log line). Found by the `uplink_http` fuzz target.
+    if buf.iter().any(|&b| b == b'\r' || b == 0) {
+        return Err(bad("bare CR or NUL in the response head"));
+    }
     String::from_utf8(buf).map_err(|_| bad("response head is not UTF-8"))
 }
 
@@ -967,6 +973,26 @@ mod tests {
 
     fn parse(s: &[u8]) -> io::Result<HttpResponse> {
         read_response(&mut BufReader::new(s))
+    }
+
+    /// Bare CR / NUL in a status, header or chunk-size line (the
+    /// `uplink_http` fuzz target's first finding: `Retry-After:\r\r\n`
+    /// was returned as the value "\r").
+    #[test]
+    fn bare_cr_and_nul_in_the_head_are_refused() {
+        for bad in [
+            &b"HTTP/1.1 429\nRetry-After:\r\r\n\n"[..],
+            b"HTTP/1.1 429 Busy\r\nRetry-After: 7\rX-Injected: 1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX: a\0b\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200\rOK\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\r\nabc\r\n0\r\n\r\n",
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{bad:?}");
+        }
+        // CRLF and bare LF line ends stay accepted.
+        assert!(parse(b"HTTP/1.1 429 Busy\r\nRetry-After: 7\r\n\r\n").is_ok());
+        assert!(parse(b"HTTP/1.1 429 Busy\nRetry-After: 7\n\n").is_ok());
     }
 
     #[test]

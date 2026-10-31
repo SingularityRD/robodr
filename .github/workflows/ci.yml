@@ -112,6 +112,7 @@ jobs:
           python3 scripts/check-focal-units.py --self-test
           python3 scripts/check-packages.py --self-test
           python3 scripts/third_party_notices.py --self-test
+          python3 scripts/compare-rebuild.py --self-test
           scripts/ci-install-ebpf-toolchain.sh --self-test
       - name: Package variants consistent (programs, workflows, maintainer scripts)
         # Every robodr-* program classified per package variant, every
@@ -127,6 +128,15 @@ jobs:
         # Runs a copy of the helper whose /run/credentials is a temporary
         # directory; root because the helper requires it and chowns.
         run: sudo sh scripts/test-load-credential.sh
+      - name: Release toolchain pin still matches static.rust-lang.org
+        # The independent rebuild (release.yml) installs Rust from the
+        # channel manifest pinned by SHA-256; this fails as soon as the pin
+        # and rust-toolchain.toml disagree (downloads only the manifest).
+        run: ROBODR_TOOLCHAIN_DRY_RUN=1 scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"
+      - name: exporter / gateway user migration (deb postinst, rpm post)
+        # Runs a copy of migrate_exporter_users against a temporary
+        # /var/lib/robodr with stand-in users; root because it chowns.
+        run: sudo sh scripts/test-exporter-migration.sh
       - name: robodr-pulsard's external-BTF guard (robodr-btf-check)
         run: sh scripts/test-btf-check.sh
       - name: Validate Pulsar rules (rules/) against vendor/pulsar
@@ -238,12 +248,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   msrv:
-    # Informational. Every crate now opts in with `rust-version.workspace = true`;
-    # flip continue-on-error off once this job has passed on the runners (it has
-    # not been run on 1.87 outside CI). Checks the pure crates on the MSRV.
-    name: MSRV check (informational)
+    # Required (T89): every crate opts in with `rust-version.workspace = true`,
+    # so a change that needs a newer Rust than [workspace.package]
+    # rust-version fails here instead of on a customer's pinned toolchain.
+    # Checks the pure crates on the MSRV.
+    name: MSRV check
     runs-on: ubuntu-24.04
-    continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -526,6 +536,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: docker.io/library/ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+      # PATH spelled out: a step after a $GITHUB_PATH addition runs with
+      # PATH = <additions>:<PATH from the container's Config.Env>, and the
+      # Rocky Linux image sets no PATH there, so the runner's
+      # `docker exec ... sh` found no shell ("exec: sh: executable file
+      # not found"). Same value as the Ubuntu image's (and the shells') default.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     strategy:
       fail-fast: false
       matrix:
@@ -591,6 +608,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: quay.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f
+      # PATH spelled out: a step after a $GITHUB_PATH addition runs with
+      # PATH = <additions>:<PATH from the container's Config.Env>, and the
+      # Rocky Linux image sets no PATH there, so the runner's
+      # `docker exec ... sh` found no shell ("exec: sh: executable file
+      # not found"). Same value as the Ubuntu image's (and the shells') default.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     strategy:
       fail-fast: false
       matrix:

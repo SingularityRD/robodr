@@ -188,6 +188,14 @@ pub enum KeyFileError {
     /// A legacy HMAC key where the caller's policy refuses them
     /// ([`KeyFile::check_hmac_policy`], [`Keyring::set_refuse_hmac`]).
     LegacyHmac(String),
+    /// A file used as a trust anchor (public keys that decide what
+    /// verifies: keyrings, `previous_keys`) that another user could have
+    /// written: owned by neither root nor the effective user, or group- or
+    /// world-writable (`mode & 0o022 != 0`).
+    UntrustedFile {
+        uid: u32,
+        mode: u32,
+    },
 }
 
 impl fmt::Display for KeyFileError {
@@ -212,6 +220,12 @@ impl fmt::Display for KeyFileError {
             KeyFileError::Key(e) => write!(f, "{e}"),
             KeyFileError::DuplicateKeyId(id) => write!(f, "key id {id:?} appears twice"),
             KeyFileError::NoRandomness(e) => write!(f, "no kernel randomness: {e}"),
+            KeyFileError::UntrustedFile { uid, mode } => write!(
+                f,
+                "key file used as a trust anchor is owned by uid {uid} with mode {mode:04o}: it \
+                 must be owned by root or this user and not group/world-writable (chown it, \
+                 chmod go-w)"
+            ),
             KeyFileError::Owner { uid } => write!(
                 f,
                 "secret key file is owned by uid {uid}, not by this user or root"
@@ -874,6 +888,25 @@ fn check_secret_access(md: &Metadata) -> Result<(), KeyFileError> {
     Ok(())
 }
 
+/// The rule for files used as trust anchors (keyrings, previous keys, even
+/// public-only): owned by root or the effective user, and writable by
+/// nobody else (`mode & 0o022 == 0`). Whoever can write such a file
+/// decides which signatures verify.
+fn check_trust_access(md: &Metadata) -> Result<(), KeyFileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = md.permissions().mode() & 0o7777;
+        let uid = md.uid();
+        if mode & 0o022 != 0 || (uid != 0 && uid != effective_uid()) {
+            return Err(KeyFileError::UntrustedFile { uid, mode });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = md;
+    Ok(())
+}
+
 /// Open without following symlinks, require a regular file of bounded
 /// size, read it. Returns the text and the opened file's metadata (the
 /// permission rule is applied by the caller once it knows whether the file
@@ -1085,31 +1118,30 @@ impl Keyring {
     }
 
     /// Load a key file or keyring file into this ring. A file holding any
-    /// secret must pass the permission/owner rule; public-only files are
-    /// accepted whatever their mode. Nothing is added unless every key in
-    /// the file is usable.
+    /// secret must pass the permission/owner rule; a public-only file the
+    /// trust-anchor rule (owned by root or this user, not group/world-
+    /// writable: [`KeyFileError::UntrustedFile`]). Nothing is added unless
+    /// every key in the file is usable.
     pub fn load_file(&mut self, path: &Path) -> Result<(), KeyFileError> {
-        let (mut text, md) = read_key_text(path)?;
-        let r = parse_key_files(&text);
-        wipe_string(&mut text);
-        let keys = r?;
-        if keys.iter().any(|k| !k.is_public()) {
-            check_secret_access(&md)?;
-        }
+        let keys = load_key_files(path)?;
         self.add_all(&keys)
     }
 
     /// Like [`Keyring::load_file`], but every key must be a public key:
     /// secret material is [`KeyFileError::NotPublic`] (for verifiers that
     /// must never hold signing keys).
+    ///
+    /// The file must pass the trust-anchor rule (owned by root or this
+    /// user, not group/world-writable: [`KeyFileError::UntrustedFile`]).
     pub fn load_public_file(&mut self, path: &Path) -> Result<(), KeyFileError> {
-        let (mut text, _) = read_key_text(path)?;
+        let (mut text, md) = read_key_text(path)?;
         let r = parse_key_files(&text);
         wipe_string(&mut text);
         let keys = r?;
         if let Some(k) = keys.iter().find(|k| !k.is_public()) {
             return Err(KeyFileError::NotPublic(k.key_id.clone()));
         }
+        check_trust_access(&md)?;
         self.add_all(&keys)
     }
 
@@ -1189,6 +1221,11 @@ impl Verifier for Keyring {
     fn key_device(&self, key_id: &str) -> Option<&str> {
         self.device_of(key_id)
     }
+    fn key_fingerprint(&self, key_id: &str) -> Option<String> {
+        self.keys
+            .get(key_id)
+            .and_then(|e| e.verifier.key_fingerprint(key_id))
+    }
     fn verify_any(&self, message: &[u8], signature: &[u8]) -> bool {
         self.keys
             .values()
@@ -1198,7 +1235,8 @@ impl Verifier for Keyring {
 
 /// Load every key in a key file or keyring file, with the checks of
 /// [`Keyring::load_file`] (a file holding any secret must pass the
-/// permission/owner rule; public-only files load whatever their mode).
+/// permission/owner rule, a public-only file the trust-anchor rule: owned
+/// by root or this user, not group/world-writable).
 pub fn load_key_files(path: &Path) -> Result<Vec<KeyFile>, KeyFileError> {
     let (mut text, md) = read_key_text(path)?;
     let r = parse_key_files(&text);
@@ -1206,8 +1244,66 @@ pub fn load_key_files(path: &Path) -> Result<Vec<KeyFile>, KeyFileError> {
     let keys = r?;
     if keys.iter().any(|k| !k.is_public()) {
         check_secret_access(&md)?;
+    } else {
+        check_trust_access(&md)?;
     }
     Ok(keys)
+}
+
+/// Load a recorder's retired keys from `paths` (public key or keyring
+/// files, [`load_key_files`]) with the checks both `robodr-agentd`
+/// (`blackbox.previous_keys`) and `robodr-blackbox rotate
+/// --previous-keys` apply: an Ed25519 secret key file is refused (its
+/// `.pub` suffices: a retired signing key has no business on the unit), an
+/// HMAC key needs `allow_hmac` (and adds a warning), no key may carry an
+/// id in `exclude` (`(key id, why)`: the current or new key), and a key
+/// bound to a device must be bound to `device_id`. Ids are distinct;
+/// algorithms are mixed only with `allow_hmac` (the way off HMAC). Errors
+/// name the file under `label`.
+pub fn load_previous_keys(
+    label: &str,
+    paths: &[&Path],
+    device_id: &str,
+    exclude: &[(&str, &str)],
+    allow_hmac: bool,
+    warnings: &mut Vec<String>,
+) -> Result<PreviousKeys, String> {
+    let mut all = Vec::new();
+    for p in paths {
+        let shown = p.display();
+        let keys = load_key_files(p).map_err(|e| format!("{label} {shown}: {e}"))?;
+        for k in keys {
+            let id = k.key_id.escape_debug().to_string();
+            k.check_hmac_policy(allow_hmac)
+                .map_err(|e| format!("{label} {shown}: {e}"))?;
+            if !k.is_symmetric() && !k.is_public() {
+                return Err(format!(
+                    "{label} {shown}: key \"{id}\" is a secret key file; a retired ed25519 key \
+                     is listed by its public file (robodr-blackbox export-pub)"
+                ));
+            }
+            if let Some((_, why)) = exclude.iter().find(|(x, _)| *x == k.key_id) {
+                return Err(format!("{label} {shown}: key \"{id}\" is {why}"));
+            }
+            if let Some(d) = k.device_id.as_deref() {
+                if d != device_id {
+                    return Err(format!(
+                        "{label} {shown}: key \"{id}\" is bound to device \"{}\", not \"{}\"",
+                        d.escape_debug(),
+                        device_id.escape_debug()
+                    ));
+                }
+            }
+            if k.is_symmetric() {
+                warnings.push(format!(
+                    "{label}: {id} is a legacy hmac-sha256 key: whoever holds it can forge \
+                     the records it signed"
+                ));
+            }
+            all.push(k);
+        }
+    }
+    PreviousKeys::from_key_files(&all, allow_hmac).map_err(|e| format!("{label}: {e}"))
 }
 
 /// A recorder's **previous** (retired) keys after a key rotation, as a
@@ -1327,6 +1423,10 @@ impl Verifier for PreviousKeys {
     }
     fn key_device(&self, key_id: &str) -> Option<&str> {
         self.find(key_id).and_then(|(_, d)| d.as_deref())
+    }
+    fn key_fingerprint(&self, key_id: &str) -> Option<String> {
+        self.find(key_id)
+            .and_then(|(v, _)| v.key_fingerprint(key_id))
     }
     fn verify_any(&self, message: &[u8], signature: &[u8]) -> bool {
         self.keys.iter().any(|(v, _)| v.verify(message, signature))
@@ -1715,11 +1815,44 @@ mod tests {
         let pp = public_key_path(&sp);
         k.write_new(&sp).unwrap();
         k.to_public().unwrap().write_new(&pp).unwrap();
-        for m in [0o644, 0o666, 0o604, 0o400] {
+        // Readable by anyone is fine for a public key ...
+        for m in [0o644, 0o604, 0o400, 0o444] {
             mode(&pp, m);
             assert!(KeyFile::load(&pp).is_ok(), "{m:o}");
             assert!(Keyring::new().load_file(&pp).is_ok(), "{m:o}");
             assert!(Keyring::new().load_public_file(&pp).is_ok(), "{m:o}");
+            assert!(load_key_files(&pp).is_ok(), "{m:o}");
+        }
+        // ... but a file used as a trust anchor (keyring, previous keys)
+        // that another user can write decides what verifies: refused.
+        for m in [0o666, 0o664, 0o646, 0o620] {
+            mode(&pp, m);
+            assert!(
+                matches!(
+                    Keyring::new().load_file(&pp),
+                    Err(KeyFileError::UntrustedFile { .. })
+                ),
+                "{m:o}"
+            );
+            assert!(
+                matches!(
+                    Keyring::new().load_public_file(&pp),
+                    Err(KeyFileError::UntrustedFile { .. })
+                ),
+                "{m:o}"
+            );
+            let e = load_key_files(&pp).unwrap_err();
+            assert!(e.to_string().contains("trust anchor"), "{e}");
+        }
+        mode(&pp, 0o644);
+        #[cfg(unix)]
+        if effective_uid() == 0 {
+            std::os::unix::fs::chown(&pp, Some(4321), None).unwrap();
+            assert!(matches!(
+                load_key_files(&pp),
+                Err(KeyFileError::UntrustedFile { uid: 4321, .. })
+            ));
+            std::os::unix::fs::chown(&pp, Some(0), None).unwrap();
         }
         for m in [0o640, 0o604, 0o644, 0o660] {
             mode(&sp, m);
@@ -2013,5 +2146,48 @@ mod tests {
         allowed.add_json(&h.to_json()).unwrap();
         assert_eq!(allowed.symmetric_key_ids(), vec!["old-hmac"]);
         Keyring::new().add_key_file(&h).unwrap();
+    }
+
+    // `rotate --previous-keys` and agentd's `blackbox.previous_keys`: one
+    // set of checks.
+    #[test]
+    fn previous_keys_loader_applies_the_retired_key_checks() {
+        let d = tmp("prevload");
+        let k = KeyFile::generate_ed25519(Some("old")).unwrap();
+        let sp = d.join("old.key");
+        let pp = public_key_path(&sp);
+        k.write_new(&sp).unwrap();
+        k.to_public().unwrap().write_new(&pp).unwrap();
+        let mut w = Vec::new();
+        let load = |p: &Path, dev: &str, ex: &[(&str, &str)], hmac: bool, w: &mut Vec<String>| {
+            load_previous_keys("--previous-keys", &[p], dev, ex, hmac, w)
+        };
+        assert_eq!(
+            load(&pp, "ugv-1", &[], false, &mut w).unwrap().key_ids(),
+            ["old"]
+        );
+        // A secret key file (the retired signing key itself) is refused.
+        let e = load(&sp, "ugv-1", &[], false, &mut w).unwrap_err();
+        assert!(e.contains("secret key file"), "{e}");
+        // Neither the current nor the new key.
+        let e = load(&pp, "ugv-1", &[("old", "the new key id")], false, &mut w).unwrap_err();
+        assert!(e.contains("the new key id"), "{e}");
+        // A key bound to another device.
+        let mut b = KeyFile::generate_ed25519(Some("foreign")).unwrap();
+        b.device_id = Some("ugv-9".into());
+        let bp = d.join("foreign.pub");
+        b.to_public().unwrap().write_new(&bp).unwrap();
+        let e = load(&bp, "ugv-1", &[], false, &mut w).unwrap_err();
+        assert!(e.contains("bound to device"), "{e}");
+        assert!(load(&bp, "ugv-9", &[], false, &mut w).is_ok());
+        // HMAC only with the opt-in (and then with a warning).
+        let h = KeyFile::hmac_from_secret(&[3; 32], Some("legacy")).unwrap();
+        let hp = d.join("legacy.key");
+        h.write_new(&hp).unwrap();
+        assert!(load(&hp, "ugv-1", &[], false, &mut w).is_err());
+        assert!(w.is_empty());
+        assert!(load(&hp, "ugv-1", &[], true, &mut w).is_ok());
+        assert_eq!(w.len(), 1);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

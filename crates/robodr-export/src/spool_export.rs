@@ -22,7 +22,10 @@
 //!    one is rejected with the reason "legacy 1.x signed record: re-sign
 //!    required". A record
 //!    that fails is **moved** to `<spool>/rejected/` with a `.reason.json`
-//!    beside it (never deleted). The batch is cut so the packer is
+//!    beside it (never deleted). A file that cannot be read (I/O error such
+//!    as `EACCES` / `EIO`, [`fsutil::READ_ATTEMPTS`] attempts) is
+//!    quarantined there the same way, with the error as its reason, instead
+//!    of failing every run (`quarantined_unreadable`). The batch is cut so the packer is
 //!    guaranteed to write it as **one** diode batch (same size/count rule
 //!    as the packer's planner).
 //! 2. Write the **intent** `{batch_seq: packer.next_seq, spool_seqs}` to
@@ -69,7 +72,10 @@
 //! deleted after each run, each with its `.reason.json`. A rejected record
 //! is never published and never read again by the exporter (it left
 //! `ready/` for good), so deleting it loses only its forensic copy; a name
-//! that is (again) in `ready/` is never touched.
+//! that is (again) in `ready/` is never touched. Its age is that of its
+//! `.reason.json`, which is written (durably) **before** the record is
+//! moved; a record found without one is dated when that is noticed (a
+//! missing reason file is written then), never by its spool time.
 //!
 //! # Planner limits
 //!
@@ -319,6 +325,10 @@ pub struct ExportReport {
     /// published), `"partial"` (some could not be proven and stay in
     /// `ready/`) or `"dropped"` (nothing had been committed).
     pub recovered: Option<String>,
+    /// Spool files that could not be read (I/O error after
+    /// [`fsutil::READ_ATTEMPTS`] attempts), quarantined in the rejected
+    /// directory with the error (also listed in `rejected`).
+    pub quarantined_unreadable: u64,
     /// Rejected records deleted by retention.
     pub pruned_rejected: PruneReport,
 }
@@ -642,11 +652,18 @@ impl Exporter {
         reason: String,
         report: &mut ExportReport,
     ) -> Result<(), ExportError> {
-        let dest = self.cfg.rejected_dir.join(name);
-        fs::rename(self.ready.join(name), &dest)?;
+        // The reason first (durably: atomic_write fsyncs the file and
+        // rejected/), then the rename. A crash in between leaves the record
+        // in ready/ (rejected again on the next run) and a reason file that
+        // retention never deletes while the name is in ready/. The other
+        // order left a record without a reason, which retention dated by
+        // the record's spool time and could delete at once.
         let why = serde_json::json!({ "file": name, "reason": reason });
         let reason_path = self.cfg.rejected_dir.join(format!("{name}.reason.json"));
         fsutil::atomic_write(&reason_path, why.to_string().as_bytes())?;
+        let dest = self.cfg.rejected_dir.join(name);
+        fs::rename(self.ready.join(name), &dest)?;
+        fsutil::fsync_dir(&self.cfg.rejected_dir)?;
         fsutil::fsync_dir(&self.ready)?;
         self.state.rejected += 1;
         report.rejected.push(Rejected {
@@ -663,9 +680,12 @@ impl Exporter {
         seq: u64,
         name: &str,
     ) -> Result<Result<(FindingEnvelope, String), String>, ExportError> {
-        let bytes = match fsutil::read_capped(&self.ready.join(name), MAX_SPOOL_FILE) {
+        // An I/O error (EACCES, EIO) is retried a bounded number of times,
+        // then the file is quarantined in rejected/ with the error rather
+        // than failing every run forever.
+        let bytes = match fsutil::read_capped_retrying(&self.ready.join(name), MAX_SPOOL_FILE) {
             Ok(b) => b,
-            Err(ReadError::Io(e)) => return Err(e.into()),
+            Err(ReadError::Io(e)) => return Ok(Err(fsutil::unreadable_reason(&e))),
             Err(ReadError::Missing) => return Ok(Err("vanished".into())),
             Err(e) => return Ok(Err(format!("unreadable: {e}"))),
         };
@@ -769,6 +789,12 @@ impl Exporter {
                 match self.load(seq, &name)? {
                     Err(reason) => {
                         if reason != "vanished" {
+                            if reason.starts_with(fsutil::UNREADABLE) {
+                                report.quarantined_unreadable += 1;
+                                eprintln!(
+                                    "robodr-spool-export: WARNING: {name} quarantined: {reason}"
+                                );
+                            }
                             self.reject(&name, reason, &mut report)?;
                         }
                     }
@@ -835,8 +861,12 @@ impl Exporter {
 
 /// Retention of the rejected directory (see "Retention" in the module
 /// docs): each `<seq>.json` with its `<seq>.json.reason.json` is one item
-/// (age: the reason file's time, i.e. when it was rejected; else the
-/// record's), deleted together. A name still in `ready/` is never touched.
+/// (age: the reason file's time, i.e. when it was rejected; a record found
+/// without one gets one now and is dated now), deleted together. A name
+/// still in `ready/` is never touched. Also used by `robodr-kafka-publish`
+/// and `robodr-uplink` for a spool source: they move records here without
+/// a reason file (the reason is in their dead-letter file), so each is
+/// dated by the first pruning pass that sees it (the run after the move).
 pub fn prune_rejected(
     dir: &Path,
     ready: &Path,
@@ -867,7 +897,22 @@ pub fn prune_rejected(
         let name = record_name(seq);
         let rec = dir.join(&name);
         let why = dir.join(format!("{name}.reason.json"));
-        let (m_rec, m_why) = (file_meta(&rec)?, file_meta(&why)?);
+        let (m_rec, mut m_why) = (file_meta(&rec)?, file_meta(&why)?);
+        if m_why.is_none() && m_rec.is_some() && fs::symlink_metadata(ready.join(&name)).is_err() {
+            // A record without its reason file (left by an earlier version
+            // that renamed before writing the reason, or by an edit): its
+            // mtime is when it was spooled, not when it was rejected, so it
+            // is dated now, by writing the missing reason file.
+            let note = serde_json::json!({
+                "file": name,
+                "reason": "unknown here: the reason file was missing (robodr-kafka-publish and \
+                           robodr-uplink record the reason in their dead-letter file, by \
+                           sequence number; robodr-spool-export writes it before the move, \
+                           so a run interrupted in between); dated when this was noticed",
+            });
+            fsutil::atomic_write(&why, note.to_string().as_bytes())?;
+            m_why = file_meta(&why)?;
+        }
         let Some(modified) = m_why.or(m_rec).map(|m| m.0) else {
             continue;
         };
@@ -933,6 +978,40 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec![record_name(7), "notes.txt".to_string()]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Review finding: a record moved into rejected/ by a run that crashed
+    /// before writing its reason file was dated by its spool mtime and
+    /// deleted at once by an age bound. It is now dated when noticed.
+    #[test]
+    fn rejected_record_without_reason_is_not_deleted_at_once() {
+        let d = std::env::temp_dir().join(format!("robodr-rej-noreason-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let (rej, ready) = (d.join("rejected"), d.join("ready"));
+        fsutil::mkdir(&rej).unwrap();
+        fsutil::mkdir(&ready).unwrap();
+        let rec = rej.join(record_name(5));
+        fs::write(&rec, b"{}").unwrap();
+        let month_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&rec)
+            .unwrap()
+            .set_modified(month_ago)
+            .unwrap();
+        let r = Retention::max_age(std::time::Duration::from_secs(86_400));
+        let rep = prune_rejected(&rej, &ready, &r, std::time::SystemTime::now()).unwrap();
+        assert_eq!(rep.removed, 0, "{rep:?}");
+        assert!(rec.exists());
+        let why = rej.join(format!("{}.reason.json", record_name(5)));
+        let note = fs::read_to_string(&why).unwrap();
+        assert!(note.contains("reason file was missing"), "{note}");
+        // Two days later it is old enough.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 86_400);
+        let rep = prune_rejected(&rej, &ready, &r, later).unwrap();
+        assert_eq!(rep.removed, 1, "{rep:?}");
+        assert!(!rec.exists() && !why.exists());
         let _ = fs::remove_dir_all(&d);
     }
 }

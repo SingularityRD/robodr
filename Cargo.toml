@@ -3,11 +3,14 @@ resolver = "2"
 members = [
     "crates/robodr-agent",
     "crates/robodr-agentd",
+    "crates/robodr-attack-sim",
     "crates/robodr-blackbox",
+    "crates/robodr-buildinfo",
     "crates/robodr-capture",
     "crates/robodr-cdr",
     "crates/robodr-commission",
     "crates/robodr-correlate",
+    "crates/robodr-demo-soc",
     "crates/robodr-deliverd",
     "crates/robodr-depot",
     "crates/robodr-diode",
@@ -19,12 +22,16 @@ members = [
     "crates/robodr-fleet",
     "crates/robodr-motion",
     "crates/robodr-ocsf",
+    "crates/robodr-ops",
     "crates/robodr-pkg",
     "crates/robodr-release",
     "crates/robodr-responder",
     "crates/robodr-ros2-pipeline",
     "crates/robodr-rtps",
     "crates/robodr-seal",
+    "crates/robodr-signer",
+    # Throughput benchmarks (sensor-box sizing, regression gate).
+    "benches",
     # Pulsar-dependent (need pulsar + tokio; cannot build without crates.io):
     "crates/robodr-pulsard",
     "crates/robodr-sensor-ros2",
@@ -62,6 +69,7 @@ robodr-executor = { path = "crates/robodr-executor" }
 robodr-export = { path = "crates/robodr-export" }
 robodr-rtps = { path = "crates/robodr-rtps" }
 robodr-blackbox = { path = "crates/robodr-blackbox" }
+robodr-buildinfo = { path = "crates/robodr-buildinfo" }
 robodr-capture = { path = "crates/robodr-capture" }
 robodr-cdr = { path = "crates/robodr-cdr" }
 robodr-commission = { path = "crates/robodr-commission" }
@@ -79,6 +87,7 @@ robodr-release = { path = "crates/robodr-release" }
 robodr-responder = { path = "crates/robodr-responder" }
 robodr-ros2-pipeline = { path = "crates/robodr-ros2-pipeline" }
 robodr-seal = { path = "crates/robodr-seal" }
+robodr-signer = { path = "crates/robodr-signer" }
 robodr-sensor-ros2 = { path = "crates/robodr-sensor-ros2" } # Pulsar-dependent
 robodr-threat-forward = { path = "crates/robodr-threat-forward" } # Pulsar-dependent
 
@@ -120,6 +129,11 @@ curve25519-dalek = { version = "4.1", default-features = false }
 # kind robodr-rules). Already in the lock through Pulsar (toml 1.1); only
 # parse + serde, no writer.
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+# Unknown-key tracking for `robodr-ros2-watch --check-config` (pulsar.toml):
+# the same pass Pulsar's ModuleConfig::parse makes, so the check warns about
+# exactly the keys the daemon ignores. Already in the lock through Pulsar
+# (MIT / Apache-2.0).
+serde_ignored = "0.1"
 # Volatile wipe of secrets and of the hasher state above (already in the graph
 # through ed25519-dalek's `zeroize` feature).
 zeroize = "1"
@@ -134,13 +148,30 @@ hkdf = "0.12"
 # - HMAC-SHA256 (keyed file digests, synthetic nonces); already in the graph
 #   through p256's RFC 6979 signing;
 hmac = "0.12"
+# SASL/SCRAM of the Kafka producer (robodr-export kafka/sasl.rs, T60):
+# HMAC and PBKDF2 (RFC 5802 `Hi`) from RustCrypto instead of in-crate code.
+# hmac 0.13 / sha2 0.11 are already in the graph (p256 0.14 -> rfc6979 0.6,
+# hkdf 0.13); their `zeroize` feature wipes the keyed hash states (ipad /
+# opad) on drop, which hmac 0.12 above does not. pbkdf2 0.13 is the only new
+# crate (RustCrypto, MIT OR Apache-2.0, no further new dependencies).
+hmac13 = { package = "hmac", version = "0.13", default-features = false, features = ["zeroize"] }
+sha2-11 = { package = "sha2", version = "0.11", default-features = false, features = ["zeroize"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+# libc constants and declarations (robodr-export fsutil: O_NOFOLLOW, flock)
+# instead of hand-written per-architecture tables (T60). Already in the
+# graph (std's own dependency, lettre, rustix, ...), MIT OR Apache-2.0.
+libc = { version = "0.2", default-features = false }
+# Constant-time, strict (canonical padding) RFC 4648 base64 for SCRAM nonces,
+# salts, proofs and signatures (RustCrypto; already in the graph through
+# spki).
+base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
 # - X25519 for depot wrapping keys and units without a TPM (§7.7); its
 #   curve arithmetic is curve25519-dalek, already in the graph;
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 # - P-256: ECDH to a unit's TPM-resident UWK (the TPM side is
 #   `tpm2_ecdhzgen`) and ECDSA for the signed PCR policy
 #   (`TPM2_PolicyAuthorize` verifies it in the TPM; TPMs do not do Ed25519).
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
 # TLS for robodr-uplink (crates/robodr-export, ingest API client). rustls with
 # the `ring` provider only: no aws-lc-rs (CMake + a large C library), no
 # `logging` (no `log` output of handshake details), TLS 1.3 and 1.2 (rustls

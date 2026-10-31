@@ -8,7 +8,9 @@
 //! Input: `config JSON \0 records`. When the JSON is not a `safety_feed`
 //! section that resolves against the harness profile, a built-in section
 //! (Bool `/estop`, UInt8 `/robot_mode`, String `/mode_name`, Odometry
-//! `/odom`, all written by the profile's participant, plus a socket) is
+//! `/odom`, Unitree `/sportmodestate`, `/lowstate` and
+//! `/wirelesscontroller`, a Nav2 lifecycle `/bt_navigator/transition_event`,
+//! all written by the profile's participant, plus a socket) is
 //! used, so mutations of the records still reach the feed. Records are
 //! `tag(1) len(u16 LE) bytes(len)`:
 //!
@@ -27,7 +29,11 @@
 //!   report that is still fresh (`now - at <= stale_after_ms`);
 //! * a transition goes from the previous state to the new one, and the
 //!   state is unchanged when `evaluate` reports none;
-//! * `status` is total and the counters never decrease.
+//! * `status` is total and the counters never decrease;
+//! * the live operational context (`evaluate_context`) is total, reports a
+//!   transition exactly when it changed, and never names `autonomous`
+//!   control while a remote source is configured and has no fresh trusted
+//!   reading (its `on_stale` is `manual`).
 //!
 //! Shared via `#[path]` with `crates/robodr-agentd/tests/fuzz_smoke.rs`.
 #![allow(dead_code)]
@@ -36,7 +42,9 @@ use std::collections::BTreeMap;
 
 use robodr_agentd::input::{parse_safety_line, Payload};
 use robodr_agentd::safety::{conservativeness, Claim, FeedStats, SafetyFeed, SafetyFeedSection};
+use robodr_agentd::safety_feed::context::LiveContext;
 use robodr_events::profile::{Envelope, Profile};
+use robodr_responder::{Connectivity, ControlMode, MissionPhase};
 use robodr_ros2_pipeline::{Datagram, Pipeline, PipelineOptions};
 
 /// The commissioned participant (GUID prefix `aa` x 12).
@@ -54,7 +62,17 @@ pub fn profile() -> Profile {
         ..Default::default()
     };
     p.participants.insert(LEGIT_HEX.into());
-    for t in ["/cmd_vel", "/odom", "/estop", "/robot_mode", "/mode_name"] {
+    for t in [
+        "/cmd_vel",
+        "/odom",
+        "/estop",
+        "/robot_mode",
+        "/mode_name",
+        "/sportmodestate",
+        "/lowstate",
+        "/wirelesscontroller",
+        "/bt_navigator/transition_event",
+    ] {
         p.writer_topics.insert(t.into());
     }
     p.motion_envelopes.insert(
@@ -83,7 +101,20 @@ pub fn default_section() -> serde_json::Value {
              "writers": [LEGIT_HEX]},
             {"topic": "/odom", "type": "nav_msgs/msg/Odometry",
              "motion": {"moving_above": 0.05, "fast_above": 1.0, "hysteresis": 0.02},
-             "writers": [LEGIT_HEX]}
+             "writers": [LEGIT_HEX]},
+            {"topic": "/sportmodestate", "type": "unitree_go::msg::dds_::SportModeState_",
+             "writers": [LEGIT_HEX],
+             "unitree_sport": {"modes": {"1": "none", "3": "none", "7": "safe_state_active"},
+                               "motion": {"moving_above": 0.05, "fast_above": 1.0},
+                               "phase": {"1": "parked", "3": "transit"}}},
+            {"topic": "/lowstate", "type": "unitree_go::msg::dds_::LowState_",
+             "writers": [LEGIT_HEX], "unitree_low": {"moving_above": 0.5}},
+            {"topic": "/wirelesscontroller", "type": "unitree_go::msg::dds_::WirelessController_",
+             "writers": [LEGIT_HEX], "wireless_controller": {"hold_ms": 100}},
+            {"topic": "/bt_navigator/transition_event",
+             "type": "lifecycle_msgs/msg/TransitionEvent", "writers": [LEGIT_HEX],
+             "lifecycle": {"states": {"active": {"control": "autonomous", "phase": "transit"},
+                                      "inactive": {"control": "autonomous", "phase": "parked"}}}}
         ],
         "socket": {"path": "/run/robodr/safety.sock", "max_connections": 4}
     })
@@ -196,6 +227,31 @@ pub fn run_counting(data: &[u8]) -> (bool, FeedStats, usize) {
                         feed.state()
                     );
                 }
+            }
+        }
+        let fallback = LiveContext {
+            control: ControlMode::Autonomous,
+            phase: MissionPhase::Task,
+            connectivity: Connectivity::Connected,
+        };
+        let prev_ctx = feed.live_context().unwrap_or(fallback);
+        if let Some((ctx, t)) = feed.evaluate_context(now, now, fallback) {
+            assert_eq!(feed.live_context(), Some(ctx));
+            match t {
+                Some(t) => {
+                    assert_eq!((t.from, t.to), (prev_ctx, ctx));
+                    assert_ne!(t.from, t.to);
+                }
+                None => assert_eq!(ctx, prev_ctx),
+            }
+            let st = feed.status(now);
+            let view = st.context.expect("context status with context sources");
+            let remote_silent = view
+                .sources
+                .iter()
+                .any(|s| s.name == "/wirelesscontroller" && !s.fresh);
+            if remote_silent {
+                assert_ne!(ctx.control, ControlMode::Autonomous);
             }
         }
         let _ = feed.status(now);

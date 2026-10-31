@@ -336,6 +336,9 @@ impl Signer for Ed25519SigningKey {
     fn verify_own(&self, message: &[u8], signature: &[u8]) -> Option<bool> {
         Some(verify(&self.public, message, signature))
     }
+    fn public_fingerprint(&self) -> Option<String> {
+        Some(crate::sign::key_fingerprint(&self.public))
+    }
 }
 
 /// Ed25519 public key usable as a [`Verifier`]. Construction validates the
@@ -393,6 +396,9 @@ impl Verifier for Ed25519VerifyingKey {
     }
     fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
         verify_key(&self.key, message, signature)
+    }
+    fn key_fingerprint(&self, key_id: &str) -> Option<String> {
+        (key_id == self.key_id).then(|| crate::sign::key_fingerprint(&self.public))
     }
 }
 

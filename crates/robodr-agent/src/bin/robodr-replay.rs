@@ -241,14 +241,14 @@ fn parse_u64(what: &str, v: &str) -> Result<u64, String> {
 /// Load the black-box signing key from `--key-file` (secret key file,
 /// permission-checked; Ed25519, or HMAC with `--allow-hmac`). Returns the key material, the key
 /// id from the file and the algorithm.
-fn key_from(a: &Args) -> Result<(Vec<u8>, String, String), String> {
+fn key_from(a: &Args) -> Result<(zeroize::Zeroizing<Vec<u8>>, String, String), String> {
     let p = a.req("key-file")?;
     let kf = robodr_blackbox::KeyFile::load_secret(p.as_ref()).map_err(|e| format!("{p}: {e}"))?;
     // Refuses unknown algorithms and re-checks the key length.
     kf.signer().map_err(|e| format!("{p}: {e}"))?;
     hmac_policy(a, p, &kf)?;
     Ok((
-        kf.secret().to_vec(),
+        zeroize::Zeroizing::new(kf.secret().to_vec()),
         kf.key_id.clone(),
         kf.algorithm.clone(),
     ))
@@ -538,7 +538,10 @@ fn main() -> ExitCode {
         }
     };
     if argv.len() == 1 && matches!(argv[0].as_str(), "-V" | "--version") {
-        println!("robodr-replay {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-replay", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     let (cmd, rest) = match argv.first().map(String::as_str) {

@@ -13,7 +13,11 @@
 //!    `Pipeline::capture_findings` with the capture source's latest health;
 //! 2. handles inputs that ended (drain the queue first, then for the capture
 //!    input `Pipeline::finish`, as `robodr-ros2-watch` does at end of input);
-//! 3. evaluates self-health ([`crate::health`]) and reports issues;
+//! 3. evaluates self-health ([`crate::health`]) and the early warnings
+//!    ([`crate::selfcheck`]: credential expiry, kernel clock, wall-clock
+//!    jumps, free disk space, executor reachability) and reports issues;
+//!    every `self_health.health_record_ms` it reports the signed
+//!    `robot.agent.health` record (findings contract 2.5);
 //! 4. writes `status.json` into the spool; prunes acked spool records;
 //! 5. every `heartbeat_ms`, appends a `robodr.agentd_heartbeat` note to the
 //!    black box (state, reasons, per-input counters, pipeline / agent /
@@ -223,6 +227,7 @@ use crate::health::{
 use crate::input::{self, Feed, InputStats, Msg, Payload, QueueBudget};
 use crate::notify::{monotonic_ms, Notifier};
 use crate::safety::{FeedFinding, FeedStatus, SafetyFeed, Transition};
+use crate::safety_feed::context::LiveContext;
 use crate::spool::{Spool, SpoolClass, SpoolError, SpoolStats};
 
 /// Most queued items handled between two clock checks.
@@ -454,6 +459,25 @@ struct Status<'a> {
     /// executor v1 link counters (absent when the executor is off).
     #[serde(skip_serializing_if = "Option::is_none")]
     executor: Option<crate::executor_link::LinkStats>,
+    /// How each private key is protected at rest (T66): TPM-sealed or the
+    /// flagged file fallback.
+    key_protection: &'a crate::key_protection::KeyReport,
+    /// Early-warning probes (sales-readiness T5 - T7, T40, T41).
+    self_health: &'a SelfView,
+}
+
+/// What the early-warning probes saw at the last tick (`status.json`
+/// `self_health`; the health record carries the same values).
+#[derive(Debug, Clone, Default, Serialize)]
+struct SelfView {
+    /// Health records emitted so far, and the period (0: off).
+    health_records: u64,
+    health_record_ms: u64,
+    clock: robodr_ocsf::ClockHealth,
+    disks: Vec<robodr_ocsf::DiskHealth>,
+    /// Certificate `notAfter` / CRL `nextUpdate`, with `days_to_expiry`.
+    credentials: Vec<robodr_ocsf::CredentialExpiry>,
+    reachability: Vec<robodr_ocsf::Reachability>,
 }
 
 /// The agent's view of the profile: what the pipeline enforces. A profile
@@ -519,6 +543,8 @@ struct Daemon<'a> {
     /// Recorder generation (`AgentStats::blackbox_reopens`) whose open
     /// incidents were last reported.
     incidents_reported: Option<u64>,
+    /// `blackbox.retention` pressure / unexported-drop findings (T15).
+    retention_watch: crate::retention::RetentionWatch,
     /// Per input: the forwarder's cumulative `dropped` at its last
     /// heartbeat (host-threat inputs only).
     host_upstream_seen: Vec<u64>,
@@ -531,11 +557,29 @@ struct Daemon<'a> {
     /// The control-plane journals' heads last recorded in the black box
     /// (gap 1: [`crate::control::anchor`]).
     state_heads_recorded: Option<crate::control::anchor::StateHeads>,
+    /// The black-box segment that holds the newest head note, and the one
+    /// the latest heartbeat went to (review of gap 1, finding 3: a head
+    /// note is re-recorded whenever the black box moved to a new segment,
+    /// so a cyclic store never ages every one of them out).
+    state_heads_segment: Option<u64>,
+    last_note_segment: Option<u64>,
+    /// The executor journal head last recorded, and its segment (findings
+    /// 1 and 2).
+    executor_head_recorded: Option<(robodr_executor::journal::JournalHead, u64)>,
     /// executor v1: requests whose failed revert was reported (one finding
     /// per request until a revert of it succeeds).
     revert_failed_reported: std::collections::BTreeSet<String>,
     /// executor v1: the link to robodr-executor (`None` = off).
     executor: Option<crate::executor_link::ExecutorLink>,
+    /// Early warnings: credential expiry, clock, disk, executor
+    /// reachability ([`crate::selfcheck`]).
+    warnings: crate::selfcheck::Warnings,
+    /// What the early-warning probes saw at the last tick (`status.json`
+    /// `self_health`, the health record).
+    self_view: SelfView,
+    /// Health records emitted, and when the last one was (daemon ms).
+    health_records: u64,
+    health_record_at_ms: u64,
     /// The packet timeline of a pcap replay (`None` for a live capture:
     /// handling time is the observation time there).
     replay: Option<ReplayTimeline>,
@@ -688,6 +732,23 @@ impl<'a> Daemon<'a> {
             firmware: None,
         };
         let mut bcfg = RecorderConfig::new(&cfg.blackbox.dir, &cfg.robot.id, &r.boot_id);
+        if let Some(ret) = &cfg.blackbox.retention {
+            // T15: the configured retention must fit on the black box's
+            // filesystem (the nearest existing directory, before the first
+            // start creates it).
+            let fs_dir = cfg
+                .blackbox
+                .dir
+                .ancestors()
+                .find(|d| d.is_dir())
+                .unwrap_or(&cfg.blackbox.dir);
+            ret.check_space(
+                crate::retention::segments_bytes(&cfg.blackbox.dir),
+                crate::control::evidence::free_bytes(fs_dir),
+            )
+            .map_err(DaemonError::Config)?;
+            ret.apply(&mut bcfg);
+        }
         match &cfg.blackbox.head_anchor {
             Some(crate::config::HeadAnchorConfig::File { path }) => {
                 let a = robodr_blackbox::FileHeadAnchor::new(path)
@@ -706,7 +767,9 @@ impl<'a> Daemon<'a> {
                         .map_err(bad)?;
                 let mut a = robodr_blackbox::TpmNvCounterAnchor::new(&tc, signer)
                     .map_err(|e| bad(e.to_string()))?;
-                // A sidecar written before an in-place key rotation.
+                // Only to name a sidecar left under a retired key in the
+                // error: such a sidecar is refused (re-sign it with
+                // `robodr-blackbox rotate --tpm-sidecar`).
                 if let Some(p) = &r.previous_keys {
                     a = a.with_previous_keys(p.clone());
                 }
@@ -811,9 +874,34 @@ impl<'a> Daemon<'a> {
         let executor = match &r.executor {
             None => None,
             Some(spec) => {
-                let link = crate::executor_link::ExecutorLink::start(
+                // Review of gap 1 (findings 1 and 2): the newest executor
+                // journal head the black box holds goes back to the
+                // executor with every event poll (an older journal put back
+                // is reset there).
+                let bb_signer =
+                    crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
+                        .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
+                let (anchor, unverified) = crate::control::anchor::latest_executor_head(
+                    &crate::control::evidence::DirSource(agent.blackbox_dir().to_path_buf()),
+                    &cfg.robot.id,
+                    bb_signer.as_ref(),
+                )
+                .map_err(|e| {
+                    DaemonError::Io(format!(
+                        "executor: reading the black box for the executor's journal head: {e}"
+                    ))
+                })?;
+                if unverified > 0 {
+                    let _ = writeln!(
+                        log,
+                        "robodr-agentd: executor: {unverified} executor journal head note(s) in \
+                         the black box do not verify under the current key: ignored"
+                    );
+                }
+                let link = crate::executor_link::ExecutorLink::start_anchored(
                     spec,
                     crate::executor_link::SafetyCell::default(),
+                    anchor,
                 )
                 .map_err(DaemonError::Io)?;
                 if link.planner_orders {
@@ -863,13 +951,6 @@ impl<'a> Daemon<'a> {
                 .map_err(|e| DaemonError::Config(format!("finding key: {e}")))?;
                 let bb_dir = agent.blackbox_dir().to_path_buf();
                 let robot = cfg.robot.id.clone();
-                let reconcile = |ids: &[String]| {
-                    crate::control::evidence::find_decision_notes(
-                        &crate::control::evidence::DirSource(bb_dir.clone()),
-                        &robot,
-                        ids,
-                    )
-                };
                 // Gap 1: the journals are sealed under a key derived from
                 // the black-box key and compared with the newest head the
                 // black box holds for them.
@@ -878,6 +959,16 @@ impl<'a> Daemon<'a> {
                 let bb_signer =
                     crate::config::signer_for(&r.key_algorithm, &r.key, r.key_id.as_deref())
                         .map_err(|e| DaemonError::Config(format!("black-box key: {e}")))?;
+                // Review of gap 1, finding 6: only authentic notes settle a
+                // decision.
+                let reconcile = |ids: &[String]| {
+                    crate::control::evidence::find_decision_notes(
+                        &crate::control::evidence::DirSource(bb_dir.clone()),
+                        &robot,
+                        ids,
+                        bb_signer.as_ref(),
+                    )
+                };
                 let anchors = crate::control::anchor::latest(
                     &crate::control::evidence::DirSource(bb_dir.clone()),
                     &robot,
@@ -904,6 +995,7 @@ impl<'a> Daemon<'a> {
                     &reconcile,
                     seal_key,
                     &anchors,
+                    bb_signer.as_ref(),
                 )
                 .map_err(DaemonError::Io)?;
                 // executor v1: accepted requests go to robodr-executor; the
@@ -1229,13 +1321,24 @@ impl<'a> Daemon<'a> {
             correlation_pressure_reported: 0,
             correlation_pressure_at_ms: None,
             incidents_reported: None,
+            retention_watch: crate::retention::RetentionWatch::default(),
             host_upstream_seen: Vec::new(),
             control,
             control_reported: [0; 2],
             control_reported_at_ms: [None; 2],
             state_heads_recorded: None,
+            state_heads_segment: None,
+            last_note_segment: None,
+            executor_head_recorded: None,
             revert_failed_reported: std::collections::BTreeSet::new(),
             executor,
+            warnings: crate::selfcheck::Warnings::new(
+                cfg.daemon.self_health.clone(),
+                cfg.daemon.health_report_ms,
+            ),
+            self_view: SelfView::default(),
+            health_records: 0,
+            health_record_at_ms: 0,
             replay: r
                 .sensor
                 .capture
@@ -1304,6 +1407,7 @@ impl<'a> Daemon<'a> {
         d.control_state_at_start();
         d.profile_witness(accepted_ok);
         d.evidence_incidents();
+        d.retention_tick();
         let names: Vec<String> = d.inputs.iter().map(|i| sanitize(&i.name)).collect();
         let _ = writeln!(
             d.log,
@@ -1374,6 +1478,32 @@ impl<'a> Daemon<'a> {
             self.stats.health_findings += 1;
             self.emit(o);
         }
+        // T11 / T12: a safety configuration file that claims more than the
+        // commissioning signed (`crate::commissioned`). Observe-only.
+        for detail in self.r.config_unattested.clone() {
+            let _ = writeln!(self.log, "robodr-agentd: {}", sanitize(&detail));
+            let dev = robodr_events::Deviation::new(
+                crate::commissioned::CONFIG_UNATTESTED,
+                robodr_events::Severity::High,
+                detail,
+            );
+            let subject = Subject {
+                node: Some("robodr-agentd".into()),
+                ..Subject::default()
+            };
+            let now = self.clock.now();
+            let safety = self.r.config.context.safety_state;
+            let o = self.agent.handle_external(
+                now,
+                Detector::SelfHealth,
+                "agentd:config_unattested",
+                subject,
+                dev,
+                safety,
+            );
+            self.stats.health_findings += 1;
+            self.emit(o);
+        }
     }
 
     fn main_loop(&mut self, should_stop: &dyn Fn() -> bool) -> StopReason {
@@ -1412,6 +1542,7 @@ impl<'a> Daemon<'a> {
                 if now >= next_heartbeat {
                     self.heartbeat("robodr.agentd_heartbeat");
                     self.record_state_heads("heartbeat");
+                    self.record_executor_head("heartbeat", false);
                     next_heartbeat = now + heartbeat;
                 }
                 if self.r.config.daemon.exit_when_inputs_end
@@ -1754,7 +1885,65 @@ impl<'a> Daemon<'a> {
         if let Some(t) = transition {
             self.transition_note(&t);
         }
+        // Every plan is graded by the context of the same moment.
+        self.live_context();
         state
+    }
+
+    /// The configured `context.*` (control, phase, connectivity).
+    fn configured_context(&self) -> LiveContext {
+        let c = &self.r.config.context;
+        LiveContext {
+            control: c.control,
+            phase: c.phase,
+            connectivity: c.connectivity,
+        }
+    }
+
+    /// The live operational context (`crate::safety_feed::context`):
+    /// re-evaluated, a change recorded in the black box and handed to the
+    /// agent for every later plan. The configured one without context
+    /// sources.
+    fn live_context(&mut self) -> LiveContext {
+        let fallback = self.configured_context();
+        let now_ms = self.now_ms();
+        let wall_ms = self.clock.now().wall_ns / 1_000_000;
+        let Some((live, transition)) = self
+            .feed
+            .as_mut()
+            .and_then(|f| f.evaluate_context(now_ms, wall_ms, fallback))
+        else {
+            return fallback;
+        };
+        if let Some(t) = transition {
+            self.agent
+                .set_operational(live.control, live.phase, live.connectivity);
+            let _ = writeln!(
+                self.log,
+                "robodr-agentd: operational context control {:?} -> {:?}, phase {:?} -> {:?}, \
+                 connectivity {:?} -> {:?}{}",
+                t.from.control,
+                t.to.control,
+                t.from.phase,
+                t.to.phase,
+                t.from.connectivity,
+                t.to.connectivity,
+                if t.conflict {
+                    " (sources disagree: most conservative taken)"
+                } else {
+                    ""
+                }
+            );
+            let now = self.clock.now();
+            if self
+                .agent
+                .record_note(now, "context transition", &t, false)
+                .is_err()
+            {
+                self.stats.note_errors += 1;
+            }
+        }
+        live
     }
 
     fn transition_note(&mut self, t: &Transition) {
@@ -1925,8 +2114,9 @@ impl<'a> Daemon<'a> {
         self.emit(o);
     }
 
-    /// A Pulsar threat: a `robot.host.pulsar_threat` finding (agent, black
-    /// box, spool), then a host-side correlation signal named by the Pulsar
+    /// A Pulsar threat: a `robot.host.<rule>` finding (its own id for a
+    /// shipped rule, else `robot.host.pulsar_threat`; agent, black box,
+    /// spool), then a host-side correlation signal named by the Pulsar
     /// rule, with the process entity and the finding's evidence.
     fn host_threat(&mut self, t: &crate::host::HostThreat) {
         if t.is_own_sensor() {
@@ -1960,8 +2150,8 @@ impl<'a> Daemon<'a> {
         if let Some(r) = &o.evidence.deviation {
             sig = sig.with_evidence_ref(r.uri(&self.r.config.robot.id));
         }
-        // `emit` does not correlate the `robot.host.pulsar_threat` finding
-        // itself: the signal below (named by the Pulsar rule) stands for it.
+        // `emit` does not correlate the `robot.host.*` finding itself: the
+        // signal below (named by the Pulsar rule) stands for it.
         self.emit(o);
         if self.correlator.is_some() {
             self.observe_signal(&sig);
@@ -1987,7 +2177,8 @@ impl<'a> Daemon<'a> {
         if self.correlator.is_none()
             || rule.starts_with(robodr_correlate::RULE_ID_PREFIX)
             || rule == health_rules::CORRELATION_PRESSURE
-            || rule == crate::host::HOST_THREAT_RULE
+            || rule == crate::selfcheck::rules::HEALTH
+            || crate::host::is_host_rule(rule)
         {
             return;
         }
@@ -2141,7 +2332,16 @@ impl<'a> Daemon<'a> {
             return;
         };
         let heads = cp.state_heads();
-        if reason == "heartbeat" && self.state_heads_recorded.as_ref() == Some(&heads) {
+        // Review of gap 1, finding 3: unchanged heads are recorded again
+        // once the black box moved to another segment, so the newest
+        // segments always hold one (a cyclic store drops the oldest).
+        if reason == "heartbeat"
+            && !crate::control::anchor::head_note_due(
+                self.state_heads_recorded.as_ref() != Some(&heads),
+                self.state_heads_segment,
+                self.last_note_segment,
+            )
+        {
             return;
         }
         let note = crate::control::anchor::head_note(
@@ -2155,12 +2355,59 @@ impl<'a> Daemon<'a> {
             .agent
             .record_note(now, "control-plane state head", &note, true)
         {
-            Ok(_) => self.state_heads_recorded = Some(heads),
+            Ok(r) => {
+                self.state_heads_recorded = Some(heads);
+                self.state_heads_segment = Some(r.segment);
+                self.last_note_segment = Some(r.segment);
+            }
             Err(e) => {
                 self.stats.note_errors += 1;
                 let _ = writeln!(
                     self.log,
                     "robodr-agentd: control-plane state head not recorded: {e:?}"
+                );
+            }
+        }
+    }
+
+    /// Review of gap 1 (findings 1 and 2): record the executor's journal
+    /// head as a signed black-box note (`robodr.executor_journal_head`)
+    /// when it changed, or when the black box moved to another segment
+    /// since the last one (`heartbeat`), and at once when its epoch
+    /// changed or it went backwards (`force`). At the next start agentd
+    /// sends the newest one back as the anchor.
+    fn record_executor_head(&mut self, reason: &str, force: bool) {
+        let Some(head) = self.executor.as_ref().and_then(|l| l.journal_head()) else {
+            return;
+        };
+        if !force {
+            if let Some((h, seg)) = &self.executor_head_recorded {
+                if !crate::control::anchor::head_note_due(
+                    *h != head,
+                    Some(*seg),
+                    self.last_note_segment,
+                ) {
+                    return;
+                }
+            }
+        }
+        let note =
+            crate::control::anchor::executor_head_note(&self.r.config.robot.id, reason, &head);
+        let now = self.clock.now();
+        match self
+            .agent
+            .record_note(now, "executor journal head", &note, true)
+        {
+            Ok(r) => {
+                self.executor_head_recorded = Some((head, r.segment));
+                self.last_note_segment = Some(r.segment);
+            }
+            Err(e) => {
+                self.stats.note_errors += 1;
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: executor journal head not recorded: {}",
+                    sanitize(&e.join("; "))
                 );
             }
         }
@@ -2249,6 +2496,24 @@ impl<'a> Daemon<'a> {
         }
     }
 
+    /// T15: report unexported evidence filling the black box's retention
+    /// before it is dropped, and any drop of unexported evidence
+    /// (`crate::retention`). Re-reads the export cursor an exporter in
+    /// another process moved.
+    fn retention_tick(&mut self) {
+        let ret = self.r.config.blackbox.retention.clone().unwrap_or_default();
+        let Some(st) = self.agent.blackbox_retention() else {
+            return;
+        };
+        let saturation = ret.mode == crate::retention::RetentionKind::Saturation;
+        for dev in self
+            .retention_watch
+            .observe(&st, ret.warn_percent, saturation)
+        {
+            self.self_health("agentd:blackbox", dev);
+        }
+    }
+
     /// Correlation housekeeping: expire state on a quiet bus; report a
     /// rising eviction / refusal count (rate-limited like other health
     /// counters).
@@ -2333,6 +2598,223 @@ impl<'a> Daemon<'a> {
         let o =
             self.agent
                 .handle_external(now, Detector::SelfHealth, &source, subject, dev, safety);
+        self.emit(o);
+    }
+
+    /// Probe credentials, clock, disks and reachability, refresh
+    /// [`SelfView`] and report what got worse ([`crate::selfcheck`]).
+    fn early_warnings(&mut self) {
+        use crate::selfcheck::{credential, fs_space, kernel_clock};
+        use robodr_ocsf::{ClockHealth, DiskHealth, ReachState, Reachability};
+        let now_ms = self.now_ms();
+        let wall_ms = self.clock.now().wall_ns / 1_000_000;
+        // Credentials: the control plane's own certificate and its CRLs.
+        let mut creds = Vec::new();
+        if let Some(t) = self.r.control_plane.as_ref().and_then(|c| c.tls.as_ref()) {
+            if let Some(na) = t.server_not_after {
+                creds.push(credential("control_plane.server_cert", na, wall_ms));
+            }
+            if let Some(crl) = &t.crl {
+                for u in crl.status().in_use {
+                    if let Some(nu) = u.next_update {
+                        creds.push(credential(
+                            &format!("control_plane.crl:{}", u.issuer),
+                            nu,
+                            wall_ms,
+                        ));
+                    }
+                }
+            }
+        }
+        // Clock.
+        let kernel = kernel_clock();
+        let wall_jumps = self.agent.stats().wall_clock_jumps;
+        let clock = ClockHealth {
+            synchronized: kernel.map(|k| k.synchronized),
+            max_error_ms: kernel.map(|k| k.max_error_us / 1000),
+            wall_jumps,
+        };
+        // Disks.
+        let mut dirs: Vec<(&str, &std::path::Path)> = vec![
+            ("blackbox", self.r.config.blackbox.dir.as_path()),
+            ("spool", self.r.config.spool.dir.as_path()),
+        ];
+        if let Some(c) = &self.r.control_plane {
+            dirs.push(("control_plane", c.state_dir.as_path()));
+        }
+        let disks: Vec<DiskHealth> = dirs
+            .into_iter()
+            .filter_map(|(name, dir)| {
+                fs_space(dir).map(|(free_bytes, total_bytes)| DiskHealth {
+                    name: name.into(),
+                    free_bytes,
+                    total_bytes,
+                })
+            })
+            .collect();
+        // Reachability: the executor link, the gateway feed and the Pulsar
+        // forwarder (their sockets are inputs: heard within silence_ms).
+        let silence = self.r.config.daemon.silence_ms;
+        let input_reach = |prefix: &str| -> ReachState {
+            let mut state = ReachState::NotConfigured;
+            for i in self.inputs.iter().filter(|i| i.name.starts_with(prefix)) {
+                state = match i.stats.last_rx_ms() {
+                    _ if i.stats.ended.load(Ordering::SeqCst) => ReachState::Unreachable,
+                    None if now_ms < silence => ReachState::Unknown,
+                    None => ReachState::Unreachable,
+                    Some(t) if now_ms.saturating_sub(t) < silence => ReachState::Reachable,
+                    Some(_) => ReachState::Unreachable,
+                };
+            }
+            state
+        };
+        let input_age = |prefix: &str| -> Option<u64> {
+            self.inputs
+                .iter()
+                .find(|i| i.name.starts_with(prefix))
+                .and_then(|i| i.stats.last_rx_ms())
+                .map(|t| now_ms.saturating_sub(t))
+        };
+        let exec = self.executor.as_ref().map(|l| l.reach());
+        let reachability = vec![
+            Reachability {
+                component: "executor".into(),
+                state: match &exec {
+                    None => ReachState::NotConfigured,
+                    Some(r) if r.unreachable_for_ms.is_some() => ReachState::Unreachable,
+                    Some(r) if r.last_ok_age_ms.is_some() => ReachState::Reachable,
+                    Some(_) => ReachState::Unknown,
+                },
+                last_ok_age_ms: exec.as_ref().and_then(|r| r.last_ok_age_ms),
+            },
+            Reachability {
+                component: "gateway".into(),
+                state: input_reach("gateway:"),
+                last_ok_age_ms: input_age("gateway:"),
+            },
+            Reachability {
+                component: "pulsard".into(),
+                state: input_reach("host:"),
+                last_ok_age_ms: input_age("host:"),
+            },
+        ];
+
+        let mut found = self.warnings.credentials(now_ms, &creds);
+        found.extend(self.warnings.clock(now_ms, kernel, wall_jumps));
+        found.extend(self.warnings.disks(&disks));
+        found.extend(self.warnings.executor(
+            exec.as_ref().and_then(|r| r.unreachable_for_ms),
+            exec.as_ref().and_then(|r| r.last_error.as_deref()),
+        ));
+        self.self_view = SelfView {
+            health_records: self.health_records,
+            health_record_ms: self.warnings.config().health_record_ms,
+            clock,
+            disks,
+            credentials: creds,
+            reachability,
+        };
+        for w in found {
+            self.self_health("agentd:self_health", w.deviation());
+        }
+    }
+
+    /// Every `daemon.self_health.health_record_ms` (first one period after
+    /// start): the signed `robot.agent.health` finding (findings contract
+    /// 2.5, §3g) with what [`Self::early_warnings`] just saw.
+    fn health_record(&mut self) {
+        use robodr_ocsf::{
+            AgentHealth, BlackBoxHealth, ComponentVersion, HealthCounters, HealthLabel,
+            InputFreshness,
+        };
+        let every = self.warnings.config().health_record_ms;
+        let now_ms = self.now_ms();
+        if every == 0 || now_ms.saturating_sub(self.health_record_at_ms) < every {
+            return;
+        }
+        self.health_record_at_ms = now_ms;
+        self.health_records += 1;
+        self.self_view.health_records = self.health_records;
+        let spool = self.spool.stats();
+        let inputs = self
+            .inputs
+            .iter()
+            .map(|i| InputFreshness {
+                name: i.name.clone(),
+                last_rx_age_ms: i.stats.last_rx_ms().map(|t| now_ms.saturating_sub(t)),
+                received: i.stats.received.load(Ordering::Relaxed),
+                dropped: i
+                    .stats
+                    .dropped
+                    .load(Ordering::Relaxed)
+                    .saturating_add(i.stats.upstream_dropped.load(Ordering::Relaxed)),
+                malformed: i.stats.malformed.load(Ordering::Relaxed),
+                ended: i.stats.ended.load(Ordering::SeqCst),
+            })
+            .collect();
+        let v = &self.self_view;
+        let record = AgentHealth {
+            state: match self.last_state.state {
+                State::Ok => HealthLabel::Ok,
+                State::Degraded => HealthLabel::Degraded,
+                State::Unknown => HealthLabel::Unknown,
+            },
+            reasons: self.last_state.reasons.clone(),
+            interval_ms: every,
+            uptime_ms: now_ms,
+            seq: self.health_records,
+            versions: vec![
+                ComponentVersion {
+                    component: "robodr-agentd".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+                ComponentVersion {
+                    component: robodr_ocsf::CONTRACT_NAME.into(),
+                    version: robodr_ocsf::CONTRACT_VERSION.into(),
+                },
+            ],
+            inputs,
+            counters: HealthCounters {
+                findings_spooled: self.stats.findings_spooled,
+                finding_errors: self.stats.finding_errors,
+                health_findings: self.stats.health_findings,
+                spool_dropped: spool.dropped_full,
+                spool_write_errors: spool.write_errors,
+                note_errors: self.stats.note_errors,
+            },
+            blackbox: BlackBoxHealth {
+                degraded: self.agent.evidence_degraded(),
+                anchored: self.agent.blackbox_anchored(),
+                anchor_failures: self.agent.blackbox_anchor_failures(),
+            },
+            reachability: v.reachability.clone(),
+            credentials: v.credentials.clone(),
+            clock: v.clock,
+            disks: v.disks.clone(),
+        };
+        let st = match record.state {
+            HealthLabel::Ok => "ok",
+            HealthLabel::Degraded => "degraded",
+            HealthLabel::Unknown => "unknown",
+        };
+        let dev = robodr_events::Deviation::new(
+            crate::selfcheck::rules::HEALTH,
+            robodr_events::Severity::Low,
+            format!(
+                "health record {} of robodr-agentd (state {st}, up {} s)",
+                self.health_records,
+                now_ms / 1000
+            ),
+        );
+        let subject = Subject {
+            node: Some("robodr-agentd".into()),
+            ..Subject::default()
+        };
+        let safety = self.safety();
+        let now = self.clock.now();
+        let o = self
+            .agent
+            .report_health(now, "agentd:health", subject, dev, record, safety);
         self.emit(o);
     }
 
@@ -2450,7 +2932,10 @@ impl<'a> Daemon<'a> {
         }
         self.correlation_tick();
         self.control_findings();
+        self.early_warnings();
+        self.health_record();
         self.evidence_incidents();
+        self.retention_tick();
         self.mark_head();
         for f in self.agent.take_faults() {
             let _ = writeln!(
@@ -2658,6 +3143,8 @@ impl<'a> Daemon<'a> {
             queue_bytes_max: self.budget.max(),
             control_plane: self.control.as_ref().map(ControlPlane::status),
             executor: self.executor.as_ref().map(|l| l.stats()),
+            key_protection: &self.r.key_protection,
+            self_health: &self.self_view,
         };
         let res = serde_json::to_vec_pretty(&status)
             .map_err(std::io::Error::other)
@@ -2710,13 +3197,16 @@ impl<'a> Daemon<'a> {
         // Serialise first: `hb` borrows self immutably.
         let value = serde_json::to_value(&hb).unwrap_or(serde_json::Value::Null);
         let now = self.clock.now();
-        if let Err(e) = self.agent.record_note(now, "heartbeat", &value, false) {
-            self.stats.note_errors += 1;
-            let _ = writeln!(
-                self.log,
-                "robodr-agentd: heartbeat not recorded: {}",
-                sanitize(&e.join("; "))
-            );
+        match self.agent.record_note(now, "heartbeat", &value, false) {
+            Ok(r) => self.last_note_segment = Some(r.segment),
+            Err(e) => {
+                self.stats.note_errors += 1;
+                let _ = writeln!(
+                    self.log,
+                    "robodr-agentd: heartbeat not recorded: {}",
+                    sanitize(&e.join("; "))
+                );
+            }
         }
     }
 
@@ -2754,6 +3244,7 @@ impl<'a> Daemon<'a> {
         // Gap 1: the listeners are joined and the queue drained, so nothing
         // is appended after this head: the next start may verify it exactly.
         self.record_state_heads("stop");
+        self.record_executor_head("stop", false);
         self.heartbeat("robodr.agentd_stop");
         self.write_status(false);
         let pipeline = *self.pipeline.stats();
@@ -2797,12 +3288,23 @@ impl cp_api::Host for Daemon<'_> {
 
     fn context(&self) -> OperationalContext {
         let c = &self.r.config.context;
+        // The live context as last evaluated (`safety_feed` context
+        // sources), else the configured one.
+        let live = self
+            .feed
+            .as_ref()
+            .and_then(SafetyFeed::live_context)
+            .unwrap_or(LiveContext {
+                control: c.control,
+                phase: c.phase,
+                connectivity: c.connectivity,
+            });
         OperationalContext {
             platform: self.r.policy.platform,
             morphology: self.r.policy.morphology,
-            phase: c.phase,
-            connectivity: c.connectivity,
-            control: c.control,
+            phase: live.phase,
+            connectivity: live.connectivity,
+            control: live.control,
             operator_present: c.operator_present,
             // Locked in the agent *and* enforced by the pipeline.
             profile_locked: self.agent.profile().locked
@@ -2984,6 +3486,7 @@ impl Daemon<'_> {
                     | robodr_executor::journal::EventKind::Drift
                     | robodr_executor::journal::EventKind::RemovedExternally
                     | robodr_executor::journal::EventKind::JournalReset
+                    | robodr_executor::journal::EventKind::Overridden
             );
             let now = self.clock.now();
             if self
@@ -3002,7 +3505,23 @@ impl Daemon<'_> {
             );
             self.executor_event_finding(&ev);
         }
+        let alarms = link.take_head_alarms();
         self.executor = Some(link);
+        // Review of gap 1 (findings 1 and 2): an executor journal that was
+        // reset, replaced or rolled back is recorded at once and reported.
+        for (_, alarm) in alarms {
+            self.record_executor_head("changed", true);
+            let dev = robodr_events::Deviation::new(
+                health_rules::EXECUTOR_JOURNAL_RESET,
+                robodr_events::Severity::High,
+                alarm,
+            );
+            self.self_health("agentd:executor", dev);
+        }
+        if self.executor_head_recorded.is_none() {
+            // The first head agentd learns is anchored at once.
+            self.record_executor_head("first", false);
+        }
     }
 
     /// S5 / gap 2: an executor event that leaves the robot in an unknown
@@ -3046,6 +3565,10 @@ impl Daemon<'_> {
                     ),
                 )
             }
+            EventKind::Overridden => match pause_overridden(ev) {
+                Some(d) => d,
+                None => return,
+            },
             EventKind::JournalReset => robodr_events::Deviation::new(
                 health_rules::EXECUTOR_JOURNAL_RESET,
                 robodr_events::Severity::High,
@@ -3059,6 +3582,57 @@ impl Daemon<'_> {
             _ => return,
         };
         self.self_health("agentd:executor", dev);
+    }
+}
+
+/// Sales-readiness T42: the executor's safe_pause latch found the robot set
+/// moving again while paused (a navigation goal, a flight-mode change) and
+/// paused it again: a High finding per event, naming the request and what
+/// was found.
+fn pause_overridden(ev: &robodr_executor::journal::Event) -> Option<robodr_events::Deviation> {
+    if ev.kind != robodr_executor::journal::EventKind::Overridden {
+        return None;
+    }
+    Some(robodr_events::Deviation::new(
+        health_rules::EXECUTOR_PAUSE_OVERRIDDEN,
+        robodr_events::Severity::High,
+        format!(
+            "robodr-executor found the robot set moving while safe_pause {} is in force and \
+             paused it again: {}",
+            sanitize(ev.id.as_deref().unwrap_or("-")),
+            sanitize(&ev.detail)
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod pause_overridden_tests {
+    use robodr_executor::journal::{Event, EventKind};
+
+    /// T42: an `overridden` executor event is a High finding; other kinds
+    /// are not this one.
+    #[test]
+    fn an_overridden_pause_is_a_high_finding() {
+        let ev: Event = serde_json::from_value(serde_json::json!({
+            "seq": 7, "at_ms": 1, "kind": "overridden", "id": "p-1",
+            "action": "safe_pause",
+            "detail": "HIGH: nav2: 1 navigation goal(s) sent while paused were cancelled"
+        }))
+        .unwrap();
+        let d = super::pause_overridden(&ev).unwrap();
+        assert_eq!(d.rule, "robot.agent.executor_pause_overridden");
+        assert_eq!(d.severity, robodr_events::Severity::High);
+        assert!(
+            d.detail.contains("p-1") && d.detail.contains("navigation goal"),
+            "{d:?}"
+        );
+        assert!(
+            robodr_ocsf::builder::rule_known(&d.rule),
+            "no catalog entry"
+        );
+        let mut other = ev.clone();
+        other.kind = EventKind::Drift;
+        assert!(super::pause_overridden(&other).is_none());
     }
 }
 

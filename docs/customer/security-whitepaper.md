@@ -25,7 +25,8 @@ It is **not a safety-rated component**
 ([`docs/compliance/safety-positioning.md`](../compliance/safety-positioning.md)).
 By default it **executes no response**: plans and SOC requests are
 recorded, not carried out. Two opt-in components can act, within narrow,
-reversible limits: executor v1 (network containment) and the inline
+reversible limits: executor v1 (network containment and, where the site
+configures OEM-validated platform adapters, motion actions) and the inline
 Motion Firewall gateway (motion-command filtering on a bridged sensor
 box). Section 7 lists exactly what each does.
 
@@ -42,8 +43,8 @@ box). Section 7 lists exactly what each does.
  │ robodr-uplink | robodr-spool-export ───────┼─diode────►│ diode-unpack ─► uplink   │
  │ control plane v2 (off by default, mTLS) ◄──┼───────────│ approved action requests,│
  │   └─(HMAC unix socket)─► robodr-executor   │ signed    │ evidence exports         │
- │      (off by default; nftables only)       │           │                          │
- │ robodr-enroll (fleet lifecycle) ───────────┼─TLS──────►│ fleet API (in progress)  │
+ │      (off by default; nftables, adapters)  │           │                          │
+ │ robodr-enroll (fleet lifecycle) ───────────┼─TLS──────►│ fleet API (unreleased)   │
  └────────────────────────────────────────────┘           └──────────────────────────┘
 
  Optional inline mode (sensor box with two bridged NICs):
@@ -58,6 +59,12 @@ box). Section 7 lists exactly what each does.
 | `robodr-uplink` | User `robodr` | Only the SOC address in its drop-in. TLS. |
 | `robodr-spool-export` | User `robodr` | None (`PrivateNetwork=yes`) |
 | `robodr-kafka-publish` | User `robodr` | Only the brokers in its drop-in. TLS (plain TCP only if explicitly allowed); optional mutual TLS, SASL/SCRAM. |
+| `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only; changes only the nftables table `inet robodr` | AF_UNIX + AF_NETLINK, `IPAddressDeny=any`; motion adapters need a drop-in that allows exactly their peers |
+| `robodr-firewall-gw` (inline sensor box, opt-in) | User `robodr`, `CAP_NET_ADMIN` only (NFQUEUE) | AF_UNIX + AF_NETLINK, `IPAddressDeny=any`; it never originates a datagram |
+| `robodr-anchor-receiver` (off-robot) | `DynamicUser=yes`, no capabilities | Its listen address; TLS (mutual TLS optional) |
+| `robodr-deliverd` (secure delivery, opt-in) | root, no ambient capabilities (it installs packages and drives the TPM) | None (`PrivateNetwork=yes`, `IPAddressDeny=any`); releases arrive from the site depot or on media |
+| `robodr-depot` (site depot, off-robot) | User `robodr-depot`, no capabilities | Its LAN listen address |
+| `robodr-enroll` (run by the operator) | root (`sudo`), no daemon | Only the SOC's fleet API, TLS; air-gapped units exchange a request and an answer file instead |
 | `robodr-executor` (off by default) | User `robodr-exec`, `CAP_NET_ADMIN` only, writes only its journal directory, runs `nft` with an argument vector and an empty environment | None: `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any` |
 | `robodr-firewall-gw` (inline mode only) | `CAP_NET_ADMIN` only (NFQUEUE), FIFO priority 40, watchdog 2 s | No IP sockets; the bridge needs no IP address |
 | `robodr-enroll` | root, run by an operator (key files) | Only the SOC, over TLS, or files on media |
@@ -109,15 +116,20 @@ Limits:
 - keys are files, not TPM-held;
 - rotation and distribution are manual
   ([`docs/OPERATIONS.md`](../OPERATIONS.md) section 4);
-- legacy HMAC keys still load, with a warning.
+- legacy HMAC keys are refused unless explicitly allowed
+  (`blackbox.allow_hmac`, `--allow-hmac`).
 
-Robot side available, SOC side in progress: enrolment with a single-use,
+Robot side available, SOC side on an unreleased AutoSecOps branch
+(enrollment ran end to end against it in one container,
+`tools/e2e/RESULTS.md`): enrolment with a single-use,
 SOC-signed token (read from a root-only file or standard input, never the
 command line) and rotation of the uplink and finding keys with the SOC
 (`robodr-enroll`; keys are generated on the unit and never leave it; the
 enrollment request is signed by all three new keys;
-[`docs/OPERATIONS.md`](../OPERATIONS.md) section 8.6). Planned: TPM sealing
-(S10) and the AutoSecOps side of the fleet API.
+[`docs/OPERATIONS.md`](../OPERATIONS.md) section 8.6). TPM use exists for the
+black-box head anchor and for sealed delivery (`robodr-seal`, a TPM-resident
+unit key), tested against swtpm only; the agent's own signing keys are
+still files.
 
 ## 5. Integrity and evidence
 
@@ -179,18 +191,21 @@ action tools in every agent; this is not released yet.
 | Item | Today |
 |---|---|
 | Response plans (on-robot responder) | **Recorded, not executed** by default. With executor v1 enabled (off by default), an eligible plan's network isolation / participant quarantine may be handed to `robodr-executor` (`planner_orders`); never on a humanoid, where everything needs a human. |
-| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then only `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor`, after its own precheck and a safety-state re-check right before apply; states `verified` / `refused` / `failed` / `reverted` are signed and journalled. `restrict_motion` is recorded only; `safe_pause`, `request_safe_state` and `rollback_config` are never executed. |
+| SOC action requests (control plane v2) | Authenticated, judged, recorded; answered `recorded_not_executed`: **nothing reaches the robot** unless executor v1 is enabled. Then `isolate_network` and `quarantine_node` (nftables, reversible, TTL) and `record_evidence` are executed, by the separate `robodr-executor`, after its own precheck and a safety-state re-check right before apply; states `verified` / `refused` / `failed` / `reverted` are signed and journalled. `restrict_motion`, `safe_pause`, `request_safe_state` and `rollback_config` are recorded or refused unless the site configures a platform adapter for them **and** sets its `oem_validated: true` (`gateway`, `unitree_sport`, `nav2`, `ros2_control`, `px4`, `rollback`); pause, safe state and rollback then need two distinct human approvers and are never executed on a humanoid ([support matrix](support-matrix.md#response-actions)). |
 | Motion Firewall, passive modes | Decides per command and per joint frame; **recording only**. |
 | Motion Firewall, inline gateway (opt-in) | Passes, limits in place, holds (humanoid: never damping or limp) or removes motion samples that cross the bridge; never originates a datagram; `fail_closed` by default when it is down. Its limits are configuration, not SOC actions. |
 | Processes RoboDR starts | None on the robot's behalf. |
 | Code loaded into the kernel | Pulsar's eBPF probes (GPL-2.0), only by `robodr-pulsard`, only where enabled. |
 | Network transmission from agentd | None (passive capture; IP denied). |
 
-**Planned for GA (not implemented):** `restrict_motion` as a SOC action
-through the gateway, and `safe_pause` through OEM-validated platform
-adapters; verification of the SOC signature and approval inside the
-executor. Every action needs SOC approval, a re-check against the live
-safety state on the robot, and an automatic revert at TTL. On humanoids
+**Implemented, not yet validated by an OEM:** `restrict_motion` as a SOC
+action through the gateway (run with the real gateway in a lab soak) and
+`safe_pause` / `request_safe_state` / `rollback_config` through platform
+adapters (run against in-process simulated peers only); the executor
+verifies the SOC's signature itself. It cannot verify the SOC's internal
+approval process. Every action needs SOC approval, a re-check against the
+live safety state on the robot, and, where it is reversible, an automatic
+revert at TTL; a `safe_pause` is never lifted automatically. On humanoids
 the de-energising actions are never executable
 ([ADR-0005](../adr/0005-action-catalog.md),
 [ADR-0012](../adr/0012-balancing-robot-response-rules.md)).
@@ -232,8 +247,11 @@ the de-energising actions are never executable
   - a real release;
   - SLSA or cosign provenance;
   - a reproducibility check of the Pulsar-bound binary;
-  - a third-party notices file in the packages;
-  - CI runs on GitHub.
+  - a green CI run on GitHub (the first complete run, 2026-10-30, failed
+    several jobs).
+
+  Third-party notices and the eBPF GPL-2.0 source offer ship in every
+  package.
 
   See [`docs/BUILD.md`](../BUILD.md).
 

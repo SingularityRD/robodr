@@ -329,3 +329,56 @@ fn revocation_list_and_config_keys() {
         .remove("trust_roots");
     assert!(load(&c).unwrap_err().contains("trust_roots"));
 }
+
+/// T12: `oem_validated` counts only for the policy file the trusted locked
+/// profile binds. An edited (or unbound) policy that still claims it is
+/// treated as not validated and reported once at start.
+#[test]
+fn unbound_or_edited_policy_is_not_oem_validated() {
+    let mut prof = robot_profile(true);
+    prof.metadata = Some(metadata(4));
+    let s = setup("trust-policy", &prof);
+    let cfg = s.config(
+        serde_json::json!({}),
+        serde_json::json!([{"kind": "stdin"}]),
+        serde_json::json!({}),
+    );
+    // The setup binds exactly the installed policy: honoured.
+    let r = s.resolve(&cfg);
+    assert!(r.policy.oem_validated);
+    assert!(r.config_unattested.is_empty(), "{:?}", r.config_unattested);
+
+    // One byte added to the policy file: not the commissioned one.
+    let mut t = std::fs::read_to_string(&s.policy).unwrap();
+    t.push('\n');
+    std::fs::write(&s.policy, &t).unwrap();
+    let r = s.resolve(&cfg);
+    assert!(!r.policy.oem_validated);
+    assert_eq!(r.config_unattested.len(), 1, "{:?}", r.config_unattested);
+    assert!(
+        r.config_unattested[0].contains("edited, replaced or rolled back"),
+        "{:?}",
+        r.config_unattested
+    );
+
+    // At start: one observe-only High finding.
+    let (found, log) = run_capture(&s);
+    let hits = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.config_unattested")
+        .count();
+    assert_eq!(hits, 1, "{log}");
+    assert!(log.contains("treated as NOT OEM-validated"), "{log}");
+
+    // A profile that binds another policy: same outcome.
+    let mut prof = robot_profile(true);
+    prof.metadata = Some(metadata(5));
+    prof.bound_config.insert(
+        "response_policy".into(),
+        format!("sha256:{}", "0".repeat(64)),
+    );
+    write_profile(&s.profile, &prof);
+    std::fs::copy(demo_policy_path(), &s.policy).unwrap();
+    let r = s.resolve(&cfg);
+    assert!(!r.policy.oem_validated);
+}

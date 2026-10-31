@@ -14,6 +14,7 @@ agent are its callers.
 | `trust` | `robodr-delivery-trust/1` | Site trust file: disjoint, torsion-free keys (roots, release, depot, operators), programmes scoping release keys and package names, ring assignment of units, capped quorum floors, revocations by key fingerprint, RPK digest and package serial, floors, expiry; acceptance under pinned roots **and site**; root rotation (the only way an accepted trust moves forward) |
 | `sig` | `robodr-sigset/1` | Detached Ed25519 signature sets over domain-separated messages; quorum by distinct key |
 | `parity` | `rs-gf256-0x11d/1` | Reed-Solomon parity over bundle files, in groups, with `robodr-diode`'s code |
+| `minisign` (+ `blake2b`) | minisign public key / `.minisig` | Release-tarball signatures as `release.yml` makes them: prehashed (`ED`, BLAKE2b-512, implemented in-crate per RFC 7693) Ed25519 with strict verification, key id, signed trusted comment; legacy `Ed`, non-canonical base64 and extra lines refused; a known-answer self-test. Used on the robot by `robodr-deliverd verify-minisign` / `install-bundle.sh` |
 
 ## Rules every format shares
 

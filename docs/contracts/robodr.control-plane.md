@@ -45,9 +45,20 @@ that as "not applied", never as success.
   be in the TLS handshake or before their request authenticated, and
   another `max_connections` authenticated ones; one source address holds at
   most `max_connections_per_source` (default 2, 1..=16) of all of them.
-  Over a cap the connection is closed at accept (no answer;
-  `connections_rejected`); an authenticated request that finds no
-  authenticated slot is answered 503 `busy` (signed).
+  When every pre-authentication slot a new connection may use is busy, it
+  cuts the **oldest** pre-authentication connection that has spent
+  `pre_auth_evict_after_ms` (default 100, 100..=5000) in its handshake or
+  request read (`connections_evicted`; the cut peer sees the connection
+  close); a source at its per-source share only cuts one of its own.
+  `soc_sources` (up to 16 networks, `"10.20.0.0/24"` or an address) gets
+  `reserved_connections` (default 1, 1..=4) extra pre-authentication
+  slots nobody else may take, and a connection from a listed address cuts
+  an unlisted peer's handshake at once; an unlisted connection never cuts a
+  listed one, and authenticated connections are never cut. `soc_sources`
+  is about availability only: a listed address still needs the client
+  certificate and a SOC key. Otherwise over a cap the connection is closed
+  at accept (no answer; `connections_rejected`); an authenticated request
+  that finds no authenticated slot is answered 503 `busy` (signed).
 * Answers are JSON (`Content-Type: application/json`) except evidence chunks
   (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
 * **Listeners** (at least one):
@@ -223,8 +234,15 @@ A method a path does not take is 405 `method_not_allowed`; an unknown path
  "mode": "enforce", "health": "ok", "executor": "recording", "executes_actions": false,
  "morphology": "wheeled_mobile",
  "actions": ["restrict_motion", "quarantine_node", "isolate_network", "record_evidence",
-             "safe_pause", "request_safe_state", "rollback_config"]}
+             "safe_pause", "request_safe_state", "rollback_config"],
+ "key_scope": {"key_id": "soc:soc-a:1",
+               "allowed_actions": ["isolate_network", "record_evidence"],
+               "max_ttl_seconds": 900}}
 ```
+
+`key_scope` is the asking key's scope (§4.2): the actions it may request
+and revert and the longest `ttl_seconds` it may give (all seven and
+86400 for an unscoped key). Additive since the T67 revision.
 
 `morphology` is the response policy's (`unspecified` when it declares
 none). `actions` lists only what this robot may be asked for: an action
@@ -297,6 +315,42 @@ Body errors are answered with an HTTP error (§7) and recorded
 `invalid_parameter`, `ttl_required`, `ttl_out_of_range`, `ttl_not_allowed`,
 `authority_not_allowed`, `invalid_request_id`, `invalid_field`,
 `invalid_request`.
+
+### 4.2 Per-key scopes (`control_plane.soc_keys`)
+
+A `soc_keys` entry is either a key file path (the key may request every
+action with any valid `ttl_seconds`) or a scoped key:
+
+```json
+"soc_keys": [
+  "/etc/robodr/soc/soc-ir-lead.pub",
+  {"path": "/etc/robodr/soc/soc-tier1.pub",
+   "allowed_actions": ["record_evidence", "isolate_network"],
+   "max_ttl_seconds": 900}
+]
+```
+
+`allowed_actions`: 1..=7 distinct catalog names (absent: every action);
+`max_ttl_seconds`: 1..=86400 (absent: 86400). agentd checks the scope of
+the key that signed the request **before** anything else about it (before
+the `request_id` is looked up, so an out-of-scope request learns nothing
+about other requests): a submission whose action is not allowed is
+refused **403 `action_not_permitted`**, one whose `ttl_seconds` is above
+the key's limit **403 `ttl_above_key_limit`**. A revert is refused
+`action_not_permitted` when the stored request's action is not in the
+reverting key's scope (a key lifts only what it may ask for; an unknown
+id is still 404). Both are answered signed, recorded as
+`robodr.control_plane_rejected` (§8) and reported as
+`robot.agent.control_plane_invalid` (Medium), never judged. GET, the
+snapshot (`key_scope`, §3.1) and the evidence API are not scoped.
+
+Limits: the scope is enforced by agentd. robodr-executor verifies the
+SOC signature on every order itself (§6a) but does not yet apply these
+scopes (planned with the executor's own key configuration), so a
+compromised agentd process could still pass it an out-of-scope request
+that a configured SOC key signed. The robot still cannot verify the SOC's
+internal approval process (the two-person names are asserted by the SOC,
+§4).
 
 ### 4.1 Judgment (Cyber-Jidoka)
 
@@ -415,7 +469,7 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 | `pending` | accepted, recorded, handed to the executor; read the state again with GET | no |
 | `verified` | the executor applied it and the read-back of its nftables rules matched; it stays in force until revert or TTL (`state.expires_at_ms`) | no |
 | `reverted` | removed again: revert request, TTL expiry, restart reconciliation, or an operator's emergency disable (`nft delete table inet robodr`) | yes |
-| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `journal_reset` (the executor's journal was unreadable or failed its seal and was reset: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, the trust-boundary codes `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing`, `soc_keys_unavailable`, `approval_key_removed` (below), `locator_out_of_scope` (a participant locator outside the executor's `network.quarantine` scope), or `executor_refused` for a code this agentd does not know | yes |
+| `refused` | the executor's own check refused it; nothing was applied; `state.decision` then reads `refused`. `refusal.code` is one of `not_executor_action` (`safe_pause`, `request_safe_state`, `rollback_config`: never executed), `fall_hazard`, `needs_approval`, `motion_path`, `locators_required` (agentd has not seen the participant's SPDP locators), `no_management_channel`, `unsupported_target` (a `node` target, or a process), `safety_state_changed`, `safety_state_stale`, `safety_state_unavailable` (also: judged or current state `unknown`), `safety_system_engaged`, `morphology_mismatch`, `observe_mode`, `operator_disabled` (an operator removed the executor's table: nothing is executed until it is re-armed on the robot), `journal_reset` (the executor's journal was unreadable or failed its seal and was reset: nothing is executed until it is re-armed on the robot), `config_unavailable`, `already_active`, `ttl_out_of_range`, `replay`, `invalid_order`, `id_conflict`, `evidence_elsewhere`, the trust-boundary codes `soc_signature_invalid`, `soc_request_stale`, `soc_nonce_replayed`, `soc_replay_store_unavailable`, `order_mismatch`, `approval_missing`, `soc_keys_unavailable`, `approval_key_removed` (below), `key_scope_denied` (below), `locator_out_of_scope` (a participant locator outside the executor's `network.quarantine` scope), or `executor_refused` for a code this agentd does not know | yes |
 | `failed` | the executor was unreachable, its queue was full, or the apply did not verify and was rolled back (`state.error`); nothing is in force | yes |
 | `recorded_not_executed` | `restrict_motion` when the executor has no `motion` section (advisory: the executor v1 behaviour, unchanged) | yes |
 | `applied` | (Sprint 8, executor `motion` section) `request_safe_state` / `rollback_config` carried out by their platform adapter; not reversible (`in_force: true`: the adapter did it; the platform owns the result) | yes |
@@ -450,10 +504,14 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     status; the Unitree sport `SpeedLevel`) and `reverted` at its TTL or
     by revert; `safe_pause` reaches `verified` through Nav2 (cancel every
     goal + zero twist), ros2_control (controller switch) or PX4 (hold
-    mode), and `reverted` by a revert (two approvers) or after the
-    executor's `motion.safe_pause_ttl_s`; reverting it **releases** the
-    pause and never resumes a mission (Nav2: goals are not restored; PX4:
-    no mode change; ros2_control: the inverse switch);
+    mode), and `reverted` only by a revert (two approvers), and only when
+    the safety state at that moment is known, fresh, not engaged and one
+    the adapter allows (otherwise the revert is refused with that code
+    and the pause stays `verified`). It is **never lifted automatically**:
+    reaching the executor's `motion.safe_pause_ttl_s` is reported (event
+    `expired`, `HIGH`) and the pause stays in force; reverting it
+    **releases** the pause and never resumes a mission (Nav2: goals are
+    not restored; PX4: no mode change; ros2_control: the inverse switch);
     `request_safe_state` and `rollback_config` (`config: program` only)
     reach `applied` (terminal). The executor's order carries the
     restriction's parameters (`max_linear_speed`, `max_joint_speed`,
@@ -471,9 +529,13 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
     `not_executor_action` for `rollback_config` of the `profile` (the
     anti-rollback chain refuses an older profile); `fall_hazard` for a
     restriction factor below `min_motion_factor` on a robot that
-    balances; `invalid_order` for a `restrict_motion` with
-    `workspace_zone` (no adapter enforces a zone: never silently
-    ignored).
+    balances, and there for an absolute cap (`max_linear_speed`,
+    `max_joint_speed`) below `min_motion_factor` of the executor's
+    `motion.envelope` or with no envelope configured; `invalid_order` for
+    a `restrict_motion` with `workspace_zone` (no adapter enforces a
+    zone: never silently ignored); `approval_missing` also when
+    `requested_by` of a two-person action is not a name
+    (`[A-Za-z0-9._%+@-]{1,100}`, like the approvers).
 * **Trust boundary (executor M1).** agentd forwards the SOC's request
   with the order exactly as it was signed (method, target, the four
   credentials of §2, body). The executor verifies it itself, with its own
@@ -490,6 +552,7 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   | `approval_missing` | the signed body lacks the approval evidence §4 requires (`authority: "request"`, `requested_by`, `source`, `reason` within its limits), or an order of the on-robot planner claims a human approval |
   | `soc_keys_unavailable` | the executor's SOC key configuration cannot be trusted: a key file unreadable or refused, or a SOC key equal to one of the robot's own keys (`soc.robot_keys`); every control-plane order is refused until it is fixed |
   | `approval_key_removed` | (after a robot reboot) the key that approved a held action is no longer configured: it is not re-armed and turns `reverted` |
+  | `key_scope_denied` | the executor's `soc.key_scopes` does not let the signing key approve this action, or not for this long (the signed `ttl_seconds`, or the executor's default TTL when none is named), or the key has no scope while `soc.require_key_scopes` is set; also on a signed revert whose key may not revert the action (it stays in force), and after a reboot for a held action its key may no longer approve (not re-armed, `reverted`) |
 
   The replay fence of a store found missing or damaged at start is the
   start time **plus** `soc.max_clock_skew_s`: a request signed up to the
@@ -620,9 +683,24 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * **Evidence.** Each executor event (`applied`, `verified`, `refused`,
   `failed`, `reverted`, `expired`, `revert_failed`, `drift`,
   `removed_externally`, `reconciled`, `journal_reset`, `held`, `rearmed`,
-  `journal_error`) is a `robodr.executor_event` note. `revert_failed`,
-  `drift`, `removed_externally` and `journal_reset` are critical
-  (fsynced). `status.json` carries `executor` counters.
+  `journal_error`, `overridden`) is a `robodr.executor_event` note.
+  `revert_failed`, `drift`, `removed_externally`, `journal_reset` and
+  `overridden` (the robot was set moving while a `safe_pause` was in
+  force; also the High finding `robot.agent.executor_pause_overridden`)
+  are critical (fsynced). `status.json` carries `executor` counters.
+* **Executor journal anchor.** Every events answer of the executor carries
+  its journal head (a random `epoch` replaced by every reset, and
+  `next_seq`); agentd records it as a critical
+  `robodr.executor_journal_head` note (`robot_id`, `reason`, `epoch`,
+  `next_seq`) when it first sees it, when the epoch changes or the
+  sequence goes back, and on heartbeats when it moved or the black box
+  started a new segment, and sends the newest one back with every poll. An
+  executor journal behind that anchor (an older copy put back) or of
+  another epoch is reset by the executor (`journal_reset`). A new epoch or
+  a sequence going back raises `robot.agent.executor_journal_reset` (High)
+  and agentd reads the new sequence from its start, so no event of the new
+  journal is missed. An executor that reports no head (older) is polled as
+  before.
 * **Reboot.** After a reboot of the robot an action in force is held
   (not installed) until the executor re-validated it and agentd supplied
   a fresh safety state; it turns `reverted` if it is not re-armed before
@@ -650,6 +728,8 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * 401: `missing_credentials`, `malformed_credentials`, `unknown_key`,
   `bad_signature`, `stale_timestamp` (also: the replay fence, §2),
   `replayed_nonce`;
+* 403 (signed; the request authenticated, its key is not allowed it,
+  §4.2): `action_not_permitted`, `ttl_above_key_limit`;
 * 404: `not_found`, `unknown_robot`, `unknown_request`, `unknown_export`,
   `unknown_chunk`, `evidence_disabled`, `no_records`,
   `evidence_not_retained`;
@@ -761,8 +841,16 @@ at start, on heartbeat and at a clean stop; an older or shorter file is a
 rollback. Damage or rollback raises
 `robot.agent.control_plane_state_untrusted` (High; Critical for a
 rollback). A v1 (checksummed) journal is adopted once, only while the black
-box has no end-point note, and that upgrade is recorded; afterwards a v1
-file is refused as a downgrade. The black box stays the record.
+box has no end-point note and the state directory has no `sealed.marker`
+(written once both journals are sealed), and that upgrade is recorded;
+afterwards a v1 file is refused as a downgrade, even if the black box no
+longer holds an end-point note. The end-point note is recorded again
+whenever the black box moved to a new segment, so a cyclic black box keeps
+one; a black box that has dropped segments but holds no end-point note
+counts as "anchor lost" (fence and reconciliation, as after a crash). Only
+notes whose record hash and signature verify under the black-box key are
+believed (end points, decisions, requests, reverts); the others are counted
+in the finding. The black box stays the record.
 
 **After damage** agentd falls back to the record:
 
@@ -778,6 +866,14 @@ file is refused as a downgrade. The black box stays the record.
   (503 `state_unavailable`; stored requests still answer) until a restart
   reconciles the journal. Requests older than the black box's retention
   are gone either way (as after eviction).
+  When the journal may hold entries nobody decided (an adopted v1 file, a
+  rolled-back copy, lines failing their seal), a journal entry is kept only
+  when an authentic request note with the same request and evidence
+  reference backs it (an adopted v1 entry takes the note's state); the
+  others are dropped and their `request_id` is refused. Refused ids and the
+  "refuse every new id" state are persisted in the sealed
+  `state_dir/unreconciled` marker: every later start reconciles again and
+  keeps refusing them; the marker is removed once nothing is left.
 
 **Decisions** are journaled around the black-box note:
 
@@ -1129,8 +1225,13 @@ another robot), 13 (signed in the removed v1 domain); all 401
 * A network attacker without the client certificate can still make the TLS
   listener spend handshakes (bounded by `max_connections`, the per-source
   cap and the 5 s deadline, which a byte-at-a-time peer cannot stretch) and
-  drop or delay requests and answers; from several source addresses it can
-  keep every TCP pre-authentication slot busy (never the unix socket's).
+  drop or delay requests and answers. From several source addresses,
+  reopening handshakes faster than `pre_auth_evict_after_ms`, it can still
+  keep the general TCP pre-authentication slots busy (never the unix
+  socket's); the SOC's own addresses, configured as `soc_sources`, keep a
+  reserved slot and cut the attacker's handshakes (W2-4: 20/20 SOC requests
+  during the attack, `slowloris_cannot_lock_the_listed_soc_out`). Without
+  `soc_sources` the SOC competes with the attacker for the general slots.
 * Tested with synthetic traffic, an in-process signing client and an
   OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
   not against a deployed SOC or across a real network.
@@ -1315,3 +1416,21 @@ Additive, no version change (`robodr-control-plane/v2`); with
   answer carries them back with `containment`. **Upgrade the executor
   first** (as for R2-7): an older executor does not understand an order
   with these fields, and agentd answers the request `failed`.
+
+### Revision: per-key scopes and slowloris slots (T67, T39 / W2-4, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`).
+
+* **Per-key scopes** (§4.2): a `soc_keys` entry may be
+  `{"path", "allowed_actions", "max_ttl_seconds"}`. Requests outside the
+  signing key's scope are answered **403** `action_not_permitted` /
+  `ttl_above_key_limit` (signed, recorded, reported as
+  `control_plane_invalid`); a revert needs the stored action in the
+  reverting key's scope. Plain path entries keep the old behaviour. New
+  in the snapshot (§3.1): `key_scope`. A SOC client should treat 403 as
+  final, like a 400.
+* **Pre-authentication slots** (§1, §13): the oldest stale handshake is
+  cut when the slots are full (`pre_auth_evict_after_ms`,
+  `connections_evicted`), and `soc_sources` get `reserved_connections`
+  slots of their own. A SOC client may see a connection closed during
+  its TLS handshake under load (it retries, as for a refused connect).

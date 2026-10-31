@@ -1,0 +1,26 @@
+{
+  "rule_id": "74b77c07-35d8-5085-bb92-9dd751019938",
+  "name": "RoboDR - Unknown participant burst",
+  "description": "Unknown DDS participants or a discovery flood on the robot network: reconnaissance or a rogue node. Observe-only: alerts, never responds.",
+  "type": "query",
+  "language": "kuery",
+  "index": [
+    "logs-robodr.findings-*"
+  ],
+  "query": "event.module : \"robodr\" and (rule.id : \"robot.ros2.unknown_participant\" or rule.id : \"robot.ros2.discovery_flood\")",
+  "severity": "medium",
+  "risk_score": 47,
+  "interval": "5m",
+  "from": "now-6m",
+  "enabled": false,
+  "author": [
+    "Singularity RD"
+  ],
+  "tags": [
+    "RoboDR",
+    "Robotics",
+    "OT"
+  ],
+  "max_signals": 100,
+  "version": 1
+}

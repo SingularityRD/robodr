@@ -27,16 +27,20 @@ is tested offline. The same code runs in three places:
 | `socket` | Receive-only SPDP multicast socket. It sets `SO_REUSEADDR` before `bind` and binds to the group address, so it coexists with the robot's DDS participants. |
 | `sanitize`, `dedup` | Attacker-controlled text is control-escaped and capped at 512 chars. The dedup set is O(capacity) and stores keyed hashes. |
 | `watch` | Argument parsing and run loop for `robodr-ros2-watch`. |
+| `check` | `robodr-ros2-watch --check-config`: offline validation of `pulsar.toml`'s sensor section (TOML, unknown keys as Pulsar would ignore them, ranges, profile + trust without writing state, `/dev/shm` DDS segments, SROS 2 keystore). |
+| `sros2` | SROS 2 policy input (`sros2_keystore`): `governance.xml` and `permissions.xml` parsed (bounded), SPDP DDS-Security identities judged against the grants, visibility statements. |
 
 ## Findings
 
 | Rule | Severity | When |
 |---|---|---|
 | the profile's own rules (`robot.ros2.unknown_participant`, `robot.ros2.unauthorized_motion_writer`, `unknown_writer_topic`, `unknown_service`, `unknown_action`, `unknown_reader`, ...) | as `robodr-events` decides | every discovery event, through `Profile::evaluate` |
+| `robot.capture.unsupported_transport` | Medium | once per host and transport set: SPDP advertises shared-memory (Fast DDS SHM, Cyclone iceoryx, Connext SHMEM), TCP or unknown locators; same-host traffic over them is not inspected ([`docs/DDS-TRANSPORTS.md`](../../docs/DDS-TRANSPORTS.md)) |
+| `robot.ros2.untrusted_security_identity` | Medium / High | with `sros2_keystore`: no DDS-Security identity on a domain requiring authentication (Medium); a certificate subject no grant names (High) |
 | `robot.ros2.participant_removed` | Medium | a **profiled** participant is announced disposed or unregistered (`relayed by …` when someone else sent it) |
 | `robot.rtps.malformed_discovery` | Low | one per parse-anomaly kind and source IP (`report_anomalies`) |
 | `robot.rtps.fragmented_discovery` | Low | one per source IP sending discovery `DATA_FRAG` (`report_fragmentation`) |
-| `robot.rtps.discovery_fragment_rejected` | Medium | the reassembler refused fragments (over a cap, bad geometry; that announcement was **not** inspected), or fragments overlapped with conflicting content (the first copy was inspected; a stack keeping the other copy sees a different announcement). Always reported. |
+| `robot.rtps.discovery_fragment_rejected` | Medium; **Critical** (SEDP publications) / **High** (SEDP subscriptions) when refused for a reason a DDS stack does not share (size / memory cap, no capacity, geometry or key-flag mismatch with a pending copy) | the reassembler refused fragments (over a cap, bad geometry; that announcement was **not** inspected; an uninspected SEDP writer may be a rogue motion writer), or fragments overlapped with conflicting content (the first copy was inspected; a stack keeping the other copy sees a different announcement). Names the writer prefix. Always reported. |
 | `robot.ros2.profile_refused` | High | once at start, when the profile fails `Profile::validate`, or a locked profile file fails the seal / strict file check |
 | `robot.ros2.endpoint_source_mismatch` | Critical (writer on a motion topic, or any writer in an ambiguous announcement when the profile has motion topics) / High | an SEDP endpoint attributed to a participant was announced from an IP not bound to it (not its SPDP source, an advertised locator, or a `participant_ips` pin), or relayed / GUID-conflicting from a non-discovery-server IP. See `src/binding.rs`. |
 | `robot.ros2.endpoint_unannounced_participant` | Medium (High for a motion-capable writer) | an SEDP endpoint whose participant sent no SPDP within `binding.hold_ms` (or before the end of a replay) |
@@ -44,13 +48,13 @@ is tested offline. The same code runs in three places:
 | `robot.ros2.identity_instances_exceeded` | High | an SPDP matches a profile identity (source IP, RTPS vendor, enclave) whose `max_instances` slots are all held by live participants; the newcomer stays an unknown participant. See `src/identity.rs`. |
 | `robot.ros2.ambiguous_discovery` | High | a discovery sample repeats an identity parameter (topic, type, endpoint/participant GUID, key hash, status) with conflicting values. Stacks differ on first- vs last-wins, so what we inspected may not be what a stack acts on. Never rate limited. |
 | `robot.rtps.discovery_not_inspected` | Medium | the parser dropped content (unsupported protocol version, truncated / malformed submessage or parameter list, undecodable value, announcement without topic, anomaly list overflow). Always reported. |
-| `robot.rtps.discovery_fragment_evicted` | Medium | partial discovery samples evicted by the reassembler to stay within its caps; not inspected |
+| `robot.rtps.discovery_fragment_evicted` | Medium; High when a victim's participant is profiled | partial discovery samples evicted by the reassembler to stay within its caps; not inspected. Names the victims (source prefix, writer, sequence number, reason) |
 | `robot.rtps.discovery_removal` | Low / Medium | other disposes / unregisters (Medium when sent from an IP outside the owner's binding) |
 | `robot.capture.*` | Low / Medium | the capture layer's counters (malformed frames, IP fragment conflicts / drops / evictions) grew |
 | `robot.sensor.findings_capped` | the most severe suppressed, at least Medium | one input produced more than `max_findings_per_datagram` new findings |
 | the profile's motion rules (`robot.motion.linear_over_envelope`, `angular_over_envelope`, `joint_over_envelope`, `non_finite_command`, `unprofiled_channel`, `robot.profile.invalid_envelope`) | as `robodr-events` decides (Critical for over-envelope / non-finite) | a `MotionCommand` decoded from user DATA on a profiled motion channel (`motion.evaluate_commands`, default on) |
 | `robot.motion.undecodable_sample` | Medium, rate limited | a sample on a motion / feedback topic was not inspected: undecodable CDR, unknown type, wrong-role type, malformed DATA / inline QoS, fragments refused / evicted / conflicting, per-datagram sample cap |
-| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP |
+| `robot.motion.unattributed_sample` | High | DATA to a reader announced on a motion / feedback topic from a writer never announced via SEDP; also a motion writer / reader evicted from (or refused by) the bounded endpoint tables |
 | `robot.motion.sample_source_mismatch` | Critical (command topic) / High (feedback) | a decoded motion sample whose writer prefix is bound (SPDP / `participant_ips`) to other IPs than its source |
 | `robot.motion.command_type_mismatch` | High | a writer announced on a profiled command channel with a type other than the profile's `motion_types` entry, a type no decoder knows, or a feedback type; at the announcement, never rate limited |
 | `robot.unitree.legacy_unknown_sender` | Critical (command, decoded or compressed) / Medium (state, or no legacy length) | a Unitree legacy UDP frame from an IP not in `unitree_legacy.command_senders` (commands) / `robot_addresses` (state); the legacy protocol is unauthenticated. Not in the shared rate limiter: one finding per sender for the first 16 senders of a class |
@@ -84,6 +88,11 @@ eviction can only cause a re-report.
   `robot.rtps.*`, `robot.capture.*`, `robot.sensor.*` and
   `robot.motion.undecodable_sample` only. The profile and
   binding rules (`robot.ros2.*`) are never rate limited.
+- **Discovery reassembly caps** (`ReassemblyLimits::default()`, not
+  configurable in the TOML): samples up to 512 KiB (was 64 KiB; DDS stacks
+  accept far larger SEDP samples, so a padded announcement must not be
+  refused here while the robot takes it), 8 MiB for all partial samples
+  together, 256 partial samples, 64 per source.
 - **Memory**: dedup set, reassembler, binding table (`binding.max_participants`,
   O(log n) eviction, profiled participants evicted last), held-announcement
   queue (1024), per-participant IP / locator lists and the rate limiter are
@@ -172,7 +181,14 @@ joint firewall's clock).
   is re-announced; its samples are not decoded meanwhile (and samples to a
   known motion reader raise `unattributed_sample`).
 - A SEDP dispose does not forget a writer (a spoofed dispose must not blind
-  the decoder); the tables are bounded and evict non-motion entries first.
+  the decoder); the tables are bounded and evict non-motion entries first,
+  then motion entries of participants neither profiled nor bound (least
+  recently announced first, O(log n)). A motion writer / reader of a
+  profiled or bound participant is never evicted: a newcomer that would
+  need it gone is refused (`MotionStats::writers_refused` /
+  `readers_refused`), so a flood of fresh rogue `cmd_vel` writers cannot
+  push out the robot's real writer. Every evicted or refused motion
+  endpoint raises `robot.motion.unattributed_sample` (High) naming it.
 
 ## Go2 WebRTC sessions (`webrtc`)
 
@@ -201,6 +217,8 @@ from community clients, HTTP is read per segment.
 robodr-ros2-watch --profile /etc/robodr/profile.json --pcap lab.pcapng --stats
 # live, read-only (Linux, CAP_NET_RAW)
 sudo robodr-ros2-watch --profile profile.json --interface lo --interface eth0 --duration 60
+# validate the daemon's configuration offline (read-only; exit 1 = invalid)
+sudo robodr-ros2-watch --check-config /etc/robodr/pulsar.toml [--strict]
 ```
 
 - **stdout:** one JSON object per finding, with the fields `rule`,
@@ -281,16 +299,21 @@ There were 73 tests before:
 
 - Most tests use synthetic traffic built from the spec. Real traffic is
   limited to the container-lab captures above (Fast DDS and Cyclone DDS on
-  ROS 2 Jazzy, a Gazebo simulation, no physical robot); RTI Connext has not
-  been captured. On the motion decode path the XCDR1 `Twist` decode is
+  ROS 2 Jazzy, a Gazebo simulation; Fast DDS 2.6 on ROS 2 Humble, incl.
+  default shared-memory transports and SROS 2; no physical robot); RTI
+  Connext has not been captured. On the motion decode path the XCDR1 `Twist` decode is
   confirmed on real Fast DDS and Cyclone DDS samples; XCDR2 / `D_CDR2` and
   the other message types only on hand-built vectors.
 - Some traffic is invisible or opaque to it:
-  - shared-memory transports;
-  - RTPS over TCP;
-  - DDS-Security-protected discovery.
+  - shared-memory transports (reported per host as
+    `robot.capture.unsupported_transport`);
+  - RTPS over TCP (reported the same way);
+  - DDS-Security-protected discovery (participants and their claimed
+    certificate subjects stay visible; `sros2_keystore` judges them, see
+    `src/sros2.rs`).
 
-  See `robodr-capture` and `robodr-rtps`.
+  See `robodr-capture`, `robodr-rtps` and
+  [`docs/DDS-TRANSPORTS.md`](../../docs/DDS-TRANSPORTS.md).
 - There is no rate limit on *distinct* findings, so a GUID spray yields one
   finding per GUID. Memory stays bounded.
 - Dedup is "until evicted": a participant that leaves and rejoins is not

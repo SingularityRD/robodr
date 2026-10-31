@@ -1581,3 +1581,188 @@ fn review3_r3_1_a_participant_sending_from_an_ephemeral_port_is_dropped() {
     );
     assert_containment_matches_rules(&v, &table);
 }
+
+/// Review of gap 1, finding 1: after the executor's journal is reset (its
+/// event sequence starts again at 1), agentd still sees the new events,
+/// the `journal_reset` among them, and raises the epoch change: it does not
+/// keep waiting for sequence numbers above the old ones.
+#[test]
+fn review_gap1_f1_agentd_follows_an_executor_journal_reset() {
+    let s = setup("exec-epoch", &robot_profile(true));
+    let exec_sock = s.dir.join("executor.sock");
+    let model = Model::default();
+    // A journal with a few events, so the sequence is well above 1.
+    let state = s.dir.join("executor-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut st = robodr_executor::journal::State::empty("test-boot");
+    for i in 0..5 {
+        st.event(
+            1_000 + i,
+            robodr_executor::journal::EventKind::Reconciled,
+            None,
+            None,
+            "earlier run",
+        );
+    }
+    robodr_executor::journal::Journal::new(&state)
+        .save(&st)
+        .unwrap();
+    let exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let spec = robodr_agentd::executor_link::ExecutorSpec {
+        socket: exec_sock.clone(),
+        key: Key::from_bytes(EXEC_KEY),
+        planner_orders: false,
+        timeout: std::time::Duration::from_secs(5),
+    };
+    let link = robodr_agentd::executor_link::ExecutorLink::start(
+        &spec,
+        robodr_agentd::executor_link::SafetyCell::default(),
+    )
+    .unwrap();
+    let first = wait_for(10, "the executor's events", || {
+        let evs = link.take_events();
+        (evs.len() >= 5).then_some(evs)
+    });
+    assert!(first.iter().all(|e| e.seq >= 1));
+    let before = wait_for(5, "a journal head", || link.journal_head());
+    // The executor restarts on an unreadable journal: reset, sequence
+    // restarted, a new epoch.
+    drop(exec);
+    std::fs::write(s.dir.join("executor-state/journal.json"), b"garbage").unwrap();
+    let _exec = start_executor(&s.dir, &exec_sock, &s.policy, &model);
+    let evs = wait_for(15, "the journal_reset event after the reset", || {
+        let evs = link.take_events();
+        evs.iter()
+            .any(|e| e.kind == robodr_executor::journal::EventKind::JournalReset)
+            .then_some(evs)
+    });
+    assert!(evs.iter().all(|e| e.seq < before.next_seq), "{evs:?}");
+    let alarms = link.take_head_alarms();
+    assert_eq!(alarms.len(), 1, "{alarms:?}");
+    assert!(alarms[0].1.contains("epoch changed"), "{}", alarms[0].1);
+    assert_ne!(link.journal_head().unwrap().epoch, before.epoch);
+}
+
+/// Sales-readiness T41: an executor that does not answer is a High,
+/// observe-only `robot.agent.executor_unreachable` once per outage (after
+/// `daemon.self_health.executor_unreachable_ms`), and `status.json` shows
+/// it unreachable.
+#[test]
+fn t41_an_unreachable_executor_is_one_high_finding_per_outage() {
+    let s = setup("exec-unreach", &robot_profile(true));
+    let control = s.dir.join("control.sock");
+    let mut cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        json!({"self_health": {
+            "executor_unreachable_ms": 1000,
+            "disk_warn_percent": 1, "disk_critical_percent": 0,
+            "clock_unsynced_grace_ms": 86_400_000,
+        }}),
+    );
+    cfg["context"] = json!({"safety_state": "idle"});
+    cfg["finding_signing"] = json!({"key_file": write_finding_key(&s.dir)});
+    cfg["control_plane"] = json!({
+        "unix_socket": control,
+        "state_dir": state_dir(&s),
+        "soc_keys": [write_soc_pub(&s.dir)],
+    });
+    cfg["executor"] = json!({
+        "enabled": true, "socket": s.dir.join("nobody.sock"),
+        "key_file": write_exec_key(&s.dir), "timeout_ms": 500,
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let st = wait_for(15, "executor unreachable", || {
+        let st = status(&s.spool)?;
+        let r = st["self_health"]["reachability"]
+            .as_array()?
+            .iter()
+            .find(|r| r["component"] == "executor")?
+            .clone();
+        (r["state"] == "unreachable"
+            && notes_with(&s.blackbox, "robot.agent.executor_unreachable") >= 1)
+            .then_some(st)
+    });
+    // Still down a while later: no second finding.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let (_, log) = finish(stop, h);
+    let found = spooled(&s.spool);
+    let f: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.executor_unreachable")
+        .collect();
+    assert_eq!(f.len(), 1, "once per outage\n{log}\n{st}");
+    let env = &f[0].1;
+    assert_eq!(env.severity, robodr_events::Severity::High);
+    assert_eq!(env.entity_context.mode, robodr_ocsf::Mode::Observe);
+    assert!(
+        env.entity_context
+            .detail
+            .value
+            .contains("robodr-executor has not answered"),
+        "{}",
+        env.entity_context.detail.value
+    );
+}
+
+/// Sales-readiness T6: the control plane's own certificate is watched; an
+/// expired one is a High `robot.agent.credential_expiring`, and
+/// `status.json` shows its `days_to_expiry`.
+#[test]
+fn t6_an_expired_control_plane_certificate_is_reported() {
+    let s = setup("cp-cert-expiry", &robot_profile(true));
+    let control = s.dir.join("control.sock");
+    let mut cfg = s.config(
+        json!({}),
+        json!([{"kind": "unix_socket", "path": s.dir.join("ev.sock")}]),
+        json!({}),
+    );
+    cfg["context"] = json!({"safety_state": "idle"});
+    cfg["finding_signing"] = json!({"key_file": write_finding_key(&s.dir)});
+    let mut tls = tls_section(&s.dir);
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tls");
+    let (cert, key) = (s.dir.join("expired.pem"), s.dir.join("expired.key"));
+    std::fs::copy(fx.join("expired.pem"), &cert).unwrap();
+    std::fs::copy(fx.join("expired.key"), &key).unwrap();
+    std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    tls["cert_chain"] = json!(cert);
+    tls["key_file"] = json!(key);
+    cfg["control_plane"] = json!({
+        "unix_socket": control,
+        "listen_tcp": format!("127.0.0.1:{}", free_port()),
+        "tls": tls,
+        "state_dir": state_dir(&s),
+        "soc_keys": [write_soc_pub(&s.dir)],
+    });
+    let (stop, h) = spawn(s.resolve(&cfg));
+    let st = wait_for(10, "credential finding", || {
+        let st = status(&s.spool)?;
+        let listed = !st["self_health"]["credentials"].as_array()?.is_empty();
+        (listed && notes_with(&s.blackbox, "robot.agent.credential_expiring") >= 1).then_some(st)
+    });
+    let (_, log) = finish(stop, h);
+    let c = st["self_health"]["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "control_plane.server_cert")
+        .unwrap_or_else(|| panic!("{st}"))
+        .clone();
+    // notAfter 2001-01-01T00:00:00Z.
+    assert_eq!(c["expires_ms"], 978_307_200_000u64, "{c}");
+    assert!(c["days_to_expiry"].as_i64().unwrap() < -9000, "{c}");
+    let found = spooled(&s.spool);
+    let f: Vec<_> = found
+        .iter()
+        .filter(|(_, e)| e.entity_context.rule_id == "robot.agent.credential_expiring")
+        .collect();
+    assert_eq!(f.len(), 1, "{log}");
+    assert_eq!(f[0].1.severity, robodr_events::Severity::High);
+    assert!(f[0]
+        .1
+        .entity_context
+        .detail
+        .value
+        .contains("control_plane.server_cert expired"));
+}

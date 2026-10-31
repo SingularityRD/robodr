@@ -11,6 +11,15 @@ vulnerabilities in it as high priority.
 Report privately through GitHub's private vulnerability reporting:
 <https://github.com/SingularityRD/robodr/security/advisories/new>.
 
+> **Status (verified 2026-10-30):** private vulnerability reporting is
+> not yet enabled on this repository, so the link above does not accept
+> reports until a repository administrator turns it on (Settings → Code
+> security → Private vulnerability reporting). A security mailbox and a
+> `security.txt` are planned (`docs/compliance/cra-readiness.md`, CRA-3,
+> CRA-8). Until then, ask your RoboDR contact for a private channel, or
+> open a public issue titled "security contact request" that contains
+> **no** details of the problem; we will reply with a private channel.
+
 If the robot or site is air-gapped and you cannot reach GitHub from where you
 found the problem, write the report offline and send it through your
 organisation's normal channel to your RoboDR contact. Do not include live
@@ -22,7 +31,9 @@ Please include:
 - the RoboDR version (`robodr-pulsard --version` prints the RoboDR and Pulsar
   versions and the Pulsar commit), the kernel version and the architecture;
 - the component (sensor, capture, RTPS parser, commissioning, Motion Firewall,
-  responder, black box, OCSF, packaging/systemd units);
+  in-path gateway, executor, responder, black box, OCSF, control plane,
+  exporters, fleet enrollment, secure delivery and sealing, packaging/systemd
+  units);
 - the impact as you understand it, and the steps or input that reproduce it,
   such as a pcap or JSONL that triggers the issue. Synthetic data is preferred.
 
@@ -64,7 +75,11 @@ system, e-stop or command authority. Reports in scope include:
 - **Privilege**: escaping the systemd confinement in `packaging/systemd/`,
   reading `/etc/robodr/keys`, or using a RoboDR process to gain privileges.
 - **Supply chain**: the release workflow, SBOM, signatures, `Cargo.lock`
-  policy, and the offline install bundle.
+  policy, the offline install bundle, and the secure-delivery formats and
+  agents (`robodr-release`, `robodr-deliverd`, `robodr-depot`,
+  `robodr-seal`): accepting an unsigned, under-signed, rolled-back or
+  re-targeted pack, or recovering sealed content from a captured unit
+  outside what `docs/SECURE-DELIVERY.md` states is not claimed.
 
 Out of scope:
 
@@ -76,9 +91,15 @@ Out of scope:
 - vulnerabilities in vendored Pulsar (`vendor/pulsar`) that do not depend on
   RoboDR. Report them upstream (<https://github.com/exein-io/pulsar>) and tell
   us, so we can track the fix;
-- the HMAC-SHA256 black-box authenticator being a shared-key MAC. This is a
-  documented placeholder (`crates/robodr-blackbox/README.md`). Report attacks
-  on its *use*, not on the fact that it is symmetric.
+- the legacy HMAC-SHA256 black-box authenticator being a shared-key MAC. It
+  is refused by default and accepted only with an explicit `--allow-hmac` /
+  `blackbox.allow_hmac` for migration (`crates/robodr-blackbox/README.md`).
+  Report attacks on its *use*, or a way to make a unit accept it without the
+  opt-in, not on the fact that it is symmetric;
+- the documented limits of each component (for example the gateway's
+  "Known limits", the control plane's "Not claimed" below, and
+  `docs/customer/known-limitations.md`), unless you show they are worse than
+  documented.
 
 ### Black-box head anchors: what is claimed
 
@@ -130,11 +151,18 @@ claims are:
   `executor.enabled`, agentd hands `isolate_network` / `quarantine_node`
   (reversible nftables rules with a TTL) and `record_evidence` to the
   separate `robodr-executor` (the only `CAP_NET_ADMIN` unit), only after
-  the request's black-box note exists; the executor re-checks the live
-  safety state before it applies. Its states (`verified`, `refused`,
-  `failed`, `reverted`) are signed answers and journalled like every other
-  state. Motion, safe-pause, safe-state and rollback actions are never
-  executed.
+  the request's black-box note exists; the executor verifies the SOC's
+  signature on the request itself and re-checks the live safety state
+  before it applies. Its states (`verified`, `refused`, `failed`,
+  `reverted`) are signed answers and journalled like every other state.
+  `restrict_motion`, `safe_pause`, `request_safe_state` and
+  `rollback_config` are executed only when the executor also has a
+  `motion` section with an adapter the site marked `oem_validated`, and
+  then only through the platform's own interface (gateway restriction,
+  Unitree speed level, Nav2, ros2_control, PX4, the site's rollback
+  program); the last three need two approvers named in the signed request
+  and are refused where the morphology forbids them. Without a `motion`
+  section they are never executed.
 - **No channel without the SOC's certificate.** Off loopback the API is
   served only over mutual TLS (rustls): the peer must present a client
   certificate that chains to the configured SOC CA, is valid now and, if
@@ -209,8 +237,12 @@ so advisories will state the mitigations that need no upgrade wherever we can.
 
 ## Verifying what you run
 
-Releases are signed with minisign. Each artefact has a `.minisig`, and
-`SHA256SUMS` is signed as well. Releases ship CycloneDX SBOMs, and the pure
-binaries are built reproducibly. See `docs/OPERATIONS.md`, "Verify a release",
-for the offline procedure. The release public key must reach your entry station
-through a channel you trust, never from the bundle itself.
+**No release has been published yet** (no tag exists; verified 2026-10-30).
+The release design: every artefact is signed with minisign and has a
+`.minisig`, `SHA256SUMS` is signed as well, releases ship CycloneDX SBOMs, and
+the pure binaries are built reproducibly. See `docs/OPERATIONS.md`, "Verify a
+release", for the offline procedure and `docs/RELEASE.md` for the key
+ceremony. The release public key must reach your entry station through a
+channel you trust, never from the bundle itself. Until the first signed
+release, any RoboDR binary you were given is a pre-release build that you
+cannot verify this way.

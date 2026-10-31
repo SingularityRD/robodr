@@ -146,6 +146,11 @@ dedup.insert(v.replay_key());   // replay detection is the consumer's job
 | `robot.host.pulsar_threat` | Host runtime-security detection (Pulsar rule), data source `host_runtime`; the Pulsar rule name and process are in the detail | — |
 | *since contract 2.1 (among others):* | | |
 | `robot.ros2.discovery_flood` | Discovery flood: unknown participants aggregated (agentd folds a flooding source's per-participant discovery findings into it) | T0848 |
+| *since contract 2.5:* | | |
+| `robot.agent.health` | Agent health record; the only rule that carries `entity_context.agent_health` (`AgentHealth`, `FindingBuilder::agent_health`) | — |
+| `robot.agent.{credential_expiring, clock_unsynced, clock_jump, disk_low, executor_unreachable, control_plane_request_fenced, selftest}` | (own titles, data source `robodr_agent`) | — |
+| `robot.gateway.overload` | In-path gateway overloaded (data source `ros2_motion_commands`) | — |
+| `robot.host.<rule>` | one per shipped Pulsar rule (`HOST_RULES`, `host_rule_id`; title = the rule name), data source `host_runtime`; `robot.host.pulsar_threat` stays the fallback | — |
 | anything else | RoboDR model-profile deviation | — |
 
 The validator applies the catalog of the message's own `contract_version`
@@ -161,6 +166,15 @@ Technique names are from memory of ATT&CK for ICS — verify against the
 current matrix.
 
 ## OCSF-UNCERTAIN
+
+> **Checked (T61).** Produced findings are now validated against the official
+> OCSF 1.1.0 schema (compiled from `ocsf/ocsf-schema` v1.1.0 by the OCSF
+> compiler) and the contract schema with the `jsonschema` package
+> (`tests/external_validator.rs`, `integrations/schemas/README.md`). Only
+> `device.model` is not OCSF 1.1.0; every other item below holds. ATT&CK for
+> ICS ids are checked against MITRE's v20 data (`tests/attack_ics.rs`): T0855
+> and T0856 were revoked (now T1692.001 / T1692.002). The list below is kept
+> as written for history.
 
 Written from knowledge of OCSF 1.x without access to the schema server.
 Confident: class 2004 / category 2 and their captions, `activity_id` 1/2/3,

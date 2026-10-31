@@ -2203,4 +2203,50 @@ mod tests {
         assert!(Manifest::parse(&t.replace(MANIFEST_FORMAT, "v0")).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    // ------------------------------------------- bound configuration ---
+
+    /// T12: a bound file (here without any motion channel) needs its own
+    /// confirmed item, and that item is under the motion quorum: one
+    /// operator cannot make a response policy enforceable alone.
+    #[test]
+    fn bound_config_needs_its_item_and_the_motion_quorum() {
+        let mut p = base();
+        p.motion_envelopes.clear();
+        let d = format!("sha256:{}", "a".repeat(64));
+        p.bound_config.insert("response_policy".into(), d.clone());
+        // A list without the binding item: refused by the floor.
+        let mut unbound = p.clone();
+        unbound.bound_config.clear();
+        let mut so = Signoff::for_profile(&unbound).confirm_all("alice");
+        so.rebind(crate::signoff::draft_digest(&p));
+        let why = lock(&p, &so).unwrap_err();
+        assert!(
+            why.iter().any(
+                |r| matches!(r, LockRefusal::RequiredItemMissing { subject, .. }
+                if subject == &format!("response_policy {d}"))
+            ),
+            "{why:?}"
+        );
+        // The conservative list carries it; one signer under quorum 2 fails.
+        let draft = crate::to_json(&p).unwrap();
+        let so = crate::to_json(&Signoff::for_profile(&p).confirm_all("alice")).unwrap();
+        let o = ops(2);
+        let one = sign(&so, &[&o.alice]);
+        let policy = OperatorPolicy {
+            trust: &o.trust,
+            min_motion_quorum: 1,
+        };
+        let why =
+            lock_signed_draft(&draft, &so, Some(&one), &policy, &HardCaps::default()).unwrap_err();
+        assert!(
+            why.iter()
+                .any(|r| matches!(r, LockRefusal::MotionQuorumNotMet { have: 1, need: 2 })),
+            "{why:?}"
+        );
+        let two = sign(&so, &[&o.alice, &o.bob]);
+        let (locked, _) =
+            lock_signed_draft(&draft, &so, Some(&two), &policy, &HardCaps::default()).unwrap();
+        assert_eq!(locked.bound_config.get("response_policy"), Some(&d));
+    }
 }

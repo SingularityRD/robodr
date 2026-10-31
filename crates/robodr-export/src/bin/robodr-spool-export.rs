@@ -18,7 +18,9 @@ const USAGE: &str = "usage: robodr-spool-export --spool DIR --outbox DIR --state
 [--rejected-max-age-s N] [--rejected-max-count N] [--rejected-max-bytes N]\n\
 Unsigned contract 1.x records (spooled before an upgrade) are upgraded to contract 2.0 with \
 --upgrade-data-source (default robodr) and --upgrade-topic (default robodr.findings); signed \
-ones are moved to the rejected directory (\"legacy 1.x signed record: re-sign required\").\n\
+ones are moved to the rejected directory (\"legacy 1.x signed record: re-sign required\"). \
+A spool file that cannot be read (I/O error after 3 attempts) is moved there too, with the \
+error as its reason, and the run goes on.\n\
 The rejected directory is kept in full unless --rejected-max-age-s / --rejected-max-count / \
 --rejected-max-bytes bound it (0 = no bound): the oldest rejected records (with their \
 .reason.json) beyond the bounds are deleted after each run.";
@@ -111,7 +113,10 @@ fn main() -> ExitCode {
         }
     };
     if is_version_request(&v) {
-        println!("robodr-spool-export {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-spool-export", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     let parsed = parse_args_with_switches(

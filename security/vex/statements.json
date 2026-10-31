@@ -1,0 +1,17 @@
+{
+  "format": "robodr-vex-statements/1",
+  "comment": "Curated exploitability statements for RoboDR releases. scripts/vex.py turns them into OpenVEX (signed release asset robodr-<version>.openvex.json) and CSAF 2.0 VEX (.github/workflows/vuln-scan.yml). Every advisory that cargo-deny / osv-scanner reports against a published release (vuln-scan.yml) needs a statement here: not_affected with a justification and impact, affected with an action, fixed, or under_investigation. docs/RELEASE.md, 'Vulnerability monitoring and VEX'.",
+  "statements": [
+    {
+      "vulnerability": "RUSTSEC-2021-0139",
+      "aliases": [],
+      "component": "pkg:cargo/ansi_term@0.12.1",
+      "products": ["robodr", "robodr-rpm"],
+      "versions": "*",
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "Informational 'unmaintained' advisory: ansi_term has no known vulnerability. It is linked only into robodr-pulsard (Pulsar bpf-common -> nut) and only formats ANSI colour codes of log output. Tracked in deny.toml; review by 2027-04-17 or on the next Pulsar bump.",
+      "timestamp": "2026-10-17T00:00:00Z"
+    }
+  ]
+}

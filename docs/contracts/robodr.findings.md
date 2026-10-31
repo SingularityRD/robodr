@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Contract | `robodr.findings`, version **2.4.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
+| Contract | `robodr.findings`, version **2.5.0** (`contract_version` field, `robodr-contract-version` header); changes in §10 |
 | Producer | `robodr-agentd` (findings spool; since 2.2 also `robodr-deliverd`, the on-unit delivery agent, which writes its `robot.deliver.*` findings, and since 2.3 its `robot.seal.*` findings, into the same spool; since 2.3 the in-path gateway `robodr-firewall-gw` reports its `robot.gateway.*` findings through agentd's `gateway_feed` socket), `robodr-diode` importer (air-gapped sites), `robodr-kafka-publish` |
 | Consumer | Any SOC, SIEM or SOAR: the envelope is vendor-neutral and the body is a standard OCSF Detection Finding |
-| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.4.0`; it also describes 2.0.x, 2.1.x, 2.2.x and 2.3.x messages, whose only difference is the rule catalog the validator applies, §3) |
+| Value schema | [`robodr-finding.schema.json`](robodr-finding.schema.json) (JSON Schema 2020-12, `$id` `https://schemas.singularityrd.com/robodr/findings/2.5.0`; it also describes 2.0.x – 2.4.x messages, whose only difference is the rule catalog the validator applies, §3, and, since 2.5, the optional `entity_context.agent_health` record of §3g) |
 | Golden example | [`robodr-finding.example.json`](robodr-finding.example.json) |
 | Reference implementation | `crates/robodr-ocsf` (`FindingBuilder`, `validate`, `kafka::record`, `sig`) |
 | Superseded | Contract 1.x (`robot-edr.findings`): [`legacy/robot-edr.findings.md`](legacy/robot-edr.findings.md); parse-only (§5) |
@@ -50,7 +50,7 @@ each one against the robot's current safety state and may refuse it.
 | `title`, `description` | trusted catalog text + sensor-authored facts (never tainted text) |
 | `severity` | `low` \| `medium` \| `high` \| `critical` |
 | `timestamp` | RFC 3339 UTC, ms (= `ocsf.time`) |
-| `entity_context` | robot, profile, rule id, mode, safety state, attestation, ROS/DDS identifiers (tainted), command and envelope, bus message id, occurrence count, detail (tainted) |
+| `entity_context` | robot, profile, rule id, mode, safety state, attestation, ROS/DDS identifiers (tainted), command and envelope, bus message id, occurrence count, detail (tainted); since 2.5 `agent_health` on `robot.agent.health` findings only (§3g) |
 | `mitre_predictions` | ATT&CK for ICS techniques from RoboDR's own rule catalog (`provenance: sensor`) |
 | `evidence_links` | `robodr-blackbox://<robot>/<segment>/<seq>?sha256=<hex>` |
 | `anomaly_score` | *optional*, in [0, 1] |
@@ -71,7 +71,7 @@ each one against the robot's current safety state and may refuse it.
 | Header | Value |
 | --- | --- |
 | `content-type` | `application/json` |
-| `robodr-contract-version` | the value's own `contract_version` (`2.4.0` from this producer; a forwarded or replayed 2.0 – 2.3 message keeps its version) |
+| `robodr-contract-version` | the value's own `contract_version` (`2.5.0` from this producer; a forwarded or replayed 2.0 – 2.4 message keeps its version) |
 | `ocsf-version` | `1.1.0` |
 | `data-source` | the value's `data_source` (default `robodr`) |
 | `robot-id` | robot id (`[A-Za-z0-9._-]{1,64}`) |
@@ -86,7 +86,7 @@ not trust a header that disagrees with the value.
 
 ```json
 {
-  "contract_version": "2.4.0",
+  "contract_version": "2.5.0",
   "finding_id": "rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "external_id": "ugv-007:rf1-0d7e79aac05cfd23bcfbdd38ef617eba",
   "data_source": "robodr",
@@ -398,7 +398,9 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   `robodr_agent` (`robot.agent.*`, `robot.ros2.profile_state_tampered`,
   `robot.ros2.profile_refused`) and `host_runtime`
   (`robot.host.pulsar_threat`: a Pulsar host rule forwarded to agentd; the
-  Pulsar rule name is in the description, since it is not a rule id), and
+  Pulsar rule name is in the detail, since it is not a rule id; since 2.5
+  each Pulsar rule RoboDR ships has its own `robot.host.<rule>` id and
+  `robot.host.pulsar_threat` is the fallback for any other rule, §3g), and
   since 2.2 `robodr_delivery` (`robot.deliver.*`, the on-unit delivery agent
   `robodr-deliverd`, `docs/SECURE-DELIVERY.md` §9; for these findings
   `entity_context.profile` names the delivery trust file they were judged
@@ -423,7 +425,8 @@ not run `robodr_ocsf::parse_and_validate` must enforce at least these:
   | 1.3 – 1.x, 2.0 | base + the 1.3 entries, exactly as 1.3.0 shipped (2.0 did not change the catalog) |
   | 2.1 | + the 2.1 entries: the low-level joint-frame firewall ids (`robot.firewall.joint_*`, `disabled_motor_energised`, `crc_invalid`), `robot.motion.api_id_out_of_range`, `robot.motion.control_handover`, `robot.motion.command_type_mismatch` and the Unitree legacy-UDP ids `robot.unitree.legacy_unknown_sender`, `legacy_sender_flood`, `legacy_sender_mac_mismatch`, `legacy_port_rtps`, and agentd's discovery-flood aggregate `robot.ros2.discovery_flood` (§10, 2.1.0) |
   | 2.2 | everything of 2.1 (`robot.ros2.discovery_flood` included, unchanged) + the 2.2 entries: the secure-delivery ids `robot.deliver.installed` (Low: the contract has no informational severity), `deferred_safety` (Low, Medium when repeated), `health_failed` (High), `rollback_blocked_floor` (Critical), `refused` (High), `stale` (Medium, High after the grace period), `chain_gap` (High), data source `robodr_delivery`, no techniques; titles and catalog sentences in §3a |
-  | 2.4 and later | everything of 2.3, unchanged + the 2.4 agentd entries `robot.agent.control_plane_state_untrusted` (High / Critical), `robot.agent.executor_revert_failed` (High), `robot.agent.executor_journal_reset` (High), data source `robodr_agent`, no techniques (§3f) |
+  | 2.5 and later | everything of 2.4, unchanged (`robot.host.pulsar_threat` included) + the 2.5 entries of §3g: `robot.agent.health` (Low), `robot.agent.credential_expiring` (Medium / High), `robot.agent.clock_unsynced` (Medium), `robot.agent.clock_jump` (High), `robot.agent.disk_low` (Medium / High), `robot.agent.executor_unreachable` (High), `robot.agent.executor_pause_overridden` (High), `robot.agent.control_plane_request_fenced` (Low), `robot.agent.selftest` (Low), data source `robodr_agent`; `robot.gateway.overload` (Medium / High), data source `ros2_motion_commands`; one `robot.host.<rule>` per shipped Pulsar rule, data source `host_runtime`; no techniques |
+  | 2.4 | everything of 2.3, unchanged + the 2.4 agentd entries `robot.agent.control_plane_state_untrusted` (High / Critical), `robot.agent.executor_revert_failed` (High), `robot.agent.executor_journal_reset` (High), data source `robodr_agent`, no techniques (§3f) |
   | 2.3 | everything of 2.2, unchanged + the 2.3 in-path gateway entries (`robot.gateway.*`, data source `ros2_motion_commands`, no techniques; §3b) and the sealing entries `robot.seal.unseal_failed` (High), `robot.seal.lease_expired` (Medium), `robot.seal.erased` (Critical), `robot.seal.tamper` (Critical), data source `robodr_delivery`, no techniques (§3c), and the Unitree WebRTC entries `robot.unitree.webrtc_*`, data source `ros2_motion_commands`, no techniques (§3d), and the depot entries `robot.depot.import_refused` (High), `robot.depot.enrolment_refused` (High), `robot.depot.unit_enrolled` (Low), `robot.depot.rollout_halted` (High), `robot.depot.locked` (Critical) and `robot.seal.erase_deferred` (Medium), data source `robodr_delivery`, no techniques (§3e) |
 
   A finding of an older minor for a rule that only gained an entry in a
@@ -646,12 +649,14 @@ never feed a response).
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | High (damaged, edited, another key); Critical (rolled back against the black box's signed head, or an unsealed v1 file after sealing started) |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | High |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | High |
+| `robot.agent.executor_pause_overridden` | Robot set moving while paused (added in **2.5**, listed here with its executor siblings; a 2.4 validator applies the generic entry) | High |
 
 Catalog sentences (`finding_info.desc`):
 
 * `robot.agent.control_plane_state_untrusted`: At start the control plane's sealed request journal or replay store was damaged, edited, sealed under another key, or older than the head the black box recorded for it. The robot failed safe: the damaged copy was quarantined, requests were reconciled with the black box and the replay store was fenced; nothing was reset silently.
 * `robot.agent.executor_revert_failed`: The robot's executor could not revert a containment action: its transaction or read-back failed, so the action's rules may still be in force after its time limit or revert request. The executor retries every tick; the detail names the action, request, time limit and error.
 * `robot.agent.executor_journal_reset`: The robot's executor found its journal unreadable or failing its seal and started empty: every action it held was lifted and its history lost. It refuses new orders until an operator re-arms it.
+* `robot.agent.executor_pause_overridden`: While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found.
 
 `robot.agent.control_plane_state_untrusted` is raised once per agentd start;
 `robot.agent.executor_revert_failed` once per request until a revert of it
@@ -659,6 +664,83 @@ succeeds (the executor reports every retry as a black-box note); the
 detail of each names what failed. Each is also in the black box (the
 finding record, and the `robodr.executor_event` or
 `robodr.control_plane_start` note).
+
+## 3g. Contract 2.5: agent health record, early warnings, per-rule host ids
+
+The 2.5 addition (`catalog_2_5` in `robodr-ocsf`), applied as in §3 to a
+message whose `contract_version` is 2.5.x or a later 2.x. A 2.4 validator,
+and a 2.5 validator given a 2.4 message, apply the generic entry to these
+ids. No techniques. Producer `robodr-agentd` unless noted; every
+`robot.agent.*` finding is self-health and observe-only (never feeds a
+response).
+
+| Rule id | Title | Severity emitted | Raised |
+| --- | --- | --- | --- |
+| `robot.agent.health` | Agent health record | Low | every `daemon.self_health.health_record_ms` (default 60 s), carries `entity_context.agent_health` |
+| `robot.agent.credential_expiring` | Agent credential expires soon | Medium (≤ `credential_warn_days`, default 14); High (≤ `credential_critical_days`, default 3, or expired) | per credential on each escalation, then at most daily |
+| `robot.agent.clock_unsynced` | Robot clock not synchronised | Medium | once per episode, after the kernel has reported the clock unsynchronised for `clock_unsynced_grace_ms` (default 5 min) |
+| `robot.agent.clock_jump` | Robot wall clock jumped | High | per wall-clock jump against the monotonic clock (> 1 s), at most every `health_report_ms` |
+| `robot.agent.disk_low` | Agent storage running out of space | Medium (free < `disk_warn_percent`, default 10 %); High (free < `disk_critical_percent`, default 3 %) | per filesystem on each escalation |
+| `robot.agent.executor_unreachable` | Response executor unreachable | High | once per outage, after `executor_unreachable_ms` (default 30 s) without an answer |
+| `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | Low | reserved in 2.5 for the control plane (a fenced request is not an authentication failure) |
+| `robot.agent.selftest` | Agent field acceptance self-test | Low | reserved in 2.5 for the field acceptance self-test |
+| `robot.gateway.overload` | In-path gateway overloaded | Medium; High above the gateway's threshold | reserved in 2.5 for `robodr-firewall-gw` (aggregated per interval; `robot.firewall.internal_fault` stays for real faults) |
+| `robot.host.<rule>` | the Pulsar rule's name without its `RoboDR: ` prefix | the Pulsar rule's | per Pulsar threat (data source `host_runtime`) |
+
+Catalog sentences (`finding_info.desc`):
+
+* `robot.agent.health`: Periodic health and liveness record of the robot's RoboDR agent: monitoring state, component versions, input freshness, counters, black-box state, reachability of the executor, gateway and host sensor, credential expiry, clock synchronisation and free disk space. A robot whose newest record is older than a few record periods is silent.
+* `robot.agent.credential_expiring`: A certificate or certificate revocation list the robot's agent depends on expires or reaches its next-update time soon (or already has): renew it before the control plane refuses every SOC client.
+* `robot.agent.clock_unsynced`: The robot's kernel reports its wall clock unsynchronised (no NTP, NTS or PTP lock) or with a large error estimate: finding and evidence times may be wrong.
+* `robot.agent.clock_jump`: The robot's wall clock moved away from what its monotonic clock says elapsed (a time step, an RTC reset or a spoofed time source). Durations are unaffected; finding and evidence times around the jump may be wrong.
+* `robot.agent.disk_low`: A filesystem the robot's agent writes evidence, findings or control-plane state to is nearly full: free space before recording stops.
+* `robot.agent.executor_unreachable`: The robot's agent cannot reach its response executor: containment actions cannot be applied, verified or reverted, and actions in force are not watched, until it answers again.
+* `robot.agent.control_plane_request_fenced`: A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.
+* `robot.agent.selftest`: A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection.
+* `robot.gateway.overload`: The in-path motion gateway could not process every command in time over the last interval (late or shed packets, aggregated): commands were delayed or dropped by its fail behaviour. Not a gateway fault.
+* every `robot.host.<rule>`: A RoboDR runtime-security rule fired on the robot controller (process, file or network activity of the host operating system, seen by Pulsar); the finding's rule id names the rule, the detail names the process.
+
+**Per-rule host ids.** The table is `robodr_ocsf::HOST_RULES` (Pulsar
+rule name → id), checked against `rules/robodr/*.toml` in both directions
+by the `host_rules` test of `robodr-ocsf`. The match is exact on the rule
+name; a Pulsar rule RoboDR does not ship (a deployment's own) keeps
+`robot.host.pulsar_threat`. An id is never renamed or reused: a renamed
+Pulsar rule keeps its id. Because the id differs, a 2.5 finding for a host
+rule has a different `finding_id` than the 2.4 `robot.host.pulsar_threat`
+finding for the same process: a SOC that grouped on that id should group
+on `data_source = host_runtime` instead. A response policy's
+`rule_overrides[]` can now name one host rule.
+
+**`entity_context.agent_health`** (and its copy under
+`ocsf.unmapped.robodr`) is present exactly on a 2.5+ `robot.agent.health`
+finding; the validator refuses it on any other rule or minor and refuses a
+2.5 health finding without it. Every value is sensor-authored (agentd's own
+counters and configuration), printable ASCII, never tainted. Lists hold at
+most 16 entries, reasons at most 256 bytes, names and versions 1 – 128
+bytes (`robodr_ocsf::health_limits`):
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `ok` \| `degraded` \| `unknown`, as in agentd's `status.json` (`unknown`: the agent is blind) |
+| `reasons[]` | why the state is not `ok` |
+| `interval_ms` | the record period: a SOC alerts when the newest record (`ocsf.time`) is older than about three periods |
+| `uptime_ms`, `seq` | since agentd started; `seq` counts records from 1, so a restart is visible |
+| `versions[]` | `{component, version}`: `robodr-agentd` and the contract it emits |
+| `inputs[]` | `{name, last_rx_age_ms?, received, dropped, malformed, ended}` per input |
+| `counters` | `findings_spooled`, `finding_errors`, `health_findings`, `spool_dropped`, `spool_write_errors`, `note_errors` |
+| `blackbox` | `{degraded, anchored, anchor_failures}` |
+| `reachability[]` | `{component, state, last_ok_age_ms?}` for `executor`, `gateway` (the in-path gateway's feed) and `pulsard` (the host-threat forwarder): `reachable` \| `unreachable` \| `unknown` (configured, not heard yet) \| `not_configured` |
+| `credentials[]` | `{name, expires_ms, days_to_expiry}`: the control plane's server certificate (`control_plane.server_cert`) and each CRL's `nextUpdate` (`control_plane.crl:<issuer>`) |
+| `clock` | `{synchronized?, max_error_ms?, wall_jumps}` from `adjtimex(2)` and agentd's time guard |
+| `disks[]` | `{name, free_bytes, total_bytes}` for `blackbox`, `spool` and `control_plane` |
+
+The profile digest and the safety state are the finding's own
+`entity_context.profile` and `entity_context.safety_state`. The record is
+one finding per robot (fixed subject): each period is an *Update* of the
+same `finding_id` with a higher `count`, so a SOC upserts it and reads
+`last_seen_time` as the robot's last sign of life. Like every finding it is
+signed when `finding_signing` is configured (§2a), recorded in the black
+box, and exported on every path (Kafka, HTTPS uplink, diode) unchanged.
 
 ## 4. Ordering and partitioning
 
@@ -689,9 +771,10 @@ finding record, and the `robodr.executor_event` or
   parallel (e.g. a new topic) until consumers migrate.
 * `ocsf.metadata.version` moves independently; upgrading the OCSF version
   inside the envelope is a minor change only if it is additive for consumers.
-* **2.0 vs 2.1 vs 2.2 vs 2.3 vs 2.4.** 2.1, 2.2, 2.3 and 2.4 only added
+* **2.0 vs 2.1 vs 2.2 vs 2.3 vs 2.4 vs 2.5.** 2.1 – 2.4 only added
   rule-catalog entries (§3; 2.2 also the data source `robodr_delivery` they
-  use). A 2.4 validator accepts 2.0 – 2.3 messages with their own catalogs; an older
+  use); 2.5 added entries and the optional `entity_context.agent_health`
+  object (§3g). A 2.5 validator accepts 2.0 – 2.4 messages with their own catalogs; an older
   validator accepts a newer message for every rule both catalogs share and
   rejects one for a rule only the newer minor catalogues (title / data
   source differ): upgrade consumers (and both sides of a diode) before
@@ -699,7 +782,11 @@ finding record, and the `robodr.executor_event` or
   SOC side before its findings are exported, and 2.3 validators once it
   installs sealed RPKs (`robot.seal.*`). An agentd that emits 2.4
   (`robot.agent.control_plane_state_untrusted`, `executor_revert_failed`,
-  `executor_journal_reset`) needs 2.4 validators on the SOC side.
+  `executor_journal_reset`) needs 2.4 validators on the SOC side, and one
+  that emits 2.5 (the health record, the early warnings and the per-rule
+  host ids) 2.5 validators: an older validator rejects those findings (their
+  catalog entry differs), so upgrade the SOC side and both sides of a diode
+  first.
 * **What 2.0 changed from 1.3** (`robot-edr.findings`): `data_source` is no
   longer the constant `robot_edr` but a deployment label (default
   `robodr`); the topic is no longer fixed to `robot-edr.findings` but
@@ -988,6 +1075,23 @@ safely. Nothing here is specific to one product.
       eval inputs.
 
 ## 10. Changelog
+
+* **2.5.0** — rule-catalog entries and one optional field (minor),
+  sales-readiness WP2:
+  - New optional `entity_context.agent_health` (and its copy under
+    `ocsf.unmapped.robodr`), only on `robot.agent.health` findings (§3g);
+    schema `$defs/AgentHealth`.
+  - New entries, data source `robodr_agent`: `robot.agent.health`,
+    `robot.agent.credential_expiring`, `robot.agent.clock_unsynced`,
+    `robot.agent.clock_jump`, `robot.agent.disk_low`,
+    `robot.agent.executor_unreachable` (emitted by `robodr-agentd`),
+    `robot.agent.control_plane_request_fenced` and `robot.agent.selftest`
+    (reserved for their producers); data source `ros2_motion_commands`:
+    `robot.gateway.overload` (reserved for `robodr-firewall-gw`); data
+    source `host_runtime`: one `robot.host.<rule>` per shipped Pulsar rule
+    (`robodr_ocsf::HOST_RULES`), `robot.host.pulsar_threat` kept as the
+    fallback (§3g).
+  - Schema `$id` `https://schemas.singularityrd.com/robodr/findings/2.5.0`.
 
 * **2.4.0** — rule-catalog entries only (minor): agentd's sealed
   control-plane state and the executor (GA-ROADMAP S5):

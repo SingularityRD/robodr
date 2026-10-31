@@ -1,0 +1,171 @@
+#!/bin/sh
+# robodr-signer-pkcs11: a robodr-signer/v1 external signer (see
+# crates/robodr-signer/src/lib.rs) over a PKCS#11 token: YubiKey (ykcs11 or
+# OpenSC), Nitrokey, SoftHSM, a network HSM's PKCS#11 module. It drives
+# OpenSC's pkcs11-tool with CKM_EDDSA (pure Ed25519), so the private key
+# never leaves the token.
+#
+#   robodr-signer-pkcs11 sign       TOKEN... --id HEX [--pin-env NAME | --pin-file FILE]
+#       stdin: the message; stdout: the 64-byte signature (raw)
+#   robodr-signer-pkcs11 public-key TOKEN... --id HEX
+#       stdout: the key's Ed25519 public key, 64 hex digits
+#   robodr-signer-pkcs11 signer-file TOKEN... --id HEX --key-id ID
+#                        [--pin-env NAME | --pin-file FILE] [--adapter PATH]
+#       stdout: a robodr-signer/v1 signer file for this key (the public key
+#       is read from the token now and pinned in the file)
+#
+#   TOKEN: --module /abs/path/to/pkcs11-module.so [--token-label LABEL | --slot N]
+#
+# PIN: --pin-env NAME takes it from that environment variable (list NAME in
+# the signer file's "pass_env"); --pin-file FILE reads it from a file the
+# caller can read (mode 0600). Without either, pkcs11-tool asks on the
+# terminal. The PIN is never put on a command line (pkcs11-tool reads it
+# with "--pin env:VAR", OpenSC 0.25 and later; tested with 0.25.0).
+#
+# Exit 0 on success; anything else on failure (messages on stderr). The
+# caller verifies every signature against the pinned public key.
+
+set -eu
+
+die() {
+    echo "robodr-signer-pkcs11: $*" >&2
+    exit 1
+}
+
+[ $# -ge 1 ] || die "usage: robodr-signer-pkcs11 sign|public-key|signer-file --module SO --id HEX ..."
+op=$1
+shift
+
+module=
+token_label=
+slot=
+id=
+pin_env=
+pin_file=
+key_id=
+adapter=/usr/lib/robodr/robodr-signer-pkcs11
+
+while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || die "$1 needs a value"
+    case $1 in
+        --module) module=$2 ;;
+        --token-label) token_label=$2 ;;
+        --slot) slot=$2 ;;
+        --id) id=$2 ;;
+        --pin-env) pin_env=$2 ;;
+        --pin-file) pin_file=$2 ;;
+        --key-id) key_id=$2 ;;
+        --adapter) adapter=$2 ;;
+        *) die "unknown option $1" ;;
+    esac
+    shift 2
+done
+
+# Values end up in a JSON file and on pkcs11-tool's command line: keep them
+# to plain characters (no quoting games).
+plain() {
+    case $2 in
+        "" | *[!A-Za-z0-9._/+:@-]*) die "$1 must be non-empty [A-Za-z0-9._/+:@-]" ;;
+    esac
+}
+
+plain --module "$module"
+case $module in /*) ;; *) die "--module must be an absolute path" ;; esac
+[ -f "$module" ] || die "--module $module: no such file"
+case $id in "" | *[!0-9A-Fa-f]*) die "--id must be hex (the CKA_ID of the key)" ;; esac
+[ -z "$token_label" ] || plain --token-label "$token_label"
+case $slot in *[!0-9]*) die "--slot must be a number" ;; esac
+[ -z "$token_label" ] || [ -z "$slot" ] || die "--token-label and --slot exclude each other"
+if [ -n "$pin_env" ]; then
+    case $pin_env in [A-Z_]*) ;; *) die "--pin-env must name a variable [A-Z_][A-Z0-9_]*" ;; esac
+    case $pin_env in *[!A-Z0-9_]*) die "--pin-env must name a variable [A-Z_][A-Z0-9_]*" ;; esac
+fi
+[ -z "$pin_env" ] || [ -z "$pin_file" ] || die "--pin-env and --pin-file exclude each other"
+[ -z "$pin_file" ] || plain --pin-file "$pin_file"
+
+command -v pkcs11-tool >/dev/null 2>&1 || die "pkcs11-tool (OpenSC) not found in PATH"
+
+set -- --module "$module"
+if [ -n "$token_label" ]; then
+    set -- "$@" --token-label "$token_label"
+elif [ -n "$slot" ]; then
+    set -- "$@" --slot "$slot"
+fi
+
+umask 077
+tmp=$(mktemp -d) || die "mktemp failed"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+public_key_hex() {
+    pkcs11-tool "$@" --read-object --type pubkey --id "$id" -o "$tmp/pub" >/dev/null 2>"$tmp/err" ||
+        { cat "$tmp/err" >&2; die "reading public key $id failed"; }
+    if head -c 11 "$tmp/pub" | grep -q -- '-----BEGIN'; then
+        grep -v -- '-----' "$tmp/pub" | base64 -d >"$tmp/pub.der" 2>/dev/null ||
+            die "public key $id: bad PEM"
+    else
+        cp "$tmp/pub" "$tmp/pub.der"
+    fi
+    # Ed25519 SubjectPublicKeyInfo: 12-byte prefix (OID 1.3.101.112) + 32.
+    [ "$(wc -c <"$tmp/pub.der" | tr -d ' ')" = 44 ] || die "key $id is not an Ed25519 key"
+    [ "$(head -c 12 "$tmp/pub.der" | od -An -v -tx1 | tr -d ' \n')" = 302a300506032b6570032100 ] ||
+        die "key $id is not an Ed25519 key"
+    tail -c 32 "$tmp/pub.der" | od -An -v -tx1 | tr -d ' \n'
+}
+
+case $op in
+    sign)
+        cat >"$tmp/msg"
+        if [ -n "$pin_file" ]; then
+            [ -r "$pin_file" ] || die "--pin-file $pin_file is not readable"
+            ROBODR_P11_PIN=$(head -n 1 "$pin_file")
+            export ROBODR_P11_PIN
+            set -- "$@" --login --pin env:ROBODR_P11_PIN
+        elif [ -n "$pin_env" ]; then
+            eval "[ -n \"\${$pin_env:-}\" ]" || die "--pin-env $pin_env is not set (list it in pass_env)"
+            set -- "$@" --login --pin "env:$pin_env"
+        else
+            set -- "$@" --login
+        fi
+        # pkcs11-tool's chatter goes to stderr; stdout carries only the
+        # signature.
+        pkcs11-tool "$@" --sign --mechanism EDDSA --id "$id" \
+            -i "$tmp/msg" -o "$tmp/sig" >&2 || die "signing with key $id failed"
+        [ "$(wc -c <"$tmp/sig" | tr -d ' ')" = 64 ] || die "the token returned no Ed25519 signature"
+        cat "$tmp/sig"
+        ;;
+    public-key)
+        public_key_hex "$@"
+        echo
+        ;;
+    signer-file)
+        [ -n "$key_id" ] || die "signer-file needs --key-id"
+        plain --key-id "$key_id"
+        plain --adapter "$adapter"
+        pub=$(public_key_hex "$@")
+        tok=""
+        [ -z "$token_label" ] || tok=", \"--token-label\", \"$token_label\""
+        [ -z "$slot" ] || tok=", \"--slot\", \"$slot\""
+        pin=""
+        pass=""
+        if [ -n "$pin_env" ]; then
+            pin=", \"--pin-env\", \"$pin_env\""
+            pass=",
+  \"pass_env\": [\"$pin_env\"]"
+        elif [ -n "$pin_file" ]; then
+            pin=", \"--pin-file\", \"$pin_file\""
+        fi
+        cat <<EOF
+{
+  "format": "robodr-signer/v1",
+  "backend": "external",
+  "key_id": "$key_id",
+  "public_key_hex": "$pub",
+  "command": ["$adapter", "sign", "--module", "$module"$tok, "--id", "$id"$pin]$pass,
+  "timeout_ms": 120000
+}
+EOF
+        ;;
+    *)
+        die "unknown operation $op (sign, public-key, signer-file)"
+        ;;
+esac

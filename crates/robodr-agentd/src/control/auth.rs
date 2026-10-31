@@ -79,6 +79,96 @@ pub struct SocKey {
     pub public: [u8; 32],
 }
 
+/// What one SOC key may ask for (T67, GAP-07 scopes): the catalog actions
+/// it may request or revert and the longest `ttl_seconds` it may give.
+/// Configured per entry of `control_plane.soc_keys`; a plain path entry is
+/// [`KeyScope::unrestricted`]. A valid signature never widens it: a request
+/// outside the scope is refused 403 and recorded like an invalid body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyScope {
+    /// `None`: every catalog action.
+    pub allowed_actions: Option<std::collections::BTreeSet<super::api::ActionKind>>,
+    /// 1..=[`super::api::MAX_TTL_SECONDS`].
+    pub max_ttl_seconds: u64,
+}
+
+impl Default for KeyScope {
+    fn default() -> Self {
+        Self::unrestricted()
+    }
+}
+
+impl KeyScope {
+    /// Every action, the protocol's longest TTL.
+    pub fn unrestricted() -> Self {
+        Self {
+            allowed_actions: None,
+            max_ttl_seconds: super::api::MAX_TTL_SECONDS,
+        }
+    }
+
+    pub fn allows(&self, action: super::api::ActionKind) -> bool {
+        self.allowed_actions
+            .as_ref()
+            .is_none_or(|set| set.contains(&action))
+    }
+
+    /// The actions this key may ask for, catalog order.
+    pub fn actions(&self) -> Vec<&'static str> {
+        super::api::ActionKind::ALL
+            .into_iter()
+            .filter(|a| self.allows(*a))
+            .map(super::api::ActionKind::as_str)
+            .collect()
+    }
+
+    /// A new request by this key: its action in scope, its TTL within the
+    /// key's limit.
+    pub fn check_submit(
+        &self,
+        key_id: &str,
+        action: super::api::ActionKind,
+        ttl_seconds: Option<u64>,
+    ) -> Result<(), super::api::ApiError> {
+        self.check_action(key_id, action)?;
+        match ttl_seconds {
+            Some(t) if t > self.max_ttl_seconds => Err(super::api::ApiError::new(
+                403,
+                "ttl_above_key_limit",
+                format!(
+                    "SOC key {:?} may give ttl_seconds up to {} (control_plane.soc_keys \
+                     max_ttl_seconds)",
+                    robodr_ros2_pipeline::sanitize(key_id),
+                    self.max_ttl_seconds
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// A request (new, or the one a revert lifts) for `action` by this key.
+    pub fn check_action(
+        &self,
+        key_id: &str,
+        action: super::api::ActionKind,
+    ) -> Result<(), super::api::ApiError> {
+        if self.allows(action) {
+            return Ok(());
+        }
+        Err(super::api::ApiError::new(
+            403,
+            "action_not_permitted",
+            format!(
+                "SOC key {:?} may not request or revert {} (control_plane.soc_keys \
+                 allowed_actions: {})",
+                robodr_ros2_pipeline::sanitize(key_id),
+                action.as_str(),
+                self.actions().join(", ")
+            ),
+        ))
+    }
+}
+
 /// The credentials a request carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -393,7 +483,7 @@ impl ReplayGuard {
             wrong_key: loaded.wrong_key,
             upgraded_from_v1: loaded.upgraded_from_v1,
             legacy_refused: loaded.legacy_refused,
-            anchor: loaded.anchor,
+            anchor: sealing.qualify(loaded.anchor),
             ..ReplayLoad::default()
         };
         let untrusted_store = load.upgraded_from_v1

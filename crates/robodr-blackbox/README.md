@@ -56,7 +56,8 @@ robodr-blackbox verify     DIR|BUNDLE --keyring FILE [--keyring FILE]... [--chec
                            [--device ID] [--allow-hmac] [--allow-mixed-algorithms]
                            [--strict] [--json]
 robodr-blackbox rotate     DIR --old-key FILE --new-key FILE --device ID
-                           [--previous-keys FILE]... [--boot-id ID] [--reason TEXT]
+                           [--previous-keys FILE]... [--tpm-sidecar FILE]
+                           [--boot-id ID] [--reason TEXT]
                            [--allow-hmac]
 robodr-blackbox inspect    DIR|SEGMENT [--json] [--limit N]
 ```
@@ -113,6 +114,24 @@ from the command line (argv is readable by every process via `/proc`).
   alone works. Verify a log, directory or bundle spanning a rotation with a
   keyring holding both keys (`verify DIR --keyring old.key.pub --keyring
   new.key.pub`). Rotation is also the HMAC-to-Ed25519 migration path.
+- **A retired key vouches only up to its rotation** (it is usually retired
+  because it leaked). The recorder checks every record under exactly the
+  key the chain names for it: the chain key or a `SegmentStart`'s
+  `signing_key`, changed only by a `KeyRotation` that is signed by its
+  `from` key. Across segments a key never changes without a rotation,
+  never switches back to an earlier key, and a rotation never targets a
+  key that already signed (refused at open for the head, quarantined as
+  critical damage for a closed segment; the verifier reports
+  `KeySwitchRefused`). State files that name no key (`head.json`,
+  `checkpoint.json`, the recovery pin) count under a retired key only for
+  positions at or before the `KeyRotation` that retired it; the export
+  cursor and the TPM sidecar only under the current key (`rotate_key`
+  re-signs the cursor; its seal rewrites checkpoint and head mark).
+  `KeyRotation` v2 carries `to_fingerprint` and a later `SegmentStart`
+  `signing_key_fingerprint` (`sign::key_fingerprint`: SHA-256 of the
+  public key); recorder and verifier check them against the key they hold
+  under that id (`KeyFingerprintMismatch`). v1 records without them stay
+  readable.
 - **`rotate`** does that rotation in place on a stopped log (the writer
   holds the directory lock otherwise): it opens `DIR` of unit `--device`
   with `--old-key` (the current secret key; keys retired by an earlier
@@ -122,13 +141,21 @@ from the command line (argv is readable by every process via `/proc`).
   It refuses a directory without segments (nothing to rotate), the wrong
   old key (`KeyMismatch`), and a log with records it cannot authenticate;
   re-running it after success reports "already rotated" (exit 0).
+  `--previous-keys` get `keys::load_previous_keys`, the checks
+  `robodr-agentd` applies to `blackbox.previous_keys` (public files only,
+  bound to `--device` if bound, HMAC only with `--allow-hmac`, neither the
+  old nor the new key id). `--tpm-sidecar FILE` re-signs the TPM anchor's
+  sidecar under the new key (`tpm_anchor::resign_sidecar`).
   `PreviousKeys` (`keys.rs`) is the `Send + Sync` set of retired keys a
   long-running writer passes to `Recorder::open_with_keys` on every
-  (re)open (`robodr-agentd`'s `blackbox.previous_keys`), and
-  `TpmNvCounterAnchor::with_previous_keys` accepts a sidecar written under
-  a retired key (checked under the key the sidecar names) until the next
-  mark rewrites it. `keys::load_key_files` loads a key or keyring file with
-  the permission rule.
+  (re)open (`robodr-agentd`'s `blackbox.previous_keys`).
+  `TpmNvCounterAnchor` refuses a sidecar signed by a retired key (it names
+  no position the rotation could bound); `with_previous_keys` only makes
+  the error say so, and the next mark rewrites the sidecar.
+  `keys::load_key_files` loads a key or keyring file with the permission
+  rule; files used as trust anchors (keyrings, previous keys, even
+  public-only) must be owned by root or the effective user and not
+  group/world-writable (`KeyFileError::UntrustedFile`).
 - **Limit:** `Keyring::verify` (used for records, which do not name their
   key) accepts a signature from *any* key in the ring. Keep one keyring per
   unit (or fleet trust domain). With HMAC every key file is a forging key on
@@ -537,7 +564,12 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
     what the receiver holds. Key rotation is a new chain: move the unit's
     receiver state aside when its key changes. With `allow_plaintext`
     marks are not encrypted (hashes and seqs only). Mutual TLS
-    authenticates hosts, not unit ids; no CRL / OCSP. Tested over loopback with a real receiver
+    authenticates hosts; a unit's `client_spki_sha256` on the receiver
+    binds its `current` queries to its TLS client certificate
+    (`AnchorReceiver::set_client_bindings`; unbound units are listed at
+    start). CRLs (`src/crl.rs`): a CRL number is required, the highest per
+    issuer wins, an older CRL put back is refused (high-water marks,
+    persisted in the receiver's `crl-high-water.json`); no OCSP. Tested over loopback with a real receiver
     process (`tests/remote_anchor.rs`), not across a real network.
 - **Truncation evidence:** an authentic `checkpoint.json` or
   `export-cursor.json` naming a seq **beyond** the head proves the tail was
@@ -606,6 +638,15 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   If an attacker deletes the oldest segment without that record, the verifier
   reports `HeadMissing`. If a segment vanishes before the recorder deletes it,
   the recorder writes `missing: true` into the drop record.
+- **Pending-export protection** (`RecorderConfig::unexported_reserve_segments`,
+  cyclic only, default 0): a rotation keeps a segment whose records are not
+  all covered by the confirmed export position (signed cursor, or receiver
+  ack in ack mode, re-read from disk first by `refresh_export_state`, so an
+  exporter in another process counts), up to that many segments beyond
+  `max_segments`. Only then is unexported evidence dropped; the drop record
+  says `exported: false` and `unexported_drops()` counts it.
+  `retention_status()` reports unexported segments and records against the
+  capacity, for a host to warn before a drop (agentd: `blackbox.retention`).
 - **Saturation mode:** once `max_segments` are full, a `Saturation` record is
   written. Non-critical appends are then refused (`Refused(Saturated)`) and
   counted. Critical records go into `critical_reserve_segments` extra segments.
@@ -630,6 +671,23 @@ against the first record's signed `prev_hash`. Neither is trusted on its own.
   intact. A skipped bundle shows up as `Deleted`, a replayed one as
   `StaleBundle`, and loss from cyclic wrap before export as
   `DroppedBeforeExport`.
+- **Exporting beside a live recorder** (`outbox`,
+  `robodr-blackbox export-pending`): the recorder's writer holds the
+  directory lock, so the exporter works on the directory instead: its own
+  `export.lock`, one segment in memory at a time, the records of the current
+  chain after the signed cursor, each checked (hash, signature with the
+  caller's keys, link) and the bundle stopped at the first break; the bundle
+  is written durably to the outbox before the cursor is advanced (signed
+  with the recorder's current key, handed to the directory's owner). A gap
+  after the cursor is reported (`PendingExport::gap`) and the bundle carries
+  no anchor; a record that does not chain onto the cursor's hash is refused
+  (`Error::Untrusted`).
+- **Backup and restore** (`backup`, `robodr-blackbox backup`): OPERATIONS
+  §14 as code. `create` archives the "back up" paths of a unit (RBKUP001:
+  per-file SHA-256, headers digest in the end record); `restore` verifies
+  the whole archive first, restores configuration, sends evidence only to
+  `--evidence-to`, and never restores the monotonic or device-bound state
+  of §14.1 (`backup::NEVER_RESTORE`), even from a crafted archive.
 
 ## Verifier diagnoses
 
@@ -749,7 +807,13 @@ tamper finding.
   (mode 0600, owner = the loading user or root, both checked). Sealing them
   to a TPM is not implemented. Secret buffers are wiped best-effort only.
 - `export_pending` reads the retained segments into memory to build a bundle.
-  Size bundles with `max_records` on constrained units.
+  Size bundles with `max_records` on constrained units. The `outbox`
+  exporter holds one segment plus the bundle (bounded by `max_bytes`,
+  default 64 MiB).
+- The `outbox` exporter checks record signatures with `Verifier::verify_any`
+  over the recorder's own current and previous keys (trusted local keys),
+  not with the key each record's chain names; the far side's
+  `Receiver` does the full per-key verification.
 - A segment always takes at least one caller record after its header. A single
   record larger than `max_segment_bytes` therefore produces an oversized
   segment rather than an error. Payloads are capped by `max_payload_bytes`

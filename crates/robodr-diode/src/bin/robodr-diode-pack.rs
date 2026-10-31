@@ -70,7 +70,10 @@ fn main() -> ExitCode {
         }
     };
     if cli::is_version_request(&argv) {
-        println!("robodr-diode-pack {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-diode-pack", env!("CARGO_PKG_VERSION"))
+        );
         return ExitCode::SUCCESS;
     }
     if argv.first().map(String::as_str) == Some("resend") {

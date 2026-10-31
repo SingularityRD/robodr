@@ -49,7 +49,9 @@ tls_port="${KAFKA_IT_TLS_PORT:-19095}"
 idle_ms=10000
 read -r -a cargo_flags <<<"${CARGO_FLAGS:-}"
 
-docker() { MSYS_NO_PATHCONV=1 "$docker_cmd" "$@"; }
+# `command`: with the default KAFKA_IT_DOCKER=docker, "$docker_cmd" would
+# otherwise name this very function and recurse until bash segfaults.
+docker() { MSYS_NO_PATHCONV=1 command "$docker_cmd" "$@"; }
 kexec() { docker exec -i "$name" "$@"; }
 kbin() {
   local tool="$1"

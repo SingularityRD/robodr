@@ -299,3 +299,89 @@ fn locked_profile_without_trust_or_signature_is_refused() {
     assert_eq!(args(&["--expect-platform", "a b"]).status.code(), Some(2));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// T91: `--check-config` validates pulsar.toml offline, reports typos the
+/// daemon would only log, evaluates the profile's trust without writing the
+/// anti-rollback state, and is read-only.
+#[test]
+fn check_config_validates_pulsar_toml_offline() {
+    let dir = temp_dir("cli-check-config");
+    let prof = dir.join("profile.json");
+    write_profile(&prof, true);
+    let trust = trust_of(&prof);
+    let state = dir.join("state.json");
+    let cfg = dir.join("pulsar.toml");
+    let section = |extra: &str| {
+        format!(
+            "[pulsar]\n\n[module.robodr-sensor-ros2]\nenabled = true\nprofile_path = {:?}\n\
+             [module.robodr-sensor-ros2.capture]\nenabled = false\n\
+             [module.robodr-sensor-ros2.profile_trust]\ntrusted_keys = {:?}\nstate_file = {:?}\n{extra}",
+            prof.to_str().unwrap(),
+            trust.to_str().unwrap(),
+            state.to_str().unwrap(),
+        )
+    };
+    let check = |text: &str, extra: &[&str]| {
+        write(&cfg, text.as_bytes());
+        let mut a = vec!["--check-config", cfg.to_str().unwrap()];
+        a.extend_from_slice(extra);
+        watch(&a)
+    };
+
+    // Signed, trusted, locked: valid, would enforce, state NOT written
+    // (one warning: no revocation list).
+    let out = check(&section(""), &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout.contains("would be ENFORCED"), "{stdout}");
+    assert!(stdout.contains("configuration OK"), "{stdout}");
+    assert!(!state.exists(), "the check must not write the state file");
+
+    // Typo in a key: still valid (the daemon ignores it), warned; --strict fails.
+    let typo = section("expect_platfrom = \"ugv-lab\"\n");
+    let out = check(&typo, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`profile_trust.expect_platfrom`"));
+    assert_eq!(check(&typo, &["--strict"]).status.code(), Some(1));
+
+    // Out-of-range value: invalid.
+    let out = check(
+        &section("").replace("enabled = false", "enabled = true\nqueue_capacity = 0"),
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("queue_capacity"));
+
+    // Signature removed: the profile would be refused -> warning, --strict fails.
+    std::fs::remove_file(robodr_commission::sig_path_for(&prof)).unwrap();
+    let out = check(&section(""), &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("REFUSED for enforcement"));
+    assert_eq!(check(&section(""), &["--strict"]).status.code(), Some(1));
+
+    // Syntax error, missing file: invalid.
+    assert_eq!(
+        check("[module.robodr-sensor-ros2\n", &[]).status.code(),
+        Some(1)
+    );
+    let out = watch(&["--check-config", dir.join("absent.toml").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+
+    // Usage: a run flag next to --check-config, or no value.
+    let out = watch(&["--check-config", cfg.to_str().unwrap(), "--pcap", "x.pcap"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(watch(&["--check-config"]).status.code(), Some(2));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The shipped example section has only known keys and valid syntax (the
+/// files it names are absent on a build host, so it is not otherwise OK).
+#[test]
+fn check_config_shipped_example_has_no_unknown_keys() {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/robodr.toml.example");
+    let out = watch(&["--check-config", example.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("unknown key"), "{stderr}");
+    assert!(!stderr.contains("TOML syntax error"), "{stderr}");
+    assert!(stderr.contains("profile_path"), "{stderr}");
+}

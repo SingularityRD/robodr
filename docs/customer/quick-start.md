@@ -1,6 +1,6 @@
 # RoboDR quick start
 
-> **Pre-release draft (refreshed 2026-10-26).** RoboDR is alpha software
+> **Pre-release draft (refreshed 2026-10-30).** RoboDR is alpha software
 > (`0.1.0-alpha`). No signed release has been published yet, and nothing
 > has run on a customer robot. The SOC side of the connected path (the
 > AutoSecOps ingest module, control-plane client, robot pages and fleet
@@ -25,7 +25,7 @@ the motion stack depends on it**, and run the first field period
 
 | | On-robot agent | Passive sensor box |
 |---|---|---|
-| Where | The robot's companion computer (Ubuntu 24.04, or `robodr-focal` on 20.04 / 22.04) | A separate box on a tap or mirror port |
+| Where | The robot's companion computer: `robodr` on Ubuntu 22.04 / 24.04, JetPack 6, Debian 12 / 13 or EL9; `robodr-focal` on Ubuntu 20.04 / JetPack 5 ([platform requirements](support-matrix.md#platform-requirements)) | A separate box on a tap or mirror port |
 | Sees | DDS traffic on that computer's interfaces, plus host behaviour if `robodr-pulsard` can run (a BTF kernel) | DDS traffic on the mirrored link. Installs nothing on the robot. |
 
 ## 1. Entry station: verify the release
@@ -58,9 +58,12 @@ sudo sh /root/robodr-$V/robodr-$V-$A/install-bundle.sh install \
 ```
 
 Units are installed **disabled**. Before installing, check the
-requirements: kernel with BTF for `robodr-pulsard`, systemd 247+, glibc
-2.39 for the regular package ([OPERATIONS section 1](../OPERATIONS.md)). On
-a sensor box, also follow the hardening checklist in
+[platform requirements](support-matrix.md#platform-requirements): for the
+`robodr` package glibc 2.35+ and systemd 247+ (`robodr-focal`: systemd
+245+), a kernel with BTF for `robodr-pulsard`, and `minisign` where the
+signature is checked. RHEL / Rocky / Alma 9 use the RPM offline bundle
+(`robodr-$V-$A-rpm-offline.tar.gz`) with the same commands. On a sensor
+box, also follow the hardening checklist in
 [UNITREE.md section 3.1](../UNITREE.md).
 
 ## 3. Keys
@@ -90,6 +93,30 @@ robot** ([OPERATIONS section 4](../OPERATIONS.md)).
 Until the profile is locked and the response policy is OEM-validated,
 every finding is observe-only and every response is recorded, not acted
 on.
+
+## 4a. POC fast path: observe on a draft profile
+
+For a POC or a lab evaluation ([`poc-guide.md`](poc-guide.md)) you do not
+need the full commissioning ceremony to see findings. The agent runs on a
+**draft** (learned, unlocked) profile in `observe` mode; locking can wait
+until the false positives on clean operation have been reviewed. Effort
+figures are estimates, not timed on a customer site.
+
+| Step | Effort | What |
+|---|---|---|
+| 1 | 30 min | Install (section 2) and generate the black-box key (section 3). |
+| 2 | one clean run of each mission (at least 30 min each) | Capture the robot bus on the mirror port or the companion computer: `sudo tcpdump -i <if> -w run1.pcapng udp`. |
+| 3 | 10 min | Learn a draft: `robodr-commission learn --pcap run1.pcapng [--pcap run2.pcapng ...] --model <model> --out /etc/robodr/profile.json --report learn-report.json`. For Unitree models, compare the draft with the matching example under `/usr/share/doc/robodr/examples/` (`robodr-commission diff profile.unitree-<model>.example.json /etc/robodr/profile.json`). |
+| 4 | 30 min | Write `/etc/robodr/agentd.json` (section 5) **without** `sensor.profile_trust`, check it, start the agent. Its profile status reads `observing`; every finding carries `mode: observe`. |
+| 5 | 5 min | Read the findings: from the SOC path (section 6) or the local spool (`/var/lib/robodr/spool/agentd`). |
+| 6 | half a day, after the review | Lock: create a one-operator trust list for the lab (`robodr-blackbox keygen --out op.key`, then `robodr-commission operators --out operators.json --operator <name>=op.key.pub --motion-quorum 1`), confirm the sign-off items, sign them (`robodr-commission signoff ... --sign-key op.key`), then `lock`, `trust-keys`, add `sensor.profile_trust` and restart ([OPERATIONS section 5](../OPERATIONS.md)). A single operator is acceptable for a lab or POC only; production motion items need the site's quorum. |
+
+What reports from the first minute, and what needs the draft or more
+configuration, is in the [detection catalog](detection-catalog.md#what-each-detection-needs):
+packet and discovery health, agent self-health and (where
+`robodr-pulsard` runs) host detections need no profile content; graph and
+motion rules report against the draft. There is no `poc-init` helper yet;
+the steps above are manual.
 
 ## 5. Start the agent
 
@@ -149,8 +176,10 @@ Enable **exactly one** spool consumer. The units conflict.
   network.
 - **Enrollment** (optional): `robodr-enroll` registers the unit's keys
   with the SOC using a single-use token
-  ([OPERATIONS section 8.6](../OPERATIONS.md)). The AutoSecOps side is not
-  finished; until then, register keys by hand.
+  ([OPERATIONS section 8.6](../OPERATIONS.md)). The AutoSecOps side is on
+  its unreleased development branch (enrollment ran end to end against it
+  in one container, `tools/e2e/RESULTS.md`); until it is released,
+  register keys by hand.
 - **Evidence:** export black-box bundles
   ([OPERATIONS section 8.2](../OPERATIONS.md)), or through the control
   plane's evidence API, and verify them with `robodr-blackbox verify`

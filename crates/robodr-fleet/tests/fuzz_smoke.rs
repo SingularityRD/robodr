@@ -40,6 +40,8 @@ fn fleet_seeds_take_the_success_paths() {
             wire::T_CANCEL_ANSWER,
             wire::T_APPROVAL,
             wire::T_RING,
+            wire::T_DECOMMISSION_REQUEST,
+            wire::T_DECOMMISSION_ANSWER,
         ] {
             if Envelope::parse(&f, kind).is_ok() {
                 ok = true;
@@ -51,7 +53,7 @@ fn fleet_seeds_take_the_success_paths() {
     // The malformed-request vectors (no mac, trailing bytes) are seeds too.
     assert!(parsed + 2 >= total, "only {parsed} of {total} seeds parse");
     assert!(
-        kinds.len() >= 9,
+        kinds.len() >= 11,
         "seeds cover too few envelope types: {kinds:?}"
     );
 }

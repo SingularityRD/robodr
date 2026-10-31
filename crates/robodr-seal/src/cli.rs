@@ -108,7 +108,10 @@ const TPM_FLAGS: [&str; 7] = [
 /// Run one command line (without the program name).
 pub fn run(args: Vec<String>) -> i32 {
     if is_version_request(&args) {
-        println!("robodr-seal {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "{}",
+            robodr_buildinfo::version_line("robodr-seal", env!("CARGO_PKG_VERSION"))
+        );
         return 0;
     }
     if matches!(args.as_slice(), [a] if a == "--help" || a == "-h") {
@@ -604,6 +607,7 @@ fn erase(args: Vec<String>) -> Result<(), Cmd> {
         mapper: opt(&a, "mapper")?,
         mount: mount.as_deref(),
         stop_units: &units,
+        defer_lockdown: false,
     };
     let r = u.erase(req(&a, "trigger")?, &luks, &target)?;
     print(serde_json::to_value(&r).unwrap_or_default());

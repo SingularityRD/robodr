@@ -1778,13 +1778,21 @@ fn m4_binary_failed_start_and_stop_cleanup_leave_no_rule() {
         .unwrap()
         .validate()
         .unwrap();
+    // The binary writes the journal sealed under the link key (gap 1); the
+    // package prepares the first start (review finding 2).
+    let seal = robodr_executor::proto::Key::parse(&"5a".repeat(32))
+        .unwrap()
+        .state_seal_key()
+        .unwrap();
+    std::fs::write(dir.join(robodr_executor::journal::INIT_MARKER), "").unwrap();
     let install = |id: &str| {
-        let mut e = Engine::open(
+        let mut e = Engine::open_sealed(
             cfg.clone(),
             policy(Morphology::WheeledMobile, &[]),
             Box::new(lab.nft()),
             &boot,
             robodr_executor::engine::Now::system(),
+            seal.clone(),
         )
         .unwrap();
         let o = order(id, ActionId::IsolateNetwork, Morphology::WheeledMobile);
@@ -1814,7 +1822,7 @@ fn m4_binary_failed_start_and_stop_cleanup_leave_no_rule() {
         "a failed start left the rules: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let st = robodr_executor::journal::Journal::new(&dir).load();
+    let st = robodr_executor::journal::Journal::sealed(&dir, seal.clone()).load();
     match st {
         robodr_executor::journal::Loaded::State(s) => {
             assert!(s.entries.is_empty());
@@ -1839,15 +1847,18 @@ fn m4_binary_failed_start_and_stop_cleanup_leave_no_rule() {
     );
     assert!(out.status.success());
     assert!(nft::table_exists(&mut lab.nft()).unwrap());
-    let e = Engine::open(
+    let e = Engine::open_sealed(
         cfg.clone(),
         policy(Morphology::WheeledMobile, &[]),
         Box::new(lab.nft()),
         &boot,
         robodr_executor::engine::Now::system(),
+        seal,
     )
     .unwrap();
+    // Review finding 10: stop-cleanup marked the sealed journal.
     assert_eq!(e.status("i-bin2").status, Status::Reverted);
+    assert!(!e.state().operator_disabled);
     assert_eq!(e.status("i-bin3").status, Status::Verified);
 }
 
@@ -1879,7 +1890,7 @@ fn l4_m3_rearm_through_the_protocol() {
     // Reboot.
     lab.nft_cmd(&["delete", "table", "inet", "robodr"]).unwrap();
     let engine = Engine::open(
-        cfgr,
+        cfgr.clone(),
         policy(Morphology::WheeledMobile, &[]),
         Box::new(lab.nft()),
         "boot-2",
@@ -1928,18 +1939,24 @@ fn l4_m3_rearm_through_the_protocol() {
         .unwrap();
     assert_eq!(out.refusal.unwrap().code, codes::OPERATOR_DISABLED);
     assert!(client.health().unwrap().operator_disabled);
-    assert!(client.rearm("lab").unwrap());
-    assert!(!client.health().unwrap().operator_disabled);
-    let q2 = sign_at(
-        order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile),
-        robodr_executor::proto::wall_ms() / 1000,
-    );
-    let out = client
-        .submit(&q2, &mut || Ok((SafetyState::Idle, 2)))
-        .unwrap();
-    assert_eq!(out.status, Status::Verified, "{out:?}");
+    // Review finding 2: the protocol socket has no re-arm (agentd holds its
+    // key); the operator re-arms on the journal with the executor stopped.
+    assert!(robodr_executor::server::serving(&cfgr.config.socket).unwrap());
     stop.store(true, Ordering::SeqCst);
     server.join().unwrap();
+    assert!(!robodr_executor::server::serving(&cfgr.config.socket).unwrap());
+    let mut e = Engine::open(
+        cfgr,
+        policy(Morphology::WheeledMobile, &[]),
+        Box::new(lab.nft()),
+        "boot-2",
+        now(),
+    )
+    .unwrap();
+    assert!(e.rearm("lab", now()).unwrap());
+    let q2 = order("q-pr2", ActionId::QuarantineNode, Morphology::WheeledMobile);
+    let out = submit(&mut e, &q2, &mut idle(), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
 }
 
 /// IPv6 (this kernel may have none: the rules are still loaded and read

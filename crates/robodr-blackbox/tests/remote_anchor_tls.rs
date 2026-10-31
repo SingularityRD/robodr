@@ -739,3 +739,65 @@ fn crl_files_refuse_a_revoked_receiver_and_a_revoked_unit() {
     .unwrap_err();
     assert!(e.contains("no X509 CRL"), "{e}");
 }
+
+/// Review (TLS, finding 3): with client bindings, a unit certificate of
+/// the same unit CA can no longer read another unit's head over mutual
+/// TLS; the bound client still can, and marks keep their signature model.
+#[test]
+fn current_queries_are_bound_to_the_client_certificate() {
+    let pki = Pki::new();
+    let d = TestDir::new("tls-recv-bind");
+    let recv = AnchorReceiver::open(
+        d.path(),
+        vec![UnitKey {
+            unit: UNIT.into(),
+            verifier: Box::new(unit_key().verifying_key()),
+        }],
+        Box::new(receiver_key()),
+        Some(Box::new(|_: &str| {})),
+    )
+    .unwrap();
+    let pin = |leaf: &str| {
+        let c = CertificateDer::from_pem_file(pki.p(&format!("{leaf}.pem"))).unwrap();
+        tls::spki_sha256(&c).unwrap()
+    };
+    recv.set_client_bindings(&[(UNIT.to_string(), pin("crl-client"))])
+        .unwrap();
+    assert!(recv.unbound_units().is_empty());
+    let recv = Arc::new(recv);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (r2, s2) = (Arc::clone(&recv), Arc::clone(&stop));
+    let opts = ServeOptions {
+        max_connections: 8,
+        io_timeout: Duration::from_millis(1500),
+        tls: Some(pki.server("server", Some("crl-ca.pem"))),
+        ..ServeOptions::default()
+    };
+    let th = std::thread::spawn(move || r2.serve(l, &opts, &s2));
+    // Another unit's certificate (same CA, not bound to UNIT): its marks
+    // are accepted (they verify under UNIT's key) but it cannot read
+    // UNIT's head.
+    let other = anchor(
+        &addr,
+        Some(pki.client("ca.pem", Some("crl-revoked-client"), None, &[])),
+        false,
+    )
+    .unwrap();
+    other.advance(&cp(5)).unwrap();
+    assert!(other.flush(Duration::from_secs(3)));
+    assert_eq!(recv.held(UNIT).map(|m| m.seq), Some(5));
+    let e = other.current().unwrap_err();
+    assert!(e.contains("not bound"), "{e}");
+    // The unit's own certificate reads it.
+    let own = anchor(
+        &addr,
+        Some(pki.client("ca.pem", Some("crl-client"), None, &[])),
+        false,
+    )
+    .unwrap();
+    assert_eq!(own.current().map(|h| h.map(|h| h.seq)), Ok(Some(5)));
+    stop.store(true, Ordering::SeqCst);
+    let _ = th.join();
+}

@@ -19,21 +19,29 @@
 #     not even in the private repository; the tag name only reaches the jobs
 #     as GITHUB_REF_NAME.
 #  3. Guard tests: the prepare job must REFUSE a tag that does not match
-#     VERSION and a commit whose Cargo.toml version disagrees with VERSION.
+#     VERSION, a commit whose Cargo.toml version disagrees with VERSION, a
+#     commit that is on neither main nor release/X.Y, and a commit whose CI
+#     run (the shim's `gh api`) did not pass.
 #  4. The jobs of release.yml, through scripts/gha-local-run.py, which runs
-#     each step's `run:` script as written: prepare, build (amd64, arm64),
-#     build-static (amd64, arm64), publish. Each job starts from a fresh
-#     clone (a fresh runner: no target/, no dist/) that is deleted after
-#     the job. `gh release ...` is scripts/gh-release-shim.sh (a local
-#     draft release directory). Adaptations, all printed in the log:
-#       * build arm64 runs on a native arm64 runner on GitHub; here it is
-#         cross-compiled (aarch64-linux-gnu-gcc links, ring's C still with
-#         the pinned clang-18, robodr-pulsard against multiarch arm64
-#         libssl/libsqlite3), so target/release reads
-#         target/aarch64-unknown-linux-gnu/release and the host triple
-#         reads aarch64-unknown-linux-gnu in its step scripts;
+#     each step's `run:` script as written, `container:` jobs inside their
+#     pinned image (docker), with a local artifact store between jobs:
+#     prepare, build, build-rpm, build-static, smoke, rebuild-deb,
+#     rebuild-rpm, rebuild-static, delivery, publish. Each job starts from a
+#     fresh clone (a fresh runner: no target/, no dist/) that is deleted
+#     after the job. `gh release ...` / the CI `gh api` call are
+#     scripts/gh-release-shim.sh (a local draft release directory).
+#     Adaptations, all printed in the log:
+#       * the arm64 jobs that GitHub runs on native arm64 runners (build,
+#         build-rpm, smoke, rebuild-deb, rebuild-rpm) run only on an
+#         aarch64 host; elsewhere they, delivery and publish are SKIPPED
+#         (reported, RESULT stays PASS for what ran). build-static and
+#         rebuild-static arm64 run anywhere (cross-linked, as on GitHub).
+#         The complete dry run on real runners is the workflow itself:
+#         run release.yml with workflow_dispatch (job publish-dry-run,
+#         throwaway key, nothing published; docs/RELEASE.md "Dry run").
 #       * `ln -sf ... /usr/local/bin/X` writes into the dry run's own bin
-#         directory (first on PATH) instead of the host's /usr/local/bin.
+#         directory (first on PATH) instead of the host's /usr/local/bin;
+#       * actions/attest-build-provenance is skipped (needs GitHub OIDC).
 #     `sudo apt-get install` steps run for real (they install the same
 #     packages the runner gets).
 #  5. Signing with a THROWAWAY minisign key, generated in the work dir for
@@ -44,7 +52,9 @@
 #     the work dir (which must be outside the repository).
 #  6. Acceptance beyond the workflow: the published set is complete and
 #     signed (minisign -V with the public key FILE, SHA256SUMS covers every
-#     asset), every offline bundle passes `install-bundle.sh verify --pubkey
+#     asset), the SLSA provenance verifies against the published assets
+#     (scripts/slsa-provenance.py verify), the release is marked Latest,
+#     every offline bundle passes `install-bundle.sh verify --pubkey
 #     --tarball` (trusted copy from the release commit) and is refused when
 #     tampered with or checked with another key, and every .deb passes
 #     scripts/deb-install-smoke.sh --strict (throwaway dpkg root, --version
@@ -54,15 +64,14 @@
 #     SHA-256), OUT/logs/, and the published assets in OUT/assets/ together
 #     with the TEST-ONLY public key (OUT/TEST-ONLY-dry-run-minisign.pub).
 #
-# Host prerequisites (checked first): python3 with PyYAML, git, cargo/rustup
-# (rust-toolchain.toml), the musl and aarch64-unknown-linux-gnu targets,
-# clang-18 (scripts/c-toolchain.sh), gcc-aarch64-linux-gnu +
-# libc6-dev-arm64-cross, libssl-dev:arm64 + libsqlite3-dev:arm64
-# (dpkg --add-architecture arm64), qemu-aarch64-static, minisign, dpkg-deb,
-# systemd-analyze. About 6 GB of free disk; network for apt and crates.
+# Host prerequisites (checked first): python3 with PyYAML, git, docker (the
+# container jobs), cargo/rustup (rust-toolchain.toml) with the musl targets,
+# clang-18 (scripts/c-toolchain.sh), qemu-aarch64-static, minisign, rpm,
+# dpkg-deb, systemd-analyze. About 20 GB of free disk; network for images,
+# apt/dnf and crates. --jobs "..." runs a subset (e.g. --jobs prepare).
 #
-# Exit: 0 every job and check passed, 1 something failed (see the report),
-# 2 usage or missing prerequisite.
+# Exit: 0 every job and check that ran passed, 1 something failed (see the
+# report), 2 usage or missing prerequisite.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,8 +80,13 @@ tag="v0.1.0-rc.0-dryrun"
 out="$root/dist/release-dry-run"
 work=""
 keep=0
-jobs_all="prepare build:amd64 build:arm64 build-static:amd64 build-static:arm64 publish"
-jobs="$jobs_all"
+jobs_all="prepare build:amd64 build:arm64 build-rpm:amd64 build-rpm:arm64 build-static:amd64 build-static:arm64
+smoke:amd64 smoke:arm64 rebuild-deb:amd64 rebuild-deb:arm64 rebuild-rpm:amd64 rebuild-rpm:arm64
+rebuild-static:amd64 rebuild-static:arm64 delivery publish"
+# Jobs GitHub runs on native arm64 runners; without them delivery and
+# publish have nothing to work on.
+native_arm64=" build:arm64 build-rpm:arm64 smoke:arm64 rebuild-deb:arm64 rebuild-rpm:arm64 "
+jobs="$(tr '\n' ' ' <<<"$jobs_all")"
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --tag) tag="$2"; shift 2 ;;
@@ -87,22 +101,16 @@ done
 case "$tag" in v[0-9]*) ;; *) echo "release-dry-run: --tag must look like v<version>" >&2; exit 2 ;; esac
 version="${tag#v}"
 workflow_rel=.github/workflows/release.yml
-cross_triple=aarch64-unknown-linux-gnu
 
 # ---------------------------------------------------------------- preflight
 missing=()
 need() { command -v "$1" >/dev/null 2>&1 || missing+=("$1 ($2)"); }
-need git git; need python3 python3; need cargo rustup; need rustup rustup
+need git git; need python3 python3; need cargo rustup; need rustup rustup; need docker docker
 need clang-18 "clang-18=1:18.1.3-1ubuntu1, scripts/ci-install-clang.sh"
-need aarch64-linux-gnu-gcc gcc-aarch64-linux-gnu; need qemu-aarch64-static qemu-user-static
+need qemu-aarch64-static qemu-user-static; need rpm rpm
 need minisign minisign; need dpkg-deb dpkg; need systemd-analyze systemd; need shred coreutils
 python3 -c 'import yaml' 2>/dev/null || missing+=("PyYAML (python3-yaml)")
-[[ -e /usr/aarch64-linux-gnu/lib/libc.so.6 ]] || missing+=("arm64 glibc sysroot (libc6-dev-arm64-cross)")
-for p in libssl-dev:arm64 libsqlite3-dev:arm64; do
-    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' ||
-        missing+=("$p (dpkg --add-architecture arm64; robodr-pulsard cross build)")
-done
-for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl "$cross_triple"; do
+for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     (cd "$root" && rustup target list --installed 2>/dev/null) | grep -qx "$t" || missing+=("rust target $t")
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
@@ -242,60 +250,70 @@ runner() { # name logfile shim-root [gha-local-run args...]
     GH_SHIM_ROOT="$shimroot" python3 "$here/gha-local-run.py" \
         --workflow "$repo/$workflow_rel" --repo "$repo" \
         --workspace "$rdir/robodr" --runner-temp "$rdir/temp" \
+        --artifacts "$work/artifacts" --event push \
         --subst "/usr/local/bin/=>$bin/" --log "$log" "$@"
 }
 
 # ------------------------------------------------------- 3. guard tests
 guard_root="$work/gh-guard"
 mkdir -p "$guard_root"
-if runner guard-tag "$out/logs/guard-wrong-tag.log" "$guard_root" --job prepare \
-    --sha "$sha" --ref-name "v0.0.0-not-$version" >/dev/null 2>&1; then
-    result FAIL "guard: prepare accepted tag v0.0.0-not-$version for VERSION $version"
-else
-    result PASS "guard: prepare refuses a tag that does not match VERSION"
-fi
+guard() { # name expect-in-log description args...
+    local gname="$1" want="$2" what="$3"
+    shift 3
+    local glog="$out/logs/guard-$gname.log"
+    if runner "guard-$gname" "$glog" "$guard_root" --job prepare "$@" >/dev/null 2>&1; then
+        result FAIL "guard: prepare accepted $what"
+    elif grep -q -- "$want" "$glog"; then
+        result PASS "guard: prepare refuses $what"
+    else
+        result FAIL "guard: prepare failed for another reason than $what (logs/guard-$gname.log)"
+    fi
+    rm -rf "$work/runner/guard-$gname"
+}
+guard wrong-tag "does not match VERSION" "a tag that does not match VERSION" \
+    --sha "$sha" --ref-name "v0.0.0-not-$version"
 git -C "$repo" checkout -q -b guard-cargo-version "$sha"
 set_version "$repo" "$version-guard" 0
 git -C "$repo" commit -q -am "guard: VERSION without Cargo.toml"
 guard_sha="$(git -C "$repo" rev-parse HEAD)"
+git -C "$repo" checkout -q -b guard-feature "$sha"
+git -C "$repo" commit -q --allow-empty -m "guard: an unreviewed commit on a feature branch"
+feature_sha="$(git -C "$repo" rev-parse HEAD)"
 git -C "$repo" checkout -q main
-if runner guard-cargo "$out/logs/guard-cargo-version.log" "$guard_root" --job prepare \
-    --sha "$guard_sha" --ref-name "v$version-guard" >/dev/null 2>&1; then
-    result FAIL "guard: prepare accepted a commit whose Cargo.toml version is not VERSION ($version-guard)"
-else
-    result PASS "guard: prepare refuses a commit whose Cargo.toml version is not VERSION"
-fi
-rm -rf "$work/runner/guard-tag" "$work/runner/guard-cargo"
+guard cargo-version "Cargo.toml" "a commit whose Cargo.toml version is not VERSION" \
+    --sha "$guard_sha" --ref-name "v$version-guard"
+guard release-line "neither on main nor on release/" "a commit on neither main nor release/X.Y" \
+    --sha "$feature_sha" --ref-name "$tag"
+GH_SHIM_CI_CONCLUSION=failure guard ci-red "CI did not pass" "a commit whose CI run failed" \
+    --sha "$sha" --ref-name "$tag"
+git -C "$repo" branch -q -D guard-cargo-version guard-feature
 
 # ------------------------------------------------------- 4. the jobs
 shim="$work/gh-releases"
-mkdir -p "$shim"
+mkdir -p "$shim" "$work/artifacts"
 outputs="$work/prepare-outputs.json"
 vout=""
+skipped=()
+publish_ran=0
 for j in $jobs; do
     job="${j%%:*}"
     arch=""
     [[ "$j" == *:* ]] && arch="${j#*:}"
     name="$job${arch:+-$arch}"
     log="$out/logs/$name.log"
+    if [[ "$(uname -m)" != aarch64 && "$native_arm64" == *" $j "* ]]; then
+        skipped+=("$j")
+        result INFO "job $name: SKIPPED (a native arm64 runner on GitHub; this host is $(uname -m))"
+        continue
+    fi
+    if [[ ("$job" == delivery || "$job" == publish) && ${#skipped[@]} -gt 0 ]]; then
+        result INFO "job $name: SKIPPED (needs ${skipped[*]}); run release.yml with workflow_dispatch for the complete dry run"
+        continue
+    fi
     args=(--job "$job" --sha "$sha" --ref-name "$tag")
     [[ -n "$arch" ]] && args+=(--matrix "arch=$arch")
-    [[ -n "$vout" ]] && args+=(--needs "prepare.version=$vout")
+    [[ -n "$vout" ]] && args+=(--needs "prepare.version=$vout" --needs "prepare.latest=true" --needs "prepare.dry_run=false")
     [[ "$job" == prepare ]] && args+=(--outputs-file "$outputs")
-    if [[ "$job" == build && "$arch" == arm64 && "$(uname -m)" != aarch64 ]]; then
-        args+=(
-            --env "CARGO_BUILD_TARGET=$cross_triple"
-            --env "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
-            --env "PKG_CONFIG_ALLOW_CROSS=1"
-            --env "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
-            --subst "target/release=>target/$cross_triple/release"
-            --subst "rustc -vV | sed -n 's/^host: //p'=>echo $cross_triple"
-            # A host tool, not a release binary: CARGO_BUILD_TARGET would
-            # make `cargo install` put an aarch64 cargo-cyclonedx into
-            # ~/.cargo/bin (the first dry run did exactly that).
-            --subst "cargo install =>env -u CARGO_BUILD_TARGET cargo install "
-        )
-    fi
     # The build jobs run with ROBODR_RELEASE=1, which refuses a placeholder
     # maintainer; the dry run's own (reserved .test domain) stands in for
     # the repository variable ROBODR_MAINTAINER.
@@ -324,6 +342,7 @@ for j in $jobs; do
     rm -rf "$work/runner/$name"
     if [[ "$rc" == 0 ]]; then
         result PASS "job $name ($((secs / 60)) min $((secs % 60)) s)"
+        [[ "$job" == publish ]] && publish_ran=1
     else
         result FAIL "job $name (exit $rc after $((secs / 60)) min; see logs/$name.log)"
         break
@@ -331,6 +350,8 @@ for j in $jobs; do
     if [[ "$job" == prepare ]]; then
         vout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$outputs")"
         [[ "$vout" == "$version" ]] || { result FAIL "prepare output version '$vout' != $version"; break; }
+        lout="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["latest"])' "$outputs")"
+        [[ "$lout" == true ]] || { result FAIL "prepare: a commit on main must become Latest (latest=$lout)"; break; }
     fi
 done
 grep -h '^\[dry-run\] .*adaptation' "$out"/logs/*.log 2>/dev/null | sort | uniq -c |
@@ -338,12 +359,17 @@ grep -h '^\[dry-run\] .*adaptation' "$out"/logs/*.log 2>/dev/null | sort | uniq 
 
 # ------------------------------------------------------- 6. acceptance
 rel="$shim/$tag"
-if [[ $rc_all == 0 && " $jobs " == *" publish "* ]]; then
+if [[ $rc_all == 0 && $publish_ran == 1 ]]; then
     assets="$rel/assets"
     if grep -qx 'draft=0' "$rel/meta"; then
         result PASS "release published (draft=false)"
     else
         result FAIL "release still a draft"
+    fi
+    if grep -qx 'latest=1' "$rel/meta"; then
+        result PASS "marked Latest (a release from main)"
+    else
+        result FAIL "a release from main is not marked Latest"
     fi
     case "$version" in
     *-*)
@@ -357,13 +383,18 @@ if [[ $rc_all == 0 && " $jobs " == *" publish "* ]]; then
     # Expected asset set (release.yml header).
     debver="${version/-/\~}-1"
     want=()
+    rpmver="${version/-/\~}"
+    declare -A rpmarch=([amd64]=x86_64 [arm64]=aarch64)
     for a in amd64 arm64; do
         want+=("robodr_${debver}_$a.deb" "robodr-$version-$a-offline.tar.gz"
             "robodr-$version-$a-sbom.tar.gz" "SHA256SUMS-$a"
+            "robodr-$rpmver-1.${rpmarch[$a]}.rpm" "robodr-$version-$a-rpm-offline.tar.gz"
+            "robodr-$version-rpm-$a-sbom.tar.gz" "SHA256SUMS-rpm-$a"
             "robodr-focal_${debver}_$a.deb" "robodr-focal-$version-$a-offline.tar.gz"
-            "SHA256SUMS-focal-$a")
+            "robodr-focal-$version-$a-sbom.tar.gz" "SHA256SUMS-focal-$a")
     done
-    want+=(SHA256SUMS)
+    want+=("robodr-$version-rpk.tar.gz" "REPRODUCIBILITY-$version.txt" "robodr-$version.openvex.json"
+        "robodr-$version.intoto.jsonl" SHA256SUMS)
     have="$(cd "$assets" && find . -maxdepth 1 -type f ! -name '*.minisig' -printf '%P\n' | LC_ALL=C sort)"
     wantl="$(printf '%s\n' "${want[@]}" | LC_ALL=C sort)"
     if [[ "$have" == "$wantl" ]]; then
@@ -387,6 +418,12 @@ if [[ $rc_all == 0 && " $jobs " == *" publish "* ]]; then
         result PASS "SHA256SUMS covers every asset (per-arch SHA256SUMS-* files are signed, not listed) and matches"
     else
         result FAIL "SHA256SUMS incomplete or mismatching"
+    fi
+    if python3 "$here/slsa-provenance.py" verify --provenance "$assets/robodr-$version.intoto.jsonl" \
+        --assets "$assets" --commit "$sha" --tag "$tag" >"$out/logs/provenance.log" 2>&1; then
+        result PASS "SLSA provenance names every published asset with its SHA-256, the commit and the tag"
+    else
+        result FAIL "SLSA provenance (logs/provenance.log)"
     fi
     # Offline bundles: the documented entry-station check, with a trusted
     # copy of the installer (the release commit's), never the bundle's.

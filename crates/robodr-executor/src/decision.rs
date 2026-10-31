@@ -168,9 +168,14 @@ pub mod codes {
     pub const REQUIRES_IDLE: &str = "requires_idle";
     /// The policy's safe behaviour is not one the adapter can carry out.
     pub const BEHAVIOUR_UNSUPPORTED: &str = "behaviour_unsupported";
+    // --- Per-key scopes (sales-readiness T67, `crate::soc::check_scope`) ----
+    /// The SOC key that signed the request (or its revert) may not approve
+    /// this action, or not for this long (`soc.key_scopes`), or has no
+    /// scope while `soc.require_key_scopes` is set.
+    pub const KEY_SCOPE_DENIED: &str = "key_scope_denied";
 
     /// Every code, for mapping a wire string back to a static one.
-    pub const ALL: [&str; 36] = [
+    pub const ALL: [&str; 37] = [
         INVALID_ORDER,
         REPLAY,
         NOT_EXECUTOR_ACTION,
@@ -207,6 +212,7 @@ pub mod codes {
         SAFETY_STATE_NOT_ALLOWED,
         REQUIRES_IDLE,
         BEHAVIOUR_UNSUPPORTED,
+        KEY_SCOPE_DENIED,
     ];
 
     /// The static code for a wire string.
@@ -621,6 +627,30 @@ pub fn precheck(
         ));
     }
     if let Some(m) = motion {
+        // Review finding 4: a motion restriction is containment too. On a
+        // robot that falls when de-energised it is the substitute
+        // containment that always waits for a human (ADR-0012 rule 3), and
+        // the site option asks for a human on every containment.
+        if order.action == ActionId::RestrictMotion
+            && !order.human_approved
+            && (own.falls_when_de_energised() || cfg.config.require_approval_for_all_containment)
+        {
+            return Err(Refusal::new(
+                codes::NEEDS_APPROVAL,
+                if own.falls_when_de_energised() {
+                    format!(
+                        "on a {} robot every containment, restrict_motion included, needs a \
+                         human's approval",
+                        own.as_str()
+                    )
+                } else {
+                    "this site requires a human's approval for every containment \
+                     (require_approval_for_all_containment): restrict_motion from the on-robot \
+                     planner is not executed"
+                        .to_string()
+                },
+            ));
+        }
         return crate::motion::plan(order, policy, m, &cfg.config.ttl);
     }
     if order.action == ActionId::RestrictMotion {

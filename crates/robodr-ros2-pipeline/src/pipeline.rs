@@ -21,12 +21,14 @@
 //! | an anomaly after which the parser dropped content (version, truncation, malformed PL, bad value, no topic, anomaly overflow) | [`rules::DISCOVERY_NOT_INSPECTED`] | Medium, always |
 //! | any other parse [`Anomaly`] (if `report_anomalies`) | [`rules::MALFORMED_DISCOVERY`] | Low |
 //! | discovery `DATA_FRAG` seen (if `report_fragmentation`) | [`rules::FRAGMENTED_DISCOVERY`] | Low |
-//! | discovery fragments refused by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | Medium |
+//! | discovery fragments refused by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_REJECTED`] | **Critical** when an SEDP publications writer's sample was refused for a reason a DDS stack does not share (over a size / memory cap, no capacity, geometry or key-flag mismatch with a pending copy): the unseen announcement may be a rogue motion writer; **High** for the SEDP subscriptions writer; Medium otherwise (SPDP, or malformed geometry / short data, which stacks drop too). Names the writer prefix |
 //! | discovery fragments overlapping received bytes with conflicting content (first copy inspected; writers in that datagram judged as motion writers) (always, even with `report_anomalies = false`) | [`rules::DISCOVERY_FRAGMENT_CONFLICT`] | Medium |
-//! | partially reassembled discovery samples evicted by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_EVICTED`] | Medium |
+//! | partially reassembled discovery samples evicted by the reassembler (always) | [`rules::DISCOVERY_FRAGMENT_EVICTED`] | Medium; High when a victim's prefix is profiled. Names the victims (source prefix, writer, sequence number, reason) |
 //! | capture-layer counters grew ([`Pipeline::capture_findings`]) | `robot.capture.*`: [`rules::CAPTURE_IP_FRAGMENT_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_DUPLICATE_CONFLICT`], [`rules::CAPTURE_IP_FRAGMENT_REFUSED`], [`rules::CAPTURE_IP_REASSEMBLY_EVICTED`] | Medium |
 //! | | [`rules::CAPTURE_MALFORMED_FRAMES`], [`rules::CAPTURE_IP_REASSEMBLY_DROPPED`] (geometry, timeout, distance rule), [`rules::CAPTURE_NOT_UDP`] | Low |
 //! | | [`rules::CAPTURE_BAD_CHECKSUM`] | Low; Medium when bursty |
+//! | with an SROS 2 policy ([`PipelineOptions::sros2`]): an SPDP without a DDS-Security identity on a domain requiring authentication, or claiming a certificate subject no keystore grant names | [`crate::sros2::rules::UNTRUSTED_SECURITY_IDENTITY`] | Medium / High |
+//! | an SPDP announcement advertises shared-memory (Fast DDS SHM, Cyclone Iceoryx, Connext SHMEM), TCP or unknown-kind locators | [`rules::CAPTURE_UNSUPPORTED_TRANSPORT`] (one per host and transport set) | Medium |
 //! | | [`rules::CAPTURE_UNSUPPORTED_MIDDLEWARE`]: Zenoh (`rmw_zenoh_cpp`) packets on the bus, which the sensor cannot decode | **High** while the capture has accepted no RTPS at all (the sensor is blind to this robot), Medium when RTPS is seen too (part of the bus is not inspected) |
 //! | the profile failed `Profile::validate`, or a locked profile file failed the commissioning file check (seal: edited after `lock`) or the trust check (signature, trust anchors, platform/unit, anti-rollback; see [`crate::profile_trust`]) (once, [`Pipeline::status_findings`]) | [`rules::PROFILE_REFUSED`] | High |
 //! | one input produced more than `max_findings_per_datagram` new findings | [`rules::FINDINGS_CAPPED`] | most severe suppressed, >= Medium |
@@ -113,8 +115,8 @@ use robodr_commission::ProfileFileError;
 use robodr_events::profile::{Profile, ProfileError};
 use robodr_events::{Deviation, Mode, RobotEvent, Severity};
 use robodr_rtps::{
-    hex12, hex_guid, Anomaly, DatagramReport, EndpointKind, FragmentEventKind, FragmentReassembler,
-    GuidPrefix, ReassemblyLimits,
+    hex12, hex_guid, Anomaly, DatagramReport, DiscoveryTopic, EndpointKind, FragmentEvent,
+    FragmentEventKind, FragmentReassembler, GuidPrefix, ReassemblyLimits, RejectReason,
 };
 use serde::Serialize;
 
@@ -330,6 +332,16 @@ pub mod rules {
     /// at all (blind), Medium otherwise. Rate limited like every
     /// `robot.capture.*` rule.
     pub const CAPTURE_UNSUPPORTED_MIDDLEWARE: &str = "robot.capture.unsupported_middleware";
+    /// Participants on a host advertise SPDP locators of a transport the
+    /// capture cannot inspect: shared memory (Fast DDS SHM, on by default in
+    /// Fast DDS 2.x / ROS 2 Humble; Cyclone DDS Iceoryx; Connext SHMEM),
+    /// whose traffic between participants on that host never reaches any
+    /// interface, or TCP / unknown kinds, which are not decoded. Motion
+    /// commands between same-host processes may then be invisible. One
+    /// finding per (source IP, transports), Medium. Rate limited like every
+    /// `robot.capture.*` rule. Commissioning: UDP-only transports
+    /// (docs/DDS-TRANSPORTS.md).
+    pub const CAPTURE_UNSUPPORTED_TRANSPORT: &str = "robot.capture.unsupported_transport";
     /// A discovery announcement repeats an identity parameter (topic, type,
     /// GUID, key hash, status) with conflicting values: DDS stacks differ on
     /// which value wins, so what was inspected may not be what a stack acts
@@ -383,6 +395,10 @@ pub struct PipelineOptions {
     /// Unitree legacy UDP (Go1 generation, [`crate::legacy`]); off by
     /// default.
     pub legacy: LegacyOptions,
+    /// The robot's SROS 2 keystore policy ([`crate::sros2`]): SPDP
+    /// DDS-Security identities are judged against it. `None` (default) =
+    /// not checked.
+    pub sros2: Option<std::sync::Arc<crate::sros2::Sros2Policy>>,
 }
 
 impl Default for PipelineOptions {
@@ -398,6 +414,7 @@ impl Default for PipelineOptions {
             max_findings_per_datagram: DEFAULT_MAX_FINDINGS_PER_DATAGRAM,
             motion: MotionOptions::default(),
             legacy: LegacyOptions::default(),
+            sros2: None,
         }
     }
 }
@@ -648,8 +665,6 @@ pub struct Pipeline {
     reassembler: FragmentReassembler,
     binding: BindingTable,
     limiter: RateLimiter,
-    /// `reassembler.evicted()` already reported.
-    frag_evicted_seen: u64,
     /// Last capture health snapshot already turned into findings.
     last_health: Option<CaptureHealth>,
     /// Checksum failures seen in the current burst window (start, count).
@@ -734,7 +749,6 @@ impl Pipeline {
             reassembler: FragmentReassembler::new(opts.reassembly),
             binding: BindingTable::new(opts.binding.clone(), &profile),
             limiter: RateLimiter::new(opts.rate_limit_burst, opts.rate_limit_interval),
-            frag_evicted_seen: 0,
             last_health: None,
             checksum_window: None,
             motion: MotionTracker::new(opts.motion.clone()),
@@ -937,7 +951,10 @@ impl Pipeline {
             if let Some(p) = &p {
                 self.binding.note_finding(p, dev.severity);
             }
-            let key = format!("{}|{}", dev.rule, dev.detail);
+            // Dedup on what is displayed (Finding::description / extra):
+            // details that differ only in text `sanitize` cuts out are one
+            // finding, not a flood of identical-looking ones.
+            let key = format!("{}|{}", dev.rule, sanitize(&dev.detail));
             if self.seen.contains(&key) || !batch_keys.insert(key.clone()) {
                 self.stats.duplicates += 1;
                 continue;
@@ -1082,10 +1099,11 @@ impl Pipeline {
         self.profile_findings(&report, src_ip, &mut out);
         self.binding_findings(&report, ip, ingress, ambiguity.any(), &mut out, now);
         self.removal_findings(&report, src_ip, ip, ingress, now, &mut out);
+        self.transport_findings(&report, src_ip, &mut out);
         self.node_evidence(&report, now);
         self.protocol_findings(&report, src_ip, &ambiguity, &mut out);
         // Motion: learn this datagram's SEDP first, then its user DATA.
-        for (dev, p) in self.motion.learn(&self.profile, &report) {
+        for (dev, p) in self.motion.learn(&self.profile, &self.binding, &report) {
             self.push_for(&mut out, dev, src_ip, Some(p));
         }
         let ctx = DatagramCtx {
@@ -1805,6 +1823,163 @@ impl Pipeline {
         }
     }
 
+    /// [`rules::DISCOVERY_FRAGMENT_REJECTED`] for one datagram. A refused
+    /// SEDP sample is an endpoint announcement nobody inspected: when the
+    /// reason is one a DDS stack does not share (a size / memory cap, no
+    /// capacity, a geometry or key-flag mismatch with a pending copy), the
+    /// stack may well accept it, so a padded rogue `cmd_vel` writer must
+    /// not get away with a Medium. Critical for the publications writer,
+    /// High for the subscriptions writer, naming the writer prefix.
+    fn rejected_fragment_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        out: &mut Vec<Candidate>,
+    ) {
+        let mut severity = Severity::Medium;
+        let mut prefix = None;
+        let mut named: Vec<String> = Vec::new();
+        for e in &report.fragment_events {
+            let FragmentEventKind::Rejected(why) = e.kind else {
+                continue;
+            };
+            let sev = match (e.topic, why) {
+                (_, RejectReason::BadGeometry | RejectReason::ShortData) => Severity::Medium,
+                (DiscoveryTopic::Publications, _) => Severity::Critical,
+                (DiscoveryTopic::Subscriptions, _) => Severity::High,
+                (DiscoveryTopic::Participant, _) => Severity::Medium,
+            };
+            if sev > severity {
+                severity = sev;
+                prefix = Some(e.source);
+            }
+            if named.len() < 4 {
+                named.push(format!("{} ({why:?})", fragment_sample_name(e)));
+            }
+        }
+        let why = if severity > Severity::Medium {
+            "a DDS stack may accept that announcement; an uninspected SEDP writer may be a rogue \
+             motion writer"
+        } else {
+            "over a size cap, inconsistent geometry or no capacity"
+        };
+        let detail = format!(
+            "discovery fragments from {src_ip} refused by the reassembler [{}]: {why}; that \
+             announcement was not inspected",
+            named.join(", ")
+        );
+        self.push_for(
+            out,
+            Deviation::new(rules::DISCOVERY_FRAGMENT_REJECTED, severity, detail),
+            src_ip,
+            prefix,
+        );
+    }
+
+    /// [`rules::DISCOVERY_FRAGMENT_EVICTED`] for the evictions one datagram
+    /// caused, naming the victims; High when a victim's participant is
+    /// profiled (the robot's own announcement went uninspected).
+    fn evicted_fragment_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        out: &mut Vec<Candidate>,
+    ) {
+        let total = report.stats.frag_evicted;
+        self.stats.fragment_evictions += u64::from(total);
+        let mut severity = Severity::Medium;
+        let mut prefix = None;
+        let mut named: Vec<String> = Vec::new();
+        for e in &report.fragment_events {
+            let FragmentEventKind::Evicted(why) = e.kind else {
+                continue;
+            };
+            let profiled = self.binding.is_profiled(&e.source);
+            if profiled && severity < Severity::High {
+                severity = Severity::High;
+                prefix = Some(e.source);
+            }
+            if named.len() < 4 || profiled {
+                let tag = if profiled { ", profiled" } else { "" };
+                named.push(format!(
+                    "{} ({why:?}, {}/{} fragments{tag})",
+                    fragment_sample_name(e),
+                    e.received_fragments,
+                    e.total_fragments
+                ));
+            }
+        }
+        named.truncate(8);
+        let detail = format!(
+            "{total} partially reassembled discovery sample(s) evicted to stay within the \
+             reassembler's caps while processing discovery from {src_ip} [{}]; those \
+             announcements were not inspected",
+            named.join(", ")
+        );
+        self.push_for(
+            out,
+            Deviation::new(rules::DISCOVERY_FRAGMENT_EVICTED, severity, detail),
+            src_ip,
+            prefix,
+        );
+    }
+
+    /// SPDP locators of transports the capture cannot inspect
+    /// ([`rules::CAPTURE_UNSUPPORTED_TRANSPORT`]). The detail names the host
+    /// and the transports only (not the participant), so dedup keeps it to
+    /// one finding per host and transport set; the participant is attached
+    /// as the finding's subject.
+    fn transport_findings(
+        &mut self,
+        report: &DatagramReport,
+        src_ip: &str,
+        out: &mut Vec<Candidate>,
+    ) {
+        if let Some(policy) = self.opts.sros2.clone() {
+            for spdp in &report.participants {
+                if let Some(dev) = policy.judge_spdp(spdp, src_ip) {
+                    self.push_for(out, dev, src_ip, Some(spdp.guid_prefix));
+                }
+            }
+        }
+        for spdp in &report.participants {
+            let t = spdp.uninspected_transports();
+            if t.is_empty() {
+                continue;
+            }
+            let shm = t
+                .iter()
+                .any(|(t, _)| *t == robodr_rtps::LocatorTransport::SharedMemory);
+            let kinds: Vec<String> = t
+                .iter()
+                .map(|(t, k)| format!("{} ({k})", t.name()))
+                .collect();
+            let why = if shm {
+                "traffic between DDS participants on that host over shared memory never reaches \
+                 a network interface, so their discovery and data (motion commands included) \
+                 are not inspected"
+            } else {
+                "RoboDR does not decode RTPS over these transports, so traffic on them is not \
+                 inspected"
+            };
+            let detail = format!(
+                "participant(s) on {src_ip} advertise {} locators: {why}; commission the robot \
+                 with UDP-only DDS transports (docs/DDS-TRANSPORTS.md)",
+                kinds.join(", ")
+            );
+            self.push_for(
+                out,
+                Deviation::new(
+                    rules::CAPTURE_UNSUPPORTED_TRANSPORT,
+                    Severity::Medium,
+                    detail,
+                ),
+                src_ip,
+                Some(spdp.guid_prefix),
+            );
+        }
+    }
+
     fn protocol_findings(
         &mut self,
         report: &DatagramReport,
@@ -1925,36 +2100,12 @@ impl Pipeline {
             );
         }
         if s.frag_rejected > 0 {
-            let detail = format!(
-                "discovery fragments from {src_ip} refused by the reassembler (over a size cap, \
-                 inconsistent geometry or no capacity); that announcement was not inspected"
-            );
-            self.push(
-                out,
-                Deviation::new(rules::DISCOVERY_FRAGMENT_REJECTED, Severity::Medium, detail),
-                src_ip,
-            );
+            self.rejected_fragment_findings(report, src_ip, out);
         }
-        // TODO(rtps-hardening): the parallel robodr-rtps work adds per-datagram
-        // eviction / conflict info to the detailed report. Until then the
-        // reassembler's cumulative `evicted()` counter is diffed here; the
-        // evicted sample may belong to another sender than `src_ip` (the one
-        // whose datagram caused the eviction).
-        let evicted = self.reassembler.evicted();
-        if evicted > self.frag_evicted_seen {
-            let delta = evicted - self.frag_evicted_seen;
-            self.frag_evicted_seen = evicted;
-            self.stats.fragment_evictions += delta;
-            let detail = format!(
-                "{delta} partially reassembled discovery sample(s) evicted to stay within the \
-                 reassembler's memory caps while processing discovery from {src_ip}; those \
-                 announcements were not inspected"
-            );
-            self.push(
-                out,
-                Deviation::new(rules::DISCOVERY_FRAGMENT_EVICTED, Severity::Medium, detail),
-                src_ip,
-            );
+        // Evictions this datagram caused, from its own fragment events (the
+        // victims may belong to other senders than `src_ip`).
+        if s.frag_evicted > 0 {
+            self.evicted_fragment_findings(report, src_ip, out);
         }
         if self.opts.report_fragmentation && report.fragmented_discovery_seen() {
             let detail = format!(
@@ -1968,6 +2119,18 @@ impl Pipeline {
             );
         }
     }
+}
+
+/// `Publications sample sn 7 of writer <prefix>:<entity>` for a fragment
+/// event (the prefix and entity are wire claims, hex).
+fn fragment_sample_name(e: &FragmentEvent) -> String {
+    let entity: String = e.writer.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{:?} sample sn {} of writer {}:{entity}",
+        e.topic,
+        e.sn,
+        hex12(&e.source)
+    )
 }
 
 #[cfg(test)]

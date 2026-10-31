@@ -1,0 +1,158 @@
+# Signed apt and dnf repositories of a published RoboDR release
+# (scripts/build-pkg-repo.sh; docs/RELEASE.md "Package repositories").
+#
+# Runs when a release is published, or by hand for a tag. Every package is
+# verified against the release's minisign key (repository variable
+# ROBODR_MINISIGN_PUBKEY) before it enters a repository; the repository
+# metadata is signed with the OpenPGP repository key:
+#   secret   REPO_GPG_PRIVATE_KEY   ASCII-armoured secret key (signing subkey)
+#   secret   REPO_GPG_PASSPHRASE    its passphrase (may be empty)
+#   variable ROBODR_REPO_GPG_FINGERPRINT  the primary key fingerprint (40 hex)
+#   environment "package-repo" holding the secrets, with required reviewers.
+# dry_run: true signs with a throwaway OpenPGP key instead (no environment,
+# no secret), to test the workflow; its output says TEST-ONLY.
+#
+# Output: the repository tree as a workflow artifact (robodr-pkg-repo-<tag>).
+# Where it is served (an authenticated portal or registry) is the hosting
+# decision of the delivery channel (SALES-READINESS C14); publishing the
+# tree there is the step this workflow leaves to that channel.
+name: Package repositories
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (vX.Y.Z[-pre])"
+        required: true
+        type: string
+      dry_run:
+        description: "Sign with a throwaway key (TEST ONLY)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pkg-repo-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  repo:
+    name: Signed apt / dnf repositories
+    if: github.event_name == 'release' || !inputs.dry_run
+    runs-on: ubuntu-24.04
+    environment: package-repo
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign apt-utils createrepo-c rpm gnupg
+      - name: The release's assets and signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::bad tag $TAG"; exit 1 ;; esac
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/assets" \
+            --pattern '*.deb' --pattern '*.deb.minisig' --pattern '*.rpm' --pattern '*.rpm.minisig'
+      - name: Build, sign and verify the repositories
+        env:
+          PUBKEY: ${{ vars.ROBODR_MINISIGN_PUBKEY }}
+          FPR: ${{ vars.ROBODR_REPO_GPG_FINGERPRINT }}
+          REPO_GPG_PRIVATE_KEY: ${{ secrets.REPO_GPG_PRIVATE_KEY }}
+          REPO_GPG_PASSPHRASE: ${{ secrets.REPO_GPG_PASSPHRASE }}
+        run: |
+          test -n "$PUBKEY" || { echo "::error::ROBODR_MINISIGN_PUBKEY is not set"; exit 1; }
+          test -n "$REPO_GPG_PRIVATE_KEY" || { echo "::error::REPO_GPG_PRIVATE_KEY is not set"; exit 1; }
+          umask 077
+          printf 'untrusted comment: release key\n%s\n' "$PUBKEY" > "$RUNNER_TEMP/release.pub"
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          trap 'gpgconf --kill all; rm -rf "$GNUPGHOME" "$RUNNER_TEMP/pass"' EXIT
+          printf '%s' "$REPO_GPG_PASSPHRASE" > "$RUNNER_TEMP/pass"
+          printf '%s\n' "$REPO_GPG_PRIVATE_KEY" | gpg --batch --pinentry-mode loopback \
+            --passphrase-file "$RUNNER_TEMP/pass" --import
+          pass=()
+          [ -n "$REPO_GPG_PASSPHRASE" ] && pass=(--passphrase-file "$RUNNER_TEMP/pass")
+          scripts/build-pkg-repo.sh --assets "$RUNNER_TEMP/assets" --pubkey "$RUNNER_TEMP/release.pub" \
+            --version "${TAG#v}" --gnupghome "$GNUPGHOME" --key "$FPR" "${pass[@]}" --out dist/pkg-repo
+      - name: Hand the repository tree over
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: robodr-pkg-repo-${{ env.TAG }}
+          path: dist/pkg-repo
+          if-no-files-found: error
+          retention-days: 90
+
+  repo-dry-run:
+    name: Signed apt / dnf repositories (dry run, throwaway key)
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign apt-utils createrepo-c rpm gnupg
+      - name: The release's assets and signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::bad tag $TAG"; exit 1 ;; esac
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/assets" \
+            --pattern '*.deb' --pattern '*.deb.minisig' --pattern '*.rpm' --pattern '*.rpm.minisig'
+      - name: Build, sign (TEST-ONLY key) and verify
+        env:
+          PUBKEY: ${{ vars.ROBODR_MINISIGN_PUBKEY }}
+        run: |
+          test -n "$PUBKEY" || { echo "::error::ROBODR_MINISIGN_PUBKEY is not set"; exit 1; }
+          printf 'untrusted comment: release key\n%s\n' "$PUBKEY" > "$RUNNER_TEMP/release.pub"
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key "RoboDR TEST-ONLY repository key <test-only@robodr.test>" rsa3072 sign 1d
+          fpr="$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          scripts/build-pkg-repo.sh --assets "$RUNNER_TEMP/assets" --pubkey "$RUNNER_TEMP/release.pub" \
+            --version "${TAG#v}" --gnupghome "$GNUPGHOME" --key "$fpr" --out dist/pkg-repo
+          echo "TEST ONLY: signed with a throwaway key generated in this job" > dist/pkg-repo/TEST-ONLY
+      - name: Hand the TEST-ONLY repository tree over
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: robodr-pkg-repo-${{ env.TAG }}-TEST-ONLY
+          path: dist/pkg-repo
+          if-no-files-found: error
+          retention-days: 7
+
+  self-test:
+    # The repository builder against throwaway keys and minimal packages, on
+    # every manual run (also when the release has no packages yet).
+    name: build-pkg-repo.sh self-test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign apt-utils createrepo-c rpm gnupg
+      - run: scripts/test-build-pkg-repo.sh

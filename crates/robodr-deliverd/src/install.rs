@@ -65,6 +65,31 @@
 //! exit status: [`Installer::deb_verify`]) and against the file list
 //! recorded at its install ([`Installer::deb_files_digest`]).
 //!
+//! # Self-upgrade: the agent installing RoboDR's own package (T52)
+//!
+//! Every `dpkg --install` runs with [`DELIVERD_INSTALL_ENV`]
+//! (`ROBODR_DELIVERD_INSTALL=1`) added to the fixed environment, and dpkg
+//! hands it on to the maintainer scripts. RoboDR's own `postinst` then
+//! does **not** `systemctl try-restart robodr-deliverd.service`: that
+//! restart would stop the very process that waits for dpkg, so systemd
+//! would signal dpkg and the `postinst` itself (they run in the agent's
+//! cgroup) and the package would be left half-configured. The agent
+//! instead finishes its pass (health gate, commit or rollback) on the old
+//! binary and then exits with [`crate::cli::EXIT_RESTART`] because its
+//! own executable was replaced; the unit restarts it on the new one. The
+//! marker only ever skips that one restart; the agent notices a replaced
+//! binary by itself, so a marker set by anyone else costs nothing but
+//! the restart postinst would have done.
+//!
+//! # deb only: no RPM delivery (T53)
+//!
+//! There is no `rpm` RPK kind: the agent and the depot deliver `.deb`
+//! packages to Debian / Ubuntu units only. On a unit without a dpkg
+//! database (`<dpkg_root>/var/lib/dpkg/status`: an RPM-based host) a
+//! `deb` RPK is refused before anything is unpacked, with a reason that
+//! says so; the other kinds work there as anywhere. RPM hosts get RoboDR
+//! itself through `install-bundle.sh` (`docs/OPERATIONS.md` section 7).
+//!
 //! What this does not cover (release signers are root-equivalent for
 //! `deb`, `docs/SECURE-DELIVERY.md` §6.7): maintainer scripts (when the
 //! release allowed them) and files a `.deb` adds that change the system's
@@ -171,6 +196,12 @@ pub const DPKG_INSTALL_FLAGS: [&str; 8] = [
     "--refuse-overwrite-dir",
     "--refuse-overwrite-diverted",
 ];
+
+/// Added to the environment of every `dpkg --install` (and so of the
+/// `.deb`'s maintainer scripts): "the caller is robodr-deliverd". RoboDR's
+/// `postinst` skips restarting `robodr-deliverd.service` under it (T52,
+/// see the module docs).
+pub const DELIVERD_INSTALL_ENV: (&str, &str) = ("ROBODR_DELIVERD_INSTALL", "1");
 
 /// Maintainer-script members of a `.deb`'s control area.
 pub const MAINTAINER_SCRIPTS: [&str; 6] = [
@@ -548,6 +579,18 @@ impl Installer<'_> {
     }
 
     fn prepare_deb(&self, m: &Manifest, v: &mut Ver) -> Result<(), PrepError> {
+        // T53: deb only. A unit without a dpkg database is an RPM-based
+        // (or otherwise non-Debian) host: refused before anything is
+        // unpacked, never left to fail half-way in dpkg.
+        let status = self.admindir().join("status");
+        if !status.is_file() {
+            return Err(PrepError::Refused(format!(
+                "kind deb needs a Debian / Ubuntu unit and {} does not exist (no dpkg \
+                 database: an RPM-based host?); RoboDR delivers no RPM packages \
+                 (docs/SECURE-DELIVERY.md 4.2)",
+                status.display()
+            )));
+        }
         let files: Vec<_> = m.payload_files().collect();
         let [f] = files.as_slice() else {
             return Err(PrepError::Refused(
@@ -906,7 +949,14 @@ impl Installer<'_> {
                 ];
                 a.extend(DPKG_INSTALL_FLAGS.iter().map(|f| f.to_string()));
                 a.extend(["--install".into(), deb.to_string_lossy().into_owned()]);
-                let r = self.tool(&a, u64::from(self.cfg.install.dpkg_timeout_s));
+                let r = runner::run_env(
+                    &a,
+                    &[DELIVERD_INSTALL_ENV],
+                    Limits {
+                        timeout: Duration::from_secs(u64::from(self.cfg.install.dpkg_timeout_s)),
+                        max_output: 64 * 1024,
+                    },
+                );
                 if r.success() {
                     Ok(())
                 } else {

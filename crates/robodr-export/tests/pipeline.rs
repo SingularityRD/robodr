@@ -538,6 +538,101 @@ fn publisher_from_a_connected_site_spool() {
     assert_eq!(p.run_once().unwrap().published, 0);
 }
 
+/// Review finding: with the publisher's clock 2 h ahead of the brokers'
+/// (Kafka 4.0 refuses CreateTime more than 1 h ahead by default), every
+/// record got INVALID_TIMESTAMP and was dead-lettered, with no re-drive.
+/// Now the run fails naming the clock, nothing is dead-lettered or
+/// committed, and the records go out once the clock is fixed.
+#[test]
+fn publisher_with_a_skewed_clock_dead_letters_nothing() {
+    let r = Robot::new("pub-clock");
+    r.spool_findings(0, 3);
+    let c = Cluster::start(1, 1);
+    {
+        let mut st = c.state.lock().unwrap();
+        st.timestamp_after_max_ms = Some(3_600_000);
+        st.clock_offset_ms = -7_200_000;
+    }
+    let mut pc = ProducerConfig::new(c.bootstrap());
+    pc.allow_plaintext = true;
+    pc.retry_backoff = Duration::from_millis(5);
+    pc.retries = 2;
+    let cfg = PublishConfig::new(Source::Spool(r.spool.clone()), &r.soc_state);
+    let mut p = Publisher::open(cfg, Producer::new(pc).unwrap()).unwrap();
+    let e = p.run_once().unwrap_err().to_string();
+    assert!(
+        e.contains("INVALID_TIMESTAMP") && e.contains("clock"),
+        "{e}"
+    );
+    assert!(!r.soc_state.join("dead-letter.jsonl").exists(), "{e}");
+    assert_eq!(p.progress().dead_lettered_total, 0);
+    assert_eq!(r.ready().len(), 3, "nothing committed");
+    assert!(Robot::names(&r.spool.join("rejected")).is_empty());
+    // NTP fixed: the next run publishes everything.
+    c.state.lock().unwrap().clock_offset_ms = 0;
+    let rep = p.run_once().unwrap();
+    assert_eq!((rep.published, rep.dead_lettered), (3, 0));
+    assert_eq!(c.total(), 3);
+}
+
+/// Review finding: an I/O error (EACCES, EIO) reading one spool file failed
+/// every run forever. Now it is retried a bounded number of times, then
+/// quarantined (dead letter with the error, file moved to rejected/) and
+/// the rest is published; a transient error is simply retried.
+#[test]
+fn publisher_quarantines_an_unreadable_spool_file() {
+    let r = Robot::new("pub-eio");
+    r.spool_findings(0, 4);
+    let bad = r.ready()[1].clone();
+    let c = Cluster::start(1, 1);
+    let mut p = Publisher::open(
+        PublishConfig::new(Source::Spool(r.spool.clone()), &r.soc_state),
+        producer(&c),
+    )
+    .unwrap();
+    robodr_export::inject_read_errors(&bad, u32::MAX);
+    let rep = p.run_once().unwrap();
+    robodr_export::inject_read_errors(&bad, 0);
+    assert_eq!((rep.published, rep.dead_lettered), (3, 1), "{rep:?}");
+    assert_eq!(rep.quarantined_unreadable, 1);
+    assert!(r.ready().is_empty());
+    assert_eq!(Robot::names(&r.spool.join("rejected")), vec![bad.clone()]);
+    let dl = fs::read_to_string(r.soc_state.join("dead-letter.jsonl")).unwrap();
+    assert!(
+        dl.contains("unreadable (I/O error after 3 attempts"),
+        "{dl}"
+    );
+
+    // Transient: fails twice, read on the third attempt, published.
+    r.spool_findings(4, 1);
+    let flaky = r.ready()[0].clone();
+    robodr_export::inject_read_errors(&flaky, 2);
+    let rep = p.run_once().unwrap();
+    assert_eq!((rep.published, rep.quarantined_unreadable), (1, 0));
+    assert_eq!(c.total(), 4);
+}
+
+/// The same for the robot-side spool exporter: quarantined in rejected/
+/// with the I/O error as its reason, the rest is packed.
+#[test]
+fn spool_export_quarantines_an_unreadable_spool_file() {
+    let r = Robot::new("exp-eio");
+    r.spool_findings(0, 3);
+    let bad = r.ready()[0].clone();
+    let mut x = r.exporter(None);
+    robodr_export::inject_read_errors(&bad, u32::MAX);
+    let rep = x.run_once(NOW).unwrap();
+    robodr_export::inject_read_errors(&bad, 0);
+    assert_eq!(rep.exported, 2);
+    assert_eq!(rep.quarantined_unreadable, 1);
+    assert_eq!(rep.rejected.len(), 1);
+    assert!(rep.rejected[0].reason.starts_with("unreadable (I/O error"));
+    assert!(r.ready().is_empty());
+    let why =
+        fs::read_to_string(r.spool.join("rejected").join(format!("{bad}.reason.json"))).unwrap();
+    assert!(why.contains("I/O error"), "{why}");
+}
+
 #[test]
 fn publisher_stops_on_fatal_kafka_error_without_committing() {
     let r = Robot::new("pub-fatal");
