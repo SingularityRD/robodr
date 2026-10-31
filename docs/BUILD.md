@@ -637,7 +637,8 @@ comment; container images by multi-arch index digest (resolved with
 
 `.github/workflows/ci-extended.yml` has the same triggers as `ci.yml`. It
 holds the jobs that need a privileged runner, the arm64 runner, a real
-broker or a real kernel. All of them are required.
+broker or a real kernel. All of them are required except `bench`, which is
+informational (`continue-on-error`).
 
 | Job | What |
 |---|---|
@@ -646,6 +647,7 @@ broker or a real kernel. All of them are required.
 | `kafka` | First `scripts/kafka-it.sh`: a single-node KRaft broker in docker, image pinned by digest. It covers plaintext, clean refusal of SASL/PLAIN and of self-signed TLS, ACL denial, quota, the Java partitioner, a broker restart mid-stream, and a `kafka-dump-log` CRC re-check. Then `scripts/kafka-tls-it.sh`: TLS, mutual TLS, and SASL_SSL SCRAM-SHA-256/512 with re-authentication, against the Apache Kafka 3.9.1 distribution (SHA-512 checked) |
 | `ebpf-load` | On amd64 and arm64: builds `robodr-pulsard` in release and runs `scripts/ebpf-load-smoke.sh` as root. The probes load into the runner's kernel with `rules/robodr`. The script sets off one real event per rule family: an interactive shell, a program run from `/tmp`, an interpreter one-liner, a tracer, a shell network connection, writes to the linker path and module autoload configuration, and a directory created under `/etc/robodr` (removed afterwards, with `/etc/robodr` itself when the script created it). Each event must fire on stdout **and** arrive on the agentd-side host-threats socket through `robodr-threat-forward`. That socket is a stand-in listener that checks the wire format |
 | `coverage` | `cargo llvm-cov nextest` over the pure crates (cargo-llvm-cov 0.9.1, cargo-nextest 0.9.148, profile `ci` of `.config/nextest.toml`). It uploads `lcov.info`, the JUnit XML and the line-coverage summary, and shows the summary on the run page. There is no floor yet: set one with `--fail-under-lines` once the first runs give a number |
+| `bench` | Informational. Builds `robodr-benches` in release and runs `robodr-bench --quick --gate benches/results/baseline-quick.json --tolerance 0.5` (`benches/README.md`), uploading the JSON result. That baseline was recorded on a different host class, so the job does not fail the workflow; commit a result from this runner as its baseline and remove `continue-on-error` to make it a gate |
 
 `.github/workflows/lifecycle.yml` runs after every successful `ci.yml` run
 of a push or a same-repository pull request. It takes that run's `pkg-*`
