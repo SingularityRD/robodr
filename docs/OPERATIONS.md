@@ -1432,7 +1432,12 @@ sudo systemctl restart robodr-agentd
   "allowed_actions": ["record_evidence", "isolate_network"],
   "max_ttl_seconds": 900}` lets that key request (and revert) only those
   actions, with at most that TTL; anything else is answered 403 and
-  reported as `robot.agent.control_plane_invalid` (contract §4.2). Keep
+  reported as `robot.agent.control_plane_invalid` (contract §4.2).
+  `max_ttl_seconds` bounds only actions that take a TTL
+  (`restrict_motion`, `isolate_network`): the others (`quarantine_node`,
+  `safe_pause`, `request_safe_state`, `rollback_config`) stay in force
+  until reverted or restored by an operator, so leave them out of
+  `allowed_actions` to keep the key from them. Keep
   the unscoped key (all seven actions) with the people who may ask for
   `safe_pause` / `request_safe_state`. The executor does not apply these
   scopes yet (contract §4.2). The TLS key file must have no group/other bits (the
@@ -1511,16 +1516,22 @@ sudo systemctl restart robodr-agentd
   `max_connections_per_source` (default 2): raise it if several SOC
   workers share one NAT address. The unix socket has its own 2 slots, so
   an operator on the robot is never locked out by network peers. Rejected
-  connections count in `connections_rejected`. When the pre-authentication
-  slots are full, a new connection cuts the oldest handshake older than
-  `pre_auth_evict_after_ms` (default 100; raise it if the SOC's link has
-  long round trips), counted in `connections_evicted`. **Set
-  `soc_sources`** to the SOC's egress networks (e.g.
-  `["203.0.113.0/28"]`): they get `reserved_connections` (default 1) slots
-  of their own and cut any unlisted handshake when they need room, so a
-  TLS slowloris from other addresses cannot lock the SOC out (W2-4). Keep
-  the `IPAddressAllow=` drop-in (§6.4) as well: it stops unlisted peers
-  before agentd sees them.
+  connections count in `connections_rejected`. **Set `soc_sources`** to
+  the SOC's egress networks (e.g. `["203.0.113.0/28"]`; a /0 is
+  refused): they get `reserved_connections` (default 1) slots of their
+  own and cut any unlisted handshake when they need room, so a TLS
+  slowloris from other addresses cannot lock the SOC out (W2-4). Without
+  `soc_sources`, when the pre-authentication slots are full a new
+  connection cuts the oldest handshake older than `pre_auth_evict_after_ms`
+  (default 100 ms without `soc_sources`, counted in `connections_evicted`).
+  That holds a slowloris back only partly, and under legitimate overload
+  over long round trips (more SOC clients than slots, round trip above
+  the setting) the clients cut each other's handshakes and few finish;
+  workers behind one NAT address at their per-source share cut their own.
+  With `soc_sources` nothing is cut by age unless you set
+  `pre_auth_evict_after_ms`; `0` turns it off without `soc_sources` too.
+  Keep the `IPAddressAllow=` drop-in (§6.4) as well: it stops unlisted
+  peers before agentd sees them.
 - Watch `status.json` `control_plane` (`unauthenticated`, `tls_failures`,
   `last_auth_failure`, `connections_rejected`, `connections_evicted`,
   `recorded_not_executed`,

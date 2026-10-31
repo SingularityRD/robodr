@@ -49,6 +49,9 @@ robodr-capture = { workspace = true }
 # tests/gateway_feed.rs: the gateway's own feed writer and decision
 # summaries against the daemon (testkit: a fixture gateway; dev only).
 robodr-firewall-gw = { workspace = true, features = ["testkit"] }
+# tests/control_plane.rs: client sockets bound to 127.0.0.x source
+# addresses (slowloris with several attacker addresses and a SOC address).
+socket2 = { workspace = true }
 
 [[bin]]
 name = "robodr-agentd"

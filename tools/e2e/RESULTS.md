@@ -454,8 +454,14 @@ MAC-bound, `block_unlisted`). Scripts: `redteam2.sh`,
   (`pre_auth_evict_after_ms`, `soc_sources` / `reserved_connections`,
   contract §1); the in-process regression
   `slowloris_cannot_lock_the_listed_soc_out` gets 20/20 SOC requests
-  through an 8-connection trickling attacker (0/20 without the fix). The
-  netns re-run of S2 with the release binaries is still to do.
+  through an 8-connection trickling attacker from 4 loopback source
+  addresses, and its committed control
+  `without_soc_sources_the_same_slowloris_locks_the_soc_out` (no
+  `soc_sources`, nothing cut by age) gets 0/20 in our runs (it asserts
+  fewer than 20). With `soc_sources` agentd no longer cuts by age unless
+  `pre_auth_evict_after_ms` is set (review follow-up: cutting by age lets
+  legitimate clients cut each other under load). The netns re-run of S2
+  with the release binaries is still to do.
 - **W2-5 (Low, design note).** The gateway feed is trusted by uid: a
   process running as root or as the gateway's user can claim any
   catalogued gateway / firewall finding and its severity (G7) and can

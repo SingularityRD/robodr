@@ -161,6 +161,11 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 # instead of hand-written per-architecture tables (T60). Already in the
 # graph (std's own dependency, lettre, rustix, ...), MIT OR Apache-2.0.
 libc = { version = "0.2", default-features = false }
+# Tests only (robodr-agentd tests/control_plane.rs): bind a client socket to
+# a chosen loopback address (127.0.0.x) before connecting, so one host can
+# stand for a SOC and several attacker addresses. Already in the graph
+# (tokio, lettre), MIT OR Apache-2.0.
+socket2 = "0.6"
 # Constant-time, strict (canonical padding) RFC 4648 base64 for SCRAM nonces,
 # salts, proofs and signatures (RustCrypto; already in the graph through
 # spki).
