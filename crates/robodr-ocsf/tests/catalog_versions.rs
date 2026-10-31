@@ -493,6 +493,7 @@ const IDS_2_5_AGENT: &[&str] = &[
     "robot.agent.evidence_unexported_dropped",
     "robot.agent.control_plane_request_fenced",
     "robot.agent.control_plane_saturated",
+    "robot.agent.control_plane_replay_unavailable",
     "robot.agent.selftest",
 ];
 

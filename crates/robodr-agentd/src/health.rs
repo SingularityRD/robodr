@@ -72,6 +72,12 @@ pub mod rules {
     /// (every slot they could use was busy: a handshake flood, a slowloris
     /// or legitimate overload). Medium. Contract 2.5.
     pub const CONTROL_PLANE_SATURATED: &str = "robot.agent.control_plane_saturated";
+    /// Correctly signed control-plane requests refused because the robot
+    /// could not check them for replay (replay store not durable, replay
+    /// cache full, clock unreadable): a robot-side fault, not an
+    /// authentication failure. Medium. Contract 2.5.
+    pub const CONTROL_PLANE_REPLAY_UNAVAILABLE: &str =
+        "robot.agent.control_plane_replay_unavailable";
     /// The control plane's sealed state (request journal, replay store)
     /// failed its integrity check at start: damaged, edited, sealed under
     /// another key (High) or rolled back against the black box's signed

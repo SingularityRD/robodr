@@ -227,7 +227,12 @@ impl Ctx {
     pub fn journal(&self, robot_id: &str) -> Result<Journal, String> {
         let d = self.path("journal");
         fsx::ensure_private_dir(&d).map_err(|e| format!("{}: {e}", d.display()))?;
-        Journal::open(&d, robot_id, &self.cfg.blackbox_key)
+        Journal::open(
+            &d,
+            robot_id,
+            &self.cfg.blackbox_key,
+            &self.facts.blackbox_previous_keys,
+        )
     }
 
     /// Whether `id` is in the replay-guard list `name`.

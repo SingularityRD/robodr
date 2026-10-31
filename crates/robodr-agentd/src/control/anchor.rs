@@ -315,18 +315,22 @@ pub fn latest(src: &dyn SegmentSource, robot_id: &str, signer: &dyn Signer) -> i
 
 /// Kind of the executor's journal head note (review of gap 1, findings 1
 /// and 2): `{"kind":"robodr.executor_journal_head","robot_id":..,
-/// "reason":..,"epoch":"<32 hex>","next_seq":<n>}`, recorded by agentd when
-/// the executor's epoch changes and on heartbeats when the head moved or
-/// the black box started a new segment.
+/// "reason":..,"epoch":"<32 hex>","next_seq":<n>,"processed_seq":<n>}`,
+/// recorded by agentd when the executor's epoch changes, after it recorded
+/// executor events, and on heartbeats when the head moved or the black box
+/// started a new segment. `processed_seq` (optional; absent while events
+/// were still queued) is the last event of that epoch agentd recorded: the
+/// next start resumes after it (review 2, M6).
 pub const EXECUTOR_HEAD_NOTE: &str = "robodr.executor_journal_head";
 
-/// The newest authentic executor journal head note of `robot_id` (and how
-/// many such notes did not verify).
+/// The newest authentic executor journal head note of `robot_id`: the
+/// head, its `processed_seq` if the note has one, and how many such notes
+/// did not verify.
 pub fn latest_executor_head(
     src: &dyn SegmentSource,
     robot_id: &str,
     signer: &dyn Signer,
-) -> io::Result<(Option<robodr_executor::journal::JournalHead>, usize)> {
+) -> io::Result<ExecutorAnchor> {
     let mut newest = None;
     let mut unverified = 0;
     let needle = EXECUTOR_HEAD_NOTE.as_bytes();
@@ -356,28 +360,61 @@ pub fn latest_executor_head(
                 serde_json::json!({"epoch": v.get("epoch"), "next_seq": v.get("next_seq")}),
             )
             .ok();
+            let mut processed = v.get("processed_seq").and_then(Value::as_u64);
             match (super::evidence::authentic(&rec, signer), head) {
-                (true, Some(h)) => newest = Some(h),
+                (true, Some(h)) => {
+                    // A note without it keeps the last one of the same
+                    // epoch (a lower bound: events are numbered upwards).
+                    if processed.is_none() {
+                        processed = newest
+                            .as_ref()
+                            .filter(|(o, _): &&(robodr_executor::journal::JournalHead, _)| {
+                                o.epoch == h.epoch
+                            })
+                            .and_then(|(_, p)| *p);
+                    }
+                    newest = Some((h, processed));
+                }
                 _ => unverified += 1,
             }
         }
     }
-    Ok((newest, unverified))
+    Ok(ExecutorAnchor {
+        processed_seq: newest.as_ref().and_then(|(_, p)| *p),
+        head: newest.map(|(h, _)| h),
+        unverified,
+    })
 }
 
-/// The executor journal head note.
+/// What [`latest_executor_head`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutorAnchor {
+    pub head: Option<robodr_executor::journal::JournalHead>,
+    /// The last event of `head`'s epoch agentd recorded.
+    pub processed_seq: Option<u64>,
+    /// Head notes that did not verify (ignored).
+    pub unverified: usize,
+}
+
+/// The executor journal head note (`processed_seq`: see
+/// [`EXECUTOR_HEAD_NOTE`]).
 pub fn executor_head_note(
     robot_id: &str,
     reason: &str,
     head: &robodr_executor::journal::JournalHead,
+    processed_seq: Option<u64>,
 ) -> Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "kind": EXECUTOR_HEAD_NOTE,
         "robot_id": robot_id,
         "reason": reason,
         "epoch": head.epoch,
         "next_seq": head.next_seq,
-    })
+    });
+    if let (Some(p), Some(o)) = (processed_seq, v.as_object_mut()) {
+        o.insert("processed_seq".into(), p.into());
+    }
+    v
 }
 
 /// Whether a head note is due on a heartbeat (review of gap 1, finding 3):

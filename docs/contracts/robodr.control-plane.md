@@ -170,8 +170,11 @@ refused (`stale_timestamp`); sign again. It fences when, at start,
   `max_clock_skew_s` seconds**;
 * the store is damaged (§9);
 * the wall clock reads below the store's persisted high-water mark (the
-  latest second at which it dropped expired pairs, a `clock` entry); and,
-  while running, when the clock steps back below that mark.
+  newest `dead_after` of the expired pairs it dropped, a `clock` entry:
+  below it a dropped pair's timestamp would be in the window again); and,
+  while running, when the clock steps back below that mark. The mark is
+  the pairs' own bound, never the clock that dropped them, so a clock
+  stepped forward and corrected does not fence the corrected clock.
 
 The fence is `max(now, high-water mark) + max_clock_skew_s`: a request
 accepted before may carry a timestamp up to the skew ahead of the clock
@@ -726,9 +729,17 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
   its journal head (a random `epoch` replaced by every reset, and
   `next_seq`); agentd records it as a critical
   `robodr.executor_journal_head` note (`robot_id`, `reason`, `epoch`,
-  `next_seq`) when it first sees it, when the epoch changes or the
+  `next_seq`, and `processed_seq`: the last event of that epoch agentd
+  recorded, when no polled event was still waiting) when it first sees
+  it, after it recorded executor events, when the epoch changes or the
   sequence goes back, and on heartbeats when it moved or the black box
-  started a new segment, and sends the newest one back with every poll. An
+  started a new segment, and sends the newest one back with every poll.
+  At start agentd resumes the event poll after `processed_seq` of the
+  newest note (the executor keeps its last events and would otherwise
+  hand them over again, each one recorded and reported a second time);
+  a note without it, or a new epoch, reads the journal from its start.
+  An event recorded just before a crash and after the last note may be
+  recorded once more (at least once, never lost). An
   executor journal behind that anchor (an older copy put back) or of
   another epoch is reset by the executor (`journal_reset`). A new epoch or
   a sequence going back raises `robot.agent.executor_journal_reset` (High)
@@ -826,6 +837,11 @@ self-health, rate limited by `daemon.health_report_ms`):
   (§2, §9; answered 401 `stale_timestamp` as before). They are counted in
   `fenced`, not in `unauthenticated`: the SOC did nothing wrong and should
   re-sign and resend;
+* `robot.agent.control_plane_replay_unavailable` (Medium): correctly signed requests refused because the robot
+  could not check them for replay (503 `replay_store_unavailable`,
+  `replay_cache_full`, `clock_unavailable`) since the last report: a fault
+  on the robot (storage, clock), not an authentication failure. They are
+  counted in `replay_unavailable`, not in `unauthenticated`;
 * `robot.agent.control_plane_saturated` (Medium): connections refused at
   accept (`connections_rejected`) or cut before they authenticated
   (`connections_evicted`) since the last report: every slot they could
@@ -944,7 +960,8 @@ same steps (`revert_begin` / `revert_commit` / `revert_abort`). The newest
 **Replay store entries** are `{"t":"nonce","key_id":...,"nonce":...,
 "dead_after":<unix s>}`, plus one `{"t":"clock","key_id":"","nonce":"",
 "dead_after":<unix s>}` written with every compaction: the high-water mark
-of §2 (the latest second at which expired pairs were dropped). An agentd
+of §2 (the newest `dead_after` of the expired pairs dropped; stores written
+before review 2 recorded the clock at the drop instead). An agentd
 older than this revision reads a `clock` entry as damage and fences once.
 
 **Executor states** (executor v1, §6a) are one entry each,

@@ -341,6 +341,12 @@ it); the SOC imports it with exactly the §3.3 processing (its import time is
   by group or others, the public half next to it (`.pub`, 0644). An
   existing key file is registered only with `--reuse-existing-keys` (e.g.
   the black-box key of an agentd that already runs).
+* A `blackbox` key rotated on the unit (`robodr-blackbox rotate`,
+  OPERATIONS 4.3) stays registered at the SOC under its enrollment
+  fingerprint: the unit keeps that retired secret and signs a
+  decommission request (§5.6) with it; the request names the registered
+  key, so nothing changes for the SOC. A unit that destroyed it can only
+  be retired from the SOC side.
 * A `blackbox` key authenticates nothing at the ingest API (it is to be
   treated like a wrong-role key there: `401 unknown_key`); a `finding` key
   authenticates no batch and no fleet request.

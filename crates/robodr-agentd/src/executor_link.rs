@@ -194,6 +194,8 @@ struct Shared {
     /// (it journals the new state at once, control plane v2).
     changed: VecDeque<String>,
     events: VecDeque<Event>,
+    /// The poll cursor: events up to it were read (they are in `events`
+    /// or the main loop took them).
     last_seq: u64,
     stats: LinkStats,
     /// The executor's journal head as agentd last knew it (from the black
@@ -371,19 +373,31 @@ fn unreachable_outcome(id: &str, e: &str) -> Outcome {
 impl ExecutorLink {
     /// Start the worker. Nothing is sent until orders are dispatched.
     pub fn start(spec: &ExecutorSpec, safety: SafetyCell) -> Result<Self, String> {
-        Self::start_anchored(spec, safety, None)
+        Self::start_anchored(spec, safety, None, None)
     }
 
     /// [`ExecutorLink::start`] with the executor journal head agentd's
     /// black box holds (`anchor`, review of gap 1): sent with every event
     /// poll, so an older executor journal put back is reset by the executor.
+    /// `resume_seq` is the last event of that journal agentd recorded
+    /// ([`ExecutorLink::resume_point`], kept in the same head note): the
+    /// poll continues after it, so a restart does not record (and report)
+    /// the executor's retained events again (review 2, M6). Without it, or
+    /// when the executor's epoch changed, the journal is read from its
+    /// start ([`judge_head`]).
     pub fn start_anchored(
         spec: &ExecutorSpec,
         safety: SafetyCell,
         anchor: Option<JournalHead>,
+        resume_seq: Option<u64>,
     ) -> Result<Self, String> {
         let (tx, rx) = sync_channel::<Job>(QUEUE);
         let shared = Arc::new(Mutex::new(Shared {
+            last_seq: if anchor.is_some() {
+                resume_seq.unwrap_or(0)
+            } else {
+                0
+            },
             head: anchor,
             ..Shared::default()
         }));
@@ -638,6 +652,19 @@ impl ExecutorLink {
     /// The executor's journal head as agentd knows it now.
     pub fn journal_head(&self) -> Option<JournalHead> {
         lock(&self.shared).head.clone()
+    }
+
+    /// The journal head and the last event of it the main loop has taken
+    /// ([`ExecutorLink::take_events`]), read together; `None` while events
+    /// read from the executor still wait to be taken (the cursor is then
+    /// ahead of what was recorded). Recorded in the head note after the
+    /// events, it is where the next start resumes (review 2, M6).
+    pub fn resume_point(&self) -> Option<(JournalHead, u64)> {
+        let g = lock(&self.shared);
+        if !g.events.is_empty() {
+            return None;
+        }
+        g.head.clone().map(|h| (h, g.last_seq))
     }
 
     /// Journal heads that changed the epoch or went backwards, with their

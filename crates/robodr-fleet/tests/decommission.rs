@@ -351,3 +351,106 @@ fn enrollment_on_a_decommissioned_state_dir_is_refused_even_with_fresh_keys() {
         Some(Phase::Done)
     );
 }
+
+/// What `docs/OPERATIONS.md` 4.3 does to a unit's black-box key: a new key,
+/// the old one moved to `retired/`, and, when `rotate_journal`, the fleet
+/// journal rotated in place onto the new key the way `robodr-blackbox
+/// rotate` does (`Recorder::rotate_key`). Returns the retired key's path
+/// and a copy of its `.pub` where agentd's `blackbox.previous_keys` points.
+fn rotate_blackbox_in_place(
+    u: &Unit,
+    rotate_journal: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use robodr_blackbox::keys::public_key_path;
+    use robodr_blackbox::{Recorder, RecorderConfig, SystemClock, TimeSource};
+    use std::os::unix::fs::PermissionsExt;
+    let active = u.cfg.blackbox_key.clone();
+    let keys_dir = active.parent().unwrap().to_path_buf();
+    let next = keys_dir.join("agentd-blackbox-next.key");
+    robodr_fleet::keys::generate("blackbox", &next).unwrap();
+    if rotate_journal {
+        let old = KeyFile::load_secret(&active).unwrap().signer().unwrap();
+        let new = KeyFile::load_secret(&next).unwrap().signer().unwrap();
+        let cfg = RecorderConfig::new(u.cfg.state_dir.join("journal"), ROBOT, "test-boot");
+        let mut rec =
+            Recorder::open(cfg, old, Box::new(SystemClock::new(TimeSource::Rtc))).unwrap();
+        rec.rotate_key(new, None, "scheduled rotation").unwrap();
+        rec.close().unwrap();
+    }
+    let retired = keys_dir.join("retired");
+    std::fs::create_dir_all(&retired).unwrap();
+    std::fs::set_permissions(&retired, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let old_key = retired.join("agentd-blackbox-old.key");
+    std::fs::rename(&active, &old_key).unwrap();
+    std::fs::rename(public_key_path(&active), public_key_path(&old_key)).unwrap();
+    std::fs::rename(&next, &active).unwrap();
+    std::fs::rename(public_key_path(&next), public_key_path(&active)).unwrap();
+    let prev = u.root.join("etc/blackbox-previous.pub");
+    std::fs::copy(public_key_path(&old_key), &prev).unwrap();
+    std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o644)).unwrap();
+    (old_key, prev)
+}
+
+#[test]
+fn black_box_key_rotated_in_place_still_decommissions_with_the_retired_registered_key() {
+    let (mut u, soc) = enrolled("decom-bb-rotated");
+    let registered = u.ctx().enrollment().unwrap().keys;
+    let (_, prev) = rotate_blackbox_in_place(&u, true);
+
+    // Without the retired .pub the rotated journal's older records do not
+    // authenticate: refused, nothing reset.
+    let e = decommission::prepare(&u.ctx(), "end_of_life").unwrap_err();
+    assert!(e.contains("fleet journal"), "{e}");
+
+    // agentd's blackbox.previous_keys names the retired .pub; the fleet
+    // tool reads it from agentd's configuration.
+    u.facts.blackbox_previous_keys = vec![prev.clone()];
+    let ctx = u.ctx();
+    // Other fleet commands work again (they need the journal).
+    rotate::prepare(&ctx, "finding", &rotate::no_crash).unwrap();
+    rotate::abort(&ctx, "finding").unwrap();
+    // The request is signed by the keys the SOC has registered (the
+    // black-box one is the retired key); the SOC accepts it.
+    let d = decommission::prepare(&ctx, "end_of_life").unwrap();
+    assert_eq!(d.keys, registered);
+    let d = decommission::submit(&ctx, &mut Direct { soc: &soc }).unwrap();
+    assert_eq!(d.phase, Phase::Done);
+    assert_eq!(active_keys(&soc), 0);
+    // The journal verifies with both keys: the rotation, then the final
+    // notes signed by the new key.
+    let mut ring = robodr_blackbox::Keyring::new();
+    ring.load_public_file(&prev).unwrap();
+    ring.load_public_file(&robodr_blackbox::keys::public_key_path(&u.cfg.blackbox_key))
+        .unwrap();
+    let report = verify_dir(
+        &u.cfg.state_dir.join("journal"),
+        &ring,
+        &VerifyOptions::default(),
+    )
+    .unwrap();
+    assert!(report.is_intact(), "{:?}", report.findings);
+}
+
+#[test]
+fn black_box_key_rotated_without_the_journal_or_without_the_retired_key_is_refused_clearly() {
+    // The journal not rotated: the error names the command that fixes it.
+    let (mut u, _soc) = enrolled("decom-bb-journal");
+    let (_, prev) = rotate_blackbox_in_place(&u, false);
+    u.facts.blackbox_previous_keys = vec![prev];
+    let e = decommission::prepare(&u.ctx(), "end_of_life").unwrap_err();
+    assert!(e.contains("robodr-blackbox rotate"), "{e}");
+    assert!(e.contains("OPERATIONS.md 4.3"), "{e}");
+
+    // The journal rotated but the retired secret destroyed: refused before
+    // anything is sent, naming the way out.
+    let (mut u, soc) = enrolled("decom-bb-destroyed");
+    let (old_key, prev) = rotate_blackbox_in_place(&u, true);
+    std::fs::remove_file(&old_key).unwrap();
+    u.facts.blackbox_previous_keys = vec![prev];
+    let ctx = u.ctx();
+    let e = decommission::prepare(&ctx, "end_of_life").unwrap_err();
+    assert!(e.contains("retired secret key"), "{e}");
+    assert!(e.contains("stale_key"), "{e}");
+    assert!(decommission::current(&ctx).unwrap().is_none());
+    assert_eq!(active_keys(&soc), 3);
+}

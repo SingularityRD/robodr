@@ -181,6 +181,10 @@ sudo robodr-agentd --config /etc/robodr/agentd.json --check-config
 sudo systemctl enable --now robodr-agentd
 ```
 
+Before the first start the check reads the keys where the unit loads
+them from (`/etc/robodr/keys/...`) and says so; `/run/credentials/...`
+in the configuration exists only while the service runs.
+
 Health: `systemctl status robodr-agentd` (STATUS line) and the daemon's
 `status.json` ([OPERATIONS section 6](../OPERATIONS.md)).
 

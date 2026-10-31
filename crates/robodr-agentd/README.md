@@ -28,6 +28,18 @@ Exit codes: `0` clean stop (SIGTERM/SIGINT, or every input ended when
 `exit_when_inputs_end` is set); `1` runtime failure; `2` usage or
 configuration error (nothing started).
 
+`--check-config` from a shell before the service has run: the keys the
+configuration names under the credentials directory
+(`/run/credentials/robodr-agentd.service/`, which exists only while the
+unit runs) are checked at the files the unit loads them from
+(`LoadCredential=` of `robodr-agentd.service` and its drop-ins; on
+`robodr-focal`, its `robodr-load-credential` lines), and the report says
+so (`credential blackbox.key: checked at its source ...`). A credential
+sealed to the TPM (`LoadCredentialEncrypted=`) cannot be read outside the
+unit: the check refuses and prints the `systemd-run` command that checks
+it with the unit's credentials. The daemon itself reads only what systemd
+hands it.
+
 `selftest` (field acceptance, `src/selftest.rs`) asks the daemon already
 running with that configuration to prove the path to the SOC: it writes
 `<spool>/selftest.request` (a fresh 128-bit nonce); the daemon takes it on
@@ -646,7 +658,10 @@ accepted request is `recorded_not_executed` (`"executed": false`),
   (Medium), correctly signed requests refused by the replay fence
   `robot.agent.control_plane_request_fenced` (Low), connections refused or
   cut before they authenticated (a handshake flood, a slowloris, overload)
-  `robot.agent.control_plane_saturated` (Medium); all observe-only
+  `robot.agent.control_plane_saturated` (Medium), correctly signed
+  requests the robot could not check for replay (replay store not durable,
+  replay cache full, clock unreadable: a robot-side fault)
+  `robot.agent.control_plane_replay_unavailable` (Medium); all observe-only
   self-health, rate-limited by `health_report_ms`. The API is not an input: a quiet SOC never makes the
   state `unknown`.
 - **Sockets.** Every unix socket of the daemon (events, safety feed, host
@@ -850,7 +865,7 @@ finding):
 | `robot.agent.credential_expiring` | Medium at `credential_warn_days` (14) or less before the control plane's certificate `notAfter` or a CRL's `nextUpdate`; High at `credential_critical_days` (3) or less, or expired | per credential on each escalation, then daily |
 | `robot.agent.clock_unsynced` | Medium | `adjtimex(2)` reports the clock unsynchronised for `clock_unsynced_grace_ms` (5 min); once per episode |
 | `robot.agent.clock_jump` | High | the agent's time guard saw the wall clock jump against the monotonic clock (> 1 s); at most every `health_report_ms` |
-| `robot.agent.disk_low` | Medium below `disk_warn_percent` (10 %) free, High below `disk_critical_percent` (3 %) | per filesystem (black box, spool, control-plane state) on each escalation, before `spool_full` / `evidence_degraded` |
+| `robot.agent.disk_low` | Medium below `disk_warn_percent` (10 %) free, High below `disk_critical_percent` (3 %) | per filesystem (black box, spool, control-plane state) on each escalation, before `spool_full` / `evidence_degraded`; re-armed only once free space is 1 percentage point above the threshold (no flood while it hovers there) |
 | `robot.agent.executor_unreachable` | High | executor v1 has not answered its event poll for `executor_unreachable_ms` (30 s); once per outage |
 | `robot.agent.evidence_retention_pressure` | Medium; High from 95 % | unexported black-box segments reach `blackbox.retention.warn_percent` of the capacity (pending-export reserve or saturation mode); once per episode (`src/retention.rs`) |
 | `robot.agent.evidence_unexported_dropped` | High with a pending-export reserve; Medium on plain cyclic retention | cyclic retention dropped segments no export had confirmed; plain cyclic only when `blackbox.retention.export` is `expected`, or `auto` once an export cursor exists, at most once a day |

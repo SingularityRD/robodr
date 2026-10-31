@@ -75,7 +75,11 @@
 //!   authenticated invalid requests as `robot.agent.control_plane_invalid`
 //!   (Medium), correctly signed requests refused by the replay fence as
 //!   `robot.agent.control_plane_request_fenced` (Low; not an
-//!   authentication failure), and connections refused or cut before they
+//!   authentication failure), correctly signed requests the robot could not
+//!   check for replay (its replay store not durable, its replay cache full,
+//!   its clock unreadable: a robot-side fault, not an authentication
+//!   failure) as `robot.agent.control_plane_replay_unavailable` (Medium),
+//!   and connections refused or cut before they
 //!   authenticated (a full listener: a handshake flood, a slowloris or
 //!   legitimate overload) as `robot.agent.control_plane_saturated`
 //!   (Medium). A cut handshake is not an authentication failure, so a
@@ -703,6 +707,11 @@ pub struct Counters {
     /// Correctly signed requests refused by the replay fence
     /// ([`AuthFailure::Fenced`]; not in `unauthenticated`).
     pub fenced: AtomicU64,
+    /// Correctly signed requests refused because the robot could not check
+    /// them for replay: [`AuthFailure::ReplayStoreUnavailable`],
+    /// [`AuthFailure::ReplayCacheFull`], [`AuthFailure::ClockUnavailable`]
+    /// (a robot-side fault; not in `unauthenticated`).
+    pub replay_unavailable: AtomicU64,
     /// Requests that could not be read (malformed, too large, timeout).
     pub malformed: AtomicU64,
     /// Failed authentications, TLS handshakes included.
@@ -718,9 +727,25 @@ pub struct Counters {
     /// Answers that could not be signed (sent as 500, unsigned).
     pub answer_sign_failures: AtomicU64,
     last_auth_failure: Mutex<Option<String>>,
+    last_replay_unavailable: Mutex<Option<String>>,
 }
 
 impl Counters {
+    fn note_replay_unavailable(&self, why: String) {
+        self.replay_unavailable.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_replay_unavailable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(why);
+    }
+
+    pub fn last_replay_unavailable(&self) -> Option<String> {
+        self.last_replay_unavailable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn note_auth_failure(&self, why: String) {
         self.unauthenticated.fetch_add(1, Ordering::Relaxed);
         *self
@@ -808,6 +833,7 @@ pub struct ControlStatus {
     pub connections_rejected: u64,
     pub connections_evicted: u64,
     pub fenced: u64,
+    pub replay_unavailable: u64,
     pub malformed: u64,
     pub unauthenticated: u64,
     pub tls_failures: u64,
@@ -1264,6 +1290,7 @@ impl ControlPlane {
             connections_rejected: g(&c.connections_rejected),
             connections_evicted: g(&c.connections_evicted),
             fenced: g(&c.fenced),
+            replay_unavailable: g(&c.replay_unavailable),
             malformed: g(&c.malformed),
             unauthenticated: g(&c.unauthenticated),
             tls_failures: g(&c.tls_failures),
@@ -2072,8 +2099,21 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared, slot: &mut Slot) 
     if let Err(f) = auth::verify(&req, &creds, &sh.keys, &sh.robot_id) {
         return fail(&mut s, f);
     }
+    // From here on the signature is good: a refusal the robot causes (its
+    // clock, its replay store) is a robot-side fault, not an
+    // authentication failure (review 2, M5).
+    let unavailable = |s: &mut S, f: AuthFailure| {
+        c.note_replay_unavailable(format!(
+            "{} ({} {}) from key {}",
+            f.code(),
+            req.method,
+            robodr_ros2_pipeline::sanitize(&req.target),
+            robodr_ros2_pipeline::sanitize(&creds.key_id)
+        ));
+        send(s, f.status(), &api::error_body(f.code(), &f.message()), &[]);
+    };
     let Some(now_s) = wall_s() else {
-        return fail(&mut s, AuthFailure::ClockUnavailable);
+        return unavailable(&mut s, AuthFailure::ClockUnavailable);
     };
     let checked = sh
         .replay
@@ -2094,6 +2134,11 @@ fn serve<S: http::Stream>(mut s: S, peer: String, sh: &Shared, slot: &mut Slot) 
             );
             return;
         }
+        Err(
+            f @ (AuthFailure::ReplayStoreUnavailable
+            | AuthFailure::ReplayCacheFull
+            | AuthFailure::ClockUnavailable),
+        ) => return unavailable(&mut s, f),
         Err(f) => return fail(&mut s, f),
     }
     c.authenticated.fetch_add(1, Ordering::Relaxed);
@@ -2538,6 +2583,142 @@ fn evidence_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An in-memory connection: the request bytes in, the answer out.
+    struct Fake {
+        input: std::io::Cursor<Vec<u8>>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Fake {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(b)
+        }
+    }
+
+    impl std::io::Write for Fake {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.out.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl http::Stream for Fake {
+        fn set_read_deadline(&self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn shared_with(replay: ReplayGuard) -> Arc<Shared> {
+        let soc = robodr_blackbox::Ed25519SigningKey::from_seed("soc-1", &[7; 32]).unwrap();
+        let (tx, _) = sync_channel(1);
+        Arc::new(Shared {
+            robot_id: "ugv-1".into(),
+            keys: vec![SocKey {
+                key_id: "soc-1".into(),
+                public: soc.public_key(),
+            }],
+            replay: Arc::new(Mutex::new(replay)),
+            rate: Mutex::new(RateLimiter::new(600, 100)),
+            chunk_rate: Mutex::new(RateLimiter::new(600, 100)),
+            counters: Arc::new(Counters::default()),
+            calls: tx,
+            answer_signer: Mutex::new(Box::new(
+                robodr_blackbox::Ed25519SigningKey::from_seed("answer", &[9; 32]).unwrap(),
+            )),
+            answer_timeout: Duration::from_millis(10),
+            tcp_slots: TcpSlots::new(1, 1),
+            unix_active: AtomicUsize::new(1),
+            stop: Arc::new(AtomicBool::new(false)),
+            evidence: None,
+        })
+    }
+
+    /// Serve one request signed by `soc-1` (or with a bad signature);
+    /// returns the answer's status line.
+    fn serve_one(sh: &Arc<Shared>, nonce: &str, good: bool) -> String {
+        let soc = robodr_blackbox::Ed25519SigningKey::from_seed("soc-1", &[7; 32]).unwrap();
+        let ts = wall_s().unwrap();
+        let target = "/api/v2/robots/ugv-1";
+        let sig = if good {
+            let m = auth::signing_message("GET", target, "ugv-1", "soc-1", ts, nonce, b"");
+            robodr_blackbox::crypto::to_hex(&soc.sign_message(&m))
+        } else {
+            "00".repeat(64)
+        };
+        let raw = format!(
+            "GET {target} HTTP/1.1\r\nHost: robot\r\nContent-Length: 0\r\n\
+             X-RoboDR-Key-Id: soc-1\r\nX-RoboDR-Timestamp: {ts}\r\nX-RoboDR-Nonce: {nonce}\r\n\
+             X-RoboDR-Signature: {sig}\r\n\r\n"
+        );
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let s = Fake {
+            input: std::io::Cursor::new(raw.into_bytes()),
+            out: out.clone(),
+        };
+        sh.unix_active.fetch_add(1, Ordering::SeqCst);
+        let mut slot = Slot::Unix(sh.clone());
+        serve(s, "test".into(), sh, &mut slot);
+        let out = String::from_utf8_lossy(&out.lock().unwrap()).to_string();
+        out.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// Review 2, M5: a correctly signed request the robot cannot check for
+    /// replay (its replay store not durable, its cache full of live pairs)
+    /// was counted as an authentication failure and raised the High
+    /// `control_plane_unauthenticated` ("someone without a SOC key...")
+    /// while the storage fault itself was never reported. It is counted in
+    /// `replay_unavailable` now; a bad signature still is an
+    /// authentication failure.
+    #[test]
+    fn robot_side_replay_faults_are_not_authentication_failures() {
+        // A cache of one, already holding a live pair: full.
+        let now = wall_s().unwrap();
+        let mut g = ReplayGuard::new(30, 1);
+        g.check("soc-1", "nonce-prefill-000000", now, now).unwrap();
+        let sh = shared_with(g);
+        let line = serve_one(&sh, "nonce-aaaaaaaaaaaaaaaa", true);
+        assert!(line.contains(" 503 "), "{line}");
+        let c = &sh.counters;
+        assert_eq!(c.replay_unavailable.load(Ordering::Relaxed), 1);
+        assert_eq!(c.unauthenticated.load(Ordering::Relaxed), 0);
+        assert!(c
+            .last_replay_unavailable()
+            .is_some_and(|m| m.contains("replay_cache_full") && m.contains("soc-1")));
+        assert!(c.last_auth_failure().is_none());
+        let line = serve_one(&sh, "nonce-bbbbbbbbbbbbbbbb", false);
+        assert!(line.contains(" 401 "), "{line}");
+        assert_eq!(c.unauthenticated.load(Ordering::Relaxed), 1);
+        assert_eq!(c.replay_unavailable.load(Ordering::Relaxed), 1);
+
+        // A replay store that cannot make the pair durable (a full disk,
+        // an fsync error): the same.
+        let d = std::env::temp_dir().join(format!("robodr-cp-m5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (g, _) = ReplayGuard::persistent(
+            &d,
+            30,
+            100,
+            now - 500,
+            &crate::control::journal::tests::sealing(),
+        )
+        .unwrap();
+        let sh = shared_with(g);
+        crate::control::fsutil::fault::arm("survive.journal.append.short_write", 1);
+        let line = serve_one(&sh, "nonce-cccccccccccccccc", true);
+        assert!(line.contains(" 503 "), "{line}");
+        assert_eq!(sh.counters.replay_unavailable.load(Ordering::Relaxed), 1);
+        assert_eq!(sh.counters.unauthenticated.load(Ordering::Relaxed), 0);
+        assert!(sh
+            .counters
+            .last_replay_unavailable()
+            .is_some_and(|m| m.contains("replay_store_unavailable")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// Review finding 9: `%XX` takes two hex digits only; a sign
     /// (`from_str_radix` accepts a leading `+`) is not one.

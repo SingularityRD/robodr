@@ -890,6 +890,25 @@ fn executor_states_survive_a_restart() {
     finish(stop, h);
     // One request note each; the restarts judged nothing again.
     assert_eq!(notes(&s.blackbox, "robodr.control_plane_request").len(), 2);
+    // Review 2, M6: every start polled the executor's retained events from
+    // 0 and recorded (and reported) them again. The head note now carries
+    // the last event recorded and the next start resumes after it: each
+    // event is in the black box once.
+    let evs = notes(&s.blackbox, "robodr.executor_event");
+    let mut seqs: Vec<u64> = evs
+        .iter()
+        .map(|e| e["event"]["seq"].as_u64().unwrap())
+        .collect();
+    assert!(seqs.len() >= 3, "{evs:?}");
+    let n = seqs.len();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs.len(), n, "an executor event recorded twice: {evs:?}");
+    let heads = notes(&s.blackbox, "robodr.executor_journal_head");
+    assert!(
+        heads.iter().any(|h| h["processed_seq"].as_u64().is_some()),
+        "{heads:?}"
+    );
 }
 
 #[test]

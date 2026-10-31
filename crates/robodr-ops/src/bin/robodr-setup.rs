@@ -24,10 +24,20 @@ usage:
 
 ROLE: robot | unitree-edu | unitree-sensor-box | soc-relay
 KIND: blackbox | finding | uplink | diode   (default: blackbox; soc-relay: uplink)
-Defaults: --keys-dir /etc/robodr/keys, --examples /usr/share/doc/robodr/examples,
+Defaults: --keys-dir /etc/robodr/keys, --examples /usr/share/robodr/examples
+          (then /usr/share/doc/robodr/examples),
           --out /etc/robodr/agentd.json, --state-dir /var/lib/robodr, --min-free-mib 2048.
-init = preflight (stops on FAIL) + keys + config + fingerprints. Nothing existing is
-ever overwritten. Exit: 0 ok, 1 a check failed or an error, 2 usage.";
+init = preflight (stops on FAIL) + keys + config + fingerprints; the config template is
+read before any key is generated. Nothing existing is ever overwritten.
+Exit: 0 ok, 1 a check failed or an error, 2 usage.";
+
+/// Where the agentd templates are looked for without `--examples`: the
+/// package's own copy (kept on minimal images, which drop /usr/share/doc),
+/// then the documentation examples.
+const EXAMPLE_DIRS: [&str; 2] = [
+    "/usr/share/robodr/examples",
+    "/usr/share/doc/robodr/examples",
+];
 
 enum Fail {
     Usage(String),
@@ -234,22 +244,44 @@ fn cmd_keys(raw: &[String]) -> Result<bool, Fail> {
     Ok(true)
 }
 
+/// The role's agentd template (`None`: the role has no agentd): from
+/// `--examples`, or the first of [`EXAMPLE_DIRS`] that has it.
+fn read_example(a: &Args, root: &Path, role: Role) -> Result<Option<String>, Fail> {
+    let Some(example) = role.agentd_example() else {
+        return Ok(None);
+    };
+    let dirs: Vec<String> = match a.one("examples")? {
+        Some(_) => vec![abs(a, "examples", "")?],
+        None => EXAMPLE_DIRS.iter().map(|d| d.to_string()).collect(),
+    };
+    let mut tried = Vec::new();
+    for d in &dirs {
+        let src = robodr_ops::rooted(root, &format!("{d}/{example}"));
+        match std::fs::read_to_string(&src) {
+            Ok(t) => return Ok(Some(t)),
+            Err(e) => tried.push(format!("{d}/{example}: {e}")),
+        }
+    }
+    Err(Fail::Run(format!(
+        "the agentd template for this role is missing ({}); reinstall the robodr package, or \
+         give --examples DIR",
+        tried.join("; ")
+    )))
+}
+
 fn do_config(
     a: &Args,
     root: &Path,
     role: Role,
+    text: Option<String>,
 ) -> Result<Option<(String, bool, Vec<String>)>, Fail> {
-    let Some(example) = role.agentd_example() else {
+    let Some(text) = text else {
         return Ok(None);
     };
     let unit = a
         .one("unit-id")?
         .ok_or_else(|| "--unit-id is required".to_string())?;
-    let examples = abs(a, "examples", "/usr/share/doc/robodr/examples")?;
     let out = abs(a, "out", "/etc/robodr/agentd.json")?;
-    let src = robodr_ops::rooted(root, &format!("{examples}/{example}"));
-    let text = std::fs::read_to_string(&src)
-        .map_err(|e| Fail::Run(format!("{examples}/{example}: {e}")))?;
     let req = ConfigRequest {
         role,
         unit_id: unit.to_string(),
@@ -298,7 +330,9 @@ fn cmd_config(raw: &[String]) -> Result<bool, Fail> {
     )?;
     no_positional(&a)?;
     let root = root(&a)?;
-    let r = do_config(&a, &root, role(&a, true)?)?;
+    let role = role(&a, true)?;
+    let text = read_example(&a, &root, role)?;
+    let r = do_config(&a, &root, role, text)?;
     print_config(&r);
     Ok(true)
 }
@@ -383,8 +417,11 @@ fn cmd_init(raw: &[String]) -> Result<bool, Fail> {
         }
         return Ok(false);
     }
+    // The template first: a missing one must fail before any key exists
+    // (review 2, L18: init used to generate the keys and then fail).
+    let template = read_example(&a, &root, role)?;
     let keys = do_keys(&a, &root, role)?;
-    let cfg = do_config(&a, &root, role)?;
+    let cfg = do_config(&a, &root, role, template)?;
     let keys_dir = abs(&a, "keys-dir", "/etc/robodr/keys")?;
     let fps = setup::fingerprints(&root, &keys_dir).map_err(Fail::Run)?;
     if a.flag("json") {

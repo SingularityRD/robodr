@@ -97,9 +97,9 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-255 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+256 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (29)
+### `robot.agent.*` (30)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -107,6 +107,7 @@ correlation entry.
 | `robot.agent.clock_unsynced` | Robot clock not synchronised | `robodr_agent` | — | 2.5 |
 | `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | `robodr_agent` | — | 1.3 |
+| `robot.agent.control_plane_replay_unavailable` | Control-plane request refused: replay check unavailable | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_saturated` | Control-plane connections refused or cut before authentication | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | `robodr_agent` | — | 2.4 |
