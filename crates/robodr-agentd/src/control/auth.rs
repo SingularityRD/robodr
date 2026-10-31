@@ -107,6 +107,15 @@ impl KeyScope {
         }
     }
 
+    /// No action at all: what a key without an installed scope gets (fail
+    /// closed; agentd installs one per configured key).
+    pub fn nothing() -> Self {
+        Self {
+            allowed_actions: Some(std::collections::BTreeSet::new()),
+            max_ttl_seconds: 0,
+        }
+    }
+
     pub fn allows(&self, action: super::api::ActionKind) -> bool {
         self.allowed_actions
             .as_ref()
@@ -146,7 +155,7 @@ impl KeyScope {
         }
     }
 
-    /// A request (new, or the one a revert lifts) for `action` by this key.
+    /// A new request for `action` by this key.
     pub fn check_action(
         &self,
         key_id: &str,
@@ -159,13 +168,30 @@ impl KeyScope {
             403,
             "action_not_permitted",
             format!(
-                "SOC key {:?} may not request or revert {} (control_plane.soc_keys \
+                "SOC key {:?} may not request {} (control_plane.soc_keys \
                  allowed_actions: {})",
                 robodr_ros2_pipeline::sanitize(key_id),
                 action.as_str(),
                 self.actions().join(", ")
             ),
         ))
+    }
+}
+
+impl KeyScope {
+    /// The refusal of a revert outside the key's actions. It names neither
+    /// the stored request's action nor the key's scope: the request may be
+    /// another key's.
+    pub fn revert_not_permitted(key_id: &str) -> super::api::ApiError {
+        super::api::ApiError::new(
+            403,
+            "action_not_permitted",
+            format!(
+                "SOC key {:?} may not revert this request: its action is outside the key's \
+                 control_plane.soc_keys allowed_actions",
+                robodr_ros2_pipeline::sanitize(key_id)
+            ),
+        )
     }
 }
 

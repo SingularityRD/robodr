@@ -1285,9 +1285,11 @@ pub struct Engine {
     /// every unknown id is refused when the black box could not be read.
     lost_ids: std::collections::HashSet<String>,
     refuse_new: Option<String>,
-    /// Per-key action scopes and TTL limits (T67); a key not listed here
-    /// is unrestricted (unit tests; agentd lists every configured key).
-    scopes: std::collections::BTreeMap<String, super::auth::KeyScope>,
+    /// Per-key action scopes and TTL limits (T67). `None` (scopes never
+    /// installed: unit tests) is unrestricted; once installed (agentd
+    /// always installs one per configured key), a key missing from the
+    /// map may ask for nothing (fail closed).
+    scopes: Option<std::collections::BTreeMap<String, super::auth::KeyScope>>,
     pub stats: EngineStats,
 }
 
@@ -1315,7 +1317,7 @@ impl Engine {
             journal: None,
             lost_ids: std::collections::HashSet::new(),
             refuse_new: None,
-            scopes: std::collections::BTreeMap::new(),
+            scopes: None,
             stats: EngineStats::default(),
         }
     }
@@ -1325,11 +1327,17 @@ impl Engine {
         &mut self,
         scopes: std::collections::BTreeMap<String, super::auth::KeyScope>,
     ) {
-        self.scopes = scopes;
+        self.scopes = Some(scopes);
     }
 
     fn scope(&self, key_id: &str) -> super::auth::KeyScope {
-        self.scopes.get(key_id).cloned().unwrap_or_default()
+        match &self.scopes {
+            None => super::auth::KeyScope::unrestricted(),
+            Some(m) => m
+                .get(key_id)
+                .cloned()
+                .unwrap_or_else(super::auth::KeyScope::nothing),
+        }
     }
 
     /// Record and answer a call refused before judgment (an invalid body,
@@ -1778,8 +1786,11 @@ impl Engine {
         let Some(action) = self.store.get(id).map(|s| s.request.action) else {
             return Answer::error(&unknown_request());
         };
-        // T67: a key may lift only what it may ask for.
-        if let Err(e) = self.scope(&meta.key_id).check_action(&meta.key_id, action) {
+        // T67: a key may lift only what it may ask for. The id was looked
+        // up first (an unknown id is 404), so the refusal does not name the
+        // stored request's action (GET is not scoped and shows it anyway).
+        if !self.scope(&meta.key_id).allows(action) {
+            let e = super::auth::KeyScope::revert_not_permitted(&meta.key_id);
             return self.reject(&e, meta, host);
         }
         let Some(s) = self.store.get(id) else {
@@ -2925,7 +2936,17 @@ mod tests {
             ),
             max_ttl_seconds: 600,
         };
-        e.set_key_scopes([("tier1".to_string(), tier1)].into_iter().collect());
+        e.set_key_scopes(
+            [
+                ("tier1".to_string(), tier1),
+                (
+                    "soc-1".to_string(),
+                    super::super::auth::KeyScope::unrestricted(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
         let t1 = Meta {
             key_id: "tier1".into(),
             ..Meta::default()
@@ -2984,6 +3005,10 @@ mod tests {
             (a.status, a.body["error"]["code"].as_str()),
             (403, Some("action_not_permitted"))
         );
+        // The refusal does not tell the scoped key what the other key's
+        // request asks for.
+        let msg = a.body["error"]["message"].as_str().unwrap();
+        assert!(!msg.contains("restrict_motion"), "{msg}");
         assert_eq!(e.stats.reverts, 0);
         // Its own action it may revert.
         let a = e.handle(&rv(&ok.request_id), &t1, &mut h);
@@ -3008,6 +3033,41 @@ mod tests {
             7
         );
         assert_eq!(a.body["key_scope"]["max_ttl_seconds"], MAX_TTL_SECONDS);
+    }
+
+    /// Review of T67: a key missing from the installed scopes used to be
+    /// unrestricted (fail open). agentd installs one scope per configured
+    /// key, but a key without one now may ask for nothing.
+    #[test]
+    fn a_key_without_an_installed_scope_may_ask_for_nothing() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        // Scopes never installed (unit tests): unrestricted.
+        let a = e.handle(
+            &Call::Submit(req("isolate_network", json!({}), Some(60))),
+            &meta(),
+            &mut h,
+        );
+        assert_eq!(a.status, 200, "{}", a.body);
+        // Installed for another key only: soc-1 is refused, never judged.
+        e.set_key_scopes(
+            [(
+                "other".to_string(),
+                super::super::auth::KeyScope::unrestricted(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut r = req("record_evidence", json!({}), None);
+        r.request_id = "robot_x:ugv-007:00000000000000fe".into();
+        let a = e.handle(&Call::Submit(r), &meta(), &mut h);
+        assert_eq!(
+            (a.status, a.body["error"]["code"].as_str()),
+            (403, Some("action_not_permitted"))
+        );
+        assert_eq!(e.stats.submitted, 1);
+        let a = e.handle(&Call::Robot, &meta(), &mut h);
+        assert_eq!(a.body["key_scope"]["allowed_actions"], json!([]));
     }
 
     #[test]
