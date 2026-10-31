@@ -129,7 +129,10 @@ the enrollment. The black-box key stays until step 8.
 * `--reason`: `end_of_life`, `transfer` or `repair`.
 * Air-gapped unit: `--request-out FILE`, carry it to the SOC, import it
   there, carry the answer back, `robodr-enroll decommission --answer FILE
-  --receipt-out FILE`.
+  --receipt-out FILE`. The request file has no expiry: whoever imports it
+  retires the unit's keys. Keep it in custody like the evidence export
+  and delete it from the media once the answer is back (fleet-api §5.6,
+  "Request age and request files").
 * Network down or no answer: run the same command again; the stored
   request is resent unchanged and the SOC answers with its stored answer.
   A request that may have reached the SOC is never dropped on the unit.
