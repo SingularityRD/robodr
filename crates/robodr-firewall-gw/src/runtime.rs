@@ -137,12 +137,45 @@ pub fn load_with_provenance(
             cfg.firewall.display()
         ));
     }
+    // Sales-readiness T11 (review WP6): a trusted profile that binds a
+    // `motion_firewall` file names the one envelope it was commissioned
+    // with. Another file signed for the same profile (an older or a lab
+    // envelope) is refused in enforce mode and noted in observe mode. A
+    // profile that binds none relies on the signature above alone.
+    if accepted.is_some() {
+        if let Err(e) = bound_firewall(&profile, &text) {
+            let why = format!("{}: {e}", cfg.firewall.display());
+            if cfg.mode == GatewayMode::Enforce {
+                return Err(format!("{why} (enforce refused)"));
+            }
+            notes.push(format!("{why}; enforce mode would refuse it"));
+        }
+    }
     let prov = crate::summary::Provenance {
         config_sha256: cfg.source_sha256.clone(),
         firewall_sha256: Some(robodr_commission::trust::file_digest(text.as_bytes())),
         profile_sha256,
     };
     Ok((profile, fw, notes, prov))
+}
+
+/// The firewall configuration `text` against the profile's
+/// `motion_firewall` binding: `Ok` when the profile binds none or binds
+/// exactly these bytes.
+fn bound_firewall(
+    profile: &Profile,
+    text: &str,
+) -> Result<(), robodr_commission::trust::bound::BindingRefusal> {
+    use robodr_commission::trust::bound::{bytes_digest, check_binding, ROLE_MOTION_FIREWALL};
+    if !profile.bound_config.contains_key(ROLE_MOTION_FIREWALL) {
+        return Ok(());
+    }
+    check_binding(
+        profile,
+        ROLE_MOTION_FIREWALL,
+        &bytes_digest(text.as_bytes()),
+    )
+    .map(|_| ())
 }
 
 /// Sales-readiness T11: `<firewall>.sig` (`robodr-firewall-config-sig/v1`,

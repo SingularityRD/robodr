@@ -419,7 +419,7 @@ chain:
 |---|---|---|
 | `response_policy` | the response policy (`oem_validated`, morphology, safe behaviour) | agentd, executor |
 | `executor_motion` | the `motion` section of `executor.json` (adapters and their `oem_validated`), canonical JSON | executor |
-| `motion_firewall` | the gateway's Motion Firewall file (`firewall.json`: envelopes, `allowed_sources`) | robodr-firewall-gw (pending, WP11) |
+| `motion_firewall` | the gateway's Motion Firewall file (`firewall.json`: envelopes, `allowed_sources`) | robodr-firewall-gw (when bound; its signature is checked either way) |
 | `joint_firewall` | agentd's `firewall.joint_config` | agentd |
 
 ```sh
@@ -477,14 +477,23 @@ What the unit does (fail closed):
   at a restart, which prints the UNSIGNED warning again when the section
   is gone. Someone who can edit `executor.json` *and* restart the
   executor can still drop to unsigned flags; making the section mandatory
-  is an open product decision. When a re-read's notes differ from the
-  previous ones (a binding lost or regained, the section changed), the
-  executor logs them and journals a `reconciled` event that agentd
-  receives. A profile accepted under a lab-only trust file (`poc-init`)
-  makes the executor print the LAB-ONLY banner at start too.
-* **gateway** (`motion_firewall`): `trust::bound::verify_bindings` is the
-  call; refusing `enforce` on an unbound file belongs to the gateway work
-  package (WP11) and is not in this change.
+  is an open product decision. The executor journals each note as a
+  `commissioning` event at start, and again whenever a re-read's notes
+  differ from the previous ones (a binding lost or regained, the section
+  changed). With the executor link, agentd raises a High
+  `robot.agent.config_unattested` for a flag the executor does not honour
+  and for a section removed or changed at runtime, and for the UNSIGNED
+  warning when its trusted profile binds `response_policy` or
+  `executor_motion` (so a restart without the section on a unit
+  commissioned with signed flags is reported, not only printed). A
+  profile accepted under a lab-only trust file (`poc-init`) makes the
+  executor print the LAB-ONLY banner at start too (journalled, no
+  finding).
+* **gateway** (`motion_firewall`): in `enforce` mode its firewall file
+  must be signed for the accepted profile (`sign-firewall`) and, when the
+  profile binds a `motion_firewall` file, be that file; otherwise the
+  gateway does not start (`observe` mode warns). A profile that binds no
+  `motion_firewall` is not refused for that: the signature alone decides.
 
 **Upgrade note.** After this change a unit whose profile does not bind its
 policy runs observe-only even if the policy says `oem_validated: true`.

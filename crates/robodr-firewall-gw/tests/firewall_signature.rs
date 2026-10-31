@@ -38,7 +38,18 @@ fn tmpdir(tag: &str) -> PathBuf {
 /// A locked, signed G1 profile, its trust file and the G1 example
 /// firewall configuration (unsigned).
 fn site(dir: &Path) -> Site {
+    site_binding(dir, None)
+}
+
+/// [`site`] with a profile that binds `bound` as its `motion_firewall`.
+fn site_binding(dir: &Path, bound: Option<String>) -> Site {
     let mut p = profile(Fixture::G1);
+    if let Some(d) = bound {
+        p.bound_config.insert(
+            robodr_commission::trust::bound::ROLE_MOTION_FIREWALL.into(),
+            d,
+        );
+    }
     p.metadata = Some(ProfileMetadata {
         schema_version: PROFILE_SCHEMA_VERSION,
         profile_version: 3,
@@ -127,6 +138,43 @@ fn enforce_needs_the_envelope_signed_for_the_profile() {
         notes
             .iter()
             .any(|n| n.contains("enforce mode would refuse")),
+        "{notes:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review WP6 (T11 gateway part): a profile that binds a `motion_firewall`
+/// file accepts only that envelope. Before, a second envelope the same key
+/// signed for the same profile (an older or a lab one) was enforced.
+#[test]
+fn enforce_needs_the_bound_envelope_when_the_profile_binds_one() {
+    use robodr_commission::trust::bound::bytes_digest;
+    let dir = tmpdir("bound");
+    let example =
+        std::fs::read_to_string(config_dir().join("firewall.unitree-g1.example.json")).unwrap();
+    // The profile binds the example envelope: signed and bound, accepted.
+    let s = site_binding(&dir, Some(bytes_digest(example.as_bytes())));
+    sign(&s, &s.profile_digest, &key("oem", 3));
+    load_with_provenance(&s.cfg).unwrap();
+
+    // Another envelope, validly signed for this profile by its key, but not
+    // the bound one: refused in enforce mode.
+    let widened = example.replace("\"max_dq_step\": 0.15", "\"max_dq_step\": 3.0");
+    assert_ne!(widened, example, "fixture has max_dq_step");
+    std::fs::write(&s.firewall, &widened).unwrap();
+    sign(&s, &s.profile_digest, &key("oem", 3));
+    let e = load_with_provenance(&s.cfg).map(|_| ()).unwrap_err();
+    assert!(
+        e.contains("motion_firewall") && e.contains("enforce refused"),
+        "{e}"
+    );
+
+    // Observe mode starts, with a note.
+    let mut obs = s.cfg.clone();
+    obs.mode = GatewayMode::Observe;
+    let (_, _, notes, _) = load_with_provenance(&obs).unwrap();
+    assert!(
+        notes.iter().any(|n| n.contains("motion_firewall")),
         "{notes:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
