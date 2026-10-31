@@ -252,6 +252,126 @@ fn bound_policy_and_executor_motion_are_honoured_only_as_signed() {
     let _ = std::fs::remove_dir_all(&c.d);
 }
 
+/// Review (WP6): binding in steps with `--signoff` (the policy first, the
+/// executor's motion section with the first run's list) kept only the
+/// items of the last run, so `lock` refused the list (RequiredItemMissing).
+#[test]
+fn bind_in_steps_keeps_the_earlier_binding_items() {
+    let c = chain();
+    let pol = c.d.join("response-policy.json");
+    std::fs::write(&pol, policy_text(true)).unwrap();
+    let exe = c.d.join("executor.json");
+    std::fs::write(&exe, EXECUTOR).unwrap();
+    let learned = PathBuf::from(format!("{}.signoff.json", c.draft.display()));
+    let b1 = c.d.join("b1.json");
+    let o = run(&[
+        "bind",
+        "--in",
+        s(&c.draft),
+        "--out",
+        s(&b1),
+        "--signoff",
+        s(&learned),
+        "--response-policy",
+        s(&pol),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so1 = c.d.join("b1.json.signoff.json");
+    let b2 = c.d.join("b2.json");
+    let o = run(&[
+        "bind",
+        "--in",
+        s(&b1),
+        "--out",
+        s(&b2),
+        "--signoff",
+        s(&so1),
+        "--executor-config",
+        s(&exe),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so2 = c.d.join("b2.json.signoff.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&so2).unwrap()).unwrap();
+    let subjects: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "bound_config")
+        .map(|i| i["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+    assert!(subjects.iter().any(|s| s.starts_with("response_policy ")));
+    assert!(subjects.iter().any(|s| s.starts_with("executor_motion ")));
+
+    // Re-binding the same role replaces its item (no stale digest kept).
+    std::fs::write(&pol, policy_text(false)).unwrap();
+    let b3 = c.d.join("b3.json");
+    let o = run(&[
+        "bind",
+        "--in",
+        s(&b2),
+        "--out",
+        s(&b3),
+        "--signoff",
+        s(&so2),
+        "--response-policy",
+        s(&pol),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let so3 = c.d.join("b3.json.signoff.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&so3).unwrap()).unwrap();
+    let pol_items: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "bound_config")
+        .filter_map(|i| i["subject"].as_str())
+        .filter(|s| s.starts_with("response_policy "))
+        .collect();
+    assert_eq!(
+        pol_items,
+        vec![format!(
+            "response_policy {}",
+            bytes_digest(policy_text(false).as_bytes())
+        )]
+    );
+
+    // And the two-step list locks.
+    confirm(&so3, "alice [LAB-ONLY]");
+    let ops = c.poc.join("operators.json");
+    let o = run(&[
+        "signoff",
+        "--signoff",
+        s(&so3),
+        "--sign-key",
+        s(&c.poc.join("lab-only-operator.key")),
+        "--operators",
+        s(&ops),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let o = run(&[
+        "lock",
+        "--in",
+        s(&b3),
+        "--signoff",
+        s(&so3),
+        "--operators",
+        s(&ops),
+        "--out",
+        s(&c.d.join("locked.json")),
+        "--platform",
+        "ugv",
+        "--profile-version",
+        "1",
+        "--sign-key",
+        s(&c.poc.join("lab-only-profile.key")),
+    ]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let _ = std::fs::remove_dir_all(&c.d);
+}
+
 #[test]
 fn bind_refuses_invalid_files_and_locked_input() {
     let c = chain();

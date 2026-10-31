@@ -11,7 +11,8 @@ use robodr_commission::ops::{manifest_path_for, Manifest};
 use robodr_commission::profile_file::MAX_PROFILE_BYTES;
 use robodr_commission::report_html::{render, RenderInputs};
 use robodr_commission::signoff::{
-    bound_config_item, draft_digest, sha256_hex, signoff_sig_path, Signoff, BOUND_CONFIG_KIND,
+    bound_config_item, bound_config_subject, draft_digest, sha256_hex, signoff_sig_path, Signoff,
+    BOUND_CONFIG_KIND,
 };
 use robodr_commission::trust::bound::{
     digest_for_role, summarize, ROLE_EXECUTOR_MOTION, ROLE_JOINT_FIREWALL, ROLE_MOTION_FIREWALL,
@@ -154,10 +155,19 @@ pub(super) fn cmd_bind(argv: &[String]) -> Outcome {
                 )
                 .into());
             }
+            // Bindings of an earlier `bind` run that this run does not
+            // replace keep their items (review WP6: binding in steps lost
+            // them, and lock then refused the list).
+            let earlier: std::collections::BTreeSet<String> = p
+                .bound_config
+                .iter()
+                .filter(|(role, _)| !files.iter().any(|(r, _)| r == role))
+                .map(|(role, d)| bound_config_subject(role, d))
+                .collect();
             let mut kept: Vec<_> = so
                 .items
                 .into_iter()
-                .filter(|i| i.kind != BOUND_CONFIG_KIND)
+                .filter(|i| i.kind != BOUND_CONFIG_KIND || earlier.contains(&i.subject))
                 .collect();
             kept.extend(items);
             for i in &mut kept {
