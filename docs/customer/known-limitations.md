@@ -193,7 +193,12 @@
   deployed SOC. Every TLS path checks CRLs (fail closed, reloaded on
   change, since 2026-10-30); there is no OCSP (by design, for air-gapped
   fleets), so revocation is only as fresh as the CRL files the operator
-  installs, and there is no early warning before a CRL's `nextUpdate`.
+  installs. Early warnings before a CRL's `nextUpdate` or a certificate's
+  expiry: agentd raises `robot.agent.credential_expiring` for the control
+  plane's certificate and CRLs; `robodr-uplink`, `robodr-kafka-publish`,
+  `robodr-anchor-receiver` and `robodr-depot` only log them, and the
+  site-acceptance checks print the days left. The robot's remote head
+  anchor client and `robodr-deliverd` do not warn.
 - **Keys are files**, not TPM-held. The robot side of SOC-driven uplink
   and finding key rotation exists (`robodr-enroll`), and the SOC side is
   on an unreleased AutoSecOps branch. The black-box key is rotated with

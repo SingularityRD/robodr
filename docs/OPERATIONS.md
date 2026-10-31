@@ -1172,6 +1172,30 @@ loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and
 keep-alives), so a hung, still-alive pulsard is not restarted automatically.
 Monitor the findings and heartbeat flow on the fleet side.
 
+#### Health record and early warnings (`daemon.self_health`)
+
+Every `health_record_ms` (default 60 s; 0 switches it off, only for replay
+and tests) agentd sends one Low, observe-only `robot.agent.health`
+finding (findings contract 2.5, §3g), an Update of the same finding each
+time, carrying `entity_context.agent_health`: state and reasons,
+component and contract versions, per-input freshness and counters, spool
+and black-box counters, executor / gateway / pulsard reachability,
+credential expiry, clock and free disk space. A SOC rule "no health
+record from robot X for N periods" tells a silent robot from a quiet one.
+`status.json` `self_health` shows the same probes between records. Under
+a producer cap below 2.5 (`findings.max_contract_minor`, contract §5) the
+record is off.
+
+The early warnings, all observe-only (they never trigger a response):
+
+| Finding | Severity | When (setting, default) |
+|---|---|---|
+| `robot.agent.credential_expiring` | Medium; High | the control plane's server certificate or a CRL within `credential_warn_days` (14); within `credential_critical_days` (3) or expired |
+| `robot.agent.clock_unsynced` | Medium | the kernel reports the clock unsynchronised for `clock_unsynced_grace_ms` (5 min); never where `adjtimex(2)` is refused, as under the shipped unit (`docs/TIME-SYNC.md`) |
+| `robot.agent.clock_jump` | High | the wall clock jumped against the monotonic clock (> 1 s) |
+| `robot.agent.disk_low` | Medium; High | the black-box or spool filesystem below `disk_warn_percent` (10 %) free; below `disk_critical_percent` (3 %) |
+| `robot.agent.executor_unreachable` | High | the executor has not answered for `executor_unreachable_ms` (30 s) |
+
 #### Crashes and restarts (`panic = "abort"`)
 
 Release binaries are built with `panic = "abort"` (`Cargo.toml`,
