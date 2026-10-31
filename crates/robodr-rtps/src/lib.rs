@@ -201,8 +201,8 @@ mod testutil;
 
 pub use frag::{
     EvictionReason, FragmentEvent, FragmentEventKind, FragmentReassembler, ReassemblyLimits,
-    RejectReason, DEFAULT_MAX_SAMPLE_BYTES, DEFAULT_MAX_TOTAL_BYTES, HARD_MAX_PENDING_SAMPLES,
-    HARD_MAX_SAMPLE_BYTES,
+    RejectReason, DEFAULT_MAX_SAMPLE_BYTES, DEFAULT_MAX_TOTAL_BYTES,
+    DESTINATION_NO_SINGLE_RECEIVER, HARD_MAX_PENDING_SAMPLES, HARD_MAX_SAMPLE_BYTES,
 };
 pub use parse::{
     Anomaly, Attribution, DatagramReport, DiscoveryTopic, EndpointAlternate, EndpointInfo,

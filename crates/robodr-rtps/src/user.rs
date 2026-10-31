@@ -670,10 +670,10 @@ impl<'a> Walk<'a> {
             FragIn {
                 key: SampleKey {
                     source: address.writer_prefix(),
-                    destination: read_array(&address.reader, 0).unwrap_or_default(),
                     writer: address.writer_entity(),
                     sn: address.sequence_number as u64, // > 0, checked
                 },
+                destination: read_array(&address.reader, 0).unwrap_or_default(),
                 // The reassembler's tag type is the discovery topic; user
                 // samples are tagged with a placeholder that never leaves
                 // this module (events are converted, the tag dropped).
@@ -691,7 +691,7 @@ impl<'a> Walk<'a> {
         for e in &events {
             self.fragment_event(e);
         }
-        if let FragOutcome::Complete(buf, inline, key_only) = outcome {
+        if let FragOutcome::Complete(buf, inline, key_only, _) = outcome {
             self.report.stats.frag_completed = self.report.stats.frag_completed.saturating_add(1);
             if !self.room() {
                 return;

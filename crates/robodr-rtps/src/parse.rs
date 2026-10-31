@@ -931,10 +931,10 @@ impl Report {
             FragIn {
                 key: SampleKey {
                     source,
-                    destination,
                     writer,
                     sn: (u64::from(sn_hi) << 32) | u64::from(sn_lo),
                 },
+                destination,
                 topic,
                 start,
                 count,
@@ -952,7 +952,7 @@ impl Report {
         match outcome {
             // Both already reported through the fragment events.
             FragOutcome::Pending | FragOutcome::Rejected | FragOutcome::LateCopy => {}
-            FragOutcome::Complete(buf, inline, key_only) => {
+            FragOutcome::Complete(buf, inline, key_only, destination) => {
                 self.stats.frag_completed += 1;
                 self.handle_sample(Sample {
                     topic,

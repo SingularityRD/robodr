@@ -255,13 +255,21 @@ pub struct FragmentEvent {
     pub total_fragments: u32,
 }
 
-/// Identity of a sample being reassembled.
+/// Destination reported for a completed sample that no single receiver got
+/// whole: its fragments were addressed (INFO_DST) to different receivers.
+/// It is neither [`crate::GUIDPREFIX_UNKNOWN`] nor any receiver's prefix, so
+/// an enforcement point treats the sample as addressed elsewhere.
+pub const DESTINATION_NO_SINGLE_RECEIVER: [u8; 12] = [0xff; 12];
+
+/// Identity of a sample being reassembled. The INFO_DST destination is not
+/// part of it: a stack multicasts a sample's fragments to every receiver and
+/// resends a lost one to the reader that asked (Cyclone DDS answers a
+/// NACK_FRAG with INFO_DST), and both copies belong to the same sample. The
+/// destination of the completed sample is derived from its fragments'
+/// (see [`FragOutcome::Complete`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SampleKey {
     pub source: [u8; 12],
-    /// The INFO_DST destination in effect: fragments addressed to different
-    /// receivers are different samples (a receiver only sees its own).
-    pub destination: [u8; 12],
     pub writer: [u8; 4],
     pub sn: u64,
 }
@@ -270,6 +278,8 @@ pub(crate) struct SampleKey {
 /// submessage by the caller.
 pub(crate) struct FragIn<'a> {
     pub key: SampleKey,
+    /// The INFO_DST destination in effect for this DATA_FRAG.
+    pub destination: [u8; 12],
     pub topic: DiscoveryTopic,
     pub start: u32,
     pub count: u16,
@@ -286,8 +296,13 @@ pub(crate) enum FragOutcome {
     /// Stored; the sample is not complete yet.
     Pending,
     /// The sample is complete: its serialized payload, its inline QoS
-    /// readings (see the module docs) and whether it is a key-only sample.
-    Complete(Vec<u8>, InlineQos, bool),
+    /// readings (see the module docs), whether it is a key-only sample and
+    /// its destination: [`crate::GUIDPREFIX_UNKNOWN`] when every fragment
+    /// reached every receiver, the one receiver's prefix when the
+    /// fragments missing from that were all addressed to it, otherwise
+    /// [`DESTINATION_NO_SINGLE_RECEIVER`] (conservative: a fragment resent
+    /// to two readers makes the sample no single receiver's).
+    Complete(Vec<u8>, InlineQos, bool, [u8; 12]),
     /// Refused (see the [`FragmentEvent`] pushed alongside).
     Rejected,
     /// A fragment of a sample completed earlier (another reader's copy):
@@ -327,6 +342,12 @@ struct Pending {
     created: u64,
     /// Reassembler clock when a new fragment last arrived.
     last_progress: u64,
+    /// Fragments that arrived (any copy) addressed to every receiver.
+    to_every: Vec<u64>,
+    /// The receiver copies addressed to one receiver went to, and whether
+    /// they went to more than one.
+    to_one: Option<[u8; 12]>,
+    to_several: bool,
 }
 
 impl Pending {
@@ -677,7 +698,7 @@ impl FragmentReassembler {
                 // The whole sample in one submessage: complete it without
                 // touching the table, so it can neither evict nor be evicted.
                 self.completed += 1;
-                return FragOutcome::Complete(data.to_vec(), f.inline, f.key_only);
+                return FragOutcome::Complete(data.to_vec(), f.inline, f.key_only, f.destination);
             }
             None => {
                 if self.limits.max_pending_samples == 0 || self.limits.max_pending_per_source == 0 {
@@ -707,6 +728,9 @@ impl FragmentReassembler {
                     key_only: f.key_only,
                     created: self.created,
                     last_progress: self.clock,
+                    to_every: vec![0; words],
+                    to_one: None,
+                    to_several: false,
                 });
                 self.total += cost;
                 self.pending.len() - 1
@@ -722,7 +746,20 @@ impl FragmentReassembler {
         let mut conflict = false;
         let mut progressed = false;
         let delivers_head = first == 0 && !p.has(0);
+        let to_every = f.destination == crate::parse::GUIDPREFIX_UNKNOWN;
+        if !to_every {
+            match p.to_one {
+                None => p.to_one = Some(f.destination),
+                Some(d) if d != f.destination => p.to_several = true,
+                Some(_) => {}
+            }
+        }
         for n in first..last {
+            if to_every {
+                if let Some(word) = p.to_every.get_mut(n / 64) {
+                    *word |= 1 << (n % 64);
+                }
+            }
             let lo = n * frag_size - offset;
             let hi = ((n + 1) * frag_size).min(sample_size) - offset;
             let have = p.has(n);
@@ -807,7 +844,17 @@ impl FragmentReassembler {
                 inline: p.inline,
                 payload: p.buf.clone(),
             });
-            return FragOutcome::Complete(p.buf, inline, p.key_only);
+            let every = (0..p.nfrags as usize).all(|n| {
+                p.to_every
+                    .get(n / 64)
+                    .is_some_and(|w| w & (1 << (n % 64)) != 0)
+            });
+            let destination = match (every, p.to_one, p.to_several) {
+                (true, _, _) | (false, None, _) => crate::parse::GUIDPREFIX_UNKNOWN,
+                (false, Some(d), false) => d,
+                (false, Some(_), true) => DESTINATION_NO_SINGLE_RECEIVER,
+            };
+            return FragOutcome::Complete(p.buf, inline, p.key_only, destination);
         }
         FragOutcome::Pending
     }
@@ -820,7 +867,6 @@ mod tests {
     fn key_from(source: [u8; 12], sn: u64) -> SampleKey {
         SampleKey {
             source,
-            destination: [0; 12],
             writer: [0, 0, 3, 0xc2],
             sn,
         }
@@ -837,6 +883,7 @@ mod tests {
     ) -> FragIn<'a> {
         FragIn {
             key: key_from(source, sn),
+            destination: [0; 12],
             topic: DiscoveryTopic::Publications,
             start,
             count,
@@ -872,7 +919,7 @@ mod tests {
                 let hi = (lo + 100).min(250);
                 match add(&mut r, frag(1, i as u32 + 1, 1, 100, 250, &s[lo..hi])) {
                     FragOutcome::Pending => assert!(k < 2),
-                    FragOutcome::Complete(b, _, ko) => {
+                    FragOutcome::Complete(b, _, ko, _) => {
                         assert!(!ko);
                         done = Some(b)
                     }
@@ -898,7 +945,7 @@ mod tests {
         d = s[8..].to_vec();
         d.extend_from_slice(&[0, 0]); // submessage padding past the sample end
         match add(&mut r, frag(1, 3, 1, 4, 10, &d)) {
-            FragOutcome::Complete(b, _, _) => assert_eq!(b, s),
+            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s),
             other => panic!("{other:?}"),
         }
     }
@@ -950,7 +997,7 @@ mod tests {
         let mut both = b"EVIL".to_vec();
         both.extend_from_slice(&s[4..]);
         match r.add(frag(1, 1, 2, 4, 8, &both), &mut ev) {
-            FragOutcome::Complete(b, _, _) => assert_eq!(b, s, "first copy of fragment 1 kept"),
+            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s, "first copy of fragment 1 kept"),
             other => panic!("{other:?}"),
         }
         assert_eq!(r.conflicts(), 2);
@@ -1321,14 +1368,14 @@ mod tests {
         });
         let mut ev = Vec::new();
         match r.add(frag(1, 1, 1, 10, 10, &s), &mut ev) {
-            FragOutcome::Complete(b, _, _) => assert_eq!(b, s),
+            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s),
             other => panic!("{other:?}"),
         }
         // Several fragments of one sample in one submessage, plus padding.
         let mut padded = s.clone();
         padded.extend_from_slice(&[0; 3]);
         match r.add(frag(2, 1, 3, 4, 10, &padded), &mut ev) {
-            FragOutcome::Complete(b, _, _) => assert_eq!(b, s),
+            FragOutcome::Complete(b, _, _, _) => assert_eq!(b, s),
             other => panic!("{other:?}"),
         }
         let mut r = FragmentReassembler::new(ReassemblyLimits::default());
@@ -1357,5 +1404,61 @@ mod tests {
             FragOutcome::Pending
         ));
         assert_eq!(r.pending_samples(), 2);
+    }
+
+    /// A fragment lost from the multicast and resent to the reader that
+    /// asked (INFO_DST: that reader) completes the same sample; the sample
+    /// is that reader's.
+    #[test]
+    fn a_fragment_resent_to_one_reader_completes_the_sample_for_it() {
+        const READER: [u8; 12] = [0x42; 12];
+        let s = sample(300);
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        assert!(matches!(
+            add(&mut r, frag(1, 1, 1, 100, 300, &s[..100])),
+            FragOutcome::Pending
+        ));
+        assert!(matches!(
+            add(&mut r, frag(1, 3, 1, 100, 300, &s[200..])),
+            FragOutcome::Pending
+        ));
+        let mut resent = frag(1, 2, 1, 100, 300, &s[100..200]);
+        resent.destination = READER;
+        match add(&mut r, resent) {
+            FragOutcome::Complete(b, _, _, d) => {
+                assert_eq!(b, s);
+                assert_eq!(d, READER);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every fragment to every receiver: the sample is everyone's, even if
+    /// a copy also went to one reader. Fragments only two different
+    /// readers got: no single receiver has the sample.
+    #[test]
+    fn completed_destination_is_every_receiver_or_no_single_one() {
+        let s = sample(200);
+        let mut r = FragmentReassembler::new(ReassemblyLimits::default());
+        let mut copy = frag(1, 1, 1, 100, 200, &s[..100]);
+        copy.destination = [0x42; 12];
+        assert!(matches!(add(&mut r, copy), FragOutcome::Pending));
+        assert!(matches!(
+            add(&mut r, frag(1, 1, 1, 100, 200, &s[..100])),
+            FragOutcome::Pending
+        ));
+        match add(&mut r, frag(1, 2, 1, 100, 200, &s[100..])) {
+            FragOutcome::Complete(_, _, _, d) => assert_eq!(d, [0; 12]),
+            other => panic!("{other:?}"),
+        }
+        let mut a = frag(2, 1, 1, 100, 200, &s[..100]);
+        a.destination = [0x42; 12];
+        let mut b = frag(2, 2, 1, 100, 200, &s[100..]);
+        b.destination = [0x43; 12];
+        assert!(matches!(add(&mut r, a), FragOutcome::Pending));
+        match add(&mut r, b) {
+            FragOutcome::Complete(_, _, _, d) => assert_eq!(d, DESTINATION_NO_SINGLE_RECEIVER),
+            other => panic!("{other:?}"),
+        }
     }
 }
