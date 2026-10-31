@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -17,7 +18,7 @@ use robodr_blackbox::sign_ed25519::{PUBLIC_KEY_LEN, SIGNATURE_LEN};
 
 /// `PATH` the command runs with (the caller's `PATH` is not inherited).
 pub const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-/// Default deadline: long enough for a PIN prompt or a touch.
+/// Default deadline: long enough for a touch (or a slow network HSM).
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Longest deadline a signer file may set.
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -138,7 +139,13 @@ impl ExternalSigner {
             .env("ROBODR_SIGNER_KEY_ID", &self.key_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            // Its own process group (pgid = its pid), so that a timeout
+            // kills everything it started (the adapter shell *and* the
+            // pkcs11-tool it runs), not only the direct child. The price:
+            // it is not in the terminal's foreground group, so it cannot
+            // read the terminal (PINs come through `pass_env` or a file).
+            .process_group(0);
         for n in &self.pass_env {
             if let Some(v) = std::env::var_os(n) {
                 cmd.env(n, v);
@@ -176,6 +183,10 @@ impl ExternalSigner {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) if Instant::now() >= deadline => {
+                    // The group first, while the unreaped child still
+                    // holds its id; then the child itself, should the
+                    // group kill have failed.
+                    kill_process_group(child.id());
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
@@ -194,9 +205,12 @@ impl ExternalSigner {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(format!("{what}: reading its output: {e}")),
             Err(_) => {
+                // Whatever it left behind is in its process group (the
+                // id stays reserved while the group has members).
+                kill_process_group(child.id());
                 return Err(format!(
                     "{what}: exited but its stdout stayed open (a background process?)"
-                ))
+                ));
             }
         };
         // Checked before the exit status: a flood stopped by the cap ends
@@ -211,6 +225,22 @@ impl ExternalSigner {
         }
         parse_signature(&out).map_err(|e| format!("{what}: {e}"))
     }
+}
+
+/// SIGKILL to process group `pgid` (the signer command's, see
+/// [`ExternalSigner::sign`]). This crate has no `unsafe` (no `kill(2)`
+/// binding), so the shell's `kill` builtin sends it. Best effort: a group
+/// that is already gone is not an error.
+fn kill_process_group(pgid: u32) {
+    let _ = Command::new("/bin/sh")
+        .args(["-c", "kill -s KILL -- \"-$1\" 2>/dev/null", "sh"])
+        .arg(pgid.to_string())
+        .env_clear()
+        .env("PATH", SAFE_PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// `[A-Z_][A-Z0-9_]*`, at most 64 bytes.

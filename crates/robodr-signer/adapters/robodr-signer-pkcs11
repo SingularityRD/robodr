@@ -5,22 +5,31 @@
 # OpenSC's pkcs11-tool with CKM_EDDSA (pure Ed25519), so the private key
 # never leaves the token.
 #
-#   robodr-signer-pkcs11 sign       TOKEN... --id HEX [--pin-env NAME | --pin-file FILE]
+#   robodr-signer-pkcs11 sign       TOKEN... --id HEX (--pin-env NAME | --pin-file FILE)
 #       stdin: the message; stdout: the 64-byte signature (raw)
 #   robodr-signer-pkcs11 public-key TOKEN... --id HEX
 #       stdout: the key's Ed25519 public key, 64 hex digits
 #   robodr-signer-pkcs11 signer-file TOKEN... --id HEX --key-id ID
-#                        [--pin-env NAME | --pin-file FILE] [--adapter PATH]
+#                        (--pin-env NAME | --pin-file FILE) [--adapter PATH]
 #       stdout: a robodr-signer/v1 signer file for this key (the public key
 #       is read from the token now and pinned in the file)
 #
 #   TOKEN: --module /abs/path/to/pkcs11-module.so [--token-label LABEL | --slot N]
 #
-# PIN: --pin-env NAME takes it from that environment variable (list NAME in
-# the signer file's "pass_env"); --pin-file FILE reads it from a file the
-# caller can read (mode 0600). Without either, pkcs11-tool asks on the
-# terminal. The PIN is never put on a command line (pkcs11-tool reads it
-# with "--pin env:VAR", OpenSC 0.25 and later; tested with 0.25.0).
+# PIN: sign and signer-file need exactly one of --pin-env NAME (the PIN is
+# in that environment variable; list NAME in the signer file's "pass_env")
+# or --pin-file FILE (first line of FILE, which must be a regular file
+# owned by the caller or root and not readable or writable by group or
+# others, i.e. mode 0600 or 0400). There is no terminal prompt: the
+# adapter's stdin is the message and robodr-signer runs it in its own
+# process group, so a prompt would get no PIN and could spend one of the
+# token's PIN retries. The PIN is never put on a command line:
+# pkcs11-tool reads it with "--pin env:VAR", relied on from OpenSC 0.25
+# (a pkcs11-tool without that form would send the literal text "env:VAR"
+# as the PIN and spend a retry each time). The OpenSC version is read with
+# "opensc-tool --info" (the opensc-tool next to pkcs11-tool, else the one
+# in PATH) and anything older than 0.25, or unknown, is refused before the
+# token is touched. Tested with 0.25.0-rc1 (Ubuntu 24.04).
 #
 # Exit 0 on success; anything else on failure (messages on stderr). The
 # caller verifies every signature against the pinned public key.
@@ -83,7 +92,47 @@ fi
 [ -z "$pin_env" ] || [ -z "$pin_file" ] || die "--pin-env and --pin-file exclude each other"
 [ -z "$pin_file" ] || plain --pin-file "$pin_file"
 
-command -v pkcs11-tool >/dev/null 2>&1 || die "pkcs11-tool (OpenSC) not found in PATH"
+p11tool=$(command -v pkcs11-tool 2>/dev/null) || die "pkcs11-tool (OpenSC) not found in PATH"
+
+# The OpenSC release behind pkcs11-tool must understand "--pin env:VAR"
+# (0.25 and later). Checked before any login: an older pkcs11-tool would
+# log in with the literal string as the PIN and spend a retry (a YubiKey
+# PIV locks after 3).
+check_opensc() {
+    ot="${p11tool%/*}/opensc-tool"
+    [ -x "$ot" ] || ot=$(command -v opensc-tool 2>/dev/null) ||
+        die "opensc-tool not found: cannot check the OpenSC version (0.25 or later needed for --pin env:VAR)"
+    ver=$("$ot" --info 2>/dev/null | sed -n '1s/^OpenSC \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+    [ -n "$ver" ] || die "cannot read the OpenSC version from $ot --info (0.25 or later needed)"
+    # Split on purpose: two numbers.
+    # shellcheck disable=SC2086
+    set -- $ver
+    [ "$1" -gt 0 ] || [ "$2" -ge 25 ] ||
+        die "OpenSC $1.$2 is too old: 0.25 or later is needed (pkcs11-tool --pin env:VAR); refusing to log in"
+}
+
+# A PIN source is required for anything that logs in (see the header).
+need_pin() {
+    [ -n "$pin_env" ] || [ -n "$pin_file" ] ||
+        die "$op needs --pin-env NAME or --pin-file FILE (there is no terminal prompt)"
+}
+
+# The PIN file: a regular file owned by the caller or root, no group or
+# other permission bits.
+check_pin_file() {
+    st=$(stat -L -c '%u %a %F' -- "$pin_file" 2>/dev/null) || die "--pin-file $pin_file: cannot stat it"
+    # Split on purpose: uid, octal mode, file type (digits and letters).
+    # shellcheck disable=SC2086
+    set -- $st
+    case "$3 ${4:-}" in "regular file") ;; *) die "--pin-file $pin_file is not a regular file" ;; esac
+    [ "$1" = 0 ] || [ "$1" = "$(id -u)" ] ||
+        die "--pin-file $pin_file is owned by uid $1, not by you or root"
+    case $2 in
+        0 | [0-7]00 | [0-7][0-7]00) ;;
+        *) die "--pin-file $pin_file has mode $2: group or others have access (chmod 0600)" ;;
+    esac
+    [ -r "$pin_file" ] || die "--pin-file $pin_file is not readable"
+}
 
 set -- --module "$module"
 if [ -n "$token_label" ]; then
@@ -114,18 +163,19 @@ public_key_hex() {
 
 case $op in
     sign)
-        cat >"$tmp/msg"
+        need_pin
+        check_opensc
         if [ -n "$pin_file" ]; then
-            [ -r "$pin_file" ] || die "--pin-file $pin_file is not readable"
+            check_pin_file
             ROBODR_P11_PIN=$(head -n 1 "$pin_file")
+            [ -n "$ROBODR_P11_PIN" ] || die "--pin-file $pin_file: the first line is empty"
             export ROBODR_P11_PIN
             set -- "$@" --login --pin env:ROBODR_P11_PIN
-        elif [ -n "$pin_env" ]; then
+        else
             eval "[ -n \"\${$pin_env:-}\" ]" || die "--pin-env $pin_env is not set (list it in pass_env)"
             set -- "$@" --login --pin "env:$pin_env"
-        else
-            set -- "$@" --login
         fi
+        cat >"$tmp/msg"
         # pkcs11-tool's chatter goes to stderr; stdout carries only the
         # signature.
         pkcs11-tool "$@" --sign --mechanism EDDSA --id "$id" \
@@ -139,6 +189,10 @@ case $op in
         ;;
     signer-file)
         [ -n "$key_id" ] || die "signer-file needs --key-id"
+        # The signer file it writes must work: same checks as sign.
+        need_pin
+        check_opensc
+        [ -z "$pin_file" ] || check_pin_file
         plain --key-id "$key_id"
         plain --adapter "$adapter"
         pub=$(public_key_hex "$@")

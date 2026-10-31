@@ -48,8 +48,15 @@
 //! * **stdout**: the 64-byte signature, raw or as 128 hex digits
 //!   (trailing whitespace allowed), nothing else; at most
 //!   [`external::MAX_OUTPUT_BYTES`].
-//! * **stderr**: passed through to the operator (PIN prompts, "touch your
-//!   key").
+//! * **stderr**: passed through to the operator ("touch your key").
+//! * **process group**: the command runs in a process group of its own,
+//!   and on a timeout, or when it exits leaving its stdout open, the whole
+//!   group is killed (SIGKILL), so a `pkcs11-tool` the adapter started
+//!   does not outlive the call. It is therefore not in the terminal's
+//!   foreground group and cannot read the terminal: the PIN comes from a
+//!   `pass_env` variable or a file, never a prompt. A Ctrl-C at the
+//!   terminal stops the caller only; the command then runs on until it
+//!   finishes or writes to its closed stdout.
 //! * **exit status** 0 on success. Anything else, a timeout
 //!   (`timeout_ms`, default [`external::DEFAULT_TIMEOUT_MS`]), or a
 //!   signature that does **not verify under `public_key_hex`** is an
