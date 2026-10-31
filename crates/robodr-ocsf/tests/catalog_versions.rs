@@ -485,8 +485,16 @@ const IDS_2_5_AGENT: &[&str] = &[
     "robot.agent.disk_low",
     "robot.agent.executor_unreachable",
     "robot.agent.executor_pause_overridden",
+    "robot.agent.config_unattested",
     "robot.agent.control_plane_request_fenced",
     "robot.agent.selftest",
+];
+
+/// The 2.5 discovery entries (WP7: DDS transports the capture cannot
+/// inspect, SROS 2 keystore identities).
+const IDS_2_5_GRAPH: &[&str] = &[
+    "robot.capture.unsupported_transport",
+    "robot.ros2.untrusted_security_identity",
 ];
 
 #[test]
@@ -500,6 +508,7 @@ fn entries_added_in_2_5_are_not_in_2_4_or_earlier() {
             "robot.gateway.overload",
             "ros2_motion_commands",
         )))
+        .chain(IDS_2_5_GRAPH.iter().map(|id| (*id, "ros2_dds_discovery")))
         .chain(host.iter().map(|id| (*id, "host_runtime")));
     let mut n = 0;
     for (id, source) in all {
@@ -526,7 +535,10 @@ fn entries_added_in_2_5_are_not_in_2_4_or_earlier() {
         );
         assert!(robodr_ocsf::parse_and_validate(&down).is_err(), "{id}");
     }
-    assert_eq!(n, IDS_2_5_AGENT.len() + 1 + host.len());
+    assert_eq!(
+        n,
+        IDS_2_5_AGENT.len() + 1 + IDS_2_5_GRAPH.len() + host.len()
+    );
     // Everything older is unchanged in 2.5, the fallback host id included.
     for id in IDS_2_4.iter().chain(IDS_1_3).chain(IDS_2_2) {
         assert_eq!(

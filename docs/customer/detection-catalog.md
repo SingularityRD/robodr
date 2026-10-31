@@ -1,7 +1,7 @@
 # Detection catalog
 
 > **Pre-release draft (2026-10-30).** Every rule id RoboDR can report, as
-> catalogued in the `robodr.findings` contract **2.4**
+> catalogued in the `robodr.findings` contract **2.5**
 > ([`docs/contracts/robodr.findings.md`](../contracts/robodr.findings.md)).
 > The tables at the end are generated from the rule catalog in the code
 > (`crates/robodr-ocsf/src/builder.rs`) by
@@ -93,29 +93,39 @@ correlation entry.
 
 <!-- BEGIN GENERATED: scripts/check-detection-catalog.py --write -->
 
-152 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
+165 catalogued rule ids, plus the `robot.correlate.*` prefix entry for site-specific correlation rules.
 
-### `robot.agent.*` (15)
+### `robot.agent.*` (25)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
+| `robot.agent.clock_jump` | Robot wall clock jumped | `robodr_agent` | — | 2.5 |
+| `robot.agent.clock_unsynced` | Robot clock not synchronised | `robodr_agent` | — | 2.5 |
+| `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | `robodr_agent` | — | 1.3 |
+| `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | `robodr_agent` | — | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | `robodr_agent` | — | 2.4 |
 | `robot.agent.control_plane_unauthenticated` | Control-plane request failed authentication | `robodr_agent` | — | 1.3 |
 | `robot.agent.correlation_pressure` | Correlation engine state under pressure | `robodr_agent` | — | 1.3 |
+| `robot.agent.credential_expiring` | Agent credential expires soon | `robodr_agent` | — | 2.5 |
+| `robot.agent.disk_low` | Agent storage running out of space | `robodr_agent` | — | 2.5 |
 | `robot.agent.evidence_degraded` | Black-box recording failing | `robodr_agent` | — | 1.3 |
 | `robot.agent.evidence_quarantined` | Damaged black-box segment quarantined | `robodr_agent` | — | 1.3 |
 | `robot.agent.evidence_truncated` | Black-box records cut after the newest mark | `robodr_agent` | — | 1.3 |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | `robodr_agent` | — | 2.4 |
+| `robot.agent.executor_pause_overridden` | Robot set moving while paused | `robodr_agent` | — | 2.5 |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | `robodr_agent` | — | 2.4 |
+| `robot.agent.executor_unreachable` | Response executor unreachable | `robodr_agent` | — | 2.5 |
+| `robot.agent.health` | Agent health record | `robodr_agent` | — | 2.5 |
 | `robot.agent.input_ended` | Agent input ended | `robodr_agent` | — | 1.3 |
 | `robot.agent.input_malformed` | Malformed agent input | `robodr_agent` | — | 1.3 |
 | `robot.agent.input_silent` | Agent input silent | `robodr_agent` | — | 1.3 |
 | `robot.agent.pipeline_lag` | Agent pipeline lagging | `robodr_agent` | — | 1.3 |
 | `robot.agent.queue_overflow` | Agent input queue overflowed | `robodr_agent` | — | 1.3 |
+| `robot.agent.selftest` | Agent field acceptance self-test | `robodr_agent` | — | 2.5 |
 | `robot.agent.spool_full` | Finding spool full or failing | `robodr_agent` | — | 1.3 |
 
-### `robot.capture.*` (9)
+### `robot.capture.*` (10)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -128,6 +138,7 @@ correlation entry.
 | `robot.capture.malformed_frames` | Malformed or truncated captured frames | `ros2_dds_discovery` | — | 1.3 |
 | `robot.capture.not_udp` | Non-UDP packets reached the sensor | `ros2_dds_discovery` | — | 1.3 |
 | `robot.capture.unsupported_middleware` | Robot middleware not inspected (Zenoh) | `ros2_dds_discovery` | — | 1.3 |
+| `robot.capture.unsupported_transport` | DDS transport not inspected (shared memory, TCP) | `ros2_dds_discovery` | — | 2.5 |
 
 ### `robot.correlate.*` (10)
 
@@ -207,12 +218,13 @@ correlation entry.
 | `robot.firewall.rejected_unknown_channel` | Motion command rejected: unknown channel | `ros2_motion_commands` | T0855 | 1.3 |
 | `robot.firewall.rejected_unknown_source` | Motion command rejected: unknown source | `ros2_motion_commands` | T0855 | 1.3 |
 
-### `robot.gateway.*` (9)
+### `robot.gateway.*` (10)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
 | `robot.gateway.findings_dropped` | In-path gateway findings lost | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.fragmented_command` | Fragmented motion command blocked by the in-path gateway | `ros2_motion_commands` | — | 2.3 |
+| `robot.gateway.overload` | In-path gateway overloaded | `ros2_motion_commands` | — | 2.5 |
 | `robot.gateway.port_bypass_risk` | Motion traffic may bypass the in-path gateway | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.restriction_changed` | Motion restriction changed on the in-path gateway | `ros2_motion_commands` | — | 2.3 |
 | `robot.gateway.sequence_jump` | Motion command sequence jump held back | `ros2_motion_commands` | — | 2.3 |
@@ -258,7 +270,7 @@ correlation entry.
 |---|---|---|---|---|
 | `robot.profile.invalid_envelope` | Motion envelope in the profile cannot be enforced | `ros2_motion_commands` | — | 1.3 |
 
-### `robot.ros2.*` (16)
+### `robot.ros2.*` (17)
 
 | Rule id | Title | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|
@@ -278,6 +290,7 @@ correlation entry.
 | `robot.ros2.unknown_reader_topic` | Subscriber on a topic outside the reader allowlist | `ros2_dds_discovery` | T0801 | 1.3 |
 | `robot.ros2.unknown_service` | Writer on a service outside the model profile | `ros2_dds_discovery` | T0855 | 1.3 |
 | `robot.ros2.unknown_writer_topic` | Writer on a topic outside the model profile | `ros2_dds_discovery` | T0855 | 1.0 |
+| `robot.ros2.untrusted_security_identity` | Participant outside the robot's SROS 2 keystore | `ros2_dds_discovery` | — | 2.5 |
 
 ### `robot.rtps.*` (7)
 

@@ -321,7 +321,12 @@ fn postinst_leaves_the_deliverd_restart_to_the_agent_under_its_marker() {
             .collect()
     };
     let all = run(None);
-    assert_eq!(all.len(), 10, "{all:?}");
+    // The gateway and the executor are never restarted here (gated_restart
+    // marks them pending after the block).
+    assert_eq!(all.len(), 8, "{all:?}");
+    assert!(!all
+        .iter()
+        .any(|l| l.contains("executor") || l.contains("firewall-gw")));
     assert!(all.contains(&"try-restart robodr-deliverd.service".to_string()));
     let other = run(Some("0"));
     assert_eq!(other, all);

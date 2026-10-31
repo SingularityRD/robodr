@@ -30,7 +30,7 @@ const NEW_IDS: &[&str] = &[
 
 fn build(rule: &str) -> String {
     let dev = Deviation::new(rule.to_string(), Severity::High, "detail");
-    let env = FindingBuilder::from_deviation(&dev, &common::ctx())
+    let env = common::with_required(FindingBuilder::from_deviation(&dev, &common::ctx()), rule)
         .seen(common::T0, common::T0)
         .build()
         .unwrap();
@@ -244,6 +244,11 @@ const NOT_EMITTED: &[&str] = &[
     "robot.rtps.x",
     // robodr-responder unit-test rule.
     "robot.motion.envelope_exceeded",
+    // Unit-test fixtures (agentd host feed, attack simulator, demo SOC).
+    "robot.host.anything_new",
+    "robot.hostile.x",
+    "robot.x.y",
+    "robot.x.z",
 ];
 
 /// Every `"robot.<area>.<name>"` string literal in the workspace's crate

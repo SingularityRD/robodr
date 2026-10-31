@@ -2,41 +2,41 @@
      Regenerate: ROBODR_BLESS=1 cargo test -p robodr-ocsf --test detection_catalog -->
 # RoboDR detection catalog
 
-Every detection RoboDR can report, as the robot sends it in the `robodr.findings` contract 2.4.0 (`docs/contracts/robodr.findings.md`). Generated from the trusted rule catalog the sensor uses to write each finding's `title`, `description`, `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, so this page and the findings cannot disagree: a test fails when they do.
+Every detection RoboDR can report, as the robot sends it in the `robodr.findings` contract 2.5.0 (`docs/contracts/robodr.findings.md`). Generated from the trusted rule catalog the sensor uses to write each finding's `title`, `description`, `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, so this page and the findings cannot disagree: a test fails when they do.
 
 * **Rule id** is `ocsf.finding_info.analytic.uid` and `ocsf.unmapped.robodr.rule_id`; key SIEM content on it, never on the title.
 * **Severity** is set by the detector per occurrence (and by the locked profile), not by the catalog, so it is not listed here; the host rules below list their fixed Pulsar severity.
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
 * **Since** is the contract version that added the entry. A consumer validating an older message applies that message's catalog; an id without an entry is reported with a generic title ("RoboDR model-profile deviation").
 
-152 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
+165 rule ids in 17 families, plus 1 prefix entry for other ids of a family.
 
 ## By data source
 
 | Data source | Rule ids |
 |---|---|
 | `host_runtime` | 1 |
-| `robodr_agent` | 17 |
+| `robodr_agent` | 27 |
 | `robodr_correlation` | 10 |
 | `robodr_delivery` | 17 |
 | `robot_safety_state` | 4 |
-| `ros2_dds_discovery` | 32 |
-| `ros2_motion_commands` | 71 |
+| `ros2_dds_discovery` | 34 |
+| `ros2_motion_commands` | 72 |
 
 ## Families
 
-* [`robot.agent.*`](#robotagent) (15)
-* [`robot.capture.*`](#robotcapture) (9)
+* [`robot.agent.*`](#robotagent) (25)
+* [`robot.capture.*`](#robotcapture) (10)
 * [`robot.correlate.*`](#robotcorrelate) (10)
 * [`robot.dds.*`](#robotdds) (1)
 * [`robot.deliver.*`](#robotdeliver) (7)
 * [`robot.depot.*`](#robotdepot) (5)
 * [`robot.firewall.*`](#robotfirewall) (30)
-* [`robot.gateway.*`](#robotgateway) (9)
+* [`robot.gateway.*`](#robotgateway) (10)
 * [`robot.host.*`](#robothost) (1)
 * [`robot.motion.*`](#robotmotion) (20)
 * [`robot.profile.*`](#robotprofile) (1)
-* [`robot.ros2.*`](#robotros2) (16)
+* [`robot.ros2.*`](#robotros2) (17)
 * [`robot.rtps.*`](#robotrtps) (7)
 * [`robot.safety_state.*`](#robotsafety_state) (4)
 * [`robot.seal.*`](#robotseal) (5)
@@ -48,20 +48,30 @@ Every detection RoboDR can report, as the robot sends it in the `robodr.findings
 
 | Rule id | Title | Description | Data source | ATT&CK for ICS | Since |
 |---|---|---|---|---|---|
+| `robot.agent.clock_jump` | Robot wall clock jumped | The robot's wall clock moved away from what its monotonic clock says elapsed (a time step, an RTC reset or a spoofed time source). Durations are unaffected; finding and evidence times around the jump may be wrong. | `robodr_agent` | - | 2.5 |
+| `robot.agent.clock_unsynced` | Robot clock not synchronised | The robot's kernel reports its wall clock unsynchronised (no NTP, NTS or PTP lock) or with a large error estimate: finding and evidence times may be wrong. | `robodr_agent` | - | 2.5 |
+| `robot.agent.config_unattested` | Safety configuration not bound to the commissioning | A safety configuration file the robot's agent loaded (response policy, Motion Firewall joint configuration) claims more than the signed commissioning attested: it is not bound to the trusted locked profile, so the agent treats it as not validated and stays observe-only for what it governs. The detail names the file and why the binding failed. | `robodr_agent` | - | 2.5 |
 | `robot.agent.control_plane_invalid` | Invalid control-plane action request refused | The robot's control-plane API refused authenticated requests for an action, parameter, time limit or authority it never allows; each was recorded in the black box and nothing was executed. | `robodr_agent` | - | 1.3 |
+| `robot.agent.control_plane_request_fenced` | Control-plane request refused by the replay fence | A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it. | `robodr_agent` | - | 2.5 |
 | `robot.agent.control_plane_state_untrusted` | Control-plane state failed its integrity check | At start the control plane's sealed request journal or replay store was damaged, edited, sealed under another key, or older than the head the black box recorded for it. The robot failed safe: the damaged copy was quarantined, requests were reconciled with the black box and the replay store was fenced; nothing was reset silently. | `robodr_agent` | - | 2.4 |
 | `robot.agent.control_plane_unauthenticated` | Control-plane request failed authentication | The robot's control-plane API refused requests that did not carry a valid SOC signature (missing or bad signature, unknown key, stale timestamp or replayed nonce); nothing was judged or executed. | `robodr_agent` | - | 1.3 |
 | `robot.agent.correlation_pressure` | Correlation engine state under pressure | The correlation engine evicted or refused pending correlation state, which happens when many fresh entities arrive within a window (possibly a flood aimed at hiding a correlation). | `robodr_agent` | - | 1.3 |
+| `robot.agent.credential_expiring` | Agent credential expires soon | A certificate or certificate revocation list the robot's agent depends on expires or reaches its next-update time soon (or already has): renew it before the control plane refuses every SOC client. | `robodr_agent` | - | 2.5 |
+| `robot.agent.disk_low` | Agent storage running out of space | A filesystem the robot's agent writes evidence, findings or control-plane state to is nearly full: free space before recording stops. | `robodr_agent` | - | 2.5 |
 | `robot.agent.evidence_degraded` | Black-box recording failing | The black-box recorder failed to store evidence; records from this outage are missing. | `robodr_agent` | - | 1.3 |
 | `robot.agent.evidence_quarantined` | Damaged black-box segment quarantined | Opening the black box found closed segments that failed verification; they were copied to quarantine and recording continued without reusing sequence numbers. | `robodr_agent` | - | 1.3 |
 | `robot.agent.evidence_truncated` | Black-box records cut after the newest mark | Opening the black box found authentic proof that records after its newest integrity mark were removed; treat the evidence store as tampered with. | `robodr_agent` | - | 1.3 |
 | `robot.agent.executor_journal_reset` | Executor journal untrusted and reset | The robot's executor found its journal unreadable or failing its seal and started empty: every action it held was lifted and its history lost. It refuses new orders until an operator re-arms it. | `robodr_agent` | - | 2.4 |
+| `robot.agent.executor_pause_overridden` | Robot set moving while paused | While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found. | `robodr_agent` | - | 2.5 |
 | `robot.agent.executor_revert_failed` | Containment action could not be reverted | The robot's executor could not revert a containment action: its transaction or read-back failed, so the action's rules may still be in force after its time limit or revert request. The executor retries every tick; the detail names the action, request, time limit and error. | `robodr_agent` | - | 2.4 |
+| `robot.agent.executor_unreachable` | Response executor unreachable | The robot's agent cannot reach its response executor: containment actions cannot be applied, verified or reverted, and actions in force are not watched, until it answers again. | `robodr_agent` | - | 2.5 |
+| `robot.agent.health` | Agent health record | Periodic health and liveness record of the robot's RoboDR agent: monitoring state, component versions, input freshness, counters, black-box state, reachability of the executor, gateway and host sensor, credential expiry, clock synchronisation and free disk space. A robot whose newest record is older than a few record periods is silent. | `robodr_agent` | - | 2.5 |
 | `robot.agent.input_ended` | Agent input ended | An agent input reached end of stream or failed while the daemon was running; detections from that input stopped. | `robodr_agent` | - | 1.3 |
 | `robot.agent.input_malformed` | Malformed agent input | An agent input delivered items that could not be parsed; they were skipped. | `robodr_agent` | - | 1.3 |
 | `robot.agent.input_silent` | Agent input silent | An agent input delivered no valid data within the silence window; the robot state reads unknown while the agent is blind. | `robodr_agent` | - | 1.3 |
 | `robot.agent.pipeline_lag` | Agent pipeline lagging | Queue latency or tick delay in the agent exceeded the configured lag bound; detections are late. | `robodr_agent` | - | 1.3 |
 | `robot.agent.queue_overflow` | Agent input queue overflowed | The agent's input queue was full and items were dropped without inspection. | `robodr_agent` | - | 1.3 |
+| `robot.agent.selftest` | Agent field acceptance self-test | A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection. | `robodr_agent` | - | 2.5 |
 | `robot.agent.spool_full` | Finding spool full or failing | The agent could not write findings to its outbound spool (full or write errors); findings may be lost before export. | `robodr_agent` | - | 1.3 |
 
 ## robot.capture.*
@@ -77,6 +87,7 @@ Every detection RoboDR can report, as the robot sends it in the `robodr.findings
 | `robot.capture.malformed_frames` | Malformed or truncated captured frames | The capture saw malformed or truncated frames; they were not inspected. | `ros2_dds_discovery` | - | 1.3 |
 | `robot.capture.not_udp` | Non-UDP packets reached the sensor | IP packets that were not UDP passed the kernel capture filter; they were not inspected. | `ros2_dds_discovery` | - | 1.3 |
 | `robot.capture.unsupported_middleware` | Robot middleware not inspected (Zenoh) | The capture sees Zenoh (rmw_zenoh) traffic, which RoboDR does not decode: participants, publishers and motion commands on it are not inspected; with no RTPS at all the sensor is blind to the robot's bus. | `ros2_dds_discovery` | - | 1.3 |
+| `robot.capture.unsupported_transport` | DDS transport not inspected (shared memory, TCP) | Participants on a host advertise a DDS transport the capture cannot inspect (shared memory such as Fast DDS SHM or Cyclone Iceoryx, TCP, or an unknown locator kind): traffic between same-host processes over it never reaches a network interface, so motion commands there may be invisible. Commission the robot with UDP-only transports. | `ros2_dds_discovery` | - | 2.5 |
 
 ## robot.correlate.*
 
@@ -163,6 +174,7 @@ Every detection RoboDR can report, as the robot sends it in the `robodr.findings
 |---|---|---|---|---|---|
 | `robot.gateway.findings_dropped` | In-path gateway findings lost | The in-path motion gateway had more distinct findings in one reporting period than it can hold; some were counted but not reported individually. | `ros2_motion_commands` | - | 2.3 |
 | `robot.gateway.fragmented_command` | Fragmented motion command blocked by the in-path gateway | The in-path motion gateway suppressed a fragmented, key-only or non-standard RTPS sample of an enforced motion channel, or of a writer it could not classify; such a sample cannot be decided in place. | `ros2_motion_commands` | - | 2.3 |
+| `robot.gateway.overload` | In-path gateway overloaded | The in-path motion gateway could not process every command in time over the last interval (late or shed packets, aggregated): commands were delayed or dropped by its fail behaviour. Not a gateway fault. | `ros2_motion_commands` | - | 2.5 |
 | `robot.gateway.port_bypass_risk` | Motion traffic may bypass the in-path gateway | DDS discovery announced a locator on a UDP port the in-path motion gateway does not inspect: commands sent there would reach the robot unchecked until the gateway's port ranges are fixed. | `ros2_motion_commands` | - | 2.3 |
 | `robot.gateway.restriction_changed` | Motion restriction changed on the in-path gateway | A restrict_motion restriction was applied, changed, lifted or expired on the in-path motion gateway. Informational: the evidence trail of the robot's effective motion limits. | `ros2_motion_commands` | - | 2.3 |
 | `robot.gateway.sequence_jump` | Motion command sequence jump held back | The in-path motion gateway held back a sample whose RTPS sequence number jumped far past the writer's stream until the writer confirmed it: a forged high sequence number could otherwise make the robot drop the genuine commands. | `ros2_motion_commands` | - | 2.3 |
@@ -228,6 +240,7 @@ Every detection RoboDR can report, as the robot sends it in the `robodr.findings
 | `robot.ros2.unknown_reader_topic` | Subscriber on a topic outside the reader allowlist | A reader was announced on a topic, service or action outside the profile's reader allowlist; it cannot command but may collect data. | `ros2_dds_discovery` | T0801 Monitor Process State | 1.3 |
 | `robot.ros2.unknown_service` | Writer on a service outside the model profile | A writer was announced on a ROS 2 service request or reply the locked model profile does not allow. | `ros2_dds_discovery` | T0855 Unauthorized Command Message (revoked in ATT&CK for ICS 20.0; now T1692.001 Command Message) | 1.3 |
 | `robot.ros2.unknown_writer_topic` | Writer on a topic outside the model profile | A writer was announced on a topic the locked model profile does not allow anyone to publish to. | `ros2_dds_discovery` | T0855 Unauthorized Command Message (revoked in ATT&CK for ICS 20.0; now T1692.001 Command Message) | 1 |
+| `robot.ros2.untrusted_security_identity` | Participant outside the robot's SROS 2 keystore | A DDS participant's security identity does not fit the robot's SROS 2 keystore: it is unauthenticated while the governance requires authentication, or its certificate subject is named by no grant of the keystore (a participant from another keystore or CA). | `ros2_dds_discovery` | - | 2.5 |
 
 ## robot.rtps.*
 

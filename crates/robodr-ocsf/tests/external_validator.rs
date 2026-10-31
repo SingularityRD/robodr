@@ -124,7 +124,7 @@ fn all_findings() -> Vec<String> {
     for id in catalog_ids::catalog_rule_ids() {
         for sev in [Severity::Low, Severity::Critical] {
             let dev = Deviation::new(id.clone(), sev, "detail for the external validator");
-            let f = FindingBuilder::from_deviation(&dev, &ctx)
+            let f = common::with_required(FindingBuilder::from_deviation(&dev, &ctx), &id)
                 .seen(common::T0, common::T0 + 5)
                 .occurrences(2)
                 .build()

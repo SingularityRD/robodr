@@ -1124,6 +1124,7 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
     const AGENT: &str = "robodr_agent";
     const MOTION: &str = "ros2_motion_commands";
     const HOST: &str = "host_runtime";
+    const GRAPH: &str = "ros2_dds_discovery";
     const fn e(title: &'static str, desc: &'static str, data_source: &'static str) -> RuleInfo {
         RuleInfo {
             title,
@@ -1184,6 +1185,21 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "Agent field acceptance self-test",
             "A marked self-test finding the robot's agent produced on an operator's request to prove the path from the agent to the SOC end to end; it reports no detection.",
             AGENT,
+        ),
+        "robot.agent.config_unattested" => e(
+            "Safety configuration not bound to the commissioning",
+            "A safety configuration file the robot's agent loaded (response policy, Motion Firewall joint configuration) claims more than the signed commissioning attested: it is not bound to the trusted locked profile, so the agent treats it as not validated and stays observe-only for what it governs. The detail names the file and why the binding failed.",
+            AGENT,
+        ),
+        "robot.capture.unsupported_transport" => e(
+            "DDS transport not inspected (shared memory, TCP)",
+            "Participants on a host advertise a DDS transport the capture cannot inspect (shared memory such as Fast DDS SHM or Cyclone Iceoryx, TCP, or an unknown locator kind): traffic between same-host processes over it never reaches a network interface, so motion commands there may be invisible. Commission the robot with UDP-only transports.",
+            GRAPH,
+        ),
+        "robot.ros2.untrusted_security_identity" => e(
+            "Participant outside the robot's SROS 2 keystore",
+            "A DDS participant's security identity does not fit the robot's SROS 2 keystore: it is unauthenticated while the governance requires authentication, or its certificate subject is named by no grant of the keystore (a participant from another keystore or CA).",
+            GRAPH,
         ),
         "robot.gateway.overload" => e(
             "In-path gateway overloaded",

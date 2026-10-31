@@ -75,7 +75,8 @@ fn findings() -> Vec<String> {
     };
     for (i, id) in catalog_ids::catalog_rule_ids().iter().enumerate() {
         let dev = Deviation::new(id.clone(), Severity::High, "integration content check");
-        let mut b = FindingBuilder::from_deviation(&dev, &ctx).seen(common::T0, common::T0 + 1);
+        let mut b = common::with_required(FindingBuilder::from_deviation(&dev, &ctx), id)
+            .seen(common::T0, common::T0 + 1);
         // Every other finding carries a participant subject (source.ip etc.).
         if i % 2 == 0 {
             b = b.subject(Subject::from_participant(&part));

@@ -2,7 +2,7 @@ id: 34fa6a06-b415-5791-9d06-d8f3eaeb3467
 name: RoboDR - Unknown participant burst
 description: |
   Unknown DDS participants or a discovery flood on the robot network: reconnaissance or a rogue node. Observe-only: alerts, never responds.
-  RoboDR rule ids (docs/customer/detection-catalog.md):
+  RoboDR rule ids (docs/customer/detection-rules.md):
     - robot.ros2.unknown_participant
     - robot.ros2.discovery_flood
 severity: Medium
