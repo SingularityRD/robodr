@@ -147,8 +147,10 @@ sudo sh /usr/lib/robodr/install-bundle.sh install \
    (`robodr` / `robodr-focal`; the focal variant has no `robodr-pulsard`)
    is **refused** unless `--allow-variant-switch`;
 5. runs the black-box format gate (section 7);
-6. runs the **safety-state gate** for the gateway and the executor
-   (section 7, "Package upgrades and the safety state"), then `dpkg -i`.
+6. applies the **safety-state gate** for the gateway and the executor
+   (section 7, "Package upgrades and the safety state"; it is decided
+   right after the downgrade and variant checks of step 4, before the
+   security floor is raised, so a refusal changes nothing), then `dpkg -i`.
    The package creates the users `robodr` (owner of the
    shared group, runs nothing), `robodr-agentd` (agentd), `robodr-exec`
    (executor), one user per network-facing service (`robodr-spool`,
@@ -2515,14 +2517,21 @@ therefore never restarts these two unguarded:
   same rule `robodr-deliverd`'s own installs use). If the gateway or the
   executor runs and the state is not `idle` or `safe_state_active`
   (moving, human nearby, e-stop, `unknown`, or no live safety feed
-  configured), the install is **refused before anything changes**;
+  configured), the install is **refused before anything changes** (the
+  gate is decided before the security floor is raised and before
+  `dpkg`/`rpm` runs);
 - when the state allows it, the two are restarted right after the package
   is installed (the state is read again first; if it closed meanwhile, the
   restart is deferred);
 - `--defer-restart` installs now and leaves the two running the old
   binaries; `sudo sh /usr/lib/robodr/install-bundle.sh restart-pending`
   restarts them later, again only while the state allows it (exit 1 and
-  nothing restarted otherwise). A reboot also starts the new binaries;
+  nothing restarted otherwise), then runs the health check below (exit 1
+  when unhealthy; no automatic rollback). A reboot also starts the new
+  binaries. Until then `install-bundle.sh list` shows the units waiting
+  (`pending restart`). Nothing reports this to the SOC: the package
+  database and the security floor show the new version while the two
+  still run the previous binaries;
 - `--allow-gateway-restart` restarts them whatever the state says. It is
   a deliberate operator decision: motion through the gateway is
   interrupted. Use it only with the robot stopped by other means (e.g.
@@ -2533,10 +2542,24 @@ own user once and must stop the gateway for that; it cannot be deferred
 (`--defer-restart` is refused, and a plain `dpkg -i` leaves the package
 unconfigured with nothing stopped until `restart-pending` configures it
 through the gate; for an `.rpm`, install the release again with
-`install-bundle.sh` once the robot is idle). Upgrading **from a release
-whose `robodr-deliverd` has no `safety-state` command** (0.1.0-alpha.1)
-cannot read the gate before the upgrade: stop the gateway at a safe moment
-or pass `--allow-gateway-restart`.
+`install-bundle.sh` once the robot is idle). When the installed
+`robodr-deliverd` has **no `safety-state` command** (0.1.0-alpha.1),
+`install` reads the state with the `robodr-deliverd` of the package being
+installed (after its signature and checksum checks, from a copy in the
+private staging directory); if that copy cannot run there (e.g. a
+`noexec` `TMPDIR`), the gate stays closed: stop the gateway at a safe
+moment or pass `--allow-gateway-restart`.
+
+**Releases from before the gate.** The maintainer scripts of
+0.1.0-alpha.1 restart the gateway and the executor unconditionally. A
+`rollback` (or `install --allow-downgrade`) to such a release therefore
+cannot be deferred: with the gateway or the executor running and the
+state closed it is **refused**, `--defer-restart` included, unless
+`--allow-gateway-restart`. The automatic rollback after a failed health
+check goes to such a release only while the state allows it at that
+moment; otherwise the unhealthy release stays installed (exit 1) and you
+roll back by hand once the robot is idle. `install-bundle.sh` recognises
+these releases by their post-install script (no `gated_restart` block).
 
 **Health check and automatic rollback.** After `install` and `rollback`,
 every RoboDR unit that was active before must be active again (two checks
@@ -2551,7 +2574,8 @@ RoboDR unit running (before commissioning) there is nothing to check.
 
 **Kept releases.** `install --keep N` (after a healthy install) or
 `install-bundle.sh prune --keep N` keeps the N newest kept releases and
-always the installed one; the others are deleted. The formats file of a
+always the installed one; the others are deleted (`prune` is refused when
+neither `dpkg` nor `rpm` reports the installed version). The formats file of a
 pruned release is kept under `releases/formats-archive/`, so the
 black-box format gate still treats what that release wrote as verified.
 Keep at least 2 (the installed release and the one to roll back to).
@@ -2623,7 +2647,9 @@ Rollback reinstalls the kept `.deb` (or `.rpm`) after re-checking its hashes. Th
 version must be one `list` shows (a version string, never a path). Evidence
 written by the newer version stays in place. Rollback goes through the same
 safety-state gate and health check as an upgrade (`--defer-restart`,
-`--allow-gateway-restart`, `--health-timeout`).
+`--allow-gateway-restart`, `--health-timeout`); a rollback to a release
+from before the gate, such as 0.1.0~alpha.1-1 above, cannot be deferred
+(section 7, "Releases from before the gate").
 
 **Downgrades and the security floor.** `install` of a release older than
 the installed one is refused as a downgrade (it may bring back fixed
