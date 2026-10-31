@@ -17,7 +17,10 @@
 #[path = "support/catalog_ids.rs"]
 mod catalog_ids;
 mod common;
+#[path = "support/python.rs"]
+mod py_support;
 
+use py_support::missing_module;
 use robodr_blackbox::Ed25519SigningKey;
 use robodr_events::graph::Participant;
 use robodr_events::{Deviation, Severity};
@@ -50,7 +53,9 @@ fn python(script: &str, args: &[&str], stdin_file: Option<&Path>) -> Option<Outp
     }
     let required = std::env::var_os("ROBODR_REQUIRE_EXTERNAL_VALIDATOR").is_some();
     match c.output() {
-        Ok(o) if o.status.code() == Some(2) => {
+        // Exit 2 without the missing-module message is a usage or tooling
+        // error: returned, and the caller's assertions fail on it.
+        Ok(o) if missing_module(&o) => {
             let e = String::from_utf8_lossy(&o.stderr).to_string();
             assert!(!required, "{script}: {e}");
             eprintln!("SKIP {script}: {e}");
@@ -160,6 +165,14 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
     let tampered = value.replacen("\"count\":3", "\"count\":4", 1);
     assert_ne!(tampered, value);
     let reordered: Value = serde_json::from_str(&value).unwrap();
+    let ext = reordered["external_id"].as_str().unwrap();
+    let unbound = value.replacen(
+        &format!("\"external_id\":\"{ext}\""),
+        "\"external_id\":\"ugv-007:rf1-00000000000000000000000000000000\"",
+        1,
+    );
+    assert_ne!(unbound, value);
+    let unbound_sig = sign_value(&unbound, &k).unwrap().to_header_value();
     // The same signature with its hex digits in upper case.
     let upper_sig = {
         let (head, hex) = sig.split_at(sig.rfind(":\"").unwrap() + 2);
@@ -233,6 +246,13 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
             false,
         ),
         ("not json", "nope".to_string(), false),
+        (
+            // Correctly signed by ugv-007, but external_id does not bind
+            // this finding_id (contract §2: finding_id bound to the robot).
+            "finding_id not bound",
+            record(&unbound, json!([["robodr-finding-sig", unbound_sig]])),
+            false,
+        ),
     ];
     let mut failures = Vec::new();
     for (name, line, ok) in &cases {
@@ -246,12 +266,14 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
             return;
         };
         let out = String::from_utf8_lossy(&o.stdout).to_string();
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
         let accepted = o.status.success() && out.lines().count() == 1;
-        if accepted != *ok {
-            failures.push(format!(
-                "{name}: accepted={accepted}, want {ok}: {}",
-                String::from_utf8_lossy(&o.stderr)
-            ));
+        // A rejection is exit 1 with the record counted as rejected, not a
+        // usage error or a crash.
+        let rejected =
+            o.status.code() == Some(1) && out.is_empty() && err.contains("0 forwarded, 1 rejected");
+        if accepted != *ok || (!ok && !rejected) {
+            failures.push(format!("{name}: accepted={accepted}, want {ok}: {err}"));
         }
         if accepted {
             let v: Value = serde_json::from_str(out.trim()).unwrap();
@@ -283,5 +305,76 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
         assert_eq!(o.status.code(), Some(1));
     }
     assert!(failures.is_empty(), "{failures:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// verify_strict semantics (contract §2a): a small-order public key in the
+/// keyring would let R = identity, S = 0 "verify" any value under the
+/// cofactorless equation; the `cryptography` package accepts that, so the
+/// verifier refuses weak keys and weak R itself.
+#[test]
+fn pipeline_verifier_refuses_small_order_keys_and_signatures() {
+    let dir = scratch("verify-weak");
+    let value = to_json(&common::example_finding()).unwrap();
+    let k = key("ugv-007");
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let identity = format!("01{}", "00".repeat(31));
+    let forged = format!(
+        "{{\"alg\":\"ed25519\",\"key_id\":\"finding:weak:1\",\"sig\":\"{identity}{}\"}}",
+        "00".repeat(32)
+    );
+    let input = dir.join("in.ndjson");
+    std::fs::write(
+        &input,
+        record(&value, json!([["robodr-finding-sig", forged]])) + "\n",
+    )
+    .unwrap();
+    // A keyring holding a small-order key is refused as a whole.
+    let kr = dir.join("weak.json");
+    std::fs::write(
+        &kr,
+        json!({"ugv-007": {"finding:ugv-007:1": hex(&k.public_key()),
+                           "finding:weak:1": identity}})
+        .to_string(),
+    )
+    .unwrap();
+    let Some(o) = python(
+        "integrations/verify/robodr_verify.py",
+        &["--keyring", kr.to_str().unwrap()],
+        Some(&input),
+    ) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        o.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.contains("weak or non-canonical"), "{err}");
+    // A small-order R under a real key: rejected as a record.
+    let weak_r = format!(
+        "{{\"alg\":\"ed25519\",\"key_id\":\"finding:ugv-007:1\",\"sig\":\"{identity}{}\"}}",
+        "00".repeat(32)
+    );
+    std::fs::write(
+        &input,
+        record(&value, json!([["robodr-finding-sig", weak_r]])) + "\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &kr,
+        json!({"ugv-007": {"finding:ugv-007:1": hex(&k.public_key())}}).to_string(),
+    )
+    .unwrap();
+    let o = python(
+        "integrations/verify/robodr_verify.py",
+        &["--keyring", kr.to_str().unwrap()],
+        Some(&input),
+    )
+    .unwrap();
+    assert!(o.stdout.is_empty());
+    assert_eq!(o.status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
