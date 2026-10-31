@@ -56,7 +56,10 @@
 //!   foreground group and cannot read the terminal: the PIN comes from a
 //!   `pass_env` variable or a file, never a prompt. A Ctrl-C at the
 //!   terminal stops the caller only; the command then runs on until it
-//!   finishes or writes to its closed stdout.
+//!   finishes or writes to its closed stdout, and nothing on this side
+//!   bounds it any more. The shipped PKCS#11 adapter puts its own
+//!   deadline on each `pkcs11-tool` run (`--timeout`, default 110 s);
+//!   another command should do the same.
 //! * **exit status** 0 on success. Anything else, a timeout
 //!   (`timeout_ms`, default [`external::DEFAULT_TIMEOUT_MS`]), or a
 //!   signature that does **not verify under `public_key_hex`** is an

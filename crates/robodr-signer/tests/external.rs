@@ -702,6 +702,175 @@ fn pkcs11_adapter_refuses_before_spending_a_pin_retry() {
     }
 }
 
+/// A directory `name` of executable scripts `(file, body)`.
+fn fake_bin(d: &Dir, name: &str, files: &[(&str, String)]) -> PathBuf {
+    let bin = d.path(name);
+    let _ = fs::remove_dir_all(&bin);
+    fs::create_dir(&bin).unwrap();
+    for (f, body) in files {
+        let p = bin.join(f);
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+fn opensc_info(version: &str) -> String {
+    format!("echo 'OpenSC {version} [gcc  13.3.0]'")
+}
+
+/// Review findings (WP15 phase 3) on the adapter: (1) with no opensc-tool
+/// next to pkcs11-tool the version came from whichever opensc-tool was in
+/// PATH, possibly another OpenSC install, so an old pkcs11-tool passed the
+/// 0.25 check; (2) an empty PIN file was refused as "not a regular file";
+/// (3) nothing bounded a pkcs11-tool the adapter started once the caller
+/// was gone (robodr-signer's deadline dies with it): the adapter now runs
+/// it under its own deadline (`--timeout`).
+#[test]
+fn pkcs11_adapter_checks_its_own_opensc_and_bounds_pkcs11_tool() {
+    let d = Dir::new("p11-phase3");
+    let module = d.path("module.so");
+    fs::write(&module, b"").unwrap();
+    let m = module.to_str().unwrap();
+    let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let log = d.path("p11.log");
+    let logging = format!("echo \"$*\" >> {}\nexit 1", log.display());
+
+    // (1) pkcs11-tool alone in its directory; a new opensc-tool elsewhere
+    // in PATH does not vouch for it.
+    let bin = fake_bin(&d, "p11only", &[("pkcs11-tool", logging.clone())]);
+    let other = fake_bin(&d, "newopensc", &[("opensc-tool", opensc_info("0.26.0"))]);
+    let path = format!("{}:{}", bin.display(), other.display());
+    let sign = ["sign", "--module", m, "--id", "01", "--pin-env", "P11_PIN"];
+    let o = adapter_with(Path::new(&path), &sign, &[("P11_PIN", "4321")]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("no opensc-tool next to"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!log.exists(), "pkcs11-tool ran");
+
+    // (2) An empty PIN file: says so.
+    let bin = fake_bin(
+        &d,
+        "opensc",
+        &[
+            ("pkcs11-tool", logging.clone()),
+            ("opensc-tool", opensc_info("0.25.0")),
+        ],
+    );
+    let pin = d.path("pin");
+    fs::write(&pin, "").unwrap();
+    fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+    let p = pin.to_str().unwrap();
+    let o = adapter_with(
+        &bin,
+        &["sign", "--module", m, "--id", "01", "--pin-file", p],
+        &[],
+    );
+    assert!(stderr(&o).contains(" is empty"), "{}", stderr(&o));
+    assert!(!log.exists());
+    // Any mode without group or other bits is accepted (OPERATIONS 4.6).
+    fs::write(&pin, "2468\n").unwrap();
+    for mode in [0o700, 0o500, 0o200] {
+        fs::set_permissions(&pin, fs::Permissions::from_mode(mode)).unwrap();
+        let o = adapter_with(
+            &bin,
+            &["sign", "--module", m, "--id", "01", "--pin-file", p],
+            &[],
+        );
+        // 0200 is not readable for a non-root caller.
+        let e = stderr(&o);
+        assert!(
+            !e.contains("group or others") && !e.contains("not a regular"),
+            "{mode:o}: {e}"
+        );
+        let _ = fs::remove_file(&log);
+    }
+
+    // (3) A pkcs11-tool that never returns (a token waiting for a touch):
+    // killed at the adapter's --timeout.
+    let pidf = d.path("p11.pid");
+    let bin = fake_bin(
+        &d,
+        "hang",
+        &[
+            (
+                "pkcs11-tool",
+                format!("echo $$ > {}\nexec sleep 1000", pidf.display()),
+            ),
+            ("opensc-tool", opensc_info("0.25.0")),
+        ],
+    );
+    let t = Instant::now();
+    let mut timed = sign.to_vec();
+    timed.extend(["--timeout", "1"]);
+    let o = adapter_with(&bin, &timed, &[("P11_PIN", "4321")]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("timed out after 1s"), "{}", stderr(&o));
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(
+        gone_soon(pid_from(&pidf)),
+        "pkcs11-tool outlived the deadline"
+    );
+    for bad in ["0", "591", "abc", "010", "1000"] {
+        let mut v = sign.to_vec();
+        v.extend(["--timeout", bad]);
+        let o = adapter_with(&bin, &v, &[("P11_PIN", "4321")]);
+        assert!(
+            stderr(&o).contains("--timeout must be"),
+            "{bad}: {}",
+            stderr(&o)
+        );
+    }
+
+    // signer-file passes --timeout on, with timeout_ms 10 s above it.
+    let pubkey = format!(
+        "out=; prev=; for a; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\n\
+         printf '\\060\\052\\060\\005\\006\\003\\053\\145\\160\\003\\041\\000' > \"$out\"\n\
+         head -c 32 /dev/zero >> \"$out\"\n\
+         echo \"$*\" >> {}",
+        log.display()
+    );
+    let bin = fake_bin(
+        &d,
+        "pub",
+        &[
+            ("pkcs11-tool", pubkey),
+            ("opensc-tool", opensc_info("0.25.0")),
+        ],
+    );
+    let sf = |extra: &[&str]| {
+        let mut v = vec![
+            "signer-file",
+            "--module",
+            m,
+            "--id",
+            "01",
+            "--key-id",
+            "k",
+            "--pin-env",
+            "P11_PIN",
+        ];
+        v.extend(extra);
+        let o = adapter_with(&bin, &v, &[]);
+        assert!(o.status.success(), "{}", stderr(&o));
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()
+    };
+    let f = sf(&["--timeout", "50"]);
+    assert_eq!(f["timeout_ms"], 60_000, "{f}");
+    let cmd = f["command"].as_array().unwrap();
+    assert!(
+        cmd.windows(2).any(|w| w[0] == "--timeout" && w[1] == "50"),
+        "{f}"
+    );
+    assert_eq!(f["public_key_hex"], "00".repeat(32));
+    let f = sf(&[]);
+    assert_eq!(f["timeout_ms"], 120_000, "{f}");
+    assert!(!f["command"].to_string().contains("--timeout"), "{f}");
+}
+
 #[test]
 fn pkcs11_adapter_against_softhsm() {
     if std::env::var_os("ROBODR_PKCS11").is_none() {

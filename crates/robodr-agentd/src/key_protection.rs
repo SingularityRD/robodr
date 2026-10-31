@@ -42,7 +42,10 @@
 //! `$CREDENTIALS_DIRECTORY`; a `credentials_dir` that differs from it is
 //! not where this service's credentials are, so nothing in it counts as a
 //! credential (`file`, with a `detail`). Without the variable (e.g.
-//! `--check-config` from a shell) the configured directory is trusted.
+//! `--check-config` from a shell) the configured directory is trusted for
+//! the report, but the daemon itself refuses to start under
+//! `require: "tpm2"` ([`check_daemon_start`]): a process systemd did not
+//! give credentials to has no TPM-sealed key, whatever a directory holds.
 //!
 //! Limits (stated in `docs/OPERATIONS.md` 4.7): the report trusts the
 //! unit's layout (a credential named `blackbox.key` is matched to
@@ -218,6 +221,34 @@ pub fn classify_key(
     }
 }
 
+/// `$CREDENTIALS_DIRECTORY`, when systemd set it for this process.
+pub fn systemd_credentials_dir() -> Option<PathBuf> {
+    std::env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The daemon's own start check (not `--check-config`): under
+/// `require: "tpm2"` the process must have been started by systemd with
+/// credentials (`systemd_credentials` is `$CREDENTIALS_DIRECTORY`).
+/// Without it, `credentials_dir` is just a directory, and a plain key copy
+/// in it next to a sealed file of the same name would pass [`assess`].
+pub fn check_daemon_start(
+    report: &KeyReport,
+    systemd_credentials: Option<&Path>,
+) -> Result<(), String> {
+    if report.require == Requirement::Tpm2 && systemd_credentials.is_none() {
+        return Err(
+            "key_protection.require is \"tpm2\" but $CREDENTIALS_DIRECTORY is not set: systemd \
+             did not start this process with credentials, so no key can be a TPM-sealed \
+             credential (start agentd from its unit with LoadCredentialEncrypted=; see \
+             docs/OPERATIONS.md)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Classify every private key of `config` and apply `require`.
 pub fn assess(config: &DaemonConfig) -> Result<KeyReport, String> {
     let s = config.key_protection.clone().unwrap_or_default();
@@ -237,9 +268,7 @@ pub fn assess(config: &DaemonConfig) -> Result<KeyReport, String> {
             return Err(format!("{what} must be an absolute path"));
         }
     }
-    let systemd_creds = std::env::var_os("CREDENTIALS_DIRECTORY")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+    let systemd_creds = systemd_credentials_dir();
     let keys: Vec<KeyEntry> = private_keys(config)
         .into_iter()
         .map(|(role, p)| classify_key(role, &p, &cred, &enc, systemd_creds.as_deref()))
@@ -331,6 +360,24 @@ mod tests {
         // A directory as sealed source.
         fs::create_dir(e.join("dir.key")).unwrap();
         assert_eq!(k("dir.key").protection, "unknown");
+    }
+
+    /// Review finding (WP15 phase 3): with `$CREDENTIALS_DIRECTORY` unset
+    /// the configured directory cannot be shown to be systemd's; the
+    /// daemon refuses to start under `require: "tpm2"`.
+    #[test]
+    fn daemon_start_needs_systemd_credentials_under_tpm2() {
+        let report = |require| KeyReport {
+            require,
+            all_tpm2: true,
+            fallback: false,
+            keys: vec![],
+        };
+        let e = check_daemon_start(&report(Requirement::Tpm2), None).unwrap_err();
+        assert!(e.contains("CREDENTIALS_DIRECTORY"), "{e}");
+        let c = Path::new("/run/credentials/robodr-agentd.service");
+        assert!(check_daemon_start(&report(Requirement::Tpm2), Some(c)).is_ok());
+        assert!(check_daemon_start(&report(Requirement::None), None).is_ok());
     }
 
     /// Review finding (WP15): a `credentials_dir` pointed at any directory

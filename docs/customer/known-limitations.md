@@ -219,7 +219,26 @@
   `robodr-anchor-receiver` and `robodr-depot` only log them, and the
   site-acceptance checks print the days left. The robot's remote head
   anchor client and `robodr-deliverd` do not warn.
-- **Keys are files**, not TPM-held. The robot side of SOC-driven uplink
+- **Robot keys are files by default.** agentd's private keys can instead
+  be sealed to the robot's TPM as systemd encrypted credentials (systemd
+  250 or newer, not the focal package): that protects them **at rest**
+  only; while the service runs the key is in its credential ramfs and
+  memory, and the TPM does not make the signatures. agentd reports each
+  key's protection in `status.json` and, with `key_protection.require:
+  "tpm2"`, refuses to start on a weaker one (or when systemd did not start
+  it with credentials). It cannot tell a unit that still loads the plain
+  key file (`LoadCredential=`) from one that loads the sealed credential,
+  when a sealed file of that name exists; check the unit after sealing.
+  `robodr-executor`, the uplink, the exporters and the anchor receiver do
+  not report key protection. Tested on swtpm only, not on a hardware TPM.
+- **Offline signing keys in a token (PKCS#11)** are tested with SoftHSM 2
+  only, not yet on YubiKey, Nitrokey or a network HSM. The signing station
+  needs OpenSC 0.25 or later (Ubuntu 22.04 and Debian 12 ship older
+  releases, which the adapter refuses), the token PIN comes from an
+  environment variable or a PIN file (there is no terminal prompt), and
+  `keygen` makes file keys only (token keys are generated with the token
+  vendor's or OpenSC's tools).
+- **Key rotation.** The robot side of SOC-driven uplink
   and finding key rotation exists (`robodr-enroll`), and the SOC side is
   on an unreleased AutoSecOps branch. The black-box key is rotated with
   `robodr-blackbox rotate` while agentd is stopped (retired keys in

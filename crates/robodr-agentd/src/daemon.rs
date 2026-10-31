@@ -715,6 +715,13 @@ impl<'a> Daemon<'a> {
         log: &'a mut dyn Write,
         notifier: Notifier,
     ) -> Result<Self, DaemonError> {
+        // Before anything is created: `require: "tpm2"` needs the
+        // credentials systemd gave this process.
+        crate::key_protection::check_daemon_start(
+            &r.key_protection,
+            crate::key_protection::systemd_credentials_dir().as_deref(),
+        )
+        .map_err(DaemonError::Config)?;
         let epoch = Instant::now();
         let clock = SharedClock(Arc::new(SystemClock::new(TimeSource::Unknown)));
         let cfg = &r.config;

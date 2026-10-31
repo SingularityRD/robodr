@@ -15,21 +15,32 @@
 #       is read from the token now and pinned in the file)
 #
 #   TOKEN: --module /abs/path/to/pkcs11-module.so [--token-label LABEL | --slot N]
+#          [--timeout SECONDS]
+#
+# Deadline: every pkcs11-tool run is limited to --timeout seconds (default
+# 110, at most 590) by coreutils "timeout --foreground" (SIGTERM, then
+# SIGKILL 5 seconds later). robodr-signer enforces its own deadline
+# (timeout_ms) by killing the adapter's process group, but only while the
+# caller lives: after a Ctrl-C at the terminal the caller is gone, and this
+# inner deadline is what stops a pkcs11-tool still waiting on the token.
+# signer-file passes a given --timeout on and sets the file's timeout_ms
+# 10 seconds above it (default 120000).
 #
 # PIN: sign and signer-file need exactly one of --pin-env NAME (the PIN is
 # in that environment variable; list NAME in the signer file's "pass_env")
-# or --pin-file FILE (first line of FILE, which must be a regular file
-# owned by the caller or root and not readable or writable by group or
-# others, i.e. mode 0600 or 0400). There is no terminal prompt: the
+# or --pin-file FILE (first line of FILE, which must be a non-empty regular
+# file owned by the caller or root with no group or other permission bits,
+# e.g. mode 0600 or 0400). There is no terminal prompt: the
 # adapter's stdin is the message and robodr-signer runs it in its own
 # process group, so a prompt would get no PIN and could spend one of the
 # token's PIN retries. The PIN is never put on a command line:
 # pkcs11-tool reads it with "--pin env:VAR", relied on from OpenSC 0.25
 # (a pkcs11-tool without that form would send the literal text "env:VAR"
 # as the PIN and spend a retry each time). The OpenSC version is read with
-# "opensc-tool --info" (the opensc-tool next to pkcs11-tool, else the one
-# in PATH) and anything older than 0.25, or unknown, is refused before the
-# token is touched. Tested with 0.25.0-rc1 (Ubuntu 24.04).
+# "opensc-tool --info" (the opensc-tool in the same directory as the
+# pkcs11-tool found in PATH; without one the adapter refuses, since another
+# opensc-tool may belong to another OpenSC install) and anything older than
+# 0.25, or unknown, is refused before the token is touched. Tested with 0.25.0-rc1 (Ubuntu 24.04).
 #
 # Exit 0 on success; anything else on failure (messages on stderr). The
 # caller verifies every signature against the pinned public key.
@@ -53,6 +64,7 @@ pin_env=
 pin_file=
 key_id=
 adapter=/usr/lib/robodr/robodr-signer-pkcs11
+deadline=
 
 while [ $# -gt 0 ]; do
     [ $# -ge 2 ] || die "$1 needs a value"
@@ -65,6 +77,7 @@ while [ $# -gt 0 ]; do
         --pin-file) pin_file=$2 ;;
         --key-id) key_id=$2 ;;
         --adapter) adapter=$2 ;;
+        --timeout) deadline=$2 ;;
         *) die "unknown option $1" ;;
     esac
     shift 2
@@ -91,8 +104,24 @@ if [ -n "$pin_env" ]; then
 fi
 [ -z "$pin_env" ] || [ -z "$pin_file" ] || die "--pin-env and --pin-file exclude each other"
 [ -z "$pin_file" ] || plain --pin-file "$pin_file"
+timeout_given=$deadline
+case $deadline in
+    "") deadline=110 ;;
+    0* | *[!0-9]*) die "--timeout must be a number of seconds, 1 to 590" ;;
+esac
+if [ "${#deadline}" -gt 3 ] || [ "$deadline" -gt 590 ]; then
+    die "--timeout must be a number of seconds, 1 to 590"
+fi
 
 p11tool=$(command -v pkcs11-tool 2>/dev/null) || die "pkcs11-tool (OpenSC) not found in PATH"
+case $p11tool in /*) ;; *) die "pkcs11-tool resolves to $p11tool, not an absolute path" ;; esac
+command -v timeout >/dev/null 2>&1 || die "timeout (coreutils) not found in PATH: needed for the --timeout deadline"
+
+# Every pkcs11-tool run, under the deadline. --foreground keeps it in this
+# process group, so robodr-signer's group kill still reaches it.
+p11() {
+    timeout --foreground -k 5 "$deadline" "$p11tool" "$@"
+}
 
 # The OpenSC release behind pkcs11-tool must understand "--pin env:VAR"
 # (0.25 and later). Checked before any login: an older pkcs11-tool would
@@ -100,8 +129,9 @@ p11tool=$(command -v pkcs11-tool 2>/dev/null) || die "pkcs11-tool (OpenSC) not f
 # PIV locks after 3).
 check_opensc() {
     ot="${p11tool%/*}/opensc-tool"
-    [ -x "$ot" ] || ot=$(command -v opensc-tool 2>/dev/null) ||
-        die "opensc-tool not found: cannot check the OpenSC version (0.25 or later needed for --pin env:VAR)"
+    if [ ! -f "$ot" ] || [ ! -x "$ot" ]; then
+        die "no opensc-tool next to $p11tool: cannot check that this pkcs11-tool's OpenSC is 0.25 or later (needed for --pin env:VAR)"
+    fi
     ver=$("$ot" --info 2>/dev/null | sed -n '1s/^OpenSC \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
     [ -n "$ver" ] || die "cannot read the OpenSC version from $ot --info (0.25 or later needed)"
     # Split on purpose: two numbers.
@@ -124,7 +154,12 @@ check_pin_file() {
     # Split on purpose: uid, octal mode, file type (digits and letters).
     # shellcheck disable=SC2086
     set -- $st
-    case "$3 ${4:-}" in "regular file") ;; *) die "--pin-file $pin_file is not a regular file" ;; esac
+    # GNU stat says "regular empty file" for an empty one.
+    case "$3 ${4:-} ${5:-}" in
+        "regular file ") ;;
+        "regular empty file") die "--pin-file $pin_file is empty" ;;
+        *) die "--pin-file $pin_file is not a regular file" ;;
+    esac
     [ "$1" = 0 ] || [ "$1" = "$(id -u)" ] ||
         die "--pin-file $pin_file is owned by uid $1, not by you or root"
     case $2 in
@@ -146,8 +181,8 @@ tmp=$(mktemp -d) || die "mktemp failed"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 public_key_hex() {
-    pkcs11-tool "$@" --read-object --type pubkey --id "$id" -o "$tmp/pub" >/dev/null 2>"$tmp/err" ||
-        { cat "$tmp/err" >&2; die "reading public key $id failed"; }
+    p11 "$@" --read-object --type pubkey --id "$id" -o "$tmp/pub" >/dev/null 2>"$tmp/err" ||
+        { cat "$tmp/err" >&2; die "reading public key $id failed (or timed out after ${deadline}s)"; }
     if head -c 11 "$tmp/pub" | grep -q -- '-----BEGIN'; then
         grep -v -- '-----' "$tmp/pub" | base64 -d >"$tmp/pub.der" 2>/dev/null ||
             die "public key $id: bad PEM"
@@ -178,8 +213,8 @@ case $op in
         cat >"$tmp/msg"
         # pkcs11-tool's chatter goes to stderr; stdout carries only the
         # signature.
-        pkcs11-tool "$@" --sign --mechanism EDDSA --id "$id" \
-            -i "$tmp/msg" -o "$tmp/sig" >&2 || die "signing with key $id failed"
+        p11 "$@" --sign --mechanism EDDSA --id "$id" \
+            -i "$tmp/msg" -o "$tmp/sig" >&2 || die "signing with key $id failed (or timed out after ${deadline}s)"
         [ "$(wc -c <"$tmp/sig" | tr -d ' ')" = 64 ] || die "the token returned no Ed25519 signature"
         cat "$tmp/sig"
         ;;
@@ -208,14 +243,20 @@ case $op in
         elif [ -n "$pin_file" ]; then
             pin=", \"--pin-file\", \"$pin_file\""
         fi
+        tmo=""
+        timeout_ms=120000
+        if [ -n "$timeout_given" ]; then
+            tmo=", \"--timeout\", \"$deadline\""
+            timeout_ms=$(((deadline + 10) * 1000))
+        fi
         cat <<EOF
 {
   "format": "robodr-signer/v1",
   "backend": "external",
   "key_id": "$key_id",
   "public_key_hex": "$pub",
-  "command": ["$adapter", "sign", "--module", "$module"$tok, "--id", "$id"$pin]$pass,
-  "timeout_ms": 120000
+  "command": ["$adapter", "sign", "--module", "$module"$tok, "--id", "$id"$pin$tmo]$pass,
+  "timeout_ms": $timeout_ms
 }
 EOF
         ;;
