@@ -287,7 +287,15 @@ fn call_service(
             // Review F10 for this RMW: the correlation is the GUIDs (fresh
             // random entity keys) and a random sequence number. Kept below
             // 2^16 + 2: a real Fast DDS reader (Humble) never delivers a
-            // first sample numbered near 2^31 (tools/e2e/ros2-peer).
+            // first sample numbered near 2^31 (tools/e2e/ros2-peer). That
+            // leaves 16 bits here: with `participant_prefix` configured (our
+            // prefix known) a forger guesses one of two 24-bit entity keys
+            // and this number, about 2^39 tries within `timeout_ms`; without
+            // it our random 96-bit prefix is in the GUID as well. Weaker
+            // than the cyclonedds path's 64-bit client id (a forged reply
+            // could confirm a cancel that did not happen);
+            // `peer_participant_prefix` narrows answers to the peer's own
+            // writers.
             let sn = 2 + i64::from(rtps::random_u64() as u16);
             let qos =
                 rtps::related_identity_qos(rtps::guid_of(part.prefix, rep_r), rtps::SN_UNKNOWN);

@@ -343,7 +343,7 @@ refused).
 | `rmw` | Robot's RMW | Service correlation |
 |---|---|---|
 | `cyclonedds` (default) | `rmw_cyclonedds_cpp` | request header (random client id, random sequence number) leads the payload; the reply echoes it |
-| `fastrtps` | `rmw_fastrtps_cpp`, `rmw_fastrtps_dynamic_cpp` (the ROS 2 default) | bare payload; the request's inline QoS names our reply reader as its related sample identity (`PID_CUSTOM_RELATED_SAMPLE_IDENTITY` 0x800f and the standard 0x0083); the reply's names that reader (or our request writer, both with fresh random entity keys) and the request's random sequence number (2..=65537: a real Fast DDS never delivered a first sample numbered near 2^31) |
+| `fastrtps` | `rmw_fastrtps_cpp`, `rmw_fastrtps_dynamic_cpp` (the ROS 2 default) | bare payload; the request's inline QoS names our reply reader as its related sample identity (`PID_CUSTOM_RELATED_SAMPLE_IDENTITY` 0x800f and the standard 0x0083); the reply's names that reader (or our request writer, both with fresh random entity keys) and the request's random sequence number (2..=65537: a real Fast DDS never delivered a first sample numbered near 2^31). Weaker than `cyclonedds`' 64-bit client id: with `ros2.participant_prefix` set (our prefix then known), an off-path forger must guess one of two 24-bit entity keys and the 16-bit sequence number, about 2^39 tries within `timeout_ms`; without it our random 96-bit prefix is part of the GUID too. `ros2.peer_participant_prefix` adds that the reply must come from one of the peer's writers |
 
 Refused by the configuration (no adapter is sent anything):
 `rmw_connextdds` and `rmw_gurumdds` (vendor-specific reply correlation,
