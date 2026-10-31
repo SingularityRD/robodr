@@ -2560,8 +2560,11 @@ consumers drop duplicates on `event-uid`). Without `--once` it loops every
 the importer's `out/` (the marker is what stops it being published again):
 prune `out/` and the markers follow. Where the tool is the **only
 consumer** of `out/`, it can prune `out/` itself: `--out-max-age-s N` /
-`--out-max-count N` / `--out-max-bytes N` delete the batch directories it
-has finished (never one without its `done/` marker). With a spool source,
+`--out-max-count N` / `--out-max-bytes N` delete the records and bundles of
+the batches it has finished (never one without its `done/` marker); each
+directory stays with its `MANIFEST.json` as a small tombstone, so a batch
+re-emitted after an importer state reset cannot land under a finished
+name. With a spool source,
 `--rejected-max-age-s` / `--rejected-max-count` / `--rejected-max-bytes`
 bound `<spool>/rejected/` (default: kept); `robodr-uplink
 --reinject-max-age-s` / `--reinject-max-count` / `--reinject-max-bytes`

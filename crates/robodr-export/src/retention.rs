@@ -2,8 +2,9 @@
 //! (`robodr-kafka-publish`, `robodr-uplink`), rotated dead-letter files
 //! (both, [`crate::deadletter`]), rejected spool records
 //! (`robodr-spool-export`, and with a spool source `robodr-kafka-publish`
-//! and `robodr-uplink`), finished batch directories of the diode
-//! importer's `out/` ([`prune_diode_out`], opt-in, sole consumer only) and
+//! and `robodr-uplink`), the payload of finished batch directories of the
+//! diode importer's `out/` ([`prune_diode_out`], opt-in, sole consumer
+//! only; tombstones stay) and
 //! the payload of finished re-injection generations
 //! ([`prune_reinject_payloads`], opt-in; the ledger stays). What the state
 //! occupies is measured by [`state_usage`] (the uplink's status file, the
@@ -224,12 +225,6 @@ pub fn prune_done_markers(
     })
 }
 
-/// Prefix of an importer `out/` batch directory being deleted: renamed
-/// first (one atomic step that hides it from every reader of `out/`, which
-/// list only valid batch names), then removed; a leftover of an
-/// interrupted deletion is removed by the next pass.
-pub const PRUNING_PREFIX: &str = ".robodr-pruned-";
-
 /// Bytes of the regular files under `dir` (not following symlinks; at
 /// most `depth` directory levels below it).
 pub fn tree_bytes(dir: &Path, depth: u32) -> io::Result<u64> {
@@ -251,15 +246,45 @@ pub fn tree_bytes(dir: &Path, depth: u32) -> io::Result<u64> {
     Ok(n)
 }
 
+/// The payload of an importer `out/` batch directory: every entry but the
+/// manifest copy, the records file first (`(path, is_dir)`).
+fn out_payload(dir: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+    let mut v = Vec::new();
+    for e in fs::read_dir(dir)? {
+        let e = e?;
+        if e.file_name() == robodr_diode::manifest::MANIFEST_FILE {
+            continue;
+        }
+        v.push((e.path(), e.file_type()?.is_dir()));
+    }
+    let records = dir.join(crate::publish::RECORDS_FILE);
+    v.sort_by_key(|(p, _)| *p != records);
+    Ok(v)
+}
+
 /// Prune the diode importer's `out/` (opt-in, `r` unbounded by default):
-/// a batch directory over `r` is deleted only once this tool has finished
-/// it (its `done/` marker exists); without a marker it is held. Its age is
-/// the marker's (when it was finished), its size the bytes under it.
+/// a batch directory over `r` loses its payload (records, bundles) only
+/// once this tool has finished it (its `done/` marker exists); without a
+/// marker it is held. Its age is the marker's (when it was finished), its
+/// size the bytes of the payload.
+///
+/// The directory and its `MANIFEST.json` copy stay as a **tombstone**: the
+/// importer, should that unit's import state be reset and a different
+/// batch arrive under the same name, then finds the name taken by another
+/// manifest and emits the new batch under its hash-suffixed name (which
+/// has no `done/` marker, so it is published). Were the name free, the new
+/// batch would be emitted under it and skipped as done: a silent loss. A
+/// tombstone holds its `done/` marker too (the batch is "still in
+/// `out/`"); both are a few hundred bytes to a few KiB per batch, counted
+/// in [`StateUsage::diode_out`] and [`StateUsage::done_markers`].
+///
+/// The records file goes first (one `unlink`), so a crash leaves a
+/// finished batch with less payload, never a half-readable records file
+/// under a name that is not finished; the next pass completes it.
 ///
 /// Only for a tool that is the **sole consumer** of `out/`: a second
 /// consumer (another publisher or uplink on the same `out/`) would lose the
-/// batches this one has finished. The importer itself does not need them
-/// (it deduplicates on its own sequence state).
+/// batches this one has finished.
 pub fn prune_diode_out(
     out: &Path,
     done_dir: &Path,
@@ -276,39 +301,39 @@ pub fn prune_diode_out(
         Err(e) => return Err(e),
     };
     let mut cands = Vec::new();
-    let mut leftovers = Vec::new();
     for e in rd {
         let e = e?;
         let Some(name) = e.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !e.file_type()?.is_dir() {
+        if !crate::publish::valid_batch_name(&name) || !e.file_type()?.is_dir() {
             continue;
         }
-        if name.starts_with(PRUNING_PREFIX) {
-            leftovers.push(e.path());
+        let payload = out_payload(&e.path())?;
+        if payload.is_empty() {
+            // A tombstone already.
             continue;
         }
-        if !crate::publish::valid_batch_name(&name) {
-            continue;
+        let mut bytes = 0u64;
+        for (p, is_dir) in &payload {
+            bytes = bytes.saturating_add(if *is_dir {
+                tree_bytes(p, 3)?
+            } else {
+                file_meta(p)?.map_or(0, |m| m.1)
+            });
         }
         let modified = match file_meta(&done_dir.join(&name))? {
             Some((t, _)) => t,
             None => e.metadata()?.modified()?,
         };
-        let bytes = tree_bytes(&e.path(), 4)?;
         cands.push(Candidate {
             name,
-            paths: vec![e.path()],
+            paths: payload.into_iter().map(|(p, _)| p).collect(),
             modified,
             bytes,
         });
     }
-    for p in leftovers {
-        fs::remove_dir_all(p)?;
-    }
     let items: Vec<(SystemTime, u64)> = cands.iter().map(|c| (c.modified, c.bytes)).collect();
-    let mut renamed = Vec::new();
     for (c, over) in cands.iter().zip(r.over(&items, now)) {
         if !over {
             continue;
@@ -317,20 +342,21 @@ pub fn prune_diode_out(
             rep.held += 1;
             continue;
         }
-        let to = out.join(format!("{PRUNING_PREFIX}{}", c.name));
-        match fs::rename(out.join(&c.name), &to) {
-            Ok(()) => renamed.push(to),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+        for p in &c.paths {
+            let res = match fs::symlink_metadata(p) {
+                Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+                Ok(_) => fs::remove_file(p),
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
+        fsutil::fsync_dir(&out.join(&c.name))?;
         rep.removed += 1;
         rep.removed_bytes += c.bytes;
-    }
-    if !renamed.is_empty() {
-        fsutil::fsync_dir(out)?;
-        for p in renamed {
-            fs::remove_dir_all(p)?;
-        }
     }
     Ok(rep)
 }
@@ -621,13 +647,13 @@ mod tests {
             fsutil::mkdir(&out.join(b).join("bundles")).unwrap();
             fs::write(out.join(b).join("records.jsonl"), [b'x'; 100]).unwrap();
             fs::write(out.join(b).join("bundles").join("1.json"), [b'y'; 10]).unwrap();
+            fs::write(out.join(b).join("MANIFEST.json"), [b'm'; 7]).unwrap();
         }
         fs::write(done.join("rdd_a_1"), b"").unwrap();
         // Not a batch directory / a staging directory: never touched.
         fs::write(out.join("rdd_a_3"), b"").unwrap();
         fsutil::mkdir(&out.join(".tmp-import")).unwrap();
-        // A leftover of an interrupted deletion: removed.
-        fsutil::mkdir(&out.join(format!("{PRUNING_PREFIX}rdd_a_0"))).unwrap();
+        fs::write(out.join(".tmp-import").join("records.jsonl"), b"x").unwrap();
         let later = SystemTime::now() + DAY * 40;
         let r = Retention::max_age(DAY * 30);
         assert_eq!(
@@ -636,15 +662,28 @@ mod tests {
         );
         let rep = prune_diode_out(&out, &done, &r, SystemTime::now()).unwrap();
         assert_eq!((rep.removed, rep.held), (0, 0), "not old yet");
-        assert!(!out.join(format!("{PRUNING_PREFIX}rdd_a_0")).exists());
         let rep = prune_diode_out(&out, &done, &r, later).unwrap();
         assert_eq!((rep.removed, rep.held, rep.removed_bytes), (1, 1, 110));
-        assert!(!out.join("rdd_a_1").exists(), "finished: deleted");
-        assert!(out.join("rdd_a_2").exists(), "not finished: held");
-        assert!(out.join("rdd_a_3").exists() && out.join(".tmp-import").exists());
+        // Finished: only the tombstone (the manifest copy) is left.
+        let left: Vec<_> = fs::read_dir(out.join("rdd_a_1"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["MANIFEST.json"]);
+        assert!(out.join("rdd_a_2").join("records.jsonl").exists(), "held");
+        assert!(out.join("rdd_a_3").exists());
+        assert!(out.join(".tmp-import").join("records.jsonl").exists());
         assert!(done.join("rdd_a_1").exists(), "the marker is not ours");
+        // A tombstone is not pruned again.
+        let rep = prune_diode_out(&out, &done, &r, later).unwrap();
+        assert_eq!((rep.removed, rep.held), (0, 1));
+        // A crash after the records went: the next pass finishes it.
+        fs::write(done.join("rdd_a_2"), b"").unwrap();
+        fs::remove_file(out.join("rdd_a_2").join("records.jsonl")).unwrap();
+        let rep = prune_diode_out(&out, &done, &r, later).unwrap();
+        assert_eq!((rep.removed, rep.removed_bytes), (1, 10));
         let u = dir_usage(&out, 4).unwrap();
-        assert_eq!((u.entries, u.bytes), (2, 110));
+        assert_eq!((u.entries, u.bytes), (3, 14), "two tombstones, one file");
         let _ = fs::remove_dir_all(&d);
     }
 

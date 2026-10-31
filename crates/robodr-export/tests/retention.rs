@@ -247,17 +247,25 @@ fn publisher_prunes_finished_out_batches_only_when_asked() {
     assert_eq!(rep.published, 0, "nothing republished");
     assert_eq!(rep.pruned_out.removed, 2, "{rep:?}");
     assert!(rep.pruned_out.removed_bytes > 2 * 70_000);
-    let left: Vec<String> = fs::read_dir(&out)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(left.len(), 1, "{left:?}");
+    // Two payloads gone; the directories stay as tombstones (with the
+    // manifest copy the importer writes; none in this test), so the
+    // importer never re-emits a different batch under a finished name.
+    let with_records = ["rdd_a_1", "rdd_a_2", "rdd_a_3"]
+        .iter()
+        .filter(|b| out.join(b).join("records.jsonl").exists())
+        .count();
+    assert_eq!(with_records, 1);
     for b in ["rdd_a_1", "rdd_a_2", "rdd_a_3"] {
+        assert!(out.join(b).is_dir(), "tombstone");
         assert!(state.join("done").join(b).exists(), "markers stay");
     }
     let u = rep.state_usage.unwrap();
-    assert_eq!(u.diode_out.unwrap().entries, 1);
-    assert_eq!(p.run_once().unwrap().published, 0);
+    let o = u.diode_out.unwrap();
+    assert_eq!(o.entries, 3);
+    assert!(o.bytes < 100_000, "{o:?}");
+    let rep = p.run_once().unwrap();
+    assert_eq!(rep.published, 0);
+    assert_eq!(rep.pruned_out.removed, 0, "tombstones are not pruned again");
 }
 
 /// T83: with a spool source, `rejected_retention` bounds `<spool>/rejected/`

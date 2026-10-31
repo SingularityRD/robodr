@@ -75,8 +75,8 @@
 //! re-injected (`reinject` reads the files present).
 //!
 //! Opt-in, kept by default: [`UplinkConfig::out_retention`] (diode source,
-//! sole consumer of `out/` only) deletes finished `out/` batch directories
-//! ([`crate::retention::prune_diode_out`]), [`UplinkConfig::rejected_retention`]
+//! sole consumer of `out/` only) deletes the payload of finished `out/`
+//! batches, leaving tombstones ([`crate::retention::prune_diode_out`]), [`UplinkConfig::rejected_retention`]
 //! (spool source) bounds `<spool>/rejected/`
 //! ([`crate::spool_export::prune_rejected`]), and
 //! [`UplinkConfig::reinject_retention`] deletes the `records.jsonl` of
@@ -637,7 +637,7 @@ pub struct UplinkReport {
     /// Rotated dead-letter files deleted by retention (held: entries still
     /// needed for deduplication).
     pub pruned_dead_letters: PruneReport,
-    /// Finished `out/` batch directories deleted by retention (held: not
+    /// Finished `out/` batch payloads deleted by retention (held: not
     /// finished yet).
     pub pruned_out: PruneReport,
     /// `<spool>/rejected/` records deleted by retention.

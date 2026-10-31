@@ -111,8 +111,9 @@
 //! * opt-in ([`PublishConfig::out_retention`], diode source, only when
 //!   this publisher is the **sole consumer** of `out/`): a finished batch
 //!   directory of the importer's `out/` (its `done/` marker exists; aged by
-//!   the marker) over the bounds is deleted (renamed aside, then removed);
-//!   an unfinished one is held. Its marker then follows the `done/` bounds;
+//!   the marker) over the bounds loses its payload (records, bundles) and
+//!   stays as a tombstone with its `MANIFEST.json` and marker
+//!   ([`crate::retention::prune_diode_out`]); an unfinished one is held;
 //! * opt-in ([`PublishConfig::rejected_retention`], spool source):
 //!   `<spool>/rejected/` is bounded as `robodr-spool-export` bounds it
 //!   ([`crate::spool_export::prune_rejected`]).
@@ -463,7 +464,7 @@ pub struct PublishReport {
     /// Rotated dead-letter files deleted by retention (and held: entries
     /// still needed for deduplication).
     pub pruned_dead_letters: PruneReport,
-    /// Finished `out/` batch directories deleted by retention (held: not
+    /// Finished `out/` batch payloads deleted by retention (held: not
     /// finished yet).
     pub pruned_out: PruneReport,
     /// `<spool>/rejected/` records deleted by retention.

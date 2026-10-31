@@ -196,9 +196,14 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   (`pruned_dead_letters.held`). Every deletion of a file holding entries
   is logged on stderr with the count (`pruned_dead_letters.removed_entries`).
   Opt-in, kept by default: `--out-max-age-s` / `--out-max-count` /
-  `--out-max-bytes` (diode source) delete the importer's `out/` batch
-  directories this tool has **finished** (its `done/` marker exists; aged
-  by the marker; an unfinished one is held, `pruned_out.held`); use them
+  `--out-max-bytes` (diode source) delete the payload (records, bundles)
+  of the importer's `out/` batch directories this tool has **finished**
+  (its `done/` marker exists; aged by the marker; an unfinished one is
+  held, `pruned_out.held`). The directory and its `MANIFEST.json` stay as
+  a tombstone (with its `done/` marker): should that unit's import state
+  be reset, a different batch under the same name then goes to the
+  importer's hash-suffixed name and is published, instead of landing
+  under a name already marked done. Use these flags
   only when this tool is the **only consumer** of `out/` (a second
   publisher or uplink on the same `out/` would lose those batches; the
   importer itself does not need them). `--rejected-max-age-s` /
@@ -215,9 +220,9 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   `done_markers`, `dead_letters`, `diode_out` or `spool_rejected`, and
   `reinject` for the uplink) in the publisher's JSON report and in
   `uplink-status.json`, measured at most once a minute. Deletions are
-  single `unlink`s plus a directory fsync (an `out/` batch directory is
-  renamed aside first, then removed; a leftover is removed by the next
-  pass): crash-safe at any point.
+  single `unlink`s plus a directory fsync (an `out/` payload loses its
+  records file first; a pass interrupted after that is completed by the
+  next one): crash-safe at any point.
 * **Dead letters.** A record that fails validation, or that Kafka rejects
   as a record (`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`,
   `INVALID_RECORD`), is appended to `<state>/dead-letter.jsonl`
@@ -720,9 +725,14 @@ partitioner all agreed with the real brokers.
   (key not registered, clock off by more than 300 s) is retried slowly
   forever with the batch kept, never dropped. No HTTP proxy support (the
   sites are air-gapped or direct).
-* `done/` markers are bounded only once the importer's `out/` is pruned
-  (a marker is kept while its batch is there; `--out-max-*` prunes `out/`
-  for a sole consumer, otherwise the operator does). The re-injection
+* `done/` markers are bounded only once the batch directory has left the
+  importer's `out/` (a marker is kept while its batch is there).
+  `--out-max-*` removes the bulk (records, bundles) for a sole consumer
+  but leaves a tombstone per batch (its `MANIFEST.json` and `done/`
+  marker, a few KiB; `state_usage` counts them); removing tombstones
+  (and with them, after `--done-max-age-s`, the markers) is the
+  operator's call, safe only while no importer state reset re-emits old
+  batch names. The re-injection
   ledger (`origin.jsonl` per generation, small) is never pruned; the
   importer's own `processed/` and `quarantine/` are the importer's
   (robodr-diode). No signal handling: both tools are crash-safe by

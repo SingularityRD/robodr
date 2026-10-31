@@ -48,7 +48,8 @@ Retention: rotated dead-letter files past --dead-letter-keep or older than --dea
 and done/ markers older than --done-max-age-s (default 2592000 = 30 days, 0 = keep) or beyond \
 --done-max-count, are deleted once nothing in them is needed any more (records that may still be \
 processed again; batches still in out/). Opt-in, default keep: --out-max-* (diode source; only \
-when this uplink is the sole consumer of out/) delete the out/ batch directories it has finished, \
+when this uplink is the sole consumer of out/) delete the records of out/ batches it has finished \
+(a tombstone with the manifest stays), \
 --rejected-max-* (spool source) the oldest <spool>/rejected/ records, --reinject-max-* the \
 records.jsonl of finished re-injection generations (their origin.jsonl ledger stays). \
 uplink-status.json carries state_usage (entries and bytes of each, measured at most once a \

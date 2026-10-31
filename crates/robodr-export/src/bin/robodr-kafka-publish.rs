@@ -43,8 +43,9 @@ optionally bounded by --dead-letter-max-age-s; older rotated files are then DELE
 deletion is logged with its entry count). done/ markers older than --done-max-age-s (default \
 2592000 = 30 days, 0 = keep) or beyond --done-max-count are deleted once their batch has left \
 the importer's out/. --out-max-age-s / --out-max-count / --out-max-bytes (diode source, \
-default keep; only when this publisher is the sole consumer of out/) delete the out/ batch \
-directories it has finished (aged by their done/ marker); --rejected-max-age-s / \
+default keep; only when this publisher is the sole consumer of out/) delete the records of out/ \
+batches it has finished (aged by their done/ marker; a tombstone with the manifest stays); \
+--rejected-max-age-s / \
 --rejected-max-count / --rejected-max-bytes (spool source, default keep) delete the oldest \
 <spool>/rejected/ records. Nothing still needed for deduplication is deleted. The JSON report \
 carries state_usage (entries and bytes of done/, dead letters, out/ or rejected/, measured at \
