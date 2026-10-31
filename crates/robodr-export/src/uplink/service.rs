@@ -389,6 +389,9 @@ pub fn run<T: Transport>(
     // Carried from one run's Uplink to the next (usage measured at most
     // once per interval, a lasting pruning error logged once).
     let mut upkeep = super::Upkeep::default();
+    // The snapshot error last logged: one line while the same error
+    // lasts, not one per loop pass (every `--interval-ms`).
+    let mut snap_err: Option<String> = None;
     loop {
         let (result, snap) = match open() {
             Ok(u) => {
@@ -396,8 +399,15 @@ pub fn run<T: Transport>(
                 let r = u.run_once();
                 let snap = u.snapshot();
                 upkeep = u.take_upkeep();
-                if let Err(e) = &snap {
-                    (env.log)(&format!("cannot update the status snapshot: {e}"));
+                match &snap {
+                    Ok(_) => snap_err = None,
+                    Err(e) => {
+                        let msg = format!("cannot update the status snapshot: {e}");
+                        if snap_err.as_deref() != Some(msg.as_str()) {
+                            (env.log)(&msg);
+                            snap_err = Some(msg);
+                        }
+                    }
                 }
                 (r, snap.ok())
             }

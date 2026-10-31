@@ -246,6 +246,85 @@ fn spool_to_kafka_end_to_end() {
     assert_eq!(c.total(), 30);
 }
 
+/// T83 end to end, with the real packer and importer: `--out-max-*`
+/// leaves a pruned batch's directory and `MANIFEST.json` as a tombstone.
+/// After the robot's packer and the importer's state are reset, a new
+/// batch arrives under the same name; the importer finds the name taken
+/// by another manifest and emits it under its hash-suffixed name, which
+/// has no `done/` marker, so it is published. The control run removes the
+/// tombstone: the new batch then lands under the finished name and is
+/// skipped as done (the silent loss the tombstone prevents).
+#[test]
+fn a_pruned_out_batch_tombstone_keeps_a_reused_name_from_being_skipped() {
+    for tombstone in [true, false] {
+        let r = Robot::new(if tombstone { "tomb" } else { "tomb-ctl" });
+        r.spool_findings(0, 5);
+        r.exporter(None).run_once(NOW).unwrap();
+        assert_eq!(r.transfer_and_import().accepted.len(), 1);
+        let out = r.high.join("out");
+        let name = Robot::names(&out).pop().unwrap();
+        let c = Cluster::start(1, 1);
+        let open = || {
+            let mut cfg = PublishConfig::new(Source::DiodeOut(out.clone()), &r.soc_state);
+            cfg.out_retention = robodr_export::retention::Retention {
+                max_count: Some(0),
+                ..Default::default()
+            };
+            Publisher::open(cfg, producer(&c)).unwrap()
+        };
+        // Finished and pruned in the same run.
+        let rep = open().run_once().unwrap();
+        assert_eq!((rep.published, rep.pruned_out.removed), (5, 1), "{rep:?}");
+        assert_eq!(Robot::names(&out.join(&name)), ["MANIFEST.json"]);
+        if !tombstone {
+            fs::remove_dir_all(out.join(&name)).unwrap();
+        }
+
+        // The robot is reinstalled (packer and exporter state gone) and the
+        // importer's state is reset: the next batch reuses the name.
+        fs::remove_file(&r.pack_state).unwrap();
+        let _ = fs::remove_file(&r.export_state);
+        for b in r.outbox_batches() {
+            fs::remove_dir_all(r.outbox.join(b)).unwrap();
+        }
+        fs::remove_file(r.high.join("state.json")).unwrap();
+        fs::remove_dir_all(r.high.join("processed")).unwrap();
+        r.spool_findings(5, 5);
+        r.exporter(None).run_once(NOW + 1).unwrap();
+        assert_eq!(
+            r.outbox_batches(),
+            std::slice::from_ref(&name),
+            "the name is reused"
+        );
+        let imp = r.transfer_and_import();
+        assert_eq!(imp.accepted.len(), 1, "{imp:?}");
+
+        let rep = open().run_once().unwrap();
+        let mut keys: Vec<Vec<u8>> = c
+            .all_records()
+            .into_iter()
+            .map(|(_, d)| d.key.unwrap())
+            .collect();
+        keys.sort();
+        if tombstone {
+            assert!(
+                Robot::names(&out)
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{name}."))),
+                "emitted under the hash-suffixed name: {:?}",
+                Robot::names(&out)
+            );
+            assert_eq!(rep.published, 5, "{rep:?}");
+            let mut want: Vec<Vec<u8>> = (0..10).map(|i| key_of(i).into_bytes()).collect();
+            want.sort();
+            assert_eq!(keys, want, "every finding delivered once");
+        } else {
+            assert_eq!(rep.published, 0, "skipped as done: {rep:?}");
+            assert_eq!(keys.len(), 5);
+        }
+    }
+}
+
 /// The task's key case: crash after the batch is published, before the
 /// spool records are renamed into acked/.
 #[test]

@@ -260,11 +260,21 @@
   request (and agentd the client certificate); the executor refuses a
   control-plane order without a valid SOC-signed request
   ([ADR-0006](../adr/0006-approval-never-autonomous.md)).
-- **Hand-written components remain:** the agentd HTTP server (fuzzed), the
-  Kafka client, Reed-Solomon (pinned to an independent oracle)
-  ([ADR-0007](../adr/0007-audited-libraries.md)). SHA-256 now comes from
-  the audited `sha2` crate; HMAC is the RFC 2104 construction over it (a
-  few lines, so every keyed buffer can be wiped).
+- **Hand-written components remain**
+  ([ADR-0007](../adr/0007-audited-libraries.md)): the agentd HTTP server
+  (fuzzed), the Kafka client's wire protocol (fuzzed: `kafka_wire`), the
+  `robodr-uplink` HTTP/1.1 client (fuzzed: `uplink_http`), the
+  SASL/SCRAM message parsing (fuzzed: `kafka_sasl`; its HMAC, SHA-256,
+  PBKDF2 and base64 come from RustCrypto's `hmac`, `sha2`, `pbkdf2` and
+  `base64ct`), Reed-Solomon (pinned to an independent oracle), the depot's
+  X.509 DER writer (the certificates it issues go through rustls
+  handshakes in its tests) and the TPM 2.0 structure parsers
+  (`TPM2B_PUBLIC`, `TPMS_ATTEST`; fuzzed: `seal_attest`). SHA-256 now
+  comes from the audited `sha2` crate; HMAC is the RFC 2104 construction
+  over it (a few lines, so every keyed buffer can be wiped). Direct libc
+  calls (`extern "C"` or the `libc` crate: signals, sockets, `flock`,
+  clocks) remain in agentd, the black box, capture, deliverd, depot,
+  diode, executor, export, firewall-gw, fleet and the ROS 2 pipeline.
 - **`panic = "abort"`:** a panic stops the daemon until systemd restarts
   it. Panic-family calls and unchecked indexing are denied in daemon code
   and in the in-process parsers; arithmetic overflow and the remaining
@@ -305,14 +315,24 @@
   values in [`performance.md`](performance.md) come from a shared VM.
 - **The Kafka exporter** is idempotent by default (exactly-once per
   partition within a producer id's lifetime), tested against an in-process
-  fake broker only; a batch can still be written twice after the broker
-  expires the producer id (`producer.id.expiration.ms`, default 1 day) or
-  after a producer reset during a lost acknowledgement. No epoch bump
-  (KIP-360). Multi-broker behaviour has only been tested against a fake
+  fake broker and a single-node Apache Kafka (`scripts/kafka-it.sh`); a
+  batch can still be written twice (at-least-once, never lost) after the
+  broker expires the producer id (`producer.id.expiration.ms`, default
+  1 day) or after a producer id reset while an acknowledgement was lost.
+  A sequence error on a broker that supports KIP-360 (Kafka 2.5+) bumps
+  the epoch and keeps the producer id; a fencing answer
+  (`INVALID_PRODUCER_EPOCH`, `PRODUCER_FENCED`), also for a batch of an
+  older epoch of the current id, resets the producer id. Multi-broker
+  behaviour (leader failover) has only been tested against the fake
   broker.
 - **Exporter retention** prunes `done/` markers and rotated dead-letter
-  files; the reinject ledger, the publish / uplink `rejected/` directories
-  and the importer's `out/` are still pruned by the operator.
+  files by default. Pruning `rejected/`, finished re-injection payloads
+  and the importer's `out/` is opt-in (`--rejected-max-*`,
+  `--reinject-max-*`, `--out-max-*`). A pruned `out/` batch keeps a
+  tombstone (its directory and `MANIFEST.json`) and its `done/` marker for
+  good, a few KiB per batch that nothing removes; the reinject ledger is
+  never pruned. An `out/` batch the exporter may not delete or cannot read
+  is reported (`out_prune_error`) and left in place; delivery goes on.
 - **`robodr-uplink` has run against the AutoSecOps ingest module only in
   one container** (TLS and loopback HTTP, `tools/e2e/RESULTS.md`), not
   across a real network; the module is on an unreleased AutoSecOps

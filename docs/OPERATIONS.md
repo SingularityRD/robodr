@@ -3185,7 +3185,12 @@ consumer** of `out/`, it can prune `out/` itself: `--out-max-age-s N` /
 the batches it has finished (never one without its `done/` marker); each
 directory stays with its `MANIFEST.json` as a small tombstone, so a batch
 re-emitted after an importer state reset cannot land under a finished
-name. With a spool source,
+name. This needs write permission on the importer's `out/<batch>/`
+directories (run the tool as the importer's user, or give its group write
+access there): a batch it may not delete, or cannot read, is left as it
+is, the error (path and remedy) is `out_prune_error` in the publisher's
+JSON report and in `uplink-status.json`, logged once while it lasts, and
+delivery goes on. With a spool source,
 `--rejected-max-age-s` / `--rejected-max-count` / `--rejected-max-bytes`
 bound `<spool>/rejected/` (default: kept); `robodr-uplink
 --reinject-max-age-s` / `--reinject-max-count` / `--reinject-max-bytes`
@@ -3193,7 +3198,8 @@ delete the `records.jsonl` of finished re-injection generations (the
 ledger stays). All of these are off by default. Sizes: `state_usage` in
 `uplink-status.json` and in the publisher's JSON report (entries and bytes
 of `done/`, dead letters, `out/` or `rejected/`, re-injection), measured at
-most once a minute.
+most once a minute. A measurement that fails is `state_usage_error` there
+until one succeeds (logged once; it never stops delivery).
 
 Dead letters: **`robodr-kafka-publish` keeps `dead-letter.jsonl` as one
 growing file and never deletes it by default**: its entries are the

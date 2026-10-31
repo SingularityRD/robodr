@@ -344,9 +344,25 @@ fn a_failed_usage_measurement_does_not_fail_the_run() {
     assert_eq!(rep.state_usage, None);
     let e = rep.state_usage_error.expect("reported");
     assert!(e.contains("rejected"), "{e}");
-    // Within the interval: not measured (nor reported) again.
+    assert!(rep.usage_measured);
+    // Within the interval: not measured again, but the error is still
+    // reported while it lasts (Phase 3 review: it used to vanish from the
+    // reports in between). Not a fresh attempt, so the CLI prints no line
+    // for it alone.
     let rep = p.run_once().unwrap();
-    assert_eq!((rep.state_usage, rep.state_usage_error), (None, None));
+    assert_eq!(rep.state_usage, None);
+    assert_eq!(rep.state_usage_error.as_deref(), Some(e.as_str()));
+    assert!(!rep.usage_measured);
+    drop(p);
+    // Repaired and measured again: the error is gone.
+    fs::remove_file(spool.join("rejected")).unwrap();
+    fs::create_dir(spool.join("rejected")).unwrap();
+    let mut cfg = PublishConfig::new(Source::Spool(spool.clone()), &state);
+    cfg.usage_interval = std::time::Duration::ZERO;
+    let mut p = Publisher::open(cfg, OkSink).unwrap();
+    let rep = p.run_once().unwrap();
+    assert!(rep.state_usage.is_some() && rep.usage_measured);
+    assert_eq!(rep.state_usage_error, None);
 }
 
 /// Review finding (WP16): `--out-max-*` where this tool may not delete an

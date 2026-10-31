@@ -210,8 +210,10 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   bounds the batches with a payload, not the entries of `out/`. A batch
   whose payload this tool may not delete (typically the importer's
   `out/<batch>/` without write permission for this tool's user: run it
-  as the importer's user or give its group write access there) does not
-  stop publishing or delivery: the other batches are pruned, the error
+  as the importer's user or give its group write access there), or one
+  that cannot even be measured (its payload or `done/` marker cannot be
+  read; it is then neither pruned nor counted against the bounds), does
+  not stop publishing or delivery: the other batches are pruned, the error
   (path and remedy) is `out_prune_error` in the publisher's JSON report
   and in `uplink-status.json`, and it is logged once while it lasts. Use these flags
   only when this tool is the **only consumer** of `out/` (a second
@@ -233,7 +235,8 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   service keeps that pace across its per-run re-opens; the publisher
   prints a report on every run that measured, so at least once a minute
   while idle). Measuring is monitoring: a failed measurement is reported
-  as `state_usage_error` (the status file keeps the last good
+  as `state_usage_error` until a measurement succeeds (in every publisher
+  report line and in the status file, which keeps the last good
   `state_usage`) and logged once, and never fails a run. Deletions are
   single `unlink`s plus a directory fsync (an `out/` payload loses its
   records file first; a pass interrupted after that is completed by the
