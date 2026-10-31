@@ -122,7 +122,8 @@
 //! dead-letter files and `out/` or `rejected/` (measured at most every
 //! [`PublishConfig::usage_interval`]). Measuring and pruning `out/` are
 //! housekeeping: a failure there is reported (`state_usage_error`,
-//! `out_prune_error`, a warning on stderr once while it lasts) and never
+//! `out_prune_error`, in every report while it lasts, and a warning on
+//! stderr once while it lasts) and never
 //! stops publishing. Every other retention failure (`done/`, dead
 //! letters, `rejected/`) is in the publisher's own state or the spool
 //! and fails the run as before.
@@ -478,10 +479,18 @@ pub struct PublishReport {
     /// [`PublishConfig::usage_interval`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_usage: Option<crate::retention::StateUsage>,
-    /// The measurement of this run failed (monitoring only: the run goes
-    /// on; retried after the interval).
+    /// The last measurement failed and none has succeeded since: set on
+    /// every run while that lasts, also on runs in between that do not
+    /// measure (monitoring only: the run goes on; retried after the
+    /// interval).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_usage_error: Option<String>,
+    /// This run attempted a measurement (`state_usage` or a fresh
+    /// `state_usage_error`). Not serialized: `robodr-kafka-publish` prints
+    /// a report line for it, so an idle publisher prints one per interval
+    /// and not one per run while an error lasts.
+    #[serde(skip)]
+    pub usage_measured: bool,
     /// Pruning `out/` (`out_retention`) failed in this run, with the path
     /// and what to do; publishing goes on, that payload stays
     /// ([`crate::retention::prune_diode_out`]).
@@ -1029,14 +1038,18 @@ impl<S: Sink> Publisher<S> {
             crate::retention::state_usage(state_dir, DEAD_LETTER_FILE, source, false)
         }) {
             crate::retention::Measured::NotDue => {}
-            crate::retention::Measured::Fresh(u) => report.state_usage = Some(u),
+            crate::retention::Measured::Fresh(u) => {
+                report.state_usage = Some(u);
+                report.usage_measured = true;
+            }
             crate::retention::Measured::Failed { error, new } => {
                 if new {
                     eprintln!("robodr-kafka-publish: WARNING: {error}");
                 }
-                report.state_usage_error = Some(error);
+                report.usage_measured = true;
             }
         }
+        report.state_usage_error = self.usage.error().map(str::to_string);
         Ok(())
     }
 

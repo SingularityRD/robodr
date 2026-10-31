@@ -56,8 +56,8 @@ out/<batch>/) is reported as out_prune_error and warned about once; publishing g
 <spool>/rejected/ records. Nothing still needed for deduplication is deleted. A JSON report \
 line is printed after a run that published, dead-lettered or pruned something, or that measured \
 state_usage (entries and bytes of done/, dead letters, out/ or rejected/; at most once a \
-minute, so at least once a minute while idle); a failed measurement is state_usage_error and \
-never fails the run. A spool file that \
+minute, so at least once a minute while idle); a failed measurement is state_usage_error, \
+carried by every report line until a measurement succeeds, and never fails the run. A spool file that \
 cannot be read (I/O error after 3 attempts) is dead-lettered with the error and moved to \
 <spool>/rejected/; the run goes on.";
 
@@ -325,8 +325,7 @@ fn run(o: &Opts) -> Result<(), String> {
             || r.pruned_dead_letters.removed > 0
             || r.pruned_out.removed > 0
             || r.pruned_rejected.removed > 0
-            || r.state_usage.is_some()
-            || r.state_usage_error.is_some()
+            || r.usage_measured
         {
             println!("{}", serde_json::to_string(&r).unwrap_or_default());
         }
