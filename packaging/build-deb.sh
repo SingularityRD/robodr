@@ -414,7 +414,7 @@ for f in "$root"/config/*.example*; do
 done
 
 # Maintainer scripts and metadata.
-for s in postinst prerm postrm; do
+for s in preinst postinst prerm postrm; do
     install -m 0755 "$here/deb/$s" "$pkg/DEBIAN/$s"
 done
 if [[ -f "$pkg/etc/robodr/pulsar.toml" ]]; then

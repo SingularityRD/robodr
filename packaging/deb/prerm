@@ -6,6 +6,26 @@ set -e
 
 case "$1" in
 remove | deconfigure)
+    # >>> variant_switch_prerm (crates/robodr-deliverd/tests/install_bundle.rs runs this script)
+    # A variant switch: dpkg removes this package in favour of the other
+    # RoboDR variant (robodr <-> robodr-focal conflict and replace each
+    # other). For the services that is an upgrade, not a removal (review
+    # H6): nothing is stopped (stopping the gateway here would bypass the
+    # safety-state gate, and stopping robodr-deliverd would kill the dpkg
+    # run it waits for), the executor's nft table stays (its actions keep
+    # their TTLs), and the marker tells the new variant's postinst to take
+    # the upgrade path.
+    if [ "$1" = remove ] && [ "${2:-}" = in-favour ]; then
+        case "${3:-}" in
+        robodr | robodr-focal)
+            mkdir -p /var/lib/robodr
+            echo "${DPKG_MAINTSCRIPT_PACKAGE:-robodr} ${3}" >/var/lib/robodr/.variant-switch
+            exit 0
+            ;;
+        esac
+    fi
+    rm -f /var/lib/robodr/.variant-switch
+    # <<< variant_switch_prerm
     if [ -d /run/systemd/system ]; then
         # robodr-firewall-gw-rules is deliberately not stopped (it has no
         # ExecStop=): the ruleset stays, so with fail_closed the bridge keeps

@@ -36,7 +36,7 @@ operator installs on a robot. The procedures that use it are in
 | `sysusers.d/robodr.conf` | `/usr/lib/sysusers.d/` | the `robodr` system user |
 | `etc/pulsar.base.toml` | header of `/etc/robodr/pulsar.toml` | daemon config (conffile) |
 | `deb/` | `DEBIAN/` | control template, maintainer scripts |
-| `rpm/robodr.spec.in`, `rpm/{post,preun,postun}` | RPM header / scriptlets | spec template and the scriptlets, the counterparts of `deb/postinst`, `prerm`, `postrm` (`scripts/check-packages.py` checks both stop and restart the same units) |
+| `rpm/robodr.spec.in`, `rpm/{pre,post,preun,postun}` | RPM header / scriptlets | spec template and the scriptlets, the counterparts of `deb/preinst`, `postinst`, `prerm`, `postrm` (`scripts/check-packages.py` checks both stop and restart the same units, and that the pre-install scripts carry the same gateway migration gate as the post-install scripts) |
 | `build-deb.sh` | (build time) | reproducible `.deb` from built binaries: `robodr` (default) or `robodr-focal` (`--variant focal`, static binaries only); `--stage-only DIR` writes just the file tree (for `build-rpm.sh`). `Depends:` from `dpkg-shlibdeps` and a soname table, libc6 floor from `readelf -V` (docs/BUILD.md "Release build userlands") |
 | `build-rpm.sh` | (build time) | `robodr` RPM (RHEL / Rocky / Alma 9, Fedora) from binaries built on Rocky Linux 9, with the `.deb`'s file tree; reproducible mtimes and build time |
 | `make-bundle.sh` | (build time) | offline install bundle: `--deb` (Debian / Ubuntu / JetPack) or `--rpm` (`robodr-<ver>-<arch>-rpm-offline.tar.gz`, RHEL / Rocky / Alma 9, Fedora) |

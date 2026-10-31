@@ -288,6 +288,54 @@ fn maintainer_scripts_see_the_deliverd_install_marker() {
     );
 }
 
+/// A stub of RoboDR's own package `package` (`robodr` or
+/// `robodr-focal`, conflicting with and replacing the other, as the real
+/// ones), shipping `usr/sbin/robodr-deliverd` running `body` and the
+/// files `files` (path, content). Returns the `.deb`'s path.
+fn robodr_deb(
+    u: &Unit,
+    package: &str,
+    version: &str,
+    body: &str,
+    files: &[(&str, &str)],
+) -> PathBuf {
+    let other = if package == "robodr" {
+        "robodr-focal"
+    } else {
+        "robodr"
+    };
+    let st = u.work.join(format!("agent-stage-{package}-{version}"));
+    let _ = std::fs::remove_dir_all(&st);
+    std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
+    std::fs::create_dir_all(st.join("usr/sbin")).unwrap();
+    std::fs::write(
+        st.join("DEBIAN/control"),
+        format!(
+            "Package: {package}\nVersion: {version}\nArchitecture: all\n\
+             Conflicts: {other}\nReplaces: {other}\n\
+             Maintainer: RoboDR tests <tests@invalid>\nDescription: stub\n"
+        ),
+    )
+    .unwrap();
+    let exe = st.join("usr/sbin/robodr-deliverd");
+    std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for (p, text) in files {
+        let f = st.join(p);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, text).unwrap();
+    }
+    let out = u.work.join(format!("{package}_{version}.deb"));
+    let o = Command::new("dpkg-deb")
+        .args(["--root-owner-group", "-Zxz", "--build"])
+        .arg(&st)
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    out
+}
+
 /// RoboDR's own package `robodr` (as from the designated programme),
 /// shipping `usr/sbin/robodr-deliverd` as a shell script running `body`:
 /// it stands in for a self-upgrade that replaces the agent's binary.
@@ -302,30 +350,7 @@ fn agent_rpk_with(
     body: &str,
     edit: impl FnOnce(&mut robodr_release::ops::RpkSpec),
 ) -> PathBuf {
-    let st = u.work.join(format!("agent-stage-{version}"));
-    let _ = std::fs::remove_dir_all(&st);
-    std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
-    std::fs::create_dir_all(st.join("usr/sbin")).unwrap();
-    std::fs::write(
-        st.join("DEBIAN/control"),
-        format!(
-            "Package: robodr\nVersion: {version}\nArchitecture: all\n\
-             Maintainer: RoboDR tests <tests@invalid>\nDescription: stub\n"
-        ),
-    )
-    .unwrap();
-    let exe = st.join("usr/sbin/robodr-deliverd");
-    std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let out = u.work.join(format!("robodr_{version}.deb"));
-    let o = Command::new("dpkg-deb")
-        .args(["--root-owner-group", "-Zxz", "--build"])
-        .arg(&st)
-        .arg(&out)
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let deb = std::fs::read(&out).unwrap();
+    let deb = std::fs::read(robodr_deb(u, "robodr", version, body, &[])).unwrap();
     let mut s = spec("robodr", serial, Kind::Deb);
     s.sbom_path = Some("sbom.cdx.json".into());
     s.health = vec![HealthCheck::FilePresent {
@@ -592,6 +617,267 @@ fn postinst_leaves_the_deliverd_restart_to_the_agent_under_its_marker() {
         .collect();
     assert_eq!(under, expected);
     assert!(under.contains(&"try-restart robodr-agentd.service".to_string()));
+}
+
+/// An RPK of RoboDR's own package `package` at `version` ([`robodr_deb`],
+/// a binary that starts, the extra files `files`).
+fn robodr_rpk(
+    u: &Unit,
+    package: &str,
+    serial: u64,
+    version: &str,
+    files: &[(&str, &str)],
+) -> PathBuf {
+    let deb = std::fs::read(robodr_deb(u, package, version, "exit 0", files)).unwrap();
+    let mut s = spec(package, serial, Kind::Deb);
+    s.sbom_path = Some("sbom.cdx.json".into());
+    s.health = vec![HealthCheck::FilePresent {
+        path: format!(
+            "{}/usr/sbin/robodr-deliverd",
+            u.cfg.install.dpkg_root.as_ref().unwrap().display()
+        ),
+    }];
+    let name = format!("{package}.deb");
+    u.rpk(&s, &[(name.as_str(), &deb), ("sbom.cdx.json", SBOM)])
+}
+
+/// Reviews H6, M8, M9: RoboDR's own package, delivered from the
+/// designated programme, follows install-bundle.sh's rules. The unit's
+/// robodr 1.0 came from install-bundle.sh (dpkg, not the agent):
+///
+/// * the other variant is refused (a switch runs the old variant's prerm;
+///   an operator action);
+/// * a first delivery that is not the installed version is refused (the
+///   agent would have nothing to roll back to), and so is a dpkg
+///   downgrade; the installed version itself is adopted;
+/// * the unit's security floor and the SOC ring minimum refuse what is
+///   below them;
+/// * a verified black-box segment the release cannot read refuses it; a
+///   release that reads it is installed.
+#[test]
+fn robodrs_own_package_follows_install_bundles_rules() {
+    if !dpkg_available("robodr_rules") {
+        return;
+    }
+    let u = Unit::with("robodr-rules", |v| {
+        v["install"]["robodr_programme"] = PROGRAMME.into();
+    });
+    let root = dpkg_root(&u);
+    let o = Command::new("dpkg")
+        .arg(format!("--root={}", root.display()))
+        .arg("-i")
+        .arg(robodr_deb(&u, "robodr", "1.0", "exit 0", &[]))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mut e = u.open();
+    let mut prev: Option<PathBuf> = None;
+    let mut seq = 0;
+    let mut deliver = |e: &mut robodr_deliverd::Engine, r: PathBuf| {
+        seq += 1;
+        let b = u.bundle(
+            seq,
+            prev.as_ref().map(|p| bundle_hash(p)),
+            std::slice::from_ref(&r),
+        );
+        u.pack(&format!("p{seq}"), seq, &[r], std::slice::from_ref(&b));
+        prev = Some(b);
+        u.run(e, 5)
+    };
+    let refused = |reps: &[robodr_deliverd::engine::TickReport], what: &str| {
+        assert!(
+            reps.iter()
+                .any(|r| r.refused.iter().any(|x| x.contains(what))),
+            "{what}: {reps:?}"
+        );
+        assert!(reps.iter().all(|r| r.installed.is_empty()), "{reps:?}");
+    };
+    // H6: no variant switch.
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr-focal", 1, "1.0", &[]));
+    refused(&reps, "variant switch");
+    assert_eq!(package_version(&u, "robodr"), "1.0");
+    assert_eq!(package_version(&u, "robodr-focal"), "");
+    // M8: the first delivery must be the installed version; M9: never a
+    // dpkg downgrade.
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 2, "2.0", &[]));
+    refused(&reps, "first delivery of robodr");
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 3, "0.9", &[]));
+    refused(&reps, "older than the installed 1.0");
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 4, "1.0", &[]));
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr 4".to_string()]),
+        "{reps:?}"
+    );
+    // M9: the security floor and the SOC ring minimum.
+    let rel = root.join("var/lib/robodr/releases");
+    std::fs::create_dir_all(rel.join("1.0")).unwrap();
+    std::fs::write(
+        rel.join("security-floor"),
+        "min_version=1.5
+source=test
+",
+    )
+    .unwrap();
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 5, "1.2", &[]));
+    refused(
+        &reps,
+        "below the unit's security floor (install-bundle.sh) 1.5",
+    );
+    std::fs::create_dir_all(root.join("var/lib/robodr/fleet")).unwrap();
+    std::fs::write(
+        root.join("var/lib/robodr/fleet/ring.env"),
+        "ring=1
+min_version=1.6-1
+",
+    )
+    .unwrap();
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 6, "1.5.5", &[]));
+    refused(
+        &reps,
+        "SOC ring information's minimum (robodr-enroll) 1.6~1",
+    );
+    // M9: the black-box format gate. A kept release writes RBF1:2, so a
+    // segment in it is verified; 1.7 reads only the legacy format.
+    std::fs::write(
+        rel.join("1.0/formats"),
+        "blackbox_write=RBF1:2
+blackbox_read=RBF1:1,RBF1:2
+",
+    )
+    .unwrap();
+    let seg_dir = root.join("var/lib/robodr/blackbox/agentd");
+    std::fs::create_dir_all(&seg_dir).unwrap();
+    std::fs::write(seg_dir.join("seg-000001.rbb"), b"RBF1\0\0\0\0\x02frame").unwrap();
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 7, "1.7", &[]));
+    refused(&reps, "reads the black-box formats [RBF1:1]");
+    let reads = [(
+        "usr/share/robodr/formats",
+        "blackbox_write=RBF1:2\nblackbox_read=RBF1:1,RBF1:2\n",
+    )];
+    let reps = deliver(&mut e, robodr_rpk(&u, "robodr", 8, "1.8", &reads));
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr 8".to_string()]),
+        "{reps:?}"
+    );
+    assert_eq!(package_version(&u, "robodr"), "1.8");
+    assert!(u.black_box_verifies());
+}
+
+/// The text of RoboDR's postinst between its `# >>> NAME` and `# <<< NAME`
+/// markers.
+fn postinst_block(name: &str) -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/deb/postinst");
+    let s = std::fs::read_to_string(&p).unwrap();
+    let a = s
+        .find(&format!("# >>> {name}"))
+        .unwrap_or_else(|| panic!("postinst has no {name} block"));
+    let b = s.find(&format!("# <<< {name}")).unwrap();
+    s[a..b].to_string()
+}
+
+/// Review H5: under the agent, RoboDR's postinst runs inside the agent's
+/// sandbox, where `/etc/robodr/keys` is `InaccessiblePaths=` (an empty
+/// read-only mount). Its `systemd-tmpfiles --create` (the real tool, the
+/// real block, the root-owned lines of the real tmpfiles.d file, in a
+/// private mount namespace with that directory mounted read-only) fails
+/// there with EROFS unless the keys directories are excluded, which the
+/// block does under the agent's marker (and only then).
+#[test]
+fn postinst_tmpfiles_survive_the_agents_read_only_keys_directory() {
+    let usable = robodr_deliverd::users::is_root()
+        && have("unshare")
+        && have("mount")
+        && Path::new("/usr/bin/systemd-tmpfiles").is_file()
+        && Command::new("unshare")
+            .args(["-m", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+    if !usable {
+        eprintln!("SKIPPED postinst_tmpfiles: needs root, unshare -m, mount and systemd-tmpfiles");
+        return;
+    }
+    let block = postinst_block("tmpfiles_create");
+    let t = Tmp::new("postinst-tmpfiles");
+    // Only root:root lines: the test host has none of RoboDR's users.
+    let conf = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/tmpfiles.d/robodr.conf"),
+    )
+    .unwrap();
+    let rootonly: String = conf
+        .lines()
+        .filter(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() >= 5 && f[0] == "d" && f[3] == "root" && f[4] == "root"
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(rootonly.contains("/etc/robodr/keys/retired"), "{rootonly}");
+    std::fs::write(t.path().join("robodr.conf"), rootonly).unwrap();
+    // `systemd-tmpfiles` as the block calls it, redirected into the test
+    // root and onto the filtered file.
+    let bin = t.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let wrapper = bin.join("systemd-tmpfiles");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor a in \"$@\"; do\n    case \"$a\" in /usr/lib/tmpfiles.d/robodr.conf) ;; *) set -- \"$@\" \"$a\" ;; esac\n    shift\ndone\n\
+         exec /usr/bin/systemd-tmpfiles --root=\"$ROOT\" \"$@\" \"$CONF\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let run = |marker: Option<&str>| -> std::process::Output {
+        let root = t.path().join(format!("root-{}", marker.unwrap_or("none")));
+        let keys = root.join("etc/robodr/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let script = format!(
+            "set -e\nmount --bind \"$K\" \"$K\"\nchmod 000 \"$K\"\n\
+             mount -o remount,bind,ro \"$K\"\n{block}\n"
+        );
+        let mut c = Command::new("unshare");
+        c.args(["-m", "sh", "-c", &script, "sh"])
+            .env("K", &keys)
+            .env("ROOT", &root)
+            .env("CONF", t.path().join("robodr.conf"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        match marker {
+            Some(m) => c.env("ROBODR_DELIVERD_INSTALL", m),
+            None => c.env_remove("ROBODR_DELIVERD_INSTALL"),
+        };
+        let o = c.output().unwrap();
+        if marker.is_some() {
+            // The rest of the file was applied.
+            assert!(root.join("var/lib/robodr/deliverd").is_dir());
+        }
+        o
+    };
+    // Without the marker (apt, install-bundle.sh: no such sandbox) the
+    // keys directory is managed, and the read-only mount makes it fail:
+    // the failure the agent's dpkg run hit.
+    let plain = run(None);
+    assert!(!plain.status.success(), "{plain:?}");
+    assert!(
+        String::from_utf8_lossy(&plain.stderr).contains("Read-only file system"),
+        "{plain:?}"
+    );
+    let under = run(Some("1"));
+    assert!(
+        under.status.success(),
+        "{}",
+        String::from_utf8_lossy(&under.stderr)
+    );
 }
 
 /// T53: deb only. A unit without a dpkg database (an RPM-based host) gets

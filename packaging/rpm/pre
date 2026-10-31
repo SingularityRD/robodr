@@ -1,0 +1,40 @@
+#!/bin/sh
+# robodr pre scriptlet (RPM). The counterpart of packaging/deb/preinst:
+# refuses, before a file is unpacked, an upgrade that would have to stop
+# the gateway (the one-time gateway user migration) while nothing said the
+# safety state allows it (review L11). RPM does not undo a failing post
+# scriptlet: refused there alone, the new unit files stayed in place
+# without the migrated state, and the gateway failed at the next boot. A
+# failing pre scriptlet leaves the package uninstalled: the installed
+# release stays exactly as it was, running.
+#
+# $1: 1 = first install, >= 2 = upgrade.
+set -e
+
+# >>> gateway_migration_gate (the same block in packaging/deb/preinst,
+# packaging/deb/postinst, packaging/rpm/pre and packaging/rpm/post;
+# scripts/check-packages.py keeps them identical)
+# The one-time gateway user migration (migrate_exporter_users) stops the
+# gateway. It runs only when install-bundle.sh found the safety state to
+# allow it (ROBODR_GATED_RESTART=allow); otherwise the upgrade is refused
+# before anything is stopped, and the gateway keeps running. The pre-install
+# scripts (deb preinst, rpm pre scriptlet) refuse it before a file is unpacked
+# (review L11: a refusal in the post-install script alone left the new
+# unit files in place without the migrated state, and the gateway failed
+# at the next boot); the post-install script asks again.
+gateway_migration_gate() {
+    [ ! -e /var/lib/robodr/.exporter-users-migrated ] || return 0
+    [ -d /run/systemd/system ] || return 0
+    [ "${ROBODR_GATED_RESTART:-}" != allow ] || return 0
+    systemctl is-active --quiet robodr-firewall-gw.service || return 0
+    echo "robodr: this upgrade must stop robodr-firewall-gw once to move its state to its own" >&2
+    echo "robodr: user, and nothing said the safety state allows that. Nothing was stopped." >&2
+    echo "robodr: When the robot is idle or in its safe state, install the release again with" >&2
+    echo "robodr:   /usr/lib/robodr/install-bundle.sh install   (it asks the safety state), or, for a" >&2
+    echo "robodr:   .deb left unconfigured, install-bundle.sh restart-pending (OPERATIONS.md 7)." >&2
+    exit 1
+}
+# <<< gateway_migration_gate
+
+gateway_migration_gate
+exit 0

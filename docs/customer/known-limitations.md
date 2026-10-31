@@ -312,6 +312,20 @@
   robot.** They are tested against the real `dpkg` in a separate dpkg
   root, including the black-box format gate, downgrade refusal and the
   security floor ([`docs/OPERATIONS.md`](../OPERATIONS.md) section 7).
+- **Switching between `robodr` and `robodr-focal` from a release before
+  this one** runs that release's removal script, which stops every
+  RoboDR unit (the gateway included) and deletes the executor's
+  containment table. `install-bundle.sh` therefore allows a switch only
+  through the safety-state gate (never deferred) and starts the units
+  again afterwards, but containment actions active at that moment are not
+  re-applied: switch with none active. The delivery agent never switches
+  variants.
+- **One tool per unit updates RoboDR.** Once `robodr-deliverd` delivers
+  RoboDR's own package (`install.robodr_programme`), `install-bundle.sh`
+  must no longer install or roll back RoboDR there (the two keep separate
+  records). The agent's first delivery of RoboDR must be the version
+  already installed, so it has a release to roll back to
+  ([`docs/OPERATIONS.md`](../OPERATIONS.md), `install.robodr_programme`).
 - **No fleet management console yet.** The robot side of the fleet
   lifecycle exists (`robodr-enroll`: enrollment, uplink / finding key
   rotation, revocation lists and SOC profiles,

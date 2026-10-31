@@ -593,7 +593,10 @@ package (designated programme, maintainer scripts allowed), its
 inside the agent's own dpkg run: the stop job would signal the agent's
 cgroup, killing dpkg and the `postinst` half-way. Every `dpkg --install`
 therefore carries `ROBODR_DELIVERD_INSTALL=1` (dpkg passes it to the
-maintainer scripts) and the `postinst` skips that one restart; the agent
+maintainer scripts) and the `postinst` skips that one restart (and, as it
+runs inside the agent's sandbox where `/etc/robodr/keys` is an
+inaccessible read-only mount, leaves that directory out of its
+`systemd-tmpfiles --create`; review 2, H5); the agent
 finishes the pass on the old binary, notices that its executable was
 replaced (path now naming another inode) and exits 3, on which the unit
 restarts it (`RestartForceExitStatus=3`). Before that pass commits, the
@@ -807,6 +810,18 @@ refused. RoboDR's own packages, which conflict with and replace each
 other, are allowed only for RPKs from bundles of the **designated RoboDR
 programme** (`install.robodr_programme` in the unit's configuration;
 default none, so RoboDR itself is updated with `install-bundle.sh`).
+For them the unit applies `install-bundle.sh`'s rules too (review 2, H6,
+M8, M9; `crates/robodr-deliverd/src/selfpkg.rs`): no variant switch
+(`robodr` <-> `robodr-focal`: an operator action, as the old variant's
+`prerm` runs), no dpkg version below the installed one and nothing that
+dpkg has in a state other than `installed`, nothing below the unit's
+security floor or the SOC ring information's minimum, no release that
+cannot read a verified black-box segment, and the first delivery of
+RoboDR to a unit must be the version dpkg has installed (the agent's
+rollback target for every later delivery; without it a failing first
+self-upgrade had nothing to roll back to). Once the field is set, only
+the agent updates RoboDR on that unit (`install-bundle.sh` would change
+a recorded package: `changed_outside`).
 Floors apply to the dpkg identity because it is the RPK name, so an RPK
 under another name cannot carry an older `.deb` **of** a floored package.
 It also cannot carry older **files** of one (review 3, H-R3-1): dpkg

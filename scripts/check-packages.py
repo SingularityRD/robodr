@@ -369,6 +369,47 @@ def check_build_deb(root: Path) -> list[str]:
     return [f"packaging/build-deb.sh: never installs {p}" for p in sorted(PROGRAMS) if not re.search(rf"\b{re.escape(p)}\b", text)]
 
 
+GATE_RE = re.compile(r"# >>> gateway_migration_gate.*?# <<< gateway_migration_gate\n", re.S)
+# The scripts that carry the gateway migration gate (review L11: the
+# pre-install scripts refuse before a file is unpacked, the post-install
+# scripts ask again), and the build script lines that ship them.
+GATE_SCRIPTS = ("deb/preinst", "deb/postinst", "rpm/pre", "rpm/post")
+
+
+def check_gate_texts(scripts: dict[str, str], build_deb: str, build_rpm: str, spec: str) -> list[str]:
+    errs = []
+    blocks = {rel: GATE_RE.search(text) for rel, text in scripts.items()}
+    first = blocks.get("deb/postinst")
+    for rel in GATE_SCRIPTS:
+        m = blocks.get(rel)
+        if m is None:
+            errs.append(f"packaging/{rel}: no gateway_migration_gate block")
+            continue
+        if first is not None and m.group(0) != first.group(0):
+            errs.append(f"packaging/{rel}: its gateway_migration_gate block differs from packaging/deb/postinst's")
+        if not re.search(r"^\s*gateway_migration_gate$", scripts[rel], re.M):
+            errs.append(f"packaging/{rel}: never calls gateway_migration_gate")
+    if "%" in scripts.get("rpm/pre", ""):
+        errs.append("packaging/rpm/pre: contains '%' (rpm macro expansion)")
+    if not re.search(r"^for s in [^\n]*\bpreinst\b[^\n]*; do$", build_deb, re.M):
+        errs.append("packaging/build-deb.sh: does not ship DEBIAN/preinst")
+    if "/^@PRE@$/ { slurp(pre)" not in build_rpm:
+        errs.append("packaging/build-rpm.sh: does not fill @PRE@ from packaging/rpm/pre")
+    if "%pre -p /bin/sh\n@PRE@\n" not in spec:
+        errs.append("packaging/rpm/robodr.spec.in: no %pre scriptlet (@PRE@)")
+    return errs
+
+
+def check_gate(root: Path) -> list[str]:
+    pk = root / "packaging"
+    return check_gate_texts(
+        {rel: (pk / rel).read_text() for rel in GATE_SCRIPTS},
+        (pk / "build-deb.sh").read_text(),
+        (pk / "build-rpm.sh").read_text(),
+        (pk / "rpm" / "robodr.spec.in").read_text(),
+    )
+
+
 FOR_RE = re.compile(r"for u in (.*?); do\n(.*?)\n\s*done\b", re.S)
 
 
@@ -755,6 +796,7 @@ def static_checks(root: Path) -> list[str]:
         + check_unit_resources(root)
         + check_image_recipe(root)
         + check_identities(root)
+        + check_gate(root)
         + check_rules_unit(root)
         + check_release_workflow(root)
     )
@@ -1185,6 +1227,19 @@ def self_test() -> int:
         units, focal, sysu, tmpf, post, rpost.replace("robodr-kafka", "robodr-kafkaa"), helper), False)
     expect("unknown tmpfiles owner", check_identities_text(
         units, focal, sysu, tmpf + "d /var/lib/robodr/x 0750 robodr-nobody robodr -\n", post, rpost, helper), False)
+    # 8b. The gateway migration gate: in the pre-install scripts too
+    # (review L11), the same block everywhere, shipped by both builds.
+    gate_s = {rel: (pk / rel).read_text() for rel in GATE_SCRIPTS}
+    gate_b = [(pk / x).read_text() for x in ("build-deb.sh", "build-rpm.sh", "rpm/robodr.spec.in")]
+    expect("gate ok", check_gate_texts(gate_s, *gate_b), True)
+    expect("rpm pre without the gate", check_gate_texts(
+        {**gate_s, "rpm/pre": "#!/bin/sh\nexit 0\n"}, *gate_b), False)
+    expect("preinst gate differs", check_gate_texts(
+        {**gate_s, "deb/preinst": gate_s["deb/preinst"].replace("!= allow", "!= yes")}, *gate_b), False)
+    expect("preinst not shipped", check_gate_texts(
+        gate_s, gate_b[0].replace("for s in preinst postinst", "for s in postinst"), *gate_b[1:]), False)
+    expect("spec without pre", check_gate_texts(
+        gate_s, gate_b[0], gate_b[1], gate_b[2].replace("%pre -p /bin/sh\n@PRE@\n", "")), False)
     # 9. The rules unit.
     rules = (pk / "systemd" / "robodr-firewall-gw-rules.service").read_text()
     expect("rules unit ok", check_rules_unit_text("r", rules), True)
@@ -1233,7 +1288,7 @@ def self_test() -> int:
     fin = (ROOT / "scripts" / "release-finalize.sh").read_text()
     expect("finalize ok", check_release_finalize_text(fin), True)
     expect("no comparison", check_release_finalize_text(fin.replace("compare-rebuild.py", "true")), False)
-    total = 74
+    total = 79
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 
