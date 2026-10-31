@@ -201,6 +201,72 @@ fn require_tpm2_refuses_every_weaker_key() {
     assert!(!r.key_protection.all_tpm2);
 }
 
+/// Review finding (WP15 phase 3): with `$CREDENTIALS_DIRECTORY` unset
+/// nothing says `credentials_dir` is where systemd put this service's
+/// credentials; a plain directory holding a key copy next to a sealed file
+/// of the same name was accepted under `require: "tpm2"`. The daemon (not
+/// `--check-config`, which an operator runs from a shell) now refuses to
+/// start that way.
+#[test]
+fn require_tpm2_daemon_needs_systemd_credentials() {
+    let s = setup("keyprot-nocreds", &robot_profile(true));
+    let (creds, enc) = credential_layout(&s);
+    std::fs::write(enc.join("blackbox.key"), header(TPM2)).unwrap();
+    let cfg = with_credential(&s, &creds, &enc, "tpm2");
+    let path = s.write_config(&cfg);
+
+    // --check-config from a shell: still validated and accepted.
+    let out = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .arg("--check-config")
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+
+    // The daemon without systemd credentials: refused, nothing started.
+    // (Before the fix it started and ran: bounded wait, then killed.)
+    let mut child = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t0 = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() && t0.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("CREDENTIALS_DIRECTORY"), "{err}");
+    assert!(!s.blackbox.exists());
+    assert!(status(&s.spool).is_none());
+
+    // With systemd's credentials directory being the configured one, it
+    // starts.
+    let mut child = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let st = wait_for(20, "status.json", || status(&s.spool));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(st["key_protection"]["all_tpm2"], true, "{st}");
+    // Report-only configurations run without systemd credentials:
+    // `a_plain_key_file_is_the_flagged_fallback_in_status_json`.
+}
+
 #[test]
 fn key_protection_section_is_strict() {
     let s = setup("keyprot-strict", &robot_profile(true));
