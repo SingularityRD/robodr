@@ -52,6 +52,10 @@ Static checks (no package needed; CI job `scripts`):
      (event-driven detectors that an event storm could make spin) also set
      CPUQuota=. (The inline gateway is deliberately not CPU-capped: it is a
      real-time process in the motion path, where throttling is latency.)
+     Those capped detectors also never give up restarting
+     (StartLimitIntervalSec=0, OOMPolicy=stop, Restart=on-failure): an
+     attacker who can drive them into their caps again and again must not
+     be able to switch detection off for good.
 
   12. The sensor box image recipe (packaging/sensor-box/image, T77): the
      root partition is read-only (ReadOnly=yes), build-image.sh verifies
@@ -465,6 +469,12 @@ def check_unit_resources_text(name: str, text: str) -> list[str]:
         errs.append(f"{name}: long-running service without MemoryMax= (a runaway daemon is not capped by its own cgroup)")
     if Path(name).name in CPU_CAPPED and not unit_values(text, "CPUQuota"):
         errs.append(f"{name}: without CPUQuota= (an event storm must not take the robot's CPU)")
+    if Path(name).name in CPU_CAPPED:
+        if (unit_values(text, "StartLimitIntervalSec") or [""])[-1] != "0":
+            errs.append(f"{name}: needs StartLimitIntervalSec=0 (repeated kills at its caps must not leave detection off)")
+        if (unit_values(text, "OOMPolicy") or [""])[-1] != "stop" or (unit_values(text, "Restart") or [""])[-1] not in (
+                "on-failure", "always"):
+            errs.append(f"{name}: needs OOMPolicy=stop and Restart=on-failure (an OOM kill restarts the whole daemon)")
     return errs
 
 
@@ -1115,6 +1125,10 @@ def self_test() -> int:
     expect("pulsard without MemoryMax", check_unit_resources_text("p", pulsard.replace("MemoryMax=512M\n", "")), False)
     expect("pulsard without CPUQuota", check_unit_resources_text(
         "robodr-pulsard.service", pulsard.replace("CPUQuota=100%\n", "")), False)
+    limited = pulsard.replace("StartLimitIntervalSec=0\n", "StartLimitIntervalSec=300\nStartLimitBurst=5\n")
+    expect("pulsard with a start limit", check_unit_resources_text("robodr-pulsard.service", limited), False)
+    expect("pulsard without OOMPolicy", check_unit_resources_text(
+        "robodr-pulsard.service", pulsard.replace("OOMPolicy=stop\n", "")), False)
     expect("oneshot needs no cap", check_unit_resources_text("o", "[Service]\nType=oneshot\nExecStart=/bin/true\n"), True)
     # 12. The sensor box image recipe.
     img = pk / "sensor-box" / "image"
@@ -1138,7 +1152,7 @@ def self_test() -> int:
     expect("rebuild with rustup", check_release_workflow_text(
         rel.replace('scripts/ci-install-pinned-toolchain.sh "$RUNNER_TEMP/rust"\n', "scripts/ci-install-rustup.sh\n", 1)), False)
     expect("no comparison", check_release_workflow_text(rel.replace("python3 scripts/compare-rebuild.py", "true")), False)
-    total = 64
+    total = 66
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

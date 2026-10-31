@@ -1116,9 +1116,15 @@ journalctl -u robodr-pulsard --since -1h
 systemd-analyze security robodr-pulsard robodr-agentd   # exposure report
 ```
 
-Both units restart on failure, up to 5 times in 300 s, then stay failed. A
-failed unit does not affect the robot's operation; it does mean the robot is
-not being watched. Alert on it.
+Both units restart on failure. `robodr-agentd` restarts up to 5 times in
+300 s, then stays failed. `robodr-pulsard` has no start limit: it is
+restarted every 10 s for as long as it fails (an event storm can kill it at
+its `MemoryMax=` again and again; giving up would leave host detection
+off), and each restart is counted in its `NRestarts`. A failed or
+restarting unit does not affect the robot's operation; it does mean the
+robot is not (fully) being watched. Alert on both: `robodr-metrics`
+exports `robodr_unit_failed` and `robodr_unit_restarts` per unit
+(example alerts `RoboDRUnitFailed`, `RoboDRUnitRestartLoop`).
 
 `robodr-agentd` runs as `Type=notify` with `WatchdogSec=60s`; a hung main
 loop is restarted. Its `status.json` carries `updated_mono_ms`, `boot_id` and
