@@ -68,6 +68,12 @@ pub(crate) const PID_ENDPOINT_GUID: u16 = 0x005a;
 pub(crate) const PID_ENTITY_NAME: u16 = 0x0062;
 pub(crate) const PID_KEY_HASH: u16 = 0x0070;
 pub(crate) const PID_STATUS_INFO: u16 = 0x0071;
+/// `PID_RELATED_SAMPLE_IDENTITY` (DDS-RPC / DDS 1.4: the sample a reply
+/// answers; Fast DDS 2.10+ writes it) and Fast DDS's older vendor id for
+/// the same value (`PID_CUSTOM_RELATED_SAMPLE_IDENTITY`, 0x800f, written by
+/// every Fast DDS 2.x): `rmw_fastrtps` correlates service replies with it.
+pub(crate) const PID_RELATED_SAMPLE_IDENTITY: u16 = 0x0083;
+pub(crate) const PID_CUSTOM_RELATED_SAMPLE_IDENTITY: u16 = 0x800f;
 /// XCDR1 extended parameter header. Never legitimately used in discovery
 /// data; we stop the list rather than mis-frame what follows it.
 pub(crate) const PID_EXTENDED: u16 = 0x3f01;

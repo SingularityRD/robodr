@@ -237,8 +237,37 @@ fn correlation() -> (u64, i64) {
     (client, seq)
 }
 
-/// A service call with the `rmw_cyclonedds` request header: the reply
-/// whose header carries our client id and sequence number.
+/// Length of the `rmw_cyclonedds` request header (client id, sequence
+/// number) after the 4-octet encapsulation header.
+const CDDS_HEADER: usize = 16;
+
+/// `payload` (encapsulation, header, body) without the `rmw_cyclonedds`
+/// request header. The header is 16 octets, so the body's CDR alignment
+/// (relative to the end of the encapsulation) is unchanged.
+fn without_header(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let (encap, rest) = payload
+        .split_first_chunk::<4>()
+        .ok_or("payload shorter than its encapsulation")?;
+    let body = rest
+        .get(CDDS_HEADER..)
+        .ok_or("payload shorter than its request header")?;
+    let mut out = encap.to_vec();
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
+/// A service call. `request` is the `rmw_cyclonedds` payload (with its
+/// request header `client`, `seq`); the answer is the reply's payload
+/// **without** a request header (encapsulation and body), whichever RMW
+/// the peer runs (`p.rmw`, sales-readiness T18):
+///
+/// - `cyclonedds`: the reply whose header carries our client id and
+///   sequence number;
+/// - `fastrtps`: the request is sent without the header, with a random
+///   sequence number and our reply reader as its related sample identity;
+///   the reply is the sample whose related sample identity names our
+///   reply reader or our request writer (both with fresh random entity
+///   keys) and that sequence number.
 fn call_service(
     p: &Ros2Peer,
     service: &str,
@@ -252,23 +281,51 @@ fn call_service(
     let name = service.trim_start_matches('/');
     let req_topic = format!("rq/{name}Request");
     let rep_topic = format!("rr/{name}Reply");
+    let (payload, sn, qos) = match p.rmw {
+        super::Rmw::Cyclonedds => (request.to_vec(), 1, None),
+        super::Rmw::Fastrtps => {
+            // Review F10 for this RMW: the correlation is the GUIDs (fresh
+            // random entity keys) and a random sequence number. Kept below
+            // 2^16 + 2: a real Fast DDS reader (Humble) never delivers a
+            // first sample numbered near 2^31 (tools/e2e/ros2-peer).
+            let sn = 2 + i64::from(rtps::random_u64() as u16);
+            let qos =
+                rtps::related_identity_qos(rtps::guid_of(part.prefix, rep_r), rtps::SN_UNKNOWN);
+            (without_header(request)?, sn, Some(qos))
+        }
+    };
     let send = |part: &mut Participant| -> std::io::Result<()> {
         part.announce()?;
         part.announce_writer(req_w, &req_topic, &format!("{srv_type}Request_"))?;
         part.announce_reader(rep_r, &rep_topic, &format!("{srv_type}Response_"))?;
-        part.publish(req_w, 1, request)
+        part.publish_with(req_w, sn, qos.as_deref(), &payload)
     };
     send(&mut part).map_err(|e| format!("send: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
     let peer = p.peer_prefix()?;
+    let ours = [
+        rtps::guid_of(part.prefix, rep_r),
+        rtps::guid_of(part.prefix, req_w),
+    ];
+    let rmw = p.rmw;
     part.wait(
         deadline,
         Duration::from_millis(p.resend_ms),
         send,
         |r: &Received| {
             from_peer(peer, r)?;
-            let mut d = Dec::open(&r.payload).ok()?;
-            (d.u64().ok()? == client && d.i64().ok()? == seq).then(|| r.payload.clone())
+            match rmw {
+                super::Rmw::Cyclonedds => {
+                    let mut d = Dec::open(&r.payload).ok()?;
+                    (d.u64().ok()? == client && d.i64().ok()? == seq)
+                        .then(|| without_header(&r.payload).ok())
+                        .flatten()
+                }
+                super::Rmw::Fastrtps => {
+                    let (g, s) = r.related?;
+                    (ours.contains(&g) && s == sn).then(|| r.payload.clone())
+                }
+            }
         },
     )
 }
@@ -282,17 +339,23 @@ fn from_peer(peer: Option<[u8; 12]>, r: &Received) -> Option<()> {
     }
 }
 
-/// Skip the request header of a reply.
+/// The body of a reply ([`call_service`] removed any request header).
 fn reply_body(payload: &[u8]) -> Result<Dec<'_>, String> {
-    let mut d = Dec::open(payload)?;
-    d.u64()?;
-    d.i64()?;
-    Ok(d)
+    Dec::open(payload)
 }
 
 fn nav2_pause(m: &MotionSection) -> Result<String, String> {
     let n = m.nav2.as_ref().ok_or_else(|| missing(AdapterKind::Nav2))?;
+    let (mut notes, _) = nav2_cancel_all(n)?;
+    notes.push(nav2_zero_twists(n)?);
+    Ok(notes.join("; "))
+}
+
+/// `CancelGoal` (every goal) on each action server: the notes and how
+/// many goals were cancelling in all.
+fn nav2_cancel_all(n: &super::Nav2Adapter) -> Result<(Vec<String>, u64), String> {
     let mut notes = Vec::new();
+    let mut total: u64 = 0;
     for a in &n.actions {
         let (client, seq) = correlation();
         let req = cdr::cancel_all_goals(client, seq);
@@ -312,24 +375,99 @@ fn nav2_pause(m: &MotionSection) -> Result<String, String> {
             return Err(format!("{a}: cancel_goal answered return_code {code}"));
         }
         notes.push(format!("{a}: {count} goal(s) cancelling (code {code})"));
+        total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     }
+    Ok((notes, total))
+}
+
+/// A burst of zero `Twist` on `cmd_vel`.
+fn nav2_zero_twists(n: &super::Nav2Adapter) -> Result<String, String> {
     let mut part =
         Participant::open(n.ros2.peer()?, n.ros2.prefix()?).map_err(|e| format!("socket: {e}"))?;
     let topic = format!("rt{}", n.cmd_vel_topic);
     let tw = rtps::fresh_entity(0x03);
-    part.announce().map_err(|e| format!("send: {e}"))?;
-    part.announce_writer(tw, &topic, "geometry_msgs::msg::dds_::Twist_")
-        .map_err(|e| format!("send: {e}"))?;
     let z = cdr::zero_twist();
     for sn in 1..=i64::from(n.zero_twists) {
+        // Announced with every twist (T18, found against a real Cyclone
+        // DDS): a peer drops samples of a writer it has not matched yet,
+        // and an announcement that arrived before it knew this participant
+        // is not repeated by anyone else.
+        part.announce().map_err(|e| format!("send: {e}"))?;
+        part.announce_writer(tw, &topic, "geometry_msgs::msg::dds_::Twist_")
+            .map_err(|e| format!("send: {e}"))?;
         part.publish(tw, sn, &z).map_err(|e| format!("send: {e}"))?;
         std::thread::sleep(Duration::from_millis(n.zero_twist_interval_ms));
     }
-    notes.push(format!(
+    Ok(format!(
         "{} zero twist(s) on {}",
         n.zero_twists, n.cmd_vel_topic
-    ));
-    Ok(notes.join("; "))
+    ))
+}
+
+/// Re-assert a `safe_pause` in force (sales-readiness T42, see
+/// [`super::MotionPorts::latch`]). `nav2`: every goal is cancelled again;
+/// any goal that was cancelling was sent while paused (the first cancel
+/// left none in a cancelable state): overridden, and a zero-twist burst
+/// follows. `px4`: the heartbeat's mode is read back; any mode but hold is
+/// overridden and hold is set again, except a pilot's manual mode, which
+/// is reported but never taken away from the pilot. `ros2_control`: not
+/// observed (a controller switch is state the controller manager keeps).
+pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, String> {
+    use super::Latch;
+    if spec.action != ActionId::SafePause {
+        return Ok(Latch::Held(String::new()));
+    }
+    let mut held = Vec::new();
+    let mut overridden = Vec::new();
+    for k in &spec.adapters {
+        match k {
+            AdapterKind::Nav2 => {
+                let n = m.nav2.as_ref().ok_or_else(|| missing(*k))?;
+                let (notes, total) = nav2_cancel_all(n).map_err(|e| format!("nav2: {e}"))?;
+                if total == 0 {
+                    held.push("nav2: no goal".to_string());
+                } else {
+                    let tw = nav2_zero_twists(n).map_err(|e| format!("nav2: {e}"))?;
+                    overridden.push(format!(
+                        "nav2: {total} navigation goal(s) sent while paused were cancelled ({}); \
+                         {tw}",
+                        notes.join("; ")
+                    ));
+                }
+            }
+            AdapterKind::Px4 => {
+                let p = m.px4.as_ref().ok_or_else(|| missing(*k))?;
+                let mode = px4_read_mode(p).map_err(|e| format!("px4: {e}"))?;
+                let hold = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, mav::PX4_SUB_AUTO_LOITER);
+                if mode == hold {
+                    held.push("px4: in hold".to_string());
+                } else if mav::px4_is_manual(mode) {
+                    overridden.push(format!(
+                        "px4: a pilot switched to manual mode {} while paused: left to the pilot \
+                         (a manual mode is never taken away)",
+                        mav::px4_mode_name(mode)
+                    ));
+                } else {
+                    let again = px4_mode(m, spec).map_err(|e| {
+                        format!(
+                            "px4: mode {} while paused; setting hold again failed: {e}",
+                            mav::px4_mode_name(mode)
+                        )
+                    })?;
+                    overridden.push(format!(
+                        "px4: mode changed to {} while paused; hold set again: {again}",
+                        mav::px4_mode_name(mode)
+                    ));
+                }
+            }
+            other => held.push(format!("{}: not observed", other.as_str())),
+        }
+    }
+    if overridden.is_empty() {
+        Ok(Latch::Held(held.join("; ")))
+    } else {
+        Ok(Latch::Overridden(overridden.join("; ")))
+    }
 }
 
 fn switch(
@@ -511,6 +649,67 @@ fn px4_mode(m: &MotionSection, spec: &MotionSpec) -> Result<String, String> {
                     }
                     acked = true;
                 }
+            }
+        }
+    }
+}
+
+/// The vehicle's `custom_mode` from its heartbeat (a GCS heartbeat is sent
+/// so the autopilot streams to this address; nothing is commanded).
+fn px4_read_mode(p: &super::Px4Adapter) -> Result<u32, String> {
+    let sock = UdpSocket::bind(p.bind).map_err(|e| format!("bind {}: {e}", p.bind))?;
+    let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
+    let gcs = Heartbeat {
+        custom_mode: 0,
+        mav_type: 6,  // MAV_TYPE_GCS
+        autopilot: 8, // MAV_AUTOPILOT_INVALID
+        base_mode: 0,
+        system_status: 4,
+    };
+    let mut seq: u8 = 0;
+    let mut buf = [0u8; 2048];
+    let mut next_send = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("no heartbeat from the autopilot before the deadline".into());
+        }
+        if now >= next_send {
+            seq = seq.wrapping_add(1);
+            let f = mav::encode(
+                seq,
+                p.system_id,
+                p.component_id,
+                mav::MSG_HEARTBEAT,
+                &gcs.payload(),
+            )
+            .ok_or("MAVLink encode")?;
+            sock.send_to(&f, p.address)
+                .map_err(|e| format!("send: {e}"))?;
+            next_send = now + Duration::from_millis(500);
+        }
+        let _ = sock.set_read_timeout(Some(
+            deadline
+                .min(next_send)
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        ));
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if from != std::net::SocketAddr::V4(p.address) {
+            continue;
+        }
+        let Ok(frames) = mav::decode_all(buf.get(..n).unwrap_or_default()) else {
+            continue;
+        };
+        for f in frames {
+            if f.sysid != p.target_system || f.compid != p.target_component {
+                continue;
+            }
+            if let Some(hb) = Heartbeat::parse(&f) {
+                return Ok(hb.custom_mode);
             }
         }
     }

@@ -167,6 +167,11 @@ pub struct UserInlineQos {
     /// another fragment of the sample): stacks may disagree on whether the
     /// sample is a dispose.
     pub status_conflict: bool,
+    /// `PID_RELATED_SAMPLE_IDENTITY` or Fast DDS's
+    /// `PID_CUSTOM_RELATED_SAMPLE_IDENTITY` (first occurrence; 24 octets:
+    /// writer GUID, then the sequence number high:low in the submessage's
+    /// endianness): the request a `rmw_fastrtps` service reply answers.
+    pub related_sample_identity: Option<(Guid, i64)>,
 }
 
 impl UserInlineQos {
@@ -176,6 +181,7 @@ impl UserInlineQos {
             key_hash: q.key_hash,
             status: q.status,
             status_conflict: q.alt_status.is_some(),
+            related_sample_identity: q.related,
         }
     }
 
@@ -526,6 +532,17 @@ impl<'a> Walk<'a> {
                         let st = StatusInfo { raw };
                         q.status.get_or_insert(st);
                         last_status = Some(st);
+                    }
+                }
+                PID_RELATED_SAMPLE_IDENTITY | PID_CUSTOM_RELATED_SAMPLE_IDENTITY
+                    if q.related.is_none() =>
+                {
+                    if let (Some(g), Some(hi), Some(lo)) = (
+                        read_array::<16>(v, 0),
+                        read_i32(v, 16, le),
+                        read_u32(v, 20, le),
+                    ) {
+                        q.related = Some((g, (i64::from(hi) << 32) | i64::from(lo)));
                     }
                 }
                 _ => {}
@@ -1087,6 +1104,61 @@ mod tests {
             r.anomalies[0].address.map(|a| a.writer),
             Some(guid_of(W, CMD_WRITER))
         );
+    }
+
+    /// Sales-readiness T18: the related sample identity of a reply
+    /// (`rmw_fastrtps` service replies), under the standard and Fast DDS's
+    /// vendor PID, in both endiannesses; the first one wins; a short value
+    /// is ignored.
+    #[test]
+    fn inline_qos_related_sample_identity_is_read() {
+        let rsi = |pid: u16, le: bool, g: u8, hi: i32, lo: u32, len: u16| {
+            let mut q = Vec::new();
+            let (p, l) = if le {
+                (pid.to_le_bytes(), len.to_le_bytes())
+            } else {
+                (pid.to_be_bytes(), len.to_be_bytes())
+            };
+            q.extend_from_slice(&p);
+            q.extend_from_slice(&l);
+            q.extend_from_slice(&[g; 16]);
+            if le {
+                q.extend_from_slice(&hi.to_le_bytes());
+                q.extend_from_slice(&lo.to_le_bytes());
+            } else {
+                q.extend_from_slice(&hi.to_be_bytes());
+                q.extend_from_slice(&lo.to_be_bytes());
+            }
+            q.truncate(4 + usize::from(len));
+            q
+        };
+        for (pid, le) in [
+            (PID_RELATED_SAMPLE_IDENTITY, true),
+            (PID_CUSTOM_RELATED_SAMPLE_IDENTITY, true),
+            (PID_CUSTOM_RELATED_SAMPLE_IDENTITY, false),
+        ] {
+            let mut q = rsi(pid, le, 5, 2, 7, 24);
+            q.extend(rsi(PID_RELATED_SAMPLE_IDENTITY, le, 6, 0, 1, 24));
+            q.extend_from_slice(if le { &[1, 0, 0, 0] } else { &[0, 1, 0, 0] });
+            let p = twist(0.1, 0.0);
+            let body = data_body(le, CMD_READER, CMD_WRITER, (0, 3), &q, &p);
+            let flags = FLAG_Q | FLAG_D | if le { FLAG_E } else { 0 };
+            let d = dgram(&[sub(SUBMSG_DATA, flags, &body)]);
+            let r = walk_user_data(&d).unwrap();
+            assert_eq!(
+                r.samples[0].inline_qos.related_sample_identity,
+                Some(([5; 16], (2i64 << 32) | 7)),
+                "{pid:#06x} le={le}"
+            );
+        }
+        // Too short (16 octets): no identity, the sample is kept.
+        let mut q = rsi(PID_RELATED_SAMPLE_IDENTITY, true, 5, 0, 1, 16);
+        q.extend_from_slice(&[1, 0, 0, 0]);
+        let body = data_body(true, CMD_READER, CMD_WRITER, (0, 3), &q, &twist(0.1, 0.0));
+        let d = dgram(&[sub(SUBMSG_DATA, FLAG_E | FLAG_Q | FLAG_D, &body)]);
+        let r = walk_user_data(&d).unwrap();
+        assert_eq!(r.samples.len(), 1);
+        assert_eq!(r.samples[0].inline_qos.related_sample_identity, None);
     }
 
     #[test]

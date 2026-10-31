@@ -148,6 +148,9 @@ pub(crate) struct InlineQos {
     /// one list (last-wins stacks), or the inline QoS of a DATA_FRAG's
     /// fragment 1 when another fragment created the sample.
     pub alt_status: Option<StatusInfo>,
+    /// The related sample identity (first occurrence of either PID): the
+    /// writer GUID and sequence number of the sample this one answers.
+    pub related: Option<(Guid, i64)>,
 }
 
 impl InlineQos {
@@ -155,6 +158,7 @@ impl InlineQos {
     /// fills a gap, a differing status becomes [`InlineQos::alt_status`].
     pub(crate) fn with_reading(mut self, other: &InlineQos) -> Self {
         self.key_hash = self.key_hash.or(other.key_hash);
+        self.related = self.related.or(other.related);
         let mine = self.status.unwrap_or_default();
         let theirs = other.status.unwrap_or_default();
         if self.alt_status.is_none() && mine != theirs {

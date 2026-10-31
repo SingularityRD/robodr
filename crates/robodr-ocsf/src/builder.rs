@@ -1170,6 +1170,11 @@ fn catalog_2_5(rule: &str) -> Option<RuleInfo> {
             "The robot's agent cannot reach its response executor: containment actions cannot be applied, verified or reverted, and actions in force are not watched, until it answers again.",
             AGENT,
         ),
+        "robot.agent.executor_pause_overridden" => e(
+            "Robot set moving while paused",
+            "While a safe_pause the SOC approved was in force, someone set the robot moving again: a navigation goal was sent or the vehicle's flight mode was changed. The executor's latch cancelled the goal or set hold again (a pilot's manual mode is left to the pilot); the pause stays in force until the SOC's two-person signed revert. The detail names the request and what was found.",
+            AGENT,
+        ),
         "robot.agent.control_plane_request_fenced" => e(
             "Control-plane request refused by the replay fence",
             "A correctly signed control-plane request was refused because it was signed at or before the replay fence the agent set after a restart or a state repair; it was not judged or executed. The SOC should re-sign and resend it.",

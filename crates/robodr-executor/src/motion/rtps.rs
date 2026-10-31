@@ -3,9 +3,10 @@
 //! participant (the robot's ROS 2 host: its metatraffic and user unicast
 //! ports), publishes samples from reliable writers (DATA + HEARTBEAT) and
 //! reads the peer's samples addressed to it. That is what a ROS 2 topic
-//! publish, a service call (`rq/<service>Request` / `rr/<service>Reply`
-//! with the `rmw_cyclonedds` request header) and a Unitree SDK request
-//! need, and nothing more:
+//! publish, a service call (`rq/<service>Request` / `rr/<service>Reply`,
+//! correlated the `rmw_cyclonedds` way, a request header in the payload,
+//! or the `rmw_fastrtps` way, the related sample identity in the inline
+//! QoS) and a Unitree SDK request need, and nothing more:
 //!
 //! - no multicast, no discovery of anyone but the peer, no SEDP reader
 //!   (the peer's readers match the announced writers; the peer's reply
@@ -14,16 +15,20 @@
 //!   honoured by re-sending: each request is sent with a HEARTBEAT and
 //!   re-sent (same sequence number) until its reply arrives or the
 //!   deadline passes; ACKNACKs are not parsed (a re-send of the same
-//!   sequence number is a duplicate the reader drops);
+//!   sequence number is a duplicate the reader drops). Every HEARTBEAT
+//!   announces only the sample just sent (`first = last`): a re-announced
+//!   endpoint supersedes the earlier announcement, so a reader that missed
+//!   it (it arrived before the peer knew this participant) is not left
+//!   waiting for a sample that is never repaired;
 //! - replies are read with `robodr-rtps`'s user-data walker (DATA_FRAG
 //!   reassembled), never trusted beyond their payload (the adapter checks
 //!   the request header / identity of every reply).
 //!
 //! What is verified: the datagrams this module writes parse with
-//! `robodr-rtps` (SPDP, SEDP and user DATA, `tests/motion.rs`) and a
-//! simulated peer answers through it. Interoperation with a real Cyclone
-//! DDS / Fast DDS participant has **not** been verified here (README,
-//! "Motion adapters").
+//! `robodr-rtps` (SPDP, SEDP and user DATA, `motion_tests.rs`) and a
+//! simulated peer answers through it; `tools/e2e/ros2-peer/` runs the
+//! service call against a real ROS 2 node in a container (README, "Motion
+//! adapters", for what that covered).
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
@@ -229,6 +234,32 @@ fn guid(prefix: [u8; 12], entity: [u8; 4]) -> Vec<u8> {
 pub struct Received {
     pub writer: [u8; 16],
     pub payload: Vec<u8>,
+    /// The inline QoS's related sample identity (an `rmw_fastrtps`
+    /// service reply: the request it answers).
+    pub related: Option<([u8; 16], i64)>,
+}
+
+/// An inline QoS naming the related sample identity `(guid, sn)`, under
+/// both Fast DDS's vendor PID (0x800f, every Fast DDS 2.x reads it) and
+/// the standard one (0x0083, Fast DDS 2.10+): what `rmw_fastrtps` puts on
+/// a service request to name the client's reply reader.
+pub fn related_identity_qos(guid: [u8; 16], sn: i64) -> Vec<u8> {
+    let mut v = guid.to_vec();
+    v.extend_from_slice(&((sn >> 32) as i32).to_le_bytes());
+    v.extend_from_slice(&(sn as u32).to_le_bytes());
+    Pl::default().param(0x800f, &v).param(0x0083, &v).list()
+}
+
+/// `SequenceNumber_t::unknown()` (high -1, low 0).
+pub const SN_UNKNOWN: i64 = -1i64 << 32;
+
+/// A GUID from a prefix and an entity id.
+pub fn guid_of(prefix: [u8; 12], entity: [u8; 4]) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    for (d, s) in g.iter_mut().zip(prefix.iter().chain(entity.iter())) {
+        *d = *s;
+    }
+    g
 }
 
 /// See the module docs.
@@ -320,7 +351,7 @@ impl Participant {
         };
         let d = Msg::new(self.prefix)
             .data(r, w, sn, Some(&qos), &p)
-            .heartbeat(r, w, 1, sn, self.hb_count)
+            .heartbeat(r, w, sn, sn, self.hb_count)
             .finish();
         self.send(self.peer.meta_port, &d)
     }
@@ -348,10 +379,22 @@ impl Participant {
     /// One user sample of `writer` with sequence number `sn` (and a
     /// HEARTBEAT announcing it) to the peer's user port.
     pub fn publish(&mut self, writer: [u8; 4], sn: i64, payload: &[u8]) -> std::io::Result<()> {
+        self.publish_with(writer, sn, None, payload)
+    }
+
+    /// [`Participant::publish`] with an inline QoS (a parameter list with
+    /// its sentinel, e.g. [`related_identity_qos`]).
+    pub fn publish_with(
+        &mut self,
+        writer: [u8; 4],
+        sn: i64,
+        inline_qos: Option<&[u8]>,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
         self.hb_count = self.hb_count.wrapping_add(1);
         let d = Msg::new(self.prefix)
-            .data([0; 4], writer, sn, None, payload)
-            .heartbeat([0; 4], writer, 1, sn, self.hb_count)
+            .data([0; 4], writer, sn, inline_qos, payload)
+            .heartbeat([0; 4], writer, sn, sn, self.hb_count)
             .finish();
         self.send(self.peer.user_port, &d)
     }
@@ -407,6 +450,7 @@ impl Participant {
                 }
                 let got = Received {
                     writer: s.address.writer,
+                    related: s.inline_qos.related_sample_identity,
                     payload: s.payload.into_owned(),
                 };
                 if let Some(t) = accept(&got) {

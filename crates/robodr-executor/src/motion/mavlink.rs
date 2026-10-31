@@ -208,6 +208,54 @@ pub fn px4_custom_mode(main: u8, sub: u8) -> u32 {
     u32::from_le_bytes([0, 0, main, sub])
 }
 
+/// A PX4 mode a pilot flies with sticks (`px4_custom_mode.h`: MANUAL 1,
+/// ALTCTL 2, POSCTL 3 (its plain and slow sub modes, not the commanded
+/// ORBIT 1), ACRO 5, STABILIZED 7, RATTITUDE 8). The safe_pause latch
+/// (T42) never takes such a mode away from the pilot.
+pub fn px4_is_manual(custom_mode: u32) -> bool {
+    let b = custom_mode.to_le_bytes();
+    match (b[2], b[3]) {
+        (1 | 2 | 5 | 7 | 8, _) => true,
+        (3, sub) => sub != 1,
+        _ => false,
+    }
+}
+
+/// A readable name of a PX4 `custom_mode` (`MAIN.SUB`, numbers for ones
+/// not named here).
+pub fn px4_mode_name(custom_mode: u32) -> String {
+    let b = custom_mode.to_le_bytes();
+    let main = match b[2] {
+        1 => "MANUAL",
+        2 => "ALTCTL",
+        3 => "POSCTL",
+        4 => "AUTO",
+        5 => "ACRO",
+        6 => "OFFBOARD",
+        7 => "STABILIZED",
+        8 => "RATTITUDE",
+        _ => "",
+    };
+    let sub = match (b[2], b[3]) {
+        (4, 1) => "READY",
+        (4, 2) => "TAKEOFF",
+        (4, 3) => "LOITER",
+        (4, 4) => "MISSION",
+        (4, 5) => "RTL",
+        (4, 6) => "LAND",
+        (4, 8) => "FOLLOW_TARGET",
+        (4, 9) => "PRECLAND",
+        (3, 1) => "ORBIT",
+        _ => "",
+    };
+    match (main, sub) {
+        ("", _) => format!("custom_mode {custom_mode:#010x}"),
+        (m, "") if b[3] == 0 => m.to_string(),
+        (m, "") => format!("{m}.{}", b[3]),
+        (m, s) => format!("{m}.{s}"),
+    }
+}
+
 /// `COMMAND_LONG` payload.
 pub fn command_long(
     params: [f32; 7],

@@ -1925,6 +1925,12 @@ table.
    * `soc.robot_keys`: the robot's own public keys (the black-box and
      finding keys' public halves, e.g. `robodr-blackbox keygen` public
      files): never accepted as SOC keys.
+   * `soc.key_scopes` (optional): per SOC key id, the `actions` it may
+     approve and revert and its `max_ttl_s`, e.g.
+     `{"soc:tier1": {"actions": ["quarantine_node"], "max_ttl_s": 900}}`;
+     anything else signed with that key is refused `key_scope_denied`.
+     `soc.require_key_scopes: true` makes a key without an entry approve
+     nothing (recommended once every key has one).
    * `network.quarantine.cidrs`: the networks where a participant may be
      quarantined (its SPDP locators must be there, on the robot's DDS
      ports); empty refuses every quarantine (`locator_out_of_scope`).
@@ -2162,7 +2168,12 @@ restart, an emergency disable, a failed apply or re-arm leave it paused
 too. It is lifted only by the SOC's signed revert with two approvers, and
 only when agentd's safety state at that moment is known, fresh, not
 engaged and one the adapter allows (otherwise the revert is refused and
-the pause stays). Lifting a pause **releases** it and never resumes a
+the pause stays). While paused, the executor re-asserts the pause every
+`motion.safe_pause_latch_s` (default 2 s): Nav2 goals sent meanwhile are
+cancelled and a PX4 mode change is set back to hold (a pilot's manual
+mode is left to the pilot); each is a High finding
+`robot.agent.executor_pause_overridden` (find out who moved the robot).
+Lifting a pause **releases** it and never resumes a
 mission (Nav2 goals are not restored, PX4 stays in hold);
 `request_safe_state` and `rollback_config` answer `applied` and are not
 reversible. A pause or safe state is refused while `moving_fast` unless

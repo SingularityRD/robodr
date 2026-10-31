@@ -223,6 +223,41 @@ type Announced = Arc<Mutex<Vec<(String, String)>>>;
 fn sim_ros2(
     reply: impl Fn(&str, &[u8]) -> Option<Vec<u8>> + Send + 'static,
 ) -> (Sim, u16, Seen, Announced) {
+    sim_ros2_rmw(FastReply::No, reply)
+}
+
+/// How a simulated peer correlates its replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastReply {
+    /// `rmw_cyclonedds`: the reply closure echoes the payload header.
+    No,
+    /// `rmw_fastrtps` (Humble): the reply names the request's related
+    /// sample identity GUID when it is a reader (else the request writer)
+    /// and the request's sequence number, in its inline QoS.
+    Yes,
+    /// A forger that knows the GUIDs but not the sequence number.
+    WrongSn,
+    /// A reply without a related sample identity.
+    NoIdentity,
+}
+
+/// [`sim_ros2`] for a given RMW behaviour.
+fn sim_ros2_rmw(
+    fast: FastReply,
+    reply: impl Fn(&str, &[u8]) -> Option<Vec<u8>> + Send + 'static,
+) -> (Sim, u16, Seen, Announced) {
+    sim_ros2_inner(fast, false, reply)
+}
+
+/// [`sim_ros2_rmw`]; with `late`, the first SEDP announcement of every
+/// endpoint is lost (as a real peer drops one that arrives before it
+/// processed our SPDP), so its samples are not matched until the endpoint
+/// is announced again.
+fn sim_ros2_inner(
+    fast: FastReply,
+    late: bool,
+    reply: impl Fn(&str, &[u8]) -> Option<Vec<u8>> + Send + 'static,
+) -> (Sim, u16, Seen, Announced) {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
@@ -233,6 +268,7 @@ fn sim_ros2(
     let (s, sn, an) = (stop.clone(), seen.clone(), ann.clone());
     let handle = std::thread::spawn(move || {
         let mut topics: std::collections::HashMap<[u8; 16], String> = Default::default();
+        let mut lost: std::collections::HashSet<[u8; 16]> = Default::default();
         let mut buf = vec![0u8; 65536];
         let mut out_sn = 0i64;
         while !s.load(Ordering::SeqCst) {
@@ -243,6 +279,9 @@ fn sim_ros2(
             if let Some(r) = robodr_rtps::parse_datagram_detailed(d) {
                 for e in &r.endpoints {
                     if let Some(g) = e.guid {
+                        if late && lost.insert(g) {
+                            continue;
+                        }
                         topics.insert(g, e.topic.clone());
                     }
                     an.lock()
@@ -260,8 +299,18 @@ fn sim_ros2(
                     .push((topic.clone(), smp.payload.to_vec()));
                 if let Some(p) = reply(&topic, &smp.payload) {
                     out_sn += 1;
+                    let req_sn = smp.address.sequence_number;
+                    let related = match smp.inline_qos.related_sample_identity {
+                        Some((g, _)) if g[15] & 0x04 != 0 => g,
+                        _ => smp.address.writer,
+                    };
+                    let qos = match fast {
+                        FastReply::No | FastReply::NoIdentity => None,
+                        FastReply::Yes => Some(rtps::related_identity_qos(related, req_sn)),
+                        FastReply::WrongSn => Some(rtps::related_identity_qos(related, req_sn + 1)),
+                    };
                     let m = rtps::Msg::new([9; 12])
-                        .data([0; 4], [0, 0, 9, 3], out_sn, None, &p)
+                        .data([0; 4], [0, 0, 9, 3], out_sn, qos.as_deref(), &p)
                         .finish();
                     let _ = sock.send_to(&m, from);
                 }
@@ -1020,7 +1069,7 @@ fn motion_configuration_is_strict() {
         json!({"gateway": {"restriction_path": "r", "status_path": "/s"}}),
         json!({"nav2": {"ros2": peer, "bogus": 1}}),
         json!({"nav2": {"ros2": {"peer_ip": "224.0.0.1", "local_ip": "10.0.0.1"}}}),
-        json!({"nav2": {"ros2": {"peer_ip": "10.0.0.2", "local_ip": "10.0.0.1", "rmw": "fastrtps"}}}),
+        json!({"nav2": {"ros2": {"peer_ip": "10.0.0.2", "local_ip": "10.0.0.1", "rmw": "connextdds"}}}),
         json!({"ros2_control": {"ros2": peer, "deactivate": []}}),
         json!({"ros2_control": {"ros2": peer, "deactivate": ["a"], "activate": ["a"]}}),
         json!({"px4": {"address": "10.0.0.3:14540", "bind": "0.0.0.0:0", "system_id": 1}}),
@@ -1986,4 +2035,427 @@ fn review_11_revert_all_and_abandon_undo_motion_actions() {
     let s = journal_of(&d);
     assert_eq!(s.entries.len(), 1);
     assert_eq!(s.entries[0].phase, crate::journal::Phase::Active);
+}
+
+// ------------------------------------- sales-readiness T42: the pause latch
+
+fn overridden(e: &Engine) -> Vec<String> {
+    e.state()
+        .events
+        .iter()
+        .filter(|ev| ev.kind == crate::journal::EventKind::Overridden)
+        .map(|ev| ev.detail.clone())
+        .collect()
+}
+
+/// T42: a Nav2 pause was not a latch: a goal sent after the cancel set the
+/// robot moving again unnoticed. Now every `safe_pause_latch_s` every goal
+/// is cancelled again; a goal found is reported `overridden` (HIGH) and
+/// zero twists follow. A peer that stops answering is one `drift` event,
+/// not one per run.
+#[test]
+fn t42_nav2_pause_is_latched_and_an_override_is_reported() {
+    // Goals the simulated Nav2 holds; a cancel cancels them all.
+    let goals = Arc::new(Mutex::new(1u32));
+    let answering = Arc::new(AtomicBool::new(true));
+    let (g2, a2) = (goals.clone(), answering.clone());
+    let (_sim, port, seen, _) = sim_ros2(move |topic, p| {
+        if !a2.load(Ordering::SeqCst) {
+            return None;
+        }
+        if topic.starts_with("rq/") && topic.ends_with("/_action/cancel_goalRequest") {
+            let n = std::mem::take(&mut *g2.lock().unwrap());
+            return service_reply(p, |e| {
+                e.u8(0); // ERROR_NONE
+                e.u32(n);
+                for i in 0..n {
+                    for b in 0..16u8 {
+                        e.u8(b ^ i as u8);
+                    }
+                    e.i32(1);
+                    e.u32(0);
+                }
+            });
+        }
+        None
+    });
+    let twists = |seen: &Seen| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == "rt/cmd_vel")
+            .count()
+    };
+    let d = tmpdir("t42-nav2");
+    let motion = json!({"safe_pause": "nav2", "safe_pause_latch_s": 2,
+        "nav2": {"oem_validated": true, "ros2": ros2_peer(port),
+                 "actions": ["/navigate_to_pose"], "zero_twists": 3,
+                 "zero_twist_interval_ms": 10}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        t0,
+    );
+    let o = signed(
+        "lp1",
+        ActionId::SafePause,
+        Morphology::WheeledMobile,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    assert_eq!(twists(&seen), 3);
+    // Before the interval: nothing is sent.
+    e.tick(late(1_000));
+    assert_eq!(twists(&seen), 3);
+    // Nobody moved it: re-cancelled, nothing found, no event.
+    e.tick(late(2_100));
+    assert!(overridden(&e).is_empty());
+    assert_eq!(twists(&seen), 3);
+    // Someone sends a navigation goal while paused.
+    *goals.lock().unwrap() = 2;
+    e.tick(late(10_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "{ov:?}");
+    assert!(ov[0].starts_with("HIGH:"), "{ov:?}");
+    assert!(ov[0].contains("2 navigation goal(s)"), "{ov:?}");
+    assert_eq!(
+        *goals.lock().unwrap(),
+        0,
+        "the new goals were not cancelled"
+    );
+    assert_eq!(twists(&seen), 6, "no zero twists after the override");
+    assert_eq!(e.status("lp1").status, Status::Verified);
+    // The peer stops answering: one drift event per change, not per run.
+    answering.store(false, Ordering::SeqCst);
+    let drifts = |e: &Engine| {
+        e.state()
+            .events
+            .iter()
+            .filter(|ev| ev.kind == crate::journal::EventKind::Drift)
+            .count()
+    };
+    e.tick(late(20_000));
+    e.tick(late(30_000));
+    assert_eq!(drifts(&e), 1);
+    answering.store(true, Ordering::SeqCst);
+    e.tick(late(40_000));
+    assert_eq!(overridden(&e).len(), 1);
+    assert_eq!(e.status("lp1").status, Status::Verified);
+}
+
+/// T42: a PX4 hold was not a latch: a mode change (a mission resumed,
+/// offboard) moved the vehicle again unnoticed. Now its mode is read back
+/// every `safe_pause_latch_s`; another mode is reported `overridden`
+/// (HIGH) and hold is set again, but a pilot's manual mode is reported and
+/// left to the pilot.
+#[test]
+fn t42_px4_hold_is_latched_but_a_pilot_keeps_manual_control() {
+    let (_sim, addr, mode) = sim_px4(true);
+    let d = tmpdir("t42-px4");
+    let motion = json!({"safe_pause": "px4",
+        "px4": {"oem_validated": true, "address": addr.to_string(), "bind": "127.0.0.1:0",
+                "timeout_ms": 3000}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Drone, Morphology::Aerial),
+        t0,
+    );
+    let o = signed(
+        "lh1",
+        ActionId::SafePause,
+        Morphology::Aerial,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::MovingSlow,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::MovingSlow), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let hold = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, mav::PX4_SUB_AUTO_LOITER);
+    assert_eq!(*mode.lock().unwrap(), hold);
+    e.tick(late(2_100));
+    assert!(overridden(&e).is_empty());
+    // A ground station resumes the mission while paused.
+    *mode.lock().unwrap() = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, 4);
+    e.tick(late(5_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "{ov:?}");
+    assert!(
+        ov[0].starts_with("HIGH:") && ov[0].contains("AUTO.MISSION"),
+        "{ov:?}"
+    );
+    assert_eq!(*mode.lock().unwrap(), hold, "hold was not set again");
+    // Offboard (a companion computer steering it): set back to hold too.
+    *mode.lock().unwrap() = mav::px4_custom_mode(6, 0);
+    e.tick(late(8_000));
+    assert_eq!(overridden(&e).len(), 2);
+    assert_eq!(*mode.lock().unwrap(), hold);
+    // A pilot takes manual control (POSCTL): reported, never taken away.
+    let posctl = mav::px4_custom_mode(3, 0);
+    *mode.lock().unwrap() = posctl;
+    e.tick(late(11_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 3, "{ov:?}");
+    assert!(
+        ov[2].contains("POSCTL") && ov[2].contains("left to the pilot"),
+        "{ov:?}"
+    );
+    assert_eq!(
+        *mode.lock().unwrap(),
+        posctl,
+        "the latch took control from the pilot"
+    );
+    assert_eq!(e.status("lh1").status, Status::Verified);
+}
+
+#[test]
+fn t42_latch_interval_is_validated() {
+    let d = tmpdir("t42-cfg");
+    for bad in [0, 61] {
+        let mut v: Value =
+            serde_json::from_str(&crate::tests::config_json(d.to_str().unwrap())).unwrap();
+        v["motion"] = json!({"safe_pause_latch_s": bad});
+        let r = crate::ExecutorConfig::parse(&v.to_string()).and_then(|c| c.validate());
+        assert!(r.is_err(), "safe_pause_latch_s {bad} accepted");
+    }
+    assert!(mav::px4_is_manual(mav::px4_custom_mode(1, 0)));
+    assert!(mav::px4_is_manual(mav::px4_custom_mode(3, 2)));
+    assert!(
+        !mav::px4_is_manual(mav::px4_custom_mode(3, 1)),
+        "ORBIT is commanded"
+    );
+    assert!(!mav::px4_is_manual(mav::px4_custom_mode(6, 0)));
+    assert!(!mav::px4_is_manual(mav::px4_custom_mode(4, 4)));
+}
+
+// ------------------------------ sales-readiness T18: rmw_fastrtps services
+
+/// T18: the ROS 2 adapters only spoke `rmw_cyclonedds` (`rmw: fastrtps`
+/// was refused), so a robot on the ROS 2 default RMW could not be paused.
+/// Now `rmw: fastrtps` sends the bare request with our reply reader as its
+/// related sample identity and takes the reply that names it and the
+/// request's sequence number; a reply that names another sequence number,
+/// or none, is not an answer.
+#[test]
+fn t18_fastrtps_service_calls_pause_and_lift_and_forged_replies_fail() {
+    let pol = policy(PlatformFamily::Arm, Morphology::Arm);
+    let pause = |id: &str| {
+        signed(
+            id,
+            ActionId::SafePause,
+            Morphology::Arm,
+            Target::None,
+            None,
+            &["alice", "bob"],
+            SafetyState::Idle,
+        )
+    };
+    let requests = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let sim = |fast: FastReply, reqs: Arc<Mutex<Vec<Vec<u8>>>>| {
+        sim_ros2_rmw(fast, move |topic, p| {
+            if topic != "rq/controller_manager/switch_controllerRequest" {
+                return None;
+            }
+            reqs.lock().unwrap().push(p.to_vec());
+            let mut e = cdr::Enc::default();
+            e.bool(true);
+            Some(e.payload())
+        })
+    };
+    let (_s, port, _, ann) = sim(FastReply::Yes, requests.clone());
+    let mut m = r2c_motion(port);
+    m["ros2_control"]["ros2"]["rmw"] = json!("fastrtps");
+    let d = tmpdir("t18-fast");
+    let mut e = engine(&d, m.clone(), pol.clone(), now());
+    let out = e.submit(&pause("f1"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let out = e.revert_request(
+        "f1",
+        "done",
+        Some(&revert_req("f1", &["alice", "bob"])),
+        &mut state(SafetyState::Idle),
+        now(),
+    );
+    assert_eq!(out.status, Status::Reverted, "{out:?}");
+    {
+        // The request is the bare SwitchController request (no
+        // rmw_cyclonedds header): the activate list comes first.
+        let r = requests.lock().unwrap();
+        assert!(r.len() >= 2, "{}", r.len());
+        let mut dec = cdr::Dec::open(&r[0]).unwrap();
+        assert_eq!(
+            dec.strings(16).unwrap(),
+            vec!["hold_controller".to_string()]
+        );
+        // Same topic and type names as rmw_cyclonedds.
+        let a = ann.lock().unwrap();
+        assert!(a.iter().any(
+            |(t, ty)| t == "rq/controller_manager/switch_controllerRequest"
+                && ty == "controller_manager_msgs::srv::dds_::SwitchController_Request_"
+        ));
+        assert!(a.iter().any(
+            |(t, ty)| t == "rr/controller_manager/switch_controllerReply"
+                && ty == "controller_manager_msgs::srv::dds_::SwitchController_Response_"
+        ));
+    }
+    drop(e);
+    // A reply naming another sequence number, or no request at all, is
+    // not an answer: the call fails (nothing is believed applied).
+    for (tag, fast) in [("sn", FastReply::WrongSn), ("none", FastReply::NoIdentity)] {
+        let (_s, port, _, _) = sim(fast, Arc::default());
+        let mut m = r2c_motion(port);
+        m["ros2_control"]["ros2"]["rmw"] = json!("fastrtps");
+        m["ros2_control"]["ros2"]["timeout_ms"] = json!(400);
+        let d = tmpdir(&format!("t18-forged-{tag}"));
+        let mut e = engine(&d, m, pol.clone(), now());
+        let out = e.submit(&pause("f2"), &mut state(SafetyState::Idle), now());
+        assert_eq!(out.status, Status::Failed, "{tag}: {out:?}");
+    }
+    // A cyclonedds peer is not answered by a fastrtps client, nor the
+    // reverse: the RMW must match the robot's.
+    let (_s, port, _, _) = sim(FastReply::No, Arc::default());
+    let mut m = r2c_motion(port);
+    m["ros2_control"]["ros2"]["rmw"] = json!("fastrtps");
+    m["ros2_control"]["ros2"]["timeout_ms"] = json!(400);
+    let d = tmpdir("t18-mismatch");
+    let mut e = engine(&d, m, pol, now());
+    let out = e.submit(&pause("f3"), &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Failed, "{out:?}");
+}
+
+/// T18 against a **real** ROS 2 node (`tools/e2e/ros2-peer/run.sh` starts
+/// it in a container and runs this test): the `nav2` safe_pause over the
+/// node's RMW (`ROBODR_ROS2_RMW`: `fastrtps` or `cyclonedds`), the zero
+/// twists reaching its subscriber, and the latch finding the goals the
+/// node "received" while paused. Ignored without the container.
+/// T18, found against a real Cyclone DDS: the zero twists were published
+/// after one announcement of their writer; a peer that dropped it (it
+/// arrived before the peer processed our SPDP) never matched the writer
+/// and dropped every twist. Each twist now re-announces the writer.
+#[test]
+fn t18_zero_twists_reach_a_peer_that_missed_the_first_announcement() {
+    let (_sim, port, seen, _) = sim_ros2_inner(FastReply::No, true, |topic, p| {
+        if topic.ends_with("/_action/cancel_goalRequest") {
+            return service_reply(p, |e| {
+                e.u8(0);
+                e.u32(0);
+            });
+        }
+        None
+    });
+    let d = tmpdir("t18-late");
+    let motion = json!({"safe_pause": "nav2",
+        "nav2": {"oem_validated": true, "ros2": ros2_peer(port),
+                 "actions": ["/navigate_to_pose"], "zero_twists": 4,
+                 "zero_twist_interval_ms": 10}});
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        now(),
+    );
+    let o = signed(
+        "late1",
+        ActionId::SafePause,
+        Morphology::WheeledMobile,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), now());
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    std::thread::sleep(Duration::from_millis(50));
+    let twists = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, _)| t == "rt/cmd_vel")
+        .count();
+    assert!(twists >= 3, "{twists} zero twist(s) matched");
+}
+
+#[test]
+#[ignore = "needs a ROS 2 peer: tools/e2e/ros2-peer/run.sh"]
+fn t18_real_ros2_peer() {
+    let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+    let (peer_ip, local_ip, rmw, out) = (
+        env("ROBODR_ROS2_PEER_IP"),
+        env("ROBODR_ROS2_LOCAL_IP"),
+        env("ROBODR_ROS2_RMW"),
+        env("ROBODR_ROS2_PEER_OUT"),
+    );
+    let peer_state = || -> Value {
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap_or_default())
+            .unwrap_or(Value::Null)
+    };
+    let motion = json!({"safe_pause": "nav2", "safe_pause_latch_s": 1,
+        "nav2": {"oem_validated": true,
+                 "ros2": {"peer_ip": peer_ip, "local_ip": local_ip, "rmw": rmw,
+                          "timeout_ms": 3000, "resend_ms": 200},
+                 "actions": ["/navigate_to_pose"], "zero_twists": 5,
+                 "zero_twist_interval_ms": 50}});
+    let d = tmpdir(&format!("t18-real-{rmw}"));
+    let t0 = now();
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        t0,
+    );
+    let o = signed(
+        "real1",
+        ActionId::SafePause,
+        Morphology::WheeledMobile,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let note = out.note.unwrap_or_default();
+    assert!(note.contains("1 goal(s) cancelling"), "{note}");
+    // The zero twists reach the node's subscriber (reliable, so all of
+    // them once matched; at least one).
+    let mut st = Value::Null;
+    for _ in 0..50 {
+        st = peer_state();
+        if st["zero_twists"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(st["zero_twists"].as_u64().unwrap_or(0) >= 1, "{st}");
+    assert_eq!(st["other_twists"], 0, "{st}");
+    // Latch: nothing found, then the 2 goals the node scripts.
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    e.tick(late(1_100));
+    assert!(overridden(&e).is_empty(), "{:?}", e.state().events);
+    e.tick(late(10_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "{:?}", e.state().events);
+    assert!(ov[0].contains("2 navigation goal(s)"), "{ov:?}");
+    let st = peer_state();
+    assert_eq!(st["cancels"], 3, "{st}");
+    eprintln!("peer: {st}");
 }

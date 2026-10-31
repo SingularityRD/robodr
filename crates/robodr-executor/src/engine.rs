@@ -22,7 +22,7 @@
 //!   precheck of its stored order) and held until agentd supplies a fresh,
 //!   known safety state that is not engaged ([`Engine::rearm_held`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -313,6 +313,10 @@ pub struct Engine {
     soc_replay: crate::soc::ReplayStore,
     /// The platform adapters of motion actions (Sprint 8).
     motion: Box<dyn crate::motion::MotionPorts + Send>,
+    /// When the safe_pause latch last ran (monotonic ms; T42).
+    last_latch_boot_ms: u64,
+    /// The last latch error per pause (one event per change).
+    latch_errors: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -423,6 +427,8 @@ impl Engine {
             journal_errors: 0,
             soc_replay,
             motion: Box::new(crate::motion::SystemPorts),
+            last_latch_boot_ms: now.boot_ms.unwrap_or(now.wall_ms),
+            latch_errors: BTreeMap::new(),
         };
         if let Some(why) = e.soc_replay.fenced_because.clone() {
             e.state.event(
@@ -926,6 +932,19 @@ impl Engine {
                         ),
                     ));
                 }
+                // T67: the key's scope as configured now.
+                let c = &self.cfg.config;
+                crate::soc::check_scope(
+                    &c.soc,
+                    key_id,
+                    order.action,
+                    crate::soc::scoped_ttl(order.action, order.ttl_s, c.ttl.default_s),
+                    "approve",
+                )
+                .map_err(|mut r| {
+                    r.reason = format!("{}: not re-armed", r.reason);
+                    r
+                })?;
             }
         }
         let p = decision::precheck(order, &self.policy, &self.cfg)?;
@@ -1338,6 +1357,17 @@ impl Engine {
                     now_ms,
                 };
                 let approvers = crate::soc::verify(order, &cx, &mut self.soc_replay)?;
+                // T67: what this key may approve, and for how long.
+                if let crate::order::Origin::ControlPlane { key_id, .. } = &order.origin {
+                    let c = &self.cfg.config;
+                    crate::soc::check_scope(
+                        &c.soc,
+                        key_id,
+                        order.action,
+                        crate::soc::scoped_ttl(order.action, order.ttl_s, c.ttl.default_s),
+                        "approve",
+                    )?;
+                }
                 // With a `motion` section the two-person actions can be
                 // executed: their approvers are checked here (without one
                 // they are refused `not_executor_action` by the precheck).
@@ -1610,6 +1640,16 @@ impl Engine {
                 };
                 let (rb, approvers) =
                     crate::soc::verify_revert(id, soc, &cx, &mut self.soc_replay)?;
+                // T67: the revert's key may revert this action.
+                if let Some(s) = soc {
+                    crate::soc::check_scope(
+                        &self.cfg.config.soc,
+                        &s.key_id,
+                        action,
+                        None,
+                        "revert",
+                    )?;
+                }
                 if crate::motion::two_person(action) {
                     crate::motion::approvers_ok(action, &rb, &approvers)?;
                 }
@@ -1800,6 +1840,7 @@ impl Engine {
             );
             self.revert(&id, "TTL expired: automatic revert", now);
         }
+        self.motion_latch(now);
         let every = self.cfg.config.verify_interval_s.saturating_mul(1000);
         let mono = now.boot_ms.unwrap_or(now_ms);
         if mono.abs_diff(self.last_verify_boot_ms) >= every {
