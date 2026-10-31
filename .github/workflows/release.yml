@@ -179,6 +179,7 @@ jobs:
           python3 scripts/vuln-scan-tags.py --self-test
           python3 scripts/metadata_to_cyclonedx.py --self-test
           python3 scripts/sbom-select.py --self-test
+          scripts/test-release-sbom-gate.sh
           python3 scripts/release-rpk.py --self-test
           python3 scripts/vex.py --self-test
           python3 scripts/slsa-provenance.py --self-test

@@ -409,7 +409,8 @@ are left out), and an eBPF ELF object in the program that no `*.bpf.o`
 accounts for fails the build; and a `formulation` naming
 rustc (release, commit, LLVM), cargo, cargo-cyclonedx and the C compilers.
 `robodr-focal` does not ship `robodr-pulsard`, so its archives leave out
-that crate's SBOM. `publish` refuses to sign unless all six archives are
+that crate's SBOM. `publish` (`scripts/release-sbom-gate.sh`, tested by
+`scripts/test-release-sbom-gate.sh` in CI) refuses to sign unless all six archives are
 present, the `robodr` and `.rpm` archives contain a `robodr-pulsard` SBOM
 (with its eBPF objects) and the `robodr-focal` ones do not, and every
 file passes `metadata_to_cyclonedx.py --check --require-complete` and
