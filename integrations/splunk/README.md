@@ -15,8 +15,12 @@ tar -C integrations/splunk -czf TA-robodr.tgz TA-robodr
 * Sourcetype `robodr:finding:verified`: the same settings, for the output of
   `integrations/verify/robodr_verify.py` only (run it on your own consumer
   and send by HEC with this sourcetype; not shipped). Here
-  `robodr_verification_status` is the status the verifier wrote. Give that
-  HEC token to the verifier alone.
+  `robodr_verification_status` is the status the verifier wrote when it is
+  the field's only value; a second value (a literal
+  `"robodr_verification.status"` top-level key, which `KV_MODE = json`
+  extracts into the same field) makes it `malformed`, never `verified`. The
+  verifier refuses every top-level key outside the finding contract, so its
+  output has no such key. Give that HEC token to the verifier alone.
 * CIM Intrusion Detection aliases: `signature_id` (rule id), `signature`,
   `dest` (robot id), `src`/`src_ip` (escaped source address), `severity`,
   `category`, `vendor_product`, `ids_type`. Tag `ids`, `attack`.
@@ -33,4 +37,6 @@ Splunk instance. On `robodr:finding`, a forged top-level
 `robodr_verification_status` key in the event JSON is hidden only if the
 calculated field `EVAL-robodr_verification_status = null()` replaces the
 JSON-extracted field of the same name, as calculated fields are specified
-to; that has not been observed on an instance yet.
+to; that has not been observed on an instance yet. Neither has the
+multivalue extraction the `malformed` guard on `robodr:finding:verified`
+relies on.

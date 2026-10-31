@@ -180,7 +180,11 @@ policy)` / `verify_record`):
 1. Exactly one `robodr-finding-sig` header (name case-insensitive), else
    reject (`Duplicate`). Parse it strictly: unknown/duplicate fields,
    `alg` ≠ `ed25519` (HMAC is never accepted: a symmetric key lets every
-   verifier forge), bad key id or non-lower-case hex → reject.
+   verifier forge), bad key id or non-lower-case hex → reject. The value
+   must be byte for byte the compact form above (that field order, no
+   whitespace, no needless escapes); anything else (another order, an
+   array, whitespace) → reject, in the Rust parser and in
+   `integrations/verify/robodr_verify.py` alike.
 2. Validate the value with the strict validator (unchanged).
 3. Look up the verifier for the unit **the finding itself names**,
    `entity_context.robot.id` (already bound by the validator to
@@ -1001,7 +1005,9 @@ records to Kafka are outside the crate (no network code).
   (`robodr_ocsf::record`). There the batch is authenticated by
   `MANIFEST.sig` (unit-bound diode key) instead, so SOC consumers behind a
   diode must run the §2a check in `Optional` mode or rely on the importer's
-  batch verification. `robodr-uplink --diode-out` (ingest API,
+  batch verification; downstream of the importer, the produce ACL on the
+  findings topic is then the only thing that keeps out injected findings
+  (unsigned ones pass `Optional` as `Unsigned`). `robodr-uplink --diode-out` (ingest API,
   [`robodr.ingest-api.md`](robodr.ingest-api.md)) therefore sends these
   findings with `"sig":null` under a `relay` key. Carrying it would need a signed per-finding sidecar
   (e.g. `finding-sigs.jsonl` listed and hashed in the manifest) and an

@@ -29,7 +29,13 @@ Verification status: `robodr-findings` first removes any
 unverified path chooses every field), so its documents never have
 `robodr.verification`. `robodr-findings-verified` sets the verifier's
 `robodr_verification` aside, runs `robodr-findings`, then stores it as
-`robodr.verification`. Use it only for `robodr_verify.py` output.
+`robodr.verification`. Use it only for `robodr_verify.py` output. It
+refuses a document with any dotted top-level key (an indexing error, not a
+document): `robodr_verify.py` only forwards findings whose top-level keys
+are the contract's own, so such a key did not come from it, and a literal
+`"robodr_verification.status": "verified"` would otherwise be expanded and
+merged into the verifier's status (a `["unsigned", "verified"]` array that
+`robodr.verification.status : "verified"` matches).
 
 Attacker-controlled values are stored but not indexed: the raw tainted
 names (`robodr.entity_context.**.value`; search and show the escaped
@@ -61,11 +67,14 @@ ROBODR_ES_URL=http://127.0.0.1:9200 cargo test -p robodr-ocsf --test integration
 
 It installs both pipelines and the template (overwriting: use a scratch
 cluster), `_simulate`s every finding through both pipelines, checks a forged
-status is dropped, indexes into `logs-robodr.findings-check`, counts the
+status is dropped and that `robodr-findings-verified` refuses a dotted
+status key, indexes into `logs-robodr.findings-check`, counts the
 verified documents and checks a raw tainted value is not searchable while
-its `display` is. It passed with the 166 findings of the cargo test on
+its `display` is. It passed with the 170 findings of the cargo test on
 Elasticsearch 8.15.3 (Docker image `elasticsearch:8.15.3`, single node)
-on 2026-10-31. Not run in CI.
+on 2026-10-31; the previous verified pipeline failed its dotted-key
+check there (a literal `robodr_verified_by_forwarder.status` key became
+`robodr.verification.status: ["unsigned", "verified"]`). Not run in CI.
 
 `live_check_rules.py --es URL --kibana URL --findings findings.ndjson`
 (or `ROBODR_KIBANA_URL` next to `ROBODR_ES_URL` in the cargo test above;

@@ -64,12 +64,19 @@ object: any re-formatting breaks the signature on purpose).
   `{"value": "<raw value string>", "headers": [["robodr-finding-sig", "<header>"]]}`
   (what the ruby filter in `logstash/robodr-kafka.conf` writes from
   Logstash's Kafka input with `decorate_events => "extended"`), checks the
-  header, the finding's identity fields (robot, `external_id`,
-  `finding_id`) and the signature (with the strict-verification checks:
-  no weak or non-canonical keys or R), and emits the finding with a
+  header (exactly the producer's compact `{"alg","key_id","sig"}` form),
+  the finding's top-level keys (exactly the contract's: nothing of its own
+  named `robodr_verification`, no dotted key a SIEM would expand into it),
+  its identity fields (robot, `external_id`, `finding_id`) and the
+  signature (with the strict-verification checks: no weak or
+  non-canonical keys or R), and emits the finding with a
   `robodr_verification` object (`status`: `verified` or, under
-  `--policy optional`, `unsigned`; `key_id`). Records that fail are written
-  to the reject file with the reason and never forwarded. It does **not**
+  `--policy optional`, `unsigned`; `key_id`). Records that fail, including
+  any record malformed in a way no check names, are written to the reject
+  file with the reason and never forwarded; the run goes on with the next
+  record. Its copy of the contract's top-level fields must be upgraded
+  before robots emit a minor that adds one (consumers first, contract §5).
+  It does **not**
   run the strict content validator (contract §2a step 2): run
   `schemas/validate_findings.py` as well (schema-level only). On the
   Logstash path a duplicated `robodr-finding-sig` header is collapsed to one
@@ -95,8 +102,8 @@ verifier's output arrives on and discards it everywhere else:
 
 | SIEM | Verified route (status kept) | Every other route (status discarded) |
 |---|---|---|
-| Splunk | sourcetype `robodr:finding:verified` | sourcetype `robodr:finding`: `robodr_verification_status` is set to null whatever the event carries |
-| Elastic | ingest pipeline `robodr-findings-verified` | ingest pipeline `robodr-findings`: removes `robodr_verification` and any `robodr` object before mapping |
+| Splunk | sourcetype `robodr:finding:verified` (a multivalue status reads `malformed`) | sourcetype `robodr:finding`: `robodr_verification_status` is set to null whatever the event carries |
+| Elastic | ingest pipeline `robodr-findings-verified` (refuses a document with a dotted top-level key) | ingest pipeline `robodr-findings`: removes `robodr_verification` and any `robodr` object before mapping |
 | Sentinel | DCR stream `Custom-RoboDRFindingsVerified` | DCR stream `Custom-RoboDRFindingsRaw`: does not declare `robodr_verification`; `VerificationStatus` is empty |
 
 This holds only while nothing but the verifier's output uses the verified
