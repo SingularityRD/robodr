@@ -33,14 +33,22 @@
 //! 100 ms into the spool. [`FeedLimiter`] bounds that per fixed window of
 //! [`WINDOW_NS`] (60 s, opened by the first line): the first [`PER_KEY`]
 //! lines of a (rule, channel) are reported one by one ([`CRITICAL_PER_KEY`]
-//! for Critical lines), at most [`PER_WINDOW`] in all. A line past its
-//! budget is **folded**: still recorded in the black box, not reported;
-//! when the window closes each key with folded lines is reported once as
-//! an aggregate with the same rule and channel, the most severe folded
-//! severity (a Critical fold stays Critical), the summed gateway count and
-//! the first folded line's detail. Lines of keys beyond [`MAX_KEYS`] are
+//! for Critical lines), at most [`PER_WINDOW`] lines below Critical in all
+//! and, from a separate budget, at most [`CRITICAL_PER_WINDOW`] Critical
+//! lines. A line past its budget is **folded**: recorded in the black box,
+//! not reported; when the window closes each key with folded lines is
+//! reported once as an aggregate with the same rule and channel, the most
+//! severe folded severity (a Critical fold stays Critical), the summed
+//! gateway count and the first folded line's detail. At most [`MAX_KEYS`]
+//! (rule, channel) pairs are counted per window, and [`CRITICAL_KEYS`]
+//! more that only a Critical line may open, so a flood of low-severity
+//! lines on new channel names cannot take the reporting budget or the key
+//! table from a genuine Critical finding. Lines of keys beyond those are
 //! folded into one `robot.gateway.findings_dropped` aggregate (with the
-//! most severe folded severity).
+//! most severe folded severity). The black box takes at most
+//! [`RECORD_PER_WINDOW`] folded lines below Critical and as many Critical
+//! ones per window; the rest are only **counted** into their aggregate
+//! ([`Admit::Count`]), which says how many were not recorded.
 
 use serde::Deserialize;
 
@@ -246,25 +254,37 @@ pub const WINDOW_NS: u64 = 60_000_000_000;
 pub const PER_KEY: u32 = 4;
 /// Critical lines reported per (rule, channel) and window.
 pub const CRITICAL_PER_KEY: u32 = 8;
-/// Lines reported per window in all.
+/// Lines below Critical reported per window in all.
 pub const PER_WINDOW: u32 = 256;
+/// Critical lines reported per window in all (a budget of their own).
+pub const CRITICAL_PER_WINDOW: u32 = 64;
 /// (rule, channel) keys counted per window.
 pub const MAX_KEYS: usize = 128;
+/// Further keys per window that only a Critical line may open.
+pub const CRITICAL_KEYS: usize = 32;
+/// Folded lines recorded in the black box per window, for lines below
+/// Critical and (separately) for Critical lines.
+pub const RECORD_PER_WINDOW: u32 = 1024;
 /// The rule of the aggregate of lines whose key was not counted.
 pub const OVERFLOW_RULE: &str = "robot.gateway.findings_dropped";
 
 /// The decision of [`FeedLimiter::admit`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Admit {
     /// Report the line.
     Report,
     /// Record it only: it is counted into its key's aggregate.
     Fold,
+    /// Neither report nor record it (the window's black-box budget is
+    /// spent): it is only counted into its key's aggregate.
+    Count,
 }
 
 #[derive(Debug, Clone)]
 struct Folded {
     lines: u64,
+    /// Lines of `lines` not recorded in the black box ([`Admit::Count`]).
+    unrecorded: u64,
     count: u64,
     severity: robodr_events::Severity,
     mode: robodr_events::Mode,
@@ -275,6 +295,7 @@ impl Folded {
     fn new(l: &GatewayLine) -> Self {
         Folded {
             lines: 0,
+            unrecorded: 0,
             count: 0,
             severity: l.severity,
             mode: l.mode,
@@ -305,10 +326,15 @@ struct KeyState {
 pub struct FeedLimiter {
     start_ns: Option<u64>,
     reported: u32,
+    reported_critical: u32,
+    recorded: u32,
+    recorded_critical: u32,
     keys: std::collections::BTreeMap<(String, Option<String>), KeyState>,
     overflow: Option<(Folded, Option<String>)>,
-    /// Lines folded since start (status).
+    /// Lines folded since start (status), recorded or only counted.
     pub folded_total: u64,
+    /// Folded lines only counted, not recorded, since start (status).
+    pub unrecorded_total: u64,
     /// Aggregates reported since start (status).
     pub aggregates_total: u64,
 }
@@ -321,18 +347,30 @@ impl FeedLimiter {
         let closed = self.tick(now_ns);
         self.start_ns.get_or_insert(now_ns);
         let key = (l.rule.clone(), l.channel.clone());
-        let tracked = self.keys.contains_key(&key) || self.keys.len() < MAX_KEYS;
+        let critical = l.severity == robodr_events::Severity::Critical;
+        let key_room = if critical {
+            MAX_KEYS + CRITICAL_KEYS
+        } else {
+            MAX_KEYS
+        };
+        let tracked = self.keys.contains_key(&key) || self.keys.len() < key_room;
         if !tracked {
+            let admit = self.fold_admit(critical);
             let (f, _) = self
                 .overflow
                 .get_or_insert_with(|| (Folded::new(l), l.channel.clone()));
             f.add(l);
-            self.folded_total = self.folded_total.saturating_add(1);
-            return (Admit::Fold, closed);
+            if admit == Admit::Count {
+                f.unrecorded = f.unrecorded.saturating_add(1);
+            }
+            return (admit, closed);
         }
-        let critical = l.severity == robodr_events::Severity::Critical;
-        let window_open = self.reported < PER_WINDOW;
-        let k = self.keys.entry(key).or_default();
+        let window_open = if critical {
+            self.reported_critical < CRITICAL_PER_WINDOW
+        } else {
+            self.reported < PER_WINDOW
+        };
+        let k = self.keys.entry(key.clone()).or_default();
         let within = if critical {
             k.reported_critical < CRITICAL_PER_KEY
         } else {
@@ -341,15 +379,40 @@ impl FeedLimiter {
         if within && window_open {
             if critical {
                 k.reported_critical += 1;
+                self.reported_critical += 1;
             } else {
                 k.reported += 1;
+                self.reported += 1;
             }
-            self.reported += 1;
             return (Admit::Report, closed);
         }
-        k.folded.get_or_insert_with(|| Folded::new(l)).add(l);
+        let admit = self.fold_admit(critical);
+        if let Some(k) = self.keys.get_mut(&key) {
+            let f = k.folded.get_or_insert_with(|| Folded::new(l));
+            f.add(l);
+            if admit == Admit::Count {
+                f.unrecorded = f.unrecorded.saturating_add(1);
+            }
+        }
+        (admit, closed)
+    }
+
+    /// A line is folded: recorded while the window's black-box budget for
+    /// its severity class lasts, else only counted.
+    fn fold_admit(&mut self, critical: bool) -> Admit {
         self.folded_total = self.folded_total.saturating_add(1);
-        (Admit::Fold, closed)
+        let recorded = if critical {
+            &mut self.recorded_critical
+        } else {
+            &mut self.recorded
+        };
+        if *recorded < RECORD_PER_WINDOW {
+            *recorded += 1;
+            Admit::Fold
+        } else {
+            self.unrecorded_total = self.unrecorded_total.saturating_add(1);
+            Admit::Count
+        }
     }
 
     /// Housekeeping at monotonic `now_ns`: the aggregates of a window that
@@ -366,6 +429,9 @@ impl FeedLimiter {
     pub fn flush(&mut self) -> Vec<GatewayLine> {
         self.start_ns = None;
         self.reported = 0;
+        self.reported_critical = 0;
+        self.recorded = 0;
+        self.recorded_critical = 0;
         let keys = std::mem::take(&mut self.keys);
         let mut out: Vec<GatewayLine> = keys
             .into_iter()
@@ -388,9 +454,15 @@ impl FeedLimiter {
 }
 
 fn aggregate(rule: String, channel: Option<String>, f: &Folded, what: &str) -> GatewayLine {
+    let unrecorded = if f.unrecorded > 0 {
+        format!(" ({} not recorded in the black box)", f.unrecorded)
+    } else {
+        String::new()
+    };
     let mut detail = format!(
-        "{} gateway lines, gateway count {}, folded by the agentd feed limit: {what}, \
-         {PER_KEY} or {CRITICAL_PER_KEY} Critical per {} s reported one by one; first: ",
+        "{} gateway lines{unrecorded}, gateway count {}, folded by the agentd feed limit: \
+         {what}, {PER_KEY} or {CRITICAL_PER_KEY} Critical per {} s reported one by one; \
+         first: ",
         f.lines,
         f.count,
         WINDOW_NS / 1_000_000_000
@@ -626,14 +698,101 @@ mod tests {
                 }
             }
         }
-        let (a, _) = f.admit(&line(busy, Critical, "/late"), 3);
-        assert_eq!(a, Admit::Fold);
         // /busy reported PER_KEY, /quiet 1.
         assert_eq!(reported + PER_KEY + 1, PER_WINDOW);
+        // Critical lines on new keys have keys and a budget of their own
+        // (next test); once those are spent too they are folded.
+        for i in 0..CRITICAL_KEYS {
+            let (a, _) = f.admit(&line(busy, Critical, &format!("/k{i}")), 3);
+            assert_eq!(a, Admit::Report);
+        }
+        let (a, _) = f.admit(&line(busy, Critical, "/late"), 3);
+        assert_eq!(a, Admit::Fold);
         let out = f.flush();
         let over = out.iter().find(|l| l.rule == OVERFLOW_RULE).unwrap();
         assert_eq!(over.severity, Critical);
         assert!(robodr_ocsf::builder::rule_known(OVERFLOW_RULE));
+    }
+
+    /// Verifier finding (GW+WP11): a flood of low-severity lines on new
+    /// channel names used up the window and the key table, and a genuine
+    /// Critical finding on a new key was folded into `findings_dropped`,
+    /// reported only when the window closed. Critical lines now have a
+    /// reporting budget and keys of their own.
+    #[test]
+    fn a_low_severity_flood_does_not_hide_a_new_critical_finding() {
+        use robodr_events::Severity::{Critical, Low};
+        let mut f = FeedLimiter::default();
+        for i in 0..2000 {
+            f.admit(
+                &line("robot.gateway.sequence_jump", Low, &format!("/c{i}")),
+                1,
+            );
+        }
+        let (a, _) = f.admit(
+            &line("robot.firewall.internal_fault", Critical, "/lowcmd"),
+            2,
+        );
+        assert_eq!(a, Admit::Report);
+        // Critical lines alone are bounded too.
+        let mut reported = 1;
+        for i in 0..1000 {
+            let (a, _) = f.admit(
+                &line(
+                    "robot.firewall.rejected_stale",
+                    Critical,
+                    &format!("/x{}", i % 16),
+                ),
+                3,
+            );
+            if a == Admit::Report {
+                reported += 1;
+            }
+        }
+        assert_eq!(reported, CRITICAL_PER_WINDOW);
+    }
+
+    /// Verifier finding (GW+WP11): every folded line was one black-box
+    /// record, so a flood grew the black box without bound. Past
+    /// RECORD_PER_WINDOW folded lines per severity class and window the
+    /// rest are only counted, and the aggregate says how many.
+    #[test]
+    fn folded_lines_recorded_in_the_black_box_are_bounded_per_window() {
+        use robodr_events::Severity::{Critical, Medium};
+        let mut f = FeedLimiter::default();
+        let rule = "robot.gateway.sequence_jump";
+        let n = RECORD_PER_WINDOW + PER_KEY + 10;
+        let mut admits = std::collections::HashMap::new();
+        for _ in 0..n {
+            let (a, _) = f.admit(&line(rule, Medium, "/busy"), 1);
+            *admits.entry(a).or_insert(0u32) += 1;
+        }
+        assert_eq!(admits.get(&Admit::Report), Some(&PER_KEY));
+        assert_eq!(admits.get(&Admit::Fold), Some(&RECORD_PER_WINDOW));
+        assert_eq!(admits.get(&Admit::Count), Some(&10));
+        // Critical folds have their own record budget.
+        for _ in 0..CRITICAL_PER_KEY {
+            f.admit(&line(rule, Critical, "/arm"), 2);
+        }
+        let (a, _) = f.admit(&line(rule, Critical, "/arm"), 2);
+        assert_eq!(a, Admit::Fold);
+        assert_eq!(f.unrecorded_total, 10);
+        let out = f.flush();
+        let busy = out
+            .iter()
+            .find(|l| l.channel.as_deref() == Some("/busy"))
+            .unwrap();
+        assert!(
+            busy.detail.contains("10 not recorded in the black box"),
+            "{}",
+            busy.detail
+        );
+        // A new window: the record budget is back.
+        for _ in 0..PER_KEY {
+            f.admit(&line(rule, Medium, "/busy"), WINDOW_NS + 5);
+        }
+        let (a, _) = f.admit(&line(rule, Medium, "/busy"), WINDOW_NS + 5);
+        assert_eq!(a, Admit::Fold);
     }
 
     /// T19: the gateway's decision summary is parsed strictly.

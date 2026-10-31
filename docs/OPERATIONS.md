@@ -2552,7 +2552,8 @@ while the chain is flushed.
   `pending`, `dropped`, `last_error`; agentd counts
   `daemon.gateway_findings`; past 4 lines (8 Critical) per rule, channel
   and minute agentd folds the rest into one aggregate per minute, kept in
-  the black box line by line (`daemon.gateway_folded`,
+  the black box line by line up to 1024 folded lines (and 1024 Critical
+  ones) a minute (`daemon.gateway_folded`, `daemon.gateway_unrecorded`,
   `daemon.gateway_aggregates`; agentd README, "In-path gateway feed").
   An idle gateway writes a heartbeat line
   every 5 s (`daemon.gateway_heartbeats`), so a quiet gateway is not

@@ -310,6 +310,9 @@ pub struct DaemonStats {
     /// Gateway lines folded by the feed limit (recorded in the black box,
     /// reported in an aggregate; `crate::gateway_feed`, T82).
     pub gateway_folded: u64,
+    /// Folded gateway lines not recorded in the black box because the
+    /// window's record budget was spent (counted in the aggregate only).
+    pub gateway_unrecorded: u64,
     /// Aggregates of folded gateway lines reported.
     pub gateway_aggregates: u64,
     /// Forwarder heartbeats received.
@@ -2113,6 +2116,11 @@ impl<'a> Daemon<'a> {
         let (admit, closed) = self.gateway_limit.admit(g, ns);
         for a in closed {
             self.gateway_aggregate(&a);
+        }
+        if admit == crate::gateway_feed::Admit::Count {
+            self.stats.gateway_folded += 1;
+            self.stats.gateway_unrecorded += 1;
+            return;
         }
         if admit == crate::gateway_feed::Admit::Fold {
             self.stats.gateway_folded += 1;
