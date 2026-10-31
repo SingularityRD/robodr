@@ -460,6 +460,43 @@ fn topic_ok(s: &str) -> bool {
 }
 
 impl MotionSection {
+    /// Does any configured adapter claim `oem_validated`?
+    pub fn any_validated(&self) -> bool {
+        [
+            AdapterKind::Gateway,
+            AdapterKind::UnitreeSport,
+            AdapterKind::Nav2,
+            AdapterKind::Ros2Control,
+            AdapterKind::Px4,
+            AdapterKind::Rollback,
+        ]
+        .into_iter()
+        .any(|k| self.adapter(k).is_some_and(|(v, _)| v))
+    }
+
+    /// Treat every adapter as not OEM-validated (the section is not the one
+    /// the signed commissioning binds: `crate::config::Commissioning`).
+    pub fn clear_validation(&mut self) {
+        if let Some(a) = &mut self.gateway {
+            a.oem_validated = false;
+        }
+        if let Some(a) = &mut self.unitree_sport {
+            a.oem_validated = false;
+        }
+        if let Some(a) = &mut self.nav2 {
+            a.oem_validated = false;
+        }
+        if let Some(a) = &mut self.ros2_control {
+            a.oem_validated = false;
+        }
+        if let Some(a) = &mut self.px4 {
+            a.oem_validated = false;
+        }
+        if let Some(a) = &mut self.rollback {
+            a.oem_validated = false;
+        }
+    }
+
     /// The adapter's `oem_validated` and allowed states (`None`: not
     /// configured).
     pub fn adapter(&self, k: AdapterKind) -> Option<(bool, Option<&[SafetyState]>)> {

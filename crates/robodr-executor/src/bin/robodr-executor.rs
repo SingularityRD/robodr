@@ -120,9 +120,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
 }
 
 fn load(path: &std::path::Path) -> Result<(Resolved, robodr_responder::ResponsePolicy), String> {
-    let text = config::read_small(path)?;
-    let cfg = ExecutorConfig::parse(&text)?.validate()?;
-    let policy = config::load_policy(&cfg.config.policy_path)?;
+    let (cfg, policy, notes) = config::load_commissioned(path)?;
+    for n in notes {
+        eprintln!("robodr-executor: {n}");
+    }
     Ok((cfg, policy))
 }
 
