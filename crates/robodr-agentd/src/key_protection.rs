@@ -33,16 +33,28 @@
 //! | `null`              | sealed with the null key: no confidentiality                    |
 //! | `unknown`           | a sealed source that is unreadable or not recognised            |
 //! | `plain-credential`  | a credential with no sealed source (`LoadCredential=` from a plain file) |
-//! | `file`              | a plain key file outside `credentials_dir` (the file fallback)  |
+//! | `file`              | a plain key file outside `credentials_dir` (the file fallback), or any key when `credentials_dir` is not the directory systemd gave this process (`$CREDENTIALS_DIRECTORY`) |
 //!
 //! Only `tpm2` and `host+tpm2` count as TPM-held; anything else is a
 //! **fallback** and is flagged (`fallback: true` per key and overall).
 //!
-//! Limits (stated in `docs/customer/known-limitations.md` by its owner):
-//! the report trusts the configuration's layout (a credential named
-//! `blackbox.key` is matched to `<encrypted_dir>/blackbox.key` by name;
-//! the unit file is not read), so it detects a missing or weaker seal, not
-//! a root user who deliberately misconfigures the unit. TPM sealing
+//! When systemd started the process with credentials it sets
+//! `$CREDENTIALS_DIRECTORY`; a `credentials_dir` that differs from it is
+//! not where this service's credentials are, so nothing in it counts as a
+//! credential (`file`, with a `detail`). Without the variable (e.g.
+//! `--check-config` from a shell) the configured directory is trusted.
+//!
+//! Limits (stated in `docs/OPERATIONS.md` 4.7): the report trusts the
+//! unit's layout (a credential named `blackbox.key` is matched to
+//! `<encrypted_dir>/blackbox.key` by name; the unit file is not read).
+//! systemd puts a `LoadCredential=` copy of a plain file and a
+//! `LoadCredentialEncrypted=` decryption in the same place, identically,
+//! and the unit makes the plain key directory inaccessible to the service
+//! (`InaccessiblePaths=`), so from inside the service the two cannot be
+//! told apart: if a sealed source of that name exists but the unit still
+//! loads the plain file (the `15-` drop-in removed or overridden), the key
+//! is reported as sealed. The report detects a missing or weaker seal, not
+//! a unit that loads a different source than the sealed one. TPM sealing
 //! protects keys at rest: at run time the decrypted key is in the
 //! service's credential ramfs and memory, and the TPM does not perform the
 //! signatures.
@@ -138,12 +150,14 @@ pub fn private_keys(config: &DaemonConfig) -> Vec<(&'static str, PathBuf)> {
     v
 }
 
-/// Classify one key path.
+/// Classify one key path. `systemd_credentials` is `$CREDENTIALS_DIRECTORY`
+/// when systemd set it for this process.
 pub fn classify_key(
     role: &'static str,
     path: &Path,
     credentials_dir: &Path,
     encrypted_dir: &Path,
+    systemd_credentials: Option<&Path>,
 ) -> KeyEntry {
     let entry = |protection: &'static str, tpm2: bool, src: Option<PathBuf>, detail| KeyEntry {
         role,
@@ -160,6 +174,19 @@ pub fn classify_key(
         (Some(dir), Some(n)) if dir == credentials_dir => n,
         _ => return entry("file", false, None, None),
     };
+    if let Some(real) = systemd_credentials.filter(|r| *r != credentials_dir) {
+        return entry(
+            "file",
+            false,
+            None,
+            Some(format!(
+                "key_protection.credentials_dir {} is not this service's credentials directory \
+                 ($CREDENTIALS_DIRECTORY is {})",
+                credentials_dir.display(),
+                real.display()
+            )),
+        );
+    }
     let src = encrypted_dir.join(name);
     match std::fs::symlink_metadata(&src) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -210,9 +237,12 @@ pub fn assess(config: &DaemonConfig) -> Result<KeyReport, String> {
             return Err(format!("{what} must be an absolute path"));
         }
     }
+    let systemd_creds = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     let keys: Vec<KeyEntry> = private_keys(config)
         .into_iter()
-        .map(|(role, p)| classify_key(role, &p, &cred, &enc))
+        .map(|(role, p)| classify_key(role, &p, &cred, &enc, systemd_creds.as_deref()))
         .collect();
     let all_tpm2 = !keys.is_empty() && keys.iter().all(|k| k.tpm2);
     if s.require == Requirement::Tpm2 && !all_tpm2 {
@@ -278,7 +308,7 @@ mod tests {
             b"{\"format\":\"robodr-blackbox-key/v2\"}",
         )
         .unwrap();
-        let k = |n: &str| classify_key("x", &c.join(n), &c, &e);
+        let k = |n: &str| classify_key("x", &c.join(n), &c, &e, None);
         assert_eq!((k("bb.key").protection, k("bb.key").tpm2), ("tpm2", true));
         assert_eq!(k("fs.key").protection, "host+tpm2");
         assert!(!k("fs.key").fallback);
@@ -293,13 +323,33 @@ mod tests {
         assert!(k("other.key").fallback);
         // Outside the credentials directory: the file fallback, even when a
         // sealed source of that name exists.
-        let f = classify_key("x", &d.0.join("bb.key"), &c, &e);
+        let f = classify_key("x", &d.0.join("bb.key"), &c, &e, None);
         assert_eq!((f.protection, f.fallback), ("file", true));
         // A nested path under the credentials dir is not a credential.
-        let n = classify_key("x", &c.join("sub/bb.key"), &c, &e);
+        let n = classify_key("x", &c.join("sub/bb.key"), &c, &e, None);
         assert_eq!(n.protection, "file");
         // A directory as sealed source.
         fs::create_dir(e.join("dir.key")).unwrap();
         assert_eq!(k("dir.key").protection, "unknown");
+    }
+
+    /// Review finding (WP15): a `credentials_dir` pointed at any directory
+    /// (say a plain one on disk holding a copy of the key) next to a sealed
+    /// file of the same name was reported as TPM-sealed. When systemd says
+    /// where this service's credentials are, nothing elsewhere counts.
+    #[test]
+    fn a_credentials_dir_that_is_not_systemds_is_not_trusted() {
+        let d = dir("realcreds");
+        let (c, e) = (d.0.join("creds"), d.0.join("enc"));
+        fs::write(e.join("bb.key"), header("0c7cc07b117645919c4b0bea08bc20fe")).unwrap();
+        let real = Path::new("/run/credentials/robodr-agentd.service");
+        let k = classify_key("x", &c.join("bb.key"), &c, &e, Some(real));
+        assert_eq!((k.protection, k.tpm2, k.fallback), ("file", false, true));
+        assert!(k.detail.unwrap().contains("CREDENTIALS_DIRECTORY"));
+        // The matching directory (trailing slash or not) is trusted.
+        for same in [c.clone(), PathBuf::from(format!("{}/", c.display()))] {
+            let k = classify_key("x", &c.join("bb.key"), &c, &e, Some(&same));
+            assert_eq!((k.protection, k.tpm2), ("tpm2", true));
+        }
     }
 }

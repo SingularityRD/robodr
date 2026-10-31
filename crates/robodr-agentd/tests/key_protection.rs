@@ -156,6 +156,31 @@ fn require_tpm2_refuses_every_weaker_key() {
     assert!(!r.key_protection.fallback);
     assert_eq!(r.key_protection.keys[0].protection, "tpm2");
 
+    // Review finding (WP15): the same layout, but systemd says this
+    // service's credentials are elsewhere ($CREDENTIALS_DIRECTORY): the
+    // configured directory is just a directory, refused under tpm2.
+    let out = Command::new(BIN)
+        .arg("--config")
+        .arg(s.write_config(&cfg))
+        .arg("--check-config")
+        .env("CREDENTIALS_DIRECTORY", s.dir.join("elsewhere"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("blackbox") && err.contains(": file)"), "{err}");
+    // ... and accepted when it is the configured one.
+    let out = Command::new(BIN)
+        .arg("--config")
+        .arg(s.write_config(&cfg))
+        .arg("--check-config")
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("key blackbox: tpm2"), "{err}");
+
     // A second key that is a plain file breaks the requirement again.
     let fk = s.dir.join("finding.key");
     robodr_blackbox::KeyFile::ed25519_from_seed(&[3; 32], Some("finding-1"))
