@@ -78,7 +78,9 @@
 //! one is configured, else from static configuration; the feed was only
 //! run against synthetic traffic, not a real safety PLC or e-stop. The
 //! rest of the operational context (control mode, mission phase,
-//! connectivity) is still static configuration. The black box uses the
+//! connectivity) is live where a context source is configured
+//! ([`safety_feed::context`]: Unitree remote and sport mode, ROS 2
+//! lifecycle, uplink status), else static configuration. The black box uses the
 //! HMAC placeholder key.
 
 // S10: `unsafe` is denied crate-wide; each item that needs it (FFI to libc

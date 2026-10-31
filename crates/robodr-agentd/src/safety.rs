@@ -20,6 +20,12 @@
 //!     `/robot_mode`: `"0"` -> `idle`, `"3"` -> `safe_state_active`;
 //!   * `std_msgs/msg/String`: `values` maps exact strings (at most
 //!     [`MAX_VALUE_KEY_LEN`] bytes, compared as bytes) to claims;
+//!   * Unitree `SportModeState_` / `LowState_` (`unitree_sport`,
+//!     `unitree_low`): see [`crate::safety_feed::unitree`];
+//!   * Unitree `WirelessController_` and `lifecycle_msgs/msg/
+//!     TransitionEvent` (`wireless_controller`, `lifecycle`): operational
+//!     context only, they never take part in the safety state (see
+//!     [`crate::safety_feed::context`]);
 //!   * `nav_msgs/msg/Odometry`: `motion` thresholds derive `idle` /
 //!     `moving_slow` / `moving_fast` from `‖twist.linear‖` and
 //!     `‖twist.angular‖` with hysteresis ([`next_level`]). Turning on the
@@ -148,8 +154,9 @@
 //!   only keeps motion and feedback topics.
 //! * Synthetic traffic only (hand-built RTPS + CDR); not run against a real
 //!   RMW, a real safety PLC or real e-stop hardware.
-//! * Only the safety state is live; the rest of the operational context
-//!   (control mode, mission phase, connectivity) is still configuration.
+//! * The operational context (control mode, mission phase, connectivity)
+//!   is live only for the fields some context source reports
+//!   ([`crate::safety_feed::context`]); the others stay configuration.
 //! * A topic source trusts nothing until its writer's participant has sent
 //!   SPDP since the daemon started (or is pinned): after a restart, sources
 //!   read `unknown` for up to one SPDP period. Pin the safety writers'
