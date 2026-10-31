@@ -87,6 +87,13 @@ pub struct QueueConfig {
     pub controller_port: String,
     /// Bridge port facing the robot (ruleset rendering).
     pub robot_port: String,
+    /// 802.1Q VLAN ids (`1..=4094`, at most 16) whose IPv4 / ARP frames
+    /// are bridged from the controller port (sales-readiness T44). Their
+    /// IPv4 is queued and decided exactly like untagged traffic
+    /// (`bridge-nf-filter-vlan-tagged`). Default: none (every tagged frame
+    /// is dropped). Stacked tags (QinQ) are always dropped.
+    #[serde(default)]
+    pub vlan_ids: Vec<u16>,
 }
 
 fn default_max_len() -> u32 {
@@ -1053,6 +1060,17 @@ impl GatewayConfig {
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
             {
                 return Err(format!("interface name {n:?} is not valid"));
+            }
+        }
+        if self.queue.vlan_ids.len() > 16 {
+            return Err("queue.vlan_ids: at most 16 VLAN ids".into());
+        }
+        let mut vids = std::collections::BTreeSet::new();
+        for v in &self.queue.vlan_ids {
+            if !(1..=4094).contains(v) || !vids.insert(*v) {
+                return Err(format!(
+                    "queue.vlan_ids: {v} is not a VLAN id (1..=4094) or is listed twice"
+                ));
             }
         }
         if self.queue.max_len == 0 {

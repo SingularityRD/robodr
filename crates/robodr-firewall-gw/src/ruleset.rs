@@ -15,7 +15,11 @@
 //! 1. `sysctl`: `bridge-nf-call-iptables=1` (and ip6tables / arptables),
 //!    `bridge-nf-filter-vlan-tagged=1`, `bridge-nf-filter-pppoe-tagged=1`.
 //! 2. **L2 hygiene** (`nft`, `bridge` family, table `robodr_gw_l2`): from
-//!    the controller port only IPv4 and ARP are bridged. IPv6, VLAN-tagged,
+//!    the controller port only IPv4 and ARP are bridged, plus the
+//!    configured pass-through (sales-readiness T44): single-tagged 802.1Q
+//!    frames of `queue.vlan_ids` carrying IPv4 or ARP (their IPv4 is queued
+//!    and decided like untagged traffic: `bridge-nf-filter-vlan-tagged`),
+//!    IPv6 (the gateway decides IPv4 only), other VLAN ids, stacked tags,
 //!    PPPoE and every other ethertype are dropped, so no motion command can
 //!    reach the robot by a path the gateway does not inspect.
 //! 3. **Defragmentation** (`raw` table, chain `ROBODR_GW_RAW`): bridged
@@ -104,14 +108,26 @@ pub fn render(cfg: &GatewayConfig, source: &str) -> String {
         s.push_str(&format!("sysctl -qw {k}={v}\n"));
     }
     s.push_str(
-        "\n# 2. L2 hygiene: only IPv4 and ARP are bridged from the controller side.\n\
+        "\n# 2. L2 hygiene: only IPv4 and ARP are bridged from the controller side\n\
+         #    (and IPv4 / ARP in the VLANs of queue.vlan_ids).\n\
          nft -f - <<EOF\n\
          table bridge robodr_gw_l2\n\
          delete table bridge robodr_gw_l2\n\
          table bridge robodr_gw_l2 {\n\
          \x20 chain forward {\n\
-         \x20   type filter hook forward priority -200; policy accept;\n\
-         \x20   iifname \"$CTRL\" ether type != { ip, arp } counter drop\n\
+         \x20   type filter hook forward priority -200; policy accept;\n",
+    );
+    if !cfg.queue.vlan_ids.is_empty() {
+        let ids: Vec<String> = cfg.queue.vlan_ids.iter().map(u16::to_string).collect();
+        // One tag, a listed id, IPv4 or ARP inside: bridged; its IPv4 is
+        // queued below like untagged traffic (bridge-nf-filter-vlan-tagged).
+        s.push_str(&format!(
+            "\x20   iifname \"$CTRL\" ether type 8021q vlan id {{ {} }} vlan type {{ ip, arp }} accept\n",
+            ids.join(", ")
+        ));
+    }
+    s.push_str(
+        "\x20   iifname \"$CTRL\" ether type != { ip, arp } counter drop\n\
          \x20 }\n\
          }\n\
          EOF\n",
@@ -279,6 +295,38 @@ mod tests {
         let s = render(&c, "test.json");
         assert!(s.contains("--queue-num 7 --queue-bypass\n"));
         assert!(s.contains("UNCHECKED"));
+    }
+
+    /// T44: VLAN ids are bridged only when configured (single tag, IPv4 /
+    /// ARP inside); invalid ids are refused.
+    #[test]
+    fn renders_the_l2_pass_through() {
+        let base = |q: &str| {
+            format!(
+                r#"{{"mode":"enforce","profile":"/p","firewall":"/f",
+                "queue":{{"num":7,"controller_port":"c0","robot_port":"r0"{q}}},
+                "rtps":{{"domain_ids":[0]}},
+                "channels":[{{"firewall_channel":"/lowcmd","codec":"unitree_go_lowcmd"}}]}}"#
+            )
+        };
+        let plain = render(&GatewayConfig::from_json(&base("")).unwrap(), "t");
+        assert!(!plain.contains("vlan id"));
+        assert!(plain.contains("ether type != { ip, arp } counter drop"));
+        let c = GatewayConfig::from_json(&base(r#","vlan_ids":[10,4094]"#)).unwrap();
+        let s = render(&c, "t");
+        let vlan = s
+            .find("vlan id { 10, 4094 } vlan type { ip, arp } accept")
+            .unwrap();
+        let drop = s.find("ether type != { ip, arp } counter drop").unwrap();
+        assert!(vlan < drop, "the accept precedes the drop");
+        for bad in [
+            r#","vlan_ids":[0]"#,
+            r#","vlan_ids":[4095]"#,
+            r#","vlan_ids":[7,7]"#,
+            r#","vlan_ids":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]"#,
+        ] {
+            assert!(GatewayConfig::from_json(&base(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

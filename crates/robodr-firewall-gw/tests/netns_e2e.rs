@@ -915,3 +915,309 @@ fn new_channels_and_extra_ports_end_to_end() {
     let _ = std::fs::remove_file(&status);
     drop(topo);
 }
+
+// Raw Ethernet frames (AF_PACKET) for the L2 pass-through test: the test
+// kernel need not have the 8021q module or an IPv6 stack, and a frame can
+// carry any tag or ethertype.
+extern "C" {
+    fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
+    fn bind(fd: i32, addr: *const SockaddrLl, len: u32) -> i32;
+    fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+    fn close(fd: i32) -> i32;
+    fn if_nametoindex(name: *const std::ffi::c_char) -> u32;
+}
+const AF_PACKET: i32 = 17;
+const SOCK_RAW: i32 = 3;
+const SOCK_NONBLOCK: i32 = 0o4000;
+const ETH_P_ALL: u16 = 0x0003;
+
+#[repr(C)]
+struct SockaddrLl {
+    family: u16,
+    protocol: u16,
+    ifindex: i32,
+    hatype: u16,
+    pkttype: u8,
+    halen: u8,
+    addr: [u8; 8],
+}
+
+/// A raw socket on `dev` of the calling thread's namespace.
+struct Raw(i32);
+
+impl Raw {
+    fn open(dev: &str) -> Raw {
+        let name = std::ffi::CString::new(dev).unwrap();
+        // SAFETY: plain libc calls on a NUL-terminated name and a
+        // correctly sized sockaddr_ll; the fd is owned by `Raw`.
+        unsafe {
+            let ifindex = if_nametoindex(name.as_ptr());
+            assert!(ifindex > 0, "no interface {dev}");
+            let fd = socket(
+                AF_PACKET,
+                SOCK_RAW | SOCK_NONBLOCK,
+                i32::from(ETH_P_ALL.to_be()),
+            );
+            assert!(fd >= 0, "AF_PACKET: {}", std::io::Error::last_os_error());
+            let sa = SockaddrLl {
+                family: AF_PACKET as u16,
+                protocol: ETH_P_ALL.to_be(),
+                ifindex: ifindex as i32,
+                hatype: 0,
+                pkttype: 0,
+                halen: 0,
+                addr: [0; 8],
+            };
+            let rc = bind(fd, &sa, std::mem::size_of::<SockaddrLl>() as u32);
+            assert_eq!(rc, 0, "bind {dev}: {}", std::io::Error::last_os_error());
+            Raw(fd)
+        }
+    }
+
+    fn send(&self, frame: &[u8]) {
+        // SAFETY: a valid fd and buffer.
+        let n = unsafe { send(self.0, frame.as_ptr(), frame.len(), 0) };
+        assert_eq!(
+            n,
+            frame.len() as isize,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn recv(&self) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 65_536];
+        // SAFETY: a valid fd and buffer.
+        let n = unsafe { recv(self.0, buf.as_mut_ptr(), buf.len(), 0) };
+        (n > 0).then(|| {
+            buf.truncate(n as usize);
+            buf
+        })
+    }
+}
+
+impl Drop for Raw {
+    fn drop(&mut self) {
+        // SAFETY: the fd is owned.
+        unsafe { close(self.0) };
+    }
+}
+
+const CTRL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x64];
+const ROBOT_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xa1];
+
+/// An Ethernet frame from the controller to the robot: `tags` 802.1Q
+/// (TPID, VID) pairs, then `ethertype` and `payload`.
+fn eth(tags: &[(u16, u16)], ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&ROBOT_MAC);
+    f.extend_from_slice(&CTRL_MAC);
+    for (tpid, vid) in tags {
+        f.extend_from_slice(&tpid.to_be_bytes());
+        f.extend_from_slice(&vid.to_be_bytes());
+    }
+    f.extend_from_slice(&ethertype.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// An IPv6 packet with `next` header `nh`, hop limit `hl` and `body`
+/// (link-local addresses; checksums are not checked by the bridge).
+fn ipv6(nh: u8, hl: u8, body: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x60, 0, 0, 0];
+    p.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    p.push(nh);
+    p.push(hl);
+    for last in [0x64u8, 0xa1] {
+        p.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, last]);
+    }
+    p.extend_from_slice(body);
+    p
+}
+
+/// The UDP payload of an IPv4 datagram to the DDS port inside `frame`
+/// (untagged, or with the tag the receiving kernel left in place).
+fn dds_payload(frame: &[u8]) -> Option<Vec<u8>> {
+    let mut at = 12;
+    while frame.get(at..at + 2)? == [0x81, 0x00] {
+        at += 4;
+    }
+    if frame.get(at..at + 2)? != [0x08, 0x00] {
+        return None;
+    }
+    let ip = frame.get(at + 2..)?;
+    let ihl = usize::from(ip.first()? & 0x0f) * 4;
+    let udp = ip.get(ihl..)?;
+    (u16::from_be_bytes([*udp.get(2)?, *udp.get(3)?]) == DDS_PORT)
+        .then(|| udp.get(8..).map(<[u8]>::to_vec))
+        .flatten()
+}
+
+/// Sales-readiness T44 through the real kernel, with raw frames on the
+/// bridge (`queue.vlan_ids: [10]`): a valid LowCmd in a VLAN 10 frame
+/// arrives byte-identical and a violating one as the hold (the tagged IPv4
+/// is queued and decided like untagged traffic); the same frame on VLAN 20,
+/// double-tagged or QinQ, IPv6 (untagged or in VLAN 10) and PPPoE never
+/// arrive.
+#[test]
+#[ignore = "needs root, network namespaces, iptables + nft and nfnetlink_queue; run with --ignored"]
+fn vlan_pass_through_end_to_end() {
+    let topo = Topology::new('v', false);
+    let fx = Fixture::G1;
+    let mut cfg: GatewayConfig = gateway_config(fx);
+    cfg.queue.num = 9;
+    cfg.queue.controller_port = topo.ctrl_port.clone();
+    cfg.queue.robot_port = topo.rob_port.clone();
+    cfg.queue.vlan_ids = vec![10];
+    cfg.housekeeping_ms = 50;
+    let script = ruleset::render(&cfg, "netns_e2e");
+    let script_path =
+        std::env::temp_dir().join(format!("robodr-gw-e2e-v-{}.sh", std::process::id()));
+    std::fs::write(&script_path, &script).unwrap();
+    sh(&format!(
+        "ip netns exec {} sh {}",
+        topo.gw,
+        script_path.display()
+    ));
+
+    let stop_rx = Arc::new(AtomicBool::new(false));
+    let (tx_rx, rx_rx) = mpsc::channel::<Vec<u8>>();
+    let rob = topo.rob.clone();
+    let s2 = stop_rx.clone();
+    let receiver = std::thread::spawn(move || {
+        enter(&rob);
+        let r = Raw::open("r0");
+        while !s2.load(Ordering::SeqCst) {
+            match r.recv() {
+                // Only frames from the controller's MAC (the robot's own
+                // replies are seen too).
+                Some(f) if f.get(6..12) == Some(&CTRL_MAC[..]) => {
+                    let _ = tx_rx.send(f);
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    });
+    let stop_gw = Arc::new(AtomicBool::new(false));
+    let gwns = topo.gw.clone();
+    let s3 = stop_gw.clone();
+    let gcfg = cfg.clone();
+    let gw_thread = std::thread::spawn(move || {
+        enter(&gwns);
+        let mut gw = Gateway::new(&gcfg, &profile(Fixture::G1), &firewall(Fixture::G1)).unwrap();
+        let opts = RunOptions {
+            max_packets: None,
+            max_duration: Some(Duration::from_secs(60)),
+        };
+        let r = runtime::run(&gcfg, &mut gw, opts, &|| s3.load(Ordering::SeqCst));
+        (r, gw.stats)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    enter(&topo.ctrl);
+    let tx = Raw::open("c0");
+    let drain = || -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            if let Ok(x) = rx_rx.recv_timeout(Duration::from_millis(10)) {
+                v.push(x);
+            }
+        }
+        v
+    };
+    let spec = lowcmd_spec(fx);
+    let pins = (spec.pinned_mode_pr, spec.pinned_mode_machine);
+    let spare = spec.motors.iter().position(|m| !m.enabled).unwrap();
+    let mut good = mid_frame(LowCmdCodec::Hg, &spec.motors, 0.0, pins);
+    let mut w = good.motor(0).unwrap();
+    w.dq = 0.5;
+    good.set_motor(0, w);
+    good.seal();
+    let ip_of = |sn: i64, f: &WireLowCmd| {
+        packet(
+            CONTROLLER_IP,
+            DDS_PORT,
+            &lowcmd_datagram(PREFIX, WRITER, sn, f, Representation::CdrLe),
+        )
+    };
+    const VLAN: u16 = 0x8100;
+
+    // VLAN 10: bridged and decided.
+    let d1 = lowcmd_datagram(PREFIX, WRITER, 1, &good, Representation::CdrLe);
+    tx.send(&eth(&[(VLAN, 10)], 0x0800, &ip_of(1, &good)));
+    let got: Vec<_> = drain().iter().filter_map(|f| dds_payload(f)).collect();
+    assert_eq!(
+        got,
+        vec![d1],
+        "valid frame on VLAN 10 forwarded byte-identical"
+    );
+    let mut bad = good;
+    bad.set_motor(
+        spare,
+        WireMotor {
+            mode: 1,
+            kp: 40.0,
+            ..Default::default()
+        },
+    );
+    bad.seal();
+    let d2 = lowcmd_datagram(PREFIX, WRITER, 2, &bad, Representation::CdrLe);
+    tx.send(&eth(&[(VLAN, 10)], 0x0800, &ip_of(2, &bad)));
+    let got: Vec<_> = drain().iter().filter_map(|f| dds_payload(f)).collect();
+    assert_eq!(got.len(), 1, "the violating frame arrives rewritten");
+    assert_ne!(got[0], d2, "a violating frame on VLAN 10 is decided");
+    let held = lowcmd_of(&got[0]).expect("a hold, CRC valid");
+    assert_eq!(
+        held.motor(spare).unwrap().kp,
+        0.0,
+        "the spare motor stays off"
+    );
+
+    // VLAN 20, stacked tags, IPv6, PPPoE: never bridged.
+    for (what, f) in [
+        ("VLAN 20", eth(&[(VLAN, 20)], 0x0800, &ip_of(3, &bad))),
+        (
+            "QinQ",
+            eth(&[(0x88a8, 10), (VLAN, 10)], 0x0800, &ip_of(4, &bad)),
+        ),
+        (
+            "double 802.1Q",
+            eth(&[(VLAN, 10), (VLAN, 10)], 0x0800, &ip_of(5, &bad)),
+        ),
+        ("untagged IPv6 UDP", {
+            let mut udp = vec![0xc3, 0x50];
+            udp.extend_from_slice(&DDS_PORT.to_be_bytes());
+            udp.extend_from_slice(&[0, 16, 0, 0]);
+            udp.extend_from_slice(b"motion!!");
+            eth(&[], 0x86dd, &ipv6(17, 64, &udp))
+        }),
+        (
+            "VLAN 10 IPv6 UDP",
+            eth(
+                &[(VLAN, 10)],
+                0x86dd,
+                &ipv6(17, 64, &[0xc3, 0x50, 0x1c, 0xeb, 0, 8, 0, 0]),
+            ),
+        ),
+        (
+            "PPPoE session",
+            eth(&[], 0x8864, &[0x11, 0, 0, 1, 0, 2, 0, 0x21]),
+        ),
+    ] {
+        tx.send(&f);
+        let got = drain();
+        assert!(got.is_empty(), "{what} must not be bridged: {got:?}");
+    }
+
+    stop_gw.store(true, Ordering::SeqCst);
+    let (r, stats) = gw_thread.join().unwrap();
+    r.expect("gateway run loop");
+    println!("vlan pass-through ok: {stats:?}");
+    stop_rx.store(true, Ordering::SeqCst);
+    receiver.join().unwrap();
+    let _ = std::fs::remove_file(&script_path);
+    drop(topo);
+}

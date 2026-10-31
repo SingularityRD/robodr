@@ -861,6 +861,7 @@ oneshot unit), or `fail_closed` would mean nothing.
 | `queue.num`, `queue.max_len` | —, 1024 | NFQUEUE number and kernel queue length |
 | `queue.on_gateway_down` | `fail_closed` | see above |
 | `queue.controller_port`, `queue.robot_port` | — | bridge port names (ruleset) |
+| `queue.vlan_ids` | none | 802.1Q VLAN ids (`1..=4094`, at most 16) whose single-tagged IPv4 / ARP frames are bridged from the controller port; their IPv4 is queued and decided like untagged traffic (`bridge-nf-filter-vlan-tagged`). Other ids, stacked tags (QinQ), IPv6 and PPPoE stay dropped (T44; `tests/netns_e2e.rs::vlan_pass_through_end_to_end`) |
 | `rtps.domain_ids` | `[0]` | queued DDS port ranges (7400 + 250·d .. +249) |
 | `rtps.malformed_datagram` | `drop` | whole-datagram policy |
 | `rtps.unknown_writers` | `probe` | `probe` or `pass` |
@@ -1124,6 +1125,9 @@ these two harnesses; `gw_latency` takes `--budget-p99-ns` /
   `rt/arm_sdk` (`hg`, weight slot 27) are enforceable.
 - **Go1 compressed low-level frames** cannot be decided (dropped if the
   channel is configured).
-- **IPv4 only**: the ruleset drops IPv6 (and VLAN-tagged, PPPoE, other
-  ethertypes) from the controller port; a site that needs them through the
-  bridge must route them around the gateway explicitly.
+- **IPv4 only**: the ruleset drops IPv6, PPPoE, stacked VLAN tags and
+  every other ethertype from the controller port (the gateway decides
+  IPv4 only, so nothing else could carry a command past it unchecked).
+  Single-tagged 802.1Q frames are bridged for the ids in `queue.vlan_ids`
+  (T44) and decided like untagged traffic. A site that needs IPv6 or PPPoE
+  through the bridge must route it around the gateway explicitly.
