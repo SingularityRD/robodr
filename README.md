@@ -212,6 +212,29 @@ crates/
                           erase epoch (tpm2-tools), the LUKS2 runtime
                           volume and the Clevis/Tang fallback. Binary:
                           robodr-seal. Sprint 13c; tested against swtpm.
+  robodr-signer/          Key providers: one Ed25519 signer for commissioning
+                          and release keys (a robodr-blackbox key file, or an
+                          external signer command such as the shipped PKCS#11
+                          adapter in adapters/), and the classification of
+                          systemd encrypted credentials (TPM2-sealed or not).
+                          Binary: robodr-signer (check, credential).
+  robodr-ops/             Operator tools. Binaries: robodr-setup (host
+                          preflight, key generation, role configuration, key
+                          fingerprints), robodr-support-bundle (redacted
+                          diagnostics with a SHA-256 manifest; never keys or
+                          evidence), robodr-metrics (Prometheus textfile
+                          exporter of the daemons' status files).
+  robodr-buildinfo/       Build identity (commit, SOURCE_DATE_EPOCH, target
+                          triple) for every binary's --version line.
+  robodr-attack-sim/      Attack simulator for POCs and demos: the red-team
+                          network scenarios as an offline pcap generator, a
+                          guarded live sender (allow-listed target, public
+                          addresses refused) and a scorer of the findings
+                          they must produce. Binary: robodr-attack-sim.
+  robodr-demo-soc/        Demo SOC for POCs: the reference robodr.ingest v1
+                          consumer behind a minimal HTTP server, a finding
+                          store and a browser viewer with time-to-SOC. Demo
+                          only, not a production SOC. Binary: robodr-demo-soc.
   robodr-sensor-ros2/     Thin Pulsar module wrapping robodr-ros2-pipeline.
                           Pulsar-dependent: built, linted and tested against
                           vendor/pulsar in CI's `pulsar` job (needs Pulsar's
@@ -224,6 +247,10 @@ crates/
                           Pulsar-dependent; built and tested in the `pulsar`
                           job; run as root with eBPF probes loaded in WSL2,
                           never on a robot (PULSAR-INTEGRATION §7b).
+benches/                Throughput benchmarks for sizing a sensor box
+                        (robodr-agentd end to end, robodr-correlate) with a
+                        regression gate against a recorded baseline
+                        (benches/README.md). Binary: robodr-bench.
 rules/robodr/           Robot detection rules in Pulsar rules-engine TOML format
                         (validate: scripts/validate_rules.py; see rules/README.md).
 config/                 Profile, response-policy and daemon config examples.
@@ -239,7 +266,7 @@ docs/contracts/         robodr.findings contract (v2) + JSON Schema + example,
 docs/{adr,compliance,customer}/  ADRs (D1-D9 etc.), IEC 62443/CRA/safety notes, customer
                         documents (support matrix, detection catalog, performance,
                         POC guide, quick start, known limitations, drafts).
-fuzz/                   37 cargo-fuzz targets (RTPS, capture, black box, OCSF,
+fuzz/                   41 cargo-fuzz targets (RTPS, capture, black box, OCSF,
                         commissioning, firewall, pipeline config, control-plane
                         requests; own workspace) + std-only smoke runs in the
                         crates' tests.
@@ -307,7 +334,7 @@ qemu. No release has been cut or signed. GitHub CI has run once in full
 - **Hardening (S10)**: `sha2` (HMAC as a wiping RFC 2104 wrapper over it)
   instead of hand-written crypto,
   `forbid(unsafe_code)` where possible, panic-family calls denied in daemon
-  code, 37 fuzz targets (CI runs each for 60 s; an earlier campaign ran 10
+  code, 41 fuzz targets (CI runs each for 60 s; an earlier campaign ran 10
   of them for 630 s each, no crash).
 
 **Not verified:**

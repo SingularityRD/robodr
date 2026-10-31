@@ -180,6 +180,11 @@ morphology, safety system not engaged, state known).
 |---|---|---|---|
 | `restrict_motion` | `gateway` | restriction file for `robodr-firewall-gw` (`motion.gateway.restriction_path`, expiry = TTL); the gateway's status must report its id within `verify_timeout_ms` | file removed, read back; the gateway also lifts it at its expiry on its own |
 | | `unitree_sport` | sport `SpeedLevel(speed_level)` (`rt/api/sport/request`, `unitree_api` `Request_`), the `Response_` with the same identity and code 0 | `SpeedLevel(0)` (the SDK's default level: **not** necessarily the level before; documented) |
+| `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel`; **latched** (below) | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
+| | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch, **only** on the SOC's two-person signed revert with the safety state re-checked (never at TTL, restart or emergency disable) |
+| | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode; **latched** (below) | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
+| `request_safe_state` | `px4` (hold, or RTL when the policy's `safe_state` is `return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
+| `rollback_config` | `rollback` (`config: program`) | the site's OEM-validated program, `--verify` afterwards | not reversible: `applied`; `config: profile` is refused (`not_executor_action`: the profile's anti-rollback chain) |
 
 `SpeedLevel` is a firmware speed range, not a cap: on its own anyone on
 the bus can set another level. With the gateway in the path, list
@@ -189,11 +194,6 @@ the gateway refuses every `SpeedLevel` while its restriction is in force
 Without the gateway, the level is advisory. A restriction limits commands
 decided after it is applied; a joint trajectory the controller already
 accepted keeps executing at its accepted speeds (use `safe_pause`).
-| `safe_pause` | `nav2` | `CancelGoal` with a zero goal id and stamp (every goal) on each configured action server, then `zero_twists` zero `Twist` on `cmd_vel`; **latched** (below) | **nothing to undo**: cancelled goals are not restored, the operator re-issues the mission |
-| | `ros2_control` | `SwitchController` STRICT: deactivate `deactivate`, activate `activate` (a hold controller); reply `ok` | the inverse switch, **only** on the SOC's two-person signed revert with the safety state re-checked (never at TTL, restart or emergency disable) |
-| | `px4` | MAVLink 2 `COMMAND_LONG DO_SET_MODE` AUTO.LOITER, `COMMAND_ACK` accepted, then a `HEARTBEAT` in that mode; **latched** (below) | **no mode change**: the vehicle stays in hold until its operator switches (a mission is never resumed by the executor) |
-| `request_safe_state` | `px4` (hold, or RTL when the policy's `safe_state` is `return_to_launch`), `nav2`, `ros2_control` | as above | not reversible: status `applied` |
-| `rollback_config` | `rollback` (`config: program`) | the site's OEM-validated program, `--verify` afterwards | not reversible: `applied`; `config: profile` is refused (`not_executor_action`: the profile's anti-rollback chain) |
 
 Gates, in order after the common ones (refusal codes): a
 `restrict_motion` without a human's approval on a robot that falls when

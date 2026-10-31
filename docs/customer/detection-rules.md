@@ -4,6 +4,8 @@
 
 Every detection RoboDR can report, as the robot sends it in the `robodr.findings` contract 2.5.0 (`docs/contracts/robodr.findings.md`). Generated from the trusted rule catalog the sensor uses to write each finding's `title`, `description`, `ocsf.finding_info.data_sources` and `mitre_predictions` / `ocsf.finding_info.attacks`, so this page and the findings cannot disagree: a test fails when they do.
 
+This is the full generated reference. How to read a finding, what each detection needs and what is not detected are in the customer guide, [`detection-catalog.md`](detection-catalog.md).
+
 * **Rule id** is `ocsf.finding_info.analytic.uid` and `ocsf.unmapped.robodr.rule_id`; key SIEM content on it, never on the title.
 * **Severity** is set by the detector per occurrence (and by the locked profile), not by the catalog, so it is not listed here; the host rules below list their fixed Pulsar severity.
 * **ATT&CK for ICS** ids are the sensor's mapping; technique names follow the ATT&CK for ICS matrix; `crates/robodr-ocsf/tests/attack_ics.rs` checks them against MITRE's data (`integrations/schemas/attack-ics-techniques.json`), and a technique MITRE has since revoked names its replacement. Findings keep the id they were built with until a contract change moves them.
