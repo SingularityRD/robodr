@@ -2845,6 +2845,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "base64ct",
  "hmac 0.13.0",
+ "libc",
  "pbkdf2",
  "robodr-agent",
  "robodr-agentd",

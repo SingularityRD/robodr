@@ -27,6 +27,7 @@ hmac13 = { workspace = true }
 sha2-11 = { workspace = true }
 pbkdf2 = { workspace = true }
 base64ct = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
