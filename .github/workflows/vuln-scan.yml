@@ -1,0 +1,149 @@
+# Vulnerability monitoring of PUBLISHED releases (ci.yml's cargo-deny job
+# only sees the default branch). Daily, and by hand.
+#
+# For the newest release of every release line (vX.Y.*, so LTS lines stay
+# covered) and the newest release overall:
+#   * cargo-deny (advisories, with an EMPTY config: no waiver of the tag's
+#     deny.toml can hide an advisory) and osv-scanner (pinned by SHA-256)
+#     against the tag's committed Cargo.lock;
+#   * every advisory found must have an applicable statement in the CURRENT
+#     security/vex/statements.json (scripts/vex.py coverage): a new
+#     advisory against a shipped release turns this workflow red until it
+#     is assessed (not_affected with a justification, affected with an
+#     action, fixed, or under_investigation);
+#   * OpenVEX and CSAF 2.0 VEX documents for that release, from the current
+#     statements, as an artifact (vex-<tag>) for customers and the advisory
+#     page (SALES-READINESS C14).
+# docs/RELEASE.md "Vulnerability monitoring and VEX".
+name: Vulnerability scan of releases
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Same pin as ci.yml.
+  CARGO_DENY_VERSION: 0.20.2
+  # osv-scanner v2.2.4 linux_amd64; SHA-256 from the project's published
+  # osv-scanner_SHA256SUMS of that release (checked against the download
+  # on 2026-10-31).
+  OSV_SCANNER_VERSION: 2.2.4
+  OSV_SCANNER_SHA256: 7702cd1e5d9f5059dd9570f4ad967f27d3c5f5391b371ec937b384c238177f55
+
+jobs:
+  tags:
+    name: Releases to scan
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.pick.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Newest tag per release line
+        id: pick
+        run: |
+          tags="$(git tag -l 'v[0-9]*' | sort -V | python3 -c '
+          import json, re, sys
+          newest = {}
+          for t in sys.stdin.read().split():
+              m = re.match(r"^v([0-9]+)\.([0-9]+)\.[0-9]+(-[0-9A-Za-z.]+)?$", t)
+              if m:
+                  newest[(m.group(1), m.group(2))] = t   # input is version-sorted
+          print(json.dumps(sorted(set(newest.values()))))')"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "scanning: $tags"
+
+  scan:
+    name: Scan ${{ matrix.tag }}
+    needs: tags
+    if: needs.tags.outputs.tags != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.tags.outputs.tags) }}
+    steps:
+      - name: The current VEX statements and scripts (default branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: current
+      - name: The release's source (tag)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.tag }}
+          submodules: recursive
+          path: release
+      - name: Tools (cargo-deny by version, osv-scanner by SHA-256)
+        run: |
+          cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v$OSV_SCANNER_VERSION/osv-scanner_linux_amd64"
+          echo "$OSV_SCANNER_SHA256  $RUNNER_TEMP/osv-scanner" | sha256sum --strict -c
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: Advisories against the release's Cargo.lock
+        working-directory: release
+        run: |
+          : > "$RUNNER_TEMP/empty-deny.toml"
+          # Exit status ignored on purpose: findings are judged by the VEX
+          # coverage step; a tool failure leaves no output and is caught there.
+          cargo deny --manifest-path Cargo.toml --locked --format json --config "$RUNNER_TEMP/empty-deny.toml" \
+            check advisories 2> "$RUNNER_TEMP/deny.json" || true
+          "$RUNNER_TEMP/osv-scanner" scan source --lockfile Cargo.lock --format json \
+            > "$RUNNER_TEMP/osv.json" || true
+          test -s "$RUNNER_TEMP/osv.json" || { echo "::error::osv-scanner produced no output"; exit 1; }
+          grep -q '"type":"summary"\|"type": "summary"' "$RUNNER_TEMP/deny.json" ||
+            { echo "::error::cargo-deny produced no summary"; cat "$RUNNER_TEMP/deny.json"; exit 1; }
+          python3 - "$RUNNER_TEMP/deny.json" "$RUNNER_TEMP/osv.json" > "$RUNNER_TEMP/findings.txt" <<'PY'
+          import json, re, sys
+          ids = set()
+          for ln in open(sys.argv[1], encoding="utf-8", errors="replace"):
+              try:
+                  d = json.loads(ln)
+              except ValueError:
+                  continue
+              adv = ((d.get("fields") or {}).get("advisory") or {}) if isinstance(d, dict) else {}
+              if adv.get("id"):
+                  ids.add(adv["id"])
+          osv = json.load(open(sys.argv[2], encoding="utf-8"))
+          for r in osv.get("results", []) or []:
+              for p in r.get("packages", []) or []:
+                  for v in p.get("vulnerabilities", []) or []:
+                      ids.add(v.get("id", ""))
+          for i in sorted(x for x in ids if re.match(r"^(RUSTSEC|CVE|GHSA)-", x)):
+              print(i)
+          PY
+          echo "findings for ${{ matrix.tag }}:"
+          cat "$RUNNER_TEMP/findings.txt"
+      - name: Every finding has a VEX statement
+        run: |
+          python3 current/scripts/vex.py coverage --version "${MATRIX_TAG#v}" \
+            --findings "$RUNNER_TEMP/findings.txt" --statements current/security/vex/statements.json
+        env:
+          MATRIX_TAG: ${{ matrix.tag }}
+      - name: OpenVEX and CSAF VEX documents
+        env:
+          MATRIX_TAG: ${{ matrix.tag }}
+        run: |
+          v="${MATRIX_TAG#v}"
+          mkdir -p dist/vex
+          cp "$RUNNER_TEMP/findings.txt" "dist/vex/findings-$v.txt"
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 current/scripts/vex.py openvex --version "$v" --timestamp "$ts" \
+            --statements current/security/vex/statements.json --out "dist/vex/robodr-$v.openvex.json"
+          python3 current/scripts/vex.py csaf --version "$v" --timestamp "$ts" \
+            --statements current/security/vex/statements.json --out "dist/vex/robodr-$v.csaf.json" ||
+            echo "no statement applies to $v: no CSAF document (the VEX profile needs a vulnerability)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vex-${{ matrix.tag }}
+          path: dist/vex
+          if-no-files-found: error
+          retention-days: 90
