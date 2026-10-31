@@ -37,13 +37,13 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 work="$(mktemp -d /var/tmp/robodr-ebpf-work.XXXXXX)"
 
-# rule name | trigger (bash, run as root)
+# rule name | trigger (bash, run as root; @WORK@ and @PORT@ filled in later)
 TRIGGERS=(
     "RoboDR: Interactive shell started on robot controller|bash -i -c true </dev/null >/dev/null 2>&1"
-    "RoboDR: Program executed from a temporary directory|cp /bin/true $work/robodr-ebpf-true && $work/robodr-ebpf-true"
+    "RoboDR: Program executed from a temporary directory|cp /bin/true @WORK@/robodr-ebpf-true && @WORK@/robodr-ebpf-true"
     "RoboDR: Interpreter one-liner executed|python3 -c pass"
     "RoboDR: Debugger or tracer started on robot controller|strace -o /dev/null true"
-    "RoboDR: Shell or netcat-style tool opened a network connection|bash -c 'exec 3<>/dev/tcp/127.0.0.1/$port' || true"
+    "RoboDR: Shell or netcat-style tool opened a network connection|bash -c 'exec 3<>/dev/tcp/127.0.0.1/@PORT@' || true"
     "RoboDR: Dynamic linker search path changed|echo '# robodr ebpf smoke' >/etc/ld.so.conf.d/zz-robodr-ebpf-smoke.conf"
     "RoboDR: Kernel module autoload configuration changed|echo '# robodr ebpf smoke' >/etc/modules-load.d/zz-robodr-ebpf-smoke.conf"
     "RoboDR: Directory created in a RoboDR or Pulsar protected path|mkdir -p /etc/robodr/zz-ebpf-smoke"
@@ -142,8 +142,8 @@ fi
 for t in "${TRIGGERS[@]}"; do
     rule="${t%%|*}"
     cmd="${t#*|}"
-    cmd="${cmd//\$work/$work}"
-    cmd="${cmd//\$port/$port}"
+    cmd="${cmd//@WORK@/$work}"
+    cmd="${cmd//@PORT@/$port}"
     echo "ebpf-load-smoke: $rule <- $cmd"
     bash -c "$cmd" || true
 done
