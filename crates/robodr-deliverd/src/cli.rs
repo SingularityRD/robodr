@@ -498,19 +498,11 @@ fn report_json(r: &crate::engine::TickReport) -> serde_json::Value {
     })
 }
 
-/// `self-check`: what `run` needs before READY (configuration, state,
-/// keys), read only. Run by the old agent on a binary that replaced it,
-/// before that install commits ([`crate::own::SelfCheck`]).
+/// `self-check`: what `run` needs before READY, read only
+/// ([`Engine::self_check`]). Run by the old agent on a binary that
+/// replaced it, before that install commits ([`crate::own::SelfCheck`]).
 fn self_check(cfg: &Config) -> Result<(), String> {
-    StateFile::new(&cfg.state_path()).load()?;
-    crate::journal::load_blackbox_key(&cfg.blackbox.key, cfg.blackbox.allow_hmac, "black-box key")?
-        .signer()
-        .map_err(|e| format!("black-box key {}: {e}", cfg.blackbox.key.display()))?;
-    if let Some(p) = &cfg.findings.finding_key {
-        robodr_blackbox::KeyFile::load_secret(p)
-            .and_then(|k| k.signer())
-            .map_err(|e| format!("finding key {}: {e}", p.display()))?;
-    }
+    Engine::self_check(cfg).map_err(|e| e.0)?;
     println!("robodr-deliverd: self-check ok");
     Ok(())
 }

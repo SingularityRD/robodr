@@ -333,3 +333,82 @@ fn self_check_loads_what_run_needs_without_writing() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+/// WP14 (MEDIUM #3, narrowed): `self-check` refuses what would stop
+/// `Engine::open` or lock the start, not only an unparsable state or key:
+/// a state file of another unit, a missing or older high-water record
+/// next to a journal with records, and a trust anchor that does not load.
+/// After a real start and stop it passes, and it still writes nothing.
+#[test]
+fn self_check_refuses_what_would_stop_or_lock_the_start() {
+    let u = Unit::new("bin-self-check-open");
+    let cfgp = u.dir().join("deliverd.json");
+    std::fs::write(&cfgp, serde_json::to_vec_pretty(&u.cfg).unwrap()).unwrap();
+    let c = cfgp.to_str().unwrap();
+    u.open().close().unwrap();
+    let check = || {
+        let o = deliverd(&["self-check", "--config", c]);
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        )
+    };
+    let (code, err) = check();
+    assert_eq!(code, Some(0), "{err}");
+    let listing = |d: &std::path::Path| -> Vec<(std::ffi::OsString, u64)> {
+        let mut v: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), e.metadata().unwrap().len())
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let bb = listing(&u.cfg.blackbox.dir);
+    let st = std::fs::read(u.cfg.state_path()).unwrap();
+    let (code, _) = check();
+    assert_eq!(code, Some(0));
+    assert_eq!(listing(&u.cfg.blackbox.dir), bb);
+    assert_eq!(std::fs::read(u.cfg.state_path()).unwrap(), st);
+
+    // A state file of another unit: Engine::open refuses it.
+    let mut v: serde_json::Value = serde_json::from_slice(&st).unwrap();
+    v["unit"] = "another-unit".into();
+    std::fs::write(u.cfg.state_path(), serde_json::to_vec(&v).unwrap()).unwrap();
+    let (code, err) = check();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("state of unit another-unit"), "{err}");
+    std::fs::write(u.cfg.state_path(), &st).unwrap();
+
+    // The high-water record gone while the journal has records: the start
+    // would be locked.
+    let hw = robodr_deliverd::highwater::path(&u.cfg.blackbox.dir);
+    let hw_bytes = std::fs::read(&hw).unwrap();
+    std::fs::remove_file(&hw).unwrap();
+    let (code, err) = check();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("the start would be locked"), "{err}");
+    std::fs::write(&hw, &hw_bytes).unwrap();
+    assert_eq!(check().0, Some(0));
+
+    // A damaged mirror of the anchor record: the record is what counts,
+    // and self-check does not repair the mirror (it writes nothing).
+    let anchor = u.cfg.anchor_path();
+    let a = std::fs::read(&anchor).unwrap();
+    std::fs::write(&anchor, b"{}").unwrap();
+    let (code, err) = check();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(std::fs::read(&anchor).unwrap(), b"{}");
+    std::fs::write(&anchor, &a).unwrap();
+    // An anchor record that does not load.
+    let chain = robodr_release::ops::anchor_chain_path(&anchor);
+    let ch = std::fs::read(&chain).unwrap();
+    std::fs::write(&chain, b"{}").unwrap();
+    let (code, err) = check();
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("trust anchor"), "{err}");
+    std::fs::write(&chain, &ch).unwrap();
+    assert_eq!(check().0, Some(0));
+}

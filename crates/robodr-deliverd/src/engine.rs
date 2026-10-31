@@ -207,91 +207,25 @@ impl Engine {
             signer,
         );
         let mut file = StateFile::new(&cfg.state_path());
-        let hw = match highwater::load(&cfg.blackbox.dir, hw_key.as_ref()) {
-            Ok(Some(h)) if h.site != cfg.unit.site || h.unit != cfg.unit.id => Err(format!(
-                "high-water record of unit {} at site {}, this is {} at {}",
-                h.unit, h.site, cfg.unit.id, cfg.unit.site
-            )),
-            other => other,
-        };
+        let hw = load_highwater(&cfg, hw_key.as_ref());
         let now = clock.now_s().unwrap_or(0);
-        let mut restored: Option<&str> = None;
-        let mut lock: Option<String> = None;
         let loaded = file.load()?;
         let state_present = loaded.is_some();
         let mut state = match loaded {
             Some(s) => {
-                if s.site != cfg.unit.site || s.unit != cfg.unit.id {
-                    return Err(EngineError(format!(
-                        "{}: state of unit {} at site {}, this is {} at {}",
-                        file.path().display(),
-                        s.unit,
-                        s.site,
-                        cfg.unit.id,
-                        cfg.unit.site
-                    )));
-                }
+                check_state_owner(&cfg, file.path(), &s)?;
                 s
             }
             None => State::new(&cfg.unit.site, &cfg.unit.id),
         };
         let state_gen = state.hw_generation;
-        match &hw {
-            Ok(Some(h)) => {
-                // Review M-B: an older copy of the record put back.
-                let newest = history.hw_generation.max(state_gen);
-                if h.generation < newest {
-                    lock = Some(format!(
-                        "the high-water record is generation {}, older than the generation {} \
-                         the {} recorded: an older copy was put back",
-                        h.generation,
-                        newest,
-                        if history.hw_generation >= state_gen {
-                            "delivery journal"
-                        } else {
-                            "state file"
-                        }
-                    ));
-                } else if let Some(l) = &h.locked {
-                    // Review M-A: the lock is part of the signed record.
-                    lock = Some(l.why.clone());
-                } else if !state_present {
-                    restored = Some(
-                        "the state file is missing; floors, deployment sequence, time floor \
-                         and chain heads restored from the signed high-water record",
-                    );
-                }
-            }
-            Ok(None) if !had_records && !state_present => {}
-            Ok(None) if !had_records => {
-                // A state file with no journal at all: the record is
-                // written from it (a unit set up before the record).
-            }
-            Ok(None) => {
-                lock = Some(if state_present {
-                    "the high-water record is missing while the state file and the delivery \
-                     journal exist: the state file cannot be shown to be current"
-                        .into()
-                } else {
-                    "the state file and the high-water record are missing but the delivery \
-                     journal has records: the floors and the deployment sequence cannot be \
-                     restored completely"
-                        .into()
-                });
-            }
-            Err(e) => {
-                lock = Some(format!(
-                    "the high-water record is not usable ({}); the {} cannot be shown to be \
-                     current",
-                    robodr_pkg::common::trunc(e),
-                    if state_present {
-                        "state file"
-                    } else {
-                        "baseline"
-                    }
-                ));
-            }
-        }
+        let (mut lock, restored) = start_lock(
+            &hw,
+            history.hw_generation,
+            state_gen,
+            state_present,
+            had_records,
+        );
         // Sprint 14b: the high-water record against the TPM NV counter.
         let nv = match cfg
             .seal
@@ -451,6 +385,79 @@ impl Engine {
         }
         e.cleanup();
         Ok(e)
+    }
+
+    /// `robodr-deliverd self-check` (T52): what [`Engine::open`] needs
+    /// before a start, read only (nothing is created or written, the
+    /// journal is not opened for writing and the TPM is not used). It
+    /// fails when the black-box or finding key does not load, the journal
+    /// segments cannot be read, the state file does not parse or is of
+    /// another unit or site, the start would be locked by the high-water
+    /// record (not usable, of another unit, missing although the journal
+    /// has records, or older than the journal's or the state's generation;
+    /// a lock the record already carries is not this binary's doing and
+    /// does not fail it), the TPM settings of the anti-rollback NV counter
+    /// are invalid, or the trust anchor exists but does not load under the
+    /// pinned roots and site. Not covered: the NV counter's value, the
+    /// journal's chain as the recorder resumes it, and what `run` does
+    /// after the start (the erase trigger socket, the passes).
+    pub fn self_check(cfg: &Config) -> R<()> {
+        let hw_kf = crate::journal::load_blackbox_key(
+            &cfg.blackbox.key,
+            cfg.blackbox.allow_hmac,
+            "black-box key",
+        )?;
+        let hw_key = hw_kf
+            .signer()
+            .map_err(|e| format!("black-box key {}: {e}", cfg.blackbox.key.display()))?;
+        if let Some(p) = &cfg.findings.finding_key {
+            robodr_blackbox::KeyFile::load_secret(p)
+                .and_then(|k| k.signer())
+                .map_err(|e| format!("finding key {}: {e}", p.display()))?;
+        }
+        let had_records = Journal::has_records(&cfg.blackbox.dir);
+        if had_records {
+            robodr_blackbox::verify::read_segments(&cfg.blackbox.dir)
+                .map_err(|e| format!("delivery journal {}: {e}", cfg.blackbox.dir.display()))?;
+        }
+        let history = Journal::history(&cfg.blackbox.dir, hw_key.as_ref());
+        let mut file = StateFile::new(&cfg.state_path());
+        let loaded = file.load()?;
+        if let Some(s) = &loaded {
+            check_state_owner(cfg, file.path(), s)?;
+        }
+        let hw = load_highwater(cfg, hw_key.as_ref());
+        let carried = matches!(&hw, Ok(Some(h)) if h.locked.is_some());
+        let (lock, _) = start_lock(
+            &hw,
+            history.hw_generation,
+            loaded.as_ref().map_or(0, |s| s.hw_generation),
+            loaded.is_some(),
+            had_records,
+        );
+        if let Some(why) = lock.filter(|_| !carried) {
+            return Err(EngineError(format!("the start would be locked: {why}")));
+        }
+        if let Some(s) = &cfg.seal {
+            if let Some(i) = &s.anti_rollback_nv {
+                let t = s
+                    .tpm
+                    .as_ref()
+                    .ok_or_else(|| EngineError("seal.anti_rollback_nv needs seal.tpm".into()))?;
+                robodr_seal::tpm::Tpm::new(
+                    t.tpm_config().map_err(EngineError)?,
+                    Box::new(robodr_seal::cmd::System),
+                )
+                .map_err(|e| EngineError(e.to_string()))?;
+                robodr_seal::unit::parse_handle(i, 0x01).map_err(|e| EngineError(e.to_string()))?;
+            }
+        }
+        let anchor = cfg.anchor_path();
+        if robodr_release::ops::anchor_exists(&anchor) {
+            robodr_release::ops::read_anchor_only(&anchor, &cfg.trust.roots, &cfg.unit.site)
+                .map_err(|e| format!("trust anchor {}: {e}", anchor.display()))?;
+        }
+        Ok(())
     }
 
     /// Operator re-anchoring after a lost state (review M1): accept the
@@ -2837,6 +2844,107 @@ impl Engine {
 }
 
 /// SHA-256 (hex) of `dpkg --verify` lines, sorted (review H-R3-1).
+/// The high-water record of this unit's journal; one of another unit or
+/// site is not usable.
+fn load_highwater(
+    cfg: &Config,
+    key: &dyn robodr_blackbox::Signer,
+) -> Result<Option<HighWater>, String> {
+    match highwater::load(&cfg.blackbox.dir, key) {
+        Ok(Some(h)) if h.site != cfg.unit.site || h.unit != cfg.unit.id => Err(format!(
+            "high-water record of unit {} at site {}, this is {} at {}",
+            h.unit, h.site, cfg.unit.id, cfg.unit.site
+        )),
+        other => other,
+    }
+}
+
+/// A state file of another unit or site is refused.
+fn check_state_owner(cfg: &Config, path: &std::path::Path, s: &State) -> R<()> {
+    if s.site != cfg.unit.site || s.unit != cfg.unit.id {
+        return Err(EngineError(format!(
+            "{}: state of unit {} at site {}, this is {} at {}",
+            path.display(),
+            s.unit,
+            s.site,
+            cfg.unit.id,
+            cfg.unit.site
+        )));
+    }
+    Ok(())
+}
+
+/// Why a start from this high-water record, journal and state file is
+/// locked (`None`: it is not), and what was restored from the record
+/// (the table of [`Engine::open`]).
+fn start_lock(
+    hw: &Result<Option<HighWater>, String>,
+    journal_hw_generation: u64,
+    state_gen: u64,
+    state_present: bool,
+    had_records: bool,
+) -> (Option<String>, Option<&'static str>) {
+    let mut restored: Option<&'static str> = None;
+    let mut lock: Option<String> = None;
+    match hw {
+        Ok(Some(h)) => {
+            // Review M-B: an older copy of the record put back.
+            let newest = journal_hw_generation.max(state_gen);
+            if h.generation < newest {
+                lock = Some(format!(
+                    "the high-water record is generation {}, older than the generation {} \
+                     the {} recorded: an older copy was put back",
+                    h.generation,
+                    newest,
+                    if journal_hw_generation >= state_gen {
+                        "delivery journal"
+                    } else {
+                        "state file"
+                    }
+                ));
+            } else if let Some(l) = &h.locked {
+                // Review M-A: the lock is part of the signed record.
+                lock = Some(l.why.clone());
+            } else if !state_present {
+                restored = Some(
+                    "the state file is missing; floors, deployment sequence, time floor \
+                     and chain heads restored from the signed high-water record",
+                );
+            }
+        }
+        Ok(None) if !had_records && !state_present => {}
+        Ok(None) if !had_records => {
+            // A state file with no journal at all: the record is
+            // written from it (a unit set up before the record).
+        }
+        Ok(None) => {
+            lock = Some(if state_present {
+                "the high-water record is missing while the state file and the delivery \
+                 journal exist: the state file cannot be shown to be current"
+                    .into()
+            } else {
+                "the state file and the high-water record are missing but the delivery \
+                 journal has records: the floors and the deployment sequence cannot be \
+                 restored completely"
+                    .into()
+            });
+        }
+        Err(e) => {
+            lock = Some(format!(
+                "the high-water record is not usable ({}); the {} cannot be shown to be \
+                 current",
+                robodr_pkg::common::trunc(e),
+                if state_present {
+                    "state file"
+                } else {
+                    "baseline"
+                }
+            ));
+        }
+    }
+    (lock, restored)
+}
+
 fn lines_digest(lines: &[String]) -> String {
     let mut v: Vec<&str> = lines.iter().map(String::as_str).collect();
     v.sort_unstable();
