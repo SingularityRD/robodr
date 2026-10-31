@@ -1673,13 +1673,16 @@ pub struct FindingBuilder<'a> {
 }
 
 /// A trusted label for `entity_context.agent_health`: printable ASCII
-/// without `<`, `>` or `` ` `` (anything else becomes `?`), at most `max`
-/// bytes. Names come from agentd's own configuration (input names carry
-/// configured paths), never from the bus.
+/// without `<`, `>`, `` ` ``, `"` or `\` (anything else becomes `?`), at
+/// most `max` bytes. Names come from agentd's own configuration (input
+/// names carry configured paths), never from the bus. `"` and `\` are
+/// replaced because JSON escapes them to two bytes: without them a label
+/// serialises to at most `max` bytes, which keeps the largest record
+/// within the finding size limit (`tests/agent_health.rs`).
 fn health_label(s: &str, max: usize) -> String {
     s.chars()
         .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() && !matches!(c, '<' | '>' | '`') {
+            if c.is_ascii() && !c.is_ascii_control() && !matches!(c, '<' | '>' | '`' | '"' | '\\') {
                 c
             } else {
                 '?'

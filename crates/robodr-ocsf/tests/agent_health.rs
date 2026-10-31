@@ -114,3 +114,100 @@ fn bounds_are_enforced_on_parse_and_cut_by_the_builder() {
     v["entity_context"]["agent_health"]["state"] = "ok".into();
     assert!(parse_and_validate(&v.to_string()).is_err());
 }
+
+/// The largest record the limits allow (every list full, every name and
+/// reason at its byte limit, made of `"` so JSON escaping doubles it, every
+/// number at its maximum), duplicated into `ocsf.unmapped.robodr`, still
+/// fits `MAX_FINDING_BYTES`: otherwise `validate_for_emit` would drop the
+/// liveness record. A limit bump that breaks this fails here, not on a
+/// robot.
+#[test]
+fn a_worst_case_health_record_fits_the_size_limit() {
+    use health_limits::{ITEMS, NAME_BYTES, REASONS, REASON_BYTES};
+    let name = || "\"".repeat(NAME_BYTES);
+    let max = u64::MAX;
+    let h = AgentHealth {
+        state: HealthLabel::Degraded,
+        reasons: (0..REASONS).map(|_| "\"".repeat(REASON_BYTES)).collect(),
+        interval_ms: max,
+        uptime_ms: max,
+        seq: max,
+        versions: (0..ITEMS)
+            .map(|_| ComponentVersion {
+                component: name(),
+                version: name(),
+            })
+            .collect(),
+        inputs: (0..ITEMS)
+            .map(|_| InputFreshness {
+                name: name(),
+                last_rx_age_ms: Some(max),
+                received: max,
+                dropped: max,
+                malformed: max,
+                ended: false,
+            })
+            .collect(),
+        counters: HealthCounters {
+            findings_spooled: max,
+            finding_errors: max,
+            health_findings: max,
+            spool_dropped: max,
+            spool_write_errors: max,
+            note_errors: max,
+        },
+        blackbox: BlackBoxHealth {
+            degraded: true,
+            anchored: true,
+            anchor_failures: max,
+        },
+        reachability: (0..ITEMS)
+            .map(|_| Reachability {
+                component: name(),
+                state: ReachState::NotConfigured,
+                last_ok_age_ms: Some(max),
+            })
+            .collect(),
+        credentials: (0..ITEMS)
+            .map(|_| CredentialExpiry {
+                name: name(),
+                expires_ms: max,
+                days_to_expiry: i64::MIN,
+            })
+            .collect(),
+        clock: ClockHealth {
+            synchronized: Some(false),
+            max_error_ms: Some(max),
+            source: Some(ClockSource::Adjtimex),
+            adjtimex_errno: Some(u32::MAX),
+            timesync_age_ms: Some(max),
+            wall_jumps: max,
+        },
+        disks: (0..ITEMS)
+            .map(|_| DiskHealth {
+                name: name(),
+                free_bytes: max,
+                total_bytes: max,
+            })
+            .collect(),
+    };
+    let dev = Deviation::new(
+        AGENT_HEALTH_RULE,
+        Severity::Low,
+        "health record 18446744073709551615 of robodr-agentd (state degraded, up 18446744073709551 s)",
+    )
+    .with_mode(robodr_events::Mode::Observe);
+    let ctx = common::ctx();
+    let env = FindingBuilder::from_deviation(&dev, &ctx)
+        .agent_health(h)
+        .seen(common::T0, common::T0 + 60_000)
+        .occurrences(max)
+        .build()
+        .expect("worst-case health finding builds");
+    let json = to_json(&env).unwrap();
+    let limit = robodr_ocsf::validate::MAX_FINDING_BYTES;
+    assert!(json.len() <= limit, "{} bytes > {limit}", json.len());
+    validate_for_emit(&env).expect("emittable");
+    parse_and_validate(&json).expect("parses back");
+    eprintln!("worst-case health finding: {} bytes", json.len());
+}
