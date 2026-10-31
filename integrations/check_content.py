@@ -32,9 +32,18 @@
    robodr-findings removes robodr_verification and any robodr object, also
    given as dotted top-level keys (a forged finding run through it has no
    robodr.verification);
-   robodr-findings-verified keeps the verifier's status. Sentinel: the DCR's
+   robodr-findings-verified keeps the verifier's status and refuses a
+   document with a dotted top-level key (a forged
+   robodr_verification.status would merge into it). Splunk's verified
+   sourcetype reads a multivalue status as "malformed". Sentinel: the DCR's
    unverified stream does not declare robodr_verification and sets
    VerificationStatus empty; only the verified stream maps it.
+9. verify/robodr_verify.py: its copy of the contract's top-level fields is
+   the schema's; a correctly signed finding verifies; and each hostile
+   record below (a key outside the envelope, header forms the contract
+   refuses, input that used to crash it) is rejected on its own while the
+   record after it is still forwarded (needs `cryptography`; skipped with
+   a note without it).
    The evaluator implements only the processors and options the pipeline
    uses and fails on anything else, so a new processor needs a new
    evaluator branch (it is not Elasticsearch).
@@ -44,9 +53,11 @@ Exit 0 when everything holds, 1 with a list of problems otherwise.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import fnmatch
 import importlib.util
+import io
 import ipaddress
 import json
 import os
@@ -74,7 +85,9 @@ SPLUNK_VERIFIED = f'(NOT {SPLUNK_STATUS}=* OR {SPLUNK_STATUS}="verified")'
 SPLUNK_SOURCETYPES = {
     # sourcetype -> how props.conf computes SPLUNK_STATUS for it
     "robodr:finding": "null()",
-    "robodr:finding:verified": "'robodr_verification.status'",
+    # Only a single value: a forged dotted top-level key would add a second.
+    "robodr:finding:verified": "if(mvcount('robodr_verification.status')=1, "
+    "'robodr_verification.status', \"malformed\")",
 }
 
 problems: list[str] = []
@@ -276,6 +289,113 @@ def generated_match():
                         problem(f"{sub}/{f} differs from gen_detections.py output; regenerate")
 
 
+# ------------------------------------------------------------------ verifier
+
+
+def load_verify():
+    spec = importlib.util.spec_from_file_location("robodr_verify", os.path.join(HERE, "verify/robodr_verify.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def verifier(schema, findings):
+    """robodr_verify.py: its envelope is the contract's; hostile records are
+    rejected one by one and never stop the run (fuzz cases below)."""
+    v = load_verify()
+    envelope, required = getattr(v, "ENVELOPE", None), getattr(v, "REQUIRED", None)
+    if envelope != set(schema["properties"]) or required != set(schema["required"]):
+        problem(f"verify/robodr_verify.py: ENVELOPE/REQUIRED differ from the schema's top-level "
+                f"properties {sorted(schema['properties'])} / required {sorted(schema['required'])}")
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        print("check_content: cryptography not installed, robodr_verify.py fuzz cases skipped", file=sys.stderr)
+        return
+    if not findings:
+        return
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    value = json.dumps(findings[0], separators=(",", ":"))
+    robot = findings[0]["entity_context"]["robot"]["id"]
+    sk = Ed25519PrivateKey.generate()
+    pub = sk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    sig = sk.sign(v.signed_message("ed25519", "k", value.encode())).hex()
+    # A correctly signed record's header; the L2 cases below keep its
+    # signature (which verifies) and change only the header's form.
+    head = '{"alg":"ed25519","key_id":"k","sig":"' + sig + '"}'
+
+    def rec(val=value, sig=None, **extra):
+        headers = [] if sig is None else [["robodr-finding-sig", sig]]
+        return json.dumps(dict({"value": val, "headers": headers}, **extra))
+
+    def with_key(key, val="verified"):
+        f = dict(findings[0])
+        f[key] = val
+        return json.dumps(f, separators=(",", ":"))
+
+    deep = "[" * 20000 + "]" * 20000  # within the 64 KiB value cap
+    cases = {
+        "line not UTF-8": b'{"value": "\xff"}',
+        # H3: a key the SIEMs would read as (or merge into) the status.
+        "dotted status key": rec(with_key("robodr_verification.status")),
+        "own robodr_verification": rec(with_key("robodr_verification", {"status": "verified"})),
+        "dotted robodr key": rec(with_key("robodr.verification.status")),
+        "unknown top-level key": rec(with_key("x")),
+        "missing required key": rec(json.dumps({k: x for k, x in findings[0].items() if k != "title"})),
+        # M3: shapes that used to escape the Reject handling.
+        "header is a JSON array of ints": rec(sig="[1,2,3]"),
+        "header is a JSON string": rec(sig='"x"'),
+        "header lone surrogate": rec(sig="\ud800"),
+        "value lone surrogate": rec(val="\ud800"),
+        "value nested too deep": rec(val=deep),
+        "line nested too deep": deep,
+        "headers is a number": json.dumps({"value": value, "headers": 5}),
+        "header value not a string": rec(headers=[["robodr-finding-sig", 5]]),
+        "header pair of three": rec(headers=[["robodr-finding-sig", head, 1]]),
+        "header alg is an object": rec(sig='{"alg":{},"key_id":"k","sig":"' + sig + '"}'),
+        # L2: forms of a valid signature the contract and the Rust parser
+        # refuse (the signature itself verifies).
+        "header as pairs array": rec(sig=json.dumps([["alg", "ed25519"], ["key_id", "k"], ["sig", sig]])),
+        "header sig with trailing newline": rec(sig=head.replace('"}', '\\n"}')),
+        "header with whitespace": rec(sig=head.replace(",", ", ")),
+        "header with needless escape": rec(sig=head.replace('"k"', '"\\u006b"')),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        kr = os.path.join(d, "keys.json")
+        with open(kr, "w", encoding="utf-8") as fh:
+            json.dump({robot: {"k": pub}}, fh)
+        # The baseline: the correctly signed record verifies.
+        signed = os.path.join(d, "signed")
+        with open(signed, "w", encoding="utf-8") as fh:
+            fh.write(rec(sig=head) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = v.main(["--keyring", kr, "--reject", os.path.join(d, "rej-signed"), signed])
+        if code != 0 or '"status":"verified"' not in out.getvalue():
+            problem(f"verify/robodr_verify.py: a correctly signed finding does not verify (exit {code})")
+        for name, line in cases.items():
+            inp, rej = os.path.join(d, f"in-{len(name)}"), os.path.join(d, f"rej-{name}")
+            # The hostile record first, then a good (unsigned) one: the run
+            # must reject the first and still forward the second.
+            with open(inp, "wb") as fh:
+                fh.write((line if isinstance(line, bytes) else line.encode()) + b"\n" + rec().encode() + b"\n")
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    code = v.main(["--keyring", kr, "--policy", "optional", "--reject", rej, inp])
+            except Exception as e:  # noqa: BLE001
+                problem(f"verify/robodr_verify.py: {name}: crashed ({type(e).__name__}: {e})")
+                continue
+            with open(rej, encoding="utf-8") as fh:
+                rejected = [json.loads(x) for x in fh if x.strip()]
+            forwarded = out.getvalue().splitlines()
+            if code != 1 or [r["line"] for r in rejected] != [1] or len(forwarded) != 1:
+                problem(f"verify/robodr_verify.py: {name}: exit {code}, rejected {rejected}, "
+                        f"{len(forwarded)} forwarded (want line 1 rejected, line 2 forwarded)")
+
+
 # ------------------------------------------------------------------ elastic
 
 MUSTACHE = re.compile(r"\{\{\{([^}]+)\}\}\}")
@@ -323,9 +443,24 @@ class PipelineError(Exception):
     pass
 
 
+# Painless `if` conditions the pipelines use, by their exact text, and what
+# they mean (the evaluator does not run Painless: a new condition needs an
+# entry here).
+CONDITIONS = {
+    # Any top-level key with a dot (a literal "a.b" key, not a path).
+    "ctx.keySet().stream().anyMatch(k -> k.contains('.'))": lambda doc: any("." in k for k in doc),
+}
+
+
 def run_processor(p, doc, ingest):
     (kind, o), = p.items()
+    if "if" in o:
+        if kind != "fail" or o["if"] not in CONDITIONS:
+            raise SystemExit(f"evaluator: unsupported condition on {kind}: {o['if']!r}")
+        if not CONDITIONS[o["if"]](doc):
+            return
     allowed = {
+        "fail": {"if", "message"},
         "rename": {"field", "target_field", "ignore_missing"},
         "date": {"field", "target_field", "formats"},
         "set": {"field", "value", "copy_from", "ignore_empty_value"},
@@ -346,6 +481,8 @@ def run_processor(p, doc, ingest):
             for h in o["on_failure"]:
                 run_processor(h, doc, {"on_failure_message": str(e)})
         return
+    if kind == "fail":
+        raise PipelineError(o["message"])
     if kind == "convert":
         if o["type"] != "ip":
             raise SystemExit(f"evaluator: convert type {o['type']} not implemented")
@@ -436,13 +573,21 @@ VERIFIED_PIPELINE = "robodr-findings-verified"
 STAGING = "robodr_verified_by_forwarder"
 
 
+class Refused(Exception):
+    """The document is not indexed: a failure inside on_failure (Elasticsearch
+    returns it as the bulk item's error)."""
+
+
 def run_pipeline(pipeline, doc):
     try:
         for p in pipeline["processors"]:
             run_processor(p, doc, {})
     except PipelineError as e:
-        for p in pipeline.get("on_failure", []):
-            run_processor(p, doc, {"on_failure_message": str(e)})
+        try:
+            for p in pipeline.get("on_failure", []):
+                run_processor(p, doc, {"on_failure_message": str(e)})
+        except PipelineError as e2:
+            raise Refused(str(e2)) from None
     return doc
 
 
@@ -544,10 +689,27 @@ def elastic(schema, ids, findings):
             problem(f"elastic pipeline robodr-findings keeps a forged status: robodr.verification = "
                     f"{get_path(doc, 'robodr.verification')!r}, event.kind {get_path(doc, 'event.kind')!r}")
         forged["robodr_verification"] = {"status": "unsigned"}
-        doc = run_pipeline(verified, forged)
+        doc = run_pipeline(verified, {k: v for k, v in forged.items() if "." not in k})
         if get_path(doc, "robodr.verification") != {"status": "unsigned"} or STAGING in doc:
             problem(f"elastic pipeline {VERIFIED_PIPELINE}: robodr.verification = "
                     f"{get_path(doc, 'robodr.verification')!r}, want the verifier's status only")
+        # A dotted top-level key on the verified route (robodr_verify.py
+        # never emits one): expanded, robodr_verification.status would merge
+        # into the verifier's status (["unsigned", "verified"], which
+        # `robodr.verification.status : "verified"` matches); left literal,
+        # robodr.verification.status would be indexed as that field. The
+        # document is refused, also when the failure handler runs.
+        for key in ("robodr_verification.status", f"{STAGING}.status", "robodr.verification.status"):
+            one = copy.deepcopy(f)
+            one["robodr_verification"] = {"status": "unsigned"}
+            one[key] = "verified"
+            try:
+                doc = run_pipeline(verified, one)
+            except Refused:
+                continue
+            problem(f"elastic pipeline {VERIFIED_PIPELINE}: a dotted {key!r} key is indexed, "
+                    f"robodr.verification = {get_path(doc, 'robodr.verification')!r}, "
+                    f"root keys {sorted(k for k in doc if '.' in k)}")
     # A source address display that is not an IP (source.ip is mapped `ip`):
     # dropped in the pipeline, not left to fail the whole document at index time.
     with_src = [f for f in findings if get_path(f, "entity_context.ros.src_ip.display")]
@@ -735,6 +897,7 @@ def main(argv):
     splunk(schema, ids)
     generated_match()
     elastic(schema, ids, findings)
+    verifier(schema, findings)
     sentinel(schema, ids)
     with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
         readme = fh.read()

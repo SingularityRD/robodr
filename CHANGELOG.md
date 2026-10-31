@@ -49,6 +49,15 @@ requires a `## [<VERSION>]` section here and uses it as the release notes.
   rewritten to checked access, so a short or inconsistent packet, file or
   response takes the existing malformed / refused path instead of aborting
   under `panic = "abort"`. Wire formats and decisions are unchanged.
+- **SIEM verification status cannot be forged through a dotted key:**
+  `integrations/verify/robodr_verify.py` rejects a finding whose top-level
+  keys are not the contract's; the Elastic `robodr-findings-verified`
+  pipeline refuses a document with a dotted top-level key (a literal
+  `robodr_verified_by_forwarder.status` used to merge into the verifier's
+  status); Splunk's verified sourcetype reads a multivalue status as
+  `malformed`. The verifier now rejects any malformed record on its own
+  instead of crashing the run, and accepts only the producer's compact
+  signature header form, as the Rust parser now also requires.
 
 ### Changed (exporters)
 

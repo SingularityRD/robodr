@@ -236,7 +236,12 @@ impl FindingSignature {
 
     /// Parse and check a [`SIG_HEADER`] value: size-capped, exactly the three
     /// fields (no unknown or duplicate keys), `alg` = [`SIG_ALG`], a valid
-    /// key id and 128 lower-case hex digits.
+    /// key id and 128 lower-case hex digits, written exactly as
+    /// [`FindingSignature::to_header_value`] writes them (contract §2a:
+    /// compact, that field order). serde alone would also take another
+    /// order, whitespace or the `[alg, key_id, sig]` array form, which
+    /// `integrations/verify/robodr_verify.py` refuses: both verifiers give
+    /// the same verdict.
     pub fn from_header_value(s: &str) -> Result<Self, SignatureError> {
         if s.len() > MAX_SIG_HEADER_BYTES {
             return Err(SignatureError::Malformed("header value too long"));
@@ -244,6 +249,11 @@ impl FindingSignature {
         let me: Self = serde_json::from_str(s)
             .map_err(|_| SignatureError::Malformed("not a {alg,key_id,sig} object"))?;
         me.check()?;
+        if me.to_header_value() != s {
+            return Err(SignatureError::Malformed(
+                "not the compact {alg,key_id,sig} form",
+            ));
+        }
         Ok(me)
     }
 
@@ -542,6 +552,16 @@ mod tests {
                 "ab".repeat(64)
             ),
             v.replace('}', ""),
+            // Not the producer's compact form (review L2): another field
+            // order, whitespace, the serde array form, a needless escape.
+            format!(
+                "{{\"key_id\":\"ed25519:abcd\",\"alg\":\"ed25519\",\"sig\":\"{}\"}}",
+                "ab".repeat(64)
+            ),
+            v.replace("\",\"", "\", \""),
+            format!(" {v}"),
+            format!("[\"ed25519\",\"ed25519:abcd\",\"{}\"]", "ab".repeat(64)),
+            v.replace("ed25519:abcd", "ed25519:\\u0061bcd"),
         ];
         for b in &bad {
             assert!(FindingSignature::from_header_value(b).is_err(), "{b}");

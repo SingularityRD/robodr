@@ -16,7 +16,10 @@ Installs both ingest pipelines and the index template from this directory
    `threat.technique.id`, `source.ip`) and where the status ends up;
 2. `_simulate`s a finding carrying a forged status (robodr_verification,
    a robodr object, a dotted `robodr.verification.status` key) through
-   `robodr-findings`: no robodr.verification;
+   `robodr-findings`: no robodr.verification; and verifier output (status
+   `unsigned`) with a dotted `robodr_verification.status`,
+   `robodr_verified_by_forwarder.status` or `robodr.verification.status`
+   key through `robodr-findings-verified`: refused (no document);
 3. indexes every finding into the data stream `logs-robodr.findings-check`
    (verified pipeline; the template's default pipeline for the forged one)
    and searches it: one verified document per finding, none from the forged
@@ -163,6 +166,18 @@ def main(argv=None):
     if get(doc, "event.kind") != "alert" or get(doc, "robodr.verification") is not None:
         problem(f"robodr-findings kept a forged status: {get(doc, 'robodr.verification')!r}, "
                 f"event.kind {get(doc, 'event.kind')!r}")
+    # A dotted key on the verified route (robodr_verify.py never forwards
+    # one): expanded it would merge into the verifier's status, literal it
+    # would be indexed as robodr.verification.status. Refused either way.
+    dotted_keys = ("robodr_verification.status", "robodr_verified_by_forwarder.status",
+                   "robodr.verification.status")
+    outs = simulate(es, "robodr-findings-verified",
+                    [dict(copy.deepcopy(findings[0]), robodr_verification={"status": "unsigned"}, **{k: "verified"})
+                     for k in dotted_keys])
+    for key, doc in zip(dotted_keys, outs):
+        if not doc.get("error") or set(doc) != {"error"}:
+            problem(f"robodr-findings-verified indexed a document with a dotted {key!r} key: "
+                    f"robodr.verification = {get(doc, 'robodr.verification')!r}")
 
     # 3. Index and search.
     call(es, "DELETE", f"/_data_stream/{DS}")

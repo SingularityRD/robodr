@@ -16,10 +16,15 @@ step 1 cannot fire there; the remaining header must still verify.
 For each record (docs/contracts/robodr.findings.md section 2, "Verification"):
 
 1. exactly one ``robodr-finding-sig`` header (name case-insensitive), parsed
-   strictly: exactly ``alg``, ``key_id``, ``sig`` in that order, ``alg`` =
-   ``ed25519``, printable-ASCII key id of 1-128 bytes, 128 lower-case hex;
-2. NOT the contract's step 2: the value is only parsed as JSON and its
-   identity checked: it names a robot (``entity_context.robot.id``),
+   strictly: a JSON object of exactly ``alg``, ``key_id``, ``sig`` in that
+   order and in the compact form producers emit (no whitespace, no
+   needless escapes), ``alg`` = ``ed25519``, printable-ASCII key id of
+   1-128 bytes, 128 lower-case hex;
+2. NOT the contract's step 2: the value is only parsed as JSON, its
+   top-level keys checked against the contract envelope (every required
+   field, nothing else: no ``robodr_verification`` of its own, no dotted
+   key a SIEM would expand into one), and its identity checked: it names a
+   robot (``entity_context.robot.id``),
    ``external_id`` is exactly ``<robot id>:<finding_id>``,
    ``ocsf.finding_info.uid`` is ``finding_id`` and ``ocsf.device.uid`` is the
    robot. The strict validator (``robodr_ocsf::parse_and_validate``) is not
@@ -46,7 +51,13 @@ Verified findings are written to stdout as the finding object plus
 ``"robodr_verification": {"status": "verified", "key_id": ...}``. With
 ``--policy optional`` a record without the header passes as ``unsigned``
 (migration only). Anything else goes to ``--reject FILE`` (default stderr)
-with the reason, and is not forwarded.
+with the reason, and is not forwarded. A record the checks cannot handle
+(malformed input of any kind) is rejected the same way; it never stops
+the run, so the rest of the spool is still verified.
+
+The envelope is this script's copy of the contract's top-level fields
+(``ENVELOPE``): upgrade the script before robots emit a newer minor that
+adds one, as for every consumer (contract section 5).
 
 This checks origin, not content: run the schema validation
 (``integrations/schemas/validate_findings.py``) as well, and drop exact
@@ -61,6 +72,7 @@ Requires the ``cryptography`` package.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import struct
@@ -70,8 +82,19 @@ SIG_HEADER = "robodr-finding-sig"
 DOMAIN = b"robodr-ocsf/finding-sig/v1\x00"
 MAX_VALUE = 64 * 1024
 MAX_HEADER = 512
-KEY_ID = re.compile(r"^[!-~]{1,128}$")
-SIG = re.compile(r"^[0-9a-f]{128}$")
+KEY_ID = re.compile(r"[!-~]{1,128}")  # always fullmatch: `$` allows a trailing newline
+SIG = re.compile(r"[0-9a-f]{128}")
+# The finding's top-level fields (docs/contracts/robodr-finding.schema.json;
+# integrations/check_content.py checks this copy against it). Anything else
+# is refused: the SIEMs read the verifier's own robodr_verification next to
+# these, and Elasticsearch and Splunk expand a dotted top-level key such as
+# "robodr_verification.status" into that same object.
+REQUIRED = frozenset(
+    "contract_version finding_id external_id data_source title description severity "
+    "timestamp entity_context mitre_predictions evidence_links adversary_controlled_fields "
+    "ocsf".split()
+)
+ENVELOPE = REQUIRED | {"anomaly_score"}
 
 # Ed25519 (RFC 8032) field and group constants for the strict checks.
 _P = 2**255 - 19
@@ -82,6 +105,10 @@ _SQRT_M1 = pow(2, (_P - 1) // 4, _P)
 
 class Reject(Exception):
     pass
+
+
+class _Object(list):
+    """A JSON object as its (key, value) pairs, in order, duplicates kept."""
 
 
 def signed_message(alg: str, key_id: str, value: bytes) -> bytes:
@@ -134,7 +161,11 @@ def strong_point(b: bytes) -> bool:
 
 
 def header_value(headers) -> str | None:
-    pairs = headers.items() if isinstance(headers, dict) else headers or []
+    if headers is None:
+        return None
+    if not isinstance(headers, (dict, list)):
+        raise Reject("malformed headers")
+    pairs = headers.items() if isinstance(headers, dict) else headers
     found = None
     for pair in pairs:
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
@@ -149,23 +180,46 @@ def header_value(headers) -> str | None:
     return found
 
 
+def utf8(s: str, what: str) -> bytes:
+    try:
+        return s.encode("utf-8")
+    except UnicodeEncodeError:
+        raise Reject(f"{what} is not valid UTF-8 (lone surrogate)") from None
+
+
 def parse_header(h: str):
-    if len(h.encode()) > MAX_HEADER:
+    if len(utf8(h, "signature header")) > MAX_HEADER:
         raise Reject("signature header too long")
     try:
-        pairs = json.loads(h, object_pairs_hook=lambda p: p)
-    except ValueError:
+        pairs = json.loads(h, object_pairs_hook=_Object)
+    except (ValueError, RecursionError):
         raise Reject("signature header is not JSON") from None
-    if not isinstance(pairs, list) or [k for k, _ in pairs] != ["alg", "key_id", "sig"]:
-        raise Reject("signature header must be exactly alg, key_id, sig in that order")
+    # An object (not an array of pairs) with exactly these keys, in order.
+    if not isinstance(pairs, _Object) or [k for k, _ in pairs] != ["alg", "key_id", "sig"]:
+        raise Reject("signature header must be an object of exactly alg, key_id, sig in that order")
     d = dict(pairs)
     if d["alg"] != "ed25519":
-        raise Reject(f"unsupported signature algorithm {d['alg']!r}")
-    if not isinstance(d["key_id"], str) or not KEY_ID.match(d["key_id"]):
+        raise Reject("unsupported signature algorithm (not ed25519)")
+    if not isinstance(d["key_id"], str) or not KEY_ID.fullmatch(d["key_id"]):
         raise Reject("bad key id")
-    if not isinstance(d["sig"], str) or not SIG.match(d["sig"]):
+    if not isinstance(d["sig"], str) or not SIG.fullmatch(d["sig"]):
         raise Reject("signature is not 128 lower-case hex digits")
+    # Byte for byte the compact form producers emit
+    # (robodr_ocsf::FindingSignature::to_header_value, which the Rust parser
+    # also requires): no whitespace, no needless escapes.
+    if h != json.dumps(d, separators=(",", ":")):
+        raise Reject("signature header is not in the compact form")
     return d["alg"], d["key_id"], bytes.fromhex(d["sig"])
+
+
+def check_envelope(finding: dict) -> None:
+    """Exactly the contract's top-level fields: every required one, no other."""
+    extra = [k for k in finding if k not in ENVELOPE]
+    if extra:
+        raise Reject(f"{len(extra)} top-level key(s) not in the finding contract, e.g. {extra[0][:64]!r}")
+    missing = sorted(REQUIRED - finding.keys())
+    if missing:
+        raise Reject(f"finding lacks {', '.join(missing)}")
 
 
 def robot_of(finding) -> str:
@@ -196,16 +250,17 @@ def verify(record, keyring, policy: str):
 
     if not isinstance(record, dict) or not isinstance(record.get("value"), str):
         raise Reject("record has no string value")
-    raw = record["value"].encode("utf-8")
+    raw = utf8(record["value"], "value")
     if len(raw) > MAX_VALUE:
         raise Reject("value larger than 64 KiB")
     h = header_value(record.get("headers"))
     try:
         finding = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise Reject("value is not JSON") from None
     if not isinstance(finding, dict):
         raise Reject("value is not a JSON object")
+    check_envelope(finding)
     robot = robot_of(finding)
     if h is None:
         if policy == "optional":
@@ -258,8 +313,18 @@ def main(argv=None) -> int:
         print("python3 package 'cryptography' is required", file=sys.stderr)
         return 2
     keyring = load_keyring(a.keyring)
-    rej = open(a.reject, "a", encoding="utf-8") if a.reject else sys.stderr
-    sources = [open(f, encoding="utf-8") for f in a.files] or [sys.stdin]
+    with contextlib.ExitStack() as stack:
+        rej = stack.enter_context(open(a.reject, "a", encoding="utf-8")) if a.reject else sys.stderr
+        # Bytes, decoded line by line: a line that is not UTF-8 is rejected
+        # on its own instead of ending the run.
+        sources = [stack.enter_context(open(f, "rb")) for f in a.files] or [sys.stdin.buffer]
+        ok, bad = run(sources, rej, keyring, a.policy)
+    print(f"robodr_verify: {ok} forwarded, {bad} rejected", file=sys.stderr)
+    return 0 if bad == 0 else 1
+
+
+def run(sources, rej, keyring, policy: str):
+    """Verify every line of `sources`; returns (forwarded, rejected)."""
     ok = bad = 0
     for src in sources:
         for n, line in enumerate(src, 1):
@@ -267,19 +332,28 @@ def main(argv=None) -> int:
                 continue
             try:
                 try:
-                    record = json.loads(line)
-                except ValueError:
+                    record = json.loads(line.decode("utf-8"))
+                except UnicodeDecodeError:
+                    raise Reject("line is not UTF-8") from None
+                except (ValueError, RecursionError):
                     raise Reject("line is not JSON") from None
-                finding, status = verify(record, keyring, a.policy)
+                finding, status = verify(record, keyring, policy)
+                finding["robodr_verification"] = status
+                out = json.dumps(finding, separators=(",", ":")) + "\n"
             except Reject as e:
                 bad += 1
                 rej.write(json.dumps({"line": n, "reason": str(e)}) + "\n")
                 continue
-            finding["robodr_verification"] = status
-            sys.stdout.write(json.dumps(finding, separators=(",", ":")) + "\n")
+            except Exception as e:  # noqa: BLE001
+                # Input the checks above did not foresee: reject this record
+                # and go on. One crafted record must not stop verified ingest
+                # (and every rerun would crash on the same line again).
+                bad += 1
+                rej.write(json.dumps({"line": n, "reason": f"malformed record ({type(e).__name__})"}) + "\n")
+                continue
+            sys.stdout.write(out)
             ok += 1
-    print(f"robodr_verify: {ok} forwarded, {bad} rejected", file=sys.stderr)
-    return 0 if bad == 0 else 1
+    return ok, bad
 
 
 if __name__ == "__main__":

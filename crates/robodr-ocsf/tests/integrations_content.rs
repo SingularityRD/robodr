@@ -10,7 +10,10 @@
 //!   sourcetype, Elastic pipeline, Sentinel stream).
 //! * `integrations/verify/robodr_verify.py`: findings signed by this crate
 //!   verify; tampered values, another robot's key, duplicate or malformed
-//!   headers and (under the strict policy) missing headers are rejected.
+//!   headers (also any form but the producer's compact one), top-level
+//!   keys outside the contract and (under the strict policy) missing
+//!   headers are rejected, and a record that used to crash the run is
+//!   rejected on its own while the records after it are still verified.
 //!
 //! Needs `python3` with PyYAML, and `cryptography` for the verifier. Skipped
 //! with a message when missing, unless `ROBODR_REQUIRE_EXTERNAL_VALIDATOR=1`
@@ -230,6 +233,17 @@ fn record(value: &str, headers: Value) -> String {
     json!({"value": value, "headers": headers}).to_string()
 }
 
+/// The same signature header as an array of `[name, value]` pairs.
+fn pairs_form(header: &str) -> String {
+    let h: Value = serde_json::from_str(header).unwrap();
+    json!([
+        ["alg", h["alg"]],
+        ["key_id", h["key_id"]],
+        ["sig", h["sig"]]
+    ])
+    .to_string()
+}
+
 #[test]
 fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
     let dir = scratch("verify");
@@ -342,6 +356,31 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
             record(&value, json!([["robodr-finding-sig", upper_sig]])),
             false,
         ),
+        // The header forms the contract (and the Rust parser) refuse, with
+        // a signature that verifies (review L2): a pairs array instead of an
+        // object, a trailing newline (`$` matched before it, and
+        // bytes.fromhex skipped it), whitespace.
+        (
+            "header as pairs array",
+            record(&value, json!([["robodr-finding-sig", pairs_form(&sig)]])),
+            false,
+        ),
+        (
+            "sig with trailing newline",
+            record(
+                &value,
+                json!([["robodr-finding-sig", sig.replace("\"}", "\\n\"}")]]),
+            ),
+            false,
+        ),
+        (
+            "header with whitespace",
+            record(
+                &value,
+                json!([["robodr-finding-sig", sig.replace("\",\"", "\", \"")]]),
+            ),
+            false,
+        ),
         ("not json", "nope".to_string(), false),
         (
             // Correctly signed by ugv-007, but external_id does not bind
@@ -380,15 +419,35 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
         }
     }
     // Optional policy: an unsigned finding passes, marked unsigned; a bad
-    // signature still fails.
+    // signature still fails. So do (review H3) an unsigned finding with a
+    // top-level key outside the contract, here a literal
+    // "robodr_verification.status" that Elasticsearch and Splunk would
+    // read as (part of) the verifier's status, and (review M3) records
+    // that used to crash the run: the unsigned finding after them is
+    // still forwarded.
+    let dotted = format!(
+        "{},\"robodr_verification.status\":\"verified\"}}",
+        value.strip_suffix('}').unwrap()
+    );
+    let own_status = format!(
+        "{},\"robodr_verification\":{{\"status\":\"verified\"}}}}",
+        value.strip_suffix('}').unwrap()
+    );
     let input = dir.join("opt.ndjson");
     std::fs::write(
         &input,
-        format!(
-            "{}\n{}\n",
+        [
+            record(&tampered, json!([["robodr-finding-sig", sig]])),
+            record(&dotted, json!([])),
+            record(&own_status, json!([])),
+            record(&value, json!([["robodr-finding-sig", "[1,2,3]"]])),
+            record(&value, json!(7)),
+            // A lone surrogate escape: valid JSON, not UTF-8 once decoded.
+            r#"{"value":"\ud800","headers":[]}"#.to_string(),
             record(&value, json!([])),
-            record(&tampered, json!([["robodr-finding-sig", sig]]))
-        ),
+        ]
+        .join("\n")
+            + "\n",
     )
     .unwrap();
     if let Some(o) = python(
@@ -397,8 +456,11 @@ fn pipeline_verifier_accepts_signed_findings_and_rejects_the_rest() {
         Some(&input),
     ) {
         let out = String::from_utf8_lossy(&o.stdout).to_string();
-        assert_eq!(out.lines().count(), 1, "{out}");
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        assert_eq!(out.lines().count(), 1, "{out}\n{err}");
         assert!(out.contains("\"status\":\"unsigned\""), "{out}");
+        assert!(!out.contains("robodr_verification.status"), "{out}");
+        assert!(err.contains("1 forwarded, 6 rejected"), "{err}");
         assert_eq!(o.status.code(), Some(1));
     }
     assert!(failures.is_empty(), "{failures:#?}");
