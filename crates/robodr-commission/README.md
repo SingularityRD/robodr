@@ -391,13 +391,19 @@ runs.
   need care. Adding the *first* reader topics switches enforcement on, which
   is `reader-topic enforcement: off -> on [tightens]`. Removing all of them
   switches it off, which is `[LOOSENS]`. Adding reader topics while
-  enforcement is already on is `[LOOSENS]`.
+  enforcement is already on is `[LOOSENS]`. Bound safety configuration
+  (`bound_config`, see `bind` below) that was added, re-bound or removed is
+  listed as `bound <role>` with both digests (`bound_config_changes` in
+  `--json`) and marked `[REVIEW the file]`: whether a new policy or firewall
+  file permits more depends on its content, which `diff` does not read.
 * **merge** refuses an input with a bound above the hard caps (same flags as
   `lock`), so "larger bound wins" cannot carry a hand-edited `1e300` into the
   result. It also unions services, actions, raw DDS topics and reader topics.
   It refuses to mix profiles that enforce reader topics with profiles that do
   not, because the union would start enforcing readers that the other
-  missions never recorded.
+  missions never recorded. It does not carry over `bound_config`: the
+  merged draft binds nothing until `bind` runs on it again, so a unit using
+  it treats the policy and adapters as not OEM-validated.
 * **check** runs `Profile::evaluate` on every event, plus one rule of this
   crate's own, `commission.motion.anomalous_speed` (see Limits).
 
