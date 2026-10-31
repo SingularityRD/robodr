@@ -220,6 +220,121 @@ fn a_deb_for_another_architecture_is_refused() {
     );
 }
 
+/// Copy `/bin/sh` and the libraries it loads into `root`: dpkg runs
+/// maintainer scripts chrooted into `--root`.
+fn shell_into(root: &Path) {
+    let sh = std::fs::canonicalize("/bin/sh").unwrap();
+    let mut files = vec![sh.clone()];
+    let o = Command::new("ldd").arg(&sh).output().unwrap();
+    for l in String::from_utf8_lossy(&o.stdout).lines() {
+        if let Some(p) = l.split_whitespace().find(|w| w.starts_with('/')) {
+            files.push(PathBuf::from(p));
+        }
+    }
+    for f in &files {
+        let dest = root.join(f.strip_prefix("/").unwrap());
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(f, &dest).unwrap();
+    }
+    let dest = root.join("bin/sh");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    if !dest.exists() {
+        std::fs::copy(&sh, &dest).unwrap();
+    }
+}
+
+/// T52: every `dpkg --install` carries ROBODR_DELIVERD_INSTALL=1 into the
+/// maintainer scripts, so RoboDR's own postinst knows its caller is this
+/// agent and does not restart robodr-deliverd.service from inside the
+/// dpkg run the agent is waiting for (which would kill dpkg and the
+/// postinst with it). Nothing else of the agent's environment leaks.
+#[test]
+fn maintainer_scripts_see_the_deliverd_install_marker() {
+    if !dpkg_available("deb_install_marker") {
+        return;
+    }
+    let u = Unit::new("deb-marker");
+    let root = dpkg_root(&u);
+    shell_into(&root);
+    stub_deb(&u.work, "1.0", true, true);
+    let st = u.work.join("stage-1.0-true-true");
+    std::fs::write(
+        st.join("DEBIAN/postinst"),
+        "#!/bin/sh\necho \"marker=${ROBODR_DELIVERD_INSTALL:-unset} \
+         home=${HOME:-unset}\" >/postinst-env\nexit 0\n",
+    )
+    .unwrap();
+    let out = u.work.join("marker.deb");
+    assert!(Command::new("dpkg-deb")
+        .args(["--root-owner-group", "--build"])
+        .arg(&st)
+        .arg(&out)
+        .status()
+        .unwrap()
+        .success());
+    let r = deb_rpk(&u, 1, &std::fs::read(&out).unwrap(), true);
+    let b = u.bundle(1, None, std::slice::from_ref(&r));
+    u.pack("p1", 1, &[r], &[b]);
+    let mut e = u.open();
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr-stub 1".to_string()]),
+        "{reps:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("postinst-env")).unwrap(),
+        "marker=1 home=unset\n"
+    );
+}
+
+/// T52, the package side: the upgrade-restart loop of RoboDR's postinst
+/// (between its `restart_on_upgrade` markers), with `systemctl` replaced
+/// by a shell function that logs. Under the agent's marker every unit but
+/// robodr-deliverd.service is try-restarted; without it (apt, an operator,
+/// install-bundle.sh) all of them, as before.
+#[test]
+fn postinst_leaves_the_deliverd_restart_to_the_agent_under_its_marker() {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/deb/postinst");
+    let s = std::fs::read_to_string(&p).unwrap();
+    let a = s
+        .find("# >>> restart_on_upgrade")
+        .expect("postinst has no restart_on_upgrade block");
+    let b = s.find("# <<< restart_on_upgrade").unwrap();
+    let block = &s[a..b];
+    let t = Tmp::new("postinst-restart");
+    let run = |marker: Option<&str>| -> Vec<String> {
+        let log = t.path().join(format!("log-{}", marker.unwrap_or("none")));
+        let script = format!("set -e\nsystemctl() {{ echo \"$*\" >>\"$LOG\"; }}\n{block}\n");
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", &script, "sh"]).env("LOG", &log);
+        match marker {
+            Some(m) => c.env("ROBODR_DELIVERD_INSTALL", m),
+            None => c.env_remove("ROBODR_DELIVERD_INSTALL"),
+        };
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let all = run(None);
+    assert_eq!(all.len(), 10, "{all:?}");
+    assert!(all.contains(&"try-restart robodr-deliverd.service".to_string()));
+    let other = run(Some("0"));
+    assert_eq!(other, all);
+    let under = run(Some("1"));
+    let expected: Vec<String> = all
+        .iter()
+        .filter(|l| *l != "try-restart robodr-deliverd.service")
+        .cloned()
+        .collect();
+    assert_eq!(under, expected);
+    assert!(under.contains(&"try-restart robodr-agentd.service".to_string()));
+}
+
 const RULES_OK: &str = r#"[[rules]]
 name = "robodr-delivered-test"
 type = "Exec"

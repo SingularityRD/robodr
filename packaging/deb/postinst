@@ -158,12 +158,22 @@ configure)
         done
         if [ -n "$2" ]; then
             # Upgrade: restart only what was running.
+            # >>> restart_on_upgrade (crates/robodr-deliverd/tests/kinds.rs runs this block)
+            # Under robodr-deliverd (its dpkg runs carry
+            # ROBODR_DELIVERD_INSTALL=1) the agent is not restarted here: it
+            # waits for this dpkg run, and stopping its unit would kill dpkg
+            # and this script with it. It restarts itself once its pass is
+            # done (it exits 3 when its binary was replaced; T52).
             for u in robodr-pulsard.service robodr-agentd.service robodr-anchor-receiver.service \
                 robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
                 robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service \
                 robodr-depot.service; do
+                if [ "$u" = robodr-deliverd.service ] && [ "${ROBODR_DELIVERD_INSTALL:-}" = 1 ]; then
+                    continue
+                fi
                 systemctl try-restart "$u" || true
             done
+            # <<< restart_on_upgrade
         else
             echo "robodr: installed. Services are disabled until commissioning is"
             echo "robodr: complete: see /usr/share/doc/robodr/OPERATIONS.md"
