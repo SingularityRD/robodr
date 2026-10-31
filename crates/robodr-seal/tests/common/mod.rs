@@ -138,6 +138,68 @@ pub fn listening(port: u16) -> bool {
         .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
 }
 
+/// The inodes of the sockets listening on TCP `port` (any address, IPv4
+/// or IPv6), from `/proc/net/tcp{,6}` of this network namespace.
+fn listening_inodes(port: u16) -> Vec<String> {
+    let want = format!("{port:04X}");
+    let mut out = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (Some(local), Some(st), Some(inode)) = (f.get(1), f.get(3), f.get(9)) else {
+                continue;
+            };
+            // st 0A: TCP_LISTEN.
+            if *st == "0A" && local.rsplit(':').next() == Some(want.as_str()) {
+                out.push((*inode).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Process `pid` itself holds a socket listening on `port`: not merely
+/// "something answers on the port" (another process may have taken it
+/// between [`port_pair`] releasing its probe sockets and swtpm binding).
+pub fn listens_on(pid: u32, port: u16) -> bool {
+    let inodes = listening_inodes(port);
+    if inodes.is_empty() {
+        return false;
+    }
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.filter_map(Result::ok).any(|e| {
+        std::fs::read_link(e.path()).is_ok_and(|l| {
+            let l = l.to_string_lossy();
+            inodes.iter().any(|i| l == format!("socket:[{i}]"))
+        })
+    })
+}
+
+/// Wait until the swtpm `child` itself listens on both of its ports.
+/// `Err` (with the reason) when it exits first or after 10 s.
+fn wait_owned(child: &mut Child, port: u16, ctrl: u16) -> Result<(), String> {
+    let t0 = Instant::now();
+    loop {
+        if listens_on(child.id(), port) && listens_on(child.id(), ctrl) {
+            return Ok(());
+        }
+        if let Some(st) = child.try_wait().unwrap() {
+            return Err(format!(
+                "swtpm exited ({st}) before listening on {port}/{ctrl}"
+            ));
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            return Err(format!("swtpm did not listen on {port}/{ctrl} within 10 s"));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
 fn wait_port(port: u16, what: &str) {
     let t0 = Instant::now();
     while !listening(port) {
@@ -165,34 +227,23 @@ pub struct SwTpm {
 impl SwTpm {
     pub fn start(state: &Path) -> Self {
         std::fs::create_dir_all(state).unwrap();
-        // A port may be taken by another process: swtpm then exits at
-        // once, and the next pair of ports is tried.
+        // A port may be taken by another process: swtpm then exits, and
+        // the next pair of ports is tried. Ready means our swtpm process
+        // holds both listening sockets ([`listens_on`]), so another
+        // listener on the port can never pass for it.
         for _ in 0..8 {
             let (port, ctrl) = port_pair();
             let mut child = Self::spawn(state, port, ctrl);
-            let t0 = Instant::now();
-            loop {
-                // Ours: something answers on the port AND our swtpm is
-                // still running a moment later (one that lost the port to
-                // another listener exits at once).
-                if listening(port) && {
-                    std::thread::sleep(Duration::from_millis(50));
-                    child.try_wait().unwrap().is_none()
-                } {
-                    return Self {
-                        child,
-                        port,
-                        ctrl,
-                        state: state.to_path_buf(),
-                    };
-                }
-                if child.try_wait().unwrap().is_some() || t0.elapsed() > Duration::from_secs(10) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(30));
+            if wait_owned(&mut child, port, ctrl).is_ok() {
+                return Self {
+                    child,
+                    port,
+                    ctrl,
+                    state: state.to_path_buf(),
+                };
             }
+            let _ = child.kill();
+            let _ = child.wait();
         }
         let log = std::fs::read_to_string(state.join("swtpm.log")).unwrap_or_default();
         let tail: Vec<&str> = log.lines().rev().take(8).collect();
@@ -253,7 +304,13 @@ impl SwTpm {
         // The port may linger briefly.
         std::thread::sleep(Duration::from_millis(200));
         self.child = Self::spawn(&self.state, self.port, self.ctrl);
-        wait_port(self.port, "swtpm");
+        // Same ports (the TCTI and work directory derive from them): our
+        // swtpm must hold them again, not whatever took them meanwhile.
+        if let Err(why) = wait_owned(&mut self.child, self.port, self.ctrl) {
+            let log = std::fs::read_to_string(self.state.join("swtpm.log")).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(8).collect();
+            panic!("swtpm did not restart: {why} (swtpm.log, newest first: {tail:?})");
+        }
     }
 
     pub fn tcti(&self) -> String {
