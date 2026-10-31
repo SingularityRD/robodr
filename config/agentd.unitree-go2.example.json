@@ -1,0 +1,133 @@
+{
+  "robot": {
+    "id": "unitree-go2-001",
+    "site": "site-a",
+    "model": "unitree-go2-edu",
+    "robot_model": "Go2"
+  },
+  "sensor": {
+    "profile_path": "/etc/robodr/profile.json",
+    "listen_spdp": false,
+    "capture": {
+      "enabled": true,
+      "interfaces": [
+        "eth0"
+      ]
+    },
+    "profile_trust": {
+      "trusted_keys": "/etc/robodr/profile-trust.json",
+      "state_file": "/var/lib/robodr/profile-state/agentd.json",
+      "expect_platform": "unitree-go2",
+      "expect_unit_id": "unitree-go2-001"
+    }
+  },
+  "policy_path": "/etc/robodr/response-policy.json",
+  "blackbox": {
+    "dir": "/var/lib/robodr/blackbox/agentd",
+    "key_file": "/run/credentials/robodr-agentd.service/blackbox.key"
+  },
+  "spool": {
+    "dir": "/var/lib/robodr/spool/agentd",
+    "status_socket": "/run/robodr-agentd/status.sock"
+  },
+  "context": {
+    "safety_state": "unknown",
+    "control": "autonomous",
+    "phase": "unknown"
+  },
+  "safety_feed": {
+    "stale_after_ms": 500,
+    "topics": [
+      {
+        "topic": "/sportmodestate",
+        "type": "unitree_go::msg::dds_::SportModeState_",
+        "writers": [
+          "0123456789abcdef01234567"
+        ],
+        "unitree_sport": {
+          "modes": {
+            "0": "none",
+            "1": "none",
+            "2": "none",
+            "3": "none",
+            "5": "none",
+            "6": "none",
+            "7": "safe_state_active",
+            "8": "moving_slow",
+            "10": "none",
+            "11": "moving_fast",
+            "12": "moving_fast",
+            "13": "moving_fast"
+          },
+          "motion": {
+            "moving_above": 0.05,
+            "fast_above": 1.0,
+            "angular_moving_above": 0.1,
+            "hysteresis": 0.02
+          },
+          "error_code_nonzero": "unknown",
+          "phase": {
+            "0": "parked",
+            "1": "parked",
+            "2": "parked",
+            "3": "transit",
+            "5": "parked",
+            "6": "parked",
+            "7": "parked",
+            "8": "unknown",
+            "10": "parked",
+            "11": "unknown",
+            "12": "unknown",
+            "13": "unknown"
+          }
+        },
+        "on_stale": {
+          "phase": "unknown"
+        }
+      },
+      {
+        "topic": "/lowstate",
+        "type": "unitree_go::msg::dds_::LowState_",
+        "writers": [
+          "0123456789abcdef01234567"
+        ],
+        "unitree_low": {
+          "moving_above": 0.5,
+          "fast_above": 5.0,
+          "hysteresis": 0.1
+        }
+      },
+      {
+        "topic": "/wirelesscontroller",
+        "type": "unitree_go::msg::dds_::WirelessController_",
+        "writers": [
+          "0123456789abcdef01234567"
+        ],
+        "stale_after_ms": 2000,
+        "wireless_controller": {
+          "deadzone": 0.1,
+          "hold_ms": 5000,
+          "control": "manual"
+        },
+        "on_stale": {
+          "control": "manual"
+        }
+      }
+    ]
+  },
+  "firewall": {
+    "joint_config": "/etc/robodr/firewall.json",
+    "max_angular": {
+      "/api/sport/request": 1.0
+    }
+  },
+  "correlation": {
+    "enabled": true,
+    "include_default_rules": true
+  },
+  "daemon": {
+    "tick_ms": 1000,
+    "heartbeat_ms": 10000,
+    "silence_ms": 30000
+  }
+}
