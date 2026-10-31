@@ -18,6 +18,9 @@
 //!   (Sprint 14a; pure, the sockets are the depot's and the agent's);
 //! * [`parity`]: Reed-Solomon parity over bundle files with
 //!   `robodr-diode`'s code;
+//! * [`minisign`] (with [`blake2b`]): minisign release-signature
+//!   verification, so the robot checks a release bundle with RoboDR's own
+//!   code (`robodr-deliverd verify-minisign`, `packaging/install-bundle.sh`);
 //! * [`common`]: refusal codes, the canonical-JSON reader, validators.
 //!
 //! **No I/O.** Every function takes the bytes it judges (or callbacks that
@@ -51,10 +54,12 @@
     )
 )]
 
+pub mod blake2b;
 pub mod bundle;
 pub mod common;
 pub mod deployment;
 pub mod entry;
+pub mod minisign;
 pub mod parity;
 pub mod rpk;
 pub mod sig;
