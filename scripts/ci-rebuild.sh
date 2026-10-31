@@ -83,8 +83,10 @@ chmod 0755 "$stage"/robodr-*
 
 case "$kind" in
 deb)
-    SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
     deb="$(packaging/build-deb.sh --bin-dir "$stage" --arch "$arch" --out "$out")"
+    SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+    # The SBOMs of the crates the package ships, selected as release.yml does.
+    python3 scripts/sbom-select.py dist/sbom --package "$deb"
     packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out "$out" >/dev/null
     (cd "$out" && sha256sum robodr_*.deb robodr-*-offline.tar.gz) >"$out/PACKAGES-$kind-$arch.sha256"
     ;;
@@ -94,12 +96,12 @@ rpm)
     (cd "$out" && sha256sum robodr-*.rpm robodr-*-rpm-offline.tar.gz) >"$out/PACKAGES-$kind-$arch.sha256"
     ;;
 focal)
-    SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
-    # As release.yml's robodr-focal job: robodr-focal does not ship
-    # robodr-pulsard, so its SBOM is not in the bundle (the rebuild
-    # comparison fails on a member present in one bundle only).
-    rm -f dist/sbom/*robodr-pulsard*.cdx.json
     deb="$(packaging/build-deb.sh --variant focal --bin-dir "$stage" --arch "$arch" --out "$out")"
+    SBOM_TOOL=cyclonedx scripts/sbom.sh dist/sbom
+    # As release.yml's robodr-focal job (no robodr-pulsard SBOM, among
+    # others): the rebuild comparison fails on a bundle member present in
+    # one bundle only.
+    python3 scripts/sbom-select.py dist/sbom --package "$deb"
     packaging/make-bundle.sh --deb "$deb" --sbom-dir dist/sbom --out "$out" >/dev/null
     (cd "$out" && sha256sum robodr-focal*) >"$out/PACKAGES-$kind-$arch.sha256"
     ;;

@@ -116,6 +116,7 @@ jobs:
           python3 scripts/check-packages.py --self-test
           python3 scripts/third_party_notices.py --self-test
           python3 scripts/compare-rebuild.py --self-test
+          python3 scripts/sbom-select.py --self-test
           python3 scripts/check-detection-catalog.py --self-test
           python3 scripts/check-doc-facts.py --self-test
           scripts/ci-install-ebpf-toolchain.sh --self-test

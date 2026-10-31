@@ -296,7 +296,10 @@ released from a protected branch `release/0.1`:
 
 1. Create `release/0.1` from the last `v0.1.*` tag; protect it like `main`
    (required reviews, `ci.yml` jobs as required checks, no force push).
-   `ci.yml` must run on pushes to `release/**`.
+   The release commit needs a successful `ci.yml` run of its own: `ci.yml`
+   runs on pushes to `main` only, so start it by hand on `release/0.1`
+   (`workflow_dispatch`, which the CI gate counts), or add a `release/**`
+   push trigger to `ci.yml` (section 3, step 1).
 2. Cherry-pick or backport the fix with a reviewed PR into `release/0.1`;
    release commit as in section 3 (version `0.1.4`).
 3. Tag `v0.1.4` on that branch. `prepare` accepts it only because the commit
@@ -385,7 +388,15 @@ served (authenticated portal or registry) is the delivery-channel decision
 
 ## 9. SBOMs and provenance
 
-Every SBOM archive holds cargo-cyclonedx's per-crate CycloneDX 1.5 SBOMs,
+Every SBOM archive holds cargo-cyclonedx's per-crate CycloneDX 1.5 SBOMs
+for the crates its package ships: `scripts/sbom-select.py` keeps the SBOM
+of each crate that builds a `robodr-*` program in the package's `usr/bin`
+or `usr/sbin`, and of each workspace crate those depend on (normal or build
+dependency), and removes the rest (for example `robodr-attack-sim`,
+`robodr-demo-soc` and the benches in every archive, and `robodr-pulsard`
+and the crates only it uses in the `robodr-focal` ones). The independent
+rebuild (`scripts/ci-rebuild.sh`) runs the same selection, so the release
+and rebuilt bundles carry the same SBOM members. The SBOMs are then
 completed by `scripts/release-sbom-augment.sh`
 (`scripts/metadata_to_cyclonedx.py --augment`) with what cargo does not
 see: Rust `std`/`core`/`alloc` of the pinned toolchain; for the musl builds
