@@ -1285,6 +1285,9 @@ pub struct Engine {
     /// every unknown id is refused when the black box could not be read.
     lost_ids: std::collections::HashSet<String>,
     refuse_new: Option<String>,
+    /// Per-key action scopes and TTL limits (T67); a key not listed here
+    /// is unrestricted (unit tests; agentd lists every configured key).
+    scopes: std::collections::BTreeMap<String, super::auth::KeyScope>,
     pub stats: EngineStats,
 }
 
@@ -1312,8 +1315,40 @@ impl Engine {
             journal: None,
             lost_ids: std::collections::HashSet::new(),
             refuse_new: None,
+            scopes: std::collections::BTreeMap::new(),
             stats: EngineStats::default(),
         }
+    }
+
+    /// Install the per-key scopes (`control_plane.soc_keys`, T67).
+    pub fn set_key_scopes(
+        &mut self,
+        scopes: std::collections::BTreeMap<String, super::auth::KeyScope>,
+    ) {
+        self.scopes = scopes;
+    }
+
+    fn scope(&self, key_id: &str) -> super::auth::KeyScope {
+        self.scopes.get(key_id).cloned().unwrap_or_default()
+    }
+
+    /// Record and answer a call refused before judgment (an invalid body,
+    /// or a request outside the key's scope).
+    fn reject(&mut self, e: &ApiError, meta: &Meta, host: &mut dyn Host) -> Answer {
+        self.stats.invalid += 1;
+        let note = json!({
+            "kind": "robodr.control_plane_rejected",
+            "api": API_VERSION,
+            "error": {"code": e.code, "message": e.message, "status": e.status},
+            "request": meta,
+        });
+        if host
+            .record("control-plane rejected request", &note)
+            .is_err()
+        {
+            self.stats.record_failures += 1;
+        }
+        Answer::error(e)
     }
 
     /// An engine on a persistent journal, with the requests it restored
@@ -1480,8 +1515,19 @@ impl Engine {
 
     pub fn handle(&mut self, call: &Call, meta: &Meta, host: &mut dyn Host) -> Answer {
         match call {
-            Call::Robot => self.robot(host),
-            Call::Submit(req) => self.submit(req, meta, host),
+            Call::Robot => self.robot(&meta.key_id, host),
+            Call::Submit(req) => {
+                // T67: the key's scope first; a valid signature never
+                // widens it (and an out-of-scope id reveals nothing).
+                match self.scope(&meta.key_id).check_submit(
+                    &meta.key_id,
+                    req.action,
+                    req.ttl_seconds,
+                ) {
+                    Ok(()) => self.submit(req, meta, host),
+                    Err(e) => self.reject(&e, meta, host),
+                }
+            }
             Call::Get(id) => {
                 self.refresh(id);
                 match self.store.get(id) {
@@ -1508,26 +1554,12 @@ impl Engine {
                     ))
                 }
             },
-            Call::Invalid(e) => {
-                self.stats.invalid += 1;
-                let note = json!({
-                    "kind": "robodr.control_plane_rejected",
-                    "api": API_VERSION,
-                    "error": {"code": e.code, "message": e.message, "status": e.status},
-                    "request": meta,
-                });
-                if host
-                    .record("control-plane rejected request", &note)
-                    .is_err()
-                {
-                    self.stats.record_failures += 1;
-                }
-                Answer::error(e)
-            }
+            Call::Invalid(e) => self.reject(e, meta, host),
         }
     }
 
-    fn robot(&self, host: &mut dyn Host) -> Answer {
+    fn robot(&self, key_id: &str, host: &mut dyn Host) -> Answer {
+        let scope = self.scope(key_id);
         let state = host.safety_state();
         let ctx = host.context();
         let observe = !ctx.profile_locked || !host.policy().oem_validated;
@@ -1552,6 +1584,12 @@ impl Engine {
                 .filter(|a| !a.refused_for(host.policy().morphology))
                 .map(ActionKind::as_str)
                 .collect::<Vec<_>>(),
+            // T67: what the asking key may request (its scope).
+            "key_scope": {
+                "key_id": key_id,
+                "allowed_actions": scope.actions(),
+                "max_ttl_seconds": scope.max_ttl_seconds,
+            },
         }))
     }
 
@@ -1737,6 +1775,13 @@ impl Engine {
         // executor v1: judge the revert by the executor's latest word (a TTL
         // may have lifted it already).
         self.refresh(id);
+        let Some(action) = self.store.get(id).map(|s| s.request.action) else {
+            return Answer::error(&unknown_request());
+        };
+        // T67: a key may lift only what it may ask for.
+        if let Err(e) = self.scope(&meta.key_id).check_action(&meta.key_id, action) {
+            return self.reject(&e, meta, host);
+        }
         let Some(s) = self.store.get(id) else {
             return Answer::error(&unknown_request());
         };
@@ -2864,6 +2909,107 @@ mod tests {
         assert_eq!(v.body["refusal"]["code"], "not_reversible");
     }
 
+    /// T67 (GAP-07): every SOC key used to be able to request every action
+    /// with any TTL. A scoped key is refused (403, recorded, counted as
+    /// invalid) outside its actions and above its TTL, cannot revert what
+    /// it may not request, and sees its scope in the robot snapshot.
+    #[test]
+    fn key_scopes_bound_actions_ttl_and_reverts() {
+        let mut e = engine();
+        let mut h = FakeHost::new(SafetyState::MovingSlow);
+        let tier1 = super::super::auth::KeyScope {
+            allowed_actions: Some(
+                [ActionKind::RecordEvidence, ActionKind::IsolateNetwork]
+                    .into_iter()
+                    .collect(),
+            ),
+            max_ttl_seconds: 600,
+        };
+        e.set_key_scopes([("tier1".to_string(), tier1)].into_iter().collect());
+        let t1 = Meta {
+            key_id: "tier1".into(),
+            ..Meta::default()
+        };
+        // Outside the actions: refused before judgment, recorded.
+        let a = e.handle(
+            &Call::Submit(req("safe_pause", json!({}), None)),
+            &t1,
+            &mut h,
+        );
+        assert_eq!(
+            (a.status, a.body["error"]["code"].as_str()),
+            (403, Some("action_not_permitted"))
+        );
+        assert_eq!(h.notes.len(), 1);
+        assert_eq!(h.notes[0]["kind"], "robodr.control_plane_rejected");
+        assert_eq!(h.notes[0]["error"]["code"], "action_not_permitted");
+        assert_eq!(e.stats.invalid, 1);
+        assert_eq!(e.stats.submitted, 0, "never judged");
+        // Above the TTL limit.
+        let a = e.handle(
+            &Call::Submit(req("isolate_network", json!({}), Some(601))),
+            &t1,
+            &mut h,
+        );
+        assert_eq!(
+            (a.status, a.body["error"]["code"].as_str()),
+            (403, Some("ttl_above_key_limit"))
+        );
+        // In scope: judged as before.
+        let ok = req("isolate_network", json!({}), Some(600));
+        let a = e.handle(&Call::Submit(ok.clone()), &t1, &mut h);
+        assert_eq!(a.status, 200, "{}", a.body);
+        assert_eq!(e.stats.submitted, 1);
+        // An unscoped key's request: tier1 may not lift it.
+        let mut other = req(
+            "restrict_motion",
+            json!({"max_linear_speed": 0.5}),
+            Some(60),
+        );
+        other.request_id = "robot_x:ugv-007:00000000000000ff".into();
+        let a = e.handle(&Call::Submit(other.clone()), &meta(), &mut h);
+        assert_eq!(a.status, 200, "{}", a.body);
+        let rv = |id: &str| {
+            Call::Revert(
+                id.to_string(),
+                RevertRequest {
+                    reason: String::new(),
+                    requested_by: "a".into(),
+                    approved_by: Vec::new(),
+                },
+            )
+        };
+        let a = e.handle(&rv(&other.request_id), &t1, &mut h);
+        assert_eq!(
+            (a.status, a.body["error"]["code"].as_str()),
+            (403, Some("action_not_permitted"))
+        );
+        assert_eq!(e.stats.reverts, 0);
+        // Its own action it may revert.
+        let a = e.handle(&rv(&ok.request_id), &t1, &mut h);
+        assert_eq!(a.status, 200, "{}", a.body);
+        assert_eq!(e.stats.reverts, 1);
+        // An unknown id is still 404 (nothing to scope).
+        let a = e.handle(&rv("nope"), &t1, &mut h);
+        assert_eq!(a.status, 404);
+        // The snapshot names the asking key's scope.
+        let a = e.handle(&Call::Robot, &t1, &mut h);
+        assert_eq!(
+            a.body["key_scope"],
+            json!({"key_id": "tier1", "allowed_actions": ["isolate_network", "record_evidence"],
+                   "max_ttl_seconds": 600})
+        );
+        let a = e.handle(&Call::Robot, &meta(), &mut h);
+        assert_eq!(
+            a.body["key_scope"]["allowed_actions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(a.body["key_scope"]["max_ttl_seconds"], MAX_TTL_SECONDS);
+    }
+
     #[test]
     fn no_evidence_no_claim() {
         let mut e = engine();
@@ -2910,7 +3056,7 @@ mod tests {
     fn robot_snapshot_says_it_executes_nothing() {
         let e = engine();
         let mut h = FakeHost::new(SafetyState::EStopActive);
-        let a = e.robot(&mut h);
+        let a = e.robot("soc-1", &mut h);
         assert_eq!(a.body["online"], true);
         assert_eq!(a.body["safety_state"]["state"], "estop_active");
         assert_eq!(a.body["safety_state"]["safety_system_engaged"], true);
@@ -2934,7 +3080,7 @@ mod tests {
         ] {
             let mut h = FakeHost::new(SafetyState::Idle);
             (h.ctx, h.policy) = body_plan(m);
-            let a = e.robot(&mut h);
+            let a = e.robot("soc-1", &mut h);
             let listed: Vec<&str> = a.body["actions"]
                 .as_array()
                 .unwrap()

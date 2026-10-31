@@ -45,9 +45,20 @@ that as "not applied", never as success.
   be in the TLS handshake or before their request authenticated, and
   another `max_connections` authenticated ones; one source address holds at
   most `max_connections_per_source` (default 2, 1..=16) of all of them.
-  Over a cap the connection is closed at accept (no answer;
-  `connections_rejected`); an authenticated request that finds no
-  authenticated slot is answered 503 `busy` (signed).
+  When every pre-authentication slot a new connection may use is busy, it
+  cuts the **oldest** pre-authentication connection that has spent
+  `pre_auth_evict_after_ms` (default 100, 100..=5000) in its handshake or
+  request read (`connections_evicted`; the cut peer sees the connection
+  close); a source at its per-source share only cuts one of its own.
+  `soc_sources` (up to 16 networks, `"10.20.0.0/24"` or an address) gets
+  `reserved_connections` (default 1, 1..=4) extra pre-authentication
+  slots nobody else may take, and a connection from a listed address cuts
+  an unlisted peer's handshake at once; an unlisted connection never cuts a
+  listed one, and authenticated connections are never cut. `soc_sources`
+  is about availability only: a listed address still needs the client
+  certificate and a SOC key. Otherwise over a cap the connection is closed
+  at accept (no answer; `connections_rejected`); an authenticated request
+  that finds no authenticated slot is answered 503 `busy` (signed).
 * Answers are JSON (`Content-Type: application/json`) except evidence chunks
   (`application/octet-stream`, §11.5). `Cache-Control: no-store`.
 * **Listeners** (at least one):
@@ -223,8 +234,15 @@ A method a path does not take is 405 `method_not_allowed`; an unknown path
  "mode": "enforce", "health": "ok", "executor": "recording", "executes_actions": false,
  "morphology": "wheeled_mobile",
  "actions": ["restrict_motion", "quarantine_node", "isolate_network", "record_evidence",
-             "safe_pause", "request_safe_state", "rollback_config"]}
+             "safe_pause", "request_safe_state", "rollback_config"],
+ "key_scope": {"key_id": "soc:soc-a:1",
+               "allowed_actions": ["isolate_network", "record_evidence"],
+               "max_ttl_seconds": 900}}
 ```
+
+`key_scope` is the asking key's scope (§4.2): the actions it may request
+and revert and the longest `ttl_seconds` it may give (all seven and
+86400 for an unscoped key). Additive since the T67 revision.
 
 `morphology` is the response policy's (`unspecified` when it declares
 none). `actions` lists only what this robot may be asked for: an action
@@ -297,6 +315,42 @@ Body errors are answered with an HTTP error (§7) and recorded
 `invalid_parameter`, `ttl_required`, `ttl_out_of_range`, `ttl_not_allowed`,
 `authority_not_allowed`, `invalid_request_id`, `invalid_field`,
 `invalid_request`.
+
+### 4.2 Per-key scopes (`control_plane.soc_keys`)
+
+A `soc_keys` entry is either a key file path (the key may request every
+action with any valid `ttl_seconds`) or a scoped key:
+
+```json
+"soc_keys": [
+  "/etc/robodr/soc/soc-ir-lead.pub",
+  {"path": "/etc/robodr/soc/soc-tier1.pub",
+   "allowed_actions": ["record_evidence", "isolate_network"],
+   "max_ttl_seconds": 900}
+]
+```
+
+`allowed_actions`: 1..=7 distinct catalog names (absent: every action);
+`max_ttl_seconds`: 1..=86400 (absent: 86400). agentd checks the scope of
+the key that signed the request **before** anything else about it (before
+the `request_id` is looked up, so an out-of-scope request learns nothing
+about other requests): a submission whose action is not allowed is
+refused **403 `action_not_permitted`**, one whose `ttl_seconds` is above
+the key's limit **403 `ttl_above_key_limit`**. A revert is refused
+`action_not_permitted` when the stored request's action is not in the
+reverting key's scope (a key lifts only what it may ask for; an unknown
+id is still 404). Both are answered signed, recorded as
+`robodr.control_plane_rejected` (§8) and reported as
+`robot.agent.control_plane_invalid` (Medium), never judged. GET, the
+snapshot (`key_scope`, §3.1) and the evidence API are not scoped.
+
+Limits: the scope is enforced by agentd. robodr-executor verifies the
+SOC signature on every order itself (§6a) but does not yet apply these
+scopes (planned with the executor's own key configuration), so a
+compromised agentd process could still pass it an out-of-scope request
+that a configured SOC key signed. The robot still cannot verify the SOC's
+internal approval process (the two-person names are asserted by the SOC,
+§4).
 
 ### 4.1 Judgment (Cyber-Jidoka)
 
@@ -671,6 +725,8 @@ apply**. `executed` is `true` for `applied`, `verified` and `reverted`.
 * 401: `missing_credentials`, `malformed_credentials`, `unknown_key`,
   `bad_signature`, `stale_timestamp` (also: the replay fence, §2),
   `replayed_nonce`;
+* 403 (signed; the request authenticated, its key is not allowed it,
+  §4.2): `action_not_permitted`, `ttl_above_key_limit`;
 * 404: `not_found`, `unknown_robot`, `unknown_request`, `unknown_export`,
   `unknown_chunk`, `evidence_disabled`, `no_records`,
   `evidence_not_retained`;
@@ -1166,8 +1222,13 @@ another robot), 13 (signed in the removed v1 domain); all 401
 * A network attacker without the client certificate can still make the TLS
   listener spend handshakes (bounded by `max_connections`, the per-source
   cap and the 5 s deadline, which a byte-at-a-time peer cannot stretch) and
-  drop or delay requests and answers; from several source addresses it can
-  keep every TCP pre-authentication slot busy (never the unix socket's).
+  drop or delay requests and answers. From several source addresses,
+  reopening handshakes faster than `pre_auth_evict_after_ms`, it can still
+  keep the general TCP pre-authentication slots busy (never the unix
+  socket's); the SOC's own addresses, configured as `soc_sources`, keep a
+  reserved slot and cut the attacker's handshakes (W2-4: 20/20 SOC requests
+  during the attack, `slowloris_cannot_lock_the_listed_soc_out`). Without
+  `soc_sources` the SOC competes with the attacker for the general slots.
 * Tested with synthetic traffic, an in-process signing client and an
   OpenSSL-made test PKI (`crates/robodr-agentd/tests/data/control-tls/`),
   not against a deployed SOC or across a real network.
@@ -1352,3 +1413,21 @@ Additive, no version change (`robodr-control-plane/v2`); with
   answer carries them back with `containment`. **Upgrade the executor
   first** (as for R2-7): an older executor does not understand an order
   with these fields, and agentd answers the request `failed`.
+
+### Revision: per-key scopes and slowloris slots (T67, T39 / W2-4, 2026-10)
+
+Additive, no version change (`robodr-control-plane/v2`).
+
+* **Per-key scopes** (§4.2): a `soc_keys` entry may be
+  `{"path", "allowed_actions", "max_ttl_seconds"}`. Requests outside the
+  signing key's scope are answered **403** `action_not_permitted` /
+  `ttl_above_key_limit` (signed, recorded, reported as
+  `control_plane_invalid`); a revert needs the stored action in the
+  reverting key's scope. Plain path entries keep the old behaviour. New
+  in the snapshot (§3.1): `key_scope`. A SOC client should treat 403 as
+  final, like a 400.
+* **Pre-authentication slots** (§1, §13): the oldest stale handshake is
+  cut when the slots are full (`pre_auth_evict_after_ms`,
+  `connections_evicted`), and `soc_sources` get `reserved_connections`
+  slots of their own. A SOC client may see a connection closed during
+  its TLS handshake under load (it retries, as for a refused connect).
