@@ -62,7 +62,7 @@ use std::fmt::Write;
 pub const AGENTD_STATUS: &str = "/var/lib/robodr/spool/agentd/status.json";
 /// Where the packaged `robodr-uplink` unit writes its status.
 pub const UPLINK_STATUS: &str = "/var/lib/robodr/export/uplink/uplink-status.json";
-/// Default output (the example unit's RuntimeDirectory).
+/// Default output (robodr-metrics.service's RuntimeDirectory).
 pub const DEFAULT_OUT: &str = "/run/robodr-metrics/robodr.prom";
 
 /// RoboDR's long-running services (`packaging/systemd/*.service`, checked

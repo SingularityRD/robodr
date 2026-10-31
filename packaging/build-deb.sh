@@ -321,14 +321,16 @@ fi
 install_bin robodr-enroll usr/sbin 0 || true
 # Operator tools (crates/robodr-ops, sales-readiness T68-T70): first-boot
 # setup and the support bundle (root-only, usr/sbin), the metrics textfile
-# exporter (usr/bin) with its example unit, timer and alert rules. Pure
-# crate, built with every workspace build: always required.
+# exporter (usr/bin) with its unit and timer (installed disabled) and
+# example alert rules. Pure crate, built with every workspace build: always
+# required.
 install_bin robodr-setup usr/sbin 1
 install_bin robodr-support-bundle usr/sbin 1
 install_bin robodr-metrics usr/bin 1
-for f in robodr-metrics.service.example robodr-metrics.timer.example robodr-alerts.example.yml; do
-    install -D -m 0644 "$here/metrics/$f" "$pkg/$ex/metrics/$f"
+for f in robodr-metrics.service robodr-metrics.timer; do
+    install -D -m 0644 "$here/metrics/$f" "$pkg/$units/$f"
 done
+install -D -m 0644 "$here/metrics/robodr-alerts.example.yml" "$pkg/$ex/metrics/robodr-alerts.example.yml"
 # Kernel modules of the enforcing units (executor, gateway), never active.
 install -D -m 0644 "$here/modules-load.d/robodr.conf.example" \
     "$pkg/$ex/modules-load.d/robodr.conf.example"

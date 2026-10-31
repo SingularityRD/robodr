@@ -169,8 +169,12 @@ UNITS = {
     "robodr-anchor-receiver": ["robodr-anchor-receiver.service"],
     "robodr-deliverd": ["robodr-deliverd.service"],
     "robodr-depot": ["robodr-depot.service"],
+    # Installed from packaging/metrics/ (a oneshot and its timer).
+    "robodr-metrics": ["robodr-metrics.service", "robodr-metrics.timer"],
 }
 NOT_STOPPED = {"robodr-firewall-gw-rules.service"}
+# Not restarted on upgrade: the timer runs the new binary at its next run.
+NOT_RESTARTED = {"robodr-metrics.service", "robodr-metrics.timer"}
 # Restarted on upgrade only through the safety-state gate (T9): the
 # maintainer scripts mark them pending, never try-restart them.
 GATED = {"robodr-executor.service", "robodr-firewall-gw.service"}
@@ -224,8 +228,6 @@ SHIPPED_DOCS = (
     "/usr/share/doc/robodr/demo/fastrtps_baseline.pcap",
     "/usr/share/doc/robodr/demo/fastrtps_rogue_cmd_vel.pcap",
     "/usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
-    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.service.example",
-    "/usr/share/doc/robodr/examples/metrics/robodr-metrics.timer.example",
     "/usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
 )
 # A key is its header followed by its base64 body. The header alone is not
@@ -370,7 +372,7 @@ def unit_loops(text: str) -> dict[str, set[str]]:
     systemctl verb of the loop body (try-restart / stop / start)."""
     out: dict[str, set[str]] = {}
     for m in FOR_RE.finditer(text):
-        units = set(re.findall(r"robodr-[a-z0-9-]+\.service", m.group(1)))
+        units = set(re.findall(r"robodr-[a-z0-9-]+\.(?:service|timer)", m.group(1)))
         body = m.group(2)
         verb = ("try-restart" if "try-restart" in body else "stop" if "systemctl stop" in body
                 else "pending" if "mark_pending_restart" in body else "other")
@@ -408,7 +410,7 @@ def check_unit_loops(rel: str, verb: str, loops: dict[str, set[str]], want: set[
         pend = loops.get("pending")
         if pend != GATED:
             errs.append(f"packaging/{rel}: marks {sorted(pend or [])} pending-restart, want exactly {sorted(GATED)}")
-        want = want - GATED
+        want = want - GATED - NOT_RESTARTED
     got = loops.get(verb)
     if got is None:
         return errs + [f"packaging/{rel}: no `for u in ...` loop that runs systemctl {verb}"]
@@ -1056,6 +1058,14 @@ def self_test() -> int:
         gated_ok.replace("robodr-a.service;", "robodr-a.service robodr-executor.service;")), want_t), False)
     expect("gated unit not pending", check_unit_loops("t", "try-restart", unit_loops(
         gated_ok.replace(" robodr-firewall-gw.service; do\n    mark", "; do\n    mark")), want_t), False)
+    # A timer is a unit like a service: stopped on removal, never restarted.
+    want_s = {"robodr-a.service", "robodr-metrics.timer"}
+    stop_ok = "for u in robodr-a.service robodr-metrics.timer; do\n    systemctl stop \"$u\"\ndone\n"
+    expect("timer stopped", check_unit_loops("t", "stop", unit_loops(stop_ok), want_s), True)
+    expect("timer not stopped", check_unit_loops("t", "stop", unit_loops(
+        stop_ok.replace(" robodr-metrics.timer;", ";")), want_s), False)
+    expect("timer not restarted", check_unit_loops("t", "try-restart", unit_loops(
+        gated_ok), want_t | {"robodr-metrics.timer"}), True)
 
     def ent(kind="f", mode=0o644, owner="root", digest="x"):
         return Entry(kind, mode, owner, "root", digest)
@@ -1188,7 +1198,7 @@ def self_test() -> int:
     fin = (ROOT / "scripts" / "release-finalize.sh").read_text()
     expect("finalize ok", check_release_finalize_text(fin), True)
     expect("no comparison", check_release_finalize_text(fin.replace("compare-rebuild.py", "true")), False)
-    total = 71
+    total = 74
     print(f"self-test: {total - failed}/{total} passed")
     return 1 if failed else 0
 

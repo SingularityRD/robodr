@@ -16,7 +16,7 @@ if [ "${1:-0}" -eq 0 ]; then
         for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
             robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
             robodr-executor.service robodr-firewall-gw.service robodr-deliverd.service \
-            robodr-depot.service; do
+            robodr-depot.service robodr-metrics.timer robodr-metrics.service; do
             systemctl stop "$u" 2>/dev/null || :
         done
     fi
@@ -27,7 +27,7 @@ if [ "${1:-0}" -eq 0 ]; then
         for u in robodr-spool-export.service robodr-kafka-publish.service robodr-uplink.service \
             robodr-agentd.service robodr-pulsard.service robodr-anchor-receiver.service \
             robodr-executor.service robodr-firewall-gw.service robodr-firewall-gw-rules.service \
-            robodr-deliverd.service robodr-depot.service; do
+            robodr-deliverd.service robodr-depot.service robodr-metrics.timer robodr-metrics.service; do
             systemctl --no-reload disable "$u" >/dev/null 2>&1 || :
         done
     fi

@@ -551,6 +551,9 @@ fn build_deb_and_make_bundle_carry_robodr_enroll() {
         "./usr/share/man/man8/robodr-executor.8.gz",
         "./usr/share/man/man8/robodr-firewall-gw.8.gz",
         "./usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
+        // robodr-metrics' unit and timer are installed (disabled), T70.
+        "./usr/lib/systemd/system/robodr-metrics.service",
+        "./usr/lib/systemd/system/robodr-metrics.timer",
         "./usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
         // Customer documentation and demo data (T49).
         "./usr/share/doc/robodr/customer/quick-start.md",

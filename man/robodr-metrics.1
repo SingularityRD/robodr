@@ -149,21 +149,22 @@ written atomically (temporary file, fsync, rename), mode 0644. Default
 .B \-\-stdout
 print instead.
 .SH SETUP
-The package ships an example service and timer (every 15 s) and example
-alert rules in
+The package installs
+.B robodr\-metrics.service
+and
+.B robodr\-metrics.timer
+(every 15 s), disabled like every RoboDR unit, and example alert rules in
 .IR /usr/share/doc/robodr/examples/metrics/ :
 .PP
 .nf
-install \-m 0644 robodr\-metrics.service.example /etc/systemd/system/robodr\-metrics.service
-install \-m 0644 robodr\-metrics.timer.example /etc/systemd/system/robodr\-metrics.timer
-systemctl daemon\-reload && systemctl enable \-\-now robodr\-metrics.timer
+systemctl enable \-\-now robodr\-metrics.timer
 .fi
 .PP
 Point node_exporter at the directory
 .RB ( \-\-collector.textfile.directory=/run/robodr\-metrics )
 or symlink
 .I /run/robodr\-metrics/robodr.prom
-into the directory it already reads. The example service runs with
+into the directory it already reads. The service runs with
 .B CAP_DAC_READ_SEARCH
 only (to read the 0600 uplink status), no network, a read-only OS, and the
 key and evidence trees hidden. Load
