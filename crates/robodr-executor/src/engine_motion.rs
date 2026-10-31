@@ -577,10 +577,21 @@ impl Engine {
     /// `motion.safe_pause_latch_s` each pause in force is re-asserted
     /// through its adapter ([`crate::motion::MotionPorts::latch`]). What
     /// someone did to move the robot while paused is an `overridden`
-    /// event with a `HIGH:` detail (agentd: a High finding); a platform
-    /// that cannot be read is a `drift` event, once per change of the
-    /// error. The interval is counted from the end of the previous run, so
-    /// a peer that does not answer cannot keep the engine busy.
+    /// event with a `HIGH:` detail (agentd: a High finding), once per kind
+    /// of override; the same kind again is counted and reported at most
+    /// every [`crate::engine::LATCH_REPEAT_REPORT_MS`] with the count. A
+    /// platform that cannot be read is a `drift` event, once per change of
+    /// the error.
+    ///
+    /// The adapter calls are synchronous: while a run lasts the engine
+    /// handles nothing else (reverts, new orders and TTL expiries wait).
+    /// One run takes at most the adapter's configured worst case
+    /// ([`crate::motion::MotionSection::worst_case_ms`], at most
+    /// [`crate::motion::MOTION_BUDGET_MS`] for `nav2`); for `px4` a mode
+    /// read plus, when the mode changed, setting hold again: up to twice
+    /// `timeout_ms`. The interval is counted from the end of the previous
+    /// run, which bounds the share of time a peer that does not answer can
+    /// take, not the length of one run.
     pub(super) fn motion_latch(&mut self, now: Now) {
         let now_ms = now.wall_ms;
         let m = self.motion_cfg();
@@ -603,6 +614,9 @@ impl Engine {
             .collect();
         self.latch_errors
             .retain(|id, _| pauses.iter().any(|(p, _, _)| p == id));
+        self.latch_overrides
+            .retain(|id, _| pauses.iter().any(|(p, _, _)| p == id));
+        const REPEAT: u64 = crate::engine::LATCH_REPEAT_REPORT_MS;
         if pauses.is_empty() {
             self.last_latch_boot_ms = mono;
             return;
@@ -622,8 +636,26 @@ impl Engine {
                         let _ = self.save();
                     }
                 }
-                Ok(crate::motion::Latch::Overridden(what)) => {
+                Ok(crate::motion::Latch::Overridden { kind, note }) => {
                     self.latch_errors.remove(&id);
+                    // Review (T42): the same kind of override again within
+                    // LATCH_REPEAT_REPORT_MS is counted, not reported (it
+                    // was cancelled / set back to hold all the same).
+                    if let Some(s) = self.latch_overrides.get_mut(&id) {
+                        if s.kind == kind && mono.saturating_sub(s.reported_ms) < REPEAT {
+                            s.unreported = s.unreported.saturating_add(1);
+                            s.last_note = note;
+                            continue;
+                        }
+                    }
+                    let earlier = match self.latch_overrides.remove(&id) {
+                        Some(p) if p.unreported > 0 => format!(
+                            " (before it: {} further override(s) of kind {} not reported \
+                             separately, the last: {})",
+                            p.unreported, p.kind, p.last_note
+                        ),
+                        _ => String::new(),
+                    };
                     self.state.event(
                         now_ms,
                         EventKind::Overridden,
@@ -631,11 +663,21 @@ impl Engine {
                         Some(action),
                         format!(
                             "HIGH: the robot was set moving while safe_pause {id} is in force: \
-                             {what}; the pause stays in force until the SOC's two-person signed \
-                             revert"
+                             {note}; the pause stays in force until the SOC's two-person signed \
+                             revert; the same kind is reported again at most every {} s{earlier}",
+                            REPEAT / 1000
                         ),
                     );
                     let _ = self.save();
+                    self.latch_overrides.insert(
+                        id.clone(),
+                        crate::engine::OverrideSeen {
+                            kind,
+                            reported_ms: mono,
+                            unreported: 0,
+                            last_note: String::new(),
+                        },
+                    );
                 }
                 Err(e) => {
                     if self.latch_errors.get(&id) != Some(&e) {
@@ -652,8 +694,36 @@ impl Engine {
                             ),
                         );
                         let _ = self.save();
-                        self.latch_errors.insert(id, e);
+                        self.latch_errors.insert(id.clone(), e);
                     }
+                }
+            }
+            // Repeats counted and not reported: summarised once the
+            // interval has passed, even if none follows.
+            let due = self.latch_overrides.get(&id).and_then(|s| {
+                (s.unreported > 0 && mono.saturating_sub(s.reported_ms) >= REPEAT).then(|| {
+                    format!(
+                        "HIGH: the robot was set moving again while safe_pause {id} is in \
+                         force: {} further override(s) of kind {} since the last report, each \
+                         cancelled / set back to hold, the last: {}; the pause stays in force \
+                         until the SOC's two-person signed revert",
+                        s.unreported, s.kind, s.last_note
+                    )
+                })
+            });
+            if let Some(detail) = due {
+                self.state.event(
+                    now_ms,
+                    EventKind::Overridden,
+                    Some(&id),
+                    Some(action),
+                    detail,
+                );
+                let _ = self.save();
+                if let Some(s) = self.latch_overrides.get_mut(&id) {
+                    s.reported_ms = mono;
+                    s.unreported = 0;
+                    s.last_note.clear();
                 }
             }
         }

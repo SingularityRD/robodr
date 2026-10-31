@@ -2111,7 +2111,10 @@ table.
      `{"soc:tier1": {"actions": ["quarantine_node"], "max_ttl_s": 900}}`;
      anything else signed with that key is refused `key_scope_denied`.
      `soc.require_key_scopes: true` makes a key without an entry approve
-     nothing (recommended once every key has one).
+     nothing (recommended once every key has one). An entry whose key id
+     matches no key in `soc.keys` (a typo, or a key you removed) makes
+     every key without an entry approve and revert nothing until you fix
+     or remove the entry; `robodr-executor --check-config` fails on it.
    * `network.quarantine.cidrs`: the networks where a participant may be
      quarantined (its SPDP locators must be there, on the robot's DDS
      ports); empty refuses every quarantine (`locator_out_of_scope`).
@@ -2354,6 +2357,10 @@ the pause stays). While paused, the executor re-asserts the pause every
 cancelled and a PX4 mode change is set back to hold (a pilot's manual
 mode is left to the pilot); each is a High finding
 `robot.agent.executor_pause_overridden` (find out who moved the robot).
+The same kind of override found again (a pilot staying in a manual mode,
+a script re-sending a goal) is still cancelled or set back to hold every
+run, but reported at most once per 5 minutes per pause, with the count of
+the repeats.
 Lifting a pause **releases** it and never resumes a
 mission (Nav2 goals are not restored, PX4 stays in hold);
 `request_safe_state` and `rollback_config` answer `applied` and are not

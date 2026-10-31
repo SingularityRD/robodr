@@ -3594,3 +3594,167 @@ fn t67_soc_key_scope_bounds_actions_ttl_reverts_and_rearm() {
         );
     }
 }
+
+/// Review of T67: a `soc.key_scopes` entry whose key id names no loaded
+/// SOC key (a typo, a stale entry) left the key it was meant for unscoped:
+/// it approved every action up to `ttl.max_s` (fail open). Now a key
+/// without an entry approves and reverts nothing while such an entry
+/// exists; a key with its own entry is unaffected.
+#[test]
+fn t67_review_a_scope_naming_no_loaded_key_fails_closed() {
+    let d = tmpdir("t67-stale");
+    let nft = FakeNft::default();
+    // The scope meant for the real key, with its id mistyped.
+    let typo = json!({"keys": [soc_key_path()],
+        "key_scopes": {"soc:tier1-typo": {"actions": ["quarantine_node"], "max_ttl_s": 900}}});
+    let mut e = engine_soc(&d, &nft, "b1", 1_000, typo).unwrap();
+    let i = order(
+        "t67s-iso",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let out = e.submit(&i, &mut idle(), 1_000);
+    assert_eq!(refusal_code(&out), codes::KEY_SCOPE_DENIED, "{out:?}");
+    let reason = out
+        .refusal
+        .as_ref()
+        .map(|r| r.reason.clone())
+        .unwrap_or_default();
+    assert!(reason.contains("soc:tier1-typo"), "{reason}");
+    assert!(nft.0.lock().unwrap().table.is_none());
+    drop(e);
+    // The real key with its own entry, the stale one beside it: scoped as
+    // configured.
+    let both = json!({"keys": [soc_key_path()],
+        "key_scopes": {SOC_KEY_ID: {"actions": ["isolate_network"], "max_ttl_s": 900},
+                       "soc:gone": {"actions": ["quarantine_node"]}}});
+    let mut e = engine_soc(&d, &nft, "b1", 2_000, both).unwrap();
+    let i = sign_at(
+        unsigned(
+            "t67s-iso2",
+            ActionId::IsolateNetwork,
+            Morphology::WheeledMobile,
+            SafetyState::Idle,
+        ),
+        2,
+    );
+    let out = e.submit(&i, &mut idle(), 2_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    drop(e);
+    let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+    v["soc"] = json!({"keys": [soc_key_path()],
+        "key_scopes": {SOC_KEY_ID: {"actions": ["isolate_network"]},
+                       "soc:gone": {"actions": ["quarantine_node"]}}});
+    let c = ExecutorConfig::parse(&v.to_string()).unwrap();
+    let stale = crate::soc::stale_scopes(
+        &c.soc,
+        &crate::soc::load_keys_checked(&[soc_key_path()], &[], "ugv-007").unwrap(),
+    );
+    assert_eq!(stale, vec!["soc:gone"]);
+}
+
+/// Review of T67: a held order re-armed after a reboot had its key scope's
+/// TTL bound checked against today's `ttl.default_s`, not the default it
+/// was approved and applied with: a site that raised `default_s` saw a
+/// valid isolation refused at re-arm. The entry's own TTL is what is
+/// bounded now.
+#[test]
+fn t67_review_rearm_bounds_the_ttl_the_order_was_approved_with() {
+    let d = tmpdir("t67-rearm-ttl");
+    let nft = FakeNft::default();
+    let open = |boot: &str, now: u64, default_s: u64| {
+        let mut v: Value = serde_json::from_str(&config_json(d.to_str().unwrap())).unwrap();
+        v["ttl"] = json!({"default_s": default_s, "max_s": 3600});
+        v["soc"] = json!({"keys": [soc_key_path()],
+            "key_scopes": {SOC_KEY_ID: {"actions": ["isolate_network"], "max_ttl_s": 900}}});
+        let c = ExecutorConfig::parse(&v.to_string())
+            .unwrap()
+            .validate()
+            .unwrap();
+        Engine::open(
+            c,
+            policy(Morphology::WheeledMobile, true, &[]),
+            Box::new(nft.clone()),
+            boot,
+            now,
+        )
+        .unwrap()
+    };
+    let mut e = open("b1", 1_000, 600);
+    let mut i = unsigned(
+        "t67r-iso",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    i.ttl_s = None;
+    let out = e.submit(&signed(i), &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    drop(e);
+    // A reboot; meanwhile the site raised ttl.default_s above the key's
+    // max_ttl_s. The isolation runs 600 s as approved: re-armed.
+    nft.0.lock().unwrap().table = None;
+    let mut e = open("b2", 3_000, 1_000);
+    e.rearm_held(
+        Ok(Current {
+            state: SafetyState::Idle,
+            age_ms: 5,
+        }),
+        3_100,
+    );
+    let st = e.status("t67r-iso");
+    assert_eq!(st.status, Status::Verified, "not re-armed: {st:?}");
+    assert!(nft.0.lock().unwrap().table.is_some());
+}
+
+/// Review of T67: the re-arm skipped the key and scope checks of a
+/// control-plane order whose journal entry was not flagged
+/// `human_approved` (a journal from an older build). Every control-plane
+/// order is checked now.
+#[test]
+fn t67_review_rearm_checks_the_scope_of_every_control_plane_order() {
+    let d = tmpdir("t67-rearm-flag");
+    let nft = FakeNft::default();
+    let scope = |actions: Value| {
+        json!({"keys": [soc_key_path()],
+               "key_scopes": {SOC_KEY_ID: {"actions": actions}}})
+    };
+    let mut e = engine_soc(&d, &nft, "b1", 1_000, scope(json!(["isolate_network"]))).unwrap();
+    let i = order(
+        "t67f-iso",
+        ActionId::IsolateNetwork,
+        Morphology::WheeledMobile,
+        SafetyState::Idle,
+    );
+    let out = e.submit(&i, &mut idle(), 1_000);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    e.edit_state_saved(|s| {
+        for en in &mut s.entries {
+            if let Some(o) = &mut en.order {
+                o.human_approved = false;
+            }
+        }
+    });
+    drop(e);
+    // A reboot; the key may no longer approve isolations.
+    nft.0.lock().unwrap().table = None;
+    let mut e = engine_soc(&d, &nft, "b2", 3_000, scope(json!(["quarantine_node"]))).unwrap();
+    e.rearm_held(
+        Ok(Current {
+            state: SafetyState::Idle,
+            age_ms: 5,
+        }),
+        3_100,
+    );
+    let st = e.status("t67f-iso");
+    assert_eq!(st.status, Status::Reverted, "{st:?}");
+    assert!(
+        st.note
+            .as_deref()
+            .unwrap_or("")
+            .contains("key_scope_denied"),
+        "{st:?}"
+    );
+    assert!(nft.0.lock().unwrap().table.is_none());
+}

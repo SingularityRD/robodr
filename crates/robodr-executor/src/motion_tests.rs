@@ -2224,6 +2224,157 @@ fn t42_px4_hold_is_latched_but_a_pilot_keeps_manual_control() {
     assert_eq!(e.status("lh1").status, Status::Verified);
 }
 
+/// Review of T42: a pilot holding a manual mode (or anything the latch
+/// finds again and again) wrote a new HIGH `overridden` event and a
+/// journal save every `safe_pause_latch_s`: an alert flood that pushed
+/// older evidence out of the journal's ring. Now one event per kind of
+/// override, repeats summarised with their count every
+/// `LATCH_REPEAT_REPORT_MS`; a different kind is reported at once.
+#[test]
+fn t42_review_a_held_manual_mode_is_reported_once_per_kind_not_per_run() {
+    let (_sim, addr, mode) = sim_px4(true);
+    let d = tmpdir("t42-px4-dedup");
+    let motion = json!({"safe_pause": "px4",
+        "px4": {"oem_validated": true, "address": addr.to_string(), "bind": "127.0.0.1:0",
+                "timeout_ms": 3000}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Drone, Morphology::Aerial),
+        t0,
+    );
+    let o = signed(
+        "ld1",
+        ActionId::SafePause,
+        Morphology::Aerial,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::MovingSlow,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::MovingSlow), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    let posctl = mav::px4_custom_mode(3, 0);
+    *mode.lock().unwrap() = posctl;
+    let events_before = e.state().events.len();
+    // Ten latch runs with the pilot in POSCTL: one event.
+    for i in 1..=10u64 {
+        e.tick(late(i * 2_100));
+    }
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "one event per run: {ov:?}");
+    assert!(
+        ov[0].starts_with("HIGH:") && ov[0].contains("POSCTL"),
+        "{ov:?}"
+    );
+    assert_eq!(
+        e.state().events.len(),
+        events_before + 1,
+        "the repeats still wrote events"
+    );
+    assert_eq!(*mode.lock().unwrap(), posctl, "taken from the pilot");
+    // After the repeat interval, still in POSCTL: reported again, with the
+    // count of the nine runs not reported.
+    let t = crate::engine::LATCH_REPEAT_REPORT_MS;
+    e.tick(late(t + 30_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 2, "{ov:?}");
+    assert!(
+        ov[1].starts_with("HIGH:")
+            && ov[1].contains("9 further override(s)")
+            && ov[1].contains("px4:manual:POSCTL"),
+        "{ov:?}"
+    );
+    // Within the interval: counted, not reported.
+    e.tick(late(t + 32_200));
+    assert_eq!(overridden(&e).len(), 2);
+    // A different kind (a mission resumed) is reported at once and set
+    // back to hold.
+    *mode.lock().unwrap() = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, 4);
+    e.tick(late(t + 34_400));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 3, "{ov:?}");
+    assert!(ov[2].contains("AUTO.MISSION") && ov[2].contains("1 further override(s)"));
+    let hold = mav::px4_custom_mode(mav::PX4_MAIN_AUTO, mav::PX4_SUB_AUTO_LOITER);
+    assert_eq!(*mode.lock().unwrap(), hold);
+    assert_eq!(e.status("ld1").status, Status::Verified);
+}
+
+/// Review of T42: a script re-sending a Nav2 goal every few seconds was
+/// one HIGH event per latch run. Each goal is still cancelled (and zero
+/// twists follow); the reports are rate-limited with a count.
+#[test]
+fn t42_review_nav2_goal_spam_is_cancelled_every_run_but_reported_rate_limited() {
+    let goals = Arc::new(Mutex::new(0u32));
+    let cancels = Arc::new(Mutex::new(0u32));
+    let (g2, c2) = (goals.clone(), cancels.clone());
+    let (_sim, port, _seen, _) = sim_ros2(move |topic, p| {
+        if topic.starts_with("rq/") && topic.ends_with("/_action/cancel_goalRequest") {
+            let n = std::mem::take(&mut *g2.lock().unwrap());
+            *c2.lock().unwrap() += n;
+            return service_reply(p, |e| {
+                e.u8(0);
+                e.u32(n);
+                for i in 0..n {
+                    for b in 0..16u8 {
+                        e.u8(b ^ i as u8);
+                    }
+                    e.i32(1);
+                    e.u32(0);
+                }
+            });
+        }
+        None
+    });
+    let d = tmpdir("t42-nav2-spam");
+    let motion = json!({"safe_pause": "nav2", "safe_pause_latch_s": 2,
+        "nav2": {"oem_validated": true, "ros2": ros2_peer(port),
+                 "actions": ["/navigate_to_pose"], "zero_twists": 1,
+                 "zero_twist_interval_ms": 10}});
+    let t0 = now();
+    let late = |ms: u64| Now {
+        wall_ms: t0.wall_ms + ms,
+        boot_ms: t0.boot_ms.map(|b| b + ms),
+    };
+    let mut e = engine(
+        &d,
+        motion,
+        policy(PlatformFamily::Ugv, Morphology::WheeledMobile),
+        t0,
+    );
+    let o = signed(
+        "ls1",
+        ActionId::SafePause,
+        Morphology::WheeledMobile,
+        Target::None,
+        None,
+        &["alice", "bob"],
+        SafetyState::Idle,
+    );
+    let out = e.submit(&o, &mut state(SafetyState::Idle), t0);
+    assert_eq!(out.status, Status::Verified, "{out:?}");
+    // A goal every other run, with quiet runs in between.
+    for i in 1..=12u64 {
+        if i % 2 == 1 {
+            *goals.lock().unwrap() = 1;
+        }
+        e.tick(late(i * 2_100));
+    }
+    assert_eq!(*cancels.lock().unwrap(), 6, "a goal was not cancelled");
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 1, "one event per goal: {ov:?}");
+    let t = crate::engine::LATCH_REPEAT_REPORT_MS;
+    e.tick(late(t + 30_000));
+    let ov = overridden(&e);
+    assert_eq!(ov.len(), 2, "{ov:?}");
+    assert!(ov[1].contains("5 further override(s)"), "{ov:?}");
+}
+
 #[test]
 fn t42_latch_interval_is_validated() {
     let d = tmpdir("t42-cfg");

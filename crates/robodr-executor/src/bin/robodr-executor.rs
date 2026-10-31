@@ -328,6 +328,26 @@ fn main() -> ExitCode {
         ),
         Ok(_) => {}
     }
+    // T67 review: a soc.key_scopes entry naming no loaded key is a typo or
+    // stale; keys without an entry then approve nothing (key_scope_denied).
+    if let Ok(k) = &soc_keys {
+        let stale = robodr_executor::soc::stale_scopes(&cfg.config.soc, k);
+        if !stale.is_empty() {
+            eprintln!(
+                "robodr-executor: soc.key_scopes names key id(s) no soc.keys key has ({}): \
+                 a SOC key without a key_scopes entry approves and reverts nothing \
+                 (key_scope_denied) until this is fixed",
+                stale
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if a.check {
+                return ExitCode::from(2);
+            }
+        }
+    }
     if a.check {
         println!(
             "robodr-executor: {} SOC key(s) for approvals",

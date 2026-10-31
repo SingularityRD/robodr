@@ -244,8 +244,7 @@ after a reboot call the adapter's undo; a failed undo leaves the action
 setting hold once is not enough: a new goal or a mode change by someone
 else would set the robot moving again. While a `safe_pause` is in force
 the executor re-asserts it every `motion.safe_pause_latch_s` (1..=60,
-default 2; counted from the end of the previous run, so a peer that does
-not answer cannot keep the engine busy):
+default 2; counted from the end of the previous run):
 
 * `nav2`: `CancelGoal` (every goal) on each action server again. A goal
   found cancelling was sent while paused: event `overridden` with detail
@@ -259,6 +258,26 @@ not answer cannot keep the engine busy):
   pilot**: the latch never takes the sticks away from a human.
 * `ros2_control`: not observed (the controller manager keeps the switch;
   a later switch by someone else is not detected).
+
+Every run cancels / sets hold again, but the `overridden` events are
+rate-limited per pause: a kind of override (`nav2:goals`,
+`px4:manual:<mode>`, `px4:mode:<mode>`) is reported once, and the same
+kind found again within 5 minutes is counted, not reported; the count
+(and the last one's detail) is reported in the next event for that pause,
+at the latest 5 minutes after the previous one. A different kind is
+reported at once. A pilot holding a manual mode, or a script re-sending a
+goal, is therefore at most one High finding per 5 minutes per pause, and
+cannot push older evidence (approvals, applies, refusals) out of the
+journal's ring of events.
+
+The latch's adapter calls are synchronous: while one run lasts, the
+engine handles nothing else (reverts, new orders and TTL expiries wait).
+One `nav2` run takes at most the adapter's configured worst case (every
+action server's `timeout_ms` plus the zero-twist burst; validated against
+the 4 s motion budget); a `px4` run reads the mode (up to `timeout_ms`)
+and, after a mode change, sets hold again (up to `timeout_ms` more).
+Counting the interval from the end of the previous run limits the share
+of time a peer that does not answer can take; it does not shorten one run.
 
 A platform that cannot be read (no answer, a refused cancel) is one
 `drift` event per change of the error (and `verified` once it answers
@@ -324,7 +343,7 @@ refused).
 | `rmw` | Robot's RMW | Service correlation |
 |---|---|---|
 | `cyclonedds` (default) | `rmw_cyclonedds_cpp` | request header (random client id, random sequence number) leads the payload; the reply echoes it |
-| `fastrtps` | `rmw_fastrtps_cpp`, `rmw_fastrtps_dynamic_cpp` (the ROS 2 default) | bare payload; the request's inline QoS names our reply reader as its related sample identity (`PID_CUSTOM_RELATED_SAMPLE_IDENTITY` 0x800f and the standard 0x0083); the reply's names that reader (or our request writer, both with fresh random entity keys) and the request's random sequence number (2..=65537: a real Fast DDS never delivered a first sample numbered near 2^31) |
+| `fastrtps` | `rmw_fastrtps_cpp`, `rmw_fastrtps_dynamic_cpp` (the ROS 2 default) | bare payload; the request's inline QoS names our reply reader as its related sample identity (`PID_CUSTOM_RELATED_SAMPLE_IDENTITY` 0x800f and the standard 0x0083); the reply's names that reader (or our request writer, both with fresh random entity keys) and the request's random sequence number (2..=65537: a real Fast DDS never delivered a first sample numbered near 2^31). Weaker than `cyclonedds`' 64-bit client id: with `ros2.participant_prefix` set (our prefix then known), an off-path forger must guess one of two 24-bit entity keys and the 16-bit sequence number, about 2^39 tries within `timeout_ms`; without it our random 96-bit prefix is part of the GUID too. `ros2.peer_participant_prefix` adds that the reply must come from one of the peer's writers |
 
 Refused by the configuration (no adapter is sent anything):
 `rmw_connextdds` and `rmw_gurumdds` (vendor-specific reply correlation,
@@ -561,11 +580,19 @@ named; it bounds `restrict_motion`, `quarantine_node` and
 over-shared tier-1 key cannot isolate the robot for a day or pause it. A
 key without an entry approves every action up to `ttl.max_s` (the
 behaviour before scopes), unless `soc.require_key_scopes: true`, which
-makes such a key approve nothing. The executor enforces this itself with
-its own configuration (agentd's check of the same key is not trusted for
-it); a held action is re-armed after a reboot only while the scope of the
-key that approved it, as configured then, still allows it (otherwise
-reverted, `key_scope_denied`). Two-person actions still need two
+makes such a key approve nothing. A `soc.key_scopes` entry whose key id
+no key of `soc.keys` has (a typo, or a key removed from `soc.keys`) also
+makes every key without an entry approve and revert nothing
+(`key_scope_denied`, naming the entry) until it is fixed: a mistyped id
+would otherwise leave the key it was meant for unscoped. `--check-config` fails
+on such an entry and a start logs it. The executor enforces this itself
+with its own configuration (agentd's check of the same key is not trusted
+for it); a held control-plane action is re-armed after a reboot only
+while the key that approved it is still in `soc.keys` and its scope, as
+configured then, still allows the action and the TTL it was approved and
+applied with (the signed one, else the `ttl.default_s` in force at
+approval; a later change of `ttl.default_s` does not change it).
+Otherwise it is reverted (`approval_key_removed`, `key_scope_denied`). Two-person actions still need two
 `approved_by` names in the body the key signed; a second, independent
 signature is not implemented.
 

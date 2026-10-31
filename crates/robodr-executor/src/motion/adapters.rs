@@ -287,7 +287,15 @@ fn call_service(
             // Review F10 for this RMW: the correlation is the GUIDs (fresh
             // random entity keys) and a random sequence number. Kept below
             // 2^16 + 2: a real Fast DDS reader (Humble) never delivers a
-            // first sample numbered near 2^31 (tools/e2e/ros2-peer).
+            // first sample numbered near 2^31 (tools/e2e/ros2-peer). That
+            // leaves 16 bits here: with `participant_prefix` configured (our
+            // prefix known) a forger guesses one of two 24-bit entity keys
+            // and this number, about 2^39 tries within `timeout_ms`; without
+            // it our random 96-bit prefix is in the GUID as well. Weaker
+            // than the cyclonedds path's 64-bit client id (a forged reply
+            // could confirm a cancel that did not happen);
+            // `peer_participant_prefix` narrows answers to the peer's own
+            // writers.
             let sn = 2 + i64::from(rtps::random_u64() as u16);
             let qos =
                 rtps::related_identity_qos(rtps::guid_of(part.prefix, rep_r), rtps::SN_UNKNOWN);
@@ -419,6 +427,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
     }
     let mut held = Vec::new();
     let mut overridden = Vec::new();
+    let mut kinds = Vec::new();
     for k in &spec.adapters {
         match k {
             AdapterKind::Nav2 => {
@@ -428,6 +437,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
                     held.push("nav2: no goal".to_string());
                 } else {
                     let tw = nav2_zero_twists(n).map_err(|e| format!("nav2: {e}"))?;
+                    kinds.push("nav2:goals".to_string());
                     overridden.push(format!(
                         "nav2: {total} navigation goal(s) sent while paused were cancelled ({}); \
                          {tw}",
@@ -442,6 +452,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
                 if mode == hold {
                     held.push("px4: in hold".to_string());
                 } else if mav::px4_is_manual(mode) {
+                    kinds.push(format!("px4:manual:{}", mav::px4_mode_name(mode)));
                     overridden.push(format!(
                         "px4: a pilot switched to manual mode {} while paused: left to the pilot \
                          (a manual mode is never taken away)",
@@ -454,6 +465,7 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
                             mav::px4_mode_name(mode)
                         )
                     })?;
+                    kinds.push(format!("px4:mode:{}", mav::px4_mode_name(mode)));
                     overridden.push(format!(
                         "px4: mode changed to {} while paused; hold set again: {again}",
                         mav::px4_mode_name(mode)
@@ -466,7 +478,10 @@ pub fn latch(m: &MotionSection, spec: &MotionSpec) -> Result<super::Latch, Strin
     if overridden.is_empty() {
         Ok(Latch::Held(held.join("; ")))
     } else {
-        Ok(Latch::Overridden(overridden.join("; ")))
+        Ok(Latch::Overridden {
+            kind: kinds.join("+"),
+            note: overridden.join("; "),
+        })
     }
 }
 

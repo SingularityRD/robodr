@@ -7,8 +7,8 @@
 #
 # mode:
 #   fastrtps      peer.py (rclpy) on rmw_fastrtps_cpp, the stock image
-#                 (default mirror.gcr.io/library/ros:humble-ros-core; any
-#                 ros:<distro>-ros-core works)
+#                 (default mirror.gcr.io/library/ros:humble-ros-core,
+#                 pinned by digest below; any ros:<distro>-ros-core works)
 #   cyclonedds    peer.py on rmw_cyclonedds_cpp: an image with
 #                 ros-<distro>-rmw-cyclonedds-cpp (`docker build -t
 #                 robodr-ros2-cyclone -f tools/e2e/ros2-peer/Dockerfile.cyclone
@@ -16,7 +16,8 @@
 #   cyclonedds-py peer_cyclone.py: Cyclone DDS 0.10 (Python binding) speaking
 #                 the rmw_cyclonedds wire format, on the stock image; the
 #                 wheel comes from $ROBODR_CYCLONEDDS_WHEELS (a directory
-#                 with cyclonedds-0.10.5-cp310-...whl) or PyPI
+#                 with cyclonedds-0.10.5-cp310-...whl) or PyPI; either way
+#                 it must match the sha256 pinned in entrypoint_cyclone.sh
 #
 # Needs docker; the peer is reached on the docker bridge (no host network).
 # Cyclone peers run with participant index 0 (well-known ports).
@@ -24,7 +25,10 @@ set -euo pipefail
 mode="${1:-fastrtps}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
-stock=mirror.gcr.io/library/ros:humble-ros-core
+# The stock image, pinned by its index digest (multi-arch; the Humble
+# ros-core image of 2026-10-26). Pass another image as [image] to test
+# another distro.
+stock=mirror.gcr.io/library/ros:humble-ros-core@sha256:def377f78b58f925e26a2f1f082708d5efed8a602ed43f66449c73618df349a9
 cyclone_uri='<CycloneDDS><Domain><Discovery><ParticipantIndex>0</ParticipantIndex></Discovery></Domain></CycloneDDS>'
 extra=()
 case "$mode" in
