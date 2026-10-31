@@ -107,7 +107,19 @@
 //!   (diode entries while their batch is in `out/` without a `done/`
 //!   marker, spool entries while their file is still in `ready/`), and every
 //!   deletion of a file holding entries is logged on stderr with its entry
-//!   count (and counted in `pruned_dead_letters.removed_entries`).
+//!   count (and counted in `pruned_dead_letters.removed_entries`);
+//! * opt-in ([`PublishConfig::out_retention`], diode source, only when
+//!   this publisher is the **sole consumer** of `out/`): a finished batch
+//!   directory of the importer's `out/` (its `done/` marker exists; aged by
+//!   the marker) over the bounds is deleted (renamed aside, then removed);
+//!   an unfinished one is held. Its marker then follows the `done/` bounds;
+//! * opt-in ([`PublishConfig::rejected_retention`], spool source):
+//!   `<spool>/rejected/` is bounded as `robodr-spool-export` bounds it
+//!   ([`crate::spool_export::prune_rejected`]).
+//!
+//! The report's `state_usage` gives the entries and bytes of `done/`, the
+//! dead-letter files and `out/` or `rejected/` (measured at most every
+//! [`PublishConfig::usage_interval`]).
 
 use crate::deadletter::{DeadLetters, Rotation};
 use crate::fsutil::{self, ReadError};
@@ -229,6 +241,16 @@ pub struct PublishConfig {
     pub dead_letter_retention: Retention,
     /// Bounds on `done/` markers (default: 30 days), see the module docs.
     pub done_retention: Retention,
+    /// Bounds on the importer's `out/` batch directories this publisher has
+    /// finished (default: unbounded, kept). Only when this publisher is the
+    /// sole consumer of `out/` ([`crate::retention::prune_diode_out`]).
+    pub out_retention: Retention,
+    /// Bounds on `<spool>/rejected/` (spool source; default: unbounded),
+    /// as `robodr-spool-export`'s ([`crate::spool_export::prune_rejected`]).
+    pub rejected_retention: Retention,
+    /// How often the state's disk usage is measured for the report
+    /// ([`PublishReport::state_usage`]; default 60 s).
+    pub usage_interval: std::time::Duration,
     /// Test hook: fail with [`PublishError::Injected`] after the n-th
     /// chunk (1-based) was acknowledged by Kafka but before progress was
     /// saved — a simulated crash.
@@ -248,6 +270,9 @@ impl PublishConfig {
             dead_letter_rotation: None,
             dead_letter_retention: Retention::UNBOUNDED,
             done_retention: DEFAULT_DONE_RETENTION,
+            out_retention: Retention::UNBOUNDED,
+            rejected_retention: Retention::UNBOUNDED,
+            usage_interval: std::time::Duration::from_secs(60),
             fail_after_send: None,
         }
     }
@@ -438,6 +463,15 @@ pub struct PublishReport {
     /// Rotated dead-letter files deleted by retention (and held: entries
     /// still needed for deduplication).
     pub pruned_dead_letters: PruneReport,
+    /// Finished `out/` batch directories deleted by retention (held: not
+    /// finished yet).
+    pub pruned_out: PruneReport,
+    /// `<spool>/rejected/` records deleted by retention.
+    pub pruned_rejected: PruneReport,
+    /// What the state occupies (measured at most every
+    /// [`PublishConfig::usage_interval`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_usage: Option<crate::retention::StateUsage>,
 }
 
 /// One input record, as the importer writes it (and as agentd spools it).
@@ -792,6 +826,8 @@ pub struct Publisher<S: Sink> {
     /// The dead-letter file (dedup set loaded on the first dead letter).
     dead: DeadLetters,
     dead_loaded: bool,
+    /// When the state usage was last measured.
+    usage_at: Option<std::time::Instant>,
 }
 
 fn save_progress(state_dir: &Path, p: &Progress) -> Result<(), PublishError> {
@@ -881,6 +917,7 @@ impl<S: Sink> Publisher<S> {
             chunks_sent: 0,
             dead,
             dead_loaded: false,
+            usage_at: None,
         })
     }
 
@@ -935,6 +972,20 @@ impl<S: Sink> Publisher<S> {
                 &self.cfg.done_retention,
                 now,
             )?;
+            report.pruned_out = crate::retention::prune_diode_out(
+                out,
+                &self.cfg.state_dir.join(DONE_DIR),
+                &self.cfg.out_retention,
+                now,
+            )?;
+        }
+        if let Source::Spool(root) = &self.cfg.source {
+            report.pruned_rejected = crate::spool_export::prune_rejected(
+                &root.join("rejected"),
+                &root.join("ready"),
+                &self.cfg.rejected_retention,
+                now,
+            )?;
         }
         let r = self.cfg.dead_letter_retention;
         let mut dead = std::mem::replace(
@@ -944,6 +995,18 @@ impl<S: Sink> Publisher<S> {
         let res = dead.prune(&r, now, |s, p| self.dead_letter_needed(s, p));
         self.dead = dead;
         report.pruned_dead_letters = res?;
+        let due = self
+            .usage_at
+            .is_none_or(|t| t.elapsed() >= self.cfg.usage_interval);
+        if due {
+            report.state_usage = Some(crate::retention::state_usage(
+                &self.cfg.state_dir,
+                DEAD_LETTER_FILE,
+                &self.cfg.source,
+                false,
+            )?);
+            self.usage_at = Some(std::time::Instant::now());
+        }
         Ok(())
     }
 

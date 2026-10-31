@@ -14,7 +14,7 @@ use robodr_export::uplink::http::{self, Endpoint, HttpsTransport, Timeouts};
 use robodr_export::uplink::reinject::{self, ReinjectOptions};
 use robodr_export::uplink::service::{self, Env, ServiceConfig};
 use robodr_export::uplink::{self, RetryPolicy, StateLock, Uplink, UplinkConfig};
-use robodr_export::Source;
+use robodr_export::{retention, Source};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,6 +27,9 @@ const USAGE: &str = "usage: robodr-uplink --url https://HOST[:PORT][/API-ROOT] -
 [--max-attempts N] [--backoff-base-ms N] [--backoff-max-ms N] [--refused-backoff-max-s N] \
 [--exit-when-stuck-s N] [--dead-letter-max-bytes N] [--dead-letter-keep N] \
 [--dead-letter-max-age-s N] [--done-max-age-s N] [--done-max-count N] \
+[--out-max-age-s N] [--out-max-count N] [--out-max-bytes N] \
+[--rejected-max-age-s N] [--rejected-max-count N] [--rejected-max-bytes N] \
+[--reinject-max-age-s N] [--reinject-max-count N] [--reinject-max-bytes N] \
 [--upgrade-data-source LABEL] [--upgrade-topic TOPIC] [--interval-ms N] [--once]\n\
        robodr-uplink reinject --state-dir DIR (--spool DIR | --diode-out DIR) \
 --dead-letter FILE [--dead-letter FILE ...] [--codes CODE,CODE,...] [--dry-run]\n\
@@ -44,9 +47,37 @@ stop the service first.\n\
 Retention: rotated dead-letter files past --dead-letter-keep or older than --dead-letter-max-age-s, \
 and done/ markers older than --done-max-age-s (default 2592000 = 30 days, 0 = keep) or beyond \
 --done-max-count, are deleted once nothing in them is needed any more (records that may still be \
-processed again; batches still in out/).\n\
+processed again; batches still in out/). Opt-in, default keep: --out-max-* (diode source; only \
+when this uplink is the sole consumer of out/) delete the out/ batch directories it has finished, \
+--rejected-max-* (spool source) the oldest <spool>/rejected/ records, --reinject-max-* the \
+records.jsonl of finished re-injection generations (their origin.jsonl ledger stays). \
+uplink-status.json carries state_usage (entries and bytes of each, measured at most once a \
+minute).\n\
 Exit: 0 done (--once, reinject), 1 runtime or configuration error, 2 usage, \
 3 failing longer than --exit-when-stuck-s.";
+
+/// `--out-max-*` (diode source only) and `--rejected-max-*` (spool source
+/// only), `--reinject-max-*` when `reinject` (opt-in bounds, default keep).
+fn source_bounds(
+    a: &Args,
+    diode: bool,
+    reinject: bool,
+) -> Result<[Option<retention::Retention>; 3], String> {
+    let out = retention::bound_flags("out", |f| a.num(f))?;
+    let rejected = retention::bound_flags("rejected", |f| a.num(f))?;
+    let re = if reinject {
+        retention::bound_flags("reinject", |f| a.num(f))?
+    } else {
+        None
+    };
+    if out.is_some() && !diode {
+        return Err("--out-max-* bound the importer's out/: they need --diode-out".into());
+    }
+    if rejected.is_some() && diode {
+        return Err("--rejected-max-* bound <spool>/rejected/: they need --spool".into());
+    }
+    Ok([out, rejected, re])
+}
 
 const SERVICE_FLAGS: &[&str] = &[
     "url",
@@ -71,6 +102,15 @@ const SERVICE_FLAGS: &[&str] = &[
     "dead-letter-max-age-s",
     "done-max-age-s",
     "done-max-count",
+    "out-max-age-s",
+    "out-max-count",
+    "out-max-bytes",
+    "rejected-max-age-s",
+    "rejected-max-count",
+    "rejected-max-bytes",
+    "reinject-max-age-s",
+    "reinject-max-count",
+    "reinject-max-bytes",
     "upgrade-data-source",
     "upgrade-topic",
     "interval-ms",
@@ -216,6 +256,10 @@ fn opts(a: &Args) -> Result<Opts, String> {
         a.num("done-max-count")?,
         None,
     );
+    let [out, rejected, re] = source_bounds(a, matches!(cfg.source, Source::DiodeOut(_)), true)?;
+    cfg.out_retention = out.unwrap_or(retention::Retention::UNBOUNDED);
+    cfg.rejected_retention = rejected.unwrap_or(retention::Retention::UNBOUNDED);
+    cfg.reinject_retention = re.unwrap_or(retention::Retention::UNBOUNDED);
     let interval = ms(a, "interval-ms")?.unwrap_or(Duration::from_secs(2));
     let service = ServiceConfig {
         interval,

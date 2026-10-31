@@ -1,7 +1,13 @@
 //! Bounded retention of the exporters' bookkeeping files: `done/` markers
 //! (`robodr-kafka-publish`, `robodr-uplink`), rotated dead-letter files
-//! (both, [`crate::deadletter`]) and rejected spool records
-//! (`robodr-spool-export`).
+//! (both, [`crate::deadletter`]), rejected spool records
+//! (`robodr-spool-export`, and with a spool source `robodr-kafka-publish`
+//! and `robodr-uplink`), finished batch directories of the diode
+//! importer's `out/` ([`prune_diode_out`], opt-in, sole consumer only) and
+//! the payload of finished re-injection generations
+//! ([`prune_reinject_payloads`], opt-in; the ledger stays). What the state
+//! occupies is measured by [`state_usage`] (the uplink's status file, the
+//! publisher's report).
 //!
 //! A [`Retention`] names up to three bounds; a file is **over** them when it
 //! is older than `max_age` (by modification time), or when it lies beyond
@@ -18,7 +24,7 @@
 //! not yet durably published.
 
 use crate::fsutil;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -218,6 +224,277 @@ pub fn prune_done_markers(
     })
 }
 
+/// Prefix of an importer `out/` batch directory being deleted: renamed
+/// first (one atomic step that hides it from every reader of `out/`, which
+/// list only valid batch names), then removed; a leftover of an
+/// interrupted deletion is removed by the next pass.
+pub const PRUNING_PREFIX: &str = ".robodr-pruned-";
+
+/// Bytes of the regular files under `dir` (not following symlinks; at
+/// most `depth` directory levels below it).
+pub fn tree_bytes(dir: &Path, depth: u32) -> io::Result<u64> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut n = 0u64;
+    for e in rd {
+        let e = e?;
+        let t = e.file_type()?;
+        if t.is_file() {
+            n = n.saturating_add(e.metadata()?.len());
+        } else if t.is_dir() && depth > 0 {
+            n = n.saturating_add(tree_bytes(&e.path(), depth - 1)?);
+        }
+    }
+    Ok(n)
+}
+
+/// Prune the diode importer's `out/` (opt-in, `r` unbounded by default):
+/// a batch directory over `r` is deleted only once this tool has finished
+/// it (its `done/` marker exists); without a marker it is held. Its age is
+/// the marker's (when it was finished), its size the bytes under it.
+///
+/// Only for a tool that is the **sole consumer** of `out/`: a second
+/// consumer (another publisher or uplink on the same `out/`) would lose the
+/// batches this one has finished. The importer itself does not need them
+/// (it deduplicates on its own sequence state).
+pub fn prune_diode_out(
+    out: &Path,
+    done_dir: &Path,
+    r: &Retention,
+    now: SystemTime,
+) -> io::Result<PruneReport> {
+    let mut rep = PruneReport::default();
+    if r.is_unbounded() {
+        return Ok(rep);
+    }
+    let rd = match fs::read_dir(out) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(rep),
+        Err(e) => return Err(e),
+    };
+    let mut cands = Vec::new();
+    let mut leftovers = Vec::new();
+    for e in rd {
+        let e = e?;
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !e.file_type()?.is_dir() {
+            continue;
+        }
+        if name.starts_with(PRUNING_PREFIX) {
+            leftovers.push(e.path());
+            continue;
+        }
+        if !crate::publish::valid_batch_name(&name) {
+            continue;
+        }
+        let modified = match file_meta(&done_dir.join(&name))? {
+            Some((t, _)) => t,
+            None => e.metadata()?.modified()?,
+        };
+        let bytes = tree_bytes(&e.path(), 4)?;
+        cands.push(Candidate {
+            name,
+            paths: vec![e.path()],
+            modified,
+            bytes,
+        });
+    }
+    for p in leftovers {
+        fs::remove_dir_all(p)?;
+    }
+    let items: Vec<(SystemTime, u64)> = cands.iter().map(|c| (c.modified, c.bytes)).collect();
+    let mut renamed = Vec::new();
+    for (c, over) in cands.iter().zip(r.over(&items, now)) {
+        if !over {
+            continue;
+        }
+        if file_meta(&done_dir.join(&c.name))?.is_none() {
+            rep.held += 1;
+            continue;
+        }
+        let to = out.join(format!("{PRUNING_PREFIX}{}", c.name));
+        match fs::rename(out.join(&c.name), &to) {
+            Ok(()) => renamed.push(to),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+        rep.removed += 1;
+        rep.removed_bytes += c.bytes;
+    }
+    if !renamed.is_empty() {
+        fsutil::fsync_dir(out)?;
+        for p in renamed {
+            fs::remove_dir_all(p)?;
+        }
+    }
+    Ok(rep)
+}
+
+/// Prune the payload of finished re-injection generations
+/// (`<state>/reinject/<generation>/records.jsonl`, `robodr-uplink`;
+/// opt-in): a generation over `r`, aged by its `done` marker, loses its
+/// `records.jsonl`. Its `origin.jsonl` and `done` marker stay: they are
+/// the re-injection **ledger** (a dead letter already re-injected is never
+/// queued twice), and they are small. A generation that is not done is
+/// never touched. A record of a pruned generation that was rejected again
+/// is re-injected from its dead letter's `record` copy.
+pub fn prune_reinject_payloads(
+    dir: &Path,
+    r: &Retention,
+    now: SystemTime,
+) -> io::Result<PruneReport> {
+    use crate::uplink::reinject;
+    if r.is_unbounded() {
+        return Ok(PruneReport::default());
+    }
+    let mut cands = Vec::new();
+    for g in reinject::list_generations(dir)? {
+        if !g.done {
+            continue;
+        }
+        let gdir = dir.join(&g.name);
+        let (Some((modified, _)), Some((_, bytes))) = (
+            file_meta(&gdir.join(reinject::DONE_FILE))?,
+            file_meta(&gdir.join(reinject::RECORDS_FILE))?,
+        ) else {
+            continue;
+        };
+        cands.push(Candidate {
+            name: g.name,
+            paths: vec![gdir.join(reinject::RECORDS_FILE)],
+            modified,
+            bytes,
+        });
+    }
+    let mut rep = PruneReport::default();
+    let items: Vec<(SystemTime, u64)> = cands.iter().map(|c| (c.modified, c.bytes)).collect();
+    for (c, over) in cands.iter().zip(r.over(&items, now)) {
+        if !over {
+            continue;
+        }
+        for p in &c.paths {
+            match fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(parent) = p.parent() {
+                fsutil::fsync_dir(parent)?;
+            }
+        }
+        rep.removed += 1;
+        rep.removed_bytes += c.bytes;
+    }
+    Ok(rep)
+}
+
+/// Entries and bytes of one kind of state.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub entries: u64,
+    pub bytes: u64,
+}
+
+/// What the exporter state occupies on disk (status / report), so its
+/// growth can be watched and bounded. `None`: not used with this source.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateUsage {
+    /// `<state>/done/` markers.
+    pub done_markers: Usage,
+    /// The dead-letter files (current and rotated).
+    pub dead_letters: Usage,
+    /// The importer's `out/` batch directories (diode source; all of them,
+    /// finished or not).
+    pub diode_out: Option<Usage>,
+    /// `<spool>/rejected/` files (spool source).
+    pub spool_rejected: Option<Usage>,
+    /// Re-injection generations (`robodr-uplink`).
+    pub reinject: Option<Usage>,
+    /// When this was measured (ms since the epoch).
+    pub measured_at_ms: u64,
+}
+
+/// Entries (not starting with `.`) directly in `dir` and the bytes under
+/// it (`depth` levels).
+pub fn dir_usage(dir: &Path, depth: u32) -> io::Result<Usage> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Usage::default()),
+        Err(e) => return Err(e),
+    };
+    let mut u = Usage::default();
+    for e in rd {
+        let e = e?;
+        if e.file_name().as_encoded_bytes().first() == Some(&b'.') {
+            continue;
+        }
+        u.entries += 1;
+        let t = e.file_type()?;
+        if t.is_file() {
+            u.bytes = u.bytes.saturating_add(e.metadata()?.len());
+        } else if t.is_dir() && depth > 0 {
+            u.bytes = u.bytes.saturating_add(tree_bytes(&e.path(), depth - 1)?);
+        }
+    }
+    Ok(u)
+}
+
+/// The usage of an exporter's state: `state_dir` with its `done/` and the
+/// dead-letter files named `dead_letter`, the diode `out/` or the spool's
+/// `rejected/`, and (`reinject`) `<state>/reinject/`.
+pub fn state_usage(
+    state_dir: &Path,
+    dead_letter: &str,
+    source: &crate::publish::Source,
+    reinject: bool,
+) -> io::Result<StateUsage> {
+    use crate::publish::Source;
+    let mut dead = Usage::default();
+    for p in crate::deadletter::files(state_dir, dead_letter)? {
+        if let Some((_, n)) = file_meta(&p)? {
+            dead.entries += 1;
+            dead.bytes = dead.bytes.saturating_add(n);
+        }
+    }
+    let (diode_out, spool_rejected) = match source {
+        Source::DiodeOut(out) => (Some(dir_usage(out, 4)?), None),
+        Source::Spool(root) => (None, Some(dir_usage(&root.join("rejected"), 0)?)),
+    };
+    Ok(StateUsage {
+        done_markers: dir_usage(&state_dir.join("done"), 0)?,
+        dead_letters: dead,
+        diode_out,
+        spool_rejected,
+        reinject: if reinject {
+            Some(dir_usage(&state_dir.join(crate::uplink::REINJECT_DIR), 1)?)
+        } else {
+            None
+        },
+        measured_at_ms: fsutil::now_ms(),
+    })
+}
+
+/// The command-line flags `--<what>-max-age-s`, `--<what>-max-count` and
+/// `--<what>-max-bytes` (`get` reads one numeric flag; `0`: that bound
+/// off). `None` when none of them is given.
+pub fn bound_flags(
+    what: &str,
+    mut get: impl FnMut(&str) -> Result<Option<u64>, String>,
+) -> Result<Option<Retention>, String> {
+    let age = get(&format!("{what}-max-age-s"))?;
+    let count = get(&format!("{what}-max-count"))?;
+    let bytes = get(&format!("{what}-max-bytes"))?;
+    if age.is_none() && count.is_none() && bytes.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(with_flags(Retention::UNBOUNDED, age, count, bytes)))
+}
+
 /// Seconds as an optional duration (`0`: unbounded), for command lines.
 pub fn secs(n: u64) -> Option<Duration> {
     (n > 0).then(|| Duration::from_secs(n))
@@ -331,5 +608,90 @@ mod tests {
         let rep = prune_done_markers(&done, &out, &r, SystemTime::now()).unwrap();
         assert_eq!(rep.removed + rep.held, 1, "{rep:?}");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn out_batches_go_only_once_finished() {
+        let d = tmp("out");
+        let (done, out) = (d.join("done"), d.join("out"));
+        fsutil::mkdir(&done).unwrap();
+        fsutil::mkdir(&out).unwrap();
+        for b in ["rdd_a_1", "rdd_a_2"] {
+            fsutil::mkdir(&out.join(b)).unwrap();
+            fsutil::mkdir(&out.join(b).join("bundles")).unwrap();
+            fs::write(out.join(b).join("records.jsonl"), [b'x'; 100]).unwrap();
+            fs::write(out.join(b).join("bundles").join("1.json"), [b'y'; 10]).unwrap();
+        }
+        fs::write(done.join("rdd_a_1"), b"").unwrap();
+        // Not a batch directory / a staging directory: never touched.
+        fs::write(out.join("rdd_a_3"), b"").unwrap();
+        fsutil::mkdir(&out.join(".tmp-import")).unwrap();
+        // A leftover of an interrupted deletion: removed.
+        fsutil::mkdir(&out.join(format!("{PRUNING_PREFIX}rdd_a_0"))).unwrap();
+        let later = SystemTime::now() + DAY * 40;
+        let r = Retention::max_age(DAY * 30);
+        assert_eq!(
+            prune_diode_out(&out, &done, &Retention::UNBOUNDED, later).unwrap(),
+            PruneReport::default()
+        );
+        let rep = prune_diode_out(&out, &done, &r, SystemTime::now()).unwrap();
+        assert_eq!((rep.removed, rep.held), (0, 0), "not old yet");
+        assert!(!out.join(format!("{PRUNING_PREFIX}rdd_a_0")).exists());
+        let rep = prune_diode_out(&out, &done, &r, later).unwrap();
+        assert_eq!((rep.removed, rep.held, rep.removed_bytes), (1, 1, 110));
+        assert!(!out.join("rdd_a_1").exists(), "finished: deleted");
+        assert!(out.join("rdd_a_2").exists(), "not finished: held");
+        assert!(out.join("rdd_a_3").exists() && out.join(".tmp-import").exists());
+        assert!(done.join("rdd_a_1").exists(), "the marker is not ours");
+        let u = dir_usage(&out, 4).unwrap();
+        assert_eq!((u.entries, u.bytes), (2, 110));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reinject_payloads_go_the_ledger_stays() {
+        use crate::uplink::reinject::{DONE_FILE, ORIGIN_FILE, RECORDS_FILE};
+        let d = tmp("rj");
+        let (g1, g2) = (
+            "rj-0000000000000001-0123456789abcdef",
+            "rj-0000000000000002-0123456789abcdef",
+        );
+        for g in [g1, g2] {
+            fsutil::mkdir(&d.join(g)).unwrap();
+            fs::write(d.join(g).join(RECORDS_FILE), [b'r'; 50]).unwrap();
+            fs::write(d.join(g).join(ORIGIN_FILE), b"{}\n").unwrap();
+        }
+        // g1 done, g2 still being sent.
+        fs::write(d.join(g1).join(DONE_FILE), b"").unwrap();
+        let r = Retention {
+            max_count: Some(0),
+            ..Default::default()
+        };
+        let rep = prune_reinject_payloads(&d, &r, SystemTime::now()).unwrap();
+        assert_eq!((rep.removed, rep.removed_bytes), (1, 50));
+        assert!(!d.join(g1).join(RECORDS_FILE).exists());
+        assert!(d.join(g1).join(ORIGIN_FILE).exists() && d.join(g1).join(DONE_FILE).exists());
+        assert!(d.join(g2).join(RECORDS_FILE).exists(), "not done: kept");
+        // Nothing left to prune.
+        let rep = prune_reinject_payloads(&d, &r, SystemTime::now()).unwrap();
+        assert_eq!(rep, PruneReport::default());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bound_flags_need_one_flag() {
+        let none = bound_flags("out", |_| Ok(None)).unwrap();
+        assert_eq!(none, None);
+        let some = bound_flags("out", |f| Ok((f == "out-max-count").then_some(3))).unwrap();
+        assert_eq!(
+            some,
+            Some(Retention {
+                max_count: Some(3),
+                ..Default::default()
+            })
+        );
+        let off = bound_flags("out", |f| Ok((f == "out-max-age-s").then_some(0))).unwrap();
+        assert!(off.is_some_and(|r| r.is_unbounded()));
+        assert!(bound_flags("out", |_| Err("bad".to_string())).is_err());
     }
 }

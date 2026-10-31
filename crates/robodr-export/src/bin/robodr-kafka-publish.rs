@@ -18,6 +18,8 @@ const USAGE: &str = "usage: robodr-kafka-publish --bootstrap HOST:PORT [--bootst
 [--interval-ms N] [--once] [--upgrade-data-source LABEL] [--no-idempotence] \
 [--dead-letter-max-bytes N] [--dead-letter-keep N] [--dead-letter-max-age-s N] \
 [--done-max-age-s N] [--done-max-count N] \
+[--out-max-age-s N] [--out-max-count N] [--out-max-bytes N] \
+[--rejected-max-age-s N] [--rejected-max-count N] [--rejected-max-bytes N] \
 (--tls-ca FILE [--tls-cert FILE --tls-key FILE] [--tls-server-name NAME] [--tls-spki-sha256 HEX]... [--tls-crl-file FILE]... \
 [--sasl-mechanism SCRAM-SHA-256|SCRAM-SHA-512 --sasl-username U --sasl-password-file FILE] \
 | --allow-plaintext)\n\
@@ -40,9 +42,38 @@ the only copy of findings Kafka refused). Opt in to rotation with --dead-letter-
 optionally bounded by --dead-letter-max-age-s; older rotated files are then DELETED (each \
 deletion is logged with its entry count). done/ markers older than --done-max-age-s (default \
 2592000 = 30 days, 0 = keep) or beyond --done-max-count are deleted once their batch has left \
-the importer's out/. Nothing still needed for deduplication is deleted. A spool file that \
+the importer's out/. --out-max-age-s / --out-max-count / --out-max-bytes (diode source, \
+default keep; only when this publisher is the sole consumer of out/) delete the out/ batch \
+directories it has finished (aged by their done/ marker); --rejected-max-age-s / \
+--rejected-max-count / --rejected-max-bytes (spool source, default keep) delete the oldest \
+<spool>/rejected/ records. Nothing still needed for deduplication is deleted. The JSON report \
+carries state_usage (entries and bytes of done/, dead letters, out/ or rejected/, measured at \
+most once a minute). A spool file that \
 cannot be read (I/O error after 3 attempts) is dead-lettered with the error and moved to \
 <spool>/rejected/; the run goes on.";
+
+/// `--out-max-*` (diode source only) and `--rejected-max-*` (spool source
+/// only), `--reinject-max-*` when `reinject` (opt-in bounds, default keep).
+fn source_bounds(
+    a: &Args,
+    diode: bool,
+    reinject: bool,
+) -> Result<[Option<retention::Retention>; 3], String> {
+    let out = retention::bound_flags("out", |f| a.num(f))?;
+    let rejected = retention::bound_flags("rejected", |f| a.num(f))?;
+    let re = if reinject {
+        retention::bound_flags("reinject", |f| a.num(f))?
+    } else {
+        None
+    };
+    if out.is_some() && !diode {
+        return Err("--out-max-* bound the importer's out/: they need --diode-out".into());
+    }
+    if rejected.is_some() && diode {
+        return Err("--rejected-max-* bound <spool>/rejected/: they need --spool".into());
+    }
+    Ok([out, rejected, re])
+}
 
 struct Opts {
     producer: ProducerConfig,
@@ -133,6 +164,9 @@ fn opts(a: &Args) -> Result<Opts, String> {
         a.num("done-max-count")?,
         None,
     );
+    let [out, rejected, _] = source_bounds(a, matches!(c.source, Source::DiodeOut(_)), false)?;
+    c.out_retention = out.unwrap_or(retention::Retention::UNBOUNDED);
+    c.rejected_retention = rejected.unwrap_or(retention::Retention::UNBOUNDED);
     let interval: u64 = a.num("interval-ms")?.unwrap_or(2_000);
     if interval == 0 {
         return Err("--interval-ms must be > 0".into());
@@ -223,6 +257,8 @@ fn run(o: &Opts) -> Result<(), String> {
             || !r.batches_done.is_empty()
             || r.pruned_done.removed > 0
             || r.pruned_dead_letters.removed > 0
+            || r.pruned_out.removed > 0
+            || r.pruned_rejected.removed > 0
         {
             println!("{}", serde_json::to_string(&r).unwrap_or_default());
         }
@@ -268,6 +304,12 @@ fn main() -> ExitCode {
             "dead-letter-max-age-s",
             "done-max-age-s",
             "done-max-count",
+            "out-max-age-s",
+            "out-max-count",
+            "out-max-bytes",
+            "rejected-max-age-s",
+            "rejected-max-count",
+            "rejected-max-bytes",
             "tls-ca",
             "tls-cert",
             "tls-key",

@@ -119,6 +119,11 @@ pub struct Snapshot {
     pub accepted_total: u64,
     pub rejected_total: u64,
     pub dead_lettered_total: u64,
+    /// What the state occupies on disk (`done/`, dead letters, `out/` or
+    /// `rejected/`, re-injection generations), measured at most every
+    /// [`super::UplinkConfig::usage_interval`].
+    #[serde(default)]
+    pub state_usage: Option<crate::retention::StateUsage>,
 }
 
 /// `<state>/uplink-status.json`.

@@ -195,8 +195,29 @@ robodr-kafka-publish --bootstrap kafka-1:9092 [--bootstrap kafka-2:9092] \
   spool: its file is still in `ready/`), otherwise it is held and reported
   (`pruned_dead_letters.held`). Every deletion of a file holding entries
   is logged on stderr with the count (`pruned_dead_letters.removed_entries`).
-  Deletions are single `unlink`s plus a directory fsync: crash-safe at any
-  point.
+  Opt-in, kept by default: `--out-max-age-s` / `--out-max-count` /
+  `--out-max-bytes` (diode source) delete the importer's `out/` batch
+  directories this tool has **finished** (its `done/` marker exists; aged
+  by the marker; an unfinished one is held, `pruned_out.held`); use them
+  only when this tool is the **only consumer** of `out/` (a second
+  publisher or uplink on the same `out/` would lose those batches; the
+  importer itself does not need them). `--rejected-max-age-s` /
+  `--rejected-max-count` / `--rejected-max-bytes` (spool source) bound
+  `<spool>/rejected/` as `robodr-spool-export` does; a record moved there
+  by the publisher or the uplink has its reason in the dead-letter file
+  and is dated by the first pass that sees it (a `.reason.json` note is
+  written then). `robodr-uplink` also takes `--reinject-max-age-s` /
+  `--reinject-max-count` / `--reinject-max-bytes`: the `records.jsonl` of
+  finished re-injection generations are deleted, their `origin.jsonl` and
+  `done` (the ledger that keeps a dead letter from being re-injected
+  twice) stay; a record whose original is gone is re-injected from its
+  dead letter's `record` copy. Sizes: `state_usage` (`{entries, bytes}` of
+  `done_markers`, `dead_letters`, `diode_out` or `spool_rejected`, and
+  `reinject` for the uplink) in the publisher's JSON report and in
+  `uplink-status.json`, measured at most once a minute. Deletions are
+  single `unlink`s plus a directory fsync (an `out/` batch directory is
+  renamed aside first, then removed; a leftover is removed by the next
+  pass): crash-safe at any point.
 * **Dead letters.** A record that fails validation, or that Kafka rejects
   as a record (`MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`,
   `INVALID_RECORD`), is appended to `<state>/dead-letter.jsonl`
@@ -697,8 +718,10 @@ partitioner all agreed with the real brokers.
   forever with the batch kept, never dropped. No HTTP proxy support (the
   sites are air-gapped or direct).
 * `done/` markers are bounded only once the importer's `out/` is pruned
-  (a marker is kept while its batch is there); the reinject ledger
-  (`<state>/reinject/`) and the publisher's/uplink's spool `rejected/`
-  are not pruned. No signal handling: both tools are crash-safe by
+  (a marker is kept while its batch is there; `--out-max-*` prunes `out/`
+  for a sole consumer, otherwise the operator does). The re-injection
+  ledger (`origin.jsonl` per generation, small) is never pruned; the
+  importer's own `processed/` and `quarantine/` are the importer's
+  (robodr-diode). No signal handling: both tools are crash-safe by
   design, so SIGTERM/SIGKILL at any point is covered by the recovery rules
   above.

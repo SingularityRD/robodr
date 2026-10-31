@@ -34,6 +34,32 @@ fn usage_errors_exit_2() {
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("--diode-out"));
+    // T83: out/ bounds need a diode source, rejected/ bounds a spool.
+    for (src, flag, want) in [
+        ("--spool", "--out-max-count", "need --diode-out"),
+        ("--diode-out", "--rejected-max-age-s", "need --spool"),
+    ] {
+        let o = Command::new(PUBLISH)
+            .args([
+                "--bootstrap",
+                "x:1",
+                "--allow-plaintext",
+                "--state-dir",
+                "/tmp/x",
+                src,
+                "/tmp/y",
+                flag,
+                "5",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains(want),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
 }
 
 #[test]
