@@ -230,6 +230,11 @@ SHIPPED_DOCS = (
     "/usr/share/doc/robodr/demo/fastrtps_rogue_cmd_vel.pcap",
     "/usr/share/doc/robodr/examples/metrics/robodr-alerts.example.yml",
     "/usr/share/doc/robodr/examples/modules-load.d/robodr.conf.example",
+    # robodr-setup's templates, outside /usr/share/doc (minimal images drop
+    # it; review 2, L18).
+    "/usr/share/robodr/examples/agentd.example.json",
+    "/usr/share/robodr/examples/agentd.unitree-edu.example.json",
+    "/usr/share/robodr/examples/agentd.unitree-sensor-box.example.json",
 )
 # A key is its header followed by its base64 body. The header alone is not
 # key material: programs that detect keys (robodr-support-bundle's final
@@ -1109,6 +1114,8 @@ def self_test() -> int:
     expect("notices missing", check_package("t", STD, no_notices, {}, ROOT), False)
     no_demo = {k: v for k, v in base.items() if not k.endswith("/fastrtps_rogue_cmd_vel.pcap")}
     expect("demo capture missing", check_package("t", STD, no_demo, {}, ROOT), False)
+    no_setup = {k: v for k, v in base.items() if not k.startswith("/usr/share/robodr/examples/")}
+    expect("robodr-setup templates missing", check_package("t", STD, no_setup, {}, ROOT), False)
     expect("draft shipped", check_package(
         "t", STD, {**base, "/usr/share/doc/robodr/customer/eula-draft.md": ent()}, {}, ROOT), False)
     expect("setuid", check_package("t", STD, {**base, "/usr/bin/robodr-replay": ent(mode=0o4755)}, {}, ROOT), False)

@@ -412,6 +412,13 @@ done
 for f in "$root"/config/*.example*; do
     install -m 0644 "$f" "$doc/examples/"
 done
+# The agentd templates robodr-setup renders (its role table,
+# robodr_ops::setup::Role::agentd_example), outside /usr/share/doc: minimal
+# images drop /usr/share/doc (dpkg path-exclude, tsflags=nodocs), and
+# robodr-setup must still find them (review 2, L18).
+for f in agentd.example.json agentd.unitree-edu.example.json agentd.unitree-sensor-box.example.json; do
+    install -D -m 0644 "$root/config/$f" "$pkg/usr/share/robodr/examples/$f"
+done
 
 # Maintainer scripts and metadata.
 for s in postinst prerm postrm; do

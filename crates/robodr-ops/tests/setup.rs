@@ -540,3 +540,85 @@ fn cli_keys_config_fingerprints() {
         assert!(!String::from_utf8_lossy(&o.stderr).contains(hexs));
     }
 }
+
+/// `--ignore-check` for every check that fails on this test host (the CLI
+/// runs the real host commands), so `init` gets past its preflight.
+fn ignore_failing(root: &str) -> Vec<String> {
+    let o = run(&["preflight", "--root", root, "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let mut out = Vec::new();
+    for c in v["checks"].as_array().unwrap() {
+        if c["level"] == "fail" {
+            assert_ne!(c["id"], "keys.dir", "{c}");
+            out.push("--ignore-check".to_string());
+            out.push(c["id"].as_str().unwrap().to_string());
+        }
+    }
+    out
+}
+
+/// Review 2, L18: `robodr-setup` read its agentd template only from
+/// `/usr/share/doc/robodr/examples`, which minimal images strip, and `init`
+/// generated the keys before it found the template missing. The package
+/// now ships the templates under `/usr/share/robodr/examples` (tried first),
+/// and `init` reads the template before any key is generated.
+#[test]
+fn cli_init_reads_the_template_before_generating_keys() {
+    let t = Tmp::new("cli-init-template");
+    good_host(&t);
+    t.put("/etc/group", "robodr:x:4242:\n");
+    let root = t.0.to_str().unwrap();
+    let ignore = ignore_failing(root);
+    let init = |extra: &[&str]| {
+        let mut args = vec![
+            "init",
+            "--root",
+            root,
+            "--role",
+            "robot",
+            "--unit-id",
+            "ugv-3",
+        ];
+        args.extend(ignore.iter().map(String::as_str));
+        args.extend(extra);
+        run(&args)
+    };
+    // No template anywhere (a minimal image without /usr/share/doc and an
+    // older package): refused, and no key was generated.
+    let o = init(&[]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        e.contains("template") && e.contains("agentd.example.json"),
+        "{e}"
+    );
+    assert!(std::fs::read_dir(t.path("/etc/robodr/keys"))
+        .unwrap()
+        .next()
+        .is_none());
+    // The package's copy outside /usr/share/doc is found.
+    let ex = t.path("/usr/share/robodr/examples");
+    std::fs::create_dir_all(&ex).unwrap();
+    std::fs::copy(
+        repo().join("config/agentd.example.json"),
+        ex.join("agentd.example.json"),
+    )
+    .unwrap();
+    let o = init(&[]);
+    assert!(
+        o.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(t.path("/etc/robodr/keys/agentd-blackbox.key").exists());
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(t.path("/etc/robodr/agentd.json")).unwrap())
+            .unwrap();
+    assert_eq!(cfg["robot"]["id"], "ugv-3");
+}

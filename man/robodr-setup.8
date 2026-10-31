@@ -280,8 +280,15 @@ keys (0700 root).
 .I /etc/robodr/agentd.json
 the role configuration.
 .TP
+.I /usr/share/robodr/examples/
+the role templates (agentd configuration per role), read before
+.B init
+generates any key; kept on minimal images, which drop
+.IR /usr/share/doc .
+Without
+.BR \-\-examples ,
 .I /usr/share/doc/robodr/examples/
-the role examples.
+is tried next.
 .SH SEE ALSO
 .BR robodr\-agentd (8),
 .BR robodr\-blackbox (1),
