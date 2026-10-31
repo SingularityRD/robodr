@@ -508,17 +508,44 @@ fn self_check(cfg: &Config) -> Result<(), String> {
 }
 
 /// The check of a replaced own binary for an engine started from the
-/// configuration file `cfg_path`.
-fn own_self_check(own: Option<OwnBinary>, cfg_path: &Path) -> Option<crate::own::SelfCheck> {
-    Some(crate::own::SelfCheck {
-        exe: own?,
-        config: std::path::absolute(cfg_path).ok()?,
-    })
+/// configuration file `cfg_path`, or why there can be none.
+fn own_self_check(
+    own: Option<OwnBinary>,
+    cfg_path: &Path,
+) -> Result<crate::own::SelfCheck, String> {
+    let exe = own.ok_or(
+        "the executable of this process is not known (/proc/self/exe did not resolve to a \
+         file, or it was replaced or removed before the start)",
+    )?;
+    let config = std::path::absolute(cfg_path)
+        .map_err(|e| format!("configuration path {}: {e}", cfg_path.display()))?;
+    Ok(crate::own::SelfCheck::new(exe, config))
+}
+
+/// Give the engine the check of a replaced own binary, or note in the
+/// journal (and on stderr) that deb installs commit without it.
+fn arm_self_check(e: &mut Engine, c: Result<crate::own::SelfCheck, String>) -> Result<(), String> {
+    match c {
+        Ok(c) => {
+            e.set_self_check(Some(c));
+            Ok(())
+        }
+        Err(why) => {
+            eprintln!(
+                "robodr-deliverd: warning: a self-upgrade will commit without the self-check \
+                 of the new binary: {why}"
+            );
+            e.self_check_unavailable(&why).map_err(|e| e.0)
+        }
+    }
 }
 
 fn once(cfg: Config, cfg_path: &Path) -> Result<(), String> {
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
-    e.set_self_check(own_self_check(OwnBinary::of_self(), cfg_path));
+    if let Err(err) = arm_self_check(&mut e, own_self_check(OwnBinary::of_self(), cfg_path)) {
+        let _ = e.close();
+        return Err(err);
+    }
     let r = e.tick().map_err(|e| e.0);
     let closed = e.close().map_err(|e| e.0);
     let r = r?;
@@ -551,7 +578,11 @@ fn run_loop(cfg: Config, cfg_path: &Path) -> Result<Stop, String> {
     let mut last_report: Option<Instant> = None;
     let mut last_pull: Option<Instant> = None;
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
-    e.set_self_check(check);
+    if let Err(err) = arm_self_check(&mut e, check) {
+        let _ = e.close();
+        return Err(err);
+    }
+    let mut stayed = false;
     let notifier = robodr_agentd::notify::Notifier::from_env();
     notifier.notify("READY=1");
     let mut res = Ok(Stop::Signal);
@@ -619,8 +650,21 @@ fn run_loop(cfg: Config, cfg_path: &Path) -> Result<Stop, String> {
         // RoboDR's own package has finished (health gate, commit or
         // rollback) on the old binary first.
         if own.as_ref().is_some_and(OwnBinary::replaced) {
-            res = Ok(Stop::Replaced);
-            break;
+            // WP14: not into a replacement that failed its self-check and
+            // is still in place (its rollback was blocked): this old code
+            // keeps running until it is stopped.
+            if !e.own_replacement_failed() {
+                res = Ok(Stop::Replaced);
+                break;
+            }
+            if !stayed {
+                stayed = true;
+                eprintln!(
+                    "robodr-deliverd: this program was replaced by a binary that failed its \
+                     self-check and was not rolled back; staying on the running one (a restart \
+                     starts the failing binary)"
+                );
+            }
         }
         let until = Instant::now() + interval;
         while Instant::now() < until && !robodr_agentd::signal::requested() {
@@ -707,5 +751,22 @@ pub fn run_replay(args: Vec<String>) -> i32 {
             println!("robodr-safety-replay: {msg}");
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WP14: an agent that cannot know its own executable says why (the
+    /// caller notes it in the journal) instead of dropping the check.
+    #[test]
+    fn an_unknown_own_executable_is_a_reason_not_a_silent_skip() {
+        let why = own_self_check(None, Path::new("/etc/robodr/deliverd.json")).unwrap_err();
+        assert!(why.contains("/proc/self/exe"), "{why}");
+        let why = own_self_check(OwnBinary::of_self(), Path::new("")).unwrap_err();
+        assert!(why.contains("configuration path"), "{why}");
+        let c = own_self_check(OwnBinary::of_self(), Path::new("deliverd.json")).unwrap();
+        assert!(c.config.is_absolute());
     }
 }

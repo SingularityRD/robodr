@@ -130,6 +130,9 @@ pub struct Engine {
     /// The agent's own binary: a deb install that replaced it commits
     /// only once the replacement passes `self-check` ([`crate::own`]).
     self_check: Option<crate::own::SelfCheck>,
+    /// What the agent's own path named right before the deb switch being
+    /// judged ([`crate::own::SelfCheck::mark`]).
+    own_mark: Option<crate::own::Mark>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -320,6 +323,7 @@ impl Engine {
             nv,
             luks: None,
             self_check: None,
+            own_mark: None,
         };
         e.load_anchor();
         e.journal.note(
@@ -605,6 +609,26 @@ impl Engine {
     /// no such check, e.g. the library used in-process).
     pub fn set_self_check(&mut self, c: Option<crate::own::SelfCheck>) {
         self.self_check = c;
+    }
+
+    /// The agent cannot check a replacement of its own binary (`why`):
+    /// deb installs commit without that check. Noted in the journal
+    /// (`robodr.deliver.self_check_unavailable`) so the skip is visible.
+    pub fn self_check_unavailable(&mut self, why: &str) -> R<()> {
+        self.self_check = None;
+        self.journal
+            .note(kinds::SELF_CHECK_UNAVAILABLE, json!({"why": why}))?;
+        Ok(())
+    }
+
+    /// The agent's own binary was replaced by one that failed `self-check`
+    /// and is still in place (its rollback did not restore the binary, e.g.
+    /// blocked by a security floor): `run` keeps the old code running
+    /// instead of exiting into it.
+    pub fn own_replacement_failed(&self) -> bool {
+        self.self_check
+            .as_ref()
+            .is_some_and(crate::own::SelfCheck::replacement_failed)
     }
 
     /// The configuration.
@@ -1884,6 +1908,7 @@ impl Engine {
             )?;
         }
         // 7. Switch.
+        self.own_mark = self.self_check.as_ref().map(crate::own::SelfCheck::mark);
         let switched = self.installer().activate(&it.name, &ver, &m);
         fault::hit("after_switch")?;
         let txn = Txn {
@@ -2357,12 +2382,13 @@ impl Engine {
             }
             self.save()?;
         }
+        let mark = self.own_mark.take();
         let mut report = health::run(&self.cfg, &m.health, &txn.to);
         // RoboDR's own package replaced this binary: the new one must be
         // able to start before the install commits, while this (old)
         // process can still roll it back.
         if txn.to.kind == robodr_pkg::rpk::Kind::Deb {
-            if let Some((passed, detail)) = self.self_check.as_ref().and_then(|c| c.judge()) {
+            if let Some((passed, detail)) = self.self_check.as_mut().and_then(|c| c.judge(mark)) {
                 report.passed &= passed;
                 report.checks.push(health::CheckResult {
                     check: crate::own::SelfCheck::LABEL.into(),

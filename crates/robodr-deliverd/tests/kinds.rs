@@ -292,6 +292,16 @@ fn maintainer_scripts_see_the_deliverd_install_marker() {
 /// shipping `usr/sbin/robodr-deliverd` as a shell script running `body`:
 /// it stands in for a self-upgrade that replaces the agent's binary.
 fn agent_rpk(u: &Unit, serial: u64, version: &str, body: &str) -> PathBuf {
+    agent_rpk_with(u, serial, version, body, |_| {})
+}
+
+fn agent_rpk_with(
+    u: &Unit,
+    serial: u64,
+    version: &str,
+    body: &str,
+    edit: impl FnOnce(&mut robodr_release::ops::RpkSpec),
+) -> PathBuf {
     let st = u.work.join(format!("agent-stage-{version}"));
     let _ = std::fs::remove_dir_all(&st);
     std::fs::create_dir_all(st.join("DEBIAN")).unwrap();
@@ -324,6 +334,7 @@ fn agent_rpk(u: &Unit, serial: u64, version: &str, body: &str) -> PathBuf {
             u.cfg.install.dpkg_root.as_ref().unwrap().display()
         ),
     }];
+    edit(&mut s);
     u.rpk(&s, &[("robodr.deb", &deb), ("sbom.cdx.json", SBOM)])
 }
 
@@ -372,10 +383,10 @@ fn a_self_upgrade_whose_new_binary_fails_self_check_is_rolled_back() {
     // The agent now "runs" version 1's binary.
     let exe = root.join("usr/sbin/robodr-deliverd");
     let cfg_file = u.work.join("deliverd.json");
-    e.set_self_check(Some(robodr_deliverd::own::SelfCheck {
-        exe: robodr_deliverd::own::OwnBinary::of(&exe).unwrap(),
-        config: cfg_file.clone(),
-    }));
+    e.set_self_check(Some(robodr_deliverd::own::SelfCheck::new(
+        robodr_deliverd::own::OwnBinary::of(&exe).unwrap(),
+        cfg_file.clone(),
+    )));
 
     // 2.0 passes its declared checks, but its binary cannot start.
     let r2 = agent_rpk(&u, 2, "2.0", "echo cannot start >&2\nexit 1");
@@ -429,6 +440,105 @@ fn a_self_upgrade_whose_new_binary_fails_self_check_is_rolled_back() {
         std::fs::read_to_string(&args).unwrap(),
         format!("self-check --config {}\n", cfg_file.display())
     );
+    assert!(u.black_box_verifies());
+}
+
+/// WP14: when a self-upgrade fails its self-check but the security floor
+/// blocks the rollback, the failing binary stays at the path. The engine
+/// knows (`own_replacement_failed`), so `run` keeps the old code running
+/// instead of exiting 3 into it; a later release that passes clears it.
+/// Meanwhile the self-check judges only a switch that replaced the
+/// agent's binary: an unrelated deb is installed, not rolled back because
+/// the failing binary is still in place.
+#[test]
+fn a_self_upgrade_whose_rollback_the_floor_blocks_is_known_to_have_failed() {
+    if !dpkg_available("deb_self_check_floor") {
+        return;
+    }
+    let u = Unit::with("deb-self-check-floor", |v| {
+        v["install"]["robodr_programme"] = PROGRAMME.into();
+    });
+    let root = dpkg_root(&u);
+    let r1 = agent_rpk(&u, 1, "1.0", "exit 0");
+    let b1 = u.bundle(1, None, std::slice::from_ref(&r1));
+    u.pack("p1", 1, &[r1], std::slice::from_ref(&b1));
+    let mut e = u.open();
+    u.run(&mut e, 5);
+    assert_eq!(package_version(&u, "robodr"), "1.0");
+    let exe = root.join("usr/sbin/robodr-deliverd");
+    e.set_self_check(Some(robodr_deliverd::own::SelfCheck::new(
+        robodr_deliverd::own::OwnBinary::of(&exe).unwrap(),
+        u.work.join("deliverd.json"),
+    )));
+    assert!(!e.own_replacement_failed());
+
+    // 2.0 raises the floor to 2 and its binary cannot start.
+    let r2 = agent_rpk_with(&u, 2, "2.0", "exit 1", |s| s.security_floor = 2);
+    let b2 = u.bundle(2, Some(bundle_hash(&b1)), std::slice::from_ref(&r2));
+    u.pack("p2", 2, &[r2], std::slice::from_ref(&b2));
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.blocked == vec!["robodr 2".to_string()]),
+        "{reps:?}"
+    );
+    assert_eq!(package_version(&u, "robodr"), "2.0");
+    assert!(e.own_replacement_failed());
+
+    // An unrelated deb: its switch did not replace the agent's binary.
+    let d = stub_deb(&u.work, "1.0", true, false);
+    let rs = deb_rpk(&u, 1, &d, false);
+    let bs = u.bundle(3, Some(bundle_hash(&b2)), std::slice::from_ref(&rs));
+    u.pack("p3", 3, &[rs], std::slice::from_ref(&bs));
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr-stub 1".to_string()]),
+        "{reps:?}"
+    );
+    assert!(reps.iter().all(|r| r.rolled_back.is_empty()), "{reps:?}");
+    let h = u
+        .notes_of("robodr.deliver.health")
+        .into_iter()
+        .find(|n| n["name"] == "robodr-stub")
+        .unwrap();
+    assert!(
+        h["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["check"] != "robodr-deliverd self-check"),
+        "{h}"
+    );
+    assert!(e.own_replacement_failed());
+
+    // 3.0 passes: installed, and nothing failing is in place any more.
+    let r3 = agent_rpk_with(&u, 3, "3.0", "exit 0", |s| s.security_floor = 2);
+    let b3 = u.bundle(4, Some(bundle_hash(&bs)), std::slice::from_ref(&r3));
+    u.pack("p4", 4, &[r3], &[b3]);
+    let reps = u.run(&mut e, 5);
+    assert!(
+        reps.iter()
+            .any(|r| r.installed == vec!["robodr 3".to_string()]),
+        "{reps:?}"
+    );
+    assert!(!e.own_replacement_failed());
+    assert!(u.black_box_verifies());
+}
+
+/// WP14: when the agent cannot check a replacement of its own binary
+/// (`/proc/self/exe` did not resolve), the skip is noted in the journal
+/// and nothing is checked.
+#[test]
+fn an_unavailable_self_check_is_noted_in_the_journal() {
+    let u = Unit::new("self-check-unavailable");
+    let mut e = u.open();
+    e.self_check_unavailable("no /proc").unwrap();
+    assert!(!e.own_replacement_failed());
+    e.close().unwrap();
+    let n = u.notes_of("robodr.deliver.self_check_unavailable");
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!(n[0]["why"], "no /proc");
     assert!(u.black_box_verifies());
 }
 
