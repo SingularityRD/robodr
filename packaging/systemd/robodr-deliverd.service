@@ -12,7 +12,8 @@
 #     stop (SIGTERM / SIGINT, handled between passes), 1 runtime failure
 #     (an evidence or state write failed; the write-ahead intent in the
 #     state file is resumed at the next start), 2 usage / configuration,
-#     3 its own binary was replaced after a pass (self-upgrade; restarted).
+#     3 its own binary was replaced after a pass (self-upgrade; restarted;
+#     the pass committed only after the new binary's `self-check` passed).
 #   * deb only: kind deb needs dpkg (Debian / Ubuntu). On an RPM-based
 #     unit a deb RPK is refused; RoboDR delivers no RPM packages (T53).
 #   * /etc/robodr/deliverd.json (robodr-deliverd-config/1, example in
@@ -97,8 +98,12 @@ SuccessExitStatus=3
 RestartForceExitStatus=3
 # A pass in progress finishes (or is recovered from its intent after a kill).
 # SIGTERM goes to the agent only: the dpkg run or probe it is waiting for
-# finishes with the pass instead of being signalled half-way; whatever is
-# left when the agent has exited (or at the timeout) gets SIGKILL.
+# finishes with the pass instead of being signalled half-way, but only
+# within TimeoutStopSec=. At the timeout the agent, dpkg and anything else
+# left get SIGKILL, and the next start recovers from the write-ahead intent
+# (a half-done dpkg run is rolled back). install.dpkg_timeout_s (default
+# 900 s, up to 7200 s), and a pass's health probes together, can exceed
+# 5 min: raise TimeoutStopSec= in a drop-in where passes take that long.
 KillMode=mixed
 TimeoutStopSec=5min
 # Never the reason the motion stack is OOM-killed; below the robot's

@@ -3639,12 +3639,30 @@ or other permissions, as for `--key`.
   and exits 3; the unit (`RestartForceExitStatus=3`) starts it again on
   the new binary within `RestartSec=`. Expect one
   `robodr-deliverd.service: Main process exited, status=3` line per
-  self-upgrade; it is not a failure. The unit also sets `KillMode=mixed`,
-  so `systemctl stop` signals the agent only and a dpkg run in progress
-  finishes with its pass. Tested with the real dpkg and a chrooted
-  `postinst` (`tests/kinds.rs`), the postinst's restart loop and the
-  exit-3 path of `run` (`tests/binary.rs`); the full upgrade on a
-  systemd-booted VM is the VM job of T10 (not yet in CI).
+  self-upgrade; it is not a failure.
+  The health gate of such an install also runs the **new** binary once,
+  `robodr-deliverd self-check --config <file>` (it loads the
+  configuration, the state file and the black-box and finding keys; 60 s
+  at most), and records it as the check `robodr-deliverd self-check`. If
+  it fails, the old agent rolls the package back like any failed gate
+  (`robot.deliver.health_failed`). A RoboDR version without the
+  `self-check` command therefore cannot be installed by the agent onto
+  itself. Not covered: a new binary that passes `self-check` but fails
+  later in `run` is not rolled back automatically; systemd restarts it
+  (`Restart=on-failure`) until its start limit (5 in 300 s) and the unit
+  is then failed; an operator restores the previous release (section 7)
+  and reports the version.
+  The unit also sets `KillMode=mixed`, so `systemctl stop` signals the
+  agent only and a dpkg run in progress finishes with its pass, as long
+  as that takes less than `TimeoutStopSec=5min`. A longer one
+  (`install.dpkg_timeout_s` allows up to 7200 s) is killed with the
+  agent at the timeout and recovered from the intent at the next start
+  (a half-done dpkg run is rolled back); raise `TimeoutStopSec=` in a drop-in where dpkg runs take
+  longer. Tested with the real dpkg and a chrooted `postinst`
+  (`tests/kinds.rs`, also the self-check rollback with a stand-in
+  package), the postinst's restart loop and the exit-3 path of `run`
+  (`tests/binary.rs`); the full upgrade on a systemd-booted VM is the VM
+  job of T10 (not yet in CI).
 * Release-allowed maintainer scripts stay root-equivalent: a `preinst`
   can divert a floored package's file (the file-list check then fails the
   switch, but the script has run).

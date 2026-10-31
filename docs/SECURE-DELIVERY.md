@@ -596,8 +596,16 @@ therefore carries `ROBODR_DELIVERD_INSTALL=1` (dpkg passes it to the
 maintainer scripts) and the `postinst` skips that one restart; the agent
 finishes the pass on the old binary, notices that its executable was
 replaced (path now naming another inode) and exits 3, on which the unit
-restarts it (`RestartForceExitStatus=3`). The unit's `KillMode=mixed`
-keeps an operator's stop from signalling a dpkg run in progress. The
+restarts it (`RestartForceExitStatus=3`). Before that pass commits, the
+health gate also runs the new binary (`robodr-deliverd self-check
+--config <file>`: configuration, state file and keys load) and rolls the
+package back if it fails, while the old binary can still do so. A new
+binary that passes `self-check` but fails later in `run` is not rolled
+back automatically (systemd's start limit, then an operator). The unit's
+`KillMode=mixed` keeps an operator's stop from signalling a dpkg run in
+progress for up to `TimeoutStopSec=` (5 min); a longer run is killed at
+that timeout and recovered from the intent at the next start (a
+half-done dpkg run is rolled back). The
 marker only removes a restart: set by anyone else, the agent still
 restarts itself on a replaced binary.
 
