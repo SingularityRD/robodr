@@ -948,7 +948,11 @@ mod tests {
     }
 
     /// T53: deb only. An `rpm` kind (or any other kind outside the closed
-    /// set) is refused as malformed, never read as some other kind.
+    /// set) is refused as malformed, never read as some other kind. A
+    /// guard against an `rpm` variant being added without the rest of an
+    /// RPM installer (it re-checks the closed serde enum); the behaviour
+    /// test of T53 is robodr-deliverd's
+    /// `a_deb_on_a_unit_without_dpkg_is_refused_as_deb_only`.
     #[test]
     fn an_rpm_kind_does_not_parse() {
         let b = to_canonical(&good()).unwrap();

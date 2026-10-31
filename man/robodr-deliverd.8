@@ -14,6 +14,9 @@ robodr\-deliverd \- install verified RoboDR delivery packages on a unit, behind 
 .B robodr\-deliverd check\-config \-\-config
 .I FILE
 .br
+.B robodr\-deliverd self\-check \-\-config
+.I FILE
+.br
 .B robodr\-deliverd init\-anchor \-\-config
 .I FILE
 .B \-\-trust
@@ -202,7 +205,15 @@ postinst): when RoboDR's own package is delivered, the agent finishes the
 pass (health gate, commit or rollback) on its old binary, sees its
 executable replaced on disk and exits 3; the unit
 .RB ( RestartForceExitStatus=3 )
-starts it again on the new one.
+starts it again on the new one. The health gate of that install also runs
+the new binary's
+.B self\-check
+(check
+.BR "robodr\-deliverd self\-check" );
+if it fails, the package is rolled back. A new binary that passes it but
+fails later in
+.B run
+is not rolled back automatically.
 .PP
 Every step is recorded in the agent's black box
 .RI ( /var/lib/robodr/blackbox/deliverd ,
@@ -230,6 +241,16 @@ One pass; prints a JSON report
 .TP
 .B check\-config
 Validate the configuration and exit.
+.TP
+.B self\-check
+Load what
+.B run
+needs before it starts (configuration, state file, black-box and finding
+keys) without writing anything; exit 0 if all of it loads, 1 otherwise.
+The running agent runs it on a new
+.B robodr\-deliverd
+that its own deb install put in place and rolls that install back if it
+fails.
 .TP
 .B init\-anchor
 Create the unit's trust anchor

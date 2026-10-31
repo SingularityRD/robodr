@@ -13,6 +13,7 @@ code, reused).
 robodr-deliverd run          --config FILE      # the daemon (robodr-deliverd.service)
 robodr-deliverd once         --config FILE      # one pass, JSON report
 robodr-deliverd check-config --config FILE
+robodr-deliverd self-check   --config FILE      # config, state and keys load (read only)
 robodr-deliverd init-anchor  --config FILE --trust TRUST.json   # once, at enrolment
 robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]   # lift the lock after a lost state
 robodr-deliverd status       --config FILE
@@ -21,8 +22,10 @@ robodr-deliverd erase        --config FILE --trigger T [--device DEV] [--key FIL
 robodr-safety-replay --socket PATH --file REPORTS.jsonl [--repeat-ms N] [--hold-ms N] [--check]
 ```
 
-Exit codes: 0 ok, 1 refused or error, 2 usage. `man robodr-deliverd(8)`,
-`docs/OPERATIONS.md` section 11.
+Exit codes: 0 ok, 1 refused or error, 2 usage, 3 (`run` only) its own
+binary was replaced by a self-upgrade (restarted by the unit; the
+install committed only after the new binary's `self-check` passed,
+`src/own.rs`). `man robodr-deliverd(8)`, `docs/OPERATIONS.md` section 11.
 
 **Sealed RPKs (Sprint 13c).** With the `seal` configuration section a
 sealed `files` / `model` / `config` RPK, and every `model`, is installed

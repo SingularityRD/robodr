@@ -76,7 +76,10 @@
 //! cgroup) and the package would be left half-configured. The agent
 //! instead finishes its pass (health gate, commit or rollback) on the old
 //! binary and then exits with [`crate::cli::EXIT_RESTART`] because its
-//! own executable was replaced; the unit restarts it on the new one. The
+//! own executable was replaced; the unit restarts it on the new one.
+//! Before that pass commits, its health gate also runs the new binary's
+//! `self-check` and rolls the package back if it fails ([`crate::own`]).
+//! The
 //! marker only ever skips that one restart; the agent notices a replaced
 //! binary by itself, so a marker set by anyone else costs nothing but
 //! the restart postinst would have done.
@@ -580,14 +583,15 @@ impl Installer<'_> {
 
     fn prepare_deb(&self, m: &Manifest, v: &mut Ver) -> Result<(), PrepError> {
         // T53: deb only. A unit without a dpkg database is an RPM-based
-        // (or otherwise non-Debian) host: refused before anything is
-        // unpacked, never left to fail half-way in dpkg.
+        // (or otherwise non-Debian) host, or its install.dpkg_root is
+        // wrong: refused before anything is unpacked, never left to fail
+        // half-way in dpkg.
         let status = self.admindir().join("status");
         if !status.is_file() {
             return Err(PrepError::Refused(format!(
                 "kind deb needs a Debian / Ubuntu unit and {} does not exist (no dpkg \
-                 database: an RPM-based host?); RoboDR delivers no RPM packages \
-                 (docs/SECURE-DELIVERY.md 4.2)",
+                 database: an RPM-based host, or install.dpkg_root names the wrong \
+                 directory); RoboDR delivers no RPM packages (docs/SECURE-DELIVERY.md 4.2)",
                 status.display()
             )));
         }

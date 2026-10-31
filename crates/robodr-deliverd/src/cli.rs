@@ -13,6 +13,7 @@ usage:
   robodr-deliverd run          --config FILE
   robodr-deliverd once         --config FILE
   robodr-deliverd check-config --config FILE
+  robodr-deliverd self-check   --config FILE
   robodr-deliverd init-anchor  --config FILE --trust TRUST.json
   robodr-deliverd reanchor     --config FILE --trust TRUST.json [--key FILE]
   robodr-deliverd rekey        --config FILE --old-key FILE --new-key FILE
@@ -39,6 +40,11 @@ black box and spools robot.deliver.* findings.
 run           loop every interval_ms until SIGTERM / SIGINT (systemd).
 once          one pass (prints what it did as JSON; exit 0, or 1 on error).
 check-config  validate the configuration and exit.
+self-check    read what `run` needs before it starts (configuration,
+              state file, black-box and finding keys) without writing;
+              exit 0 if all of it loads. The running agent runs it on a
+              new robodr-deliverd that its own deb install put in place,
+              and rolls that install back if it fails.
 init-anchor   create the unit's trust anchor from a trust file accepted
               under the pinned roots and site (once, at enrolment).
 reanchor      after a lost state file the agent locks itself (no import,
@@ -164,7 +170,7 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "rekey" => &["config", "old-key", "new-key"],
         "confirm" => &["config", "deployment", "package"],
         "erase" => &["config", "trigger", "device", "key"],
-        "run" | "once" | "check-config" | "status" | "pull" => &["config"],
+        "run" | "once" | "check-config" | "self-check" | "status" | "pull" => &["config"],
         "report" => &["config", "out"],
         "lease" => &["config", "lease"],
         "tamper" => &["socket", "trigger"],
@@ -218,15 +224,16 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
             }
         };
     }
-    let cfg = match a.req("config") {
-        Ok(p) => match Config::load(Path::new(p)) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("robodr-deliverd: configuration: {e}");
-                return 2;
-            }
-        },
+    let cfg_path = match a.req("config") {
+        Ok(p) => std::path::PathBuf::from(p),
         Err(e) => return usage(&e, USAGE, "robodr-deliverd"),
+    };
+    let cfg = match Config::load(&cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("robodr-deliverd: configuration: {e}");
+            return 2;
+        }
     };
     let r = match cmd.as_str() {
         "check-config" => {
@@ -239,11 +246,12 @@ pub fn run_deliverd(args: Vec<String>) -> i32 {
         "status" => status(&cfg),
         "confirm" => confirm(&cfg, &a),
         "erase" => erase(cfg, &a),
-        "once" => once(cfg),
+        "self-check" => self_check(&cfg),
+        "once" => once(cfg, &cfg_path),
         "pull" => crate::lan::pull(&cfg).map(|p| print(serde_json::json!({"pack": p}))),
         "report" => report_cmd(cfg, &a),
         "lease" => lease_cmd(cfg, &a),
-        _ => match run_loop(cfg) {
+        _ => match run_loop(cfg, &cfg_path) {
             Ok(Stop::Replaced) => {
                 eprintln!(
                     "robodr-deliverd: this program was replaced on disk (an upgrade); \
@@ -490,8 +498,35 @@ fn report_json(r: &crate::engine::TickReport) -> serde_json::Value {
     })
 }
 
-fn once(cfg: Config) -> Result<(), String> {
+/// `self-check`: what `run` needs before READY (configuration, state,
+/// keys), read only. Run by the old agent on a binary that replaced it,
+/// before that install commits ([`crate::own::SelfCheck`]).
+fn self_check(cfg: &Config) -> Result<(), String> {
+    StateFile::new(&cfg.state_path()).load()?;
+    crate::journal::load_blackbox_key(&cfg.blackbox.key, cfg.blackbox.allow_hmac, "black-box key")?
+        .signer()
+        .map_err(|e| format!("black-box key {}: {e}", cfg.blackbox.key.display()))?;
+    if let Some(p) = &cfg.findings.finding_key {
+        robodr_blackbox::KeyFile::load_secret(p)
+            .and_then(|k| k.signer())
+            .map_err(|e| format!("finding key {}: {e}", p.display()))?;
+    }
+    println!("robodr-deliverd: self-check ok");
+    Ok(())
+}
+
+/// The check of a replaced own binary for an engine started from the
+/// configuration file `cfg_path`.
+fn own_self_check(own: Option<OwnBinary>, cfg_path: &Path) -> Option<crate::own::SelfCheck> {
+    Some(crate::own::SelfCheck {
+        exe: own?,
+        config: std::path::absolute(cfg_path).ok()?,
+    })
+}
+
+fn once(cfg: Config, cfg_path: &Path) -> Result<(), String> {
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    e.set_self_check(own_self_check(OwnBinary::of_self(), cfg_path));
     let r = e.tick().map_err(|e| e.0);
     let closed = e.close().map_err(|e| e.0);
     let r = r?;
@@ -509,57 +544,11 @@ enum Stop {
     Replaced,
 }
 
-/// The executable this process was started from, as path, device and
-/// inode taken at start (T52). dpkg replaces a file by renaming a new one
-/// over it, so after an upgrade the path names another inode (or nothing)
-/// while this process still runs the old one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnBinary {
-    path: std::path::PathBuf,
-    dev: u64,
-    ino: u64,
-}
+pub use crate::own::OwnBinary;
 
-impl OwnBinary {
-    /// Of this process (`/proc/self/exe`). `None`: not knowable (already
-    /// replaced before the start, or no `/proc`): never reports a change.
-    pub fn of_self() -> Option<Self> {
-        Self::of(Path::new("/proc/self/exe"))
-    }
-
-    /// Of the executable `link` resolves to (`/proc/<pid>/exe`, or any
-    /// path in tests).
-    pub fn of(link: &Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let path = std::fs::canonicalize(link).ok()?;
-        // The kernel marks an unlinked executable " (deleted)".
-        if path.to_string_lossy().ends_with(" (deleted)") {
-            return None;
-        }
-        let m = std::fs::metadata(link).ok()?;
-        let p = std::fs::metadata(&path).ok()?;
-        if (m.dev(), m.ino()) != (p.dev(), p.ino()) {
-            return None;
-        }
-        Some(Self {
-            path,
-            dev: m.dev(),
-            ino: m.ino(),
-        })
-    }
-
-    /// The path now names another file, or none.
-    pub fn replaced(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(&self.path) {
-            Ok(m) => (m.dev(), m.ino()) != (self.dev, self.ino),
-            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        }
-    }
-}
-
-fn run_loop(cfg: Config) -> Result<Stop, String> {
+fn run_loop(cfg: Config, cfg_path: &Path) -> Result<Stop, String> {
     let own = OwnBinary::of_self();
+    let check = own_self_check(own.clone(), cfg_path);
     robodr_agentd::signal::install().map_err(|e| format!("signal handler: {e}"))?;
     let interval = Duration::from_millis(cfg.interval_ms);
     let triggers = match &cfg.erase {
@@ -570,6 +559,7 @@ fn run_loop(cfg: Config) -> Result<Stop, String> {
     let mut last_report: Option<Instant> = None;
     let mut last_pull: Option<Instant> = None;
     let mut e = Engine::open(cfg, Box::new(SystemClock)).map_err(|e| e.0)?;
+    e.set_self_check(check);
     let notifier = robodr_agentd::notify::Notifier::from_env();
     notifier.notify("READY=1");
     let mut res = Ok(Stop::Signal);
