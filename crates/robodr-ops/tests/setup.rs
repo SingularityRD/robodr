@@ -25,6 +25,7 @@ fn good_host(t: &Tmp) {
 fn good_runner() -> Fake {
     Fake::default()
         .with("systemctl --version", 0, "systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT\n")
+        .with("systemctl show -p Version --value", 0, "255.4-1ubuntu8\n")
         .with("getconf GNU_LIBC_VERSION", 0, "glibc 2.39\n")
         .with("dpkg-query -W -f=${Depends} robodr", 0, "libc6 (>= 2.39), libgcc-s1, systemd (>= 247)")
         .with("timedatectl show -p NTPSynchronized --value", 0, "yes\n")
@@ -152,6 +153,86 @@ fn preflight_finds_each_problem() {
     );
 }
 
+/// The version that counts is the running manager's: after an upgrade
+/// without a reboot the installed systemctl is newer than PID 1.
+#[test]
+fn preflight_judges_the_running_systemd_not_the_installed_one() {
+    let t = Tmp::new("pf-sd-run");
+    good_host(&t);
+    let r = good_runner().with("systemctl show -p Version --value", 0, "245.4-4ubuntu3\n");
+    let p = Probe {
+        root: t.0.clone(),
+        runner: &r,
+        now: now(),
+    };
+    let c = preflight::run(&p, &opts());
+    let sd = c.iter().find(|c| c.id == "systemd").unwrap();
+    assert_eq!(sd.level, Level::Fail, "{sd:?}");
+    assert!(
+        sd.detail.contains("245") && sd.detail.contains("255 is installed"),
+        "{sd:?}"
+    );
+    // The other way round (a downgrade without reboot): the running 255 passes.
+    let r = good_runner().with("systemctl --version", 0, "systemd 245 (245.4)\n");
+    let p = Probe {
+        root: t.0.clone(),
+        runner: &r,
+        now: now(),
+    };
+    assert_eq!(level(&preflight::run(&p, &opts()), "systemd"), Level::Ok);
+    // The manager does not answer: the installed version, and it says so.
+    let r = Fake::default().with("systemctl --version", 0, "systemd 255 (255.4)\n");
+    let p = Probe {
+        root: t.0.clone(),
+        runner: &r,
+        now: now(),
+    };
+    let c = preflight::run(&p, &opts());
+    let sd = c.iter().find(|c| c.id == "systemd").unwrap();
+    assert_eq!(sd.level, Level::Ok);
+    assert!(sd.detail.contains("did not answer"), "{sd:?}");
+}
+
+/// keys.dir looks at the directory the keys will be written to.
+#[test]
+fn preflight_checks_the_keys_dir_in_use() {
+    let t = Tmp::new("pf-keysdir");
+    good_host(&t);
+    mkdir_mode(&t.path("/srv/keys"), 0o750);
+    let r = good_runner();
+    let p = Probe {
+        root: t.0.clone(),
+        runner: &r,
+        now: now(),
+    };
+    let o = Options {
+        keys_dir: "/srv/keys".into(),
+        ..opts()
+    };
+    let c = preflight::run(&p, &o);
+    let k = c.iter().find(|c| c.id == "keys.dir").unwrap();
+    assert_eq!(k.level, Level::Fail, "{k:?}");
+    assert!(k.detail.contains("/srv/keys"), "{k:?}");
+    // The CLI passes --keys-dir to the check.
+    let out = run(&[
+        "preflight",
+        "--root",
+        t.0.to_str().unwrap(),
+        "--keys-dir",
+        "/srv/keys",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let k = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "keys.dir")
+        .unwrap();
+    assert_eq!(k["level"], "fail", "{v}");
+    assert!(k["detail"].as_str().unwrap().contains("/srv/keys"), "{v}");
+}
+
 #[test]
 fn preflight_focal_variant() {
     let t = Tmp::new("pf-focal");
@@ -159,7 +240,9 @@ fn preflight_focal_variant() {
     std::fs::remove_file(t.path("/sys/kernel/btf/vmlinux")).unwrap();
     t.put("/usr/lib/robodr/robodr-load-credential", "#!/bin/sh\n");
     assert_eq!(preflight::detect_variant(&t.0), Variant::Focal);
-    let r = good_runner().with("systemctl --version", 0, "systemd 245 (245.4-4ubuntu3)\n");
+    let r = good_runner()
+        .with("systemctl --version", 0, "systemd 245 (245.4-4ubuntu3)\n")
+        .with("systemctl show -p Version --value", 0, "245.4-4ubuntu3\n");
     let p = Probe {
         root: t.0.clone(),
         runner: &r,

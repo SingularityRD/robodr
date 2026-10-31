@@ -12,13 +12,14 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage:
-  robodr-setup preflight    [--json] [--min-free-mib N] [--state-dir DIR] [--ignore-check ID]...
+  robodr-setup preflight    [--json] [--min-free-mib N] [--state-dir DIR] [--keys-dir DIR]
+                            [--ignore-check ID]...
   robodr-setup keys         --unit-id ID [--role ROLE] [--key KIND]... [--keys-dir DIR]
   robodr-setup config       --role ROLE --unit-id ID [--site SITE] [--interface IF]...
                             [--examples DIR] [--out FILE]
   robodr-setup fingerprints [--keys-dir DIR] [--json]
   robodr-setup init         --role ROLE --unit-id ID [--site SITE] [--interface IF]...
-                            [--key KIND]... [--ignore-check ID]... [--json]
+                            [--key KIND]... [--keys-dir DIR] [--ignore-check ID]... [--json]
   common: [--root DIR]   operate on the file tree under DIR (image staging, tests)
 
 ROLE: robot | unitree-edu | unitree-sensor-box | soc-relay
@@ -116,6 +117,7 @@ fn preflight_checks(a: &Args, root: &Path) -> Result<Vec<Check>, String> {
         variant: preflight::detect_variant(root),
         state_dir: abs(a, "state-dir", "/var/lib/robodr")?,
         min_free_mib: a.u64_or("min-free-mib", 2048)?,
+        keys_dir: abs(a, "keys-dir", "/etc/robodr/keys")?,
         ..Default::default()
     };
     let ignored: Vec<&str> = a.all("ignore-check").collect();
@@ -146,7 +148,13 @@ fn print_checks(checks: &[Check]) {
 fn cmd_preflight(raw: &[String]) -> Result<bool, Fail> {
     let a = Args::parse(
         raw,
-        &["root", "min-free-mib", "state-dir", "ignore-check"],
+        &[
+            "root",
+            "min-free-mib",
+            "state-dir",
+            "ignore-check",
+            "keys-dir",
+        ],
         &["json"],
     )?;
     no_positional(&a)?;
