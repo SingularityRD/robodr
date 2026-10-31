@@ -49,21 +49,28 @@ fn bump() {
     let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
 }
 
+// SAFETY: every call is forwarded unchanged to `System`, which upholds the
+// `GlobalAlloc` contract; `bump` touches only a const-initialised
+// thread-local `Cell` and never allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         bump();
+        // SAFETY: forwarded to the system allocator with the caller's arguments.
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         bump();
+        // SAFETY: forwarded to the system allocator with the caller's arguments.
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         bump();
+        // SAFETY: forwarded to the system allocator with the caller's arguments.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         bump();
+        // SAFETY: forwarded to the system allocator with the caller's arguments.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

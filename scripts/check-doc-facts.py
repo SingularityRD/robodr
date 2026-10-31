@@ -58,7 +58,9 @@ Checks (``--only`` takes these names):
       ``#![deny(unsafe_code)]`` of every library and binary root of the
       workspace members (``[lib]``, ``[[bin]]``, ``src/main.rs``,
       ``src/bin/*.rs``).
-      * every library root carries one of the two;
+      * every library root carries one of the two (a root that also
+        allows, warns or expects ``unsafe_code`` crate-wide counts as
+        neither); examples, tests and benches are not checked;
       * in the current-state documents, "`forbid(unsafe_code)` on N library
         crates" and "`deny(unsafe_code)` on N library crates (`robodr-a`,
         ...)" state the count (and, when listed, exactly those crates);
@@ -340,6 +342,11 @@ def crate_roots(root: Path) -> tuple[dict[str, str], dict[str, str]]:
 
     def lint(rel: str) -> str:
         text = read(root, rel)
+        # A crate-wide allow/warn/expect (plain or under cfg_attr) undoes a
+        # deny, so such a root counts as neither (with forbid it would not
+        # compile). Item-level allows (`#[allow(...)]`) are not crate-wide.
+        if re.search(r"^#!\[(?:cfg_attr\(.*)?(?:allow|warn|expect)\([^)]*\bunsafe_code\b", text, re.MULTILINE):
+            return "none"
         if re.search(r"^#!\[forbid\(unsafe_code\)\]", text, re.MULTILINE):
             return "forbid"
         if re.search(r"^#!\[deny\(unsafe_code\)\]", text, re.MULTILINE):
@@ -889,6 +896,10 @@ MUTATIONS = (
     ("fuzz-targets", "README.md", "3 fuzz targets", "**23** fuzz targets", "says '**23** fuzz targets'"),
     ("unsafe-lints", "crates/robodr-b/src/root.rs", "#![deny(unsafe_code)]", "// nothing",
      "library crate robodr-b has neither"),
+    ("unsafe-lints", "crates/robodr-b/src/root.rs", "#![deny(unsafe_code)]",
+     "#![deny(unsafe_code)]\n#![allow(unsafe_code)]", "library crate robodr-b has neither"),
+    ("unsafe-lints", "crates/robodr-b/src/root.rs", "#![deny(unsafe_code)]",
+     "#![deny(unsafe_code)]\n#![cfg_attr(test, allow(dead_code, unsafe_code))]", "library crate robodr-b has neither"),
     ("unsafe-lints", "crates/robodr-b/src/root.rs", "#![deny(unsafe_code)]", "#![forbid(unsafe_code)]",
      "says forbid(unsafe_code) on 1 library crates; the code has 2"),
     ("unsafe-lints", "docs/compliance/a.md", "(`robodr-b`)", "(`robodr-z`)",
