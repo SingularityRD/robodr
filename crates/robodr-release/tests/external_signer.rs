@@ -3,7 +3,8 @@
 //! external signer here is `openssl pkeyutl` over a PEM of the key (a
 //! stand-in token); the PKCS#11 adapter itself is tested against SoftHSM
 //! in crates/robodr-signer/tests/external.rs. Skipped (with a message)
-//! without `openssl`.
+//! without `openssl`; on CI (`CI` or `ROBODR_REQUIRE_SIGNER_TESTS=1` set)
+//! a missing `openssl` fails instead.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -58,9 +59,23 @@ fn have_openssl() -> bool {
         .output()
         .is_ok_and(|o| o.status.success());
     if !ok {
-        eprintln!("skipped: needs openssl (Ed25519 pkeyutl)");
+        skip("needs openssl (Ed25519 pkeyutl)");
     }
     ok
+}
+
+/// A prerequisite of these tests is missing. Off CI that is a skip (with a
+/// message); on CI (`CI` set, as GitHub Actions does, or
+/// `ROBODR_REQUIRE_SIGNER_TESTS=1`) it fails the test, so a runner without
+/// `openssl` or with an untrusted checkout path cannot report green
+/// without having run them.
+fn skip(why: &str) {
+    let on = |n: &str| std::env::var(n).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+    assert!(
+        !(on("CI") || on("ROBODR_REQUIRE_SIGNER_TESTS")),
+        "required on CI, but {why}"
+    );
+    eprintln!("skipped: {why}");
 }
 
 /// A stand-in token holding `key_file`'s seed, and a signer file pinned to

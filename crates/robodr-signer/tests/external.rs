@@ -5,7 +5,10 @@
 //!
 //! The well-behaved fake signer is `openssl pkeyutl -sign -rawin` with an
 //! Ed25519 key built from a known seed; tests that need it are skipped
-//! (with a message) on a host without `openssl`.
+//! (with a message) on a host without `openssl` or when the test directory
+//! is not a trusted path (e.g. a root-run container on a checkout owned by
+//! another uid). On CI (`CI` or `ROBODR_REQUIRE_SIGNER_TESTS=1` set) either
+//! is a failure instead.
 
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -73,7 +76,9 @@ fn trusted_tree(d: &Dir) -> bool {
     match robodr_signer::external::check_trusted_executable(&probe) {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("skipped: the test directory is not a trusted path here ({e})");
+            skip(&format!(
+                "the test directory is not a trusted path here ({e})"
+            ));
             false
         }
     }
@@ -85,9 +90,23 @@ fn have_openssl() -> bool {
         .output()
         .is_ok_and(|o| o.status.success());
     if !ok {
-        eprintln!("skipped: needs openssl (Ed25519 pkeyutl)");
+        skip("needs openssl (Ed25519 pkeyutl)");
     }
     ok
+}
+
+/// A prerequisite of these tests is missing. Off CI that is a skip (with a
+/// message); on CI (`CI` set, as GitHub Actions does, or
+/// `ROBODR_REQUIRE_SIGNER_TESTS=1`) it fails the test, so a runner without
+/// `openssl` or with an untrusted checkout path cannot report green
+/// without having run them.
+fn skip(why: &str) {
+    let on = |n: &str| std::env::var(n).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+    assert!(
+        !(on("CI") || on("ROBODR_REQUIRE_SIGNER_TESTS")),
+        "required on CI, but {why}"
+    );
+    eprintln!("skipped: {why}");
 }
 
 /// A PKCS#8 PEM Ed25519 key for `seed`, and an openssl-backed signer
@@ -239,6 +258,86 @@ fn a_hanging_signer_is_killed_at_the_deadline() {
     let e = load(&f).unwrap().sign(b"doc").unwrap_err().to_string();
     assert!(e.contains("stdout stayed open"), "{e}");
     assert!(t.elapsed() < Duration::from_secs(10));
+}
+
+/// `pid` is a live process (not gone, not a zombie).
+fn alive(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => false,
+        Ok(s) => s
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// The pid a signer script wrote to `f`, waiting for it to appear.
+fn pid_from(f: &Path) -> u32 {
+    for _ in 0..500 {
+        if let Ok(s) = fs::read_to_string(f) {
+            if let Ok(p) = s.trim().parse() {
+                return p;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("{} never written", f.display());
+}
+
+fn gone_soon(pid: u32) -> bool {
+    for _ in 0..200 {
+        if !alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// Review finding (WP15): a timeout killed only the direct child (the
+/// adapter shell), so the pkcs11-tool it ran kept the token session open
+/// (or kept waiting for a touch). The command now runs in its own process
+/// group and the whole group is killed.
+#[test]
+fn a_timeout_kills_what_the_signer_started_too() {
+    let d = Dir::new("grandchild");
+    if !trusted_tree(&d) {
+        return;
+    }
+    // A shell that runs a long command and waits for it, as the adapter
+    // waits for pkcs11-tool.
+    let pidf = d.path("grandchild.pid");
+    let cmd = d.script(
+        "wait.sh",
+        &format!("sleep 30 &\necho $! > {}\nwait", pidf.display()),
+    );
+    let f = d.signer_file(
+        "w.json",
+        &SEED,
+        &[cmd.to_str().unwrap()],
+        r#","timeout_ms":300"#,
+    );
+    let e = load(&f).unwrap().sign(b"doc").unwrap_err().to_string();
+    assert!(e.contains("no answer within 300 ms"), "{e}");
+    let pid = pid_from(&pidf);
+    assert!(gone_soon(pid), "grandchild {pid} survived the timeout");
+
+    // Exited, leaving a background process on stdout: that one is killed
+    // as well.
+    let pidf = d.path("bg.pid");
+    let cmd = d.script(
+        "bg2.sh",
+        &format!("sleep 30 &\necho $! > {}\nexit 0", pidf.display()),
+    );
+    let f = d.signer_file(
+        "bg2.json",
+        &SEED,
+        &[cmd.to_str().unwrap()],
+        r#","timeout_ms":300"#,
+    );
+    let e = load(&f).unwrap().sign(b"doc").unwrap_err().to_string();
+    assert!(e.contains("stdout stayed open"), "{e}");
+    let pid = pid_from(&pidf);
+    assert!(gone_soon(pid), "background process {pid} survived");
 }
 
 #[test]
@@ -411,6 +510,196 @@ fn run(c: &mut Command) -> Vec<u8> {
         String::from_utf8_lossy(&o.stderr)
     );
     o.stdout
+}
+
+/// A fake OpenSC: `pkcs11-tool` logs its arguments (and the PIN variable
+/// it was pointed at) and fails; `opensc-tool --info` reports `version`.
+fn fake_opensc(d: &Dir, version: &str) -> (PathBuf, PathBuf) {
+    let bin = d.path("fakebin");
+    let _ = fs::remove_dir_all(&bin);
+    fs::create_dir(&bin).unwrap();
+    let log = d.path("p11.log");
+    let _ = fs::remove_file(&log);
+    let w = |name: &str, body: String| {
+        let p = bin.join(name);
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    w(
+        "pkcs11-tool",
+        format!(
+            "echo \"$*\" >> {log}\n\
+             for a; do case $a in env:*) v=${{a#env:}}; eval \"echo pin=\\${{$v}}\" >> {log};; esac; done\n\
+             exit 1",
+            log = log.display()
+        ),
+    );
+    w(
+        "opensc-tool",
+        format!("echo 'OpenSC {version} [gcc  13.3.0]'\necho 'Enabled features: x'"),
+    );
+    (bin, log)
+}
+
+fn args(v: &[String]) -> Vec<&str> {
+    v.iter().map(String::as_str).collect()
+}
+
+/// Run the adapter against the fake OpenSC in `bin`.
+fn adapter_with(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut c = Command::new(adapter());
+    c.args(args)
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let mut ch = c.spawn().unwrap();
+    {
+        use std::io::Write;
+        let _ = ch.stdin.take().unwrap().write_all(b"message");
+    }
+    ch.wait_with_output().unwrap()
+}
+
+/// Review findings (WP15): the adapter (1) passed "--pin env:VAR" to any
+/// pkcs11-tool, but OpenSC before 0.25 sends that literal text as the PIN
+/// and spends a PIN retry per attempt (a YubiKey PIV locks after 3);
+/// (2) without a PIN option it ran "--login" with stdin already read to
+/// EOF, so a prompt would get an empty PIN; (3) accepted a PIN file that
+/// group or others can read. All three are now refused before pkcs11-tool
+/// is ever run.
+#[test]
+fn pkcs11_adapter_refuses_before_spending_a_pin_retry() {
+    let d = Dir::new("p11-fake");
+    let module = d.path("module.so");
+    fs::write(&module, b"").unwrap();
+    let m = module.to_str().unwrap();
+    let base = ["sign", "--module", m, "--id", "01"];
+    let with = |extra: &[&str]| -> Vec<String> {
+        base.iter().chain(extra).map(|s| s.to_string()).collect()
+    };
+    let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+
+    // OpenSC 0.23 (Debian 12) and 0.22 (Ubuntu 22.04): refused, the token
+    // is never asked.
+    for old in ["0.23.0", "0.22.0", "0.24.0-rc1"] {
+        let (bin, log) = fake_opensc(&d, old);
+        let v = with(&["--pin-env", "P11_PIN"]);
+        let o = adapter_with(&bin, &args(&v), &[("P11_PIN", "4321")]);
+        assert!(!o.status.success());
+        assert!(stderr(&o).contains("too old"), "{old}: {}", stderr(&o));
+        assert!(!log.exists(), "{old}: pkcs11-tool ran");
+        // signer-file writes nothing either.
+        let o = adapter_with(
+            &bin,
+            &[
+                "signer-file",
+                "--module",
+                m,
+                "--id",
+                "01",
+                "--key-id",
+                "k",
+                "--pin-env",
+                "P11_PIN",
+            ],
+            &[],
+        );
+        assert!(!o.status.success() && o.stdout.is_empty());
+        assert!(!log.exists(), "{old}: pkcs11-tool ran");
+    }
+    // An unreadable version is refused too.
+    let (bin, log) = fake_opensc(&d, "unknown");
+    let v = with(&["--pin-env", "P11_PIN"]);
+    let o = adapter_with(&bin, &args(&v), &[("P11_PIN", "4321")]);
+    assert!(
+        stderr(&o).contains("cannot read the OpenSC version"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!log.exists());
+
+    // 0.25: pkcs11-tool runs, logging in with the PIN from the variable
+    // (the fake then fails, so the adapter fails).
+    let (bin, log) = fake_opensc(&d, "0.25.0-rc1");
+    let o = adapter_with(&bin, &args(&v), &[("P11_PIN", "4321")]);
+    assert!(!o.status.success());
+    let l = fs::read_to_string(&log).unwrap();
+    assert!(l.contains("--login --pin env:P11_PIN"), "{l}");
+    assert!(l.contains("pin=4321"), "{l}");
+    fs::remove_file(&log).unwrap();
+    let (bin, log) = fake_opensc(&d, "1.0.0");
+    let o = adapter_with(&bin, &args(&v), &[("P11_PIN", "4321")]);
+    assert!(!o.status.success());
+    assert!(log.exists(), "{}", stderr(&o));
+    let (bin, log) = fake_opensc(&d, "0.26.0");
+
+    // No PIN option: refused (no terminal prompt with an empty stdin).
+    let o = adapter_with(&bin, &base, &[]);
+    assert!(
+        stderr(&o).contains("needs --pin-env NAME or --pin-file"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!log.exists());
+
+    // A PIN file group or others can read: refused.
+    let pin = d.path("pin");
+    fs::write(&pin, "2468\n").unwrap();
+    let p = pin.to_str().unwrap();
+    for mode in [0o644, 0o640, 0o604, 0o660, 0o607] {
+        fs::set_permissions(&pin, fs::Permissions::from_mode(mode)).unwrap();
+        let o = adapter_with(&bin, &args(&with(&["--pin-file", p])), &[]);
+        assert!(
+            stderr(&o).contains("group or others"),
+            "{mode:o}: {}",
+            stderr(&o)
+        );
+        assert!(!log.exists(), "{mode:o}");
+    }
+    // A directory is not a PIN file.
+    let o = adapter_with(
+        &bin,
+        &args(&with(&["--pin-file", d.0.to_str().unwrap()])),
+        &[],
+    );
+    assert!(stderr(&o).contains("not a regular file"), "{}", stderr(&o));
+    // Owned by someone else (needs root to set up).
+    let root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| o.stdout == b"0\n");
+    if root {
+        let other = d.path("pin-other");
+        fs::write(&other, "2468\n").unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::chown(&other, Some(54321), None).unwrap();
+        let o = adapter_with(
+            &bin,
+            &args(&with(&["--pin-file", other.to_str().unwrap()])),
+            &[],
+        );
+        assert!(stderr(&o).contains("owned by uid 54321"), "{}", stderr(&o));
+        assert!(!log.exists());
+    }
+    // Mode 0600 (and 0400): accepted, the PIN reaches pkcs11-tool through
+    // the environment, never the command line.
+    for mode in [0o600, 0o400] {
+        fs::set_permissions(&pin, fs::Permissions::from_mode(mode)).unwrap();
+        let o = adapter_with(&bin, &args(&with(&["--pin-file", p])), &[]);
+        assert!(!o.status.success());
+        let l = fs::read_to_string(&log).unwrap();
+        assert!(
+            l.contains("--pin env:ROBODR_P11_PIN") && l.contains("pin=2468"),
+            "{l}"
+        );
+        assert!(!l.lines().next().unwrap_or("").contains("2468"), "{l}");
+        fs::remove_file(&log).unwrap();
+    }
 }
 
 #[test]

@@ -577,7 +577,8 @@ signature from stdout. **Every signature is verified against the pinned
 public key before it is used**, so a wrong token, slot or key id, or a
 misbehaving adapter, fails the command and writes nothing. The protocol
 (cleared environment, deadline, output cap, trusted-path checks of the
-signer file and of the command and its directories) is documented in
+signer file and of the command and its directories; the command runs in
+its own process group, killed as a whole on a timeout) is documented in
 `crates/robodr-signer/src/lib.rs`.
 
 The shipped adapter `/usr/lib/robodr/robodr-signer-pkcs11` drives OpenSC's
@@ -604,10 +605,22 @@ robodr-release sign --key oem-root.signer.json --target trust.json
 ```
 
 `robodr-signer check` prints the key's `public_key_hex` and `fingerprint`
-(for `--root` pins and trust files). The PIN comes from the environment
-variable named by `--pin-env` (listed in the signer file's `pass_env`) or
-from `--pin-file`; with neither, `pkcs11-tool` asks on the terminal. It
-never appears on a command line. The adapter is in the `robodr` package;
+(for `--root` pins and trust files). `sign` and `signer-file` need one
+PIN source: the environment variable named by `--pin-env` (listed in the
+signer file's `pass_env`) or the first line of `--pin-file`, which must be
+a regular file owned by you or root with no group or other access (mode
+0600 or 0400; anything else is refused). There is no terminal prompt: the
+external signer runs in its own process group with the message on stdin,
+so it cannot read the terminal. The PIN never appears on a command line:
+the adapter hands it to `pkcs11-tool` as `--pin env:VAR`. That form is
+documented for OpenSC 0.25 and tested only with 0.25; a `pkcs11-tool`
+without it would send the text `env:VAR` as the PIN and spend one of the
+token's PIN retries (a YubiKey PIV locks after 3). The adapter therefore
+reads the OpenSC version (`opensc-tool
+--info`) and refuses to log in below 0.25 or when the version cannot be
+read. Ubuntu 22.04 (0.22) and Debian 12 (0.23) ship older releases:
+install OpenSC 0.25 or later on the signing station. The adapter is in
+the `robodr` package;
 `robodr-signer` (the check tool) is built from the source tree like
 `robodr-release` (`cargo build --release -p robodr-signer`).
 
@@ -688,12 +701,25 @@ start unless every key is sealed to the TPM, add to `agentd.json`:
 (`credentials_dir`, default `/run/credentials/robodr-agentd.service`, and
 `encrypted_dir`, default `/etc/robodr/credstore.encrypted`, are optional.)
 
+Under systemd, agentd also compares `credentials_dir` with the directory
+systemd gave it (`$CREDENTIALS_DIRECTORY`); if they differ, no key counts
+as a credential (`protection: "file"`, with a `detail`). `--check-config`
+run from a shell has no such variable and trusts the configured directory.
+
 Limits: sealing protects keys **at rest**. While the service runs, the key
 is in its private credential ramfs and memory and the TPM does not make the
 signatures; root on a running unit can still read it. The report matches a
 credential to `<encrypted_dir>/<name>` by name and reads only the header;
-it does not read the unit file, so it catches a missing or weaker seal, not
-a root user who deliberately misconfigures the unit. `robodr-executor`,
+it does not read the unit file. systemd places a `LoadCredential=` copy of
+a plain file and a `LoadCredentialEncrypted=` decryption in the same
+place, identically, and the plain key directory is inaccessible to the
+service, so agentd cannot tell them apart: if the sealed file exists but
+the unit still loads the plain key (the `15-` drop-in removed or
+overridden), the key is reported
+as `tpm2`/`host+tpm2` and `require: "tpm2"` accepts it. Check the unit
+with `systemctl cat robodr-agentd` after sealing, and destroy the plain
+key file as described above. The report catches a missing or weaker seal,
+not a unit that loads another source than the sealed one. `robodr-executor`,
 `robodr-uplink` and the exporters can be sealed with the same systemd
 mechanism but do not report it. Tested against swtpm (`ROBODR_SWTPM=1
 cargo test -p robodr-agentd --test key_protection`), not yet on a hardware
